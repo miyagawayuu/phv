@@ -1,4 +1,4 @@
-# Phenix 言語仕様 (v0.1)
+# Phenix 言語仕様 (v0.2)
 
 Phenix は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋め込める」という良さを引き継ぎながら、
 型安全性・セキュリティ・実行速度・保守性を言語の側で保証する Web 向けの言語です。
@@ -12,6 +12,10 @@ Phenix は、PHP の「保存してすぐ動く」「Web に特化」「HTML に
 | null による実行時エラー | `?T` 型。null チェック (`!= null`、`is`、`??`、`?->`) をしないと使えない |
 | XSS | `<?= ?>` と Web ページへの `echo` は自動で HTML エスケープ。エスケープしないのは `Html` 型の値だけ |
 | `eval`、可変変数、`extract`、動的な `include` | 言語に存在しない。モジュールは静的な `import`、テンプレートはリテラルのパスだけ |
+| SQL インジェクション | SQL は `sql"..."` リテラル(`Sql` 型)でしか書けず、埋め込んだ値は必ずプレースホルダになる |
+| 文脈を無視したエスケープ | `<?= ?>` の位置(属性・URL・`<script>`・CSS)を判定し、エスケープでは守れない場所への挿入はコンパイルエラー |
+| CSRF・セッション固定 | フォームの POST はサーバーがトークンを自動で検査。セッション ID はサーバーが発行したものだけを受け付ける |
+| 何でもできるスクリプト | ファイル・環境変数へのアクセスは `phenix.toml` の `[permissions]` で許可したものだけ |
 | ヘッダーインジェクション | 改行を含むヘッダー値は `ValueError` |
 | パストラバーサル | サーバーは `public/` の外、ドットファイル、テンプレートを配信しない |
 | リクエスト間で状態が漏れる | リクエストごとに新しいヒープ。静的プロパティもグローバル変数もない |
@@ -37,7 +41,7 @@ Phenix は、PHP の「保存してすぐ動く」「Web に特化」「HTML に
   - `"..."` … `$name` と `{$式}` を展開する。エスケープは `\n \t \r \0 \e \\ \" \$ \{ \u{1F600}`。
 - 予約語: `function fn return if elseif else endif while endwhile do for endfor foreach endforeach as break continue
   echo class extends new public private protected readonly static true false null match default try catch finally
-  throw import export use is instanceof`
+  throw import export use is instanceof interface implements abstract final enum case const`
 
 ## 4. 型
 
@@ -115,7 +119,8 @@ $len = $user?->email?->len();             // ?int
 ```
 
 `!= null`、`== null`、`is`、`!`、`&&`、`||`、早期 `return` / `throw` / `break` / `continue` が絞り込みに使われる。
-絞り込みはローカル変数だけが対象(プロパティは対象外。ローカル変数に入れてから使う)。
+絞り込みの対象はローカル変数と、ローカル変数のプロパティ(`$this->user != null`)。プロパティの絞り込みは、
+関数やメソッドの呼び出し、プロパティへの代入があると解除される(呼び出しが値を変えたかもしれないため)。
 
 ## 6. 演算子
 
@@ -191,7 +196,15 @@ throw new RuntimeException("boom");
 $port = $config["port"] ?? throw new ValueError("port is required");
 ```
 
-投げられるのは `Exception` かそのサブクラスだけ。`finally` は未対応(今後対応)。
+```phx
+try {
+    $db->execute(sql"...");
+} finally {
+    $lock->release();      // return / break / continue / 例外のどれで抜けても実行される
+}
+```
+
+投げられるのは `Exception` かそのサブクラスだけ。
 
 ## 8. 関数
 
@@ -205,6 +218,7 @@ greet(name: "Bob", times: 3);       // 名前付き引数
 - 値を返す関数は、すべての経路で `return` しないとエラー。
 - デフォルト値は定数(リテラル、`null`、`[]`)だけ。
 - 関数は値ではない。関数を渡すときはクロージャで包む。
+- 型パラメータを持つジェネリック関数を書ける(§9 の「ジェネリック関数」)。
 
 ### クロージャ
 
@@ -256,7 +270,91 @@ class Admin extends User {
   クラスで初期化の必要なプロパティがある場合、子のコンストラクタは `parent::__construct(...)` を呼ぶ必要がある。
 - `static` メソッドは `ClassName::method()` で呼ぶ。**static プロパティはない**(リクエスト間で状態を共有させないため)。
 - オブジェクトは参照、`list` と `map` は値(コピーオンライト)。
-- 今後の予定: interface、abstract、enum、ジェネリクス。
+### interface と abstract
+
+```phx
+interface Shape {
+    const UNIT = "cm";
+    public function area(): float;
+}
+
+interface Named extends Shape {
+    public function name(): string;
+}
+
+abstract class Base implements Named {
+    public function label(): string {
+        return $this->name() . ": " . $this->area() . self::UNIT;
+    }
+}
+
+final class Square extends Base {
+    public function __construct(private float $side) {}
+    public function area(): float { return $this->side ** 2; }
+    public function name(): string { return "square"; }
+}
+```
+
+- interface はメソッドのシグネチャと定数だけを持つ。`extends` で複数の interface を継承できる。
+- `abstract` メソッドは本体を持たない。abstract メソッドを持つクラスは `abstract class` と宣言する。
+- 具象クラスが interface や abstract のメソッドを実装していない、またはシグネチャが合わないときはコンパイルエラー。
+- interface、abstract クラス、enum は `new` できない。
+- interface 型の値へのメソッド呼び出しは名前で振り分けられる。クラス型の値へは vtable で振り分けられる。
+
+### enum
+
+```phx
+enum Suit {
+    case Hearts;
+    case Spades;
+
+    public function color(): string {
+        return match ($this) {
+            Suit::Hearts => "red",
+            Suit::Spades => "black",
+        };
+    }
+}
+
+enum Status: string {        // int か string の値を持つ enum
+    case Active = "active";
+    case Banned = "banned";
+}
+
+Suit::Hearts->name;              // "Hearts"
+Status::Active->value;           // "active"
+Status::from("banned");          // Status::Banned(見つからなければ ValueError)
+Status::tryFrom("x");            // null
+Status::cases();                 // list<Status>
+```
+
+各 case は 1 回の実行(1 リクエスト)の中でただ 1 つのオブジェクトなので、`==` で比べられる。
+
+### 定数
+
+```phx
+const MAX_ITEMS = 50;            // ファイルの先頭レベル(export / import もできる)
+class Config {
+    const VERSION = "1.0";
+}
+echo MAX_ITEMS, Config::VERSION, self::VERSION;
+```
+
+定数の値はリテラル(int、float、string、bool、null)だけ。
+
+### ジェネリック関数
+
+```phx
+function first_or<T>(list<T> $xs, T $fallback): T {
+    return $xs->isEmpty() ? $fallback : $xs[0];
+}
+$n = first_or([5, 6], 0);        // int
+$s = first_or([], "none");       // string
+```
+
+型引数は呼び出しの引数から推論される(最大 4 個)。関数の中では `T` は中身の分からない型として扱われ、
+`T` の値に演算子やメソッドは使えない。ジェネリッククラスはまだない。
+
 
 ## 10. 例外クラス
 
@@ -272,7 +370,11 @@ Exception                    (getMessage(): string)
 ├── IndexError               list の範囲外アクセス
 ├── KeyError                 map にないキー
 ├── ValueError               不正な引数(ヘッダーの改行など)
-└── UnhandledMatchError
+├── UnhandledMatchError
+├── PermissionError          phenix.toml で許可されていないファイル・環境変数へのアクセス
+├── AssertionError           assert() / assert_eq() の失敗
+└── RuntimeException
+    └── DatabaseError        SQL のエラー
 ```
 
 実行時間の上限を超えたときなどの致命的なエラーは捕捉できない。
@@ -294,9 +396,10 @@ import std.http.{request, response};
 
 - `import a.b.{x, y};` は、プロジェクトのルート(`phenix.toml` のあるディレクトリ、なければ実行するファイルの
   ディレクトリ)からの `a/b.phx` を読み込む。
-- import されるモジュールのトップレベルには宣言(`function`、`class`、`import`)しか書けない。
-  モジュールを読み込んでも副作用は起きない。
-- `std.*` は標準モジュール(現在は `std.http`)。
+- import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`const`、`import`)
+  しか書けない。モジュールを読み込んでも副作用は起きない。
+- `std.*` は標準モジュール(`std.http`、`std.db`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
+- 読み込めるのはプロジェクトとパッケージのディレクトリの中のファイルだけ(シンボリックリンクで外に出ることはできない)。
 
 ## 12. テンプレート
 
@@ -317,7 +420,7 @@ echo render("views/layout.phx.html", title: "Home", body: $html);
 ```
 
 - テンプレートは `params(...)` で型付きの引数を宣言する。`render()` の呼び出しはコンパイル時に型チェックされる。
-- `render()` のパスは文字列リテラルで、プロジェクトのルートからの相対パス(`..` は使えない)。
+- `render()` のパスは文字列リテラルで、プロジェクトのルートからの相対パス(`..` は使えない)。拡張子は `.phx.html`。
 - `render()` は `Html` を返すので、別のテンプレートにそのまま渡して埋め込める(レイアウト)。
 
 ## 13. 出力とエスケープ
@@ -336,7 +439,26 @@ HTML 部分はそのまま出力される。`echo` と `<?= ?>` は同じ規則�
 - `escape($s)` / `htmlspecialchars($s)` … エスケープ済みの `Html` を返す。
 - `raw($s)` … 信頼できるマークアップを `Html` として扱う(XSS に注意して使う)。
 - `nl2br($s)` … エスケープしてから改行を `<br>` にした `Html`。
+- `safe_url($url)` … `http(s)`、`mailto`、`tel`、相対 URL だけを通し、`javascript:` などは `#` にした `Html`。
+- `json_html($value)` … `<script>` の中に置いても安全な JavaScript の値(JSON)を `Html` で返す。
 - `Html` と `string` は `.` で連結できない(エラーで `escape()` を案内する)。
+- エスケープを外す Content-Type は `text/plain`、`application/json`、`text/csv`、`text/css`、画像・音声・動画などに限る。
+  HTML・XML・SVG・知らない型ではエスケープしたまま。
+
+### HTML の文脈の検査
+
+HTML エスケープが守れるのは、要素の中身と**引用符で囲んだ**属性値だけ。`<?= ?>` がそれ以外の場所にあると
+コンパイルエラーになる。
+
+| 場所 | 例 | 扱い |
+|---|---|---|
+| 要素の中身・引用符付きの属性値 | `<p><?= $s ?></p>`、`title="<?= $s ?>"` | エスケープして出力 |
+| 引用符なしの属性値 | `href=<?= $u ?>` | エラー(引用符で囲む) |
+| タグの中(属性の間) | `<div <?= $attrs ?>>` | エラー |
+| URL 属性の先頭 | `href="<?= $u ?>"`、`src="<?= $u ?>"` | `string` はエラー。`safe_url($u)` を使う(`href="/post?id=<?= $id ?>"` のように途中なら可) |
+| `<script>` の中 | `var x = <?= $v ?>;` | `string` はエラー。`json_html($v)` を使う(数値は可) |
+| `<style>`・`style="..."` | | エラー(数値は可) |
+| イベント属性 | `onclick="go(<?= $v ?>)"` | エラー。`data-*` 属性に入れて JavaScript から読む |
 
 ## 14. Web サーバー
 
@@ -346,36 +468,191 @@ phenix serve examples/site --port 8080
 
 - サイトのディレクトリには `public/` が必要。URL はファイル名で決まる:
   `/` → `public/index.phx`、`/about` → `public/about.phx` または `public/about/index.phx`、`/about.phx` も可。
-  `.phx` 以外のファイルは静的ファイルとして配信される。
-- 配信しないもの: `public/` の外、`.` で始まるファイルやディレクトリ、`.phx.html`(テンプレート)。
+- 静的ファイルとして配信するのは既知の拡張子(html、css、js、json、txt、画像、フォント、pdf、音声、動画、wasm)だけ。
+- 配信しないもの: `public/` の外、`.` や `_` で始まるファイルとディレクトリ(`_partial.phx` は部品に使える)、
+  `.phx.html`(テンプレート)、知らない拡張子(`.php`、`.bak`、`.sql` など)。URL はファイル名と完全に同じ綴り
+  でなければならない(`INDEX.PHX` や Windows の短縮名、`::$DATA` では開けない)。
 - リクエストごとに新しい VM(新しいヒープ)で実行する。コンパイル済みのバイトコードだけが共有される。
 - ファイルを保存すると次のリクエストで再コンパイルされる(依存する全ファイルの更新時刻を見る)。
-- 1 リクエストの実行時間の上限(既定 30 秒、`--time-limit`)、リクエスト本文の上限(8 MB)。
+- 上限: 実行時間 30 秒(`--time-limit`)、メモリ 128 MB(`[security] memory_limit_mb`)、本文 8 MB、ヘッダーの受信 10 秒、
+  本文の受信 30 秒、同時接続 1024、クエリ・フォームの項目 1000 個。
 - 既定で付けるヘッダー: `X-Content-Type-Options: nosniff`、`X-Frame-Options: SAMEORIGIN`、
-  `Referrer-Policy: strict-origin-when-cross-origin`。`Server` / `X-Powered-By` のようなバージョン情報は出さない。
-- 開発モード(既定)ではコンパイルエラーと実行時エラーの詳細をブラウザに表示する。`--prod` では表示せず、
-  ログにだけ出す。
+  `Referrer-Policy: strict-origin-when-cross-origin`。`secure_cookies = true` なら HSTS、`[security] csp` を書けば
+  Content-Security-Policy。セッションや Cookie を使うレスポンスには `Cache-Control: private, no-store`。
+  `Server` / `X-Powered-By` のようなバージョン情報は出さない。スクリプトは `Content-Length` などの通信用ヘッダーを設定できない。
+- 開発モードではコンパイルエラーと実行時エラーの詳細をブラウザに表示する。開発モードが既定になるのは
+  `127.0.0.1` / `localhost` で待ち受けるときだけ(`--dev` / `--prod` で明示できる)。
 
 ### std.http
 
 ```phx
-import std.http.{request, response};
+import std.http.{request, response, session};
 
 $req = request();
 $req->method;              // "GET"
 $req->path;                // "/post"
 $req->query("id");         // ?string
-$req->form("name");        // ?string (application/x-www-form-urlencoded)
+$req->form("name");        // ?string (urlencoded / multipart)
 $req->header("Accept");    // ?string(名前の大文字小文字は区別しない)
+$req->cookie("theme");     // ?string
+$req->file("avatar");      // ?UploadedFile
+$req->json();              // any
 $req->body;                // string
 $req->isPost();            // bool
 
 response()->status(404);
 response()->header("Cache-Control", "no-store");
 response()->type("text/plain; charset=utf-8");
-response()->redirect("/login");
-response()->json($value);  // Content-Type を JSON にして json_encode で出力
+response()->cookie("theme", "dark");
+response()->redirect("/login");                       // サイト内のパスだけ
+response()->redirectExternal("https://example.com/");  // 外部の URL
+response()->json($value);
 ```
+
+### セッション
+
+```phx
+import std.http.session;
+
+session()->set("user_id", (string)$user->id);
+$id = session()->get("user_id");      // ?string
+session()->regenerate();              // ログイン直後に呼ぶ(セッション固定攻撃の対策)
+session()->flash("notice");           // 読んだら消えるメッセージ
+session()->destroy();                 // ログアウト
+```
+
+- 値はサーバーのメモリに保存され、Cookie には 256 ビットの乱数の ID だけが入る
+  (`PHXSESSID`、`HttpOnly`、`SameSite=Lax`、`[security] secure_cookies = true` で `Secure`)。
+- サーバーが発行していない ID は受け付けない。1 セッションの値は合計 64 KB まで。
+- `[security] session_ttl` 秒アクセスがないと消える。サーバーを再起動すると消える。
+
+### CSRF 対策
+
+`POST`・`PUT`・`PATCH`・`DELETE` のうち、ブラウザがほかのサイトから送れる形式
+(`application/x-www-form-urlencoded`、`multipart/form-data`、`text/plain`、Content-Type なし)のリクエストは、
+スクリプトを実行する前にサーバーがトークンを確認する。トークンがない、または違うときは 403 になる。
+
+```html
+<form method="post">
+  <?= csrf_field() ?>     <!-- <input type="hidden" name="_csrf" value="..."> -->
+  ...
+</form>
+```
+
+JavaScript から送るときは `csrf_token()` の値を `X-CSRF-Token` ヘッダーに入れる。
+JSON のリクエストは CORS のプリフライトが必要なので、ほかのサイトからは送れない。
+`[security] csrf = false` で無効にできる。
+
+### Cookie
+
+```phx
+request()->cookie("theme");                                   // ?string
+response()->cookie("theme", "dark", maxAge: 86400 * 30);      // HttpOnly; SameSite=Lax が既定
+response()->deleteCookie("theme");
+```
+
+名前に使えない文字、改行、`SameSite=None` で `Secure` なし、は `ValueError`。
+
+### アップロード
+
+```phx
+$file = request()->file("avatar");     // ?UploadedFile
+if ($file != null) {
+    echo $file->name, $file->type, $file->size;
+    $file->saveTo("storage/avatars/" . random_token(16) . ".png");   // [permissions].write が必要
+}
+```
+
+`name` はクライアントが送ったファイル名からディレクトリ部分と制御文字を取り除いたもの。
+保存先のパスには使わないこと。リクエスト本文は合計 8 MB まで。
+
+### JSON
+
+```phx
+$data = request()->json();             // any(不正な JSON は ValueError)
+if ($data is map) {
+    $name = $data["name"] ?? null;
+    if ($name is string) { ... }
+}
+response()->json(["ok" => true]);
+```
+
+### データベース(std.db)
+
+```phx
+import std.db.Database;
+
+$db = Database::open("data/app.db");      // [permissions].write = ["data/"] が必要。":memory:" も可
+$db->execute(sql"CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY, title TEXT)");
+$db->execute(sql"INSERT INTO posts (title) VALUES ({$title})");
+$id = $db->lastInsertId();
+
+foreach ($db->query(sql"SELECT id, title FROM posts WHERE id > {$min} ORDER BY id") as $row) {
+    echo $row->int("id"), $row->string("title");      // ?int, ?string
+}
+$one = $db->first(sql"SELECT * FROM posts WHERE id = {$id}");   // ?Row
+
+$db->transaction(function () use ($db): void {
+    $db->execute(sql"UPDATE posts SET title = 'x'");
+});                                         // 例外が出たら ROLLBACK
+```
+
+- **SQL は `sql"..."` リテラル(`Sql` 型)でしか書けない。** `{$x}` で埋め込んだ値は必ずプレースホルダとして
+  渡されるので、SQL インジェクションは起こらない。`string` を `query()` に渡すことはできない。
+- `Sql` どうしは `.` で連結できる(パラメータも引き継がれる)。`Sql` と `string` は連結できない。
+- 列名やテーブル名を動的に決めたいときは `sql_ident($name)`(英数字と `_` だけを許可して引用する)。
+- `ATTACH` は無効になっていて、許可されたファイル以外のデータベースには触れない。
+- SQL のエラーは `DatabaseError`。
+
+### 日付・暗号・エンコード
+
+| 関数 | 説明 |
+|---|---|
+| `date($format, ?$ts)` / `gmdate(...)` | PHP と同じ書式(`Y-m-d H:i:s`、`D, d M Y`、`c`、`U` など)。`date` はサーバーのローカル時刻 |
+| `mktime($h, $i, $s, $m, $d, $y)`, `strtotime($s): ?int`, `checkdate($m, $d, $y)` | `strtotime` は ISO 形式と `now`/`today`/`tomorrow`/`yesterday` |
+| `random_int($min, $max)`, `random_token($bytes = 32)` | OS の暗号論的乱数(`rand()` は暗号用途に使わない) |
+| `password_hash($pw)`, `password_verify($pw, $hash)` | Argon2id |
+| `hash("sha256" \| "sha384" \| "sha512", $data)`, `hash_hmac($algo, $data, $key)`, `hash_equals($a, $b)` | `hash_equals` は比較時間が内容に依存しない |
+| `base64_encode`, `base64_decode: ?string`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | |
+| `json_decode($s): any` | 深さ 128 まで |
+
+### 権限(phenix.toml)
+
+スクリプトがヒープの外に触れるものは、すべて `phenix.toml` で許可したものだけ。**何も書かなければ何も許可されない。**
+
+```toml
+[permissions]
+read = ["content/"]         # file_get_contents / file_exists で読めるディレクトリ
+write = ["data/", "storage/"]  # file_put_contents / unlink / saveTo / Database::open(読み取りも可)
+env = ["APP_*"]             # getenv で読める環境変数(末尾 * は前方一致)
+```
+
+- パスはプロジェクトからの相対パスで、`..` と絶対パスは使えない。シンボリックリンクで許可されたディレクトリの外を
+  指している場合も拒否される。
+- 許可されていないときは `PermissionError`(メッセージに `phenix.toml` に書くべき内容が出る)。
+
+### phenix.toml
+
+```toml
+[project]
+name = "blog"
+
+[security]
+csrf = true             # 既定: true
+secure_cookies = false  # HTTPS で配信するときは true
+session_ttl = 7200      # 秒
+memory_limit_mb = 128   # 1 リクエスト(1 回の実行)あたり
+
+[permissions]
+write = ["data/"]
+
+[dependencies]
+utils = { path = "../utils" }
+markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
+```
+
+`phenix.toml` のあるディレクトリがプロジェクトのルートになる。知らないキーはエラー(書き間違いに気づける)。
+`phenix serve` は起動時に読み込むので、変更したらサーバーを再起動する。
 
 ## 15. 組み込み関数
 
@@ -395,7 +672,15 @@ response()->json($value);  // Content-Type を JSON にして json_encode で出
 | `number_format(float, int $decimals = 0): string` | `1,234.50` |
 | `range(int, int): list<int>` | 両端を含む |
 | `time(): int`, `microtime(): float` | 現在時刻 |
-| `rand(int, int): int` | 疑似乱数(暗号用途には使わない) |
+| `rand(int, int): int` | 疑似乱数(暗号用途には使わない。`random_int` を使う) |
+| `json_decode(string): any`, `json_html(any): Html`, `safe_url(string): Html` | §13、§14 |
+| `csrf_token(): string`, `csrf_field(): Html` | §14 |
+| `date`, `gmdate`, `mktime`, `strtotime`, `checkdate` | 日付(§14 の表) |
+| `random_int`, `random_token`, `password_hash`, `password_verify`, `hash`, `hash_hmac`, `hash_equals` | 暗号(§14 の表) |
+| `base64_encode`, `base64_decode`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | エンコード |
+| `file_get_contents`, `file_put_contents`, `file_exists`, `unlink`, `getenv` | `[permissions]` が必要 |
+| `sql_ident(string): Sql` | 列名・テーブル名 |
+| `assert(bool, ?string)`, `assert_eq(any, any, ?string)` | テスト用 |
 
 ### string のメソッド
 
@@ -422,25 +707,95 @@ response()->json($value);  // Content-Type を JSON にして json_encode で出
 PHP の関数名で書いたときは、エラーメッセージで代わりの書き方を案内する
 (例: `strpos` → `->indexOf()`、`isset` → `??`、`var_dump` → `dump()`、`eval` → 使えない)。
 
-## 16. 実行モデル
+## 16. ツール
+
+| コマンド | 説明 |
+|---|---|
+| `phenix run file.phx` | 型検査して実行(`--html`、`--time-limit 秒`) |
+| `phenix check file.phx` | 型検査だけ(import しているモジュールとテンプレートも) |
+| `phenix serve dir` | Web サーバー(`--port`、`--host`、`--prod`、`--time-limit`) |
+| `phenix test [paths]` | `*_test.phx` の `test_*` 関数を実行(1 テストごとに新しい VM) |
+| `phenix fmt [paths] [--check]` | インデントと空白を整える(文字列・コメント・HTML は変えない) |
+| `phenix lsp` | エディタ用の Language Server(入力中のエラー表示、ホバーで型を表示) |
+| `phenix install` | `[dependencies]` を取得して `phenix.lock` に固定 |
+| `phenix migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
+| `phenix disasm file.phx` | バイトコードを表示 |
+| `phenix parse file.phx` | 構文木を表示 |
+
+### テスト
+
+```phx
+// tests/posts_test.phx
+import lib.posts.find_post;
+
+function test_find_post(): void {
+    assert_eq(find_post(2)?->title, "Types without ceremony");
+    assert(find_post(99) == null, "missing posts are null");
+}
+```
+
+`assert(bool, ?message)` と `assert_eq(expected, actual, ?message)` が失敗すると `AssertionError`。
+
+### パッケージ
+
+```toml
+[dependencies]
+textutils = { git = "https://github.com/example/textutils.git", rev = "v1" }
+local = { path = "../shared" }
+```
+
+```phx
+import textutils.strings.slugify;      // vendor/textutils/strings.phx
+```
+
+- `git` のパッケージは `vendor/<名前>` に取得され、正確なコミットが `phenix.lock` に記録される。
+  2 回目以降は lock のコミットを取得し、違っていればエラーになる。
+- 使える URL は `https://`、`ssh://`、`git@host:...`、`file://` だけ。
+- パッケージは Phenix のソースコードで、インストール時にパッケージのコードが実行されることはない。
+- パッケージの依存はアプリの `phenix.toml` に並べて書く(推移的な依存の解決はまだない)。
+
+### 移行
+
+```
+phenix migrate legacy/page.php      # page.phx を書き出す
+```
+
+`<?php`→`<?phx`、`===`→`==`、`array(...)`→`[...]`、`isset($x)`→`($x != null)`、`$_GET`/`$_POST`/`$_COOKIE`/`$_SESSION`
+→ `request()`/`session()`、`var_dump`/`print_r`→`dump`、`print`→`echo` を変換し、`require` や `global` には
+`TODO(migrate)` コメントを付ける。そのあと型検査を実行して、型注釈などの手作業が必要な箇所を表示する。
+
+## 17. 実行の仕組み
 
 1. 字句解析・構文解析(手書きの再帰下降 + Pratt パーサ)
-2. 型検査(名前解決、型推論、絞り込み、確定代入の解析)→ 型付き中間表現 (HIR)
-3. バイトコードへのコンパイル: レジスタ型。ローカル変数は固定のレジスタ、一時値はその上に積む。
-   型が分かっているので `AddI`(整数の加算)、`AddF`、`LtI` のような型ごとの命令や、
-   `JumpIfNotLtIImm`(即値との比較と分岐)のような融合命令を出す。
-4. VM で実行: 値は小さなタグ付き enum(`int`/`float`/`bool`/`null` は即値、文字列・配列は参照カウント +
-   コピーオンライト、オブジェクトは参照)。処理系は Rust の安全なコードだけで書かれている。
+2. 型検査(名前解決、推論、絞り込み、確定代入の解析)→ 型付き中間表現 (HIR)
+3. レジスタ型バイトコードへのコンパイル(`AddI`、`LtI`、`JumpIfNotLtIImm` などの型に特化した命令)
+4. 実行
+   - **インタプリタ**: 安全な Rust だけで書かれている。文字列・list・map は参照カウント + コピーオンライト。
+   - **JIT**(Cranelift): すべての値が `int`/`bool` の関数(数値計算のループや再帰)はネイティブコードになる。
+     オーバーフロー、0 での剰余、負のシフト、再帰の深さ、実行時間・メモリの上限は JIT でも同じように検査される。
+     `PHENIX_JIT=0` で無効にできる。JIT の中で起きた例外のスタックトレースは呼び出し元までになる。
+5. **バイトコードキャッシュ**: `phenix run` と `phenix serve` はコンパイル結果を `.phenix-cache/` に保存し、
+   ソースファイルと `phenix` 本体が変わっていなければ再利用する。
 
-`phenix disasm file.phx` でバイトコードを確認できる。
+### 実行時の上限
 
-## 17. 今後の予定
+| 上限 | 既定 | 超えたとき |
+|---|---|---|
+| 実行時間 | `serve`: 30 秒(`--time-limit`)、`run`: なし | 致命的エラー(捕捉できない) |
+| メモリ | 128 MB(`[security] memory_limit_mb`) | 致命的エラー |
+| 呼び出しの深さ | 10,000 | 致命的エラー |
+| リクエスト本文 | 8 MB | 413 |
 
-- JIT / AOT コンパイル(Cranelift)、バイトコードのディスクキャッシュ
-- データベース接続と、プレースホルダ以外を受け付けない `sql"..."` リテラル
-- ファイル・ネットワーク・環境変数へのアクセスを `phenix.toml` で宣言する権限モデル
-- セッション、Cookie、CSRF 対策、メモリ使用量の上限
-- `finally`、interface、abstract、enum、ユーザー定義のジェネリクス
-- 非同期 I/O
-- フォーマッタ (`phenix fmt`)、テストランナー (`phenix test`)、LSP、パッケージマネージャ
-- PHP からの移植支援ツール
+`unsafe` を使っているのは、メモリ使用量を数えるアロケータ(`phenix_vm/src/alloc.rs`)と JIT
+(`phenix_jit`、生成したコードの呼び出し)だけ。
+
+## 18. 今後の予定
+
+- ジェネリッククラス、アノテーション(属性)
+- 非同期 I/O、HTTP クライアント(`[permissions].net`)
+- JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
+- 推移的な依存関係の解決、パッケージレジストリ
+- LSP の定義ジャンプ・補完、`phenix fmt` の行の折り返し
+- 複数プロセスで共有できるセッション保存先、レート制限
+
+セキュリティ監査の結果と残っているリスクは [security-audit.md](security-audit.md) を参照。
