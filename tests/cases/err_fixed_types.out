@@ -1,0 +1,29 @@
+error: expected `int`, found `string`
+ --> err_fixed_types.phx:4:10
+  |
+4 | $count = "two";
+  |          ^^^^^
+  = note: strings are never converted to numbers implicitly; use `->toInt()` or `->toFloat()`
+
+error: cannot infer the element type of `[]`
+ --> err_fixed_types.phx:6:10
+  |
+6 | $items = [];
+  |          ^^
+  = note: declare the variable with a type, e.g. `list<string> $names = [];`
+
+error: variable `$msg` might not be defined here
+  --> err_fixed_types.phx:11:6
+   |
+11 | echo $msg;
+   |      ^^^^
+   = note: it is only assigned on some paths; assign it before the `if`/loop or in every branch
+
+error: condition must be a `bool`, found `list<int>`
+  --> err_fixed_types.phx:14:5
+   |
+14 | if ($xs) {
+   |     ^^^
+   = note: Phenix has no truthiness: write `!$xs->isEmpty()`
+
+4 errors found

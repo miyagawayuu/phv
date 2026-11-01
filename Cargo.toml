@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+phenix_syntax = { path = "crates/phenix_syntax" }
+phenix_types = { path = "crates/phenix_types" }
+phenix_compiler = { path = "crates/phenix_compiler" }
+phenix_vm = { path = "crates/phenix_vm" }
+phenix_std = { path = "crates/phenix_std" }
+phenix_driver = { path = "crates/phenix_driver" }
+phenix_server = { path = "crates/phenix_server" }
+
+indexmap = "2"
+clap = { version = "4", features = ["derive"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "fs"] }
+form_urlencoded = "1"
+percent-encoding = "2"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

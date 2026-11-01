@@ -1,0 +1,7 @@
+<?phx
+import std.http.request;
+import lib.posts.all_posts;
+
+$name = request()->query("name") ?? "world";
+$body = render("views/home.phx.html", name: $name, posts: all_posts());
+echo render("views/layout.phx.html", title: "Posts", body: $body);

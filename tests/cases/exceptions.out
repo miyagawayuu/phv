@@ -1,0 +1,18 @@
+1
+caught not found: b (b)
+InvalidArgumentException: bad argument
+RuntimeException: runtime
+fine
+math: division by zero
+index: list index 10 is out of range (length 3)
+overflow: integer overflow
+outer got inner
+port 80
+before
+
+--- runtime error ---
+Uncaught KeyError: undefined map key "missing"
+  at depth (exceptions.phx:84)
+  at depth (exceptions.phx:86)
+  at depth (exceptions.phx:86)
+  at {main} (exceptions.phx:89)

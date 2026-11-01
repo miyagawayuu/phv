@@ -1,0 +1,63 @@
+<?phx
+function grade(int $score): string {
+    if ($score >= 90) {
+        return "A";
+    } elseif ($score >= 80) {
+        return "B";
+    } else if ($score >= 70) {
+        return "C";
+    }
+    return "F";
+}
+echo grade(95), grade(85), grade(75), grade(10), "\n";
+
+$i = 0;
+while ($i < 5) {
+    $i++;
+    if ($i == 2) {
+        continue;
+    }
+    if ($i == 4) {
+        break;
+    }
+    echo $i;
+}
+echo "\n";
+
+$n = 10;
+do {
+    echo $n;
+    $n--;
+} while ($n > 7);
+echo "\n";
+
+foreach ([1, 2, 3] as $a) {
+    foreach ([10, 20, 30] as $b) {
+        if ($b == 30) {
+            continue 2;
+        }
+        if ($a == 3) {
+            break 2;
+        }
+        echo $a * $b, " ";
+    }
+}
+echo "\n";
+
+if ($n < 100):
+    echo "alt syntax ok\n";
+endif;
+foreach ([1, 2] as $x):
+    echo "item $x\n";
+endforeach;
+
+$found = false;
+foreach (["x" => 1] as $k => $v) {
+    $found = true;
+}
+echo $found ? "found\n" : "none\n";
+
+for ($a = 0, $b = 10; $a < $b; $a += 3, $b -= 3) {
+    echo "$a-$b ";
+}
+echo "\n";

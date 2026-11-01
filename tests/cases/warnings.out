@@ -1,0 +1,20 @@
+warning: the left side of `??` is never null (it is `string`)
+ --> warnings.phx:4:6
+  |
+4 | echo $name ?? "nobody", "\n";
+  |      ^^^^^
+  = note: the right side is never used
+
+warning: `?->` is not needed: `string` is never null
+ --> warnings.phx:5:6
+  |
+5 | echo $name?->upper(), "\n";
+  |      ^^^^^
+  = note: use `->`
+
+Ann
+ANN
+TOOLS
+none
+saw
+0

@@ -1,0 +1,90 @@
+<?phx
+class NotFound extends Exception {
+    public function __construct(public string $what) {
+        parent::__construct("not found: " . $what);
+    }
+}
+
+function find(map<string, int> $m, string $key): int {
+    $v = $m[$key] ?? null;
+    if ($v == null) {
+        throw new NotFound($key);
+    }
+    return $v;
+}
+
+$m = ["a" => 1];
+try {
+    echo find($m, "a"), "\n";
+    echo find($m, "b"), "\n";
+    echo "not reached\n";
+} catch (NotFound $e) {
+    echo "caught ", $e->getMessage(), " (", $e->what, ")\n";
+}
+
+function kind(Exception $e): string {
+    return match (true) {
+        $e is InvalidArgumentException => "InvalidArgumentException",
+        $e is RuntimeException => "RuntimeException",
+        default => "Exception",
+    };
+}
+
+function risky(int $k): void {
+    if ($k == 1) {
+        throw new InvalidArgumentException("bad argument");
+    }
+    if ($k == 2) {
+        throw new RuntimeException("runtime");
+    }
+}
+
+foreach ([1, 2, 3] as $k) {
+    try {
+        risky($k);
+        echo "fine\n";
+    } catch (InvalidArgumentException | RuntimeException $e) {
+        echo kind($e), ": ", $e->getMessage(), "\n";
+    }
+}
+
+try {
+    echo 1 / 0;
+} catch (DivisionByZeroError $e) {
+    echo "math: ", $e->getMessage(), "\n";
+}
+try {
+    $xs = [1, 2, 3];
+    echo $xs[10];
+} catch (IndexError $e) {
+    echo "index: ", $e->getMessage(), "\n";
+}
+try {
+    $big = 9223372036854775807;
+    echo $big + 1;
+} catch (ArithmeticError $e) {
+    echo "overflow: ", $e->getMessage(), "\n";
+}
+try {
+    try {
+        throw new LogicException("inner");
+    } catch (RuntimeException $e) {
+        echo "wrong handler\n";
+    }
+} catch (Exception $e) {
+    echo "outer got ", $e->getMessage(), "\n";
+}
+
+$value = ["port" => "80"]["port"] ?? throw new ValueError("no port");
+echo "port $value\n";
+
+function depth(int $n): int {
+    if ($n == 0) {
+        $m = ["k" => 1];
+        return $m["missing"];
+    }
+    return depth($n - 1);
+}
+echo "before\n";
+depth(2);
+echo "after\n";

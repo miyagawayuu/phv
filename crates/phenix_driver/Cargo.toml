@@ -1,0 +1,12 @@
+[package]
+name = "phenix_driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+phenix_syntax.workspace = true
+phenix_types.workspace = true
+phenix_compiler.workspace = true
+phenix_vm.workspace = true
+phenix_std.workspace = true

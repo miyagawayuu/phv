@@ -1,0 +1,12 @@
+[package]
+name = "phenix_std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+phenix_vm.workspace = true
+indexmap.workspace = true
+
+[dev-dependencies]
+phenix_types.workspace = true

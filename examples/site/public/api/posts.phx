@@ -1,0 +1,11 @@
+<?phx
+import std.http.{request, response};
+import lib.posts.all_posts;
+
+// GET /api/posts?tag=security
+$tag = request()->query("tag");
+$posts = all_posts();
+if ($tag != null) {
+    $posts = $posts->filter(fn($p) => $p->tags->contains($tag));
+}
+response()->json($posts);

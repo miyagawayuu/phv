@@ -1,0 +1,14 @@
+error: module `lib.shop` has no exported `internal_discount`
+ --> err_imports.phx:2:27
+  |
+2 | import lib.shop.{catalog, internal_discount};
+  |                           ^^^^^^^^^^^^^^^^^
+  = note: `internal_discount` exists but is not exported; add `export` to its declaration
+
+error: module `std.http` has no exported `Nope`
+ --> err_imports.phx:3:17
+  |
+3 | import std.http.Nope;
+  |                 ^^^^
+
+2 errors found

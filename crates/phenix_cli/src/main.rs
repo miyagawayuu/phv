@@ -1,0 +1,165 @@
+use clap::{Parser, Subcommand};
+use phenix_driver::{compile, find_root, run, RunOptions};
+use phenix_vm::Limits;
+use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::Duration;
+
+#[derive(Parser)]
+#[command(name = "phenix", version, about = "The Phenix programming language")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Type-check and run a script.
+    Run {
+        file: PathBuf,
+        /// Escape echoed strings as HTML, like a web page.
+        #[arg(long)]
+        html: bool,
+        /// Stop the script after this many seconds.
+        #[arg(long)]
+        time_limit: Option<f64>,
+    },
+    /// Type-check a script and everything it imports, without running it.
+    Check { file: PathBuf },
+    /// Print the syntax tree of a file.
+    Parse { file: PathBuf },
+    /// Print the bytecode of a script's functions.
+    Disasm {
+        file: PathBuf,
+        /// Only functions whose name contains this text.
+        #[arg(long)]
+        only: Option<String>,
+    },
+    /// Serve a site: `public/` is routed by file name.
+    Serve {
+        /// Site directory (containing `public/`).
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Hide error details from visitors (production mode).
+        #[arg(long)]
+        prod: bool,
+        /// Per-request time limit in seconds.
+        #[arg(long, default_value_t = 30.0)]
+        time_limit: f64,
+    },
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    // Scripts run on a thread with a large stack so deep recursion through
+    // builtins (e.g. nested `map` callbacks) has room.
+    let handle = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || exec(cli.command))
+        .expect("failed to start main thread");
+    handle.join().unwrap_or(ExitCode::FAILURE)
+}
+
+fn exec(cmd: Command) -> ExitCode {
+    let color = std::io::stderr().is_terminal();
+    match cmd {
+        Command::Run { file, html, time_limit } => {
+            let root = find_root(&file);
+            let compiled = match compile(&root, &file) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprint!("{}", e.render(color));
+                    return ExitCode::FAILURE;
+                }
+            };
+            eprint!("{}", compiled.warnings);
+            let limits = Limits { max_time: time_limit.map(Duration::from_secs_f64), ..Limits::default() };
+            let outcome = run(&compiled, RunOptions { html, limits, http: None });
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(outcome.output.as_bytes());
+            let _ = stdout.flush();
+            match outcome.error {
+                Some(err) => {
+                    eprint!("{}", err.render());
+                    ExitCode::FAILURE
+                }
+                None => ExitCode::SUCCESS,
+            }
+        }
+        Command::Check { file } => {
+            let root = find_root(&file);
+            match compile(&root, &file) {
+                Ok(c) => {
+                    eprint!("{}", c.warnings);
+                    println!("ok: no errors in {}", file.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprint!("{}", e.render(color));
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Disasm { file, only } => {
+            let root = find_root(&file);
+            let compiled = match compile(&root, &file) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprint!("{}", e.render(color));
+                    return ExitCode::FAILURE;
+                }
+            };
+            for f in &compiled.program.funcs {
+                if only.as_ref().is_some_and(|o| !f.name.contains(o.as_str())) {
+                    continue;
+                }
+                println!("fn {} (params {}, registers {})", f.name, f.num_params, f.num_regs);
+                for (i, ins) in f.code.iter().enumerate() {
+                    println!("  {i:4}  {ins:?}");
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Command::Parse { file } => {
+            let text = match std::fs::read_to_string(&file) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: cannot read {}: {e}", file.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            let is_template = file.to_string_lossy().ends_with(".phx.html");
+            let mut sources = phenix_syntax::SourceMap::default();
+            let id = sources.add(file.display().to_string(), Some(file.clone()), text);
+            let (module, diags) = phenix_syntax::parse_module(&sources.get(id).text, id, is_template);
+            println!("{module:#?}");
+            if diags.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                eprint!("{}", phenix_syntax::diag::render(&sources, &diags, color));
+                ExitCode::FAILURE
+            }
+        }
+        Command::Serve { dir, host, port, prod, time_limit } => {
+            let opts = phenix_server::ServeOptions {
+                root: dir,
+                host,
+                port,
+                dev: !prod,
+                time_limit: Duration::from_secs_f64(time_limit),
+            };
+            match phenix_server::serve(opts) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}

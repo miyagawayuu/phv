@@ -1,0 +1,11 @@
+<?phx
+class Point {
+    public function __construct(public int $x, private int $y) {}
+}
+dump(["n" => 1, "pi" => 3.5, "ok" => true, "none" => null]);
+dump([new Point(1, 2)]);
+dump(raw("<b>"));
+$id = "12"->toInt();
+$label = $id ?? -1;
+echo $label, "
+";

@@ -1,0 +1,8 @@
+//! Type checker for Phenix: resolves names, checks types and produces HIR.
+
+pub mod builtins;
+mod check;
+pub mod hir;
+pub mod types;
+
+pub use check::{check, CheckInput, ModuleInput, ModuleKind};

@@ -1,0 +1,8 @@
+[package]
+name = "phenix_types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+phenix_syntax.workspace = true

@@ -1,0 +1,33 @@
+error: `total` must return a value of type `int` on every path
+ --> err_misc.phx:6:10
+  |
+6 | function total(list<int> $xs): int {
+  |          ^^^^^
+
+error: cannot modify readonly property `$id`
+  --> err_misc.phx:15:1
+   |
+15 | $a->id = 2;
+   | ^^^^^^
+   = note: readonly properties can only be set in the constructor of their class
+
+error: property `Account::$balance` is private
+  --> err_misc.phx:16:10
+   |
+16 | echo $a->balance;
+   |          ^^^^^^^
+
+error: undefined function `eval`
+  --> err_misc.phx:17:1
+   |
+17 | eval("echo 1;");
+   | ^^^^
+   = note: dynamic code execution is not available in Phenix
+
+error: `total` takes 1 argument(s) but 2 were given
+  --> err_misc.phx:18:20
+   |
+18 | echo total([1, 2], 3);
+   |                    ^
+
+5 errors found

@@ -1,0 +1,6 @@
+<?phx
+import lib.shop.{Product, catalog};
+
+$products = catalog();
+$page = render("views/list.phx.html", title: "Tools & <Toys>", products: $products);
+echo render("views/layout.phx.html", title: "Shop", body: $page);

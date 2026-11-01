@@ -1,0 +1,21 @@
+map(4) {
+  ["n"]=>
+  int(1)
+  ["pi"]=>
+  float(3.5)
+  ["ok"]=>
+  bool(true)
+  ["none"]=>
+  NULL
+}
+list(1) {
+  [0]=>
+  object(Point) {
+    ["x"]=>
+    int(1)
+    ["y"]=>
+    int(2)
+  }
+}
+Html(3) "<b>"
+12

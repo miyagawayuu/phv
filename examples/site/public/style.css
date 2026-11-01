@@ -1,0 +1,104 @@
+:root {
+  --bg: #fbfaf8;
+  --fg: #1f2328;
+  --muted: #5f6670;
+  --card: #ffffff;
+  --border: #e3e0da;
+  --accent: #c2410c;
+  --ok-bg: #ecfdf3;
+  --ok-fg: #14532d;
+  --err-bg: #fef2f2;
+  --err-fg: #991b1b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181c;
+    --fg: #e8e6e3;
+    --muted: #a0a4ab;
+    --card: #1f2227;
+    --border: #33373e;
+    --accent: #fb923c;
+    --ok-bg: #12301f;
+    --ok-fg: #bbf7d0;
+    --err-bg: #3a1717;
+    --err-fg: #fecaca;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+a { color: var(--accent); }
+
+header.site {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 1.25rem 1rem;
+}
+
+.brand { font-weight: 700; font-size: 1.2rem; text-decoration: none; }
+nav { display: flex; gap: 1rem; }
+nav a { color: var(--muted); text-decoration: none; }
+nav a:hover { color: var(--fg); }
+
+main { max-width: 46rem; margin: 0 auto; padding: 0 1rem 3rem; }
+
+footer {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 1rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+  border-top: 1px solid var(--border);
+}
+
+.hero { padding: 1rem 0 0.5rem; }
+.hero form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+
+input, textarea, button {
+  font: inherit;
+  color: inherit;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.45rem 0.7rem;
+}
+
+button {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.25rem 1.25rem;
+  margin: 1rem 0;
+}
+
+.card h3 a { text-decoration: none; }
+.tags span { color: var(--muted); font-size: 0.875rem; margin-right: 0.6rem; }
+
+.stack { display: grid; gap: 0.4rem; max-width: 30rem; }
+.stack button { justify-self: start; margin-top: 0.5rem; }
+
+.notice { border-radius: 8px; padding: 0.75rem 1.25rem; }
+.notice.ok { background: var(--ok-bg); color: var(--ok-fg); }
+.notice.error { background: var(--err-bg); color: var(--err-fg); padding-left: 2rem; }
+
+blockquote { margin: 0.5rem 0; padding-left: 1rem; border-left: 3px solid currentColor; }

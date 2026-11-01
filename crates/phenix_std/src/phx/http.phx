@@ -1,0 +1,72 @@
+// std.http — the current request and response.
+//
+//   import std.http.{request, response};
+//   $name = request()->query("name") ?? "world";
+
+export class Request {
+    public function __construct(
+        public readonly string $method,
+        public readonly string $path,
+        public readonly map<string, string> $queryParams,
+        public readonly map<string, string> $formParams,
+        public readonly map<string, string> $headers,
+        public readonly string $body,
+    ) {}
+
+    /** A query string parameter (`?name=value`), or null. */
+    public function query(string $name): ?string {
+        return $this->queryParams[$name] ?? null;
+    }
+
+    /** A form field from an `application/x-www-form-urlencoded` POST body, or null. */
+    public function form(string $name): ?string {
+        return $this->formParams[$name] ?? null;
+    }
+
+    /** A request header (case-insensitive), or null. */
+    public function header(string $name): ?string {
+        return $this->headers[$name->lower()] ?? null;
+    }
+
+    public function isPost(): bool {
+        return $this->method == "POST";
+    }
+}
+
+export class Response {
+    public function status(int $code): Response {
+        __resp_status($code);
+        return $this;
+    }
+
+    /** Sets a response header. Line breaks in values are rejected. */
+    public function header(string $name, string $value): Response {
+        __resp_header($name, $value);
+        return $this;
+    }
+
+    /** Sets the Content-Type. Output is HTML-escaped only for `text/html`. */
+    public function type(string $contentType): Response {
+        __resp_type($contentType);
+        return $this;
+    }
+
+    public function redirect(string $url, int $code = 302): void {
+        __resp_status($code);
+        __resp_header("Location", $url);
+    }
+
+    /** Sends `$value` as JSON. */
+    public function json(any $value): void {
+        __resp_type("application/json");
+        echo json_encode($value);
+    }
+}
+
+export function request(): Request {
+    return new Request(__req_method(), __req_path(), __req_query(), __req_form(), __req_headers(), __req_body());
+}
+
+export function response(): Response {
+    return new Response();
+}

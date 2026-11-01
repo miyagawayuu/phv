@@ -1,0 +1,23 @@
+<?phx params(string $name, string $message, list<string> $errors, bool $sent) ?>
+<h1>Contact</h1>
+<?phx if ($sent): ?>
+<div class="notice ok">
+  <p>Thanks, <?= $name ?>! We received your message:</p>
+  <blockquote><?= nl2br($message) ?></blockquote>
+</div>
+<?phx else: ?>
+<?phx if (!$errors->isEmpty()): ?>
+<ul class="notice error">
+<?phx foreach ($errors as $error): ?>
+  <li><?= $error ?></li>
+<?phx endforeach; ?>
+</ul>
+<?phx endif; ?>
+<form method="post" action="/contact" class="stack">
+  <label for="name">Name</label>
+  <input id="name" name="name" value="<?= $name ?>">
+  <label for="message">Message</label>
+  <textarea id="message" name="message" rows="5"><?= $message ?></textarea>
+  <button>Send</button>
+</form>
+<?phx endif; ?>

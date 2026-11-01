@@ -1,0 +1,47 @@
+<?phx
+class Profile {
+    public function __construct(public string $bio) {}
+}
+class Person {
+    public function __construct(public string $name, public ?Profile $profile = null) {}
+}
+
+function bio(?Person $p): string {
+    if ($p == null) {
+        return "(nobody)";
+    }
+    // $p is narrowed to Person here
+    return $p->name . ": " . ($p->profile?->bio ?? "(no bio)");
+}
+echo bio(null), "\n";
+echo bio(new Person("Ann")), "\n";
+echo bio(new Person("Bo", new Profile("likes Phenix"))), "\n";
+
+?string $found = null;
+foreach (["apple", "banana", "cherry"] as $fruit) {
+    if ($fruit->startsWith("b")) {
+        $found = $fruit;
+    }
+}
+echo $found ?? "none", "\n";
+if ($found != null) {
+    echo "length ", $found->len(), "\n";
+}
+
+?int $cache = null;
+$cache ??= 42;
+echo $cache + 1, "\n";
+
+function show(int|string|null $v): string {
+    if ($v is int) {
+        return "int " . ($v * 2);
+    }
+    if ($v is string) {
+        return "string " . $v->upper();
+    }
+    return "null";
+}
+echo show(21), ", ", show("hi"), ", ", show(null), "\n";
+
+$maybe = ["a" => "x"]["b"] ?? null;
+echo $maybe == null ? "missing" : "present", "\n";

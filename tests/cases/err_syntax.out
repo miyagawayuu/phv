@@ -1,0 +1,20 @@
+error: `===` is not needed in Phenix
+ --> err_syntax.phx:4:11
+  |
+4 | if ($name === "x") {
+  |           ^^^ use `==`
+  = note: `==` and `!=` are always strict: values of different types are never equal
+
+error: variable variables (`$$name`) are not supported
+ --> err_syntax.phx:7:1
+  |
+7 | $$name = 1;
+  | ^^
+
+error: unterminated string
+ --> err_syntax.phx:8:6
+  |
+8 | echo "unterminated;
+  |      ^
+
+3 errors found

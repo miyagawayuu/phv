@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+<head><title>Shop</title></head>
+<body>
+<h1>Tools &amp; &lt;Toys&gt;</h1>
+<ul>
+  <li class="in">Hammer ($12.50)</li>
+  <li class="out">&lt;script&gt;alert(&#039;x&#039;)&lt;/script&gt; ($0.99)</li>
+  <li class="in">Saw ($1,250.00)</li>
+</ul>
+<p>3 products, <b>bold</b></p>
+</body>
+</html>
