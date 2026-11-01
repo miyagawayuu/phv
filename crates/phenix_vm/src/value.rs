@@ -75,12 +75,13 @@ impl Value {
         }
     }
 
-    /// Converts a map key value (int or string) to a `Key`.
+    /// Converts a map key value (int or string) to a `Key`. Other values
+    /// (only reachable through `any`) use their string form.
     pub fn to_key(&self) -> Key {
         match self {
             Value::Int(i) => Key::Int(*i),
             Value::Str(s) => Key::Str(s.clone()),
-            other => panic!("phenix vm: invalid map key of type {}", other.type_name()),
+            other => Key::Str(Rc::new(other.to_display_string())),
         }
     }
 
@@ -114,27 +115,95 @@ impl Key {
     }
 }
 
+/// Dropping a deeply nested value must not recurse (a list nested a million
+/// levels deep would overflow the stack and abort the process). Children of
+/// containers we hold the last reference to are moved onto a heap worklist.
+impl Drop for Value {
+    fn drop(&mut self) {
+        fn take_children(v: &mut Value, out: &mut Vec<Value>) {
+            match v {
+                Value::List(l) => {
+                    if let Some(items) = Rc::get_mut(l) {
+                        out.append(items);
+                    }
+                }
+                Value::Map(m) => {
+                    if let Some(m) = Rc::get_mut(m) {
+                        out.extend(m.drain(..).map(|(_, v)| v));
+                    }
+                }
+                Value::Object(o) => {
+                    if Rc::strong_count(o) == 1 {
+                        if let Ok(mut ob) = o.try_borrow_mut() {
+                            out.append(&mut ob.fields);
+                        }
+                    }
+                }
+                Value::Closure(c) => {
+                    if let Some(c) = Rc::get_mut(c) {
+                        out.append(&mut c.caps);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !matches!(self, Value::List(_) | Value::Map(_) | Value::Object(_) | Value::Closure(_)) {
+            return;
+        }
+        let mut stack = Vec::new();
+        take_children(self, &mut stack);
+        while let Some(mut v) = stack.pop() {
+            take_children(&mut v, &mut stack);
+            // `v` is now childless (or shared), so dropping it does not recurse.
+        }
+    }
+}
+
 /// Strict equality: values of different types are never equal, except that
 /// `int` and `float` compare numerically. Objects compare by identity.
+/// Iterative, so deeply nested values cannot overflow the stack.
 pub fn values_equal(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Null, Value::Null) => true,
-        (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => x == y,
-        (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => (*x as f64) == *y,
-        (Value::Str(x), Value::Str(y)) | (Value::Html(x), Value::Html(y)) => x == y,
-        (Value::List(x), Value::List(y)) => {
-            Rc::ptr_eq(x, y) || (x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b)))
+    let mut work: Vec<(&Value, &Value)> = vec![(a, b)];
+    while let Some((a, b)) = work.pop() {
+        let same = match (a, b) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            (Value::Int(x), Value::Int(y)) => x == y,
+            (Value::Float(x), Value::Float(y)) => x == y,
+            (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => (*x as f64) == *y,
+            (Value::Str(x), Value::Str(y)) | (Value::Html(x), Value::Html(y)) => x == y,
+            (Value::List(x), Value::List(y)) => {
+                if !Rc::ptr_eq(x, y) {
+                    if x.len() != y.len() {
+                        return false;
+                    }
+                    work.extend(x.iter().zip(y.iter()));
+                }
+                true
+            }
+            (Value::Map(x), Value::Map(y)) => {
+                if !Rc::ptr_eq(x, y) {
+                    if x.len() != y.len() {
+                        return false;
+                    }
+                    for (k, v) in x.iter() {
+                        match y.get(k) {
+                            Some(w) => work.push((v, w)),
+                            None => return false,
+                        }
+                    }
+                }
+                true
+            }
+            (Value::Object(x), Value::Object(y)) => Rc::ptr_eq(x, y),
+            (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),
+            _ => false,
+        };
+        if !same {
+            return false;
         }
-        (Value::Map(x), Value::Map(y)) => {
-            Rc::ptr_eq(x, y)
-                || (x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| values_equal(v, w))))
-        }
-        (Value::Object(x), Value::Object(y)) => Rc::ptr_eq(x, y),
-        (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),
-        _ => false,
     }
+    true
 }
 
 /// Ordering for `<`, `<=`, `<=>` and sorting. The type checker only allows
@@ -218,6 +287,19 @@ mod tests {
         assert_eq!(format_float(1.0 / 3.0), "0.33333333333333");
         assert_eq!(format_float(123456.789), "123456.789");
         assert_eq!(format_float(0.00001), "1.0E-5");
+    }
+
+    #[test]
+    fn deep_values_do_not_overflow_the_stack() {
+        let mut v = Value::list(Vec::new());
+        let mut w = Value::list(Vec::new());
+        for _ in 0..1_000_000 {
+            v = Value::list(vec![v]);
+            w = Value::list(vec![w]);
+        }
+        assert!(values_equal(&v, &w));
+        drop(v);
+        drop(w);
     }
 
     #[test]

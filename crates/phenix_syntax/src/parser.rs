@@ -39,6 +39,7 @@ struct PErr;
 type PResult<T> = Result<T, PErr>;
 
 struct Parser {
+    html: crate::htmlctx::HtmlTracker,
     toks: Vec<Token>,
     pos: usize,
     diags: Vec<Diagnostic>,
@@ -95,7 +96,15 @@ fn assign_op(tok: &Tok) -> Option<AssignOp> {
 
 impl Parser {
     fn new(toks: Vec<Token>, file: u32, is_template: bool) -> Parser {
-        Parser { toks, pos: 0, diags: Vec::new(), file, is_template, template_refs: Vec::new() }
+        Parser {
+            html: Default::default(),
+            toks,
+            pos: 0,
+            diags: Vec::new(),
+            file,
+            is_template,
+            template_refs: Vec::new(),
+        }
     }
 
     // ----- token helpers -------------------------------------------------
@@ -273,16 +282,19 @@ impl Parser {
         let kind = match self.peek().clone() {
             Tok::InlineHtml(text) => {
                 self.advance();
+                self.html.feed(&text);
                 StmtKind::InlineHtml(text)
             }
             Tok::EchoOpen => {
                 self.advance();
+                let ctx = self.html.context();
+                self.html.inserted();
                 let exprs = self.expr_list()?;
                 self.eat(&Tok::Semi);
                 if !self.at(&Tok::CloseTag) && !self.at(&Tok::Eof) {
                     return Err(self.error_here("expected `?>` to close `<?=`"));
                 }
-                StmtKind::Echo(exprs)
+                StmtKind::HtmlEcho(exprs, ctx)
             }
             Tok::Echo => {
                 self.advance();

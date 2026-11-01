@@ -1,0 +1,25 @@
+<?phx
+// Runtime behavior of the security helpers (run in text mode).
+
+echo safe_url("javascript:alert(1)"), " ", safe_url("JaVaScRiPt:x"), " ", safe_url("data:text/html,x"), "\n";
+echo safe_url("https://example.com/?a=1&b=<x>"), " ", safe_url("/post?id=2"), " ", safe_url("//evil.com"), "\n";
+echo json_html(["html" => "</script><script>alert(1)</script>", "q" => "it's", "amp" => "a&b"]), "\n";
+
+// Html concatenation escapes plain strings even if they slip in.
+$parts = raw("<b>") . raw("</b>");
+echo $parts, "\n";
+
+// Deeply nested values are freed without recursion.
+list<any> $deep = [];
+foreach (0..200000 as $i) {
+    $deep = [$deep];
+}
+echo "deep ok\n";
+echo [[1, [2]], 3] == [[1, [2]], 3] ? "equal" : "different", "\n";
+
+// Huge allocations are refused before they happen.
+try {
+    echo "a"->padStart(10000000000000, "b");
+} catch (Exception $e) {
+    echo "not reached";
+}

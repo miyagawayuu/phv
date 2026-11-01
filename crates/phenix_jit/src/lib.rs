@@ -47,11 +47,65 @@ fn supported(ins: &Instr, ok: &HashSet<u32>) -> bool {
     }
 }
 
+/// Whether every register, jump target and call in `f` is in range. Bytecode
+/// can come from the on-disk cache, and the JIT must never trust it blindly.
+fn well_formed(prog: &Program, f: &Function) -> bool {
+    use Instr::*;
+    let Some(sig) = &f.native else { return false };
+    let regs = f.num_regs as usize;
+    let n = f.code.len() as u32;
+    let r = |x: &u16| (*x as usize) < regs;
+    if sig.params.len() > 16 || sig.params.len() > regs {
+        return false;
+    }
+    if !matches!(f.code.last(), Some(Ret(_)) | Some(RetNull)) {
+        return false;
+    }
+    f.code.iter().all(|ins| match ins {
+        Int(d, _) | Bool(d, _) | IncI(d, _) => r(d),
+        Move(a, b) | NegI(a, b) | BitNot(a, b) | Not(a, b) | AddIImm(a, b, _) | SubIImm(a, b, _) => r(a) && r(b),
+        AddI(a, b, c)
+        | SubI(a, b, c)
+        | MulI(a, b, c)
+        | ModI(a, b, c)
+        | BitAnd(a, b, c)
+        | BitOr(a, b, c)
+        | BitXor(a, b, c)
+        | Shl(a, b, c)
+        | Shr(a, b, c)
+        | EqI(a, b, c)
+        | LtI(a, b, c)
+        | LeI(a, b, c)
+        | Eq(a, b, c)
+        | Ne(a, b, c)
+        | Lt(a, b, c)
+        | Le(a, b, c)
+        | Cmp(a, b, c) => r(a) && r(b) && r(c),
+        Jump(t) => *t < n,
+        JumpIfFalse(a, t) | JumpIfTrue(a, t) | JumpIfNotLtIImm(a, _, t) | JumpIfNotLeIImm(a, _, t) => r(a) && *t < n,
+        JumpIfNotLtI(a, b, t) | JumpIfNotLeI(a, b, t) => r(a) && r(b) && *t < n,
+        Ret(a) => r(a),
+        RetNull => true,
+        Call { dst, func, args, argc } => {
+            let callee = prog.funcs.get(*func as usize).and_then(|c| c.native.as_ref());
+            r(dst)
+                && callee.is_some_and(|c| c.params.len() == *argc as usize)
+                && (*args as usize + *argc as usize) <= regs
+        }
+        _ => true,
+    })
+}
+
 /// Functions that can be compiled: native signature, supported instructions,
 /// and calls only to other compilable functions.
 fn eligible(prog: &Program) -> HashSet<u32> {
-    let mut ok: HashSet<u32> =
-        prog.funcs.iter().enumerate().filter(|(_, f)| f.native.is_some()).map(|(i, _)| i as u32).collect();
+    let mut ok: HashSet<u32> = prog
+        .funcs
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.native.is_some() && well_formed(prog, f))
+        .map(|(i, _)| i as u32)
+        .collect();
     loop {
         let before = ok.len();
         let snapshot = ok.clone();

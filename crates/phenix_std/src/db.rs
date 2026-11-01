@@ -37,6 +37,12 @@ fn conn<'v>(vm: &'v Vm, h: &Value) -> Result<&'v Connection, VmError> {
 }
 
 fn db_error(vm: &Vm, e: rusqlite::Error) -> VmError {
+    if let rusqlite::Error::SqliteFailure(f, _) = &e {
+        if f.code == rusqlite::ErrorCode::OperationInterrupted {
+            let secs = vm.deadline().map(|_| "the time limit").unwrap_or("a limit");
+            return VmError::Fatal(format!("database query stopped: {secs} was reached"));
+        }
+    }
     vm.throw("DatabaseError", e.to_string())
 }
 
@@ -69,7 +75,7 @@ fn query(vm: &mut Vm, a: &[Value]) -> R {
             m.insert(Key::Str(n.clone()), v);
         }
         out.push(Value::map(m));
-        if out.len() % 4096 == 0 {
+        if out.len() % 256 == 0 {
             vm.check_memory()?;
         }
     }
@@ -95,8 +101,43 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
     }
     .map_err(|e| db_error(vm, e))?;
     c.busy_timeout(Duration::from_secs(5)).map_err(|e| db_error(vm, e))?;
+    use rusqlite::limits::Limit;
     // Prevent `ATTACH 'other.db'` from reaching files outside the permissions.
-    c.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_ATTACHED, 0).map_err(|e| db_error(vm, e))?;
+    c.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0).map_err(|e| db_error(vm, e))?;
+    // Single strings/blobs and statements are bounded (e.g. `zeroblob(1e9)`).
+    c.set_limit(Limit::SQLITE_LIMIT_LENGTH, 32 * 1024 * 1024).map_err(|e| db_error(vm, e))?;
+    c.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 1024 * 1024).map_err(|e| db_error(vm, e))?;
+    // A process-wide cap on SQLite's own memory.
+    c.execute_batch("PRAGMA hard_heap_limit = 536870912").map_err(|e| db_error(vm, e))?;
+    // Queries stop when the script's time limit is reached.
+    if let Some(deadline) = vm.deadline() {
+        c.progress_handler(10_000, Some(move || std::time::Instant::now() > deadline));
+    }
+    // Pragmas that change process-wide state or touch other files are refused.
+    c.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
+        use rusqlite::hooks::{AuthAction, Authorization};
+        match ctx.action {
+            AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
+            AuthAction::Pragma { pragma_name, .. } => {
+                let name = pragma_name.to_ascii_lowercase();
+                let blocked = [
+                    "temp_store_directory",
+                    "data_store_directory",
+                    "hard_heap_limit",
+                    "soft_heap_limit",
+                    "writable_schema",
+                    "mmap_size",
+                    "threads",
+                ];
+                if blocked.contains(&name.as_str()) {
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }
+            _ => Authorization::Allow,
+        }
+    }));
     vm.resources.push(Some(Box::new(c)));
     Ok(Value::Int(vm.resources.len() as i64 - 1))
 }

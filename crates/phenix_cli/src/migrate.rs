@@ -135,15 +135,19 @@ pub fn convert(src: &str) -> Migration {
             stack.push(Close::SuperGlobal);
             i = rewrite(i + 10, "session()->get(", "$_SESSION -> session()", &mut out);
         } else if ["require_once", "include_once", "require", "include"].iter().any(|w| word_at(i, w)) {
+            // Left as a call that does not compile: an include may be an access
+            // check (e.g. `require 'auth.php'`) that must not silently disappear.
             let end = src[i..].find(';').map(|p| i + p + 1).unwrap_or(b.len());
-            out.push_str("// TODO(migrate): replace with `import ...;`: ");
-            out.push_str(&src[i..end]);
+            out.push_str("TODO_migrate(\"replace with an import: ");
+            out.push_str(&src[i..end].replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$"));
+            out.push_str("\");");
             todos += 1;
             i = end;
         } else if word_at(i, "global") {
             let end = src[i..].find(';').map(|p| i + p + 1).unwrap_or(b.len());
-            out.push_str("// TODO(migrate): pass this value as a parameter: ");
-            out.push_str(&src[i..end]);
+            out.push_str("TODO_migrate(\"pass this value as a parameter: ");
+            out.push_str(&src[i..end].replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$"));
+            out.push_str("\");");
             todos += 1;
             i = end;
         } else if word_at(i, "new") && src[i + 3..].trim_start().to_ascii_lowercase().starts_with("stdclass") {
@@ -211,7 +215,7 @@ mod tests {
         assert!(m.text.contains("if ((request()->query('id') != null) && $x == 'a')"));
         assert!(m.text.contains("dump(request()->form('name'));"));
         assert!(m.text.contains("echo '=== in string';"));
-        assert!(m.text.contains("// TODO(migrate): replace with `import ...;`: require 'db.php';"));
+        assert!(m.text.contains("TODO_migrate(\"replace with an import: require 'db.php';\");"));
         assert_eq!(m.todos, 1);
     }
 }

@@ -5,14 +5,16 @@ use phenix_driver::{analyze, find_root};
 use phenix_syntax::{Severity, SourceFile};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 fn read_message(input: &mut impl BufRead) -> Option<Value> {
     let mut length = None;
     loop {
         let mut line = String::new();
-        if input.read_line(&mut line).ok()? == 0 {
+        // Header lines are short; refuse anything else instead of buffering it.
+        let n = (&mut *input).take(8192).read_line(&mut line).ok()?;
+        if n == 0 || (n == 8192 && !line.ends_with('\n')) {
             return None;
         }
         let line = line.trim_end();
@@ -39,7 +41,11 @@ fn send(out: &mut impl Write, msg: &Value) {
 }
 
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    // Only local files (`file:///...`), never `file://host/share`.
     let rest = uri.strip_prefix("file://")?;
+    if !rest.starts_with('/') {
+        return None;
+    }
     let decoded = percent_encoding::percent_decode_str(rest).decode_utf8_lossy().into_owned();
     // file:///C:/x -> C:/x on Windows
     let path = if cfg!(windows) { decoded.trim_start_matches('/').to_string() } else { decoded };

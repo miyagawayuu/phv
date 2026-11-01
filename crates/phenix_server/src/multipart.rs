@@ -38,10 +38,16 @@ fn param(header: &str, key: &str) -> Option<String> {
 /// name can be shown safely (it must still never be used as a path).
 pub fn clean_filename(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
-    let cleaned: String = base.chars().filter(|c| !c.is_control()).collect();
-    let cleaned = cleaned.trim().trim_start_matches('.').to_string();
+    // Also drop characters that are special in Windows paths (`:` streams, wildcards).
+    let cleaned: String = base.chars().filter(|c| !c.is_control() && !":<>\"|?*".contains(*c)).collect();
+    let cleaned = cleaned.trim().trim_start_matches('.').trim_end_matches(['.', ' ']).to_string();
+    let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str())
+        || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4);
     if cleaned.is_empty() {
         "upload".into()
+    } else if reserved {
+        format!("_{}", cleaned.chars().take(199).collect::<String>())
     } else {
         cleaned.chars().take(200).collect()
     }
@@ -111,5 +117,8 @@ mod tests {
         assert_eq!(boundary("multipart/form-data; boundary=\"XyZ\"").as_deref(), Some("XyZ"));
         assert!(parse(b"garbage", "XyZ").is_err());
         assert_eq!(clean_filename("C:\\Users\\a\\.htaccess"), "htaccess");
+        assert_eq!(clean_filename("a.txt:stream"), "a.txtstream");
+        assert_eq!(clean_filename("evil.php. . "), "evil.php");
+        assert_eq!(clean_filename("CON.txt"), "_CON.txt");
     }
 }

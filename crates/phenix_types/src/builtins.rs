@@ -57,6 +57,8 @@ pub static BUILTINS: &[BuiltinSig] = &[
     f("raw", "fn(string): Html", "raw"),
     f("escape", "fn(string): Html", "escape"),
     f("htmlspecialchars", "fn(string): Html", "escape"),
+    f("json_html", "fn(any): Html", "json_html"),
+    f("safe_url", "fn(string): Html", "safe_url"),
     f("intdiv", "fn(int, int): int", "intdiv"),
     f("abs", "fn(int): int", "abs_int"),
     f("abs", "fn(float): float", "abs_float"),

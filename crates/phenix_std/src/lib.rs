@@ -14,7 +14,7 @@ mod sys;
 mod web;
 
 pub use sys::constant_time_eq;
-pub use web::{json_decode, random_hex};
+pub use web::{csrf_expected, json_decode, random_hex};
 
 pub const PRELUDE: &str = include_str!("phx/prelude.phx");
 
@@ -86,11 +86,11 @@ fn string_map(pairs: &[(String, String)]) -> Value {
 fn char_slice(text: &str, start: i64, len: Option<i64>) -> String {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len() as i64;
-    let from = if start < 0 { (n + start).max(0) } else { start.min(n) };
+    let from = if start < 0 { n.saturating_add(start).max(0) } else { start.min(n) };
     let to = match len {
         None => n,
-        Some(l) if l < 0 => (n + l).max(from),
-        Some(l) => (from + l).min(n),
+        Some(l) if l < 0 => n.saturating_add(l).max(from),
+        Some(l) => from.saturating_add(l).min(n),
     };
     chars[from as usize..to as usize].iter().collect()
 }
@@ -128,6 +128,7 @@ fn pad(vm: &Vm, text: &str, len: i64, with: &str, start: bool) -> R {
     if len <= have {
         return Ok(Value::str(text));
     }
+    vm.reserve(((len - have) as usize).saturating_mul(with.len().div_ceil(with.chars().count().max(1)).max(1)))?;
     let padding: String = with.chars().cycle().take((len - have) as usize).collect();
     Ok(Value::str(if start { padding + text } else { text.to_string() + &padding }))
 }
@@ -349,21 +350,102 @@ fn truthy(vm: &Vm, v: Value) -> Result<bool, VmError> {
     }
 }
 
+/// Headers the server controls; a script setting them could desynchronize
+/// the HTTP connection (response splitting).
+const FRAMING_HEADERS: &[&str] =
+    &["content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer"];
+
 fn check_header(vm: &Vm, name: &str, value: &str) -> Result<(), VmError> {
+    let lower = name.to_ascii_lowercase();
+    if FRAMING_HEADERS.contains(&lower.as_str()) || lower.starts_with("proxy-") {
+        return Err(vm.throw("ValueError", format!("the \"{name}\" header is set by the server")));
+    }
     let name_ok =
         !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
     if !name_ok {
         return Err(vm.throw("ValueError", format!("invalid header name \"{name}\"")));
     }
-    if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+    if value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f) {
         return Err(vm.throw("ValueError", format!("header \"{name}\" contains a line break (header injection)")));
     }
     Ok(())
 }
 
-fn set_type(vm: &mut Vm, ct: &str) {
+/// Media types whose output is not HTML-escaped. Everything else (HTML, XML,
+/// SVG, unknown types) keeps escaping on, because a browser may render it as markup.
+const PLAIN_TYPES: &[&str] = &[
+    "text/plain",
+    "text/csv",
+    "text/css",
+    "text/javascript",
+    "text/calendar",
+    "text/markdown",
+    "application/json",
+    "application/javascript",
+    "application/octet-stream",
+    "application/pdf",
+];
+
+fn set_type(vm: &mut Vm, ct: &str) -> Result<(), VmError> {
+    if ct.contains(',') {
+        return Err(vm.throw("ValueError", "Content-Type must name a single media type"));
+    }
+    let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if mime.is_empty() || !mime.contains('/') || mime.contains(char::is_whitespace) {
+        return Err(vm.throw("ValueError", format!("invalid Content-Type \"{ct}\"")));
+    }
+    let media = ["image/", "audio/", "video/", "font/"].iter().any(|p| mime.starts_with(p)) && mime != "image/svg+xml";
     vm.http.content_type = Some(ct.to_string());
-    vm.out[0].html = ct.trim_start().to_ascii_lowercase().starts_with("text/html");
+    vm.out[0].html = !(PLAIN_TYPES.contains(&mime.as_str()) || media);
+    Ok(())
+}
+
+/// `str_replace` with a size check (and no change for an empty search).
+fn replace(vm: &Vm, subject: &str, search: &str, with: &str) -> R {
+    if search.is_empty() {
+        return Ok(Value::str(subject));
+    }
+    if with.len() > search.len() {
+        let grow = subject.matches(search).count().saturating_mul(with.len() - search.len());
+        vm.reserve(subject.len().saturating_add(grow))?;
+    }
+    Ok(Value::str(subject.replace(search, with)))
+}
+
+/// JSON safe to place inside `<script>`: `<`, `>`, `&`, quotes and the
+/// JavaScript line separators are written as `\uXXXX`.
+fn json_html(vm: &Vm, v: &Value) -> Result<String, VmError> {
+    let mut out = String::new();
+    json(vm, v, &mut out, 0)?;
+    let mut safe = String::with_capacity(out.len());
+    for c in out.chars() {
+        match c {
+            '<' | '>' | '&' | '\'' | '\u{2028}' | '\u{2029}' => safe.push_str(&format!("\\u{:04x}", c as u32)),
+            c => safe.push(c),
+        }
+    }
+    Ok(safe)
+}
+
+/// A URL that cannot run script: http(s), mailto, tel or a relative URL.
+/// Anything else (javascript:, data:, vbscript:, ...) becomes "#".
+fn safe_url(url: &str) -> String {
+    let cleaned: String = url.trim().chars().filter(|c| !c.is_control() && !c.is_whitespace()).collect();
+    let scheme_end = cleaned.find([':', '/', '?', '#']);
+    let ok = match scheme_end {
+        Some(i) if cleaned.as_bytes()[i] == b':' => {
+            let scheme = cleaned[..i].to_ascii_lowercase();
+            matches!(scheme.as_str(), "http" | "https" | "mailto" | "tel")
+        }
+        // Relative; `//host` would be protocol-relative (another site).
+        _ => !cleaned.starts_with("//"),
+    };
+    let ok = ok && !cleaned.starts_with("\\\\") && !cleaned.starts_with("/\\");
+    if ok {
+        cleaned
+    } else {
+        "#".into()
+    }
 }
 
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
@@ -387,8 +469,9 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         "list_len" => |_, a| Ok(Value::Int(list(&a[0]).len() as i64)),
         "map_len" => |_, a| Ok(Value::Int(map(&a[0]).len() as i64)),
         "strlen" => |_, a| Ok(Value::Int(s(&a[0]).len() as i64)),
-        "implode" => |_, a| {
+        "implode" => |vm, a| {
             let parts: Vec<&str> = list(&a[1]).iter().map(s).collect();
+            vm.reserve(parts.iter().map(|p| p.len()).sum::<usize>() + parts.len().saturating_mul(s(&a[0]).len()))?;
             Ok(Value::str(parts.join(s(&a[0]))))
         },
         "explode" => |vm, a| {
@@ -396,6 +479,7 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             if sep.is_empty() {
                 return Err(vm.throw("ValueError", "explode(): separator must not be empty"));
             }
+            vm.reserve(s(&a[1]).matches(sep).count().saturating_mul(64) + s(&a[1]).len())?;
             Ok(Value::list(s(&a[1]).split(sep).map(Value::str).collect()))
         },
         "str_split" => |vm, a| {
@@ -403,6 +487,7 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             if sep.is_empty() {
                 return Err(vm.throw("ValueError", "split(): separator must not be empty; use ->chars()"));
             }
+            vm.reserve(s(&a[0]).matches(sep).count().saturating_mul(64) + s(&a[0]).len())?;
             Ok(Value::list(s(&a[0]).split(sep).map(Value::str).collect()))
         },
         "str_repeat" => |vm, a| {
@@ -410,22 +495,14 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             if n < 0 {
                 return Err(vm.throw("ValueError", "repeat count must not be negative"));
             }
-            if (s(&a[0]).len() as u128) * (n as u128) > 256 * 1024 * 1024 {
-                return Err(vm.throw("ValueError", "repeated string would be too large"));
-            }
+            vm.reserve(s(&a[0]).len().saturating_mul(n as usize))?;
             Ok(Value::str(s(&a[0]).repeat(n as usize)))
         },
         "str_contains" => |_, a| Ok(Value::Bool(s(&a[0]).contains(s(&a[1])))),
         "str_starts_with" => |_, a| Ok(Value::Bool(s(&a[0]).starts_with(s(&a[1])))),
         "str_ends_with" => |_, a| Ok(Value::Bool(s(&a[0]).ends_with(s(&a[1])))),
-        "str_replace" => |_, a| Ok(Value::str(s(&a[2]).replace(s(&a[0]), s(&a[1])))),
-        "str_replace_m" => |_, a| {
-            let search = s(&a[1]);
-            if search.is_empty() {
-                return Ok(a[0].clone());
-            }
-            Ok(Value::str(s(&a[0]).replace(search, s(&a[2]))))
-        },
+        "str_replace" => |vm, a| replace(vm, s(&a[2]), s(&a[0]), s(&a[1])),
+        "str_replace_m" => |vm, a| replace(vm, s(&a[0]), s(&a[1]), s(&a[2])),
         "str_upper" => |_, a| Ok(Value::str(s(&a[0]).to_uppercase())),
         "str_lower" => |_, a| Ok(Value::str(s(&a[0]).to_lowercase())),
         "str_ucfirst" => |_, a| {
@@ -454,10 +531,15 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             let ok = !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || "+-.eE".contains(c));
             Ok(opt(t.parse::<f64>().ok().filter(|f| ok && f.is_finite()), Value::Float))
         },
-        "str_chars" => |_, a| Ok(Value::list(s(&a[0]).chars().map(|c| Value::str(c.to_string())).collect())),
+        "str_chars" => |vm, a| {
+            vm.reserve(s(&a[0]).chars().count().saturating_mul(64))?;
+            Ok(Value::list(s(&a[0]).chars().map(|c| Value::str(c.to_string())).collect()))
+        },
         "nl2br" => |_, a| Ok(Value::html(html_escape(s(&a[0])).replace('\n', "<br>\n"))),
         "raw" => |_, a| Ok(Value::html(s(&a[0]))),
         "escape" => |_, a| Ok(Value::html(html_escape(s(&a[0])))),
+        "json_html" => |vm, a| json_html(vm, &a[0]).map(Value::html),
+        "safe_url" => |_, a| Ok(Value::html(html_escape(&safe_url(s(&a[0]))))),
         "json_encode" => |vm, a| {
             let mut out = String::new();
             json(vm, &a[0], &mut out, 0)?;
@@ -501,6 +583,7 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             if count > 10_000_000 {
                 return Err(vm.throw("ValueError", "range is too large (more than 10,000,000 items)"));
             }
+            vm.reserve(count as usize * std::mem::size_of::<Value>())?;
             let items: Vec<Value> = if from <= to {
                 (from..=to).map(Value::Int).collect()
             } else {
@@ -536,16 +619,17 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             let l = list(&a[0]);
             let n = l.len() as i64;
             let start = int(&a[1]);
-            let from = if start < 0 { (n + start).max(0) } else { start.min(n) };
+            let from = if start < 0 { n.saturating_add(start).max(0) } else { start.min(n) };
             let to = match a.get(2).map(int) {
                 None => n,
-                Some(len) if len < 0 => (n + len).max(from),
-                Some(len) => (from + len).min(n),
+                Some(len) if len < 0 => n.saturating_add(len).max(from),
+                Some(len) => from.saturating_add(len).min(n),
             };
             Ok(Value::list(l[from as usize..to as usize].to_vec()))
         },
         "list_reverse" => |_, a| Ok(Value::list(list(&a[0]).iter().rev().cloned().collect())),
-        "list_concat" => |_, a| {
+        "list_concat" => |vm, a| {
+            vm.reserve((list(&a[0]).len() + list(&a[1]).len()).saturating_mul(std::mem::size_of::<Value>()))?;
             let mut v = list(&a[0]).as_ref().clone();
             v.extend(list(&a[1]).iter().cloned());
             Ok(Value::list(v))
@@ -666,7 +750,7 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         "__req_body" => |vm, _| Ok(Value::str(vm.http.body.as_str())),
         "__resp_status" => |vm, a| {
             let code = int(&a[0]);
-            if !(100..=599).contains(&code) {
+            if !(200..=599).contains(&code) {
                 return Err(vm.throw("ValueError", format!("invalid HTTP status code {code}")));
             }
             vm.http.status = code as u16;
@@ -677,7 +761,7 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             check_header(vm, name, value)?;
             if name.eq_ignore_ascii_case("content-type") {
                 let v = value.to_string();
-                set_type(vm, &v);
+                set_type(vm, &v)?;
             } else {
                 vm.http.resp_headers.push((name.to_string(), value.to_string()));
             }
@@ -686,7 +770,7 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         "__resp_type" => |vm, a| {
             let ct = s(&a[0]).to_string();
             check_header(vm, "Content-Type", &ct)?;
-            set_type(vm, &ct);
+            set_type(vm, &ct)?;
             Ok(Value::Null)
         },
         _ => return None,
@@ -709,6 +793,27 @@ mod tests {
     // reading it through the dev-dependency.
     fn phenix_types_sigs() -> Vec<&'static str> {
         phenix_types::builtins::BUILTINS.iter().map(|b| b.imp).collect()
+    }
+
+    #[test]
+    fn urls_cannot_run_script() {
+        for bad in [
+            "javascript:alert(1)",
+            " JaVaScRiPt:alert(1)",
+            "java\nscript:x",
+            "data:text/html,x",
+            "vbscript:x",
+            "//evil.com",
+            "\\\\evil\\x",
+            "/\\evil.com",
+        ] {
+            assert_eq!(safe_url(bad), "#", "{bad:?}");
+        }
+        for good in
+            ["https://example.com/a?b=1", "http://x", "mailto:a@b.c", "/posts?id=2", "post?id=2", "#top", "?page=2"]
+        {
+            assert_eq!(safe_url(good), good);
+        }
     }
 
     #[test]

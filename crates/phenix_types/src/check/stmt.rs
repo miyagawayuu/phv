@@ -50,6 +50,14 @@ impl Checker<'_> {
                     out.push(HStmt::Echo(h));
                 }
             }
+            StmtKind::HtmlEcho(es, ctx) => {
+                for e in es {
+                    let h = self.expr(e, None);
+                    self.check_printable(&h, "echo");
+                    self.check_html_context(&h, *ctx);
+                    out.push(HStmt::Echo(h));
+                }
+            }
             StmtKind::InlineHtml(text) => out.push(HStmt::Html(text.clone())),
             StmtKind::Assign { target, op, value } => self.assign(target, *op, value, out),
             StmtKind::TypedDecl { ty, name, name_span, value } => {
@@ -402,7 +410,6 @@ impl Checker<'_> {
                                 self.error("this expression does not produce a value", value.span);
                                 Type::Error
                             }
-                            Type::Never => Type::Error,
                             t => t.clone(),
                         };
                         let id = self.cx().declare(name, ty);

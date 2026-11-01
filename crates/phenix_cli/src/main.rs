@@ -63,6 +63,9 @@ enum Command {
         /// Output file (default: the input with a .phx extension).
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Overwrite the output file if it exists.
+        #[arg(long)]
+        force: bool,
     },
     /// Print the bytecode of a script's functions.
     Disasm {
@@ -80,9 +83,12 @@ enum Command {
         host: String,
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        /// Hide error details from visitors (production mode).
-        #[arg(long)]
+        /// Hide error details from visitors (the default unless the host is loopback).
+        #[arg(long, conflicts_with = "dev")]
         prod: bool,
+        /// Show error details in the browser (the default on 127.0.0.1 / localhost).
+        #[arg(long)]
+        dev: bool,
         /// Per-request time limit in seconds.
         #[arg(long, default_value_t = 30.0)]
         time_limit: f64,
@@ -159,7 +165,7 @@ fn exec(cmd: Command) -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Install { dir } => pkg::install(&dir),
-        Command::Migrate { file, output } => {
+        Command::Migrate { file, output, force } => {
             let src = match std::fs::read_to_string(&file) {
                 Ok(t) => t,
                 Err(e) => {
@@ -173,6 +179,10 @@ fn exec(cmd: Command) -> ExitCode {
                 eprintln!("error: refusing to overwrite the input file");
                 return ExitCode::FAILURE;
             }
+            if out_path.exists() && !force {
+                eprintln!("error: {} already exists (use --force to overwrite)", out_path.display());
+                return ExitCode::FAILURE;
+            }
             if let Err(e) = std::fs::write(&out_path, &m.text) {
                 eprintln!("error: cannot write {}: {e}", out_path.display());
                 return ExitCode::FAILURE;
@@ -182,7 +192,10 @@ fn exec(cmd: Command) -> ExitCode {
                 println!("  {n:>4} x {what}");
             }
             if m.todos > 0 {
-                println!("  {:>4} x TODO(migrate) comments to resolve by hand", m.todos);
+                println!("  {:>4} x TODO_migrate(...) to resolve by hand (they do not compile on purpose)", m.todos);
+            }
+            if file.components().any(|c| c.as_os_str() == "public") {
+                println!("note: delete the original .php file; it must not stay in public/");
             }
             let root = find_root(&out_path);
             match compile(&root, &out_path) {
@@ -235,12 +248,13 @@ fn exec(cmd: Command) -> ExitCode {
                 ExitCode::FAILURE
             }
         }
-        Command::Serve { dir, host, port, prod, time_limit } => {
+        Command::Serve { dir, host, port, prod, dev, time_limit } => {
+            let loopback = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
             let opts = phenix_server::ServeOptions {
                 root: dir,
                 host,
                 port,
-                dev: !prod,
+                dev: dev || (!prod && loopback),
                 time_limit: Duration::from_secs_f64(time_limit),
             };
             match phenix_server::serve(opts) {

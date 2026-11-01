@@ -68,6 +68,12 @@ pub struct HttpCtx {
     pub body: String,
     pub files: Vec<UploadedFile>,
     pub session: SessionData,
+    /// Server secret for CSRF tokens (HMAC key).
+    pub csrf_secret: Vec<u8>,
+    /// The browser's CSRF cookie, if it sent a valid one.
+    pub csrf_cookie: Option<String>,
+    /// A CSRF cookie the server must set (new visitor, or rotated after login).
+    pub new_csrf_cookie: Option<String>,
     pub status: u16,
     pub resp_headers: Vec<(String, String)>,
     pub content_type: Option<String>,
@@ -84,6 +90,9 @@ impl Default for HttpCtx {
             body: String::new(),
             files: Vec::new(),
             session: SessionData::default(),
+            csrf_secret: Vec::new(),
+            csrf_cookie: None,
+            new_csrf_cookie: None,
             status: 200,
             resp_headers: Vec::new(),
             content_type: None,
@@ -439,7 +448,7 @@ impl Vm {
 
     /// Runs natively compiled function `func` with arguments from `args`.
     fn call_jit(&mut self, entry: JitEntry, func: u32, args: &[Value]) -> Result<Value, VmError> {
-        let mut raw = [0i64; 16];
+        let mut raw = vec![0i64; args.len().max(16)];
         for (i, a) in args.iter().enumerate() {
             raw[i] = match a {
                 Value::Int(n) => *n,
@@ -483,6 +492,33 @@ impl Vm {
         })
     }
 
+    /// Fails before an allocation of `bytes` that would exceed the memory limit
+    /// (or 4 GB without one). Builtins call this before building large values,
+    /// because a failed allocation would abort the whole process.
+    pub fn reserve(&self, bytes: usize) -> Result<(), VmError> {
+        let limit = self.limits.max_memory.unwrap_or(4 << 30);
+        let used = (crate::alloc::thread_allocated() - self.mem_base).max(0) as usize;
+        if bytes > limit || used.saturating_add(bytes) > limit {
+            return Err(VmError::Fatal(format!("allowed memory size of {} MB exhausted", limit / (1024 * 1024))));
+        }
+        Ok(())
+    }
+
+    /// The time limit as an instant (for code outside the interpreter loop, e.g. SQLite).
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Runs after every builtin: builtins can take long or allocate a lot in one call.
+    fn after_builtin(&self) -> Result<(), VmError> {
+        self.check_memory()?;
+        if self.deadline.is_some_and(|d| Instant::now() > d) {
+            let secs = self.limits.max_time.map(|t| t.as_secs_f64()).unwrap_or(0.0);
+            return Err(VmError::Fatal(format!("maximum execution time of {secs} seconds exceeded")));
+        }
+        Ok(())
+    }
+
     /// Fails when the script has allocated more than its memory limit.
     pub fn check_memory(&self) -> Result<(), VmError> {
         if let Some(max) = self.limits.max_memory {
@@ -496,9 +532,9 @@ impl Vm {
 
     #[cold]
     fn check_deadline(&mut self) -> Result<(), VmError> {
+        self.budget = BUDGET;
         self.check_memory()?;
         {
-            self.budget = BUDGET;
             if let Some(d) = self.deadline {
                 if Instant::now() > d {
                     let secs = self.limits.max_time.map(|t| t.as_secs_f64()).unwrap_or(0.0);
@@ -825,9 +861,23 @@ impl Vm {
                         reg!(*d) = v;
                     }
                     Instr::Concat(d, start, n, html) => {
-                        let mut s = String::new();
+                        let mut size = 0usize;
                         for i in 0..*n {
-                            self.regs[base + (*start + i) as usize].append_to(&mut s);
+                            size += match &self.regs[base + (*start + i) as usize] {
+                                Value::Str(s) | Value::Html(s) => s.len(),
+                                _ => 24,
+                            };
+                        }
+                        if size > 1 << 20 {
+                            tri!(self.reserve(size));
+                        }
+                        let mut s = String::with_capacity(size);
+                        for i in 0..*n {
+                            match &self.regs[base + (*start + i) as usize] {
+                                // An `Html` result never contains unescaped plain strings.
+                                Value::Str(x) if *html => html_escape_into(x, &mut s),
+                                v => v.append_to(&mut s),
+                            }
                         }
                         let big = s.len() > 1 << 20;
                         reg!(*d) = if *html { Value::html(s) } else { Value::str(s) };
@@ -837,6 +887,18 @@ impl Vm {
                     }
                     Instr::AppendStr(d, s) => {
                         let src = reg!(*s).clone();
+                        let grow = match &src {
+                            Value::Str(x) | Value::Html(x) => x.len(),
+                            _ => 24,
+                        };
+                        let cur = match &reg!(*d) {
+                            Value::Str(x) => x.capacity(),
+                            _ => 0,
+                        };
+                        if grow > 1 << 20 || (cur > 1 << 20 && cur < grow + cur) {
+                            // The string may double its buffer.
+                            tri!(self.reserve(grow.max(cur) * 2));
+                        }
                         let len = match &mut reg!(*d) {
                             Value::Str(rc) => {
                                 let s = Rc::make_mut(rc);
@@ -937,6 +999,7 @@ impl Vm {
                         self.argbuf = buf;
                         let v = tri!(r);
                         reg!(*dst) = v;
+                        tri!(self.after_builtin());
                     }
                     Instr::CallNamed { dst, name, args, argc } => {
                         let class = match &reg!(*args) {
@@ -999,6 +1062,7 @@ impl Vm {
                         if count > 10_000_000 {
                             tri!(Err(self.throw("ValueError", "range is too large (more than 10,000,000 items)")));
                         }
+                        tri!(self.reserve(count as usize * std::mem::size_of::<Value>()));
                         reg!(*d) = Value::list((from..to).map(Value::Int).collect());
                     }
                     Instr::Index(d, b, k) => {

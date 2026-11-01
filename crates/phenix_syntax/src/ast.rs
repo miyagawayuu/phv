@@ -32,6 +32,8 @@ pub enum AssignOp {
 pub enum StmtKind {
     Expr(Expr),
     Echo(Vec<Expr>),
+    /// `<?= ... ?>` with the HTML context it appears in.
+    HtmlEcho(Vec<Expr>, EchoContext),
     InlineHtml(String),
     Assign {
         target: Expr,
@@ -91,6 +93,27 @@ pub enum StmtKind {
     Const(ConstDecl),
     /// `params(string $title, list<Item> $items);` at the top of a template.
     Params(Vec<Param>),
+}
+
+/// Where in an HTML document a `<?= ?>` value is inserted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoContext {
+    /// Element content, or a comment.
+    Text,
+    /// A quoted attribute value.
+    Attr,
+    /// The start of a quoted URL attribute (`href="<?= ?>"`).
+    Url,
+    /// An unquoted attribute value.
+    Unquoted,
+    /// Inside a tag, between attributes.
+    Tag,
+    /// Inside `<script>`.
+    Script,
+    /// Inside `<style>` or a `style="..."` attribute.
+    Style,
+    /// An event handler attribute (`onclick="..."`).
+    Handler,
 }
 
 #[derive(Debug, Clone)]

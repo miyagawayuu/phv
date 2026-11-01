@@ -96,7 +96,10 @@ fn mtime(p: &Path) -> Option<SystemTime> {
 /// The project root: the nearest directory containing `phenix.toml`, or the
 /// directory of the entry file.
 pub fn find_root(entry: &Path) -> PathBuf {
-    let start = entry.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    let start = match entry.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
     let mut dir = start.clone();
     loop {
         if dir.join("phenix.toml").is_file() {
@@ -122,6 +125,8 @@ fn safe_relative(p: &str) -> bool {
 
 struct Loader {
     root: PathBuf,
+    /// Canonical directories sources may be loaded from: the project and packages.
+    allowed: Vec<PathBuf>,
     /// Package name to the directory its modules are loaded from.
     packages: HashMap<String, PathBuf>,
     /// Unsaved editor buffers (for the language server), by canonical path.
@@ -155,6 +160,15 @@ impl Loader {
     fn load_file(&mut self, path: PathBuf, kind: ModuleKind, span: Span, what: &str) -> Option<usize> {
         if let Some(&i) = self.by_path.get(&path) {
             return Some(i);
+        }
+        // Symlinks and junctions must not pull in files from outside the project.
+        if let Ok(c) = path.canonicalize() {
+            if !self.allowed.iter().any(|a| c.starts_with(a)) {
+                let shown = display_name(&self.root, &path);
+                self.diags
+                    .push(Diagnostic::error(format!("{what} {shown} resolves to a file outside the project"), span));
+                return None;
+            }
         }
         let overlaid = path.canonicalize().ok().and_then(|c| self.overlay.get(&c).cloned());
         match overlaid.map(Ok).unwrap_or_else(|| std::fs::read_to_string(&path)) {
@@ -255,6 +269,10 @@ impl Loader {
                 );
                 continue;
             }
+            if !rel.to_ascii_lowercase().ends_with(".phx.html") {
+                self.diags.push(Diagnostic::error("templates must be `.phx.html` files", span));
+                continue;
+            }
             let path = self.root.join(&rel);
             self.templates.insert(rel.clone(), usize::MAX);
             match self.load_file(path, ModuleKind::Template, span, "template") {
@@ -303,9 +321,13 @@ pub fn analyze(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>) -> 
         messages.push(e);
         Config::default_for(root)
     });
+    let packages = package_dirs(root, &config);
+    let mut allowed: Vec<PathBuf> = packages.values().filter_map(|d| d.canonicalize().ok()).collect();
+    allowed.extend(root.canonicalize().ok());
     let mut loader = Loader {
         root: root.to_path_buf(),
-        packages: package_dirs(root, &config),
+        allowed,
+        packages,
         overlay,
         sources: SourceMap::default(),
         modules: Vec::new(),

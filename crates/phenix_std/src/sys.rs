@@ -188,10 +188,14 @@ fn password_hash(password: &str) -> String {
 
 fn password_verify(password: &str, hash: &str) -> bool {
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
-    match PasswordHash::new(hash) {
-        Ok(h) => argon2::Argon2::default().verify_password(password.as_bytes(), &h).is_ok(),
-        Err(_) => false,
+    let Ok(h) = PasswordHash::new(hash) else { return false };
+    // The cost comes from the stored hash; refuse values that would let a
+    // planted hash use gigabytes of memory or minutes of CPU.
+    let param = |name: &str| h.params.get_decimal(name).unwrap_or(0);
+    if param("m") > 256 * 1024 || param("t") > 16 || param("p") > 16 {
+        return false;
     }
+    argon2::Argon2::default().verify_password(password.as_bytes(), &h).is_ok()
 }
 
 // ----- files and environment ------------------------------------------------
@@ -232,16 +236,41 @@ pub fn resolve_path(vm: &Vm, rel: &str, write: bool) -> Result<PathBuf, VmError>
         .canonicalize()
         .map_err(|_| permission_error(vm, format!("the allowed directory \"{dir}\" does not exist")))?;
     let full = root.join(p);
-    let probe = if full.exists() {
-        full.canonicalize()
-    } else {
-        full.parent().map(|d| d.to_path_buf()).unwrap_or_default().canonicalize()
+    // Links are refused outright (a dangling link would otherwise be followed
+    // when writing). The parent is resolved and checked, and the returned path
+    // is built from that resolved parent, so later operations use it.
+    if let Ok(meta) = std::fs::symlink_metadata(&full) {
+        if meta.file_type().is_symlink() || is_reparse_point(&meta) {
+            return Err(permission_error(vm, format!("\"{rel}\" is a link; links are not followed")));
+        }
+    }
+    let (Some(parent), Some(name)) = (full.parent(), full.file_name()) else {
+        return Err(permission_error(vm, format!("\"{rel}\" is not a file path")));
     };
-    match probe {
-        Ok(c) if c.starts_with(&base) => Ok(full),
+    match parent.canonicalize() {
+        Ok(c) if c.starts_with(&base) => Ok(c.join(name)),
         Ok(_) => Err(permission_error(vm, format!("\"{rel}\" points outside \"{dir}\""))),
         Err(_) => Err(vm.throw("RuntimeException", format!("directory of \"{rel}\" does not exist"))),
     }
+}
+
+#[cfg(windows)]
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    meta.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT (junctions, symlinks)
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn refuse_code(vm: &Vm, rel: &str) -> Result<(), VmError> {
+    let lower = rel.to_ascii_lowercase();
+    if lower.ends_with(".phx") || lower.ends_with(".phx.html") {
+        return Err(permission_error(vm, format!("scripts cannot write Phenix source files (\"{rel}\")")));
+    }
+    Ok(())
 }
 
 fn env_allowed(vm: &Vm, name: &str) -> bool {
@@ -343,6 +372,8 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         "file_get_contents" => |vm, a| {
             let rel = s(&a[0]).to_string();
             let path = resolve_path(vm, &rel, false)?;
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            vm.reserve(size as usize)?;
             let bytes = std::fs::read(&path).map_err(|e| io_error(vm, "cannot read", &rel, e))?;
             String::from_utf8(bytes)
                 .map(Value::str)
@@ -350,6 +381,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "file_put_contents" => |vm, a| {
             let rel = s(&a[0]).to_string();
+            refuse_code(vm, &rel)?;
             let path = resolve_path(vm, &rel, true)?;
             std::fs::write(&path, s(&a[1])).map_err(|e| io_error(vm, "cannot write", &rel, e))?;
             Ok(Value::Null)

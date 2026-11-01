@@ -56,11 +56,20 @@ struct Security {
     session_ttl: u64,
     #[serde(default = "default_memory")]
     memory_limit_mb: u64,
+    /// Content-Security-Policy header added to every page (none by default).
+    #[serde(default)]
+    csp: Option<String>,
 }
 
 impl Default for Security {
     fn default() -> Self {
-        Security { csrf: true, secure_cookies: false, session_ttl: default_ttl(), memory_limit_mb: default_memory() }
+        Security {
+            csrf: true,
+            secure_cookies: false,
+            session_ttl: default_ttl(),
+            memory_limit_mb: default_memory(),
+            csp: None,
+        }
     }
 }
 
@@ -104,6 +113,7 @@ pub struct Config {
     pub secure_cookies: bool,
     pub session_ttl: u64,
     pub memory_limit_mb: u64,
+    pub csp: Option<String>,
     pub dependencies: BTreeMap<String, Dependency>,
 }
 
@@ -116,6 +126,7 @@ impl Config {
             secure_cookies: false,
             session_ttl: default_ttl(),
             memory_limit_mb: default_memory(),
+            csp: None,
             dependencies: BTreeMap::new(),
         }
     }
@@ -147,6 +158,17 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
     }
     for d in &file.permissions.write {
         check_dir("write", d)?;
+        if !Path::new(d).components().any(|c| matches!(c, std::path::Component::Normal(_))) {
+            return Err(format!(
+                "[permissions].write: \"{d}\" is the project root; scripts could rewrite their own source"
+            ));
+        }
+        let first = Path::new(d).components().find(|c| !matches!(c, std::path::Component::CurDir));
+        if first.is_some_and(|c| c.as_os_str().eq_ignore_ascii_case("public")) {
+            return Err(format!(
+                "[permissions].write: \"{d}\" is inside public/; writable files must not be servable (use e.g. \"storage/\")"
+            ));
+        }
     }
     for (name, dep) in &file.dependencies {
         if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || name.starts_with("std") {
@@ -154,6 +176,23 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
         }
         if dep.path.is_some() == dep.git.is_some() {
             return Err(format!("[dependencies].{name}: give exactly one of `path` or `git`"));
+        }
+        if let Some(p) = &dep.path {
+            // Relative only: an absolute or UNC path (\\\\host\\share) would make
+            // opening the project contact another machine.
+            let path = Path::new(p);
+            let relative = !p.starts_with(['/', '\\'])
+                && path.components().all(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::Normal(_)
+                            | std::path::Component::CurDir
+                            | std::path::Component::ParentDir
+                    )
+                });
+            if !relative {
+                return Err(format!("[dependencies].{name}: `path` must be a relative path"));
+            }
         }
     }
     let permissions =
@@ -165,6 +204,7 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
         secure_cookies: file.security.secure_cookies,
         session_ttl: file.security.session_ttl,
         memory_limit_mb: file.security.memory_limit_mb,
+        csp: file.security.csp,
         dependencies: file.dependencies,
     })
 }

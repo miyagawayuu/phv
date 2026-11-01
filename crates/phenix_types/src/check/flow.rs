@@ -67,6 +67,12 @@ pub(crate) enum FactKey {
 
 pub(crate) type Facts = Vec<(FactKey, Type)>;
 
+/// What `FnCtx::apply` replaced, for `restore`.
+pub(crate) struct Saved {
+    entries: Vec<(FactKey, Option<Type>)>,
+    gen: u64,
+}
+
 pub(crate) struct FnCtx {
     pub locals: Vec<HLocal>,
     pub names: HashMap<String, LocalId>,
@@ -79,6 +85,8 @@ pub(crate) struct FnCtx {
     /// (inner local, outer local)
     pub captures: Vec<(LocalId, LocalId)>,
     pub loop_depth: u32,
+    /// Incremented whenever property narrowings are cleared (by a call).
+    pub prop_gen: u64,
     temps: u32,
 }
 
@@ -94,6 +102,7 @@ impl FnCtx {
             auto_capture: false,
             captures: Vec::new(),
             loop_depth: 0,
+            prop_gen: 0,
             temps: 0,
         }
     }
@@ -118,7 +127,7 @@ impl FnCtx {
         self.flow.narrowed.get(&id).cloned().unwrap_or_else(|| self.locals[id as usize].ty.clone())
     }
 
-    pub fn apply(&mut self, facts: &Facts) -> Vec<(FactKey, Option<Type>)> {
+    pub fn apply(&mut self, facts: &Facts) -> Saved {
         let mut saved = Vec::new();
         for (key, ty) in facts {
             let old = match key {
@@ -127,11 +136,20 @@ impl FnCtx {
             };
             saved.push((*key, old));
         }
-        saved
+        Saved { entries: saved, gen: self.prop_gen }
     }
 
-    pub fn restore(&mut self, saved: Vec<(FactKey, Option<Type>)>) {
-        for (key, ty) in saved.into_iter().rev() {
+    /// Undoes `apply`. Returns true if a call happened in between; property
+    /// narrowings are then dropped instead of restored.
+    pub fn restore(&mut self, saved: Saved) -> bool {
+        let calls = saved.gen != self.prop_gen;
+        if calls {
+            self.flow.prop_narrowed.clear();
+        }
+        for (key, ty) in saved.entries.into_iter().rev() {
+            if calls && matches!(key, FactKey::Prop(..)) {
+                continue;
+            }
             match (key, ty) {
                 (FactKey::Local(id), Some(t)) => {
                     self.flow.narrowed.insert(id, t);
@@ -147,6 +165,7 @@ impl FnCtx {
                 }
             }
         }
+        calls
     }
 
     /// Forgets narrowings of variables a loop or `try` body may reassign.

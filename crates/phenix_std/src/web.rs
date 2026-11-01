@@ -134,8 +134,8 @@ impl Json<'_> {
     }
 
     fn hex4(&mut self) -> Result<u32, String> {
-        let h = self.s.get(self.i..self.i + 4).and_then(|b| std::str::from_utf8(b).ok());
-        let v = h.and_then(|h| u32::from_str_radix(h, 16).ok());
+        let h = self.s.get(self.i..self.i + 4).filter(|b| b.iter().all(u8::is_ascii_hexdigit));
+        let v = h.and_then(|b| std::str::from_utf8(b).ok()).and_then(|h| u32::from_str_radix(h, 16).ok());
         match v {
             Some(v) => {
                 self.i += 4;
@@ -177,13 +177,17 @@ impl Json<'_> {
                         Some(b't') => out.push('\t'),
                         Some(b'u') => {
                             let hi = self.hex4()?;
-                            let cp = if (0xD800..0xDC00).contains(&hi) && self.s[self.i..].starts_with(b"\\u") {
+                            let mut cp = hi;
+                            if (0xD800..0xDC00).contains(&hi) && self.s[self.i..].starts_with(b"\\u") {
+                                let save = self.i;
                                 self.i += 2;
                                 let lo = self.hex4()?;
-                                0x10000 + ((hi - 0xD800) << 10) + (lo.wrapping_sub(0xDC00) & 0x3FF)
-                            } else {
-                                hi
-                            };
+                                if (0xDC00..0xE000).contains(&lo) {
+                                    cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+                                } else {
+                                    self.i = save; // not a pair: decode it separately
+                                }
+                            }
                             out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
                         }
                         _ => return self.err("invalid escape"),
@@ -224,7 +228,7 @@ fn cookies(vm: &Vm) -> IndexMap<Key, Value> {
         for part in v.split(';') {
             if let Some((name, value)) = part.trim().split_once('=') {
                 let value = percent_decode_str(value.trim().trim_matches('"')).decode_utf8_lossy().into_owned();
-                m.insert(Key::Str(Rc::new(name.trim().to_string())), Value::str(value));
+                m.entry(Key::Str(Rc::new(name.trim().to_string()))).or_insert(Value::str(value));
             }
         }
     }
@@ -287,13 +291,26 @@ fn session_set(vm: &mut Vm, k: &str, v: &str) -> R {
     Ok(Value::Null)
 }
 
+/// The CSRF token for a browser's CSRF cookie: HMAC-SHA256(secret, cookie).
+/// Tokens need no server-side state, so issuing them cannot fill memory.
+pub fn csrf_expected(secret: &[u8], cookie: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut m = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    m.update(b"phenix-csrf:");
+    m.update(cookie.as_bytes());
+    m.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn csrf_token(vm: &mut Vm) -> Result<String, VmError> {
-    if let Some(t) = vm.http.session.values.get("_csrf") {
-        return Ok(t.clone());
-    }
-    let t = random_hex(32);
-    session_set(vm, "_csrf", &t)?;
-    Ok(t)
+    let cookie = match (&vm.http.new_csrf_cookie, &vm.http.csrf_cookie) {
+        (Some(c), _) | (None, Some(c)) => c.clone(),
+        (None, None) => {
+            let c = random_hex(32);
+            vm.http.new_csrf_cookie = Some(c.clone());
+            c
+        }
+    };
+    Ok(csrf_expected(&vm.http.csrf_secret, &cookie))
 }
 
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
@@ -327,6 +344,8 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         "__sess_regenerate" => |vm, _| {
             vm.http.session.regenerate = true;
             vm.http.session.changed = true;
+            // Tokens issued before login stop working after it.
+            vm.http.new_csrf_cookie = Some(random_hex(32));
             Ok(Value::Null)
         },
         "__sess_destroy" => |vm, _| {
@@ -364,6 +383,11 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             ))
         },
         "__upload_save" => |vm, a| {
+            let name = s(&a[1]).to_ascii_lowercase();
+            if name.ends_with(".phx") || name.ends_with(".phx.html") {
+                return Err(vm.throw("PermissionError", "uploads cannot be saved as .phx files"));
+            }
+            // A file that is a link is refused inside resolve_path.
             let i = int(&a[0]) as usize;
             let path = crate::sys::resolve_path(vm, s(&a[1]), true)?;
             let Some(f) = vm.http.files.get(i) else { return Ok(Value::Null) };
@@ -383,7 +407,7 @@ mod tests {
     #[test]
     fn decodes_json() {
         let v = json_decode(r#"{"a": [1, 2.5, "xé😀", true, null], "b": {}}"#).unwrap();
-        let Value::Map(m) = v else { panic!() };
+        let Value::Map(m) = &v else { panic!() };
         assert_eq!(m.len(), 2);
         assert!(json_decode("[1,]").is_err());
         assert!(json_decode("{\"a\":1} x").is_err());

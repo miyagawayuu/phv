@@ -110,7 +110,24 @@ export class Response {
         return $this;
     }
 
-    public function redirect(string $url, int $code = 302): void {
+    /**
+     * Redirects to a path on this site ("/login", "/posts?id=2"). Other URLs are
+     * rejected (open-redirect protection); use redirectExternal() for those.
+     */
+    public function redirect(string $path, int $code = 302): void {
+        $ok = $path->startsWith("/") && !$path->startsWith("//") && !$path->startsWith("/\\");
+        if (!$ok) {
+            throw new ValueError("redirect() only accepts paths on this site; use redirectExternal()");
+        }
+        __resp_status($code);
+        __resp_header("Location", $path);
+    }
+
+    /** Redirects to an absolute http(s) URL on another site. */
+    public function redirectExternal(string $url, int $code = 302): void {
+        if (!$url->startsWith("https://") && !$url->startsWith("http://")) {
+            throw new ValueError("redirectExternal() needs an http:// or https:// URL");
+        }
         __resp_status($code);
         __resp_header("Location", $url);
     }

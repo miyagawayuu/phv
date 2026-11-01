@@ -1,0 +1,9 @@
+# # #
+https://example.com/?a=1&amp;b=&lt;x&gt; /post?id=2 #
+{"html":"\u003c/script\u003e\u003cscript\u003ealert(1)\u003c/script\u003e","q":"it\u0027s","amp":"a\u0026b"}
+<b></b>
+deep ok
+equal
+
+--- runtime error ---
+Fatal error: allowed memory size of 4096 MB exhausted

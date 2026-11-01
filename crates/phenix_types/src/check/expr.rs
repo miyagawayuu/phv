@@ -137,6 +137,19 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// A map key; for `map<any, ...>` (from `is map`) it must still be an int or string.
+    fn key_to(&mut self, k: &Expr, kt: &Type) -> HExpr {
+        if *kt != Type::Any {
+            return self.expr_to(k, kt);
+        }
+        let h = self.expr(k, None);
+        if !matches!(h.ty, Type::Int | Type::Str | Type::Error) {
+            let msg = format!("map keys must be `int` or `string`, found `{}`", self.tn(&h.ty));
+            self.error(msg, h.span);
+        }
+        h
+    }
+
     pub(crate) fn expr_to(&mut self, e: &Expr, target: &Type) -> HExpr {
         let h = self.expr(e, Some(target));
         self.coerce(h, target)
@@ -240,6 +253,40 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// HTML escaping is only safe in element text and quoted attribute values.
+    pub(crate) fn check_html_context(&mut self, h: &HExpr, ctx: ast::EchoContext) {
+        use ast::EchoContext::*;
+        let numeric = h.ty.members().iter().all(|m| matches!(m, Type::Int | Type::Float | Type::Error | Type::Never));
+        let (msg, note) = match ctx {
+            Text | Attr => return,
+            Unquoted => (
+                "values in attributes must be quoted",
+                "write `attr=\"<?= $value ?>\"`: escaping does not protect unquoted attribute values",
+            ),
+            Tag => (
+                "values cannot be inserted between the attributes of a tag",
+                "write each attribute as `name=\"<?= $value ?>\"`",
+            ),
+            Url if numeric || h.ty == Type::Html => return,
+            Url => (
+                "a URL attribute cannot start with an unchecked string",
+                "use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`)",
+            ),
+            Script | Style if numeric || h.ty == Type::Html => return,
+            Script => (
+                "strings cannot be inserted into `<script>`",
+                "use `json_html($value)`, which produces a JavaScript value that is safe inside a script",
+            ),
+            Style => ("values cannot be inserted into CSS", "use a class name, or a `data-*` attribute"),
+            Handler if numeric => return,
+            Handler => (
+                "values cannot be inserted into event handler attributes",
+                "put the value in a `data-*` attribute and read it with addEventListener",
+            ),
+        };
+        self.error(msg, h.span).add_note(note);
+    }
+
     pub(crate) fn throwable(&mut self, x: &Expr) -> HExpr {
         let h = self.expr(x, None);
         let exc = self.exception_class();
@@ -287,8 +334,11 @@ impl<'a> Checker<'a> {
                 let (ha, ta, _) = self.cond(a);
                 let saved = self.cx().apply(&ta);
                 let (hb, tb, _) = self.cond(b);
-                self.cx().restore(saved);
+                let calls = self.cx().restore(saved);
                 let mut t = ta;
+                if calls {
+                    t.retain(|(k, _)| !matches!(k, FactKey::Prop(..)));
+                }
                 t.extend(tb);
                 (bool_expr(HExprKind::And(Box::new(ha), Box::new(hb))), t, Vec::new())
             }
@@ -296,8 +346,11 @@ impl<'a> Checker<'a> {
                 let (ha, _, fa) = self.cond(a);
                 let saved = self.cx().apply(&fa);
                 let (hb, _, fb) = self.cond(b);
-                self.cx().restore(saved);
+                let calls = self.cx().restore(saved);
                 let mut f = fa;
+                if calls {
+                    f.retain(|(k, _)| !matches!(k, FactKey::Prop(..)));
+                }
                 f.extend(fb);
                 (bool_expr(HExprKind::Or(Box::new(ha), Box::new(hb))), Vec::new(), f)
             }
@@ -309,8 +362,13 @@ impl<'a> Checker<'a> {
                 let mut is_null = Vec::new();
                 let mut not_null = Vec::new();
                 if let Some((key, cur)) = self.fact_target(var_side) {
-                    is_null.push((key, Type::Null));
-                    not_null.push((key, cur.without_null()));
+                    if cur.is_nullable() || matches!(cur, Type::Any | Type::Param(_)) {
+                        is_null.push((key, Type::Null));
+                    }
+                    let nn = cur.without_null();
+                    if nn != Type::Never {
+                        not_null.push((key, nn));
+                    }
                 }
                 if *op == BinOp::Eq {
                     (h, is_null, not_null)
@@ -324,8 +382,16 @@ impl<'a> Checker<'a> {
                 let mut then_facts = Vec::new();
                 let mut else_facts = Vec::new();
                 if let (Some((key, cur)), Some(test)) = (self.fact_target(x), test) {
-                    then_facts.push((key, self.narrow_to(&cur, test)));
-                    else_facts.push((key, self.remove_test(&cur, test)));
+                    // A test that can never succeed (or never fail) narrows nothing:
+                    // `never` would be assignable to every type.
+                    let then_ty = self.narrow_to(&cur, test);
+                    let else_ty = self.remove_test(&cur, test);
+                    if then_ty != Type::Never {
+                        then_facts.push((key, then_ty));
+                    }
+                    if else_ty != Type::Never {
+                        else_facts.push((key, else_ty));
+                    }
                 }
                 let test = test.unwrap_or(TestKind::Null);
                 (bool_expr(HExprKind::Is(Box::new(hx), test)), then_facts, else_facts)
@@ -372,6 +438,7 @@ impl<'a> Checker<'a> {
     pub(crate) fn clear_prop_facts(&mut self) {
         if let Some(c) = self.ctx.last_mut() {
             c.flow.prop_narrowed.clear();
+            c.prop_gen += 1;
         }
     }
 
@@ -428,6 +495,8 @@ impl<'a> Checker<'a> {
             | (TestKind::Map, Type::Map(..))
             | (TestKind::Func, Type::Func(..)) => true,
             (TestKind::Class(target), Type::Class(c)) => self.is_subclass(*c, target),
+            // `Sql` values are lists at runtime.
+            (TestKind::List, Type::Sql) => true,
             _ => false,
         }
     }
@@ -442,7 +511,7 @@ impl<'a> Checker<'a> {
             TestKind::Html => Type::Html,
             TestKind::List => Type::list(Type::Any),
             TestKind::Map => Type::map(Type::Any, Type::Any),
-            TestKind::Func => Type::Error,
+            TestKind::Func => Type::Any,
             TestKind::Class(c) => Type::Class(c),
         }
     }
@@ -455,10 +524,20 @@ impl<'a> Checker<'a> {
         for m in cur.members() {
             if self.test_matches(&m, test) {
                 out.push(m);
-            } else if let (TestKind::Class(target), Type::Class(c)) = (test, &m) {
-                if self.is_subclass(target, *c) {
-                    out.push(Type::Class(target));
+                continue;
+            }
+            match (test, &m) {
+                // A type parameter (or `any`) can hold anything: narrow to the tested type.
+                (_, Type::Param(_)) | (_, Type::Any) => out.push(Self::test_type(test)),
+                (TestKind::Class(target), Type::Class(c)) => {
+                    // A subclass of `c` may be (or implement) `target`.
+                    let either_interface =
+                        self.class_kind(target) == ClassKind::Interface || self.class_kind(*c) == ClassKind::Interface;
+                    if self.is_subclass(target, *c) || either_interface {
+                        out.push(Type::Class(target));
+                    }
                 }
+                _ => {}
             }
         }
         Type::union(out)
@@ -893,7 +972,7 @@ impl<'a> Checker<'a> {
                             HExpr { kind: HExprKind::IndexOrNull(Box::new(hb), Box::new(hk)), ty, span: l.span }
                         }
                         Type::Map(kt, vt) => {
-                            let hk = c.expr_to(k, &kt);
+                            let hk = c.key_to(k, &kt);
                             let ty = Type::nullable(*vt);
                             HExpr { kind: HExprKind::IndexOrNull(Box::new(hb), Box::new(hk)), ty, span: l.span }
                         }
@@ -1373,7 +1452,7 @@ impl<'a> Checker<'a> {
                     }
                     Type::Map(kt, vt) => match index {
                         Some(k) => {
-                            let hk = self.expr_to(k, &kt);
+                            let hk = self.key_to(k, &kt);
                             // `$m["a"]["b"] = 1` creates `$m["a"]` when it is missing.
                             let create = match &*vt {
                                 Type::List(_) => Some(HConst::EmptyList),
@@ -1423,7 +1502,7 @@ impl<'a> Checker<'a> {
                 mk(hb, hk, *t)
             }
             Type::Map(kt, vt) => {
-                let hk = self.expr_to(k, &kt);
+                let hk = self.key_to(k, &kt);
                 mk(hb, hk, *vt)
             }
             Type::Error => err(span),
@@ -1628,6 +1707,8 @@ impl<'a> Checker<'a> {
         let fid = self.template_funcs[&mi];
         let params = self.funcs[fid as usize].params.clone();
         let hargs = self.call_args(&format!("template `{key}`"), &params, &args[1..], span);
+        // The template may call methods that change properties.
+        self.clear_prop_facts();
         HExpr { kind: HExprKind::Call(fid, hargs), ty: Type::Html, span }
     }
 
