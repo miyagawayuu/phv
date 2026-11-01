@@ -177,6 +177,8 @@ fn sig_type(t: &TypeExpr) -> Type {
             ("void", []) => Type::Void,
             ("any", []) => Type::Any,
             ("Html", []) => Type::Html,
+            ("SafeUrl", []) => Type::SafeUrl,
+            ("SafeJs", []) => Type::SafeJs,
             ("Sql", []) => Type::Sql,
             ("T", []) => Type::Generic(0),
             ("U", []) => Type::Generic(1),
@@ -375,6 +377,8 @@ impl<'a> Checker<'a> {
                     "null" => simple(Type::Null),
                     "any" => simple(Type::Any),
                     "Html" => simple(Type::Html),
+                    "SafeUrl" => simple(Type::SafeUrl),
+                    "SafeJs" => simple(Type::SafeJs),
                     "list" => {
                         if args.len() != 1 {
                             self.error("`list` takes one type argument, e.g. `list<string>`", t.span);

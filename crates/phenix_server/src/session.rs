@@ -78,6 +78,18 @@ struct FileStore {
     dir: PathBuf,
     /// Unix time of the last sweep for expired and excess files.
     swept: AtomicU64,
+    /// Bytes written since the last sweep; a burst triggers an early sweep.
+    written: AtomicU64,
+}
+
+/// Session files are `<64 hex>.json`; temporary ones `.<64 hex>.json.<16 hex>`.
+/// The sweep never touches anything else in the directory.
+fn is_session_file(name: &str) -> bool {
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    if let Some(rest) = name.strip_prefix('.') {
+        return rest.split_once(".json.").is_some_and(|(id, r)| hex(id, 64) && hex(r, 16));
+    }
+    name.strip_suffix(".json").is_some_and(|id| hex(id, 64))
 }
 
 impl FileStore {
@@ -106,7 +118,13 @@ impl FileStore {
         let fail = |e: safefs::FsError| std::io::Error::other(format!("{e:?}"));
         let (dir, tmp_name) = safefs::open_parent(&self.dir, Path::new(&tmp)).map_err(fail)?;
         let mut f = dir.open(&tmp_name, true).map_err(fail)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         f.write_all(text.as_bytes())?;
+        self.written.fetch_add(text.len() as u64, Ordering::Relaxed);
         drop(f);
         let result = std::fs::rename(dir.path().join(&tmp_name), dir.path().join(&name));
         if result.is_err() {
@@ -121,14 +139,19 @@ impl FileStore {
         }
     }
 
-    /// At most every 30 seconds: deletes expired files, then the oldest ones
-    /// while there are too many or they take too much space.
+    /// Every 30 seconds, or sooner after many writes: deletes expired session
+    /// files, then the oldest ones while there are too many or they take too
+    /// much space.
     fn sweep(&self, ttl: Duration) {
         let now = now_secs();
         let last = self.swept.load(Ordering::Relaxed);
-        if now < last + 30 || self.swept.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        let burst = self.written.load(Ordering::Relaxed) > (MAX_BYTES / 16) as u64;
+        if (now < last + 30 && !burst)
+            || self.swept.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+        {
             return;
         }
+        self.written.store(0, Ordering::Relaxed);
         let Ok(rd) = std::fs::read_dir(&self.dir) else { return };
         let limit = SystemTime::now() - ttl.min(MAX_LIFETIME);
         let mut live: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
@@ -136,9 +159,12 @@ impl FileStore {
             let Ok(meta) = e.metadata() else { continue };
             let name = e.file_name().to_string_lossy().into_owned();
             let modified = meta.modified().unwrap_or(UNIX_EPOCH);
-            if !meta.is_file() || name.starts_with('.') {
+            if !meta.is_file() || !is_session_file(&name) {
+                continue;
+            }
+            if name.starts_with('.') {
                 // Temporary files left by a crash are removed once old.
-                if meta.is_file() && name != ".gitignore" && modified < limit {
+                if modified < limit {
                     let _ = std::fs::remove_file(e.path());
                 }
                 continue;
@@ -172,8 +198,10 @@ impl Store {
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 eprintln!("warning: cannot create session directory {}: {e}", dir.display());
             }
-            let _ = std::fs::write(dir.join(".gitignore"), "*\n");
-            FileStore { dir, swept: AtomicU64::new(0) }
+            if !dir.join(".gitignore").exists() {
+                let _ = std::fs::write(dir.join(".gitignore"), "*\n");
+            }
+            FileStore { dir, swept: AtomicU64::new(0), written: AtomicU64::new(0) }
         });
         Store {
             ttl,
@@ -195,7 +223,9 @@ impl Store {
             let Some(id) = id else { return SessionData::default() };
             let Some(mut r) = files.read(&id) else { return SessionData::default() };
             let now = now_secs();
-            if now >= r.last + self.ttl.as_secs() || now >= r.created + MAX_LIFETIME.as_secs() {
+            if now >= r.last.saturating_add(self.ttl.as_secs())
+                || now >= r.created.saturating_add(MAX_LIFETIME.as_secs())
+            {
                 files.remove(&id);
                 return SessionData::default();
             }
@@ -281,10 +311,11 @@ impl Store {
         };
         let mut created = Instant::now();
         if let Some(old) = &s.id {
-            if let Some(e) = inner.map.remove(old) {
-                inner.bytes -= e.bytes;
-                created = e.created;
-            }
+            // Gone meanwhile (logged out, regenerated or expired by another
+            // request): saving would bring it back for whoever holds the old id.
+            let e = inner.map.remove(old)?;
+            inner.bytes -= e.bytes;
+            created = e.created;
         }
         let bytes = size(&s.values);
         if inner.map.len() >= MAX_SESSIONS || inner.bytes + bytes > MAX_BYTES {
@@ -314,9 +345,9 @@ impl Store {
         let now = now_secs();
         let mut created = now;
         if let Some(old) = &s.id {
-            if let Some(r) = files.read(old) {
-                created = r.created;
-            }
+            // As in the memory store: a session removed meanwhile stays removed.
+            let r = files.read(old)?;
+            created = r.created;
             if old != &new_id {
                 files.remove(old);
             }
@@ -359,6 +390,40 @@ mod tests {
         let cookie2 = store.save(s).unwrap();
         assert!(!cookie2.contains(&id));
         assert!(store.load(Some(&header)).id.is_none());
+    }
+
+    #[test]
+    fn a_logged_out_session_stays_gone() {
+        for dir in [None, Some(std::env::temp_dir().join(format!("phenix-sess-gone-{}", std::process::id())))] {
+            let store = Store::new(Duration::from_secs(60), false, dir.clone());
+            let mut s = SessionData::default();
+            s.values.insert("user".into(), "alice".into());
+            s.changed = true;
+            let cookie = store.save(s).unwrap();
+            let header = format!("PHXSESSID={}", cookie.split(['=', ';']).nth(1).unwrap());
+            // A slow request loads the session, then the user logs out.
+            let mut slow = store.load(Some(&header));
+            let mut logout = store.load(Some(&header));
+            logout.destroyed = true;
+            store.save(logout);
+            // The slow request finishes and saves: the session must not come back.
+            slow.values.insert("seen".into(), "1".into());
+            slow.changed = true;
+            assert!(store.save(slow).is_none());
+            assert!(store.load(Some(&header)).id.is_none());
+            if let Some(d) = dir {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+
+    #[test]
+    fn the_sweep_only_touches_session_files() {
+        assert!(is_session_file(&format!("{}.json", "a".repeat(64))));
+        assert!(is_session_file(&format!(".{}.json.{}", "b".repeat(64), "c".repeat(16))));
+        for other in ["phenix.toml", "app.db", ".gitignore", "x.json", "index.phx"] {
+            assert!(!is_session_file(other), "{other}");
+        }
     }
 
     #[test]

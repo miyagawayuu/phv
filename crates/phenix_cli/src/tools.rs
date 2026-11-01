@@ -12,11 +12,17 @@ const SKIP_DIRS: &[&str] = &["target", "vendor", ".git", ".jj", "node_modules"];
 pub fn collect(paths: &[PathBuf], want: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
     fn walk(dir: &Path, want: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
-        let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
-        entries.sort();
-        for p in entries {
+        // Links (symlinks, junctions) are not followed: a loop would never end,
+        // and `phenix fmt` must not rewrite files outside the tree it was given.
+        let mut entries: Vec<(PathBuf, std::fs::FileType)> =
+            rd.filter_map(|e| e.ok().and_then(|e| Some((e.path(), e.file_type().ok()?)))).collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (p, ty) in entries {
+            if ty.is_symlink() {
+                continue;
+            }
             let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            if p.is_dir() {
+            if ty.is_dir() {
                 if !SKIP_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
                     walk(&p, want, out);
                 }

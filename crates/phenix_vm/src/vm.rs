@@ -236,6 +236,21 @@ pub struct Vm {
     argbuf: Vec<Value>,
     /// Enum cases are singletons within one VM (one request).
     enum_cache: std::collections::HashMap<(u32, u32), Value>,
+    /// Objects created by this run. Reference counting cannot free cycles
+    /// (`$node->next = $node`), so their fields are cleared when the run ends.
+    objects: Vec<std::rc::Weak<RefCell<Object>>>,
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        for w in std::mem::take(&mut self.objects) {
+            if let Some(o) = w.upgrade() {
+                let fields = std::mem::take(&mut o.borrow_mut().fields);
+                drop(o);
+                drop(fields);
+            }
+        }
+    }
 }
 
 #[cold]
@@ -283,6 +298,7 @@ impl Vm {
             native_depth: 0,
             argbuf: Vec::new(),
             enum_cache: std::collections::HashMap::new(),
+            objects: Vec::new(),
         }
     }
 
@@ -510,9 +526,19 @@ impl Vm {
         Ok(())
     }
 
+    /// The per-run memory limit in bytes, if any.
+    pub fn memory_limit(&self) -> Option<usize> {
+        self.limits.max_memory
+    }
+
     /// The time limit as an instant (for code outside the interpreter loop, e.g. SQLite).
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    /// Checks the memory and time limits; long-running builtins call it as they go.
+    pub fn check_limits(&self) -> Result<(), VmError> {
+        self.after_builtin()
     }
 
     /// Runs after every builtin: builtins can take long or allocate a lot in one call.
@@ -874,8 +900,10 @@ impl Vm {
                                 _ => 24,
                             };
                         }
-                        if size > 1 << 20 {
-                            tri!(self.reserve(size));
+                        // Escaping can make a string up to 6 times longer (`"` -> `&quot;`).
+                        let need = if *html { size.saturating_mul(6) } else { size };
+                        if need > 1 << 12 {
+                            tri!(self.reserve(need));
                         }
                         let mut s = String::with_capacity(size);
                         for i in 0..*n {
@@ -1030,7 +1058,13 @@ impl Vm {
                     Instr::NewObject(d, class) => {
                         let fields =
                             prog.classes[*class as usize].fields.iter().map(|f| const_value(&f.default)).collect();
-                        reg!(*d) = Value::Object(Rc::new(RefCell::new(Object { class: *class, fields })));
+                        let o = Rc::new(RefCell::new(Object { class: *class, fields }));
+                        if self.objects.len() == self.objects.capacity() && self.objects.len() >= 1024 {
+                            // Forget objects that are already gone before the list grows.
+                            self.objects.retain(|w| w.strong_count() > 0);
+                        }
+                        self.objects.push(Rc::downgrade(&o));
+                        reg!(*d) = Value::Object(o);
                     }
                     Instr::GetProp(d, o, slot) => {
                         let v = match &reg!(*o) {
@@ -1197,6 +1231,17 @@ impl Vm {
 
                     Instr::Echo(r) => {
                         let v = reg!(*r).clone();
+                        // The output buffer grows with every echo; large pieces
+                        // (and escaping, up to 6x) are checked before they are added.
+                        let len = match &v {
+                            Value::Str(s) => s.len().saturating_mul(6),
+                            Value::Html(s) => s.len(),
+                            _ => 0,
+                        };
+                        let before = self.out.last().map(|o| o.buf.len()).unwrap_or(0);
+                        if len > 1 << 12 || before > 1 << 20 && before.next_power_of_two() < before + len + 64 {
+                            tri!(self.reserve(len.max(before)));
+                        }
                         self.echo(&v);
                     }
                     Instr::EchoHtml(c) => {

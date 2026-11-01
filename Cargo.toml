@@ -36,7 +36,7 @@ rusqlite = { version = "0.37", features = ["bundled", "limits", "hooks"] }
 toml = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-postcard = { version = "1", features = ["alloc"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 [profile.release]
 # Arithmetic bugs in the runtime become caught panics instead of silent wraps.

@@ -30,7 +30,8 @@ echo greet($name);                                 // Web ページでは自動�
   interface・abstract・enum・ジェネリック関数、`finally`
 - **セキュリティ**:
   - **XSS 対策**: 出力は自動でエスケープされる。加えて、エスケープでは守れない場所(引用符なしの属性、URL、
-    `<script>`)への挿入はコンパイルエラーになる。
+    `<script>`)への挿入はコンパイルエラーになる。URL には `safe_url()`、`<script>` には `json_html()` の値
+    (型 `SafeUrl` / `SafeJs`)だけを置ける。場所の判定はブラウザの HTML 構文解析に合わせている。
   - **SQL インジェクション対策**: SQL は `sql"..."` でしか書けない。
   - **CSRF 対策**: フォームの POST をサーバーが自動で検査する。
   - **CSP**: Content-Security-Policy が既定で有効。テンプレートの `<script>` には自動で nonce が付くので、
@@ -41,7 +42,7 @@ echo greet($name);                                 // Web ページでは自動�
     パスの検査と使用の間にすり替えられることもない。
   - **上限**: メモリ・時間・再帰の深さに上限がある。
   - **動的な実行がない**: `eval` や可変変数はない。
-  - 監査結果は [docs/security-audit.md](docs/security-audit.md) にある。
+  - 2 回の監査と脆弱性診断の結果は [docs/security-audit.md](docs/security-audit.md) にある。
 - **速度**: 型に特化したレジスタ型バイトコード VM、Cranelift による JIT、バイトコードのディスクキャッシュ
 - **ツール**: テストランナー、フォーマッタ、Language Server、パッケージマネージャ、PHP からの移行ツール
 

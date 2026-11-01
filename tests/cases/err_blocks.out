@@ -1,0 +1,15 @@
+error: the HTML in this block does not end where it started
+ --> err_blocks.phx:5:49
+  |
+5 | function head(): void { ?><script>var x = <?phx }
+  |                                                 ^
+  = note: close every tag, attribute and `<script>`/`<style>` opened inside a block, loop or function before it ends
+
+error: the HTML in this block does not end where it started
+ --> err_blocks.phx:6:46
+  |
+6 | foreach ([1] as $n): ?><script>var y = <?phx endforeach;
+  |                                              ^^^^^^^^^^
+  = note: close every tag, attribute and `<script>`/`<style>` opened inside a block, loop or function before it ends
+
+2 errors found

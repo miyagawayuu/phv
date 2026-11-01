@@ -107,7 +107,13 @@ impl Csp {
             Csp::Off => None,
             Csp::Policy(p) => {
                 let n = nonce.map(|n| format!("'nonce-{n}'")).unwrap_or_default();
-                Some(p.replace("{nonce}", &n).replace("  ", " ").replace(" ;", ";"))
+                // `'nonce-{nonce}'` (as written in the docs) and `{nonce}` both work.
+                Some(
+                    p.replace("'nonce-{nonce}'", "{nonce}")
+                        .replace("{nonce}", &n)
+                        .replace("  ", " ")
+                        .replace(" ;", ";"),
+                )
             }
         }
     }
@@ -179,14 +185,35 @@ impl Config {
 
 fn check_dir(kind: &str, d: &str) -> Result<(), String> {
     let p = Path::new(d);
+    // Each name must also be safe on Windows: `public./` would open `public/`.
     let ok = !d.is_empty()
         && !p.is_absolute()
-        && p.components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir));
+        && p.components().all(|c| match c {
+            std::path::Component::Normal(n) => n.to_str().is_some_and(phenix_std::safefs::valid_name),
+            std::path::Component::CurDir => true,
+            _ => false,
+        });
     if ok {
         Ok(())
     } else {
         Err(format!("[permissions].{kind}: \"{d}\" must be a directory inside the project (no `..`, not absolute)"))
     }
+}
+
+/// The lowercase names of a project-relative directory, for comparing paths.
+fn dir_names(d: &str) -> Vec<String> {
+    Path::new(d)
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_string_lossy().to_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether one directory is inside the other (or they are the same).
+fn overlaps(a: &[String], b: &[String]) -> bool {
+    a.iter().zip(b).all(|(x, y)| x == y)
 }
 
 /// Reads `<root>/phenix.toml` (all settings are optional).
@@ -246,17 +273,34 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
         Some(p) if p.contains(['\r', '\n']) => return Err("[security].csp must be on one line".into()),
         Some(p) => Csp::Policy(p.to_string()),
     };
+    // Session files hold logins: the directory must belong to the server alone
+    // (its sweep deletes old files), not to the project or to scripts.
     let session_dir = match file.security.session_store.as_deref() {
         None | Some("memory") => None,
         Some(d) => {
             check_dir("session_store", d).map_err(|e| e.replace("[permissions].", "[security]."))?;
-            let first = Path::new(d).components().find(|c| !matches!(c, std::path::Component::CurDir));
-            if first.is_some_and(|c| c.as_os_str().eq_ignore_ascii_case("public")) {
+            let names = dir_names(d);
+            if names.is_empty() {
+                return Err("[security].session_store: use a directory of its own, not the project root".into());
+            }
+            if names[0] == "public" {
                 return Err(format!("[security].session_store: \"{d}\" is inside public/, where files are served"));
+            }
+            let perms = file.permissions.read.iter().chain(file.permissions.write.iter());
+            if let Some(p) = perms.into_iter().find(|p| overlaps(&names, &dir_names(p))) {
+                return Err(format!(
+                    "[security].session_store: \"{d}\" overlaps [permissions] \"{p}\"; scripts could read or forge sessions"
+                ));
             }
             Some(root.join(d))
         }
     };
+    if !(1..=31_536_000).contains(&file.security.session_ttl) {
+        return Err("[security].session_ttl must be between 1 and 31536000 seconds".into());
+    }
+    if !(1..=1_048_576).contains(&file.security.memory_limit_mb) {
+        return Err("[security].memory_limit_mb must be between 1 and 1048576".into());
+    }
     let permissions =
         Permissions { read: file.permissions.read, write: file.permissions.write, env: file.permissions.env };
     Ok(Config {
@@ -271,4 +315,42 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
         session_dir,
         dependencies: file.dependencies,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load(toml: &str) -> Result<Config, String> {
+        let dir = std::env::temp_dir().join(format!("phenix-config-{}-{}", std::process::id(), toml.len()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("phenix.toml"), toml).unwrap();
+        let r = load_config(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+
+    #[test]
+    fn refuses_unsafe_directories() {
+        // Windows drops trailing dots and spaces: these name public/ or the root.
+        for bad in ["public.", "public ", "...", ". ", ".. ", "data:x", "CON"] {
+            assert!(load(&format!("[permissions]\nwrite = [\"{bad}/\"]\n")).is_err(), "{bad}");
+        }
+        // The session store needs a directory of its own.
+        for bad in [".", "./", "public/sessions", "data/", "data/sessions", "public./s"] {
+            let toml = format!("[security]\nsession_store = \"{bad}\"\n[permissions]\nwrite = [\"data/\"]\n");
+            assert!(load(&toml).is_err(), "{bad}");
+        }
+        let ok = load("[security]\nsession_store = \"sessions/\"\n[permissions]\nwrite = [\"data/\"]\n").unwrap();
+        assert!(ok.session_dir.is_some());
+        assert!(load("[security]\nsession_ttl = 99999999999\n").is_err());
+        assert!(load("[security]\nmemory_limit_mb = 0\n").is_err());
+    }
+
+    #[test]
+    fn nonce_placeholder_in_both_forms() {
+        let n = Some("abc");
+        assert_eq!(Csp::Policy("script-src {nonce}".into()).header(n).unwrap(), "script-src 'nonce-abc'");
+        assert_eq!(Csp::Policy("script-src 'nonce-{nonce}'".into()).header(n).unwrap(), "script-src 'nonce-abc'");
+    }
 }

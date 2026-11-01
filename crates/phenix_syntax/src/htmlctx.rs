@@ -1,13 +1,42 @@
 //! Tracks where in an HTML document a `<?= ?>` appears, so the type checker
 //! can refuse insertions that HTML escaping does not make safe (unquoted
 //! attributes, URLs, `<script>`, `<style>`, event handler attributes).
+//!
+//! The tracker follows the parts of the WHATWG tokenizer that decide where
+//! text ends up: raw-text elements and their end tags, the escaped states of
+//! `<script>`, comments (including `<!-->` and `--!>`), bogus comments, and
+//! foreign content (`<svg>`, `<math>`). When it cannot be sure, it reports
+//! the stricter context.
 
 use crate::ast::EchoContext;
+
+/// What is known about the start of a URL attribute's value.
+#[derive(Clone, Debug, PartialEq)]
+enum UrlState {
+    /// Only this literal text so far; the scheme is not decided yet.
+    Undecided(String),
+    /// The scheme is decided (`https:`, a relative path, or an inserted safe URL).
+    Safe,
+    /// A `javascript:`, `vbscript:` or `data:` URL written in the template.
+    Script,
+}
+
+impl UrlState {
+    fn rank(&self) -> u8 {
+        match self {
+            UrlState::Safe => 0,
+            UrlState::Undecided(_) => 1,
+            UrlState::Script => 2,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 enum State {
     Text,
     Comment,
+    /// `<!x ...>`, `<?x ...>`, `</ ...>`: ignored up to the next `>`.
+    Bogus,
     /// Inside `<tag ...>` between attributes.
     Tag {
         name: String,
@@ -29,65 +58,183 @@ enum State {
         closing: bool,
         name: String,
         quote: char,
-        empty: bool,
+        /// Set for attributes whose value is a URL.
+        url: Option<UrlState>,
     },
     Unquoted {
         tag: String,
         closing: bool,
         name: String,
     },
-    /// Raw text of `<script>` or `<style>` until its end tag.
-    Raw(String),
+    /// Text of an element that ends only at its end tag. For `<script>`,
+    /// `escape` is 1 after `<!--` and 2 in the "double escaped" state, where
+    /// `</script>` does not end the script.
+    Raw {
+        tag: String,
+        escape: u8,
+    },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HtmlTracker {
     state: State,
     /// Text of a tag name being read after `<`.
     pending: Option<String>,
+    /// Depth of `<svg>` / `<math>` (foreign content has no RCDATA elements).
+    foreign: u32,
 }
 
 impl Default for HtmlTracker {
     fn default() -> Self {
-        HtmlTracker { state: State::Text, pending: None }
+        HtmlTracker { state: State::Text, pending: None, foreign: 0 }
     }
 }
 
-const URL_ATTRS: &[&str] =
-    &["href", "src", "action", "formaction", "xlink:href", "poster", "data", "cite", "background", "ping", "srcset"];
+const URL_ATTRS: &[&str] = &[
+    "href",
+    "src",
+    "action",
+    "formaction",
+    "xlink:href",
+    "poster",
+    "data",
+    "cite",
+    "background",
+    "ping",
+    "srcset",
+    "manifest",
+    "codebase",
+    "longdesc",
+    "lowsrc",
+    "dynsrc",
+];
+
+/// SVG animation elements can set `href` to their `to`/`from`/`values`.
+const ANIMATION_TAGS: &[&str] = &["animate", "set", "animatemotion", "animatetransform"];
+
+fn is_url_attr(tag: &str, name: &str) -> bool {
+    URL_ATTRS.contains(&name)
+        || (ANIMATION_TAGS.contains(&tag) && matches!(name, "to" | "from" | "values" | "by" | "attributename"))
+}
+
+/// Elements whose content is not parsed as markup, in HTML (not foreign) content.
+const RAW_TAGS: &[&str] =
+    &["script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "noscript", "plaintext"];
+
+/// Decides a URL from the literal text at its start. Browsers strip leading
+/// spaces and controls and decode character references, so `&` leaves it
+/// undecided (`&#106;avascript:` is `javascript:`).
+fn decide_url(prefix: &str) -> Option<UrlState> {
+    let mut scheme = String::new();
+    for c in prefix.chars() {
+        if c.is_ascii_whitespace() || c.is_control() {
+            continue;
+        }
+        match c {
+            '/' | '?' | '#' => return Some(UrlState::Safe),
+            ':' => {
+                let s = scheme.to_ascii_lowercase();
+                return Some(if matches!(s.as_str(), "javascript" | "vbscript" | "data") {
+                    UrlState::Script
+                } else {
+                    UrlState::Safe
+                });
+            }
+            '&' => return None,
+            c => scheme.push(c),
+        }
+    }
+    None
+}
+
+fn is_delim(c: Option<&char>) -> bool {
+    matches!(c, Some(c) if c.is_ascii_whitespace() || *c == '/' || *c == '>')
+}
 
 impl HtmlTracker {
     /// The context a value inserted at the current position lands in.
     pub fn context(&self) -> EchoContext {
+        if self.pending.is_some() {
+            return EchoContext::Tag;
+        }
         match &self.state {
-            State::Text | State::Comment => EchoContext::Text,
-            State::Raw(t) if t == "script" => EchoContext::Script,
-            State::Raw(_) => EchoContext::Style,
+            State::Text | State::Comment | State::Bogus => EchoContext::Text,
+            State::Raw { tag, .. } if tag == "script" => EchoContext::Script,
+            State::Raw { tag, .. } if tag == "style" => EchoContext::Style,
+            State::Raw { .. } => EchoContext::Text,
             State::Tag { .. } | State::AttrName { .. } => EchoContext::Tag,
             State::BeforeValue { .. } | State::Unquoted { .. } => EchoContext::Unquoted,
-            State::Quoted { name, empty, .. } => {
+            State::Quoted { name, url, .. } => {
                 if name.starts_with("on") {
                     EchoContext::Handler
                 } else if name == "style" {
                     EchoContext::Style
-                } else if *empty && URL_ATTRS.contains(&name.as_str()) {
-                    EchoContext::Url
+                } else if name == "srcdoc" {
+                    EchoContext::Srcdoc
                 } else {
-                    EchoContext::Attr
+                    match url {
+                        Some(UrlState::Undecided(_)) => EchoContext::Url,
+                        Some(UrlState::Script) => EchoContext::ScriptUrl,
+                        _ => EchoContext::Attr,
+                    }
                 }
             }
         }
     }
 
-    /// Records that a value was inserted (an attribute value is no longer empty).
+    /// Records that a value was inserted. In a URL attribute the inserted
+    /// value (a checked `SafeUrl` or a number) decides the scheme.
     pub fn inserted(&mut self) {
-        if let State::Quoted { empty, .. } = &mut self.state {
-            *empty = false;
+        if let State::Quoted { url: Some(u @ UrlState::Undecided(_)), .. } = &mut self.state {
+            *u = UrlState::Safe;
         }
     }
 
+    /// After a block that may run zero or more times: true if it ended in the
+    /// same place it started. The state is then merged with `entry`, keeping
+    /// whichever URL start is less decided.
+    pub fn end_block(&mut self, entry: &HtmlTracker) -> bool {
+        // An attribute name or unquoted value in progress is "between attributes".
+        fn norm(s: &State) -> State {
+            match s {
+                State::AttrName { tag, closing, .. } | State::Unquoted { tag, closing, .. } => {
+                    State::Tag { name: tag.clone(), closing: *closing }
+                }
+                s => s.clone(),
+            }
+        }
+        let same = match (&mut self.state, &entry.state) {
+            (
+                State::Quoted { tag: t1, closing: c1, name: n1, quote: q1, url: u1 },
+                State::Quoted { tag: t2, closing: c2, name: n2, quote: q2, url: u2 },
+            ) => {
+                let same = t1 == t2 && c1 == c2 && n1 == n2 && q1 == q2 && u1.is_some() == u2.is_some();
+                if same {
+                    if let (Some(a), Some(b)) = (u1.as_ref(), u2.as_ref()) {
+                        if b.rank() > a.rank() {
+                            *u1 = Some(b.clone());
+                        }
+                    }
+                }
+                same
+            }
+            (a, b) => {
+                let same = norm(a) == norm(b);
+                if same {
+                    *a = b.clone();
+                }
+                same
+            }
+        };
+        same && self.pending == entry.pending && self.foreign == entry.foreign
+    }
+
     fn end_tag(&mut self, tag: String, closing: bool) {
-        self.state = if !closing && (tag == "script" || tag == "style") { State::Raw(tag) } else { State::Text };
+        if matches!(tag.as_str(), "svg" | "math") {
+            self.foreign = if closing { self.foreign.saturating_sub(1) } else { self.foreign + 1 };
+        }
+        let raw = if self.foreign > 0 { tag == "script" || tag == "style" } else { RAW_TAGS.contains(&tag.as_str()) };
+        self.state = if !closing && raw { State::Raw { tag, escape: 0 } } else { State::Text };
     }
 
     /// Advances over literal HTML. Returns the byte offsets just after the
@@ -95,6 +242,10 @@ impl HtmlTracker {
     pub fn feed(&mut self, text: &str) -> Vec<usize> {
         let chars: Vec<char> = text.chars().collect();
         let offsets: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+        let starts = |i: usize, s: &str| -> bool {
+            let n = s.chars().count();
+            i + n <= chars.len() && chars[i..i + n].iter().collect::<String>().eq_ignore_ascii_case(s)
+        };
         let mut scripts = Vec::new();
         let mut i = 0;
         while i < chars.len() {
@@ -120,41 +271,88 @@ impl HtmlTracker {
             let state = std::mem::replace(&mut self.state, State::Text);
             self.state = match state {
                 State::Text => {
-                    if c == '<' {
-                        let rest: String = chars[i + 1..].iter().take(3).collect();
-                        if rest.starts_with("!--") {
-                            i += 3;
-                            State::Comment
-                        } else if chars.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic() || *n == '/') {
-                            self.pending = Some(String::new());
-                            if chars[i + 1] == '/' {
-                                self.pending = Some("/".into());
-                                i += 1;
-                            }
+                    if c != '<' {
+                        State::Text
+                    } else if starts(i, "<!--") {
+                        // `<!-->` and `<!--->` are complete (empty) comments.
+                        if chars.get(i + 4) == Some(&'>') {
+                            i += 4;
+                            State::Text
+                        } else if starts(i + 4, "->") {
+                            i += 5;
                             State::Text
                         } else {
-                            State::Text
+                            i += 3;
+                            State::Comment
                         }
                     } else {
-                        State::Text
+                        match chars.get(i + 1) {
+                            Some(n) if n.is_ascii_alphabetic() => {
+                                self.pending = Some(String::new());
+                                State::Text
+                            }
+                            Some('/') => match chars.get(i + 2) {
+                                Some(n) if n.is_ascii_alphabetic() => {
+                                    self.pending = Some("/".into());
+                                    i += 1;
+                                    State::Text
+                                }
+                                Some('>') => {
+                                    i += 2;
+                                    State::Text
+                                }
+                                _ => {
+                                    i += 1;
+                                    State::Bogus
+                                }
+                            },
+                            Some('!') | Some('?') => State::Bogus,
+                            _ => State::Text,
+                        }
                     }
                 }
                 State::Comment => {
-                    if c == '-' && chars.get(i + 1) == Some(&'-') && chars.get(i + 2) == Some(&'>') {
+                    if starts(i, "-->") {
                         i += 2;
+                        State::Text
+                    } else if starts(i, "--!>") {
+                        i += 3;
                         State::Text
                     } else {
                         State::Comment
                     }
                 }
-                State::Raw(tag) => {
-                    let end = format!("</{tag}");
-                    let ahead: String = chars[i..].iter().take(end.len()).collect::<String>().to_ascii_lowercase();
-                    if ahead == end {
-                        i += end.len() - 1;
-                        State::Tag { name: tag, closing: true }
+                State::Bogus => {
+                    if c == '>' {
+                        State::Text
                     } else {
-                        State::Raw(tag)
+                        State::Bogus
+                    }
+                }
+                State::Raw { tag, escape } => {
+                    let end = format!("</{tag}");
+                    let n = end.len();
+                    if starts(i, &end) && is_delim(chars.get(i + n)) {
+                        if tag == "script" && escape == 2 {
+                            i += n - 1;
+                            State::Raw { tag, escape: 1 }
+                        } else {
+                            i += n - 1;
+                            State::Tag { name: tag, closing: true }
+                        }
+                    } else if tag != "script" {
+                        State::Raw { tag, escape }
+                    } else if escape == 0 && starts(i, "<!--") {
+                        i += 3;
+                        State::Raw { tag, escape: 1 }
+                    } else if escape > 0 && starts(i, "-->") {
+                        i += 2;
+                        State::Raw { tag, escape: 0 }
+                    } else if escape == 1 && starts(i, "<script") && is_delim(chars.get(i + 7)) {
+                        i += 6;
+                        State::Raw { tag, escape: 2 }
+                    } else {
+                        State::Raw { tag, escape }
                     }
                 }
                 State::Tag { name, closing } => {
@@ -175,8 +373,9 @@ impl HtmlTracker {
                         self.end_tag(tag, closing);
                         i += 1;
                         continue;
-                    } else if c.is_whitespace() {
-                        // `name =value` is rare; treat a space as the end of a valueless attribute.
+                    } else if c.is_whitespace() || c == '/' {
+                        // `name =value` is rare; a space ends a valueless attribute
+                        // unless `=` follows.
                         let next = chars[i..].iter().find(|c| !c.is_whitespace());
                         if next == Some(&'=') {
                             State::AttrName { tag, closing, name }
@@ -190,7 +389,8 @@ impl HtmlTracker {
                 }
                 State::BeforeValue { tag, closing, name } => {
                     if c == '"' || c == '\'' {
-                        State::Quoted { tag, closing, name, quote: c, empty: true }
+                        let url = is_url_attr(&tag, &name).then(|| UrlState::Undecided(String::new()));
+                        State::Quoted { tag, closing, name, quote: c, url }
                     } else if c.is_whitespace() {
                         State::BeforeValue { tag, closing, name }
                     } else if c == '>' {
@@ -201,11 +401,19 @@ impl HtmlTracker {
                         State::Unquoted { tag, closing, name }
                     }
                 }
-                State::Quoted { tag, closing, name, quote, empty } => {
+                State::Quoted { tag, closing, name, quote, mut url } => {
                     if c == quote {
                         State::Tag { name: tag, closing }
                     } else {
-                        State::Quoted { tag, closing, name, quote, empty: empty && c.is_whitespace() }
+                        if let Some(UrlState::Undecided(p)) = &mut url {
+                            if p.len() < 256 {
+                                p.push(c);
+                            }
+                            if let Some(d) = decide_url(p) {
+                                url = Some(d);
+                            }
+                        }
+                        State::Quoted { tag, closing, name, quote, url }
                     }
                 }
                 State::Unquoted { tag, closing, name } => {
@@ -256,6 +464,72 @@ mod tests {
     }
 
     #[test]
+    fn follows_the_browser_tokenizer() {
+        // An end tag needs a delimiter after its name.
+        assert_eq!(ctx("<script>var a = \"</scripts>\"; var b = "), EchoContext::Script);
+        // Comments that browsers close early.
+        assert_eq!(ctx("<!--><script>var c = "), EchoContext::Script);
+        assert_eq!(ctx("<!---><script>var c = "), EchoContext::Script);
+        assert_eq!(ctx("<!-- --!><script>var d = "), EchoContext::Script);
+        // `<!--<script>` inside a script: `</script>` does not end it.
+        assert_eq!(ctx("<script><!--<script></script>var e = "), EchoContext::Script);
+        assert_eq!(ctx("<script><!--<script></script>--></script><p>"), EchoContext::Text);
+        // Raw-text and RCDATA elements hide markup.
+        assert_eq!(ctx("<textarea><a title=\"</textarea><script>var f = "), EchoContext::Script);
+        assert_eq!(ctx("<title><p title=\"</title><p>"), EchoContext::Text);
+        // In SVG, <title> is parsed as markup.
+        assert_eq!(ctx("<svg><title><script>var g = "), EchoContext::Script);
+        assert_eq!(ctx("<svg></svg><title><script>"), EchoContext::Text);
+        // Bogus comments end at the first `>`.
+        assert_eq!(ctx("<!DOCTYPE html><p>"), EchoContext::Text);
+        assert_eq!(ctx("<? x ><script>var h = "), EchoContext::Script);
+        // srcdoc is a document of its own.
+        assert_eq!(ctx("<iframe srcdoc=\""), EchoContext::Srcdoc);
+    }
+
+    #[test]
+    fn decides_url_starts_from_literal_text() {
+        assert_eq!(ctx("<a href=\" "), EchoContext::Url);
+        assert_eq!(ctx("<a href=\"&#x20;"), EchoContext::Url);
+        assert_eq!(ctx("<a href=\"j"), EchoContext::Url);
+        assert_eq!(ctx("<a href=\"&#106;"), EchoContext::Url);
+        assert_eq!(ctx("<a href=\"https://example.com/?q="), EchoContext::Attr);
+        assert_eq!(ctx("<a href=\"mailto:"), EchoContext::Attr);
+        assert_eq!(ctx("<a href=\"#"), EchoContext::Attr);
+        assert_eq!(ctx("<a href=\" JavaScript:go("), EchoContext::ScriptUrl);
+        assert_eq!(ctx("<a href=\"data:text/html,"), EchoContext::ScriptUrl);
+        assert_eq!(ctx("<svg><animate attributeName=\"href\" values=\""), EchoContext::Url);
+        let mut t = HtmlTracker::default();
+        t.feed("<a href=\"");
+        t.inserted();
+        t.feed("?page=");
+        assert_eq!(t.context(), EchoContext::Attr);
+    }
+
+    #[test]
+    fn checks_blocks() {
+        let mut t = HtmlTracker::default();
+        t.feed("<a href=\"");
+        let entry = t.clone();
+        t.feed("/x");
+        assert!(t.end_block(&entry));
+        // The block may not have run: the URL start is still undecided.
+        assert_eq!(t.context(), EchoContext::Url);
+        let mut t = HtmlTracker::default();
+        let entry = t.clone();
+        t.feed("<script>var x = ");
+        assert!(!t.end_block(&entry));
+        // `<option <?phx if (...): ?>selected<?phx endif; ?>>` is fine.
+        let mut t = HtmlTracker::default();
+        t.feed("<option value=\"1\" ");
+        let entry = t.clone();
+        t.feed("selected");
+        assert!(t.end_block(&entry));
+        t.feed(">");
+        assert_eq!(t.context(), EchoContext::Text);
+    }
+
+    #[test]
     fn finds_script_tags() {
         let mut t = HtmlTracker::default();
         let html = "<p>é</p><SCRIPT src=a.js></script><!-- <script> --><p title=\"<script\"></p><script>";
@@ -263,5 +537,8 @@ mod tests {
         assert_eq!(at.len(), 2);
         assert_eq!(&html[..at[0]], "<p>é</p><SCRIPT");
         assert_eq!(&html[at[1]..], ">");
+        // `<script` inside a textarea is text, not a tag.
+        let mut t = HtmlTracker::default();
+        assert!(t.feed("<textarea><script></textarea>").is_empty());
     }
 }

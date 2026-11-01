@@ -4,6 +4,13 @@ https://example.com/?a=1&amp;b=&lt;x&gt; /post?id=2 #
 <b></b>
 deep ok
 equal
+refused
+refused
+refused
+refused
+refused
+local ok
+equal
 
 --- runtime error ---
 Fatal error: allowed memory size of 4096 MB exhausted

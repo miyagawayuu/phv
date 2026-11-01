@@ -56,11 +56,20 @@ impl Diagnostic {
 ///    |      ^^^^^^^ no implicit conversion
 ///    = note: ...
 /// ```
+/// Messages shown at most; the rest are counted. Generated or hostile source
+/// can produce thousands, and each one quotes a line.
+const MAX_SHOWN: usize = 50;
+/// Characters of a source line shown around the error.
+const LINE_WINDOW: usize = 160;
+
 pub fn render(sources: &SourceMap, diags: &[Diagnostic], color: bool) -> String {
     let mut out = String::new();
-    for d in diags {
+    for d in diags.iter().take(MAX_SHOWN) {
         render_one(&mut out, sources, d, color);
         out.push('\n');
+    }
+    if diags.len() > MAX_SHOWN {
+        let _ = writeln!(out, "... and {} more\n", diags.len() - MAX_SHOWN);
     }
     out
 }
@@ -80,14 +89,18 @@ fn render_one(out: &mut String, sources: &SourceMap, d: &Diagnostic, color: bool
     let _ = writeln!(out, "{pad}{blue}-->{reset} {}:{}:{}", file.name, line, col);
     let _ = writeln!(out, "{pad} {blue}|{reset}");
     let text = file.line_text(line);
-    let _ = writeln!(out, "{blue}{line} |{reset} {text}");
     let (end_line, end_col) = file.line_col(d.span.end.max(d.span.start));
-    let width = if end_line == line {
-        end_col.saturating_sub(col).max(1)
-    } else {
-        text.chars().count().saturating_sub(col - 1).max(1)
-    };
-    let _ = write!(out, "{pad} {blue}|{reset} {}{red}{}{reset}", " ".repeat(col - 1), "^".repeat(width));
+    let len = text.chars().count();
+    let mut width =
+        if end_line == line { end_col.saturating_sub(col).max(1) } else { len.saturating_sub(col - 1).max(1) };
+    // Long lines are shown as a window around the error.
+    let from = if len > LINE_WINDOW { (col - 1).saturating_sub(LINE_WINDOW / 3) } else { 0 };
+    let shown: String = text.chars().skip(from).take(LINE_WINDOW).collect();
+    let (before, after) = (if from > 0 { "..." } else { "" }, if from + LINE_WINDOW < len { "..." } else { "" });
+    let _ = writeln!(out, "{blue}{line} |{reset} {before}{shown}{after}");
+    let caret = col - 1 - from + before.len();
+    width = width.min(LINE_WINDOW.saturating_sub(col - 1 - from)).max(1);
+    let _ = write!(out, "{pad} {blue}|{reset} {}{red}{}{reset}", " ".repeat(caret), "^".repeat(width));
     if let Some(label) = &d.label {
         let _ = write!(out, " {red}{label}{reset}");
     }

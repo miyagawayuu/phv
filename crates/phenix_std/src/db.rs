@@ -131,8 +131,15 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
     // Single strings/blobs and statements are bounded (e.g. `zeroblob(1e9)`).
     c.set_limit(Limit::SQLITE_LIMIT_LENGTH, 32 * 1024 * 1024).map_err(|e| db_error(vm, e))?;
     c.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 1024 * 1024).map_err(|e| db_error(vm, e))?;
-    // A process-wide cap on SQLite's own memory.
-    c.execute_batch("PRAGMA hard_heap_limit = 536870912").map_err(|e| db_error(vm, e))?;
+    // A process-wide cap on SQLite's own memory, and per connection a small
+    // page cache. An in-memory database lives entirely in memory, so it is
+    // bounded by the script's memory limit.
+    c.execute_batch("PRAGMA hard_heap_limit = 536870912; PRAGMA cache_size = -2000").map_err(|e| db_error(vm, e))?;
+    if dir.is_none() {
+        let pages = vm.memory_limit().unwrap_or(128 << 20) / 4096;
+        c.execute_batch(&format!("PRAGMA page_size = 4096; PRAGMA max_page_count = {pages}"))
+            .map_err(|e| db_error(vm, e))?;
+    }
     // Queries stop when the script's time limit is reached.
     if let Some(deadline) = vm.deadline() {
         c.progress_handler(10_000, Some(move || std::time::Instant::now() > deadline));
@@ -152,6 +159,10 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
                     "writable_schema",
                     "mmap_size",
                     "threads",
+                    // These would lift the memory caps set above.
+                    "cache_size",
+                    "max_page_count",
+                    "temp_store",
                 ];
                 if blocked.contains(&name.as_str()) {
                     Authorization::Deny

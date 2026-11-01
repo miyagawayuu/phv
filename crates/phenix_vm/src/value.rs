@@ -164,6 +164,10 @@ impl Drop for Value {
 /// Iterative, so deeply nested values cannot overflow the stack.
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     let mut work: Vec<(&Value, &Value)> = vec![(a, b)];
+    // Pairs of lists/maps already queued. Shared structure (`$a = [$a, $a]`)
+    // would otherwise be compared exponentially often; each pair is compared once.
+    let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut first_visit = |x: usize, y: usize| seen.insert((x, y));
     while let Some((a, b)) = work.pop() {
         let same = match (a, b) {
             (Value::Null, Value::Null) => true,
@@ -173,7 +177,7 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
             (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => (*x as f64) == *y,
             (Value::Str(x), Value::Str(y)) | (Value::Html(x), Value::Html(y)) => x == y,
             (Value::List(x), Value::List(y)) => {
-                if !Rc::ptr_eq(x, y) {
+                if !Rc::ptr_eq(x, y) && first_visit(Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize) {
                     if x.len() != y.len() {
                         return false;
                     }
@@ -182,7 +186,7 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
                 true
             }
             (Value::Map(x), Value::Map(y)) => {
-                if !Rc::ptr_eq(x, y) {
+                if !Rc::ptr_eq(x, y) && first_visit(Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize) {
                     if x.len() != y.len() {
                         return false;
                     }

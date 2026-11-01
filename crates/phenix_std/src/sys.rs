@@ -200,7 +200,7 @@ fn password_verify(password: &str, hash: &str) -> bool {
     // The cost comes from the stored hash; refuse values that would let a
     // planted hash use gigabytes of memory or minutes of CPU.
     let param = |name: &str| h.params.get_decimal(name).unwrap_or(0);
-    if param("m") > 256 * 1024 || param("t") > 16 || param("p") > 16 {
+    if param("m") > 64 * 1024 || param("t") > 8 || param("p") > 4 {
         return false;
     }
     argon2::Argon2::default().verify_password(password.as_bytes(), &h).is_ok()
@@ -218,7 +218,10 @@ fn permission_error(vm: &Vm, msg: String) -> VmError {
 /// name; the guard keeps it pinned while the file is used.
 pub fn resolve_path(vm: &Vm, rel: &str, write: bool) -> Result<(DirGuard, OsString), VmError> {
     let p = Path::new(rel);
+    // `Path` drops a trailing `/`, `/.` or `\`, so `x.phx/` would name `x.phx`.
+    let trailing = rel.ends_with(['/', '\\']) || rel.ends_with("/.") || rel.ends_with("\\.");
     let simple = !rel.is_empty()
+        && !trailing
         && !rel.contains('\0')
         && !p.is_absolute()
         && p.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
@@ -243,7 +246,18 @@ pub fn resolve_path(vm: &Vm, rel: &str, write: bool) -> Result<(DirGuard, OsStri
     let dir = dir.trim_end_matches('/');
     let inner = p.strip_prefix(dir).unwrap_or(p);
     let base = vm.host.root.join(dir);
-    safefs::open_parent(&base, inner).map_err(|e| fs_error(vm, rel, dir, e))
+    let (guard, name) = safefs::open_parent(&base, inner).map_err(|e| fs_error(vm, rel, dir, e))?;
+    // Checked on the final name every write goes to (file_put_contents,
+    // unlink, saveTo, Database::open), after the path is normalized.
+    if write && is_source_name(&name.to_string_lossy()) {
+        return Err(permission_error(vm, format!("scripts cannot write or delete Phenix source files (\"{rel}\")")));
+    }
+    Ok((guard, name))
+}
+
+fn is_source_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.ends_with(".phx") || lower.ends_with(".phx.html")
 }
 
 /// Turns a `safefs` refusal into the exception a script sees.
@@ -272,14 +286,6 @@ pub fn fs_error(vm: &Vm, rel: &str, dir: &str, e: FsError) -> VmError {
     }
 }
 
-fn refuse_code(vm: &Vm, rel: &str) -> Result<(), VmError> {
-    let lower = rel.to_ascii_lowercase();
-    if lower.ends_with(".phx") || lower.ends_with(".phx.html") {
-        return Err(permission_error(vm, format!("scripts cannot write Phenix source files (\"{rel}\")")));
-    }
-    Ok(())
-}
-
 fn env_allowed(vm: &Vm, name: &str) -> bool {
     vm.host.permissions.env.iter().any(|pat| match pat.strip_suffix('*') {
         Some(prefix) => name.starts_with(prefix),
@@ -305,13 +311,22 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "mktime" => |vm, a| {
             let n: Vec<i64> = a.iter().map(int).collect();
-            let d = NaiveDate::from_ymd_opt(n[5] as i32, n[3] as u32, n[4] as u32)
-                .and_then(|d| d.and_hms_opt(n[0] as u32, n[1] as u32, n[2] as u32))
+            // Out-of-range parts are an error, not silently wrapped (`as` would wrap).
+            let u = |i: usize| u32::try_from(n[i]).ok();
+            let d = i32::try_from(n[5])
+                .ok()
+                .zip(u(3).zip(u(4)))
+                .and_then(|(y, (m, day))| NaiveDate::from_ymd_opt(y, m, day))
+                .and_then(|d| d.and_hms_opt(u(0)?, u(1)?, u(2)?))
                 .and_then(|d| Local.from_local_datetime(&d).earliest());
             d.map(|d| Value::Int(d.timestamp())).ok_or_else(|| vm.throw("ValueError", "invalid date"))
         },
         "checkdate" => |_, a| {
-            let ok = NaiveDate::from_ymd_opt(int(&a[2]) as i32, int(&a[0]) as u32, int(&a[1]) as u32).is_some();
+            let part = |i: usize| u32::try_from(int(&a[i])).ok();
+            let ok = i32::try_from(int(&a[2]))
+                .ok()
+                .zip(part(0).zip(part(1)))
+                .is_some_and(|(y, (m, d))| NaiveDate::from_ymd_opt(y, m, d).is_some());
             Ok(Value::Bool(ok))
         },
         "strtotime" => |_, a| Ok(strtotime(s(&a[0])).map(Value::Int).unwrap_or(Value::Null)),
@@ -390,7 +405,6 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "file_put_contents" => |vm, a| {
             let rel = s(&a[0]).to_string();
-            refuse_code(vm, &rel)?;
             let (dir, name) = resolve_path(vm, &rel, true)?;
             let mut f = dir.open(&name, true).map_err(|e| fs_error(vm, &rel, "", e))?;
             f.write_all(s(&a[1]).as_bytes()).map_err(|e| io_error(vm, "cannot write", &rel, e))?;

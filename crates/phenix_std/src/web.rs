@@ -383,10 +383,6 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             ))
         },
         "__upload_save" => |vm, a| {
-            let name = s(&a[1]).to_ascii_lowercase();
-            if name.ends_with(".phx") || name.ends_with(".phx.html") {
-                return Err(vm.throw("PermissionError", "uploads cannot be saved as .phx files"));
-            }
             let i = int(&a[0]) as usize;
             let rel = s(&a[1]).to_string();
             let (dir, name) = crate::sys::resolve_path(vm, &rel, true)?;

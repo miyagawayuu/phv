@@ -117,8 +117,7 @@ export class Response {
      * rejected (open-redirect protection); use redirectExternal() for those.
      */
     public function redirect(string $path, int $code = 302): void {
-        $ok = $path->startsWith("/") && !$path->startsWith("//") && !$path->startsWith("/\\");
-        if (!$ok) {
+        if (!__is_local_path($path)) {
             throw new ValueError("redirect() only accepts paths on this site; use redirectExternal()");
         }
         __resp_status($code);
@@ -127,7 +126,7 @@ export class Response {
 
     /** Redirects to an absolute http(s) URL on another site. */
     public function redirectExternal(string $url, int $code = 302): void {
-        if (!$url->startsWith("https://") && !$url->startsWith("http://")) {
+        if (!__is_http_url($url)) {
             throw new ValueError("redirectExternal() needs an http:// or https:// URL");
         }
         __resp_status($code);

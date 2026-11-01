@@ -189,3 +189,32 @@ fn file_sessions_survive_a_restart() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn scripts_cannot_write_source_files() {
+    let dir = std::env::temp_dir().join(format!("phenix-http-src-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phenix.toml", "[security]\ncsrf = false\n[permissions]\nwrite = [\"views/\"]\n");
+    write(&dir, "views/page.phx.html", "original");
+    write(
+        &dir,
+        "public/index.phx",
+        "<?phx\nimport std.http.request;\n$p = request()->query(\"p\") ?? \"\";\ntry {\n    file_put_contents($p, \"<?= getenv(\\\"PATH\\\") ?>\");\n    echo \"wrote\";\n} catch (PermissionError $e) {\n    echo \"refused\";\n}\n",
+    );
+    let addr = start(&dir);
+    for p in [
+        "views/page.phx.html",
+        "views/page.phx.html/",
+        "views/page.phx.html/.",
+        "views/x.phx/",
+        "views/X.PHX",
+        "views/a.phx::$DATA",
+        "views/b.phx.",
+    ] {
+        let url = format!("/?p={}", p.replace('/', "%2F").replace(':', "%3A").replace('$', "%24"));
+        assert_eq!(get(addr, &url, "").body, "refused", "{p}");
+    }
+    assert_eq!(std::fs::read_to_string(dir.join("views/page.phx.html")).unwrap(), "original");
+    assert_eq!(get(addr, "/?p=views%2Fnotes.txt", "").body, "wrote");
+    let _ = std::fs::remove_dir_all(&dir);
+}

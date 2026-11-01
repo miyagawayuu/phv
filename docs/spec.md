@@ -55,6 +55,8 @@ Phenix は、PHP の「保存してすぐ動く」「Web に特化」「HTML に
 | `null` | null だけの型。普通は `?T` の一部として使う |
 | `void` | 戻り値がないことを表す(戻り値の型にだけ使える) |
 | `Html` | 安全な HTML として扱ってよい文字列。`raw()`、`escape()`、テンプレートが作る |
+| `SafeUrl` | URL 属性の先頭に置いてよい `Html`。`safe_url()` が作る |
+| `SafeJs` | `<script>` の中に置いてよい `Html`。`json_html()` が作る |
 | `any` | どんな値でも入る。使う前に `is` で絞り込む必要がある |
 | `list<T>` | 要素の型が `T` の配列(0 から始まる連番) |
 | `map<K, V>` | 挿入順を保つ連想配列。`K` は `int` か `string` |
@@ -440,26 +442,39 @@ HTML 部分はそのまま出力される。`echo` と `<?= ?>` は同じ規則�
 - `escape($s)` / `htmlspecialchars($s)` … エスケープ済みの `Html` を返す。
 - `raw($s)` … 信頼できるマークアップを `Html` として扱う(XSS に注意して使う)。
 - `nl2br($s)` … エスケープしてから改行を `<br>` にした `Html`。
-- `safe_url($url)` … `http(s)`、`mailto`、`tel`、相対 URL だけを通し、`javascript:` などは `#` にした `Html`。
-- `json_html($value)` … `<script>` の中に置いても安全な JavaScript の値(JSON)を `Html` で返す。
+- `safe_url($url)` … `http(s)`、`mailto`、`tel`、相対 URL だけを通し、`javascript:` などは `#` にした `SafeUrl`。
+- `json_html($value)` … `<script>` の中に置いても安全な JavaScript の値(JSON)を `SafeJs` で返す。
+  文字列の `"` はそのままなので、属性値の中には置けない(コンパイルエラー。`escape(json_encode($v))` を使う)。
+- `SafeUrl` と `SafeJs` は `Html` としても使える(逆はできない)。`escape()` の結果は `Html` なので、
+  URL や `<script>` の中には置けない。HTML のエスケープでは `javascript:` やスクリプトのコードを止められないため。
 - `Html` と `string` は `.` で連結できない(エラーで `escape()` を案内する)。
-- エスケープを外す Content-Type は `text/plain`、`application/json`、`text/csv`、`text/css`、画像・音声・動画などに限る。
+- エスケープを外す Content-Type は `text/plain`、`application/json`、`text/csv`、`text/css`、`text/javascript`、
+  `text/markdown`、`text/calendar`、`application/pdf`、`application/octet-stream`、画像・音声・動画などに限る
+  (どれもブラウザが HTML として表示しない型。`X-Content-Type-Options: nosniff` も常に付く)。
   HTML・XML・SVG・知らない型ではエスケープしたまま。
 
 ### HTML の文脈の検査
 
-HTML エスケープが守れるのは、要素の中身と**引用符で囲んだ**属性値だけ。`<?= ?>` がそれ以外の場所にあると
-コンパイルエラーになる。
+HTML エスケープが守れるのは、要素の中身と**引用符で囲んだ**属性値だけ。`<?= ?>` と `echo` がそれ以外の場所に
+あるとコンパイルエラーになる。場所の判定はブラウザの構文解析(WHATWG)に合わせている:
+`<textarea>`・`<title>` などの中身、`<script>` の中の `<!--`、`<!-->` や `--!>` のコメント、`<svg>` の中、
+`</scripts>` のように終了タグに見えて違うもの。
 
 | 場所 | 例 | 扱い |
 |---|---|---|
 | 要素の中身・引用符付きの属性値 | `<p><?= $s ?></p>`、`title="<?= $s ?>"` | エスケープして出力 |
 | 引用符なしの属性値 | `href=<?= $u ?>` | エラー(引用符で囲む) |
 | タグの中(属性の間) | `<div <?= $attrs ?>>` | エラー |
-| URL 属性の先頭 | `href="<?= $u ?>"`、`src="<?= $u ?>"` | `string` はエラー。`safe_url($u)` を使う(`href="/post?id=<?= $id ?>"` のように途中なら可) |
-| `<script>` の中 | `var x = <?= $v ?>;` | `string` はエラー。`json_html($v)` を使う(数値は可) |
+| URL 属性の先頭 | `href="<?= $u ?>"`、`src="<?= $u ?>"` | `SafeUrl`(`safe_url($u)`)と数値だけ。前に書いた文字列に `/` `?` `#` `:` があれば先頭ではない(`href="/post?id=<?= $id ?>"` は可)。`href="j<?= ?>"` や `&#106;` のような文字参照だけでは先頭のまま |
+| `javascript:` / `data:` の URL | `href="javascript:go(<?= $v ?>)"` | エラー(数値は可) |
+| `<script>` の中 | `var x = <?= $v ?>;` | `SafeJs`(`json_html($v)`)と数値だけ |
 | `<style>`・`style="..."` | | エラー(数値は可) |
 | イベント属性 | `onclick="go(<?= $v ?>)"` | エラー。`data-*` 属性に入れて JavaScript から読む |
+| `<iframe srcdoc="...">` | | エラー(値が別の HTML 文書として解析される) |
+
+- 関数・クロージャの本体、`if`・ループのブロックは、始まったときと同じ HTML の状態で終わらなければならない
+  (`<script>` や属性をブロックの中で開いたまま終えるとエラー)。呼び出し順や繰り返しで文脈がずれるのを防ぐ。
+- 式と文の入れ子は 500 段まで(深すぎるソースで処理系のスタックがあふれるのを防ぐ)。
 
 ## 14. Web サーバー
 
@@ -549,6 +564,10 @@ session()->destroy();                 // ログアウト
 
 JavaScript から送るときは `csrf_token()` の値を `X-CSRF-Token` ヘッダーに入れる。
 JSON のリクエストは CORS のプリフライトが必要なので、ほかのサイトからは送れない。
+
+トークンはブラウザごとの Cookie(`PHXCSRF`)の HMAC なので、攻撃者がその Cookie を書き換えられないことが前提になる。
+本番では HTTPS で配信して `secure_cookies = true` にする(Cookie が `__Host-` 付きになり、平文の通信や
+サブドメインから上書きされなくなる)。
 `[security] csrf = false` で無効にできる。
 
 ### Cookie
@@ -626,10 +645,10 @@ $db->transaction(function () use ($db): void {
 
 ### Content-Security-Policy
 
-ページのレスポンスには既定で次のポリシーが付く(`{nonce}` はレスポンスごとの乱数)。
+ページのレスポンスには既定で次のポリシーが付く(`{nonce}` はレスポンスごとの `'nonce-...'`。`'nonce-{nonce}'` と書いても同じ)。
 
 ```
-default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'unsafe-inline';
+default-src 'self'; script-src 'self' {nonce}; style-src 'self' 'unsafe-inline';
 img-src 'self' data: https:; font-src 'self' data:; object-src 'none'; base-uri 'self';
 form-action 'self'; frame-ancestors 'self'
 ```
@@ -658,6 +677,9 @@ rate_limit_reset("login:" . request()->ip);
 
 - `rate_limit($key, $max, $seconds)` は、そのキーの今の時間枠でまだ `$max` 回に達していなければ 1 回数えて `true`、
   達していれば `false` を返す。カウンターはサーバープロセスの中で共有され、再起動で消える。
+- 同じキーでも時間枠の長さごとに別に数える(1 分 5 回と 1 日 50 回を両方かけられる)。キーが 10 万個を超えると、
+  上限に達していないものから捨てるので、大量のキーを使っても制限中のキーは外れない。
+- `requests_per_minute` は IPv6 のアドレスを /64 ごとにまとめて数える。
 - サイト全体の制限は `[security] requests_per_minute`(§14)。
 
 ### 権限(phenix.toml)
@@ -725,7 +747,7 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 | `range(int, int): list<int>` | 両端を含む |
 | `time(): int`, `microtime(): float` | 現在時刻 |
 | `rand(int, int): int` | 疑似乱数(暗号用途には使わない。`random_int` を使う) |
-| `json_decode(string): any`, `json_html(any): Html`, `safe_url(string): Html` | §13、§14 |
+| `json_decode(string): any`, `json_html(any): SafeJs`, `safe_url(string): SafeUrl` | §13、§14 |
 | `csrf_token(): string`, `csrf_field(): Html` | §14 |
 | `csp_nonce(): string` | このレスポンスの CSP の nonce(§14) |
 | `rate_limit(string, int, int): bool`, `rate_limit_reset(string)` | §14 |

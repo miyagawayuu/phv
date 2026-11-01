@@ -46,6 +46,11 @@ struct Parser {
     file: u32,
     is_template: bool,
     template_refs: Vec<(String, Span)>,
+    /// Current nesting of expressions and blocks (see `enter`).
+    depth: u32,
+    /// Set when the nesting limit was hit: the rest of the file is skipped and
+    /// no further errors are reported.
+    halted: bool,
 }
 
 const BP_IS: u8 = 31;
@@ -94,6 +99,9 @@ fn assign_op(tok: &Tok) -> Option<AssignOp> {
     })
 }
 
+/// Deepest nesting of expressions and blocks the parser accepts.
+const MAX_NESTING: u32 = 500;
+
 impl Parser {
     fn new(toks: Vec<Token>, file: u32, is_template: bool) -> Parser {
         Parser {
@@ -104,7 +112,27 @@ impl Parser {
             file,
             is_template,
             template_refs: Vec::new(),
+            depth: 0,
+            halted: false,
         }
+    }
+
+    /// Enters one level of nesting. The type checker and compiler recurse over
+    /// the tree, so very deep source (generated, or hostile) must be refused
+    /// here instead of overflowing their stacks.
+    fn enter(&mut self, extra: u32) -> PResult<()> {
+        if self.halted {
+            return Err(PErr);
+        }
+        if self.depth + extra >= MAX_NESTING {
+            let span = self.span();
+            self.diags
+                .push(Diagnostic::error(format!("code is nested too deeply (more than {MAX_NESTING} levels)"), span));
+            self.halted = true;
+            self.pos = self.toks.len() - 1;
+            return Err(PErr);
+        }
+        Ok(())
     }
 
     // ----- token helpers -------------------------------------------------
@@ -151,8 +179,10 @@ impl Parser {
     }
 
     fn error_here(&mut self, msg: impl Into<String>) -> PErr {
-        let span = self.span();
-        self.diags.push(Diagnostic::error(msg, span));
+        if !self.halted {
+            let span = self.span();
+            self.diags.push(Diagnostic::error(msg, span));
+        }
         PErr
     }
 
@@ -238,7 +268,41 @@ impl Parser {
     // ----- statements ----------------------------------------------------
 
     fn block_until(&mut self, ends: &[Tok]) -> Vec<Stmt> {
-        let mut stmts = Vec::new();
+        // A block may run any number of times (or not at all), so the HTML it
+        // writes must end where it started; otherwise the context of what
+        // follows depends on control flow the tracker cannot see.
+        let entry = (!ends.is_empty()).then(|| self.html.clone());
+        let stmts = self.block_stmts(ends);
+        if let Some(entry) = entry {
+            self.check_block_html(&entry);
+        }
+        stmts
+    }
+
+    fn check_block_html(&mut self, entry: &crate::htmlctx::HtmlTracker) {
+        if !self.html.end_block(entry) && !self.halted {
+            let span = self.span();
+            let mut d = Diagnostic::error("the HTML in this block does not end where it started", span);
+            d.add_note(
+                "close every tag, attribute and `<script>`/`<style>` opened inside a block, loop or function before it ends",
+            );
+            self.diags.push(d);
+            self.html = entry.clone();
+        }
+    }
+
+    fn block_stmts(&mut self, ends: &[Tok]) -> Vec<Stmt> {
+        let stmts = Vec::new();
+        if self.enter(0).is_err() {
+            return stmts;
+        }
+        self.depth += 1;
+        let stmts = self.block_stmts_inner(ends, stmts);
+        self.depth -= 1;
+        stmts
+    }
+
+    fn block_stmts_inner(&mut self, ends: &[Tok], mut stmts: Vec<Stmt>) -> Vec<Stmt> {
         loop {
             let tok = self.peek();
             if *tok == Tok::Eof || ends.contains(tok) {
@@ -273,8 +337,20 @@ impl Parser {
         if self.at(&Tok::LBrace) {
             self.block()
         } else {
-            Ok(vec![self.stmt()?])
+            let entry = self.html.clone();
+            let s = self.stmt()?;
+            self.check_block_html(&entry);
+            Ok(vec![s])
         }
+    }
+
+    /// A function or closure body: it can be called from anywhere, so its HTML
+    /// is tracked from a fresh document and must end in plain text.
+    fn body_block(&mut self) -> PResult<Vec<Stmt>> {
+        let outer = std::mem::take(&mut self.html);
+        let body = self.block();
+        self.html = outer;
+        body
     }
 
     fn stmt(&mut self) -> PResult<Stmt> {
@@ -298,9 +374,16 @@ impl Parser {
             }
             Tok::Echo => {
                 self.advance();
+                // `echo` between pieces of HTML lands in the same context as `<?= ?>`.
+                let ctx = self.html.context();
                 let exprs = self.expr_list()?;
                 self.semi()?;
-                StmtKind::Echo(exprs)
+                if ctx == EchoContext::Text {
+                    StmtKind::Echo(exprs)
+                } else {
+                    self.html.inserted();
+                    StmtKind::HtmlEcho(exprs, ctx)
+                }
             }
             Tok::If => return self.if_stmt(),
             Tok::While => {
@@ -627,7 +710,7 @@ impl Parser {
         }
         let params = self.params()?;
         let ret = if self.eat(&Tok::Colon) { Some(self.ty()?) } else { None };
-        let (body, is_abstract) = if self.eat(&Tok::Semi) { (Vec::new(), true) } else { (self.block()?, false) };
+        let (body, is_abstract) = if self.eat(&Tok::Semi) { (Vec::new(), true) } else { (self.body_block()?, false) };
         Ok(FunctionDecl {
             name,
             name_span,
@@ -931,8 +1014,20 @@ impl Parser {
     }
 
     fn expr_bp(&mut self, min_bp: u8) -> PResult<Expr> {
+        self.enter(0)?;
+        self.depth += 1;
+        let r = self.expr_bp_inner(min_bp);
+        self.depth -= 1;
+        r
+    }
+
+    fn expr_bp_inner(&mut self, min_bp: u8) -> PResult<Expr> {
         let mut lhs = self.unary()?;
+        // Each operator in a chain (`a + b + c ...`) nests the tree one level deeper.
+        let mut chain = 0;
         loop {
+            self.enter(chain)?;
+            chain += 1;
             let tok = self.peek().clone();
             if tok == Tok::Question && min_bp <= 1 {
                 self.advance();
@@ -980,6 +1075,14 @@ impl Parser {
     }
 
     fn unary(&mut self) -> PResult<Expr> {
+        self.enter(0)?;
+        self.depth += 1;
+        let r = self.unary_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn unary_inner(&mut self) -> PResult<Expr> {
         let start = self.span();
         let un = |op, e: Expr| ExprKind::Unary(op, Box::new(e));
         let kind = match self.peek().clone() {
@@ -1036,7 +1139,10 @@ impl Parser {
 
     fn postfix(&mut self) -> PResult<Expr> {
         let mut e = self.primary()?;
+        let mut chain = 0;
         loop {
+            self.enter(chain)?;
+            chain += 1;
             match self.peek().clone() {
                 Tok::LParen => {
                     let args = self.args()?;
@@ -1267,7 +1373,7 @@ impl Parser {
                     self.expect(Tok::RParen)?;
                 }
                 let ret = if self.eat(&Tok::Colon) { Some(self.ty()?) } else { None };
-                let body = self.block()?;
+                let body = self.body_block()?;
                 ExprKind::Closure(Box::new(Closure { params, ret, uses, body: ClosureBody::Block(body), arrow: false }))
             }
             Tok::Match => self.match_expr()?,
@@ -1280,7 +1386,12 @@ impl Parser {
         let (toks, diags) = lex(code, self.file, offset, Mode::Code);
         self.diags.extend(diags);
         let mut p = Parser::new(toks, self.file, false);
+        p.depth = self.depth;
         let e = p.expr();
+        if p.halted {
+            self.halted = true;
+            self.pos = self.toks.len() - 1;
+        }
         if e.is_ok() && !matches!(p.peek(), Tok::Eof) {
             let _ = p.error_here("unexpected tokens in string interpolation");
         }

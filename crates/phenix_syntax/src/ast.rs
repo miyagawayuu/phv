@@ -115,6 +115,10 @@ pub enum EchoContext {
     Style,
     /// An event handler attribute (`onclick="..."`).
     Handler,
+    /// A URL attribute that starts with `javascript:`, `vbscript:` or `data:`.
+    ScriptUrl,
+    /// `<iframe srcdoc="...">`: its value is parsed as an HTML document.
+    Srcdoc,
 }
 
 #[derive(Debug, Clone)]

@@ -335,7 +335,30 @@ mod imp {
     }
 
     pub fn open_subdir(_dir: &File, path: &Path, name: &OsStr) -> Result<File, FsError> {
-        open_dir(&path.join(name), false)
+        let f = open_dir(&path.join(name), false)?;
+        check_real_name(&f, name)?;
+        Ok(f)
+    }
+
+    /// The name must be the entry's own name, not an alias that Windows also
+    /// accepts (an 8.3 short name like `LONGTE~1.HTM`, or a different case is
+    /// fine). Otherwise checks on the name (like "no .phx") could be bypassed.
+    fn check_real_name(f: &File, name: &OsStr) -> Result<(), FsError> {
+        let real = final_path(f)?;
+        let real = real.file_name().map(|n| n.to_string_lossy().to_lowercase());
+        if real.as_deref() == Some(name.to_string_lossy().to_lowercase().as_str()) {
+            Ok(())
+        } else {
+            Err(FsError::BadName)
+        }
+    }
+
+    /// Opens an entry only to read its attributes and real name.
+    fn open_entry(g: &DirGuard, name: &OsStr) -> io::Result<File> {
+        OpenOptions::new()
+            .access_mode(0x80) // FILE_READ_ATTRIBUTES
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(g.path.join(name))
     }
 
     pub fn check_not_shared(_: &File) -> Result<(), FsError> {
@@ -361,19 +384,28 @@ mod imp {
         if f.metadata()?.file_attributes() & ATTR_REPARSE_POINT != 0 {
             return Err(FsError::Link);
         }
+        check_real_name(&f, name)?;
         Ok(f)
     }
 
     pub fn exists(g: &DirGuard, name: &OsStr) -> Result<bool, FsError> {
-        match std::fs::symlink_metadata(g.path.join(name)) {
-            Ok(m) if m.file_attributes() & ATTR_REPARSE_POINT != 0 => Err(FsError::Link),
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(FsError::Io(e)),
+        let f = match open_entry(g, name) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(FsError::Io(e)),
+        };
+        if f.metadata()?.file_attributes() & ATTR_REPARSE_POINT != 0 {
+            return Err(FsError::Link);
         }
+        check_real_name(&f, name)?;
+        Ok(true)
     }
 
     pub fn remove(g: &DirGuard, name: &OsStr) -> Result<(), FsError> {
+        // The directory is pinned, so the name still means the checked entry.
+        let f = open_entry(g, name)?;
+        check_real_name(&f, name)?;
+        drop(f);
         Ok(std::fs::remove_file(g.path.join(name))?)
     }
 
@@ -469,6 +501,28 @@ mod tests {
             let (g, name) = open_parent(&base, Path::new("fifo")).unwrap();
             assert!(matches!(g.open(&name, false), Err(FsError::NotFile)));
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refuses_short_name_aliases() {
+        let d = tmp("short");
+        let base = d.join("data");
+        std::fs::write(base.join("longtemplatename.phx.html"), "x").unwrap();
+        let out = std::process::Command::new("cmd").args(["/c", "dir", "/x"]).arg(&base).output().unwrap();
+        let listing = String::from_utf8_lossy(&out.stdout).into_owned();
+        let short = listing.split_whitespace().find(|w| w.contains('~')).map(str::to_string);
+        if let Some(short) = short {
+            let (g, name) = open_parent(&base, Path::new(&short)).unwrap();
+            assert!(matches!(g.open(&name, true), Err(FsError::BadName)), "{short}");
+            assert!(matches!(g.remove(&name), Err(FsError::BadName)));
+            assert!(matches!(g.exists(&name), Err(FsError::BadName)));
+        }
+        // Another case is the same entry, not an alias.
+        let (g, name) = open_parent(&base, Path::new("LONGTEMPLATENAME.PHX.HTML")).unwrap();
+        assert!(g.exists(&name).unwrap());
+        assert_eq!(std::fs::read_to_string(base.join("longtemplatename.phx.html")).unwrap(), "x");
         let _ = std::fs::remove_dir_all(&d);
     }
 

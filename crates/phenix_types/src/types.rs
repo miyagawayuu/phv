@@ -15,6 +15,10 @@ pub enum Type {
     /// The type of `throw` expressions: never produces a value.
     Never,
     Html,
+    /// `Html` that is also safe at the start of a URL attribute (from `safe_url()`).
+    SafeUrl,
+    /// `Html` that is also a safe JavaScript value inside `<script>` (from `json_html()`).
+    SafeJs,
     /// Top type; values must be narrowed with `is` before use.
     Any,
     /// Produced after a reported error, to avoid cascading messages.
@@ -37,6 +41,11 @@ pub enum Type {
 }
 
 impl Type {
+    /// `Html` or one of its more specific forms.
+    pub fn is_html(&self) -> bool {
+        matches!(self, Type::Html | Type::SafeUrl | Type::SafeJs)
+    }
+
     pub fn list(t: Type) -> Type {
         Type::List(Box::new(t))
     }
@@ -140,6 +149,8 @@ impl fmt::Display for TypeDisplay<'_> {
             Type::Void => write!(f, "void"),
             Type::Never => write!(f, "never"),
             Type::Html => write!(f, "Html"),
+            Type::SafeUrl => write!(f, "SafeUrl"),
+            Type::SafeJs => write!(f, "SafeJs"),
             Type::Any => write!(f, "any"),
             Type::Error => write!(f, "{{unknown}}"),
             Type::List(t) => write!(f, "list<{}>", t.display(self.names)),

@@ -154,6 +154,10 @@ fn json_string(text: &str, out: &mut String) {
 }
 
 fn json(vm: &Vm, v: &Value, out: &mut String, depth: usize) -> Result<(), VmError> {
+    // Shared lists make the output exponential in the input (`$a = [$a, $a]`).
+    if out.len() > 1 << 16 {
+        vm.check_limits()?;
+    }
     if depth > 128 {
         return Err(vm.throw("ValueError", "json_encode(): value is nested too deeply (or recursive)"));
     }
@@ -219,11 +223,14 @@ fn json(vm: &Vm, v: &Value, out: &mut String, depth: usize) -> Result<(), VmErro
     Ok(())
 }
 
-fn dump_value(vm: &Vm, v: &Value, out: &mut String, indent: usize) {
+fn dump_value(vm: &Vm, v: &Value, out: &mut String, indent: usize) -> Result<(), VmError> {
+    if out.len() > 1 << 16 {
+        vm.check_limits()?;
+    }
     let pad = "  ".repeat(indent);
     if indent > 32 {
         out.push_str("*RECURSION*\n");
-        return;
+        return Ok(());
     }
     match v {
         Value::Null => out.push_str("NULL\n"),
@@ -248,7 +255,7 @@ fn dump_value(vm: &Vm, v: &Value, out: &mut String, indent: usize) {
                 let _ = writeln!(out, "{pad}  [{i}]=>");
                 out.push_str(&pad);
                 out.push_str("  ");
-                dump_value(vm, x, out, indent + 1);
+                dump_value(vm, x, out, indent + 1)?;
             }
             let _ = writeln!(out, "{pad}}}");
         }
@@ -265,7 +272,7 @@ fn dump_value(vm: &Vm, v: &Value, out: &mut String, indent: usize) {
                 }
                 out.push_str(&pad);
                 out.push_str("  ");
-                dump_value(vm, x, out, indent + 1);
+                dump_value(vm, x, out, indent + 1)?;
             }
             let _ = writeln!(out, "{pad}}}");
         }
@@ -277,12 +284,13 @@ fn dump_value(vm: &Vm, v: &Value, out: &mut String, indent: usize) {
                 let _ = writeln!(out, "{pad}  [\"{}\"]=>", f.name);
                 out.push_str(&pad);
                 out.push_str("  ");
-                dump_value(vm, x, out, indent + 1);
+                dump_value(vm, x, out, indent + 1)?;
             }
             let _ = writeln!(out, "{pad}}}");
         }
         Value::Closure(_) => out.push_str("closure\n"),
     }
+    Ok(())
 }
 
 fn assert_impl(vm: &Vm, ok: bool, msg: String) -> R {
@@ -450,6 +458,13 @@ fn safe_url(url: &str) -> String {
     }
 }
 
+/// A path on this site, safe for `Location`. Browsers drop tabs and newlines
+/// from URLs and treat `\\` like `/`, so `/<TAB>/evil.com` or `/\\evil.com`
+/// would become the protocol-relative `//evil.com`.
+pub fn is_local_path(p: &str) -> bool {
+    p.starts_with('/') && !p.starts_with("//") && !p.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\')
+}
+
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
     core_lookup(name).or_else(|| web::lookup(name)).or_else(|| sys::lookup(name)).or_else(|| db::lookup(name))
 }
@@ -549,7 +564,7 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         },
         "dump" => |vm, a| {
             let mut out = String::new();
-            dump_value(vm, &a[0], &mut out, 0);
+            dump_value(vm, &a[0], &mut out, 0)?;
             vm.echo(&Value::str(out));
             Ok(Value::Null)
         },
@@ -636,10 +651,14 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             v.extend(list(&a[1]).iter().cloned());
             Ok(Value::list(v))
         },
-        "list_unique" => |_, a| {
+        "list_unique" => |vm, a| {
             let mut seen = HashSet::new();
             let mut out: Vec<Value> = Vec::new();
-            for x in list(&a[0]).iter() {
+            for (i, x) in list(&a[0]).iter().enumerate() {
+                // Lists and maps are compared pairwise (quadratic): watch the time limit.
+                if i % 1024 == 1023 {
+                    vm.check_limits()?;
+                }
                 let fresh = match x {
                     Value::Int(_) | Value::Str(_) => seen.insert(x.to_key()),
                     _ => !out.iter().any(|y| values_equal(x, y)),
@@ -713,10 +732,19 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             }
             Ok(Value::Bool(true))
         },
-        "list_join" => |_, a| {
+        "list_join" => |vm, a| {
             let sep = s(&a[1]);
-            let mut out = String::new();
-            for (i, x) in list(&a[0]).iter().enumerate() {
+            let items = list(&a[0]);
+            let total = items
+                .iter()
+                .map(|x| match x {
+                    Value::Str(t) | Value::Html(t) => t.len(),
+                    _ => 24,
+                })
+                .fold(sep.len().saturating_mul(items.len()), usize::saturating_add);
+            vm.reserve(total)?;
+            let mut out = String::with_capacity(total);
+            for (i, x) in items.iter().enumerate() {
                 if i > 0 {
                     out.push_str(sep);
                 }
@@ -746,6 +774,13 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         },
         "__req_method" => |vm, _| Ok(Value::str(vm.http.method.as_str())),
         "__req_ip" => |vm, _| Ok(Value::str(vm.http.remote_ip.as_str())),
+        "__is_local_path" => |_, a| Ok(Value::Bool(is_local_path(s(&a[0])))),
+        "__is_http_url" => |_, a| {
+            let u = s(&a[0]);
+            let lower = u.get(..8).unwrap_or(u).to_ascii_lowercase();
+            let scheme = lower.starts_with("https://") || lower.starts_with("http://");
+            Ok(Value::Bool(scheme && !u.chars().any(|c| c.is_control() || c.is_whitespace())))
+        },
         "csp_nonce" => |vm, _| Ok(Value::str(vm.http.csp_nonce.clone().unwrap_or_default())),
         "rate_limit" => |vm, a| {
             let (max, secs) = (int(&a[1]), int(&a[2]));

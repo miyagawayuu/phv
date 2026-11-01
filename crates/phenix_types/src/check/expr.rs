@@ -13,8 +13,10 @@ type Bindings = [Option<Type>; 4];
 
 fn unify(param: &Type, actual: &Type, b: &mut Bindings) {
     match (param, actual) {
+        // Indexes beyond the bindings (a function declared with too many type
+        // parameters, already reported) are left unbound.
         (Type::Generic(i), t) => {
-            let slot = &mut b[*i as usize];
+            let Some(slot) = b.get_mut(*i as usize) else { return };
             if slot.is_none() && !t.has_unknown() && *t != Type::Error && *t != Type::Never {
                 *slot = Some(t.clone());
             }
@@ -36,7 +38,10 @@ fn unify(param: &Type, actual: &Type, b: &mut Bindings) {
 
 fn subst(t: &Type, b: &Bindings) -> Type {
     match t {
-        Type::Generic(i) => b[*i as usize].clone().unwrap_or(Type::Infer),
+        Type::Generic(i) => match b.get(*i as usize) {
+            Some(bound) => bound.clone().unwrap_or(Type::Infer),
+            None => Type::Error,
+        },
         Type::List(x) => Type::list(subst(x, b)),
         Type::Map(k, v) => Type::map(subst(k, b), subst(v, b)),
         Type::Func(ps, r) => Type::Func(ps.iter().map(|p| subst(p, b)).collect(), Box::new(subst(r, b))),
@@ -102,6 +107,8 @@ impl<'a> Checker<'a> {
             (Type::Union(ms), _) => ms.iter().all(|m| self.assignable_inner(m, to, false)),
             (_, Type::Union(ts)) => ts.iter().any(|t| self.assignable_inner(from, t, coerce)),
             (Type::Int, Type::Float) => coerce,
+            // Context-checked HTML is still HTML (not the other way round).
+            (Type::SafeUrl | Type::SafeJs, Type::Html) => true,
             (Type::Class(a), Type::Class(b)) => self.is_subclass(*a, *b),
             (Type::List(a), Type::List(b)) => self.same(a, b),
             (Type::Map(k1, v1), Type::Map(k2, v2)) => self.same(k1, k2) && self.same(v1, v2),
@@ -211,7 +218,7 @@ impl<'a> Checker<'a> {
 
     pub(crate) fn check_printable(&mut self, h: &HExpr, what: &str) {
         let printable =
-            |t: &Type| matches!(t, Type::Str | Type::Int | Type::Float | Type::Html | Type::Error | Type::Never);
+            |t: &Type| t.is_html() || matches!(t, Type::Str | Type::Int | Type::Float | Type::Error | Type::Never);
         match &h.ty {
             t if t.members().iter().all(printable) && !t.members().is_empty() => {}
             Type::Never => {}
@@ -242,7 +249,7 @@ impl<'a> Checker<'a> {
                 let t = t.clone();
                 let e = self.error(msg, h.span);
                 match t {
-                    Type::Html => {
+                    t if t.is_html() => {
                         e.add_note("join two `Html` values with `.`, or use `(string)$html` to get the raw markup")
                     }
                     Type::Bool => e.add_note("use a ternary, e.g. `$ok ? \"yes\" : \"no\"`"),
@@ -258,6 +265,10 @@ impl<'a> Checker<'a> {
         use ast::EchoContext::*;
         let numeric = h.ty.members().iter().all(|m| matches!(m, Type::Int | Type::Float | Type::Error | Type::Never));
         let (msg, note) = match ctx {
+            Attr if h.ty == Type::SafeJs => (
+                "`json_html()` is for `<script>`; its quotes would end the attribute",
+                "in an attribute, write `escape(json_encode($value))` (e.g. in a `data-*` attribute)",
+            ),
             Text | Attr => return,
             Unquoted => (
                 "values in attributes must be quoted",
@@ -267,21 +278,33 @@ impl<'a> Checker<'a> {
                 "values cannot be inserted between the attributes of a tag",
                 "write each attribute as `name=\"<?= $value ?>\"`",
             ),
-            Url if numeric || h.ty == Type::Html => return,
+            // Only values checked for this context: HTML escaping (`escape()`,
+            // templates) does not stop `javascript:` URLs or script code.
+            Url if numeric || h.ty == Type::SafeUrl => return,
             Url => (
-                "a URL attribute cannot start with an unchecked string",
-                "use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`)",
+                "a URL attribute cannot start with an unchecked value",
+                "use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe",
             ),
-            Script | Style if numeric || h.ty == Type::Html => return,
+            Script if numeric || h.ty == Type::SafeJs => return,
             Script => (
-                "strings cannot be inserted into `<script>`",
-                "use `json_html($value)`, which produces a JavaScript value that is safe inside a script",
+                "only `json_html()` values and numbers can be inserted into `<script>`",
+                "use `json_html($value)`, which produces a JavaScript value that is safe inside a script; `escape()` does not make code safe",
             ),
+            Style if numeric => return,
             Style => ("values cannot be inserted into CSS", "use a class name, or a `data-*` attribute"),
             Handler if numeric => return,
             Handler => (
                 "values cannot be inserted into event handler attributes",
                 "put the value in a `data-*` attribute and read it with addEventListener",
+            ),
+            ScriptUrl if numeric => return,
+            ScriptUrl => (
+                "values cannot be inserted into a `javascript:` (or `data:`) URL",
+                "put the value in a `data-*` attribute and read it from a script",
+            ),
+            Srcdoc => (
+                "values cannot be inserted into `srcdoc`",
+                "its value is parsed as a separate HTML document, where escaping does not apply; serve the content as its own page and use `src`",
             ),
         };
         self.error(msg, h.span).add_note(note);
@@ -490,7 +513,7 @@ impl<'a> Checker<'a> {
             | (TestKind::Int, Type::Int)
             | (TestKind::Float, Type::Float)
             | (TestKind::Str, Type::Str)
-            | (TestKind::Html, Type::Html)
+            | (TestKind::Html, Type::Html | Type::SafeUrl | Type::SafeJs)
             | (TestKind::List, Type::List(_))
             | (TestKind::Map, Type::Map(..))
             | (TestKind::Func, Type::Func(..)) => true,
@@ -861,10 +884,10 @@ impl<'a> Checker<'a> {
                         .add_note("write the extra part as `sql\"...\"` so values stay parameters");
                     return err(span);
                 }
-                if hl.ty == Type::Html && hr.ty == Type::Html {
+                if hl.ty.is_html() && hr.ty.is_html() {
                     return mk(HExprKind::Concat(vec![hl, hr], true), Type::Html);
                 }
-                if hl.ty == Type::Html || hr.ty == Type::Html {
+                if hl.ty.is_html() || hr.ty.is_html() {
                     self.error("cannot join `Html` with a plain string", span)
                         .add_note("escape the string first with `escape($s)` so the result stays safe HTML");
                     return err(span);
@@ -1023,9 +1046,10 @@ impl<'a> Checker<'a> {
             (CastKind::Int, Type::Int) | (CastKind::Float, Type::Float) => h,
             (CastKind::Int, Type::Float) => mk(HExprKind::FloatToInt(Box::new(h)), Type::Int),
             (CastKind::Float, Type::Int) => mk(HExprKind::IntToFloat(Box::new(h)), Type::Float),
-            (CastKind::String, Type::Int | Type::Float | Type::Bool | Type::Str | Type::Html) => {
-                mk(HExprKind::ToStr(Box::new(h)), Type::Str)
-            }
+            (
+                CastKind::String,
+                Type::Int | Type::Float | Type::Bool | Type::Str | Type::Html | Type::SafeUrl | Type::SafeJs,
+            ) => mk(HExprKind::ToStr(Box::new(h)), Type::Str),
             (CastKind::Bool, _) => {
                 self.error("casting to `bool` is not supported", span)
                     .add_note("Phenix has no truthiness; compare explicitly, e.g. `$n != 0`");

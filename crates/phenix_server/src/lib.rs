@@ -146,9 +146,11 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
     let path = req.uri().path().to_string();
     let ip = peer.ip().to_canonical().to_string();
     let limit = state.config.requests_per_minute;
-    let mut resp = if limit > 0 && !phenix_std::ratelimit::hit(&format!("ip:{ip}"), limit, Duration::from_secs(60)) {
+    let client = format!("ip:{}", phenix_std::ratelimit::client_key(peer.ip()));
+    let minute = Duration::from_secs(60);
+    let mut resp = if limit > 0 && !phenix_std::ratelimit::hit(&client, limit, minute) {
         let mut r = simple(StatusCode::TOO_MANY_REQUESTS, "text/plain", "too many requests".into());
-        let wait = phenix_std::ratelimit::retry_after(&format!("ip:{ip}"));
+        let wait = phenix_std::ratelimit::retry_after(&client, minute);
         r.headers_mut().insert("retry-after", HeaderValue::from(wait));
         r
     } else {

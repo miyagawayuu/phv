@@ -30,12 +30,12 @@ error: values in attributes must be quoted
    |             ^^^^^
    = note: write `attr="<?= $value ?>"`: escaping does not protect unquoted attribute values
 
-error: a URL attribute cannot start with an unchecked string
+error: a URL attribute cannot start with an unchecked value
   --> err_security.phx:45:14
    |
 45 | <a href="<?= $name ?>">url</a>
    |              ^^^^^
-   = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`)
+   = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
 
 error: values cannot be inserted into event handler attributes
   --> err_security.phx:47:25
@@ -51,12 +51,12 @@ error: values cannot be inserted between the attributes of a tag
    |          ^^^^^
    = note: write each attribute as `name="<?= $value ?>"`
 
-error: strings cannot be inserted into `<script>`
+error: only `json_html()` values and numbers can be inserted into `<script>`
   --> err_security.phx:49:21
    |
 49 | <script>var n = <?= $name ?>;</script>
    |                     ^^^^^
-   = note: use `json_html($value)`, which produces a JavaScript value that is safe inside a script
+   = note: use `json_html($value)`, which produces a JavaScript value that is safe inside a script; `escape()` does not make code safe
 
 error: values cannot be inserted into CSS
   --> err_security.phx:51:23
