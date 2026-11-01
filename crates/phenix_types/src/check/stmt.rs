@@ -16,7 +16,9 @@ fn breaks_out(stmts: &[Stmt], nest: u32) -> bool {
                 || els.as_ref().is_some_and(|b| breaks_out(b, nest))
         }
         StmtKind::Block(b) => breaks_out(b, nest),
-        StmtKind::Try { body, catches, .. } => breaks_out(body, nest) || catches.iter().any(|c| breaks_out(&c.body, nest)),
+        StmtKind::Try { body, catches, .. } => {
+            breaks_out(body, nest) || catches.iter().any(|c| breaks_out(&c.body, nest))
+        }
         StmtKind::While { body, .. }
         | StmtKind::DoWhile { body, .. }
         | StmtKind::For { body, .. }
@@ -469,12 +471,8 @@ impl Checker<'_> {
                     return;
                 }
                 let Some((kind, rty)) = self.arith_kind(bin, &pty, &h.ty) else {
-                    let msg = format!(
-                        "cannot apply `{}=` to `{}` and `{}`",
-                        bin.symbol(),
-                        self.tn(&pty),
-                        self.tn(&h.ty)
-                    );
+                    let msg =
+                        format!("cannot apply `{}=` to `{}` and `{}`", bin.symbol(), self.tn(&pty), self.tn(&h.ty));
                     self.error(msg, target.span.to(value.span));
                     return;
                 };
@@ -488,7 +486,7 @@ impl Checker<'_> {
                     self.error(msg, target.span.to(value.span));
                     return;
                 }
-                let h = if rty == Type::Float { self.to_float(h) } else { h };
+                let h = if rty == Type::Float { self.widen_to_float(h) } else { h };
                 out.push(HStmt::Compound(place, kind, h));
             }
         }

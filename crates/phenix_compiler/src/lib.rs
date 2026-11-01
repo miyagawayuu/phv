@@ -347,7 +347,8 @@ impl<'a> FnC<'a> {
             HExprKind::And(a, b) | HExprKind::Or(a, b) => {
                 let is_and = matches!(e.kind, HExprKind::And(..));
                 self.expr_into(a, dst);
-                let j = if is_and { self.emit(Instr::JumpIfFalse(dst, 0)) } else { self.emit(Instr::JumpIfTrue(dst, 0)) };
+                let j =
+                    if is_and { self.emit(Instr::JumpIfFalse(dst, 0)) } else { self.emit(Instr::JumpIfTrue(dst, 0)) };
                 self.expr_into(b, dst);
                 let end = self.here();
                 self.patch(j, end);
@@ -505,7 +506,8 @@ impl<'a> FnC<'a> {
                             Some((sr, sty)) => {
                                 let rc = self.operand(c);
                                 let t = self.alloc();
-                                let kind = if *sty == Type::Int && c.ty == Type::Int { BinKind::EqI } else { BinKind::Eq };
+                                let kind =
+                                    if *sty == Type::Int && c.ty == Type::Int { BinKind::EqI } else { BinKind::Eq };
                                 self.emit(bin_instr(kind, t, *sr, rc));
                                 jumps.push(self.emit(Instr::JumpIfTrue(t, 0)));
                             }
@@ -592,7 +594,11 @@ impl<'a> FnC<'a> {
                 let ra = self.operand(a);
                 let n = small_int(b).unwrap();
                 self.off = e.span.start;
-                let i = if *k == BinKind::LtI { Instr::JumpIfNotLtIImm(ra, n, 0) } else { Instr::JumpIfNotLeIImm(ra, n, 0) };
+                let i = if *k == BinKind::LtI {
+                    Instr::JumpIfNotLtIImm(ra, n, 0)
+                } else {
+                    Instr::JumpIfNotLeIImm(ra, n, 0)
+                };
                 vec![self.emit(i)]
             }
             HExprKind::Binary(k @ (BinKind::LtI | BinKind::LeI), a, b, swap) => {
@@ -906,10 +912,8 @@ impl<'a> FnC<'a> {
                 };
                 let exc = self.alloc();
                 let begin_c = if has_catch { Some(self.emit(Instr::TryBegin { catch: 0, exc })) } else { None };
-                self.tries.push(TryCtx {
-                    active: has_catch as u32 + finally.is_some() as u32,
-                    finally: finally.clone(),
-                });
+                self.tries
+                    .push(TryCtx { active: has_catch as u32 + finally.is_some() as u32, finally: finally.clone() });
                 self.block(body);
                 let mut ends = Vec::new();
                 if let Some(begin) = begin_c {

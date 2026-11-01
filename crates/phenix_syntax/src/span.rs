@@ -15,11 +15,7 @@ impl Span {
 
     /// The smallest span covering both `self` and `other`.
     pub fn to(self, other: Span) -> Span {
-        Span {
-            file: self.file,
-            start: self.start.min(other.start),
-            end: self.end.max(other.end),
-        }
+        Span { file: self.file, start: self.start.min(other.start), end: self.end.max(other.end) }
     }
 }
 
@@ -58,11 +54,7 @@ impl SourceFile {
     /// The text of a 1-based line, without its line break.
     pub fn line_text(&self, line: usize) -> &str {
         let start = self.line_starts[line - 1] as usize;
-        let end = self
-            .line_starts
-            .get(line)
-            .map(|e| *e as usize)
-            .unwrap_or(self.text.len());
+        let end = self.line_starts.get(line).map(|e| *e as usize).unwrap_or(self.text.len());
         self.text[start..end].trim_end_matches(['\n', '\r'])
     }
 }

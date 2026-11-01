@@ -4,8 +4,8 @@ use crate::builtins::{php_hint, Recv};
 use crate::hir::*;
 use crate::types::*;
 use phenix_syntax::ast::{
-    self, Arg, BinOp, CastKind, ClassKind, ClosureBody, Expr, ExprKind, InterpPart, MatchArm, TypeExpr, TypeExprKind, UnOp,
-    Visibility,
+    self, Arg, BinOp, CastKind, ClassKind, ClosureBody, Expr, ExprKind, InterpPart, MatchArm, TypeExpr, TypeExprKind,
+    UnOp, Visibility,
 };
 use phenix_syntax::{normalize_template_path, Span};
 
@@ -64,7 +64,9 @@ fn instantiate(t: &Type, tps: &[String]) -> Type {
         },
         Type::List(x) => Type::list(instantiate(x, tps)),
         Type::Map(k, v) => Type::map(instantiate(k, tps), instantiate(v, tps)),
-        Type::Func(ps, r) => Type::Func(ps.iter().map(|p| instantiate(p, tps)).collect(), Box::new(instantiate(r, tps))),
+        Type::Func(ps, r) => {
+            Type::Func(ps.iter().map(|p| instantiate(p, tps)).collect(), Box::new(instantiate(r, tps)))
+        }
         Type::Union(ms) => Type::union(ms.iter().map(|m| instantiate(m, tps)).collect()),
         other => other.clone(),
     }
@@ -168,7 +170,7 @@ impl<'a> Checker<'a> {
         HExpr { ty: Type::Error, ..h }
     }
 
-    pub(crate) fn to_float(&mut self, h: HExpr) -> HExpr {
+    pub(crate) fn widen_to_float(&mut self, h: HExpr) -> HExpr {
         if h.ty == Type::Int {
             let span = h.span;
             HExpr { kind: HExprKind::IntToFloat(Box::new(h)), ty: Type::Float, span }
@@ -195,16 +197,19 @@ impl<'a> Checker<'a> {
     }
 
     pub(crate) fn check_printable(&mut self, h: &HExpr, what: &str) {
-        let printable = |t: &Type| matches!(t, Type::Str | Type::Int | Type::Float | Type::Html | Type::Error | Type::Never);
+        let printable =
+            |t: &Type| matches!(t, Type::Str | Type::Int | Type::Float | Type::Html | Type::Error | Type::Never);
         match &h.ty {
-            t if t.members().iter().all(printable) && t.members().len() > 0 => {}
+            t if t.members().iter().all(printable) && !t.members().is_empty() => {}
             Type::Never => {}
             t => {
                 let msg = format!("cannot {what} a value of type `{}`", self.tn(t));
                 let t = t.clone();
                 let e = self.error(msg, h.span);
                 if t == Type::Bool {
-                    e.add_note("bools are not converted to strings implicitly; use a ternary, e.g. `$ok ? \"yes\" : \"no\"`");
+                    e.add_note(
+                        "bools are not converted to strings implicitly; use a ternary, e.g. `$ok ? \"yes\" : \"no\"`",
+                    );
                 } else if t.is_nullable() {
                     e.add_note("the value might be null; give a fallback with `?? \"\"`");
                 } else {
@@ -217,14 +222,16 @@ impl<'a> Checker<'a> {
     pub(crate) fn check_stringable(&mut self, h: &HExpr, what: &str) {
         let ok = |t: &Type| matches!(t, Type::Str | Type::Int | Type::Float | Type::Error | Type::Never);
         match &h.ty {
-            t if t.members().iter().all(ok) && t.members().len() > 0 => {}
+            t if t.members().iter().all(ok) && !t.members().is_empty() => {}
             Type::Never => {}
             t => {
                 let msg = format!("cannot {what} a value of type `{}` to a string", self.tn(t));
                 let t = t.clone();
                 let e = self.error(msg, h.span);
                 match t {
-                    Type::Html => e.add_note("join two `Html` values with `.`, or use `(string)$html` to get the raw markup"),
+                    Type::Html => {
+                        e.add_note("join two `Html` values with `.`, or use `(string)$html` to get the raw markup")
+                    }
                     Type::Bool => e.add_note("use a ternary, e.g. `$ok ? \"yes\" : \"no\"`"),
                     t if t.is_nullable() => e.add_note("the value might be null; give a fallback with `?? \"\"`"),
                     _ => e.add_note("only `string`, `int` and `float` can be joined into strings"),
@@ -593,7 +600,9 @@ impl<'a> Checker<'a> {
                 }
                 self.nullsafe(ho, *nullsafe, span, f)
             }
-            ExprKind::StaticCall { class, class_span, name, args } => self.static_call(class, *class_span, name, args, span),
+            ExprKind::StaticCall { class, class_span, name, args } => {
+                self.static_call(class, *class_span, name, args, span)
+            }
             ExprKind::New { class, class_span, args } => self.new_expr(class, *class_span, args, span),
             ExprKind::Index { base, index } => self.index(base, index.as_deref(), span),
             ExprKind::Closure(c) => self.closure(c, expect, span),
@@ -735,7 +744,11 @@ impl<'a> Checker<'a> {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow => {
                 match self.arith_kind(op, &hl.ty, &hr.ty) {
                     Some((kind, ty)) => {
-                        let (hl, hr) = if ty == Type::Float { (self.to_float(hl), self.to_float(hr)) } else { (hl, hr) };
+                        let (hl, hr) = if ty == Type::Float {
+                            (self.widen_to_float(hl), self.widen_to_float(hr))
+                        } else {
+                            (hl, hr)
+                        };
                         mk(bin(kind, hl, hr, false), ty)
                     }
                     None => {
@@ -750,7 +763,9 @@ impl<'a> Checker<'a> {
                         if op == BinOp::Add && lt == Type::Str && rt == Type::Str {
                             e.add_note("use `.` to join strings");
                         } else if lt == Type::Str || rt == Type::Str {
-                            e.add_note("strings are never converted to numbers implicitly; use `->toInt()` or `->toFloat()`");
+                            e.add_note(
+                                "strings are never converted to numbers implicitly; use `->toInt()` or `->toFloat()`",
+                            );
                         } else if lt.is_nullable() || rt.is_nullable() {
                             e.add_note("the value might be null; check it first or use `??`");
                         }
@@ -942,8 +957,10 @@ impl<'a> Checker<'a> {
                 let t = t.clone();
                 let e = self.error(msg, span);
                 if t == Type::Str {
-                    e.add_note(format!("use `$s->to{}()`, which returns null when the string is not a number",
-                        if kind == CastKind::Int { "Int" } else { "Float" }));
+                    e.add_note(format!(
+                        "use `$s->to{}()`, which returns null when the string is not a number",
+                        if kind == CastKind::Int { "Int" } else { "Float" }
+                    ));
                 }
                 err(span)
             }
@@ -1064,7 +1081,8 @@ impl<'a> Checker<'a> {
                     if i >= params.len() {
                         if !reported_count {
                             reported_count = true;
-                            let msg = format!("`{fname}` takes {} argument(s) but {} were given", params.len(), args.len());
+                            let msg =
+                                format!("`{fname}` takes {} argument(s) but {} were given", params.len(), args.len());
                             self.error(msg, a.value.span);
                         }
                         self.expr(&a.value, None);
@@ -1073,21 +1091,19 @@ impl<'a> Checker<'a> {
                     let ty = params[i].ty.clone();
                     slots[i] = Some(self.arg_to(&a.value, &ty, &mut b));
                 }
-                Some((n, nspan)) => {
-                    match params.iter().position(|p| &p.name == n) {
-                        None => {
-                            self.error(format!("`{fname}` has no parameter named `{n}`"), *nspan);
-                            self.expr(&a.value, None);
-                        }
-                        Some(j) if slots[j].is_some() => {
-                            self.error(format!("argument `{n}` is given more than once"), *nspan);
-                        }
-                        Some(j) => {
-                            let ty = params[j].ty.clone();
-                            slots[j] = Some(self.arg_to(&a.value, &ty, &mut b));
-                        }
+                Some((n, nspan)) => match params.iter().position(|p| &p.name == n) {
+                    None => {
+                        self.error(format!("`{fname}` has no parameter named `{n}`"), *nspan);
+                        self.expr(&a.value, None);
                     }
-                }
+                    Some(j) if slots[j].is_some() => {
+                        self.error(format!("argument `{n}` is given more than once"), *nspan);
+                    }
+                    Some(j) => {
+                        let ty = params[j].ty.clone();
+                        slots[j] = Some(self.arg_to(&a.value, &ty, &mut b));
+                    }
+                },
             }
         }
         let mut out = Vec::new();
@@ -1107,7 +1123,14 @@ impl<'a> Checker<'a> {
         (out, b)
     }
 
-    fn call_builtin(&mut self, name: &str, recv_kind: Option<Recv>, recv: Option<HExpr>, args: &[Arg], span: Span) -> HExpr {
+    fn call_builtin(
+        &mut self,
+        name: &str,
+        recv_kind: Option<Recv>,
+        recv: Option<HExpr>,
+        args: &[Arg],
+        span: Span,
+    ) -> HExpr {
         let overloads: Vec<(Vec<Type>, Type, &'static str)> = self
             .builtin_overloads(name, recv_kind)
             .map(|v| v.iter().map(|b| (b.params.clone(), b.ret.clone(), b.sig.imp)).collect())
@@ -1202,7 +1225,8 @@ impl<'a> Checker<'a> {
         }
         let types: Vec<String> = hargs.iter().map(|h| self.tn(&h.ty)).collect();
         let msg = format!("no version of `{display}` accepts ({})", types.join(", "));
-        let sigs: Vec<String> = cands.iter().map(|(p, r, _)| self.tn(&Type::Func(p.clone(), Box::new(r.clone())))).collect();
+        let sigs: Vec<String> =
+            cands.iter().map(|(p, r, _)| self.tn(&Type::Func(p.clone(), Box::new(r.clone())))).collect();
         self.error(msg, span).add_note(format!("available: {}", sigs.join(", ")));
         err(span)
     }
@@ -1746,7 +1770,11 @@ impl<'a> Checker<'a> {
                         let sty = s.ty.clone();
                         let h = self.expr(c, Some(&sty));
                         if !self.comparable(&sty, &h.ty) {
-                            let msg = format!("this arm can never match: `{}` is compared with `{}`", self.tn(&sty), self.tn(&h.ty));
+                            let msg = format!(
+                                "this arm can never match: `{}` is compared with `{}`",
+                                self.tn(&sty),
+                                self.tn(&h.ty)
+                            );
                             self.error(msg, h.span);
                         }
                         h

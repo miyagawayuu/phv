@@ -238,8 +238,9 @@ impl Checker<'_> {
         if let Some(&id) = ctx.names.get(name) {
             if !ctx.flow.is_assigned(id) {
                 if report {
-                    self.error(format!("variable `${name}` might not be defined here"), span)
-                        .add_note("it is only assigned on some paths; assign it before the `if`/loop or in every branch");
+                    self.error(format!("variable `${name}` might not be defined here"), span).add_note(
+                        "it is only assigned on some paths; assign it before the `if`/loop or in every branch",
+                    );
                 }
                 return None;
             }

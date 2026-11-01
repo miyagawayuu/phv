@@ -133,11 +133,14 @@ impl Server {
         }
         let now: HashSet<String> = by_file.iter().filter(|(_, v)| !v.is_empty()).map(|(k, _)| k.clone()).collect();
         for (uri, diagnostics) in by_file {
-            send(out, &json!({
-                "jsonrpc": "2.0",
-                "method": "textDocument/publishDiagnostics",
-                "params": { "uri": uri, "diagnostics": diagnostics },
-            }));
+            send(
+                out,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": { "uri": uri, "diagnostics": diagnostics },
+                }),
+            );
         }
         self.reported.insert(path.to_path_buf(), now);
     }
@@ -198,7 +201,9 @@ pub fn run() {
             }
             "textDocument/didChange" => {
                 if let Some(p) = doc_path() {
-                    if let Some(text) = params["contentChanges"].as_array().and_then(|c| c.last()).and_then(|c| c["text"].as_str()) {
+                    if let Some(text) =
+                        params["contentChanges"].as_array().and_then(|c| c.last()).and_then(|c| c["text"].as_str())
+                    {
                         server.open.insert(p.clone(), text.to_string());
                     }
                     server.check(&p, &mut out);
@@ -227,10 +232,13 @@ pub fn run() {
             },
             _ => {
                 if id.is_some() {
-                    send(&mut out, &json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "error": { "code": -32601, "message": format!("method not found: {method}") },
-                    }));
+                    send(
+                        &mut out,
+                        &json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": { "code": -32601, "message": format!("method not found: {method}") },
+                        }),
+                    );
                 }
                 None
             }

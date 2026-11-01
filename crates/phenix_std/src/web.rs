@@ -233,7 +233,8 @@ fn cookies(vm: &Vm) -> IndexMap<Key, Value> {
 
 fn set_cookie(vm: &mut Vm, a: &[Value]) -> R {
     let (name, value, max_age, path) = (s(&a[0]), s(&a[1]), int(&a[2]), s(&a[3]));
-    let (secure, http_only, same_site) = (matches!(a[4], Value::Bool(true)), matches!(a[5], Value::Bool(true)), s(&a[6]));
+    let (secure, http_only, same_site) =
+        (matches!(a[4], Value::Bool(true)), matches!(a[5], Value::Bool(true)), s(&a[6]));
     if !is_token(name) {
         return Err(vm.throw("ValueError", format!("invalid cookie name \"{name}\"")));
     }
@@ -297,10 +298,14 @@ pub fn csrf_token(vm: &mut Vm) -> Result<String, VmError> {
 
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
     let f: BuiltinFn = match name {
-        "json_decode" => |vm, a| json_decode(s(&a[0])).map_err(|e| vm.throw("ValueError", format!("json_decode(): {e}"))),
+        "json_decode" => {
+            |vm, a| json_decode(s(&a[0])).map_err(|e| vm.throw("ValueError", format!("json_decode(): {e}")))
+        }
         "__req_cookies" => |vm, _| Ok(Value::map(cookies(vm))),
         "__resp_cookie" => set_cookie,
-        "__sess_get" => |vm, a| Ok(vm.http.session.values.get(s(&a[0])).map(|v| Value::str(v.as_str())).unwrap_or(Value::Null)),
+        "__sess_get" => {
+            |vm, a| Ok(vm.http.session.values.get(s(&a[0])).map(|v| Value::str(v.as_str())).unwrap_or(Value::Null))
+        }
         "__sess_set" => |vm, a| {
             let (k, v) = (s(&a[0]).to_string(), s(&a[1]).to_string());
             session_set(vm, &k, &v)
@@ -354,13 +359,16 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "__upload_text" => |vm, a| {
             let i = int(&a[0]) as usize;
-            Ok(Value::str(vm.http.files.get(i).map(|f| String::from_utf8_lossy(&f.data).into_owned()).unwrap_or_default()))
+            Ok(Value::str(
+                vm.http.files.get(i).map(|f| String::from_utf8_lossy(&f.data).into_owned()).unwrap_or_default(),
+            ))
         },
         "__upload_save" => |vm, a| {
             let i = int(&a[0]) as usize;
             let path = crate::sys::resolve_path(vm, s(&a[1]), true)?;
             let Some(f) = vm.http.files.get(i) else { return Ok(Value::Null) };
-            std::fs::write(&path, &f.data).map_err(|e| vm.throw("RuntimeException", format!("cannot save upload: {e}")))?;
+            std::fs::write(&path, &f.data)
+                .map_err(|e| vm.throw("RuntimeException", format!("cannot save upload: {e}")))?;
             Ok(Value::Null)
         },
         _ => return None,

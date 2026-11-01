@@ -20,10 +20,21 @@ impl<'a> Finder<'a> {
         use HExprKind::*;
         match &e.kind {
             Const(_) | Local(_) | EnumCase(..) | EnumCases(_) => {}
-            Unary(_, x) | IntToFloat(x) | FloatToInt(x) | ToStr(x) | Prop(x, _) | Is(x, _) | Throw(x) | EnumFrom(_, x, _) => {
-                self.expr(x)
-            }
-            Binary(_, a, b, _) | And(a, b) | Or(a, b) | Coalesce(a, b) | Index(a, b) | IndexOrNull(a, b) | Range(a, b, _) => {
+            Unary(_, x)
+            | IntToFloat(x)
+            | FloatToInt(x)
+            | ToStr(x)
+            | Prop(x, _)
+            | Is(x, _)
+            | Throw(x)
+            | EnumFrom(_, x, _) => self.expr(x),
+            Binary(_, a, b, _)
+            | And(a, b)
+            | Or(a, b)
+            | Coalesce(a, b)
+            | Index(a, b)
+            | IndexOrNull(a, b)
+            | Range(a, b, _) => {
                 self.expr(a);
                 self.expr(b);
             }
@@ -32,8 +43,14 @@ impl<'a> Finder<'a> {
                 self.expr(b);
                 self.expr(c);
             }
-            Concat(xs, _) | List(xs) | Call(_, xs) | CallVirtual(_, xs) | CallBuiltin(_, xs) | CallNamed(_, xs)
-            | New(_, _, xs) | Closure(_, xs) => {
+            Concat(xs, _)
+            | List(xs)
+            | Call(_, xs)
+            | CallVirtual(_, xs)
+            | CallBuiltin(_, xs)
+            | CallNamed(_, xs)
+            | New(_, _, xs)
+            | Closure(_, xs) => {
                 for x in xs {
                     self.expr(x);
                 }

@@ -105,9 +105,7 @@ impl<'a> Lexer<'a> {
             let rest = &self.src[at + 2..];
             let (len, echo) = if rest.starts_with('=') {
                 (3, true)
-            } else if rest.starts_with("phx")
-                && !rest.as_bytes().get(3).copied().is_some_and(is_ident_char)
-            {
+            } else if rest.starts_with("phx") && !rest.as_bytes().get(3).copied().is_some_and(is_ident_char) {
                 (5, false)
             } else if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace()) {
                 (2, false)
@@ -344,8 +342,7 @@ impl<'a> Lexer<'a> {
             self.digits();
         }
         if matches!(self.peek(0), b'e' | b'E')
-            && (self.peek(1).is_ascii_digit()
-                || (matches!(self.peek(1), b'+' | b'-') && self.peek(2).is_ascii_digit()))
+            && (self.peek(1).is_ascii_digit() || (matches!(self.peek(1), b'+' | b'-') && self.peek(2).is_ascii_digit()))
         {
             is_float = true;
             self.pos += 2;

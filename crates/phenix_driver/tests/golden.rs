@@ -89,7 +89,8 @@ fn formatting_preserves_behavior() {
         .spawn(move || {
             let mut failures = Vec::new();
             for case in &cases {
-                let expected = std::fs::read_to_string(case.with_extension("out")).unwrap_or_default().replace("\r\n", "\n");
+                let expected =
+                    std::fs::read_to_string(case.with_extension("out")).unwrap_or_default().replace("\r\n", "\n");
                 if expected.starts_with("error") || expected.starts_with("warning") {
                     continue; // diagnostics mention columns, which formatting may move
                 }
@@ -102,7 +103,8 @@ fn formatting_preserves_behavior() {
                 }
                 let overlay = HashMap::from([(case.canonicalize().unwrap(), formatted)]);
                 let actual = render_with(&root, case, overlay).replace("\r\n", "\n");
-                let strip = |s: &str| s.lines().filter(|l| !l.trim_start().starts_with("at ")).collect::<Vec<_>>().join("\n");
+                let strip =
+                    |s: &str| s.lines().filter(|l| !l.trim_start().starts_with("at ")).collect::<Vec<_>>().join("\n");
                 if strip(&actual) != strip(&expected) {
                     failures.push(format!("{name}: output changed after formatting:\n{actual}"));
                 }
@@ -130,10 +132,12 @@ fn golden_with_jit() {
         .spawn(move || {
             let mut failures = Vec::new();
             for case in &cases {
-                let expected = std::fs::read_to_string(case.with_extension("out")).unwrap_or_default().replace("\r\n", "\n");
+                let expected =
+                    std::fs::read_to_string(case.with_extension("out")).unwrap_or_default().replace("\r\n", "\n");
                 let actual = render_opts(&root, case, HashMap::new(), true).replace("\r\n", "\n");
                 // Errors raised inside native code have a shorter stack trace.
-                let strip = |s: &str| s.lines().filter(|l| !l.trim_start().starts_with("at ")).collect::<Vec<_>>().join("\n");
+                let strip =
+                    |s: &str| s.lines().filter(|l| !l.trim_start().starts_with("at ")).collect::<Vec<_>>().join("\n");
                 if strip(&actual) != strip(&expected) {
                     let name = case.file_name().unwrap().to_string_lossy().to_string();
                     failures.push(format!("{name} differs with the JIT:\n{actual}"));

@@ -118,10 +118,8 @@ pub fn build(prog: &Program) -> Option<JitTable> {
             let config = module.target_config();
             let t = Translator::new(FunctionBuilder::new(&mut ctx.func, &mut fctx), func, config);
             let tick_ref = module.declare_func_in_func(tick, t.b.func);
-            let callees: Vec<Option<cranelift_codegen::ir::FuncRef>> = ids
-                .iter()
-                .map(|id| id.map(|(inner, _)| module.declare_func_in_func(inner, t.b.func)))
-                .collect();
+            let callees: Vec<Option<cranelift_codegen::ir::FuncRef>> =
+                ids.iter().map(|id| id.map(|(inner, _)| module.declare_func_in_func(inner, t.b.func))).collect();
             t.translate(tick_ref, &callees);
         }
         module.define_function(inner, &mut ctx).ok()?;
@@ -390,8 +388,13 @@ impl<'a> Translator<'a> {
                     let r = self.b.ins().bxor_imm_s(x, 1);
                     self.set(d, r);
                 }
-                Instr::EqI(d, a, b) | Instr::Eq(d, a, b) | Instr::Ne(d, a, b) | Instr::LtI(d, a, b)
-                | Instr::Lt(d, a, b) | Instr::LeI(d, a, b) | Instr::Le(d, a, b) => {
+                Instr::EqI(d, a, b)
+                | Instr::Eq(d, a, b)
+                | Instr::Ne(d, a, b)
+                | Instr::LtI(d, a, b)
+                | Instr::Lt(d, a, b)
+                | Instr::LeI(d, a, b)
+                | Instr::Le(d, a, b) => {
                     let cc = match ins {
                         Instr::EqI(..) | Instr::Eq(..) => IntCC::Equal,
                         Instr::Ne(..) => IntCC::NotEqual,
@@ -428,7 +431,11 @@ impl<'a> Translator<'a> {
                 }
                 Instr::JumpIfNotLtI(a, b, t) | Instr::JumpIfNotLeI(a, b, t) => {
                     let (x, y) = (self.get(a), self.get(b));
-                    let cc = if matches!(ins, Instr::JumpIfNotLtI(..)) { IntCC::SignedLessThan } else { IntCC::SignedLessThanOrEqual };
+                    let cc = if matches!(ins, Instr::JumpIfNotLtI(..)) {
+                        IntCC::SignedLessThan
+                    } else {
+                        IntCC::SignedLessThanOrEqual
+                    };
                     let c = self.b.ins().icmp(cc, x, y);
                     let (yes, no) = (self.blocks[next as usize], self.blocks[t as usize]);
                     self.b.ins().brif(c, yes, &[], no, &[]);
@@ -436,7 +443,11 @@ impl<'a> Translator<'a> {
                 }
                 Instr::JumpIfNotLtIImm(a, n, t) | Instr::JumpIfNotLeIImm(a, n, t) => {
                     let x = self.get(a);
-                    let cc = if matches!(ins, Instr::JumpIfNotLtIImm(..)) { IntCC::SignedLessThan } else { IntCC::SignedLessThanOrEqual };
+                    let cc = if matches!(ins, Instr::JumpIfNotLtIImm(..)) {
+                        IntCC::SignedLessThan
+                    } else {
+                        IntCC::SignedLessThanOrEqual
+                    };
                     let c = self.b.ins().icmp_imm_s(cc, x, n as i64);
                     let (yes, no) = (self.blocks[next as usize], self.blocks[t as usize]);
                     self.b.ins().brif(c, yes, &[], no, &[]);

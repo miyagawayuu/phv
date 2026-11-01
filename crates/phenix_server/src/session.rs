@@ -93,7 +93,7 @@ impl Store {
     fn sweep(&self) {
         let mut n = self.requests.lock().unwrap();
         *n += 1;
-        if *n % 256 != 0 {
+        if !n.is_multiple_of(256) {
             return;
         }
         drop(n);

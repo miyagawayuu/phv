@@ -350,7 +350,8 @@ fn truthy(vm: &Vm, v: Value) -> Result<bool, VmError> {
 }
 
 fn check_header(vm: &Vm, name: &str, value: &str) -> Result<(), VmError> {
-    let name_ok = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+    let name_ok =
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
     if !name_ok {
         return Err(vm.throw("ValueError", format!("invalid header name \"{name}\"")));
     }
@@ -475,7 +476,9 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             }
             x.checked_div(y).map(Value::Int).ok_or_else(|| vm.throw("ArithmeticError", "integer overflow"))
         },
-        "abs_int" => |vm, a| int(&a[0]).checked_abs().map(Value::Int).ok_or_else(|| vm.throw("ArithmeticError", "integer overflow")),
+        "abs_int" => |vm, a| {
+            int(&a[0]).checked_abs().map(Value::Int).ok_or_else(|| vm.throw("ArithmeticError", "integer overflow"))
+        },
         "abs_float" => |_, a| Ok(Value::Float(float(&a[0]).abs())),
         "min_int" => |_, a| Ok(Value::Int(int(&a[0]).min(int(&a[1])))),
         "max_int" => |_, a| Ok(Value::Int(int(&a[0]).max(int(&a[1])))),
@@ -524,7 +527,9 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         },
         "list_is_empty" => |_, a| Ok(Value::Bool(list(&a[0]).is_empty())),
         "list_contains" => |_, a| Ok(Value::Bool(list(&a[0]).iter().any(|x| values_equal(x, &a[1])))),
-        "list_index_of" => |_, a| Ok(opt(list(&a[0]).iter().position(|x| values_equal(x, &a[1])), |i| Value::Int(i as i64))),
+        "list_index_of" => {
+            |_, a| Ok(opt(list(&a[0]).iter().position(|x| values_equal(x, &a[1])), |i| Value::Int(i as i64)))
+        }
         "list_first" => |_, a| Ok(list(&a[0]).first().cloned().unwrap_or(Value::Null)),
         "list_last" => |_, a| Ok(list(&a[0]).last().cloned().unwrap_or(Value::Null)),
         "list_slice1" | "list_slice" => |_, a| {

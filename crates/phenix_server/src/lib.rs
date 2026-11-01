@@ -48,14 +48,22 @@ struct State {
 }
 
 pub fn serve(opts: ServeOptions) -> Result<(), String> {
+    let addr: SocketAddr = format!("{}:{}", opts.host, opts.port)
+        .parse()
+        .map_err(|e| format!("invalid address {}:{}: {e}", opts.host, opts.port))?;
+    let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
+    serve_on(listener, opts)
+}
+
+/// Serves on an already bound listener (tests bind port 0).
+pub fn serve_on(listener: std::net::TcpListener, opts: ServeOptions) -> Result<(), String> {
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let root = opts.root.canonicalize().map_err(|e| format!("cannot open {}: {e}", opts.root.display()))?;
     let public = root.join("public");
     if !public.is_dir() {
         return Err(format!("{} has no `public/` directory", root.display()));
     }
-    let addr: SocketAddr = format!("{}:{}", opts.host, opts.port)
-        .parse()
-        .map_err(|e| format!("invalid address {}:{}: {e}", opts.host, opts.port))?;
     let config = load_config(&root)?;
     let state = Arc::new(State {
         sessions: session::Store::new(Duration::from_secs(config.session_ttl)),
@@ -73,7 +81,7 @@ pub fn serve(opts: ServeOptions) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
     rt.block_on(async move {
-        let listener = TcpListener::bind(addr).await.map_err(|e| format!("cannot listen on {addr}: {e}"))?;
+        let listener = TcpListener::from_std(listener).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
         let mode = if state.dev { "development" } else { "production" };
         eprintln!("Phenix server ({mode} mode) listening on http://{addr}");
         eprintln!("Serving {}", state.public.display());
@@ -300,7 +308,9 @@ async fn run_script(state: &Arc<State>, script: PathBuf, req: Request<Incoming>)
             } else {
                 ""
             };
-            let body = format!("<p>The form has expired or did not come from this site. Reload the page and try again.</p>{hint}");
+            let body = format!(
+                "<p>The form has expired or did not come from this site. Reload the page and try again.</p>{hint}"
+            );
             return page(StatusCode::FORBIDDEN, "403 Forbidden", &body);
         }
     }
@@ -348,7 +358,11 @@ async fn run_script(state: &Arc<State>, script: PathBuf, req: Request<Incoming>)
         }
         Err(e) => {
             eprintln!("internal error in {rel}: {e}");
-            return page(StatusCode::INTERNAL_SERVER_ERROR, "500 Internal Server Error", "<p>Something went wrong.</p>");
+            return page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "500 Internal Server Error",
+                "<p>Something went wrong.</p>",
+            );
         }
     };
 

@@ -16,7 +16,9 @@ use crate::builtins::{BuiltinSig, Recv, BUILTINS};
 use crate::hir::*;
 use crate::types::*;
 use flow::FnCtx;
-use phenix_syntax::ast::{self, ClassDecl, ClassKind, ExprKind, FunctionDecl, StmtKind, TypeExpr, TypeExprKind, Visibility};
+use phenix_syntax::ast::{
+    self, ClassDecl, ClassKind, ExprKind, FunctionDecl, StmtKind, TypeExpr, TypeExprKind, Visibility,
+};
 use phenix_syntax::{parse_type_str, Diagnostic, Span};
 use std::collections::{HashMap, HashSet};
 
@@ -305,7 +307,12 @@ impl<'a> Checker<'a> {
     }
 
     /// The value of a `const` declaration: a scalar literal.
-    fn literal_const(&mut self, e: &ast::Expr, ty: Option<&TypeExpr>, self_class: Option<ClassId>) -> Option<(HConst, Type)> {
+    fn literal_const(
+        &mut self,
+        e: &ast::Expr,
+        ty: Option<&TypeExpr>,
+        self_class: Option<ClassId>,
+    ) -> Option<(HConst, Type)> {
         let (c, t) = match &e.kind {
             ExprKind::Int(i) => (HConst::Int(*i), Type::Int),
             ExprKind::Float(f) => (HConst::Float(*f), Type::Float),
@@ -339,7 +346,8 @@ impl<'a> Checker<'a> {
     /// For a union made only of classes, their common ancestor as a class type.
     pub(crate) fn as_single_class(&self, t: &Type) -> Option<Type> {
         let Type::Union(ms) = t else { return None };
-        let ids: Option<Vec<ClassId>> = ms.iter().map(|m| if let Type::Class(c) = m { Some(*c) } else { None }).collect();
+        let ids: Option<Vec<ClassId>> =
+            ms.iter().map(|m| if let Type::Class(c) = m { Some(*c) } else { None }).collect();
         self.common_ancestor(&ids?).map(Type::Class)
     }
 
@@ -556,11 +564,17 @@ impl<'a> Checker<'a> {
                 match &s.kind {
                     StmtKind::Function(d) => {
                         if m.kind == ModuleKind::Template {
-                            self.error("templates cannot declare functions; put them in a module and import it", d.name_span);
+                            self.error(
+                                "templates cannot declare functions; put them in a module and import it",
+                                d.name_span,
+                            );
                             continue;
                         }
                         if self.is_builtin_name(&d.name) {
-                            self.error(format!("`{}` is a built-in function and cannot be redefined", d.name), d.name_span);
+                            self.error(
+                                format!("`{}` is a built-in function and cannot be redefined", d.name),
+                                d.name_span,
+                            );
                         }
                         let fid = self.add_func(FuncInfo {
                             name: d.name.clone(),
@@ -585,7 +599,10 @@ impl<'a> Checker<'a> {
                     }
                     StmtKind::Class(d) => {
                         if m.kind == ModuleKind::Template {
-                            self.error("templates cannot declare classes; put them in a module and import it", d.name_span);
+                            self.error(
+                                "templates cannot declare classes; put them in a module and import it",
+                                d.name_span,
+                            );
                             continue;
                         }
                         let cid = self.classes.len() as ClassId;
@@ -809,11 +826,8 @@ impl<'a> Checker<'a> {
             // Classes get a vtable slot for every interface method they do not
             // define yet, so abstract classes can call them on `$this`.
             if kind != ClassKind::Interface {
-                let mut ifs: Vec<ClassId> = supers
-                    .iter()
-                    .copied()
-                    .filter(|s| self.classes[*s as usize].kind == ClassKind::Interface)
-                    .collect();
+                let mut ifs: Vec<ClassId> =
+                    supers.iter().copied().filter(|s| self.classes[*s as usize].kind == ClassKind::Interface).collect();
                 ifs.sort();
                 for i in ifs {
                     let mut ms: Vec<(String, MethodInfo)> =
@@ -875,7 +889,10 @@ impl<'a> Checker<'a> {
                             HConst::Null
                         }
                         (None, Some(v)) => {
-                            self.error("cases of a pure enum cannot have values; add a backing type, e.g. `enum E: string`", v.span);
+                            self.error(
+                                "cases of a pure enum cannot have values; add a backing type, e.g. `enum E: string`",
+                                v.span,
+                            );
                             HConst::Null
                         }
                         (None, None) => HConst::Null,
@@ -906,15 +923,19 @@ impl<'a> Checker<'a> {
                 let ty = self.resolve_type(&prop.ty, Some(cid));
                 let default = prop.default.as_ref().and_then(|d| self.const_default(d, &ty));
                 let required = !ty.is_nullable() && default.is_none() && ty != Type::Error;
-                self.add_field(cid, FieldInfo {
-                    name: prop.name.clone(),
-                    ty,
-                    vis: prop.visibility,
-                    readonly: prop.readonly,
-                    owner: cid,
-                    default,
-                    required,
-                }, prop.span);
+                self.add_field(
+                    cid,
+                    FieldInfo {
+                        name: prop.name.clone(),
+                        ty,
+                        vis: prop.visibility,
+                        readonly: prop.readonly,
+                        owner: cid,
+                        default,
+                        required,
+                    },
+                    prop.span,
+                );
             }
             let mut own_ctor = false;
             for m in &decl.methods {
@@ -933,7 +954,10 @@ impl<'a> Checker<'a> {
                     self.error("interfaces and enums cannot have constructors", m.name_span);
                 }
                 if m.is_abstract && matches!(kind, ClassKind::Class | ClassKind::Enum) {
-                    self.error(format!("`{class_name}` must be declared `abstract` to have abstract methods"), m.name_span);
+                    self.error(
+                        format!("`{class_name}` must be declared `abstract` to have abstract methods"),
+                        m.name_span,
+                    );
                 }
                 if m.is_static && kind == ClassKind::Interface {
                     self.error("interface methods cannot be static", m.name_span);
@@ -961,15 +985,19 @@ impl<'a> Checker<'a> {
                     own_ctor = true;
                     for (p, ap) in params.iter().zip(&m.params) {
                         if let Some((vis, readonly)) = p.promote {
-                            self.add_field(cid, FieldInfo {
-                                name: p.name.clone(),
-                                ty: p.ty.clone(),
-                                vis,
-                                readonly,
-                                owner: cid,
-                                default: None,
-                                required: !p.ty.is_nullable() && p.ty != Type::Error,
-                            }, ap.span);
+                            self.add_field(
+                                cid,
+                                FieldInfo {
+                                    name: p.name.clone(),
+                                    ty: p.ty.clone(),
+                                    vis,
+                                    readonly,
+                                    owner: cid,
+                                    default: None,
+                                    required: !p.ty.is_nullable() && p.ty != Type::Error,
+                                },
+                                ap.span,
+                            );
                         }
                     }
                     self.classes[ci].ctor = Some(fid);
@@ -988,12 +1016,23 @@ impl<'a> Checker<'a> {
                     }
                     Some(old) if old.vis != Visibility::Private => {
                         if old.is_static != m.is_static {
-                            self.error(format!("`{}` changes between static and non-static when overriding", m.name), m.name_span);
+                            self.error(
+                                format!("`{}` changes between static and non-static when overriding", m.name),
+                                m.name_span,
+                            );
                         }
                         if !self.compatible_override(fid, old.func) {
                             let parent_name = self.funcs[old.func as usize].name.clone();
-                            self.error(format!("`{class_name}::{}` overrides `{parent_name}` with an incompatible signature", m.name), m.name_span)
-                                .add_note("overriding methods must keep the same parameter types and a compatible return type");
+                            self.error(
+                                format!(
+                                    "`{class_name}::{}` overrides `{parent_name}` with an incompatible signature",
+                                    m.name
+                                ),
+                                m.name_span,
+                            )
+                            .add_note(
+                                "overriding methods must keep the same parameter types and a compatible return type",
+                            );
                         }
                         old.slot
                     }
@@ -1136,7 +1175,8 @@ impl<'a> Checker<'a> {
                         })
                         .collect();
                     if decls.len() > 1 {
-                        let span = m.stmts.iter().filter(|s| matches!(s.kind, StmtKind::Params(_))).nth(1).unwrap().span;
+                        let span =
+                            m.stmts.iter().filter(|s| matches!(s.kind, StmtKind::Params(_))).nth(1).unwrap().span;
                         self.error("a template can only have one `params(...)` declaration", span);
                     }
                     if let Some(p) = decls.first() {
@@ -1199,7 +1239,10 @@ impl<'a> Checker<'a> {
                             let slot = self.field_slot(class.unwrap(), &p.name).unwrap_or(0);
                             let this_ty = Type::Class(class.unwrap());
                             let place = HPlace {
-                                base: HPlaceBase::Prop(Box::new(HExpr { kind: HExprKind::Local(this), ty: this_ty, span }), slot),
+                                base: HPlaceBase::Prop(
+                                    Box::new(HExpr { kind: HExprKind::Local(this), ty: this_ty, span }),
+                                    slot,
+                                ),
                                 path: Vec::new(),
                             };
                             let value = HExpr { kind: HExprKind::Local(param_ids[i + 1]), ty: p.ty.clone(), span };
@@ -1264,8 +1307,7 @@ impl<'a> Checker<'a> {
             matches!(&s.kind, StmtKind::Expr(e) if matches!(&e.kind,
                 ExprKind::StaticCall { class, name, .. } if class == "parent" && name == "__construct"))
         });
-        let promoted: Vec<&str> =
-            d.params.iter().filter(|p| p.promote.is_some()).map(|p| p.name.as_str()).collect();
+        let promoted: Vec<&str> = d.params.iter().filter(|p| p.promote.is_some()).map(|p| p.name.as_str()).collect();
         let class = &self.classes[cid as usize];
         let missing: Vec<String> = class
             .fields
@@ -1281,11 +1323,8 @@ impl<'a> Checker<'a> {
         let parent_needs_init = class.fields.iter().any(|f| f.owner != cid && f.required);
         let name = class.name.clone();
         if !missing.is_empty() {
-            self.error(
-                format!("the constructor of `{name}` does not initialize {}", missing.join(", ")),
-                d.name_span,
-            )
-            .add_note("assign every non-nullable property without a default at the top of `__construct`");
+            self.error(format!("the constructor of `{name}` does not initialize {}", missing.join(", ")), d.name_span)
+                .add_note("assign every non-nullable property without a default at the top of `__construct`");
         }
         if parent_needs_init && !calls_parent {
             self.error(format!("the constructor of `{name}` must call `parent::__construct(...)`"), d.name_span)

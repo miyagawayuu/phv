@@ -18,11 +18,12 @@ pub fn boundary(content_type: &str) -> Option<String> {
     if !parts.next()?.trim().eq_ignore_ascii_case("multipart/form-data") {
         return None;
     }
-    parts.find_map(|p| {
-        let (k, v) = p.trim().split_once('=')?;
-        k.trim().eq_ignore_ascii_case("boundary").then(|| v.trim().trim_matches('"').to_string())
-    })
-    .filter(|b| !b.is_empty() && b.len() <= 200)
+    parts
+        .find_map(|p| {
+            let (k, v) = p.trim().split_once('=')?;
+            k.trim().eq_ignore_ascii_case("boundary").then(|| v.trim().trim_matches('"').to_string())
+        })
+        .filter(|b| !b.is_empty() && b.len() <= 200)
 }
 
 /// A parameter (`name="x"`) from a Content-Disposition header.

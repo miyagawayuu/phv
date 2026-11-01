@@ -153,7 +153,8 @@ pub fn format_source(src: &str) -> Result<String, String> {
         let inside =
             protected.iter().any(|(s, e, html)| (line_start > *s || (*html && line_start == *s)) && line_start < *e);
         let content = raw.trim_end_matches(['\n', '\r']).trim();
-        let mixed = content.starts_with("<?") || line_toks.clone().any(|k| matches!(toks[k].tok, Tok::CloseTag | Tok::EchoOpen));
+        let mixed = content.starts_with("<?")
+            || line_toks.clone().any(|k| matches!(toks[k].tok, Tok::CloseTag | Tok::EchoOpen));
         if inside {
             out.push_str(raw.trim_end_matches(['\n', '\r']));
             out.push_str(newline);

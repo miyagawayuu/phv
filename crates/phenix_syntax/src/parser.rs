@@ -206,8 +206,19 @@ impl Parser {
                     self.advance();
                     return;
                 }
-                Tok::Function | Tok::Class | Tok::Interface | Tok::Enum | Tok::Const | Tok::If | Tok::Foreach | Tok::While | Tok::For | Tok::Return
-                | Tok::Echo | Tok::Import | Tok::Export => return,
+                Tok::Function
+                | Tok::Class
+                | Tok::Interface
+                | Tok::Enum
+                | Tok::Const
+                | Tok::If
+                | Tok::Foreach
+                | Tok::While
+                | Tok::For
+                | Tok::Return
+                | Tok::Echo
+                | Tok::Import
+                | Tok::Export => return,
                 _ => {
                     self.advance();
                 }
@@ -306,11 +317,8 @@ impl Parser {
             Tok::Try => return self.try_stmt(),
             Tok::Return => {
                 self.advance();
-                let value = if matches!(self.peek(), Tok::Semi | Tok::CloseTag | Tok::Eof) {
-                    None
-                } else {
-                    Some(self.expr()?)
-                };
+                let value =
+                    if matches!(self.peek(), Tok::Semi | Tok::CloseTag | Tok::Eof) { None } else { Some(self.expr()?) };
                 self.semi()?;
                 StmtKind::Return(value)
             }
@@ -520,11 +528,7 @@ impl Parser {
         let subject = self.expr()?;
         self.expect(Tok::As)?;
         let first = self.expect_var()?;
-        let (key, value) = if self.eat(&Tok::FatArrow) {
-            (Some(first), self.expect_var()?)
-        } else {
-            (None, first)
-        };
+        let (key, value) = if self.eat(&Tok::FatArrow) { (Some(first), self.expect_var()?) } else { (None, first) };
         self.expect(Tok::RParen)?;
         let body = if self.eat(&Tok::Colon) {
             let b = self.block_until(&[Tok::Endforeach]);
@@ -582,11 +586,8 @@ impl Parser {
                 }
                 self.advance();
             }
-            let promote = if vis.is_some() || readonly {
-                Some((vis.unwrap_or(Visibility::Public), readonly))
-            } else {
-                None
-            };
+            let promote =
+                if vis.is_some() || readonly { Some((vis.unwrap_or(Visibility::Public), readonly)) } else { None };
             let ty = if matches!(self.peek(), Tok::Var(_)) { None } else { Some(self.ty()?) };
             let (name, _) = self.expect_var()?;
             let default = if self.eat(&Tok::Eq) { Some(self.expr()?) } else { None };
@@ -941,11 +942,7 @@ impl Parser {
                 self.advance();
                 let rhs = self.expr_bp(19)?;
                 let span = lhs.span.to(rhs.span);
-                let kind = ExprKind::Range {
-                    from: Box::new(lhs),
-                    to: Box::new(rhs),
-                    inclusive: tok == Tok::DotDotEq,
-                };
+                let kind = ExprKind::Range { from: Box::new(lhs), to: Box::new(rhs), inclusive: tok == Tok::DotDotEq };
                 lhs = Expr { kind, span };
                 continue;
             }
@@ -1094,9 +1091,28 @@ impl Parser {
         let t = self.peek().clone();
         match t {
             Tok::Ident(name) => Ok((name, self.advance().span)),
-            Tok::Default | Tok::Match | Tok::Is | Tok::New | Tok::Echo | Tok::Use | Tok::Import | Tok::Export
-            | Tok::Static | Tok::Class | Tok::As | Tok::Do | Tok::Try | Tok::Catch | Tok::Throw | Tok::Interface
-            | Tok::Enum | Tok::Case | Tok::Const | Tok::Abstract | Tok::Final | Tok::Implements => {
+            Tok::Default
+            | Tok::Match
+            | Tok::Is
+            | Tok::New
+            | Tok::Echo
+            | Tok::Use
+            | Tok::Import
+            | Tok::Export
+            | Tok::Static
+            | Tok::Class
+            | Tok::As
+            | Tok::Do
+            | Tok::Try
+            | Tok::Catch
+            | Tok::Throw
+            | Tok::Interface
+            | Tok::Enum
+            | Tok::Case
+            | Tok::Const
+            | Tok::Abstract
+            | Tok::Final
+            | Tok::Implements => {
                 let span = self.advance().span;
                 let text = t.describe().trim_matches('`').to_string();
                 Ok((text, span))

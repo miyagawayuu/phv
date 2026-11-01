@@ -218,14 +218,16 @@ impl Loader {
                 None => (self.root.clone(), &segments[..]),
             };
             if rest.is_empty() {
-                self.diags.push(
-                    Diagnostic::error(format!("`{name}` is a package; import one of its modules, e.g. `import {name}.main.{{...}}`"), span),
-                );
+                self.diags.push(Diagnostic::error(
+                    format!("`{name}` is a package; import one of its modules, e.g. `import {name}.main.{{...}}`"),
+                    span,
+                ));
                 continue;
             }
             if !base.is_dir() {
                 self.diags.push(
-                    Diagnostic::error(format!("package `{}` is not installed", segments[0]), span).note("run `phenix install`"),
+                    Diagnostic::error(format!("package `{}` is not installed", segments[0]), span)
+                        .note("run `phenix install`"),
                 );
                 continue;
             }
@@ -320,14 +322,28 @@ pub fn analyze(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>) -> 
         Ok(t) => t,
         Err(e) => {
             messages.push(format!("cannot read {}: {e}", entry.display()));
-            return Analysis { sources: loader.sources, diags: Vec::new(), hir: None, entry_file: None, messages, deps: Vec::new() };
+            return Analysis {
+                sources: loader.sources,
+                diags: Vec::new(),
+                hir: None,
+                entry_file: None,
+                messages,
+                deps: Vec::new(),
+            };
         }
     };
     let name = display_name(root, entry);
     let entry_module = loader.add(name, Some(entry.to_path_buf()), text, ModuleKind::Entry);
     let entry_file = Some(loader.modules[entry_module].0.file);
     if loader.diags.iter().any(|d| d.is_error()) {
-        return Analysis { sources: loader.sources, diags: loader.diags, hir: None, entry_file, messages, deps: loader.deps };
+        return Analysis {
+            sources: loader.sources,
+            diags: loader.diags,
+            hir: None,
+            entry_file,
+            messages,
+            deps: loader.deps,
+        };
     }
     let input = CheckInput {
         modules: loader

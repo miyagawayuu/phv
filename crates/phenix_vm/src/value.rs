@@ -129,8 +129,7 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         }
         (Value::Map(x), Value::Map(y)) => {
             Rc::ptr_eq(x, y)
-                || (x.len() == y.len()
-                    && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| values_equal(v, w))))
+                || (x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| values_equal(v, w))))
         }
         (Value::Object(x), Value::Object(y)) => Rc::ptr_eq(x, y),
         (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),

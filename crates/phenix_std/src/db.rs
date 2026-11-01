@@ -103,7 +103,8 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
 
 fn is_identifier(t: &str) -> bool {
     let mut chars = t.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 pub fn lookup(name: &str) -> Option<BuiltinFn> {

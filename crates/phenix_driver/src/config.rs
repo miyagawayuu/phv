@@ -156,11 +156,8 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
             return Err(format!("[dependencies].{name}: give exactly one of `path` or `git`"));
         }
     }
-    let permissions = Permissions {
-        read: file.permissions.read,
-        write: file.permissions.write,
-        env: file.permissions.env,
-    };
+    let permissions =
+        Permissions { read: file.permissions.read, write: file.permissions.write, env: file.permissions.env };
     Ok(Config {
         name: file.project.name,
         host: Arc::new(Host { root: root.to_path_buf(), permissions }),

@@ -17,7 +17,17 @@ where
 {
     const DAYS: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
     const MONTHS: [&str; 12] = [
-        "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November",
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
         "December",
     ];
     let mut out = String::new();
@@ -43,13 +53,17 @@ where
             'd' => write!(out, "{:02}", t.day()),
             'D' => write!(out, "{}", &DAYS[wd][..3]),
             'j' => write!(out, "{}", t.day()),
-            'S' => write!(out, "{}", match (t.day() % 10, t.day() % 100) {
-                (_, 11..=13) => "th",
-                (1, _) => "st",
-                (2, _) => "nd",
-                (3, _) => "rd",
-                _ => "th",
-            }),
+            'S' => write!(
+                out,
+                "{}",
+                match (t.day() % 10, t.day() % 100) {
+                    (_, 11..=13) => "th",
+                    (1, _) => "st",
+                    (2, _) => "nd",
+                    (3, _) => "rd",
+                    _ => "th",
+                }
+            ),
             'l' => write!(out, "{}", DAYS[wd]),
             'N' => write!(out, "{}", wd + 1),
             'w' => write!(out, "{}", t.weekday().num_days_from_sunday()),
@@ -128,10 +142,8 @@ fn digest(vm: &Vm, algo: &str, data: &[u8]) -> Result<String, VmError> {
         "sha384" => hex(&Sha384::digest(data)),
         "sha512" => hex(&Sha512::digest(data)),
         other => {
-            return Err(vm.throw(
-                "ValueError",
-                format!("unsupported hash algorithm \"{other}\" (use sha256, sha384 or sha512)"),
-            ))
+            return Err(vm
+                .throw("ValueError", format!("unsupported hash algorithm \"{other}\" (use sha256, sha384 or sha512)")))
         }
     })
 }
@@ -206,7 +218,9 @@ pub fn resolve_path(vm: &Vm, rel: &str, write: bool) -> Result<PathBuf, VmError>
     let Some(dir) = allowed.iter().find(|d| p.starts_with(Path::new(d.trim_end_matches('/')))) else {
         let msg = if p.components().count() > 1 {
             let first = p.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()).unwrap_or_default();
-            format!("{kind} access to \"{rel}\" is not allowed; add \"{first}/\" to [permissions].{kind} in phenix.toml")
+            format!(
+                "{kind} access to \"{rel}\" is not allowed; add \"{first}/\" to [permissions].{kind} in phenix.toml"
+            )
         } else {
             format!("{kind} access to \"{rel}\" is not allowed; keep files in a directory listed in [permissions].{kind} in phenix.toml (e.g. \"data/\")")
         };
@@ -218,7 +232,11 @@ pub fn resolve_path(vm: &Vm, rel: &str, write: bool) -> Result<PathBuf, VmError>
         .canonicalize()
         .map_err(|_| permission_error(vm, format!("the allowed directory \"{dir}\" does not exist")))?;
     let full = root.join(p);
-    let probe = if full.exists() { full.canonicalize() } else { full.parent().map(|d| d.to_path_buf()).unwrap_or_default().canonicalize() };
+    let probe = if full.exists() {
+        full.canonicalize()
+    } else {
+        full.parent().map(|d| d.to_path_buf()).unwrap_or_default().canonicalize()
+    };
     match probe {
         Ok(c) if c.starts_with(&base) => Ok(full),
         Ok(_) => Err(permission_error(vm, format!("\"{rel}\" points outside \"{dir}\""))),
@@ -326,7 +344,9 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let rel = s(&a[0]).to_string();
             let path = resolve_path(vm, &rel, false)?;
             let bytes = std::fs::read(&path).map_err(|e| io_error(vm, "cannot read", &rel, e))?;
-            String::from_utf8(bytes).map(Value::str).map_err(|_| vm.throw("ValueError", format!("\"{rel}\" is not UTF-8 text")))
+            String::from_utf8(bytes)
+                .map(Value::str)
+                .map_err(|_| vm.throw("ValueError", format!("\"{rel}\" is not UTF-8 text")))
         },
         "file_put_contents" => |vm, a| {
             let rel = s(&a[0]).to_string();
@@ -392,10 +412,7 @@ mod tests {
 
     #[test]
     fn hashes_and_passwords() {
-        assert_eq!(
-            hex(&Sha256::digest(b"abc")),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
+        assert_eq!(hex(&Sha256::digest(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         let h = password_hash("secret");
         assert!(h.starts_with("$argon2id$"));
         assert!(password_verify("secret", &h));

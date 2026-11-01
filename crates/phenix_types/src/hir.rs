@@ -98,7 +98,11 @@ pub enum HExprKind {
     IndexOrNull(Box<HExpr>, Box<HExpr>),
     Prop(Box<HExpr>, u32),
     /// `obj?->...`: evaluates `obj` into `tmp`; null short-circuits, otherwise `body`.
-    NullSafe { tmp: LocalId, obj: Box<HExpr>, body: Box<HExpr> },
+    NullSafe {
+        tmp: LocalId,
+        obj: Box<HExpr>,
+        body: Box<HExpr>,
+    },
     Call(FuncId, Vec<HExpr>),
     /// Receiver first.
     CallVirtual(u32, Vec<HExpr>),
@@ -112,7 +116,11 @@ pub enum HExprKind {
     EnumCases(ClassId),
     New(ClassId, Option<FuncId>, Vec<HExpr>),
     Closure(FuncId, Vec<HExpr>),
-    Match { subject: Option<Box<HExpr>>, arms: Vec<(Vec<HExpr>, HExpr)>, default: Option<Box<HExpr>> },
+    Match {
+        subject: Option<Box<HExpr>>,
+        arms: Vec<(Vec<HExpr>, HExpr)>,
+        default: Option<Box<HExpr>>,
+    },
     Is(Box<HExpr>, TestKind),
     Throw(Box<HExpr>),
 }
@@ -154,14 +162,34 @@ pub enum HStmt {
     /// `$s .= x` on a local string.
     Append(LocalId, HExpr),
     If(HExpr, Vec<HStmt>, Vec<HStmt>),
-    Loop { cond: Option<HExpr>, body: Vec<HStmt>, step: Vec<HStmt>, do_while: bool },
-    ForRange { var: LocalId, from: HExpr, to: HExpr, inclusive: bool, body: Vec<HStmt> },
-    Foreach { subject: HExpr, key: Option<LocalId>, val: LocalId, body: Vec<HStmt> },
+    Loop {
+        cond: Option<HExpr>,
+        body: Vec<HStmt>,
+        step: Vec<HStmt>,
+        do_while: bool,
+    },
+    ForRange {
+        var: LocalId,
+        from: HExpr,
+        to: HExpr,
+        inclusive: bool,
+        body: Vec<HStmt>,
+    },
+    Foreach {
+        subject: HExpr,
+        key: Option<LocalId>,
+        val: LocalId,
+        body: Vec<HStmt>,
+    },
     Break(u32),
     Continue(u32),
     Return(Option<HExpr>, Span),
     Throw(HExpr),
-    Try { body: Vec<HStmt>, catches: Vec<HCatch>, finally: Option<Vec<HStmt>> },
+    Try {
+        body: Vec<HStmt>,
+        catches: Vec<HCatch>,
+        finally: Option<Vec<HStmt>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

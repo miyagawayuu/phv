@@ -224,7 +224,9 @@ pub fn php_hint(name: &str) -> Option<&'static str> {
         "strval" => "use `(string)$value`",
         "header" => "use `response()->header($name, $value)` from `std.http`",
         "is_null" => "use `$x == null`",
-        "is_int" | "is_string" | "is_float" | "is_bool" | "is_array" => "use `$x is int` (or string, float, bool, list, map)",
+        "is_int" | "is_string" | "is_float" | "is_bool" | "is_array" => {
+            "use `$x is int` (or string, float, bool, list, map)"
+        }
         "mysqli_query" | "mysql_query" | "pg_query" => "use `std.db` with `sql\"...\"` queries",
         "md5" | "sha1" | "crypt" => "use `hash(\"sha256\", $s)`, or `password_hash()` for passwords",
         "rand" | "mt_rand" => "use `random_int($min, $max)` for anything security related",

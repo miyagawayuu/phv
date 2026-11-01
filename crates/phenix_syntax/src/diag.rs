@@ -18,13 +18,7 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub fn error(message: impl Into<String>, span: Span) -> Diagnostic {
-        Diagnostic {
-            severity: Severity::Error,
-            message: message.into(),
-            span,
-            label: None,
-            notes: Vec::new(),
-        }
+        Diagnostic { severity: Severity::Error, message: message.into(), span, label: None, notes: Vec::new() }
     }
 
     pub fn warning(message: impl Into<String>, span: Span) -> Diagnostic {
@@ -72,11 +66,8 @@ pub fn render(sources: &SourceMap, diags: &[Diagnostic], color: bool) -> String 
 }
 
 fn render_one(out: &mut String, sources: &SourceMap, d: &Diagnostic, color: bool) {
-    let (red, blue, bold, reset) = if color {
-        ("\x1b[31;1m", "\x1b[34;1m", "\x1b[1m", "\x1b[0m")
-    } else {
-        ("", "", "", "")
-    };
+    let (red, blue, bold, reset) =
+        if color { ("\x1b[31;1m", "\x1b[34;1m", "\x1b[1m", "\x1b[0m") } else { ("", "", "", "") };
     let kind = match d.severity {
         Severity::Error => "error",
         Severity::Warning => "warning",
@@ -96,12 +87,7 @@ fn render_one(out: &mut String, sources: &SourceMap, d: &Diagnostic, color: bool
     } else {
         text.chars().count().saturating_sub(col - 1).max(1)
     };
-    let _ = write!(
-        out,
-        "{pad} {blue}|{reset} {}{red}{}{reset}",
-        " ".repeat(col - 1),
-        "^".repeat(width)
-    );
+    let _ = write!(out, "{pad} {blue}|{reset} {}{red}{}{reset}", " ".repeat(col - 1), "^".repeat(width));
     if let Some(label) = &d.label {
         let _ = write!(out, " {red}{label}{reset}");
     }

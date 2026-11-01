@@ -110,12 +110,37 @@ pub enum Instr {
     JumpIfNotLtIImm(Reg, i32, u32),
     JumpIfNotLeIImm(Reg, i32, u32),
 
-    Call { dst: Reg, func: u32, args: Reg, argc: u16 },
-    CallVirtual { dst: Reg, slot: u32, args: Reg, argc: u16 },
-    CallClosure { dst: Reg, callee: Reg, args: Reg, argc: u16 },
-    CallBuiltin { dst: Reg, id: u32, args: Reg, argc: u16 },
+    Call {
+        dst: Reg,
+        func: u32,
+        args: Reg,
+        argc: u16,
+    },
+    CallVirtual {
+        dst: Reg,
+        slot: u32,
+        args: Reg,
+        argc: u16,
+    },
+    CallClosure {
+        dst: Reg,
+        callee: Reg,
+        args: Reg,
+        argc: u16,
+    },
+    CallBuiltin {
+        dst: Reg,
+        id: u32,
+        args: Reg,
+        argc: u16,
+    },
     /// Method call through an interface: looked up by interned name.
-    CallNamed { dst: Reg, name: u32, args: Reg, argc: u16 },
+    CallNamed {
+        dst: Reg,
+        name: u32,
+        args: Reg,
+        argc: u16,
+    },
     Ret(Reg),
     RetNull,
 
@@ -131,19 +156,37 @@ pub enum Instr {
 
     /// Iterator state lives in two registers: the collection and the position.
     IterInit(Reg, Reg),
-    IterNext { it: Reg, key: Reg, val: Reg, end: u32 },
+    IterNext {
+        it: Reg,
+        key: Reg,
+        val: Reg,
+        end: u32,
+    },
 
     Throw(Reg),
-    TryBegin { catch: u32, exc: Reg },
+    TryBegin {
+        catch: u32,
+        exc: Reg,
+    },
     TryEnd,
     InstanceOf(Reg, Reg, u32),
     IsType(Reg, Reg, TypeTag),
     MatchError(Reg),
     EnumCase(Reg, u32, u32),
-    EnumFrom { dst: Reg, class: u32, val: Reg, try_: bool },
+    EnumFrom {
+        dst: Reg,
+        class: u32,
+        val: Reg,
+        try_: bool,
+    },
     EnumCases(Reg, u32),
 
-    MakeClosure { dst: Reg, func: u32, caps: Reg, n: u16 },
+    MakeClosure {
+        dst: Reg,
+        func: u32,
+        caps: Reg,
+        n: u16,
+    },
 
     Echo(Reg),
     EchoHtml(u32),

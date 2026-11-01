@@ -447,11 +447,7 @@ impl Vm {
                 v => bad("int or bool", v),
             };
         }
-        let limits = JitLimits {
-            deadline: self.deadline,
-            max_memory: self.limits.max_memory,
-            mem_base: self.mem_base,
-        };
+        let limits = JitLimits { deadline: self.deadline, max_memory: self.limits.max_memory, mem_base: self.mem_base };
         let mut ctx = JitCtx {
             error: 0,
             depth: self.frames.len() as i64,
@@ -492,10 +488,7 @@ impl Vm {
         if let Some(max) = self.limits.max_memory {
             let used = crate::alloc::thread_allocated() - self.mem_base;
             if used > max as isize {
-                return Err(VmError::Fatal(format!(
-                    "allowed memory size of {} MB exhausted",
-                    max / (1024 * 1024)
-                )));
+                return Err(VmError::Fatal(format!("allowed memory size of {} MB exhausted", max / (1024 * 1024))));
             }
         }
         Ok(())
@@ -638,7 +631,8 @@ impl Vm {
                     tri!(self.tick());
                     let caps: &[Value] = $caps;
                     let new_base = base + func.num_regs as usize;
-                    let need = new_base + (prog.funcs[callee as usize].num_regs as usize).max(caps.len() + $argc as usize);
+                    let need =
+                        new_base + (prog.funcs[callee as usize].num_regs as usize).max(caps.len() + $argc as usize);
                     if self.regs.len() < need {
                         self.regs.resize(need, Value::Null);
                     }
@@ -818,7 +812,7 @@ impl Vm {
                     Instr::IntToFloat(d, a) => reg!(*d) = Value::Float(int!(*a) as f64),
                     Instr::FloatToInt(d, a) => {
                         let f = float!(*a);
-                        if !f.is_finite() || f >= 9.223372036854775807e18 || f < -9.223372036854775808e18 {
+                        if !(i64::MIN as f64..-(i64::MIN as f64)).contains(&f) {
                             tri!(Err(self.throw("ValueError", format!("cannot convert {} to int", format_float(f)))));
                         }
                         reg!(*d) = Value::Int(f.trunc() as i64);
@@ -965,7 +959,8 @@ impl Vm {
                     Instr::RetNull => ret!(Value::Null),
 
                     Instr::NewObject(d, class) => {
-                        let fields = prog.classes[*class as usize].fields.iter().map(|f| const_value(&f.default)).collect();
+                        let fields =
+                            prog.classes[*class as usize].fields.iter().map(|f| const_value(&f.default)).collect();
                         reg!(*d) = Value::Object(Rc::new(RefCell::new(Object { class: *class, fields })));
                     }
                     Instr::GetProp(d, o, slot) => {
@@ -983,8 +978,9 @@ impl Vm {
                         }
                     }
                     Instr::NewList(d, start, n) => {
-                        let items: Vec<Value> =
-                            (0..*n as usize).map(|i| std::mem::take(&mut self.regs[base + *start as usize + i])).collect();
+                        let items: Vec<Value> = (0..*n as usize)
+                            .map(|i| std::mem::take(&mut self.regs[base + *start as usize + i]))
+                            .collect();
                         reg!(*d) = Value::list(items);
                     }
                     Instr::NewMap(d, start, n) => {
@@ -1118,11 +1114,7 @@ impl Vm {
                             Some(i) => self.enum_case(*class, i as u32),
                             None if *try_ => Value::Null,
                             None => {
-                                let msg = format!(
-                                    "{} is not a valid value for enum {}",
-                                    short_repr(&wanted),
-                                    cls.name
-                                );
+                                let msg = format!("{} is not a valid value for enum {}", short_repr(&wanted), cls.name);
                                 tri!(Err(self.throw("ValueError", msg)))
                             }
                         };
