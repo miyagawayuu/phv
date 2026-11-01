@@ -280,3 +280,18 @@ fn cache_does_not_follow_junctions() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn inline_code_warnings_follow_the_policy() {
+    let dir = std::env::temp_dir().join(format!("phx-csp-warn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let page = dir.join("page.phx");
+    std::fs::write(&page, "<?phx\n?>\n<button onclick=\"go()\">x</button>\n").unwrap();
+    let warned = phx_driver::compile(&dir, &page).ok().unwrap();
+    assert!(warned.warnings.contains("`onclick`"), "{}", warned.warnings);
+    std::fs::write(dir.join("phx.toml"), "[security]\ncsp = \"off\"\n").unwrap();
+    let quiet = phx_driver::compile(&dir, &page).ok().unwrap();
+    assert!(quiet.warnings.is_empty(), "{}", quiet.warnings);
+    let _ = std::fs::remove_dir_all(&dir);
+}

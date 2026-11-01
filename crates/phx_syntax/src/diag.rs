@@ -14,11 +14,25 @@ pub struct Diagnostic {
     pub span: Span,
     pub label: Option<String>,
     pub notes: Vec<String>,
+    /// Identifies a kind of diagnostic that may be dropped later (see `CSP_INLINE`).
+    pub code: Option<&'static str>,
 }
+
+/// Warning code for inline JavaScript (event handler attributes, `javascript:`
+/// URLs) that the default Content-Security-Policy blocks. The driver drops it
+/// when phx.toml's policy allows inline code.
+pub const CSP_INLINE: &str = "csp-inline";
 
 impl Diagnostic {
     pub fn error(message: impl Into<String>, span: Span) -> Diagnostic {
-        Diagnostic { severity: Severity::Error, message: message.into(), span, label: None, notes: Vec::new() }
+        Diagnostic {
+            severity: Severity::Error,
+            message: message.into(),
+            span,
+            label: None,
+            notes: Vec::new(),
+            code: None,
+        }
     }
 
     pub fn warning(message: impl Into<String>, span: Span) -> Diagnostic {

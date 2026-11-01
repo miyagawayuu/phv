@@ -426,6 +426,9 @@ pub fn analyze(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>) -> 
     let (hir, diags) = phx_types::check(&input);
     drop(input);
     loader.diags.extend(diags);
+    if config.csp.allows_inline_code() {
+        loader.diags.retain(|d| d.code != Some(phx_syntax::diag::CSP_INLINE));
+    }
     Analysis { sources: loader.sources, diags: loader.diags, hir: Some(hir), entry_file, messages, deps: loader.deps }
 }
 

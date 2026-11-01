@@ -1,0 +1,21 @@
+warning: the event handler attribute `onclick` does not run under the default Content-Security-Policy
+ --> csp_inline.phx:5:9
+  |
+5 | <button onclick="save()">Save</button>
+  |         ^^^^^^^
+  = note: attach the handler from a `<script>` in the template (it gets the CSP nonce), e.g. `el.addEventListener("click", ...)`
+  = note: or allow inline code with `[security] csp` in phx.toml (not recommended)
+
+warning: `javascript:` URLs do not run under the default Content-Security-Policy
+ --> csp_inline.phx:6:9
+  |
+6 | <a href="javascript:history.back()">Back</a>
+  |         ^
+  = note: use a button with an event listener added from a `<script>` in the template
+  = note: or allow inline code with `[security] csp` in phx.toml (not recommended)
+
+<button onclick="save()">Save</button>
+<a href="javascript:history.back()">Back</a>
+<img src="data:image/png;base64,iVBORw0KGgo=" alt="">
+<p onclick-free="1" title="on">fine</p>
+<script>document.querySelector("button").addEventListener("click", () => save(3));</script>

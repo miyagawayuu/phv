@@ -1,0 +1,9 @@
+<?phx
+// Inline JavaScript that the default Content-Security-Policy blocks is a warning.
+$n = 3;
+?>
+<button onclick="save()">Save</button>
+<a href="javascript:history.back()">Back</a>
+<img src="data:image/png;base64,iVBORw0KGgo=" alt="">
+<p onclick-free="1" title="on">fine</p>
+<script>document.querySelector("button").addEventListener("click", () => save(<?= $n ?>));</script>

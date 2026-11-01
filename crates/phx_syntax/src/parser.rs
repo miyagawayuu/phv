@@ -279,6 +279,25 @@ impl Parser {
         stmts
     }
 
+    fn inline_code_warning(&mut self, span: Span, what: crate::htmlctx::InlineCode) {
+        use crate::htmlctx::InlineCode;
+        let (msg, note) = match what {
+            InlineCode::Handler(name) => (
+                format!("the event handler attribute `{name}` does not run under the default Content-Security-Policy"),
+                "attach the handler from a `<script>` in the template (it gets the CSP nonce), e.g. `el.addEventListener(\"click\", ...)`",
+            ),
+            InlineCode::ScriptUrl => (
+                "`javascript:` URLs do not run under the default Content-Security-Policy".to_string(),
+                "use a button with an event listener added from a `<script>` in the template",
+            ),
+        };
+        let mut d = Diagnostic::warning(msg, span);
+        d.add_note(note);
+        d.add_note("or allow inline code with `[security] csp` in phx.toml (not recommended)");
+        d.code = Some(crate::diag::CSP_INLINE);
+        self.diags.push(d);
+    }
+
     fn check_block_html(&mut self, entry: &crate::htmlctx::HtmlTracker) {
         if !self.html.end_block(entry) && !self.halted {
             let span = self.span();
@@ -359,6 +378,14 @@ impl Parser {
             Tok::InlineHtml(text) => {
                 self.advance();
                 let scripts = self.html.feed(&text);
+                for (at, what) in self.html.take_inline_code() {
+                    let pos = start.start + at as u32;
+                    let len = match &what {
+                        crate::htmlctx::InlineCode::Handler(name) => name.len() as u32,
+                        crate::htmlctx::InlineCode::ScriptUrl => 1,
+                    };
+                    self.inline_code_warning(Span { start: pos, end: pos + len, ..start }, what);
+                }
                 StmtKind::InlineHtml(text, scripts)
             }
             Tok::EchoOpen => {

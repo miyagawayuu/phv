@@ -1,0 +1,106 @@
+name: Release
+
+# Pushing a tag `vX.Y.Z` builds `phx` for every platform and creates a *draft*
+# GitHub release with the archives and their SHA-256 checksums; it is
+# published by hand after checking it. Running the workflow by hand (Actions
+# tab, or `gh workflow run release.yml`) only builds and tests the archives.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, native: true }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, native: true }
+          - { os: macos-latest, target: aarch64-apple-darwin, native: true }
+          - { os: macos-latest, target: x86_64-apple-darwin, native: false }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+      - name: Version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the version in Cargo.toml ($version)"
+            exit 1
+          fi
+      - name: Build
+        run: cargo build --release --locked -p phx_cli --target ${{ matrix.target }}
+      - name: Smoke test
+        if: matrix.native
+        run: |
+          bin=target/${{ matrix.target }}/release/phx
+          "$bin" --version
+          out=$("$bin" run examples/hello/hello.phx)
+          echo "$out"
+          test -n "$out"
+      - name: Package
+        run: |
+          name=phx-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          exe=phx
+          [[ "${{ matrix.target }}" == *windows* ]] && exe=phx.exe
+          cp "target/${{ matrix.target }}/release/$exe" LICENSE README.md README.ja.md SECURITY.md "dist/$name/"
+          cd dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          rm -r "$name"
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phx-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: draft release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "PHX $GITHUB_REF_NAME" \
+            --generate-notes

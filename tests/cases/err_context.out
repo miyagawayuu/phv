@@ -47,6 +47,14 @@ error: values in attributes must be quoted
    |                    ^^
    = note: write `attr="<?= $value ?>"`: escaping does not protect unquoted attribute values
 
+warning: the event handler attribute `onclick` does not run under the default Content-Security-Policy
+  --> err_context.phx:13:9
+   |
+13 | <button onclick="go(<?phx echo $q; ?>)">handler</button>
+   |         ^^^^^^^
+   = note: attach the handler from a `<script>` in the template (it gets the CSP nonce), e.g. `el.addEventListener("click", ...)`
+   = note: or allow inline code with `[security] csp` in phx.toml (not recommended)
+
 error: values cannot be inserted into event handler attributes
   --> err_context.phx:13:32
    |
@@ -102,6 +110,14 @@ error: a URL attribute cannot start with an unchecked value
 20 | <a href="j<?= $q ?>">nor is a letter</a>
    |               ^^
    = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
+
+warning: `javascript:` URLs do not run under the default Content-Security-Policy
+  --> err_context.phx:21:9
+   |
+21 | <a href="javascript:go('<?= $q ?>')">a javascript: URL</a>
+   |         ^
+   = note: use a button with an event listener added from a `<script>` in the template
+   = note: or allow inline code with `[security] csp` in phx.toml (not recommended)
 
 error: values cannot be inserted into a `javascript:` (or `data:`) URL
   --> err_context.phx:21:29

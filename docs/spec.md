@@ -661,6 +661,7 @@ form-action 'self'; frame-ancestors 'self'
   `nonce="..."` を付ける。そのため、自分で書いたインラインスクリプトはそのまま動き、エスケープをすり抜けて
   注入されたスクリプト(`raw()` に入った `<script>` など)は動かない。
 - `onclick="..."` のようなイベント属性と `javascript:` の URL は止まる。`addEventListener` を使う。
+  テンプレートに書くとコンパイル時に警告が出る(`csp` でインラインのコードを許可しているときは出ない)。
 - 文字列から組み立てた `<script>` に nonce が必要なときは `csp_nonce()` を使う
   (`raw("<script nonce=\"" . csp_nonce() . "\">...</script>")`)。
 - 静的ファイルとエラーページには nonce のないポリシーが付く(静的な `.html` のインラインスクリプトは動かない)。

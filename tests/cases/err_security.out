@@ -37,6 +37,14 @@ error: a URL attribute cannot start with an unchecked value
    |              ^^^^^
    = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
 
+warning: the event handler attribute `onclick` does not run under the default Content-Security-Policy
+  --> err_security.phx:47:9
+   |
+47 | <button onclick="go(<?= $name ?>)">handler</button>
+   |         ^^^^^^^
+   = note: attach the handler from a `<script>` in the template (it gets the CSP nonce), e.g. `el.addEventListener("click", ...)`
+   = note: or allow inline code with `[security] csp` in phx.toml (not recommended)
+
 error: values cannot be inserted into event handler attributes
   --> err_security.phx:47:25
    |

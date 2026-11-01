@@ -82,11 +82,25 @@ pub struct HtmlTracker {
     pending: Option<String>,
     /// Depth of `<svg>` / `<math>` (foreign content has no RCDATA elements).
     foreign: u32,
+    /// Byte offset (in the chunk being fed) of the attribute name or value being read.
+    mark: usize,
+    /// Inline JavaScript found in the last `feed` (see `InlineCode`).
+    found: Vec<(usize, InlineCode)>,
+}
+
+/// JavaScript written directly in template HTML, which a Content-Security-Policy
+/// without `'unsafe-inline'` does not run (unlike `<script>`, which gets a nonce).
+#[derive(Clone, Debug, PartialEq)]
+pub enum InlineCode {
+    /// An event handler attribute such as `onclick`.
+    Handler(String),
+    /// A `javascript:` (or `vbscript:`) URL.
+    ScriptUrl,
 }
 
 impl Default for HtmlTracker {
     fn default() -> Self {
-        HtmlTracker { state: State::Text, pending: None, foreign: 0 }
+        HtmlTracker { state: State::Text, pending: None, foreign: 0, mark: 0, found: Vec::new() }
     }
 }
 
@@ -180,6 +194,11 @@ impl HtmlTracker {
                 }
             }
         }
+    }
+
+    /// Inline JavaScript seen by the last `feed`, as (byte offset in that text, what).
+    pub fn take_inline_code(&mut self) -> Vec<(usize, InlineCode)> {
+        std::mem::take(&mut self.found)
     }
 
     /// Records that a value was inserted. In a URL attribute the inserted
@@ -363,11 +382,18 @@ impl HtmlTracker {
                     } else if c.is_whitespace() || c == '/' {
                         State::Tag { name, closing }
                     } else {
+                        self.mark = offsets[i];
                         State::AttrName { tag: name, closing, name: c.to_ascii_lowercase().to_string() }
                     }
                 }
                 State::AttrName { tag, closing, mut name } => {
                     if c == '=' {
+                        // Event handler names are letters only (`onclick`, not `onclick-free`).
+                        let handler =
+                            name.len() > 2 && name.starts_with("on") && name.bytes().all(|b| b.is_ascii_lowercase());
+                        if handler && !closing {
+                            self.found.push((self.mark, InlineCode::Handler(name.clone())));
+                        }
                         State::BeforeValue { tag, closing, name }
                     } else if c == '>' {
                         self.end_tag(tag, closing);
@@ -390,6 +416,7 @@ impl HtmlTracker {
                 State::BeforeValue { tag, closing, name } => {
                     if c == '"' || c == '\'' {
                         let url = is_url_attr(&tag, &name).then(|| UrlState::Undecided(String::new()));
+                        self.mark = offsets[i];
                         State::Quoted { tag, closing, name, quote: c, url }
                     } else if c.is_whitespace() {
                         State::BeforeValue { tag, closing, name }
@@ -410,6 +437,15 @@ impl HtmlTracker {
                                 p.push(c);
                             }
                             if let Some(d) = decide_url(p) {
+                                // `data:` is fine for images; only script URLs are inline code.
+                                let scheme: String =
+                                    p.chars().filter(|c| !c.is_ascii_whitespace() && !c.is_control()).collect();
+                                let scheme = scheme.to_ascii_lowercase();
+                                if d == UrlState::Script
+                                    && (scheme.starts_with("javascript:") || scheme.starts_with("vbscript:"))
+                                {
+                                    self.found.push((self.mark, InlineCode::ScriptUrl));
+                                }
                                 url = Some(d);
                             }
                         }
@@ -504,6 +540,20 @@ mod tests {
         t.inserted();
         t.feed("?page=");
         assert_eq!(t.context(), EchoContext::Attr);
+    }
+
+    #[test]
+    fn finds_inline_code() {
+        let mut t = HtmlTracker::default();
+        let html = "<button onclick=\"go()\" class=x>a</button><a href=\" javascript:void(0)\">b</a><img src=\"data:image/png,x\"><p online><p on-x=\"1\">";
+        t.feed(html);
+        let found = t.take_inline_code();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].1, InlineCode::Handler("onclick".into()));
+        assert!(html[found[0].0..].starts_with("onclick"));
+        assert_eq!(found[1].1, InlineCode::ScriptUrl);
+        assert!(html[found[1].0..].starts_with("\" javascript"));
+        assert!(t.take_inline_code().is_empty());
     }
 
     #[test]

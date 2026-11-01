@@ -96,6 +96,30 @@ pub enum Csp {
 }
 
 impl Csp {
+    /// Whether event handler attributes and `javascript:` URLs run under this
+    /// policy: no policy, or `'unsafe-inline'` for scripts without a nonce,
+    /// hash or `'strict-dynamic'` (any of which makes browsers ignore it).
+    pub fn allows_inline_code(&self) -> bool {
+        let Csp::Policy(p) = self else { return true };
+        let directive = |name: &str| {
+            p.split(';').find_map(|d| {
+                let mut words = d.split_whitespace();
+                words.next()?.eq_ignore_ascii_case(name).then(|| words.map(str::to_ascii_lowercase).collect::<Vec<_>>())
+            })
+        };
+        let sources =
+            directive("script-src-attr").or_else(|| directive("script-src")).or_else(|| directive("default-src"));
+        match sources {
+            None => true,
+            Some(s) => {
+                s.iter().any(|x| x == "'unsafe-inline'")
+                    && !s.iter().any(|x| {
+                        x.starts_with("'nonce-") || x == "{nonce}" || x.starts_with("'sha") || x == "'strict-dynamic'"
+                    })
+            }
+        }
+    }
+
     /// Whether responses need a nonce (the policy mentions `{nonce}`).
     pub fn uses_nonce(&self) -> bool {
         matches!(self, Csp::Policy(p) if p.contains("{nonce}"))
@@ -360,6 +384,16 @@ mod tests {
         assert!(ok.session_dir.is_some());
         assert!(load("[security]\nsession_ttl = 99999999999\n").is_err());
         assert!(load("[security]\nmemory_limit_mb = 0\n").is_err());
+    }
+
+    #[test]
+    fn inline_code_follows_the_policy() {
+        assert!(!Csp::Policy(DEFAULT_CSP.into()).allows_inline_code());
+        assert!(Csp::Off.allows_inline_code());
+        assert!(Csp::Policy("script-src 'self' 'unsafe-inline'".into()).allows_inline_code());
+        assert!(!Csp::Policy("script-src 'self' 'unsafe-inline' {nonce}".into()).allows_inline_code());
+        assert!(!Csp::Policy("default-src 'self'".into()).allows_inline_code());
+        assert!(Csp::Policy("img-src 'self'".into()).allows_inline_code());
     }
 
     #[test]
