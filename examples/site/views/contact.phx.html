@@ -14,6 +14,7 @@
 </ul>
 <?phx endif; ?>
 <form method="post" action="/contact" class="stack">
+  <?= csrf_field() ?>
   <label for="name">Name</label>
   <input id="name" name="name" value="<?= $name ?>">
   <label for="message">Message</label>

@@ -7,6 +7,14 @@ license.workspace = true
 [dependencies]
 phenix_vm.workspace = true
 indexmap.workspace = true
+chrono.workspace = true
+getrandom.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+argon2.workspace = true
+base64.workspace = true
+rusqlite.workspace = true
+percent-encoding.workspace = true
 
 [dev-dependencies]
 phenix_types.workspace = true

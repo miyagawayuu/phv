@@ -1,7 +1,28 @@
-// std.http — the current request and response.
+// std.http — the current request, the response and the session.
 //
-//   import std.http.{request, response};
+//   import std.http.{request, response, session};
 //   $name = request()->query("name") ?? "world";
+
+export class UploadedFile {
+    public function __construct(
+        private int $index,
+        public readonly string $field,
+        /** The client's file name (directory parts removed). Do not trust it as a path. */
+        public readonly string $name,
+        public readonly string $type,
+        public readonly int $size,
+    ) {}
+
+    /** The contents as text (invalid UTF-8 is replaced). */
+    public function text(): string {
+        return __upload_text($this->index);
+    }
+
+    /** Saves the file; the path must be inside a [permissions].write directory. */
+    public function saveTo(string $path): void {
+        __upload_save($this->index, $path);
+    }
+}
 
 export class Request {
     public function __construct(
@@ -10,6 +31,8 @@ export class Request {
         public readonly map<string, string> $queryParams,
         public readonly map<string, string> $formParams,
         public readonly map<string, string> $headers,
+        public readonly map<string, string> $cookies,
+        public readonly list<UploadedFile> $files,
         public readonly string $body,
     ) {}
 
@@ -18,7 +41,7 @@ export class Request {
         return $this->queryParams[$name] ?? null;
     }
 
-    /** A form field from an `application/x-www-form-urlencoded` POST body, or null. */
+    /** A form field (urlencoded or multipart POST body), or null. */
     public function form(string $name): ?string {
         return $this->formParams[$name] ?? null;
     }
@@ -26,6 +49,20 @@ export class Request {
     /** A request header (case-insensitive), or null. */
     public function header(string $name): ?string {
         return $this->headers[$name->lower()] ?? null;
+    }
+
+    public function cookie(string $name): ?string {
+        return $this->cookies[$name] ?? null;
+    }
+
+    /** An uploaded file from a multipart form, or null. */
+    public function file(string $field): ?UploadedFile {
+        return $this->files->find(fn($f) => $f->field == $field);
+    }
+
+    /** The body parsed as JSON. Throws ValueError for invalid JSON. */
+    public function json(): any {
+        return json_decode($this->body);
     }
 
     public function isPost(): bool {
@@ -51,6 +88,28 @@ export class Response {
         return $this;
     }
 
+    /**
+     * Sets a cookie. Cookies are HttpOnly and SameSite=Lax unless told otherwise;
+     * `$maxAge` 0 means "until the browser closes".
+     */
+    public function cookie(
+        string $name,
+        string $value,
+        int $maxAge = 0,
+        string $path = "/",
+        bool $secure = false,
+        bool $httpOnly = true,
+        string $sameSite = "Lax",
+    ): Response {
+        __resp_cookie($name, $value, $maxAge, $path, $secure, $httpOnly, $sameSite);
+        return $this;
+    }
+
+    public function deleteCookie(string $name, string $path = "/"): Response {
+        __resp_cookie($name, "", -1, $path, false, true, "Lax");
+        return $this;
+    }
+
     public function redirect(string $url, int $code = 302): void {
         __resp_status($code);
         __resp_header("Location", $url);
@@ -63,10 +122,73 @@ export class Response {
     }
 }
 
+/**
+ * The visitor's session, stored on the server. Values are strings; use
+ * json_encode / json_decode for structured data. Call regenerate() after login.
+ */
+export class Session {
+    public function get(string $key): ?string {
+        return __sess_get($key);
+    }
+
+    public function set(string $key, string $value): void {
+        __sess_set($key, $value);
+    }
+
+    public function has(string $key): bool {
+        return __sess_get($key) != null;
+    }
+
+    public function remove(string $key): void {
+        __sess_remove($key);
+    }
+
+    public function all(): map<string, string> {
+        return __sess_all();
+    }
+
+    /** Issues a new session id, keeping the values. */
+    public function regenerate(): void {
+        __sess_regenerate();
+    }
+
+    /** Deletes the session and its values. */
+    public function destroy(): void {
+        __sess_destroy();
+    }
+
+    /** Reads and removes a one-time message (e.g. "Saved!"). */
+    public function flash(string $key): ?string {
+        $v = __sess_get($key);
+        __sess_remove($key);
+        return $v;
+    }
+}
+
 export function request(): Request {
-    return new Request(__req_method(), __req_path(), __req_query(), __req_form(), __req_headers(), __req_body());
+    $files = __req_files()->map(fn($f) => new UploadedFile(
+        ($f["index"] ?? "0")->toInt() ?? 0,
+        $f["field"] ?? "",
+        $f["name"] ?? "",
+        $f["type"] ?? "",
+        ($f["size"] ?? "0")->toInt() ?? 0,
+    ));
+    return new Request(
+        __req_method(),
+        __req_path(),
+        __req_query(),
+        __req_form(),
+        __req_headers(),
+        __req_cookies(),
+        $files,
+        __req_body(),
+    );
 }
 
 export function response(): Response {
     return new Response();
+}
+
+export function session(): Session {
+    return new Session();
 }

@@ -175,6 +175,7 @@ fn sig_type(t: &TypeExpr) -> Type {
             ("void", []) => Type::Void,
             ("any", []) => Type::Any,
             ("Html", []) => Type::Html,
+            ("Sql", []) => Type::Sql,
             ("T", []) => Type::Generic(0),
             ("U", []) => Type::Generic(1),
             ("K", []) => Type::Generic(2),

@@ -1,5 +1,9 @@
 use clap::{Parser, Subcommand};
-use phenix_driver::{compile, find_root, run, RunOptions};
+
+#[global_allocator]
+static ALLOC: phenix_vm::alloc::CountingAlloc = phenix_vm::alloc::CountingAlloc;
+
+use phenix_driver::{compile, find_root, load_config, run, RunOptions};
 use phenix_vm::Limits;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -78,8 +82,19 @@ fn exec(cmd: Command) -> ExitCode {
                 }
             };
             eprint!("{}", compiled.warnings);
-            let limits = Limits { max_time: time_limit.map(Duration::from_secs_f64), ..Limits::default() };
-            let outcome = run(&compiled, RunOptions { html, limits, http: None });
+            let config = match load_config(&root) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let limits = Limits {
+                max_time: time_limit.map(Duration::from_secs_f64),
+                max_memory: Some(config.memory_limit_mb as usize * 1024 * 1024),
+                ..Limits::default()
+            };
+            let outcome = run(&compiled, RunOptions { html, limits, http: None, host: Some(config.host.clone()) });
             let mut stdout = std::io::stdout();
             let _ = stdout.write_all(outcome.output.as_bytes());
             let _ = stdout.flush();

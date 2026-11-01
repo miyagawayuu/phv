@@ -37,6 +37,27 @@ pub struct OutBuf {
     pub html: bool,
 }
 
+pub struct UploadedFile {
+    pub field: String,
+    /// The client's file name with any directory part removed.
+    pub filename: String,
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
+/// Session values for the current request. The server loads them before the
+/// script runs and stores them afterwards.
+#[derive(Default)]
+pub struct SessionData {
+    /// Id of an existing session (from the cookie), if any.
+    pub id: Option<String>,
+    pub values: indexmap::IndexMap<String, String>,
+    pub changed: bool,
+    /// `regenerate()` was called: issue a new id (prevents session fixation).
+    pub regenerate: bool,
+    pub destroyed: bool,
+}
+
 /// Request data and response state for scripts running under the web server.
 pub struct HttpCtx {
     pub method: String,
@@ -45,6 +66,8 @@ pub struct HttpCtx {
     pub form: Vec<(String, String)>,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    pub files: Vec<UploadedFile>,
+    pub session: SessionData,
     pub status: u16,
     pub resp_headers: Vec<(String, String)>,
     pub content_type: Option<String>,
@@ -59,6 +82,8 @@ impl Default for HttpCtx {
             form: Vec::new(),
             headers: Vec::new(),
             body: String::new(),
+            files: Vec::new(),
+            session: SessionData::default(),
             status: 200,
             resp_headers: Vec::new(),
             content_type: None,
@@ -70,12 +95,31 @@ impl Default for HttpCtx {
 pub struct Limits {
     pub max_time: Option<Duration>,
     pub max_frames: usize,
+    /// Bytes the script may allocate (requires the counting allocator).
+    pub max_memory: Option<usize>,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_time: None, max_frames: 10_000 }
+        Limits { max_time: None, max_frames: 10_000, max_memory: None }
     }
+}
+
+/// What a script may access outside its own heap (from `phenix.toml`).
+#[derive(Clone, Default, Debug)]
+pub struct Permissions {
+    /// Directories (relative to the project root) that may be read.
+    pub read: Vec<String>,
+    /// Directories that may be written (also readable).
+    pub write: Vec<String>,
+    /// Environment variable names; a trailing `*` matches a prefix.
+    pub env: Vec<String>,
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct Host {
+    pub root: std::path::PathBuf,
+    pub permissions: Permissions,
 }
 
 const MAX_NATIVE_DEPTH: u32 = 200;
@@ -107,7 +151,11 @@ pub struct Vm {
     consts: Vec<Option<Value>>,
     pub out: Vec<OutBuf>,
     pub http: HttpCtx,
+    pub host: Arc<Host>,
+    /// Native handles owned by this run (e.g. database connections).
+    pub resources: Vec<Option<Box<dyn std::any::Any>>>,
     limits: Limits,
+    mem_base: isize,
     deadline: Option<Instant>,
     budget: u32,
     pub rng: u64,
@@ -151,7 +199,10 @@ impl Vm {
             consts: vec![None; nconsts],
             out: vec![OutBuf { buf: String::new(), html: html_output }],
             http: HttpCtx::default(),
+            host: Arc::new(Host::default()),
+            resources: Vec::new(),
             limits,
+            mem_base: crate::alloc::thread_allocated(),
             deadline: limits.max_time.map(|d| Instant::now() + d),
             budget: BUDGET,
             rng: seed,
@@ -327,8 +378,23 @@ impl Vm {
         Ok(())
     }
 
+    /// Fails when the script has allocated more than its memory limit.
+    pub fn check_memory(&self) -> Result<(), VmError> {
+        if let Some(max) = self.limits.max_memory {
+            let used = crate::alloc::thread_allocated() - self.mem_base;
+            if used > max as isize {
+                return Err(VmError::Fatal(format!(
+                    "allowed memory size of {} MB exhausted",
+                    max / (1024 * 1024)
+                )));
+            }
+        }
+        Ok(())
+    }
+
     #[cold]
     fn check_deadline(&mut self) -> Result<(), VmError> {
+        self.check_memory()?;
         {
             self.budget = BUDGET;
             if let Some(d) = self.deadline {
@@ -660,13 +726,24 @@ impl Vm {
                         for i in 0..*n {
                             self.regs[base + (*start + i) as usize].append_to(&mut s);
                         }
+                        let big = s.len() > 1 << 20;
                         reg!(*d) = if *html { Value::html(s) } else { Value::str(s) };
+                        if big {
+                            tri!(self.check_memory());
+                        }
                     }
                     Instr::AppendStr(d, s) => {
                         let src = reg!(*s).clone();
-                        match &mut reg!(*d) {
-                            Value::Str(rc) => src.append_to(Rc::make_mut(rc)),
+                        let len = match &mut reg!(*d) {
+                            Value::Str(rc) => {
+                                let s = Rc::make_mut(rc);
+                                src.append_to(s);
+                                s.len()
+                            }
                             v => bad("string", v),
+                        };
+                        if len > 1 << 20 && len.is_power_of_two() {
+                            tri!(self.check_memory());
                         }
                     }
 

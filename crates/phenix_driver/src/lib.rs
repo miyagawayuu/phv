@@ -1,10 +1,13 @@
 //! Loads a script with its imports and templates, type-checks it, compiles it
 //! to bytecode and runs it.
 
+pub mod config;
+
+pub use config::{load_config, Config};
 use phenix_syntax::ast::{Module, StmtKind};
 use phenix_syntax::{diag, parse_module, Diagnostic, SourceMap, Span};
 use phenix_types::{CheckInput, ModuleInput, ModuleKind};
-use phenix_vm::{BuiltinFn, HttpCtx, Limits, Program, TraceLine, Vm, VmError};
+use phenix_vm::{BuiltinFn, Host, HttpCtx, Limits, Program, TraceLine, Vm, VmError};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -259,6 +262,8 @@ pub struct RunOptions {
     pub html: bool,
     pub limits: Limits,
     pub http: Option<HttpCtx>,
+    /// Project root and permissions (from `phenix.toml`).
+    pub host: Option<Arc<Host>>,
 }
 
 pub struct RuntimeError {
@@ -288,6 +293,9 @@ pub fn run(c: &Compiled, opts: RunOptions) -> RunOutcome {
     let mut vm = Vm::new(c.program.clone(), c.builtins.clone(), opts.html, opts.limits);
     if let Some(h) = opts.http {
         vm.http = h;
+    }
+    if let Some(host) = opts.host {
+        vm.host = host;
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.run_main()));
     let error = match result {

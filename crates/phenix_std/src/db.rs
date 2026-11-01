@@ -1,0 +1,146 @@
+//! SQLite access. Queries are `Sql` values (`sql"..."` literals), which keep
+//! interpolated values as bound parameters, so SQL injection cannot happen.
+//! At runtime an `Sql` value is the list `[query text, list of parameters]`.
+
+use crate::{int, s};
+use indexmap::IndexMap;
+use phenix_vm::{BuiltinFn, Key, Value, Vm, VmError};
+use rusqlite::types::{ToSqlOutput, Value as SqlValue, ValueRef};
+use rusqlite::{Connection, OpenFlags};
+use std::rc::Rc;
+use std::time::Duration;
+
+type R = Result<Value, VmError>;
+
+fn parts(v: &Value) -> (&str, &[Value]) {
+    let Value::List(l) = v else { panic!("Sql value expected") };
+    let Value::List(params) = &l[1] else { panic!("Sql parameters expected") };
+    (s(&l[0]), params)
+}
+
+fn to_sql(v: &Value) -> SqlValue {
+    match v {
+        Value::Null => SqlValue::Null,
+        Value::Bool(b) => SqlValue::Integer(*b as i64),
+        Value::Int(i) => SqlValue::Integer(*i),
+        Value::Float(f) => SqlValue::Real(*f),
+        other => SqlValue::Text(other.to_display_string()),
+    }
+}
+
+fn conn<'v>(vm: &'v Vm, h: &Value) -> Result<&'v Connection, VmError> {
+    vm.resources
+        .get(int(h) as usize)
+        .and_then(|r| r.as_ref())
+        .and_then(|b| b.downcast_ref::<Connection>())
+        .ok_or_else(|| vm.throw("DatabaseError", "the database connection is closed"))
+}
+
+fn db_error(vm: &Vm, e: rusqlite::Error) -> VmError {
+    vm.throw("DatabaseError", e.to_string())
+}
+
+struct Param<'a>(&'a Value);
+
+impl rusqlite::ToSql for Param<'_> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::Owned(to_sql(self.0)))
+    }
+}
+
+fn query(vm: &mut Vm, a: &[Value]) -> R {
+    let (text, params) = parts(&a[1]);
+    let c = conn(vm, &a[0])?;
+    let mut stmt = c.prepare(text).map_err(|e| db_error(vm, e))?;
+    let names: Vec<Rc<String>> = stmt.column_names().iter().map(|n| Rc::new(n.to_string())).collect();
+    let bound: Vec<Param> = params.iter().map(Param).collect();
+    let mut rows = stmt.query(rusqlite::params_from_iter(bound.iter())).map_err(|e| db_error(vm, e))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| db_error(vm, e))? {
+        let mut m = IndexMap::with_capacity(names.len());
+        for (i, n) in names.iter().enumerate() {
+            let v = match row.get_ref(i).map_err(|e| db_error(vm, e))? {
+                ValueRef::Null => Value::Null,
+                ValueRef::Integer(i) => Value::Int(i),
+                ValueRef::Real(f) => Value::Float(f),
+                ValueRef::Text(t) => Value::str(String::from_utf8_lossy(t).into_owned()),
+                ValueRef::Blob(b) => Value::str(String::from_utf8_lossy(b).into_owned()),
+            };
+            m.insert(Key::Str(n.clone()), v);
+        }
+        out.push(Value::map(m));
+        if out.len() % 4096 == 0 {
+            vm.check_memory()?;
+        }
+    }
+    Ok(Value::list(out))
+}
+
+fn execute(vm: &mut Vm, a: &[Value]) -> R {
+    let (text, params) = parts(&a[1]);
+    let c = conn(vm, &a[0])?;
+    let bound: Vec<Param> = params.iter().map(Param).collect();
+    let n = c.execute(text, rusqlite::params_from_iter(bound.iter())).map_err(|e| db_error(vm, e))?;
+    Ok(Value::Int(n as i64))
+}
+
+fn open(vm: &mut Vm, a: &[Value]) -> R {
+    let rel = s(&a[0]).to_string();
+    let c = if rel == ":memory:" {
+        Connection::open_in_memory()
+    } else {
+        let path = crate::sys::resolve_path(vm, &rel, true)?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        Connection::open_with_flags(path, flags)
+    }
+    .map_err(|e| db_error(vm, e))?;
+    c.busy_timeout(Duration::from_secs(5)).map_err(|e| db_error(vm, e))?;
+    // Prevent `ATTACH 'other.db'` from reaching files outside the permissions.
+    c.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_ATTACHED, 0).map_err(|e| db_error(vm, e))?;
+    vm.resources.push(Some(Box::new(c)));
+    Ok(Value::Int(vm.resources.len() as i64 - 1))
+}
+
+fn is_identifier(t: &str) -> bool {
+    let mut chars = t.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+pub fn lookup(name: &str) -> Option<BuiltinFn> {
+    let f: BuiltinFn = match name {
+        "__db_open" => open,
+        "__db_query" => query,
+        "__db_execute" => execute,
+        "__db_last_id" => |vm, a| Ok(Value::Int(conn(vm, &a[0])?.last_insert_rowid())),
+        "__db_raw" => |vm, a| {
+            // Only BEGIN / COMMIT / ROLLBACK, used by Database::transaction().
+            let cmd = s(&a[1]);
+            if !matches!(cmd, "BEGIN" | "COMMIT" | "ROLLBACK") {
+                return Err(VmError::Fatal(format!("__db_raw: unexpected statement {cmd}")));
+            }
+            conn(vm, &a[0])?.execute_batch(cmd).map_err(|e| db_error(vm, e))?;
+            Ok(Value::Null)
+        },
+        "__db_close" => |vm, a| {
+            if let Some(slot) = vm.resources.get_mut(int(&a[0]) as usize) {
+                *slot = None;
+            }
+            Ok(Value::Null)
+        },
+        "sql_concat" => |_, a| {
+            let (q1, p1) = parts(&a[0]);
+            let (q2, p2) = parts(&a[1]);
+            let params: Vec<Value> = p1.iter().chain(p2.iter()).cloned().collect();
+            Ok(Value::list(vec![Value::str(format!("{q1}{q2}")), Value::list(params)]))
+        },
+        "sql_ident" => |vm, a| {
+            let t = s(&a[0]);
+            if !is_identifier(t) {
+                return Err(vm.throw("ValueError", format!("\"{t}\" is not a valid SQL identifier")));
+            }
+            Ok(Value::list(vec![Value::str(format!("\"{t}\"")), Value::list(Vec::new())]))
+        },
+        _ => return None,
+    };
+    Some(f)
+}

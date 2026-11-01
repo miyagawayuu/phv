@@ -9,12 +9,20 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::rc::Rc;
 
+mod db;
+mod sys;
+mod web;
+
+pub use sys::constant_time_eq;
+pub use web::{json_decode, random_hex};
+
 pub const PRELUDE: &str = include_str!("phx/prelude.phx");
 
 /// Source of a `std.*` module.
 pub fn std_module(name: &str) -> Option<&'static str> {
     match name {
         "std.http" => Some(include_str!("phx/http.phx")),
+        "std.db" => Some(include_str!("phx/db.phx")),
         _ => None,
     }
 }
@@ -328,6 +336,10 @@ fn set_type(vm: &mut Vm, ct: &str) {
 }
 
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
+    core_lookup(name).or_else(|| web::lookup(name)).or_else(|| sys::lookup(name)).or_else(|| db::lookup(name))
+}
+
+fn core_lookup(name: &str) -> Option<BuiltinFn> {
     let f: BuiltinFn = match name {
         "list_len" => |_, a| Ok(Value::Int(list(&a[0]).len() as i64)),
         "map_len" => |_, a| Ok(Value::Int(map(&a[0]).len() as i64)),

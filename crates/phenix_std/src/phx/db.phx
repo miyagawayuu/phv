@@ -1,0 +1,114 @@
+// std.db — SQLite databases.
+//
+//   import std.db.Database;
+//   $db = Database::open("data/app.db");      // needs [permissions].write = ["data/"]
+//   $db->execute(sql"INSERT INTO posts (title) VALUES ({$title})");
+//   foreach ($db->query(sql"SELECT id, title FROM posts WHERE id > {$min}") as $row) {
+//       echo $row->int("id"), " ", $row->string("title");
+//   }
+//
+// Values written inside `sql"..."` are always sent as bound parameters.
+
+export class Row {
+    public function __construct(private map<string, any> $values) {}
+
+    public function get(string $column): any {
+        return $this->values[$column] ?? null;
+    }
+
+    public function has(string $column): bool {
+        return $this->values->has($column);
+    }
+
+    public function string(string $column): ?string {
+        $v = $this->values[$column] ?? null;
+        if ($v is string) {
+            return $v;
+        }
+        if ($v is int) {
+            return (string)$v;
+        }
+        if ($v is float) {
+            return (string)$v;
+        }
+        return null;
+    }
+
+    public function int(string $column): ?int {
+        $v = $this->values[$column] ?? null;
+        if ($v is int) {
+            return $v;
+        }
+        if ($v is string) {
+            return $v->toInt();
+        }
+        return null;
+    }
+
+    public function float(string $column): ?float {
+        $v = $this->values[$column] ?? null;
+        if ($v is float) {
+            return $v;
+        }
+        if ($v is int) {
+            return (float)$v;
+        }
+        return null;
+    }
+
+    public function bool(string $column): ?bool {
+        $v = $this->values[$column] ?? null;
+        if ($v is int) {
+            return $v != 0;
+        }
+        return null;
+    }
+
+    public function toMap(): map<string, any> {
+        return $this->values;
+    }
+}
+
+export class Database {
+    public function __construct(private int $handle) {}
+
+    /** Opens (or creates) a database file, or ":memory:". */
+    public static function open(string $path): Database {
+        return new Database(__db_open($path));
+    }
+
+    /** Runs a SELECT and returns all rows. */
+    public function query(Sql $query): list<Row> {
+        return __db_query($this->handle, $query)->map(fn($m) => new Row($m));
+    }
+
+    /** The first row of a SELECT, or null. */
+    public function first(Sql $query): ?Row {
+        return $this->query($query)->first();
+    }
+
+    /** Runs INSERT / UPDATE / DELETE / DDL and returns the number of changed rows. */
+    public function execute(Sql $query): int {
+        return __db_execute($this->handle, $query);
+    }
+
+    public function lastInsertId(): int {
+        return __db_last_id($this->handle);
+    }
+
+    /** Runs `$work` in a transaction; rolls back if it throws. */
+    public function transaction(fn(): void $work): void {
+        __db_raw($this->handle, "BEGIN");
+        try {
+            $work();
+        } catch (Exception $e) {
+            __db_raw($this->handle, "ROLLBACK");
+            throw $e;
+        }
+        __db_raw($this->handle, "COMMIT");
+    }
+
+    public function close(): void {
+        __db_close($this->handle);
+    }
+}

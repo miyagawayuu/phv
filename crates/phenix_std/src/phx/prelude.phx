@@ -19,3 +19,6 @@ class IndexError extends Exception {}
 class KeyError extends Exception {}
 class ValueError extends Exception {}
 class UnhandledMatchError extends Exception {}
+class PermissionError extends Exception {}
+class DatabaseError extends RuntimeException {}
+class AssertionError extends Exception {}

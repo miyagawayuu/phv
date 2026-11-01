@@ -2,6 +2,9 @@
 //! each request in a fresh VM (nothing is shared between requests except the
 //! compiled, immutable bytecode).
 
+mod multipart;
+mod session;
+
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
@@ -10,7 +13,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use phenix_driver::{compile, run, Compiled, RunOptions};
+use phenix_driver::{compile, load_config, run, Compiled, Config, RunOptions};
 use phenix_vm::value::html_escape;
 use phenix_vm::{HttpCtx, Limits};
 use std::collections::HashMap;
@@ -39,6 +42,8 @@ struct State {
     public: PathBuf,
     dev: bool,
     time_limit: Duration,
+    config: Config,
+    sessions: session::Store,
     cache: Mutex<HashMap<PathBuf, Arc<Compiled>>>,
 }
 
@@ -51,7 +56,10 @@ pub fn serve(opts: ServeOptions) -> Result<(), String> {
     let addr: SocketAddr = format!("{}:{}", opts.host, opts.port)
         .parse()
         .map_err(|e| format!("invalid address {}:{}: {e}", opts.host, opts.port))?;
+    let config = load_config(&root)?;
     let state = Arc::new(State {
+        sessions: session::Store::new(Duration::from_secs(config.session_ttl)),
+        config,
         root,
         public,
         dev: opts.dev,
@@ -248,18 +256,61 @@ async fn run_script(state: &Arc<State>, script: PathBuf, req: Request<Incoming>)
         .map(|(k, v)| (k.as_str().to_ascii_lowercase(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
         .collect();
     let query = form_urlencoded::parse(parts.uri.query().unwrap_or("").as_bytes()).into_owned().collect();
-    let is_form = parts
-        .headers
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("application/x-www-form-urlencoded"));
-    let form = if is_form { form_urlencoded::parse(&body).into_owned().collect() } else { Vec::new() };
+    let raw_content_type = parts.headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let content_type = raw_content_type.to_ascii_lowercase();
+    let mut form = Vec::new();
+    let mut files = Vec::new();
+    if content_type.starts_with("application/x-www-form-urlencoded") {
+        form = form_urlencoded::parse(&body).into_owned().collect();
+    } else if let Some(b) = multipart::boundary(raw_content_type) {
+        match multipart::parse(&body, &b) {
+            Ok((f, up)) => {
+                form = f;
+                files = up;
+            }
+            Err(e) => return simple(StatusCode::BAD_REQUEST, "text/plain", format!("bad request: {e}")),
+        }
+    }
+    let cookie_header = parts.headers.get(hyper::header::COOKIE).and_then(|v| v.to_str().ok());
+    let session = state.sessions.load(cookie_header);
+
+    // CSRF: form-style requests that change state must carry the session's
+    // token (from csrf_field()). Browsers can send these cross-site without
+    // asking, unlike JSON requests, which need a CORS preflight.
+    let unsafe_method = matches!(parts.method, Method::POST | Method::PUT | Method::PATCH | Method::DELETE);
+    let simple_body = content_type.is_empty()
+        || content_type.starts_with("application/x-www-form-urlencoded")
+        || content_type.starts_with("multipart/form-data")
+        || content_type.starts_with("text/plain");
+    if state.config.csrf && unsafe_method && simple_body {
+        let expected = session.values.get("_csrf");
+        let submitted = form
+            .iter()
+            .find(|(k, _)| k == "_csrf")
+            .map(|(_, v)| v.as_str())
+            .or_else(|| parts.headers.get("x-csrf-token").and_then(|v| v.to_str().ok()));
+        let ok = matches!((expected, submitted), (Some(e), Some(s)) if phenix_std::constant_time_eq(e.as_bytes(), s.as_bytes()));
+        if !ok {
+            let hint = if state.dev {
+                "<p class=\"hint\">Add <code>&lt;?= csrf_field() ?&gt;</code> inside the form, or send the token from \
+                 <code>csrf_token()</code> in an <code>X-CSRF-Token</code> header. \
+                 (It can be turned off with <code>[security] csrf = false</code> in phenix.toml.)</p>"
+            } else {
+                ""
+            };
+            let body = format!("<p>The form has expired or did not come from this site. Reload the page and try again.</p>{hint}");
+            return page(StatusCode::FORBIDDEN, "403 Forbidden", &body);
+        }
+    }
+
     let ctx = HttpCtx {
         method: parts.method.as_str().to_string(),
         path: percent_encoding::percent_decode_str(parts.uri.path()).decode_utf8_lossy().into_owned(),
         query,
         form,
         headers,
+        files,
+        session,
         body: String::from_utf8_lossy(&body).into_owned(),
         ..HttpCtx::default()
     };
@@ -268,8 +319,13 @@ async fn run_script(state: &Arc<State>, script: PathBuf, req: Request<Incoming>)
     let rel = script.strip_prefix(&state.root).unwrap_or(&script).to_string_lossy().replace('\\', "/");
     let result = tokio::task::spawn_blocking(move || {
         let compiled = st.compiled(&script)?;
-        let limits = Limits { max_time: Some(st.time_limit), ..Limits::default() };
-        Ok::<_, String>(run(&compiled, RunOptions { html: true, limits, http: Some(ctx) }))
+        let limits = Limits {
+            max_time: Some(st.time_limit),
+            max_memory: Some(st.config.memory_limit_mb as usize * 1024 * 1024),
+            ..Limits::default()
+        };
+        let host = Some(st.config.host.clone());
+        Ok::<_, String>(run(&compiled, RunOptions { html: true, limits, http: Some(ctx), host }))
     })
     .await;
 
@@ -308,7 +364,11 @@ async fn run_script(state: &Arc<State>, script: PathBuf, req: Request<Incoming>)
         };
     }
 
-    let http = outcome.http;
+    let mut http = outcome.http;
+    let session = std::mem::take(&mut http.session);
+    if let Some(cookie) = state.sessions.save(session, state.config.secure_cookies) {
+        http.resp_headers.push(("Set-Cookie".into(), cookie));
+    }
     let mut r = Response::new(Full::new(Bytes::from(outcome.output)));
     *r.status_mut() = StatusCode::from_u16(http.status).unwrap_or(StatusCode::OK);
     let ct = http.content_type.unwrap_or_else(|| "text/html; charset=utf-8".into());
@@ -332,6 +392,8 @@ mod tests {
         let root = dir.canonicalize().unwrap();
         State {
             public: root.join("public"),
+            config: Config::default_for(&root),
+            sessions: session::Store::new(Duration::from_secs(60)),
             root,
             dev: true,
             time_limit: Duration::from_secs(5),

@@ -1,0 +1,36 @@
+import std.db.{Database, Row};
+
+export class Entry {
+    public function __construct(
+        public readonly int $id,
+        public readonly string $name,
+        public readonly string $message,
+        public readonly string $createdAt,
+    ) {}
+}
+
+export function guestbook_db(): Database {
+    $db = Database::open("data/guestbook.db");
+    $db->execute(sql"CREATE TABLE IF NOT EXISTS entries (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        message TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )");
+    return $db;
+}
+
+export function recent_entries(Database $db, int $limit = 20): list<Entry> {
+    $rows = $db->query(sql"SELECT id, name, message, created_at FROM entries ORDER BY id DESC LIMIT {$limit}");
+    return $rows->map(fn($r) => new Entry(
+        $r->int("id") ?? 0,
+        $r->string("name") ?? "",
+        $r->string("message") ?? "",
+        $r->string("created_at") ?? "",
+    ));
+}
+
+export function add_entry(Database $db, string $name, string $message): void {
+    $now = gmdate("Y-m-d H:i");
+    $db->execute(sql"INSERT INTO entries (name, message, created_at) VALUES ({$name}, {$message}, {$now})");
+}

@@ -9,7 +9,7 @@ fn render_case(root: &Path, path: &Path) -> String {
     match compile(root, path) {
         Err(e) => e.render(false),
         Ok(c) => {
-            let outcome = run(&c, RunOptions { html: false, limits: Default::default(), http: None });
+            let outcome = run(&c, RunOptions { html: false, limits: Default::default(), http: None, host: None });
             let mut out = c.warnings.clone();
             out.push_str(&outcome.output);
             if let Some(err) = outcome.error {
