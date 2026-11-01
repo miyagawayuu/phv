@@ -114,6 +114,7 @@ export function layout({ lang, title, description, body, depth, active, otherHre
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="${up}favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="${up}style.css">
+<script src="${up}site.js" defer></script>
 </head>
 <body>
 <header class="site-header">
@@ -153,7 +154,6 @@ function docPage(src, lang, out, active, otherHref) {
     .join("\n");
   const body = `<div class="doc">
 <details class="toc" id="toc"><summary>${strings[lang].contents}</summary><ol>${items}</ol></details>
-<script>{const m = matchMedia("(min-width: 901px)"), t = document.getElementById("toc"), sync = () => { if (m.matches) t.open = true; }; sync(); m.addEventListener("change", sync);}</script>
 <article class="prose"><h1>${escape(title)}</h1>
 ${html}</article>
 </div>`;
@@ -163,8 +163,10 @@ ${html}</article>
 
 fs.rmSync(dist, { recursive: true, force: true });
 fs.mkdirSync(dist, { recursive: true });
-fs.copyFileSync(path.join(here, "static/style.css"), path.join(dist, "style.css"));
-fs.copyFileSync(path.join(here, "static/favicon.svg"), path.join(dist, "favicon.svg"));
+// style.css, site.js, favicon.svg, and _headers (HTTP headers for Cloudflare Pages).
+for (const f of fs.readdirSync(path.join(here, "static"))) {
+  fs.copyFileSync(path.join(here, "static", f), path.join(dist, f));
+}
 
 for (const lang of ["en", "ja"]) {
   const page = landing(lang, version, code);
@@ -178,7 +180,6 @@ docPage("security-audit.md", "en", "docs/security.html", "security", "../ja/docs
 docPage("security-audit.ja.md", "ja", "ja/docs/security.html", "security", "../../docs/security.html");
 write("docs/index.html", `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=spec.html"><a href="spec.html">spec.html</a>\n`);
 write("ja/docs/index.html", `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=spec.html"><a href="spec.html">spec.html</a>\n`);
-fs.writeFileSync(path.join(dist, "CNAME"), "phx-lang.org\n");
 
 const count = (dir) => fs.readdirSync(dir, { withFileTypes: true }).reduce((n, e) => n + (e.isDirectory() ? count(path.join(dir, e.name)) : 1), 0);
 console.log(`built ${count(dist)} files into ${path.relative(process.cwd(), dist) || "dist"}`);

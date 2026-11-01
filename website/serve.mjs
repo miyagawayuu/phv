@@ -6,8 +6,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const dist = path.join(path.dirname(fileURLToPath(import.meta.url)), "dist");
-const types = { ".html": "text/html; charset=utf-8", ".css": "text/css", ".svg": "image/svg+xml" };
+const types = { ".html": "text/html; charset=utf-8", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml" };
 const port = Number(process.env.PORT || 4173);
+
+// The headers Cloudflare Pages sends for every path (the `/*` block of _headers),
+// so the preview runs under the same Content-Security-Policy.
+const headers = {};
+const lines = fs.readFileSync(path.join(dist, "_headers"), "utf8").split("\n");
+for (const line of lines.slice(lines.indexOf("/*") + 1)) {
+  const m = /^\s+([\w-]+):\s*(.*)$/.exec(line);
+  if (!m) break;
+  headers[m[1].toLowerCase()] = m[2];
+}
 
 http
   .createServer((req, res) => {
@@ -18,7 +28,7 @@ http
       res.writeHead(404, { "content-type": "text/plain" }).end("not found");
       return;
     }
-    res.writeHead(200, { "content-type": types[path.extname(file)] || "application/octet-stream" });
+    res.writeHead(200, { ...headers, "content-type": types[path.extname(file)] || "application/octet-stream" });
     fs.createReadStream(file).pipe(res);
   })
   .listen(port, "127.0.0.1", () => console.log(`http://127.0.0.1:${port}`));

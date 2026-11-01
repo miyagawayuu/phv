@@ -1,0 +1,51 @@
+name: Website
+
+# Builds phx-lang.org and deploys it to Cloudflare Pages (project `phx-lang`).
+# Needs two repository secrets: CLOUDFLARE_API_TOKEN (a token with the
+# "Cloudflare Pages: Edit" permission) and CLOUDFLARE_ACCOUNT_ID. Without them
+# the site is still built, and the deploy step is skipped.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - "docs/**"
+      - "editors/vscode/syntaxes/**"
+      - "Cargo.toml"
+      - ".github/workflows/website.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: website
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build
+        working-directory: website
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+      - name: Deploy to Cloudflare Pages
+        working-directory: website
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::notice::CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID are not set; skipping the deploy"
+            exit 0
+          fi
+          wrangler="npx --yes wrangler@4.151.1"
+          # The first deploy creates the project; later runs find it.
+          $wrangler pages project list | grep -qw phx-lang \
+            || $wrangler pages project create phx-lang --production-branch main
+          $wrangler pages deploy dist --project-name phx-lang --branch main --commit-dirty=true
