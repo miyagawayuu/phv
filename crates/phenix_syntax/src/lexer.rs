@@ -15,6 +15,12 @@ pub enum Mode {
 }
 
 pub fn lex(src: &str, file: u32, base: u32, mode: Mode) -> (Vec<Token>, Vec<Diagnostic>) {
+    let (toks, _, diags) = lex_with_comments(src, file, base, mode);
+    (toks, diags)
+}
+
+/// Like `lex`, also returning the spans of comments (for the formatter).
+pub fn lex_with_comments(src: &str, file: u32, base: u32, mode: Mode) -> (Vec<Token>, Vec<Span>, Vec<Diagnostic>) {
     let mut lx = Lexer {
         src,
         bytes: src.as_bytes(),
@@ -23,9 +29,10 @@ pub fn lex(src: &str, file: u32, base: u32, mode: Mode) -> (Vec<Token>, Vec<Diag
         base,
         toks: Vec::new(),
         diags: Vec::new(),
+        comments: Vec::new(),
     };
     lx.run(mode);
-    (lx.toks, lx.diags)
+    (lx.toks, lx.comments, lx.diags)
 }
 
 struct Lexer<'a> {
@@ -36,6 +43,7 @@ struct Lexer<'a> {
     base: u32,
     toks: Vec<Token>,
     diags: Vec<Diagnostic>,
+    comments: Vec<Span>,
 }
 
 fn is_ident_start(b: u8) -> bool {
@@ -157,9 +165,12 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
             } else if self.starts_with("//") || b == b'#' {
                 // Line comment; like PHP it ends at `?>` too.
+                let start = self.pos;
                 while self.pos < self.bytes.len() && self.peek(0) != b'\n' && !self.starts_with("?>") {
                     self.pos += 1;
                 }
+                let span = self.span(start, self.pos);
+                self.comments.push(span);
             } else if self.starts_with("/*") {
                 let start = self.pos;
                 match self.src[self.pos + 2..].find("*/") {
@@ -169,6 +180,8 @@ impl<'a> Lexer<'a> {
                         self.error("unterminated block comment", start, start + 2);
                     }
                 }
+                let span = self.span(start, self.pos);
+                self.comments.push(span);
             } else {
                 return;
             }

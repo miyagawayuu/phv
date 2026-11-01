@@ -106,6 +106,10 @@ pub static BUILTINS: &[BuiltinSig] = &[
     f("unlink", "fn(string): void", "unlink"),
     f("getenv", "fn(string): ?string", "getenv"),
     f("sql_ident", "fn(string): Sql", "sql_ident"),
+    f("assert", "fn(bool): void", "assert"),
+    f("assert", "fn(bool, string): void", "assert_msg"),
+    f("assert_eq", "fn(any, any): void", "assert_eq"),
+    f("assert_eq", "fn(any, any, string): void", "assert_eq_msg"),
     // string methods
     m(Str, "len", "fn(string): int", "str_len"),
     m(Str, "isEmpty", "fn(string): bool", "str_is_empty"),

@@ -1,3 +1,8 @@
+mod lsp;
+mod migrate;
+mod pkg;
+mod tools;
+
 use clap::{Parser, Subcommand};
 
 #[global_allocator]
@@ -33,6 +38,32 @@ enum Command {
     Check { file: PathBuf },
     /// Print the syntax tree of a file.
     Parse { file: PathBuf },
+    /// Run the `test_*` functions of every `*_test.phx` file.
+    Test {
+        /// Files or directories (default: the current directory).
+        paths: Vec<PathBuf>,
+    },
+    /// Format `.phx` files (indentation and whitespace).
+    Fmt {
+        paths: Vec<PathBuf>,
+        /// Only report files that would change.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Start the language server (for editors) on stdin/stdout.
+    Lsp,
+    /// Fetch the [dependencies] listed in phenix.toml.
+    Install {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Convert a PHP file to Phenix, marking what needs manual work.
+    Migrate {
+        file: PathBuf,
+        /// Output file (default: the input with a .phx extension).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Print the bytecode of a script's functions.
     Disasm {
         file: PathBuf,
@@ -119,6 +150,49 @@ fn exec(cmd: Command) -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Command::Test { paths } => tools::test(paths, color),
+        Command::Fmt { paths, check } => tools::fmt(paths, check),
+        Command::Lsp => {
+            lsp::run();
+            ExitCode::SUCCESS
+        }
+        Command::Install { dir } => pkg::install(&dir),
+        Command::Migrate { file, output } => {
+            let src = match std::fs::read_to_string(&file) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: cannot read {}: {e}", file.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            let m = migrate::convert(&src);
+            let out_path = output.unwrap_or_else(|| file.with_extension("phx"));
+            if out_path == file {
+                eprintln!("error: refusing to overwrite the input file");
+                return ExitCode::FAILURE;
+            }
+            if let Err(e) = std::fs::write(&out_path, &m.text) {
+                eprintln!("error: cannot write {}: {e}", out_path.display());
+                return ExitCode::FAILURE;
+            }
+            println!("wrote {}", out_path.display());
+            for (what, n) in &m.changes {
+                println!("  {n:>4} x {what}");
+            }
+            if m.todos > 0 {
+                println!("  {:>4} x TODO(migrate) comments to resolve by hand", m.todos);
+            }
+            let root = find_root(&out_path);
+            match compile(&root, &out_path) {
+                Ok(_) => println!("the result type-checks"),
+                Err(e) => {
+                    let n = e.diags.iter().filter(|d| d.is_error()).count() + e.messages.len();
+                    println!("\n{n} issue(s) left for manual work (types, removed PHP features):\n");
+                    print!("{}", e.render(color));
+                }
+            }
+            ExitCode::SUCCESS
         }
         Command::Disasm { file, only } => {
             let root = find_root(&file);

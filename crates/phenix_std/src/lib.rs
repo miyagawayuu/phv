@@ -282,6 +282,36 @@ fn dump_value(vm: &Vm, v: &Value, out: &mut String, indent: usize) {
     }
 }
 
+fn assert_impl(vm: &Vm, ok: bool, msg: String) -> R {
+    if ok {
+        Ok(Value::Null)
+    } else {
+        Err(vm.throw("AssertionError", msg))
+    }
+}
+
+/// Short, readable form of a value for assertion messages.
+fn repr(vm: &Vm, v: &Value) -> String {
+    let mut out = String::new();
+    match v {
+        Value::Object(o) => {
+            let o = o.borrow();
+            out.push_str(&vm.prog.classes[o.class as usize].name);
+            out.push_str(" object");
+        }
+        Value::Closure(_) => out.push_str("closure"),
+        other => {
+            if json(vm, other, &mut out, 0).is_err() {
+                out = other.type_name().to_string();
+            }
+        }
+    }
+    if out.chars().count() > 200 {
+        out = out.chars().take(200).collect::<String>() + "…";
+    }
+    out
+}
+
 /// Stable merge sort with a comparator that may fail.
 fn merge_sort(
     items: Vec<Value>,
@@ -341,6 +371,18 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
 
 fn core_lookup(name: &str) -> Option<BuiltinFn> {
     let f: BuiltinFn = match name {
+        "assert" => |vm, a| assert_impl(vm, matches!(a[0], Value::Bool(true)), "assertion failed".into()),
+        "assert_msg" => |vm, a| assert_impl(vm, matches!(a[0], Value::Bool(true)), s(&a[1]).to_string()),
+        "assert_eq" | "assert_eq_msg" => |vm, a| {
+            if values_equal(&a[0], &a[1]) {
+                return Ok(Value::Null);
+            }
+            let mut msg = format!("expected {}, got {}", repr(vm, &a[0]), repr(vm, &a[1]));
+            if let Some(m) = a.get(2) {
+                msg = format!("{}: {msg}", s(m));
+            }
+            Err(vm.throw("AssertionError", msg))
+        },
         "list_len" => |_, a| Ok(Value::Int(list(&a[0]).len() as i64)),
         "map_len" => |_, a| Ok(Value::Int(map(&a[0]).len() as i64)),
         "strlen" => |_, a| Ok(Value::Int(s(&a[0]).len() as i64)),

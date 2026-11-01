@@ -21,6 +21,22 @@ pub struct Compiled {
     pub deps: Vec<(PathBuf, Option<SystemTime>)>,
     /// Rendered warnings (empty when there are none).
     pub warnings: String,
+    /// Source file id of the entry script.
+    pub entry_file: u32,
+}
+
+impl Compiled {
+    /// Top-level functions of the entry file whose names start with `prefix`
+    /// and take no parameters (used by `phenix test`).
+    pub fn entry_functions(&self, prefix: &str) -> Vec<(u32, String)> {
+        self.program
+            .funcs
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.file == self.entry_file && f.num_params == 0 && f.name.starts_with(prefix))
+            .map(|(i, f)| (i as u32, f.name.clone()))
+            .collect()
+    }
 }
 
 impl Compiled {
@@ -87,6 +103,10 @@ fn safe_relative(p: &str) -> bool {
 
 struct Loader {
     root: PathBuf,
+    /// Package name to the directory its modules are loaded from.
+    packages: HashMap<String, PathBuf>,
+    /// Unsaved editor buffers (for the language server), by canonical path.
+    overlay: HashMap<PathBuf, String>,
     sources: SourceMap,
     modules: Vec<(Module, ModuleKind, String)>,
     diags: Vec<Diagnostic>,
@@ -117,7 +137,8 @@ impl Loader {
         if let Some(&i) = self.by_path.get(&path) {
             return Some(i);
         }
-        match std::fs::read_to_string(&path) {
+        let overlaid = path.canonicalize().ok().and_then(|c| self.overlay.get(&c).cloned());
+        match overlaid.map(Ok).unwrap_or_else(|| std::fs::read_to_string(&path)) {
             Ok(text) => {
                 let name = display_name(&self.root, &path);
                 Some(self.add(name, Some(path), text, kind))
@@ -162,8 +183,35 @@ impl Loader {
                 }
                 continue;
             }
-            let rel: PathBuf = name.split('.').collect::<PathBuf>().with_extension("phx");
-            let path = self.root.join(rel);
+            let segments: Vec<&str> = name.split('.').collect();
+            let (base, rest) = match self.packages.get(segments[0]) {
+                Some(dir) if segments.len() > 1 => (dir.clone(), &segments[1..]),
+                Some(dir) => {
+                    if !dir.is_dir() {
+                        self.diags.push(
+                            Diagnostic::error(format!("package `{name}` is not installed"), span)
+                                .note("run `phenix install`"),
+                        );
+                        continue;
+                    }
+                    (dir.clone(), &segments[..0])
+                }
+                None => (self.root.clone(), &segments[..]),
+            };
+            if rest.is_empty() {
+                self.diags.push(
+                    Diagnostic::error(format!("`{name}` is a package; import one of its modules, e.g. `import {name}.main.{{...}}`"), span),
+                );
+                continue;
+            }
+            if !base.is_dir() {
+                self.diags.push(
+                    Diagnostic::error(format!("package `{}` is not installed", segments[0]), span).note("run `phenix install`"),
+                );
+                continue;
+            }
+            let rel: PathBuf = rest.iter().collect::<PathBuf>().with_extension("phx");
+            let path = base.join(rel);
             self.imports.insert(name.clone(), usize::MAX);
             match self.load_file(path, ModuleKind::User, span, &format!("module `{name}`")) {
                 Some(i) => {
@@ -200,10 +248,44 @@ impl Loader {
     }
 }
 
-/// Loads, checks and compiles `entry` (and everything it uses).
-pub fn compile(root: &Path, entry: &Path) -> Result<Compiled, CompileError> {
+/// The result of loading and type-checking a program (without compiling it).
+pub struct Analysis {
+    pub sources: SourceMap,
+    pub diags: Vec<Diagnostic>,
+    /// Present when parsing succeeded (it may still contain type errors).
+    pub hir: Option<phenix_types::hir::HProgram>,
+    pub entry_file: Option<u32>,
+    pub messages: Vec<String>,
+    deps: Vec<(PathBuf, Option<SystemTime>)>,
+}
+
+/// Directory of each package listed in `[dependencies]`.
+pub fn package_dirs(root: &Path, config: &Config) -> HashMap<String, PathBuf> {
+    config
+        .dependencies
+        .iter()
+        .map(|(name, dep)| {
+            let dir = match &dep.path {
+                Some(p) => root.join(p),
+                None => root.join("vendor").join(name),
+            };
+            (name.clone(), dir)
+        })
+        .collect()
+}
+
+/// Loads and type-checks `entry`, using `overlay` (canonical path to text)
+/// instead of files on disk where given.
+pub fn analyze(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>) -> Analysis {
+    let mut messages = Vec::new();
+    let config = load_config(root).unwrap_or_else(|e| {
+        messages.push(e);
+        Config::default_for(root)
+    });
     let mut loader = Loader {
         root: root.to_path_buf(),
+        packages: package_dirs(root, &config),
+        overlay,
         sources: SourceMap::default(),
         modules: Vec::new(),
         diags: Vec::new(),
@@ -212,23 +294,21 @@ pub fn compile(root: &Path, entry: &Path) -> Result<Compiled, CompileError> {
         by_path: HashMap::new(),
         deps: Vec::new(),
     };
+    loader.deps.push((root.join("phenix.toml"), mtime(&root.join("phenix.toml"))));
     loader.add("<std>/prelude.phx".into(), None, phenix_std::PRELUDE.to_string(), ModuleKind::Prelude);
-    let text = match std::fs::read_to_string(entry) {
+    let overlaid = entry.canonicalize().ok().and_then(|c| loader.overlay.get(&c).cloned());
+    let text = match overlaid.map(Ok).unwrap_or_else(|| std::fs::read_to_string(entry)) {
         Ok(t) => t,
         Err(e) => {
-            return Err(CompileError {
-                sources: loader.sources,
-                diags: Vec::new(),
-                messages: vec![format!("cannot read {}: {e}", entry.display())],
-            })
+            messages.push(format!("cannot read {}: {e}", entry.display()));
+            return Analysis { sources: loader.sources, diags: Vec::new(), hir: None, entry_file: None, messages, deps: Vec::new() };
         }
     };
     let name = display_name(root, entry);
-    loader.add(name, Some(entry.to_path_buf()), text, ModuleKind::Entry);
-
-    let fail = |loader: Loader| CompileError { sources: loader.sources, diags: loader.diags, messages: Vec::new() };
+    let entry_module = loader.add(name, Some(entry.to_path_buf()), text, ModuleKind::Entry);
+    let entry_file = Some(loader.modules[entry_module].0.file);
     if loader.diags.iter().any(|d| d.is_error()) {
-        return Err(fail(loader));
+        return Analysis { sources: loader.sources, diags: loader.diags, hir: None, entry_file, messages, deps: loader.deps };
     }
     let input = CheckInput {
         modules: loader
@@ -242,19 +322,41 @@ pub fn compile(root: &Path, entry: &Path) -> Result<Compiled, CompileError> {
     let (hir, diags) = phenix_types::check(&input);
     drop(input);
     loader.diags.extend(diags);
-    if loader.diags.iter().any(|d| d.is_error()) {
-        return Err(fail(loader));
+    Analysis { sources: loader.sources, diags: loader.diags, hir: Some(hir), entry_file, messages, deps: loader.deps }
+}
+
+/// Loads, checks and compiles `entry` (and everything it uses).
+pub fn compile(root: &Path, entry: &Path) -> Result<Compiled, CompileError> {
+    compile_with_overlay(root, entry, HashMap::new())
+}
+
+/// Like `compile`, reading the files in `overlay` (canonical path to text) from memory.
+pub fn compile_with_overlay(
+    root: &Path,
+    entry: &Path,
+    overlay: HashMap<PathBuf, String>,
+) -> Result<Compiled, CompileError> {
+    let a = analyze(root, entry, overlay);
+    if !a.messages.is_empty() || a.diags.iter().any(|d| d.is_error()) || a.hir.is_none() {
+        return Err(CompileError { sources: a.sources, diags: a.diags, messages: a.messages });
     }
-    let mut warnings: Vec<Diagnostic> = loader.diags.iter().filter(|d| !d.is_error()).cloned().collect();
+    let hir = a.hir.unwrap();
+    let mut warnings: Vec<Diagnostic> = a.diags.iter().filter(|d| !d.is_error()).cloned().collect();
     warnings.sort_by_key(|d| (d.span.file, d.span.start));
-    let warnings = diag::render(&loader.sources, &warnings, false);
-    let program = phenix_compiler::compile(&hir, &loader.sources);
+    let warnings = diag::render(&a.sources, &warnings, false);
+    let program = phenix_compiler::compile(&hir, &a.sources);
     let builtins = phenix_std::link(&program.builtin_names).map_err(|m| CompileError {
         sources: SourceMap::default(),
         diags: Vec::new(),
         messages: vec![m],
     })?;
-    Ok(Compiled { program: Arc::new(program), builtins: builtins.into(), deps: loader.deps, warnings })
+    Ok(Compiled {
+        program: Arc::new(program),
+        builtins: builtins.into(),
+        deps: a.deps,
+        warnings,
+        entry_file: a.entry_file.unwrap_or(0),
+    })
 }
 
 pub struct RunOptions {
@@ -290,6 +392,11 @@ pub struct RunOutcome {
 
 /// Runs a compiled program in a fresh VM (a fresh heap).
 pub fn run(c: &Compiled, opts: RunOptions) -> RunOutcome {
+    run_func(c, c.program.main, opts)
+}
+
+/// Runs one function of a compiled program (with no arguments) in a fresh VM.
+pub fn run_func(c: &Compiled, func: u32, opts: RunOptions) -> RunOutcome {
     let mut vm = Vm::new(c.program.clone(), c.builtins.clone(), opts.html, opts.limits);
     if let Some(h) = opts.http {
         vm.http = h;
@@ -297,7 +404,7 @@ pub fn run(c: &Compiled, opts: RunOptions) -> RunOutcome {
     if let Some(host) = opts.host {
         vm.host = host;
     }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.run_main()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.call_function(func, &[]).map(|_| ())));
     let error = match result {
         Ok(Ok(())) => None,
         Ok(Err(VmError::Exception(e))) => {
