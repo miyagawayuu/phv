@@ -512,7 +512,13 @@ mod tests {
         std::fs::write(base.join("longtemplatename.phx.html"), "x").unwrap();
         let out = std::process::Command::new("cmd").args(["/c", "dir", "/x"]).arg(&base).output().unwrap();
         let listing = String::from_utf8_lossy(&out.stdout).into_owned();
-        let short = listing.split_whitespace().find(|w| w.contains('~')).map(str::to_string);
+        // The short name is on the file's own line (the header line can contain
+        // `~` too, e.g. `C:\Users\RUNNER~1\...`). Volumes without 8.3 names have none.
+        let short = listing
+            .lines()
+            .find(|l| l.contains("longtemplatename.phx.html"))
+            .and_then(|l| l.split_whitespace().find(|w| w.contains('~') && !w.contains(['\\', '/'])))
+            .map(str::to_string);
         if let Some(short) = short {
             let (g, name) = open_parent(&base, Path::new(&short)).unwrap();
             assert!(matches!(g.open(&name, true), Err(FsError::BadName)), "{short}");
