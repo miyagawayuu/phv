@@ -15,7 +15,7 @@ function bio(?Person $p): string {
 }
 echo bio(null), "\n";
 echo bio(new Person("Ann")), "\n";
-echo bio(new Person("Bo", new Profile("likes Phenix"))), "\n";
+echo bio(new Person("Bo", new Profile("likes PHX"))), "\n";
 
 ?string $found = null;
 foreach (["apple", "banana", "cherry"] as $fruit) {

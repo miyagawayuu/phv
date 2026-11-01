@@ -1,0 +1,23 @@
+[package]
+name = "phx_server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[dependencies]
+phx_driver.workspace = true
+phx_vm.workspace = true
+phx_syntax.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+form_urlencoded.workspace = true
+percent-encoding.workspace = true
+getrandom.workspace = true
+phx_std.workspace = true
+indexmap.workspace = true
+serde_json.workspace = true

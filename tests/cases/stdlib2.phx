@@ -31,7 +31,7 @@ echo password_verify("correct horse", $hash) ? "password ok" : "bad", " ", passw
 echo hash_equals("abc", "abc") ? "equal" : "different", " ", random_token()->len(), " ", random_token(8)->len(), "\n";
 $r = random_int(1, 6);
 echo $r >= 1 && $r <= 6 ? "dice ok" : "dice broken", "\n";
-echo base64_encode("Phenix ✓"), " ", base64_decode(base64_encode("round trip")) ?? "?", "\n";
+echo base64_encode("PHX ✓"), " ", base64_decode(base64_encode("round trip")) ?? "?", "\n";
 echo urlencode("a b&c"), " ", rawurlencode("a b&c"), " ", urldecode("a+b%26c"), " ", http_build_query(["q" => "x y", "page" => "2"]), "\n";
 
 // SQLite (in memory) with sql"..." parameters
@@ -68,7 +68,7 @@ try {
     echo $e->getMessage(), "\n";
 }
 
-// permissions: nothing is allowed without phenix.toml
+// permissions: nothing is allowed without phx.toml
 try {
     echo file_get_contents("secret.txt");
 } catch (PermissionError $e) {

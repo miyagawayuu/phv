@@ -20,8 +20,8 @@ export function all_posts(): list<Post> {
     return [
         new Post(
             1,
-            "Hello, Phenix",
-            "Phenix keeps what made PHP productive: save a file, reload the page, see the result. It adds static types, automatic HTML escaping and a register-based bytecode VM.",
+            "Hello, PHX",
+            "PHX keeps what made PHP productive: save a file, reload the page, see the result. It adds static types, automatic HTML escaping and a register-based bytecode VM.",
             ["intro"],
         ),
         new Post(

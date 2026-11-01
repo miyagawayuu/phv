@@ -1,4 +1,4 @@
-error: `===` is not needed in Phenix
+error: `===` is not needed in PHX
  --> err_syntax.phx:4:11
   |
 4 | if ($name === "x") {

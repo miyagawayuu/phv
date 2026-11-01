@@ -1,4 +1,4 @@
 target/
 .claude/
-.phenix-cache/
+.phx-cache/
 vendor/

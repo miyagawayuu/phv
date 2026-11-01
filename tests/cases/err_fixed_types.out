@@ -24,6 +24,6 @@ error: condition must be a `bool`, found `list<int>`
    |
 14 | if ($xs) {
    |     ^^^
-   = note: Phenix has no truthiness: write `!$xs->isEmpty()`
+   = note: PHX has no truthiness: write `!$xs->isEmpty()`
 
 4 errors found

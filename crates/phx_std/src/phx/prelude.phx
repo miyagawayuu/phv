@@ -1,0 +1,24 @@
+// Declarations visible in every PHX file.
+
+class Exception {
+    public function __construct(public string $message = "") {}
+
+    public function getMessage(): string {
+        return $this->message;
+    }
+}
+
+class RuntimeException extends Exception {}
+class LogicException extends Exception {}
+class InvalidArgumentException extends LogicException {}
+
+// Thrown by the runtime.
+class ArithmeticError extends Exception {}
+class DivisionByZeroError extends ArithmeticError {}
+class IndexError extends Exception {}
+class KeyError extends Exception {}
+class ValueError extends Exception {}
+class UnhandledMatchError extends Exception {}
+class PermissionError extends Exception {}
+class DatabaseError extends RuntimeException {}
+class AssertionError extends Exception {}

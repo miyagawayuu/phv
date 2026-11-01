@@ -858,43 +858,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "phenix_cli"
+name = "phx_cli"
 version = "0.2.0"
 dependencies = [
  "clap",
  "percent-encoding",
- "phenix_driver",
- "phenix_server",
- "phenix_std",
- "phenix_syntax",
- "phenix_types",
- "phenix_vm",
+ "phx_driver",
+ "phx_server",
+ "phx_std",
+ "phx_syntax",
+ "phx_types",
+ "phx_vm",
  "serde",
  "serde_json",
  "toml",
 ]
 
 [[package]]
-name = "phenix_compiler"
+name = "phx_compiler"
 version = "0.2.0"
 dependencies = [
- "phenix_syntax",
- "phenix_types",
- "phenix_vm",
+ "phx_syntax",
+ "phx_types",
+ "phx_vm",
 ]
 
 [[package]]
-name = "phenix_driver"
+name = "phx_driver"
 version = "0.2.0"
 dependencies = [
  "getrandom",
  "hmac",
- "phenix_compiler",
- "phenix_jit",
- "phenix_std",
- "phenix_syntax",
- "phenix_types",
- "phenix_vm",
+ "phx_compiler",
+ "phx_jit",
+ "phx_std",
+ "phx_syntax",
+ "phx_types",
+ "phx_vm",
  "postcard",
  "serde",
  "sha2",
@@ -902,7 +902,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "phenix_jit"
+name = "phx_jit"
 version = "0.2.0"
 dependencies = [
  "cranelift-codegen",
@@ -910,11 +910,11 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
- "phenix_vm",
+ "phx_vm",
 ]
 
 [[package]]
-name = "phenix_server"
+name = "phx_server"
 version = "0.2.0"
 dependencies = [
  "bytes",
@@ -925,16 +925,16 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "percent-encoding",
- "phenix_driver",
- "phenix_std",
- "phenix_syntax",
- "phenix_vm",
+ "phx_driver",
+ "phx_std",
+ "phx_syntax",
+ "phx_vm",
  "serde_json",
  "tokio",
 ]
 
 [[package]]
-name = "phenix_std"
+name = "phx_std"
 version = "0.2.0"
 dependencies = [
  "argon2",
@@ -945,26 +945,26 @@ dependencies = [
  "indexmap",
  "libc",
  "percent-encoding",
- "phenix_types",
- "phenix_vm",
+ "phx_types",
+ "phx_vm",
  "rusqlite",
  "sha2",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
-name = "phenix_syntax"
+name = "phx_syntax"
 version = "0.2.0"
 
 [[package]]
-name = "phenix_types"
+name = "phx_types"
 version = "0.2.0"
 dependencies = [
- "phenix_syntax",
+ "phx_syntax",
 ]
 
 [[package]]
-name = "phenix_vm"
+name = "phx_vm"
 version = "0.2.0"
 dependencies = [
  "indexmap",

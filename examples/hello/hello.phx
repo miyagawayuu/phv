@@ -1,5 +1,5 @@
 <?phx
-// Hello, Phenix!
+// Hello, PHX!
 
 function greet(string $name, int $times = 1): string {
     $out = "";
@@ -9,7 +9,7 @@ function greet(string $name, int $times = 1): string {
     return $out;
 }
 
-echo greet("Phenix", 3);
+echo greet("PHX", 3);
 
 foreach (1..=15 as $n) {
     echo match (true) {

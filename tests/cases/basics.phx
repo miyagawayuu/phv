@@ -1,5 +1,5 @@
 <?phx
-$name = "Phenix";
+$name = "PHX";
 $version = 1;
 echo "Hello, $name v{$version}!\n";
 echo 'single $quoted\n', "\n";

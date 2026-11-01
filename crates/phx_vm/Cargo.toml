@@ -1,0 +1,11 @@
+[package]
+name = "phx_vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[dependencies]
+indexmap.workspace = true
+serde.workspace = true

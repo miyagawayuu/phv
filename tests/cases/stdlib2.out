@@ -8,7 +8,7 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
 password ok rejected
 equal 64 16
 dice ok
-UGhlbml4IOKckw== round trip
+UEhYIOKckw== round trip
 a+b%26c a%20b%26c a b&c q=x+y&page=2
 last id 3
 2: World (1.5)
@@ -17,9 +17,9 @@ last id 3
 after rollback: 3 rows
 db error: no such table: missing_table
 "title; DROP TABLE posts" is not a valid SQL identifier
-denied: read access to "secret.txt" is not allowed; keep files in a directory listed in [permissions].read in phenix.toml (e.g. "data/")
+denied: read access to "secret.txt" is not allowed; keep files in a directory listed in [permissions].read in phx.toml (e.g. "data/")
 denied: "../outside.txt" must be a path relative to the project without `..`
-denied: reading the environment variable "PATH" is not allowed; add it to [permissions].env in phenix.toml
+denied: reading the environment variable "PATH" is not allowed; add it to [permissions].env in phx.toml
 user=ann flash=ann after=-
 64 stable token
 no cookie

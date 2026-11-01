@@ -43,13 +43,13 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests (golden, JIT, formatting, HTTP, fuzz, unit)
         run: cargo test --workspace
-      - name: Phenix formatting and tests of the examples
+      - name: PHX formatting and tests of the examples
         shell: bash
         run: |
           cargo build --release
-          ./target/release/phenix fmt --check examples
-          ./target/release/phenix test examples
-          ./target/release/phenix check examples/site/public/index.phx
+          ./target/release/phx fmt --check examples
+          ./target/release/phx test examples
+          ./target/release/phx check examples/site/public/index.phx
 
   fuzz:
     name: longer fuzzing
@@ -59,9 +59,9 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal && rustup default stable
-      - run: cargo test --release -p phenix_driver --test fuzz
+      - run: cargo test --release -p phx_driver --test fuzz
         env:
-          PHENIX_FUZZ_ITERATIONS: "1000"
+          PHX_FUZZ_ITERATIONS: "1000"
 
   audit:
     name: dependency audit

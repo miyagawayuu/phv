@@ -1,6 +1,6 @@
 <?phx
-// Micro-benchmarks. Run with: phenix run examples/bench/bench.phx
-// (use a release build: cargo build --release; PHENIX_JIT=0 disables the JIT)
+// Micro-benchmarks. Run with: phx run examples/bench/bench.phx
+// (use a release build: cargo build --release; PHX_JIT=0 disables the JIT)
 
 function fib(int $n): int {
     if ($n < 2) {

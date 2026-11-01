@@ -5,7 +5,7 @@ echo "[", $t, "] len=", $t->len(), "\n";
 echo $t->upper(), " ", $t->lower(), "\n";
 echo $t->contains("World") ? "contains" : "missing", "\n";
 echo $t->startsWith("Hell") ? "yes" : "no", " ", $t->endsWith("x") ? "yes" : "no", "\n";
-echo $t->replace("World", "Phenix"), "\n";
+echo $t->replace("World", "PHX"), "\n";
 echo implode("|", $t->split(", ")), "\n";
 echo $t->slice(7), " / ", $t->slice(0, 5), " / ", $t->slice(-5, 3), "\n";
 echo $t->indexOf("o") ?? -1, " ", $t->indexOf("z") ?? -1, "\n";
@@ -13,7 +13,7 @@ echo "7"->padStart(3, "0"), " ", "ab"->padEnd(5, "."), "\n";
 echo "日本語テキスト"->len(), " ", strlen("日本語"), " ", "日本語テキスト"->slice(3, 2), "\n";
 echo implode(",", "abc"->chars()), "\n";
 echo str_repeat("=-", 5), "\n";
-echo ucfirst("phenix"), " ", strtoupper("abc"), " ", str_replace("a", "o", "banana"), "\n";
+echo ucfirst("phx"), " ", strtoupper("abc"), " ", str_replace("a", "o", "banana"), "\n";
 
 $n = "42"->toInt();
 if ($n != null) {

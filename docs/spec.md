@@ -1,12 +1,14 @@
-# Phenix 言語仕様 (v0.2)
+# PHX 言語仕様 (v0.2)
 
-Phenix は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋め込める」という良さを引き継ぎながら、
+公式サイト: <https://phx-lang.org>
+
+PHX は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋め込める」という良さを引き継ぎながら、
 型安全性・セキュリティ・実行速度・保守性を言語の側で保証する Web 向けの言語です。
 既存の PHP コードとの互換性はありませんが、PHP を書いてきた人がすぐ読めて書けることを目指しています。
 
 ## 1. 設計方針
 
-| PHP の弱点 | Phenix での解決 |
+| PHP の弱点 | PHX での解決 |
 |---|---|
 | 暗黙の型変換 (`"1" + 1`、`"abc" == 0`) | 暗黙の変換はしない。`==` は常に厳密比較。違う型どうしの比較はコンパイルエラー |
 | null による実行時エラー | `?T` 型。null チェック (`!= null`、`is`、`??`、`?->`) をしないと使えない |
@@ -15,7 +17,7 @@ Phenix は、PHP の「保存してすぐ動く」「Web に特化」「HTML に
 | SQL インジェクション | SQL は `sql"..."` リテラル(`Sql` 型)でしか書けず、埋め込んだ値は必ずプレースホルダになる |
 | 文脈を無視したエスケープ | `<?= ?>` の位置(属性・URL・`<script>`・CSS)を判定し、エスケープでは守れない場所への挿入はコンパイルエラー |
 | CSRF・セッション固定 | フォームの POST はサーバーがトークンを自動で検査。セッション ID はサーバーが発行したものだけを受け付ける |
-| 何でもできるスクリプト | ファイル・環境変数へのアクセスは `phenix.toml` の `[permissions]` で許可したものだけ |
+| 何でもできるスクリプト | ファイル・環境変数へのアクセスは `phx.toml` の `[permissions]` で許可したものだけ |
 | 注入されたスクリプトの実行 | 既定の Content-Security-Policy で、テンプレートに書いた `<script>` 以外のインラインスクリプトを止める |
 | ヘッダーインジェクション | 改行を含むヘッダー値は `ValueError` |
 | パストラバーサル | サーバーは `public/` の外、ドットファイル、テンプレートを配信しない |
@@ -376,7 +378,7 @@ Exception                    (getMessage(): string)
 ├── KeyError                 map にないキー
 ├── ValueError               不正な引数(ヘッダーの改行など)
 ├── UnhandledMatchError
-├── PermissionError          phenix.toml で許可されていないファイル・環境変数へのアクセス
+├── PermissionError          phx.toml で許可されていないファイル・環境変数へのアクセス
 ├── AssertionError           assert() / assert_eq() の失敗
 └── RuntimeException
     └── DatabaseError        SQL のエラー
@@ -399,7 +401,7 @@ import lib.posts.Post;
 import std.http.{request, response};
 ```
 
-- `import a.b.{x, y};` は、プロジェクトのルート(`phenix.toml` のあるディレクトリ、なければ実行するファイルの
+- `import a.b.{x, y};` は、プロジェクトのルート(`phx.toml` のあるディレクトリ、なければ実行するファイルの
   ディレクトリ)からの `a/b.phx` を読み込む。
 - import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`const`、`import`)
   しか書けない。モジュールを読み込んでも副作用は起きない。
@@ -434,7 +436,7 @@ echo render("views/layout.phx.html", title: "Home", body: $html);
 
 | 状況 | 出力先 |
 |---|---|
-| `phenix run` で実行したスクリプト | テキスト(`--html` を付けると HTML) |
+| `phx run` で実行したスクリプト | テキスト(`--html` を付けると HTML) |
 | Web サーバーが実行するページ | HTML(`response()->type("application/json")` などで HTML 以外にするとテキスト) |
 | テンプレートの中 | 常に HTML |
 
@@ -481,7 +483,7 @@ HTML エスケープが守れるのは、要素の中身と**引用符で囲ん�
 ## 14. Web サーバー
 
 ```
-phenix serve examples/site --port 8080
+phx serve examples/site --port 8080
 ```
 
 - サイトのディレクトリには `public/` が必要。URL はファイル名で決まる:
@@ -655,7 +657,7 @@ img-src 'self' data: https:; font-src 'self' data:; object-src 'none'; base-uri 
 form-action 'self'; frame-ancestors 'self'
 ```
 
-- テンプレート(`.phx.html` と `.phx` の HTML 部分)に書いた `<script>` タグには、Phenix が自動で
+- テンプレート(`.phx.html` と `.phx` の HTML 部分)に書いた `<script>` タグには、PHX が自動で
   `nonce="..."` を付ける。そのため、自分で書いたインラインスクリプトはそのまま動き、エスケープをすり抜けて
   注入されたスクリプト(`raw()` に入った `<script>` など)は動かない。
 - `onclick="..."` のようなイベント属性と `javascript:` の URL は止まる。`addEventListener` を使う。
@@ -684,9 +686,9 @@ rate_limit_reset("login:" . request()->ip);
 - `requests_per_minute` は IPv6 のアドレスを /64 ごとにまとめて数える。
 - サイト全体の制限は `[security] requests_per_minute`(§14)。
 
-### 権限(phenix.toml)
+### 権限(phx.toml)
 
-スクリプトがヒープの外に触れるものは、すべて `phenix.toml` で許可したものだけ。**何も書かなければ何も許可されない。**
+スクリプトがヒープの外に触れるものは、すべて `phx.toml` で許可したものだけ。**何も書かなければ何も許可されない。**
 
 ```toml
 [permissions]
@@ -703,10 +705,10 @@ env = ["APP_*"]             # getenv で読める環境変数(末尾 * は前方
 - ファイル名に `:`(Windows の代替データストリーム)、末尾のドットや空白、`CON` `NUL` `COM1` などのデバイス名は使えない。
 - Unix では、ほかのユーザーが書き込めるディレクトリ(`o+w`)は使えない。
 - コードとして読み込まれる場所は `write` に指定できない: `public/`、プロジェクトのルート、`.` で始まるディレクトリ
-  (`.phenix-cache/`、`.git/` など)、`vendor/`、`[dependencies]` のパッケージのディレクトリ。
-- 許可されていないときは `PermissionError`(メッセージに `phenix.toml` に書くべき内容が出る)。
+  (`.phx-cache/`、`.git/` など)、`vendor/`、`[dependencies]` のパッケージのディレクトリ。
+- 許可されていないときは `PermissionError`(メッセージに `phx.toml` に書くべき内容が出る)。
 
-### phenix.toml
+### phx.toml
 
 ```toml
 [project]
@@ -729,8 +731,8 @@ utils = { path = "../utils" }
 markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 ```
 
-`phenix.toml` のあるディレクトリがプロジェクトのルートになる。知らないキーはエラー(書き間違いに気づける)。
-`phenix serve` は起動時に読み込むので、変更したらサーバーを再起動する。
+`phx.toml` のあるディレクトリがプロジェクトのルートになる。知らないキーはエラー(書き間違いに気づける)。
+`phx serve` は起動時に読み込むので、変更したらサーバーを再起動する。
 
 ## 15. 組み込み関数
 
@@ -791,16 +793,16 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
 
 | コマンド | 説明 |
 |---|---|
-| `phenix run file.phx` | 型検査して実行(`--html`、`--time-limit 秒`) |
-| `phenix check file.phx` | 型検査だけ(import しているモジュールとテンプレートも) |
-| `phenix serve dir` | Web サーバー(`--port`、`--host`、`--prod`、`--time-limit`) |
-| `phenix test [paths]` | `*_test.phx` の `test_*` 関数を実行(1 テストごとに新しい VM) |
-| `phenix fmt [paths] [--check]` | インデントと空白を整える(文字列・コメント・HTML は変えない) |
-| `phenix lsp` | エディタ用の Language Server(入力中のエラー表示、ホバーで型を表示) |
-| `phenix install` | `[dependencies]` を取得して `phenix.lock` に固定 |
-| `phenix migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
-| `phenix disasm file.phx` | バイトコードを表示 |
-| `phenix parse file.phx` | 構文木を表示 |
+| `phx run file.phx` | 型検査して実行(`--html`、`--time-limit 秒`) |
+| `phx check file.phx` | 型検査だけ(import しているモジュールとテンプレートも) |
+| `phx serve dir` | Web サーバー(`--port`、`--host`、`--prod`、`--time-limit`) |
+| `phx test [paths]` | `*_test.phx` の `test_*` 関数を実行(1 テストごとに新しい VM) |
+| `phx fmt [paths] [--check]` | インデントと空白を整える(文字列・コメント・HTML は変えない) |
+| `phx lsp` | エディタ用の Language Server(入力中のエラー表示、ホバーで型を表示) |
+| `phx install` | `[dependencies]` を取得して `phx.lock` に固定 |
+| `phx migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
+| `phx disasm file.phx` | バイトコードを表示 |
+| `phx parse file.phx` | 構文木を表示 |
 
 ### テスト
 
@@ -828,16 +830,16 @@ local = { path = "../shared" }
 import textutils.strings.slugify;      // vendor/textutils/strings.phx
 ```
 
-- `git` のパッケージは `vendor/<名前>` に取得され、正確なコミットが `phenix.lock` に記録される。
+- `git` のパッケージは `vendor/<名前>` に取得され、正確なコミットが `phx.lock` に記録される。
   2 回目以降は lock のコミットを取得し、違っていればエラーになる。
 - 使える URL は `https://`、`ssh://`、`git@host:...`、`file://` だけ。
-- パッケージは Phenix のソースコードで、インストール時にパッケージのコードが実行されることはない。
-- パッケージの依存はアプリの `phenix.toml` に並べて書く(推移的な依存の解決はまだない)。
+- パッケージは PHX のソースコードで、インストール時にパッケージのコードが実行されることはない。
+- パッケージの依存はアプリの `phx.toml` に並べて書く(推移的な依存の解決はまだない)。
 
 ### 移行
 
 ```
-phenix migrate legacy/page.php      # page.phx を書き出す
+phx migrate legacy/page.php      # page.phx を書き出す
 ```
 
 `<?php`→`<?phx`、`===`→`==`、`array(...)`→`[...]`、`isset($x)`→`($x != null)`、`$_GET`/`$_POST`/`$_COOKIE`/`$_SESSION`
@@ -853,15 +855,15 @@ phenix migrate legacy/page.php      # page.phx を書き出す
    - **インタプリタ**: 安全な Rust だけで書かれている。文字列・list・map は参照カウント + コピーオンライト。
    - **JIT**(Cranelift): すべての値が `int`/`bool` の関数(数値計算のループや再帰)はネイティブコードになる。
      オーバーフロー、0 での剰余、負のシフト、再帰の深さ、実行時間・メモリの上限は JIT でも同じように検査される。
-     `PHENIX_JIT=0` で無効にできる。JIT の中で起きた例外のスタックトレースは呼び出し元までになる。
-5. **バイトコードキャッシュ**: `phenix run` と `phenix serve` はコンパイル結果を `.phenix-cache/` に保存し、
-   ソースファイルと `phenix` 本体が変わっていなければ再利用する。
-   - キャッシュはユーザーごとの鍵(`%LOCALAPPDATA%\phenix\cache.key`、`~/.cache/phenix/cache.key`)の HMAC で
-     署名し、署名が合わないものは読まない。ほかの人から受け取ったプロジェクトに `.phenix-cache/` が入っていても、
+     `PHX_JIT=0` で無効にできる。JIT の中で起きた例外のスタックトレースは呼び出し元までになる。
+5. **バイトコードキャッシュ**: `phx run` と `phx serve` はコンパイル結果を `.phx-cache/` に保存し、
+   ソースファイルと `phx` 本体が変わっていなければ再利用する。
+   - キャッシュはユーザーごとの鍵(`%LOCALAPPDATA%\phx\cache.key`、`~/.cache/phx/cache.key`)の HMAC で
+     署名し、署名が合わないものは読まない。ほかの人から受け取ったプロジェクトに `.phx-cache/` が入っていても、
      ソースと違うコードが動くことはない。
    - エントリはスクリプトとプロジェクトごと。依存するすべてのファイルの内容(SHA-256)を記録し、読み込むときに
      確かめる(更新時刻を保つコピーや、同じ長さの書き換えでも古いコードは使われない)。
-   - `.phenix-cache/` がリンクなら使わない。中のファイルも、リンクやハードリンクなら読み書きしない。
+   - `.phx-cache/` がリンクなら使わない。中のファイルも、リンクやハードリンクなら読み書きしない。
 
 ### 実行時の上限
 
@@ -872,8 +874,8 @@ phenix migrate legacy/page.php      # page.phx を書き出す
 | 呼び出しの深さ | 10,000 | 致命的エラー |
 | リクエスト本文 | 8 MB | 413 |
 
-`unsafe` を使っているのは、メモリ使用量を数えるアロケータ(`phenix_vm/src/alloc.rs`)と JIT
-(`phenix_jit`、生成したコードの呼び出し)だけ。
+`unsafe` を使っているのは、メモリ使用量を数えるアロケータ(`phx_vm/src/alloc.rs`)と JIT
+(`phx_jit`、生成したコードの呼び出し)だけ。
 
 ## 18. 今後の予定
 
@@ -881,7 +883,7 @@ phenix migrate legacy/page.php      # page.phx を書き出す
 - 非同期 I/O、HTTP クライアント(`[permissions].net`)
 - JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
 - 推移的な依存関係の解決、パッケージレジストリ
-- LSP の定義ジャンプ・補完、`phenix fmt` の行の折り返し
+- LSP の定義ジャンプ・補完、`phx fmt` の行の折り返し
 - 複数プロセスで共有できるレート制限、データベースに保存するセッション
 
 セキュリティ監査の結果と残っているリスクは [security-audit.md](security-audit.md) を参照。

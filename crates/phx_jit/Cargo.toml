@@ -1,0 +1,15 @@
+[package]
+name = "phx_jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[dependencies]
+cranelift-codegen = "0.137.1"
+cranelift-frontend = "0.137.1"
+cranelift-jit = "0.137.1"
+cranelift-module = "0.137.1"
+cranelift-native = "0.137.1"
+phx_vm.workspace = true

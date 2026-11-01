@@ -22,7 +22,7 @@ error: undefined function `eval`
    |
 17 | eval("echo 1;");
    | ^^^^
-   = note: dynamic code execution is not available in Phenix
+   = note: dynamic code execution is not available in PHX
 
 error: `total` takes 1 argument(s) but 2 were given
   --> err_misc.phx:18:20
