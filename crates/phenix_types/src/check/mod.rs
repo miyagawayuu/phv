@@ -107,6 +107,9 @@ struct ClassInfo<'a> {
     methods: HashMap<String, MethodInfo>,
     vtable: Vec<FuncId>,
     ctor: Option<FuncId>,
+    /// Visibility of the constructor and the class that declares it: a
+    /// private constructor means only the class itself can use `new`.
+    ctor_access: (Visibility, ClassId),
     consts: HashMap<String, (HConst, Type)>,
     cases: Vec<(String, HConst)>,
     backing: Option<Type>,
@@ -622,6 +625,7 @@ impl<'a> Checker<'a> {
                             methods: HashMap::new(),
                             vtable: Vec::new(),
                             ctor: None,
+                            ctor_access: (Visibility::Public, 0),
                             consts: HashMap::new(),
                             cases: Vec::new(),
                             backing: None,
@@ -793,11 +797,12 @@ impl<'a> Checker<'a> {
                     _ => {}
                 }
                 let parent = &self.classes[p as usize];
-                let (fields, methods, vtable, ctor, consts) = (
+                let (fields, methods, vtable, ctor, ctor_access, consts) = (
                     parent.fields.clone(),
                     parent.methods.clone(),
                     parent.vtable.clone(),
                     parent.ctor,
+                    parent.ctor_access,
                     parent.consts.clone(),
                 );
                 let c = &mut self.classes[ci];
@@ -805,6 +810,7 @@ impl<'a> Checker<'a> {
                 c.methods = methods;
                 c.vtable = vtable;
                 c.ctor = ctor;
+                c.ctor_access = ctor_access;
                 c.consts = consts;
             }
             let mut supers: HashSet<ClassId> = HashSet::from([cid]);
@@ -1005,6 +1011,7 @@ impl<'a> Checker<'a> {
                         }
                     }
                     self.classes[ci].ctor = Some(fid);
+                    self.classes[ci].ctor_access = (m.visibility, cid);
                     continue;
                 }
                 for (p, ap) in params.iter().zip(&m.params) {

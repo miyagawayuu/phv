@@ -19,8 +19,8 @@ use std::time::SystemTime;
 pub struct Compiled {
     pub program: Arc<Program>,
     pub builtins: Arc<[BuiltinFn]>,
-    /// Files the program was built from, with their modification times.
-    pub deps: Vec<(PathBuf, Option<SystemTime>)>,
+    /// Files the program was built from, as they were when they were read.
+    pub deps: Vec<Dep>,
     /// Rendered warnings (empty when there are none).
     pub warnings: String,
     /// Source file id of the entry script.
@@ -59,9 +59,59 @@ impl Compiled {
 }
 
 impl Compiled {
-    /// True if any source file changed since compilation.
+    /// True if any source file changed since compilation (a quick check: see `Dep::is_fresh`).
     pub fn is_stale(&self) -> bool {
-        self.deps.iter().any(|(p, t)| mtime(p) != *t)
+        self.deps.iter().any(|d| !d.is_fresh(false))
+    }
+}
+
+/// A source file a program was built from, recorded when it was read.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Dep {
+    pub path: PathBuf,
+    /// Modification time (seconds, nanoseconds) and size, for a quick check.
+    mtime: Option<(u64, u32)>,
+    len: u64,
+    /// SHA-256 of the content that was compiled; None if the file was missing.
+    hash: Option<[u8; 32]>,
+    /// When the record was made (seconds since the epoch).
+    recorded: u64,
+}
+
+fn stat(p: &Path) -> Option<(Option<(u64, u32)>, u64)> {
+    let m = std::fs::metadata(p).ok()?;
+    let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    Some((t.map(|d| (d.as_secs(), d.subsec_nanos())), m.len()))
+}
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).into()
+}
+
+impl Dep {
+    /// Records `path` with the content that was actually read (`None`: missing).
+    fn new(path: &Path, content: Option<&[u8]>) -> Dep {
+        let (mtime, len) = stat(path).unwrap_or((None, 0));
+        let recorded = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        Dep { path: path.to_path_buf(), mtime, len, hash: content.map(sha256), recorded }
+    }
+
+    /// Whether the file still has the recorded content. A different time or size
+    /// means changed. Equal ones are trusted only if the file was not modified
+    /// close to when it was read (the "racy" case: it may have changed again
+    /// within the clock's resolution); otherwise, or when `thorough`, the
+    /// content is hashed and compared.
+    pub fn is_fresh(&self, thorough: bool) -> bool {
+        let Some((mtime, len)) = stat(&self.path) else { return self.hash.is_none() };
+        if self.hash.is_none() || mtime != self.mtime || len != self.len {
+            return false;
+        }
+        let racy = mtime.is_none_or(|(s, _)| s + 2 >= self.recorded);
+        if !thorough && !racy {
+            return true;
+        }
+        std::fs::read(&self.path).is_ok_and(|bytes| Some(sha256(&bytes)) == self.hash)
     }
 }
 
@@ -87,10 +137,6 @@ impl CompileError {
         out.push_str(&format!("{n} error{} found\n", if n == 1 { "" } else { "s" }));
         out
     }
-}
-
-fn mtime(p: &Path) -> Option<SystemTime> {
-    std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
 /// The project root: the nearest directory containing `phenix.toml`, or the
@@ -137,13 +183,13 @@ struct Loader {
     imports: HashMap<String, usize>,
     templates: HashMap<String, usize>,
     by_path: HashMap<PathBuf, usize>,
-    deps: Vec<(PathBuf, Option<SystemTime>)>,
+    deps: Vec<Dep>,
 }
 
 impl Loader {
     fn add(&mut self, name: String, path: Option<PathBuf>, text: String, kind: ModuleKind) -> usize {
         if let Some(p) = &path {
-            self.deps.push((p.clone(), mtime(p)));
+            self.deps.push(Dep::new(p, Some(text.as_bytes())));
         }
         let file = self.sources.add(name.clone(), path.clone(), text);
         let (module, mut diags) = parse_module(&self.sources.get(file).text, file, kind == ModuleKind::Template);
@@ -295,7 +341,7 @@ pub struct Analysis {
     pub hir: Option<phenix_types::hir::HProgram>,
     pub entry_file: Option<u32>,
     pub messages: Vec<String>,
-    deps: Vec<(PathBuf, Option<SystemTime>)>,
+    deps: Vec<Dep>,
 }
 
 /// Directory of each package listed in `[dependencies]`.
@@ -337,7 +383,8 @@ pub fn analyze(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>) -> 
         by_path: HashMap::new(),
         deps: Vec::new(),
     };
-    loader.deps.push((root.join("phenix.toml"), mtime(&root.join("phenix.toml"))));
+    let toml = root.join("phenix.toml");
+    loader.deps.push(Dep::new(&toml, std::fs::read(&toml).ok().as_deref()));
     loader.add("<std>/prelude.phx".into(), None, phenix_std::PRELUDE.to_string(), ModuleKind::Prelude);
     let overlaid = entry.canonicalize().ok().and_then(|c| loader.overlay.get(&c).cloned());
     let text = match overlaid.map(Ok).unwrap_or_else(|| std::fs::read_to_string(entry)) {

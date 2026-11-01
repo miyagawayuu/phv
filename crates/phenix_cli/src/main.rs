@@ -11,7 +11,7 @@ static ALLOC: phenix_vm::alloc::CountingAlloc = phenix_vm::alloc::CountingAlloc;
 use phenix_driver::{compile, compile_cached, find_root, load_config, run, RunOptions};
 use phenix_vm::Limits;
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -95,6 +95,42 @@ enum Command {
     },
 }
 
+/// Writes the result of `phenix migrate`. The output is never the input file
+/// (also not under another spelling, e.g. `X.PHX` on Windows), never a link
+/// (a planted `x.phx` symlink would send the text anywhere), and an existing
+/// file is replaced only with `--force`.
+fn write_migrated(input: &Path, out: &Path, text: &str, force: bool) -> Result<(), String> {
+    use std::io::Write as _;
+    let shown = out.display();
+    if let (Ok(a), Ok(b)) = (input.canonicalize(), out.canonicalize()) {
+        if a == b {
+            return Err("refusing to overwrite the input file".into());
+        }
+    }
+    let parent = match out.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let name = out.file_name().ok_or_else(|| format!("{shown} is not a file name"))?;
+    let (dir, name) = phenix_std::safefs::open_parent(&parent, Path::new(name))
+        .map_err(|e| format!("cannot write {shown}: {e:?}"))?;
+    match dir.exists(&name) {
+        Ok(true) if !force => return Err(format!("{shown} already exists (use --force to overwrite)")),
+        Ok(_) => {}
+        Err(phenix_std::safefs::FsError::Link) => {
+            return Err(format!("{shown} is a link; refusing to write through it"))
+        }
+        Err(e) => return Err(format!("cannot write {shown}: {e:?}")),
+    }
+    let mut f = dir.open(&name, true).map_err(|e| match e {
+        phenix_std::safefs::FsError::Link | phenix_std::safefs::FsError::HardLink => {
+            format!("{shown} is a link; refusing to write through it")
+        }
+        e => format!("cannot write {shown}: {e:?}"),
+    })?;
+    f.write_all(text.as_bytes()).map_err(|e| format!("cannot write {shown}: {e}"))
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     // Scripts run on a thread with a large stack so deep recursion through
@@ -175,16 +211,8 @@ fn exec(cmd: Command) -> ExitCode {
             };
             let m = migrate::convert(&src);
             let out_path = output.unwrap_or_else(|| file.with_extension("phx"));
-            if out_path == file {
-                eprintln!("error: refusing to overwrite the input file");
-                return ExitCode::FAILURE;
-            }
-            if out_path.exists() && !force {
-                eprintln!("error: {} already exists (use --force to overwrite)", out_path.display());
-                return ExitCode::FAILURE;
-            }
-            if let Err(e) = std::fs::write(&out_path, &m.text) {
-                eprintln!("error: cannot write {}: {e}", out_path.display());
+            if let Err(e) = write_migrated(&file, &out_path, &m.text, force) {
+                eprintln!("error: {e}");
                 return ExitCode::FAILURE;
             }
             println!("wrote {}", out_path.display());

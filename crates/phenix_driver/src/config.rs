@@ -241,6 +241,21 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
                 "[permissions].write: \"{d}\" is inside public/; writable files must not be servable (use e.g. \"storage/\")"
             ));
         }
+        // Places whose files are loaded as code: the bytecode cache and other
+        // hidden directories (.git hooks), and package sources.
+        let names = dir_names(d);
+        let code_dir = names.first().is_some_and(|n| n.starts_with('.') || n == "vendor")
+            || file
+                .dependencies
+                .values()
+                .filter_map(|dep| dep.path.as_deref())
+                .filter(|p| !Path::new(p).components().any(|c| c == std::path::Component::ParentDir))
+                .any(|p| overlaps(&names, &dir_names(p)));
+        if code_dir {
+            return Err(format!(
+                "[permissions].write: \"{d}\" holds code (hidden directories, vendor/ or a package); use e.g. \"storage/\""
+            ));
+        }
     }
     for (name, dep) in &file.dependencies {
         if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || name.starts_with("std") {

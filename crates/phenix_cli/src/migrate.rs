@@ -36,16 +36,18 @@ pub fn convert(src: &str) -> Migration {
     let mut uses_session = false;
     let mut i = 0;
     let mut in_php = false;
-    let starts = |i: usize, pat: &str| src[i..].starts_with(pat);
+    // Byte comparisons: `i` may sit inside a multibyte character while
+    // scanning comments and strings.
+    let starts = |i: usize, pat: &str| b.get(i..).is_some_and(|s| s.starts_with(pat.as_bytes()));
     let word_at = |i: usize, w: &str| {
-        src[i..].len() >= w.len()
-            && src[i..i + w.len()].eq_ignore_ascii_case(w)
+        b.get(i..i + w.len()).is_some_and(|s| s.eq_ignore_ascii_case(w.as_bytes()))
             && (i == 0 || !ident_char(b[i - 1]))
             && b.get(i + w.len()).is_none_or(|c| !ident_char(*c))
     };
     while i < b.len() {
         if !in_php {
-            if starts(i, "<?php") {
+            // PHP's open tag is case-insensitive (`<?PHP`, `<?Php`).
+            if b.get(i..i + 5).is_some_and(|s| s.eq_ignore_ascii_case(b"<?php")) {
                 out.push_str("<?phx");
                 *changes.entry("<?php -> <?phx").or_default() += 1;
                 i += 5;
@@ -54,6 +56,13 @@ pub fn convert(src: &str) -> Migration {
                 out.push_str("<?=");
                 i += 3;
                 in_php = true;
+            } else if starts(i, "<?") {
+                // A short open tag (or `<?xml`) would run as PHP with short_open_tag
+                // on; it is not converted, so it must not pass silently as text.
+                out.push_str("<?phx TODO_migrate(\"`<?` short open tag: convert this block by hand\"); ?>");
+                todos += 1;
+                out.push_str("<?");
+                i += 2;
             } else {
                 let ch = src[i..].chars().next().unwrap();
                 out.push(ch);

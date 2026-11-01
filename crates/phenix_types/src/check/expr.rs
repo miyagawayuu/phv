@@ -1699,6 +1699,13 @@ impl<'a> Checker<'a> {
             }
             return err(span);
         }
+        let (vis, owner) = self.classes[cid as usize].ctor_access;
+        if self.classes[cid as usize].ctor.is_some() && !self.can_access(owner, vis) {
+            let cname = self.class_names[cid as usize].clone();
+            let word = Self::vis_word(vis);
+            self.error(format!("the constructor of `{cname}` is {word}"), class_span)
+                .add_note(format!("create it with one of its static methods, e.g. `{cname}::open(...)`"));
+        }
         match self.classes[cid as usize].ctor {
             Some(fid) => {
                 let (hargs, _) = self.invoke(fid, args, span);

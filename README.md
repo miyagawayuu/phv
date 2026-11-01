@@ -42,7 +42,7 @@ echo greet($name);                                 // Web ページでは自動�
     パスの検査と使用の間にすり替えられることもない。
   - **上限**: メモリ・時間・再帰の深さに上限がある。
   - **動的な実行がない**: `eval` や可変変数はない。
-  - 2 回の監査と脆弱性診断の結果は [docs/security-audit.md](docs/security-audit.md) にある。
+  - 3 回の監査と脆弱性診断の結果は [docs/security-audit.md](docs/security-audit.md) にある。
 - **速度**: 型に特化したレジスタ型バイトコード VM、Cranelift による JIT、バイトコードのディスクキャッシュ
 - **ツール**: テストランナー、フォーマッタ、Language Server、パッケージマネージャ、PHP からの移行ツール
 

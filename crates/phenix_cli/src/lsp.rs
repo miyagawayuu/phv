@@ -8,7 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
-fn read_message(input: &mut impl BufRead) -> Option<Value> {
+/// Messages on the stream: `None` means the stream ended or its framing is
+/// broken (nothing more can be read); `Some(None)` is a well-framed message
+/// that is not valid JSON, answered with a parse error.
+fn read_message(input: &mut impl BufRead) -> Option<Option<Value>> {
     let mut length = None;
     loop {
         let mut line = String::new();
@@ -31,8 +34,11 @@ fn read_message(input: &mut impl BufRead) -> Option<Value> {
     }
     let mut buf = vec![0u8; n];
     input.read_exact(&mut buf).ok()?;
-    serde_json::from_slice(&buf).ok()
+    Some(serde_json::from_slice(&buf).ok())
 }
+
+/// Open documents at most; more are ignored (each holds a copy of its text).
+const MAX_OPEN: usize = 1000;
 
 fn send(out: &mut impl Write, msg: &Value) {
     let body = msg.to_string();
@@ -40,16 +46,40 @@ fn send(out: &mut impl Write, msg: &Value) {
     let _ = out.flush();
 }
 
+/// The local file a `file:///...` URI names. Anything that could reach another
+/// machine or a device is refused: `file://host/share`, UNC paths smuggled in
+/// after decoding (`file:///%5C%5Chost%5Cshare`), `\\?\` and `\\.\` paths, and
+/// device names such as `CON` or a named pipe.
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    // Only local files (`file:///...`), never `file://host/share`.
     let rest = uri.strip_prefix("file://")?;
     if !rest.starts_with('/') {
         return None;
     }
-    let decoded = percent_encoding::percent_decode_str(rest).decode_utf8_lossy().into_owned();
-    // file:///C:/x -> C:/x on Windows
-    let path = if cfg!(windows) { decoded.trim_start_matches('/').to_string() } else { decoded };
-    Some(PathBuf::from(path))
+    let decoded = percent_encoding::percent_decode_str(rest).decode_utf8().ok()?.into_owned();
+    if decoded.contains('\0') {
+        return None;
+    }
+    let path = if cfg!(windows) {
+        // file:///C:/x -> C:/x; nothing but a drive letter may start the path.
+        let p = decoded.strip_prefix('/')?.replace('\\', "/");
+        let b = p.as_bytes();
+        if b.len() < 3 || !b[0].is_ascii_alphabetic() || b[1] != b':' || b[2] != b'/' || p[2..].starts_with("//") {
+            return None;
+        }
+        p
+    } else {
+        if decoded.starts_with("//") {
+            return None;
+        }
+        decoded
+    };
+    let path = PathBuf::from(path);
+    let names_ok = path.components().all(|c| match c {
+        std::path::Component::Normal(n) => n.to_str().is_some_and(phenix_std::safefs::valid_name),
+        std::path::Component::ParentDir => false,
+        _ => true,
+    });
+    names_ok.then_some(path)
 }
 
 pub fn path_to_uri(p: &Path) -> String {
@@ -152,7 +182,8 @@ impl Server {
     }
 
     fn hover(&self, path: &Path, line: u64, character: u64) -> Value {
-        let Some(text) = self.open.get(path).cloned().or_else(|| std::fs::read_to_string(path).ok()) else {
+        // Only documents the editor opened; other files are not read on request.
+        let Some(text) = self.open.get(path).cloned() else {
             return Value::Null;
         };
         let root = find_root(path);
@@ -180,6 +211,13 @@ pub fn run() {
     let mut server = Server { open: HashMap::new(), reported: HashMap::new() };
     let mut shutting_down = false;
     while let Some(msg) = read_message(&mut input) {
+        let Some(msg) = msg else {
+            send(
+                &mut out,
+                &json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "parse error" } }),
+            );
+            continue;
+        };
         let method = msg["method"].as_str().unwrap_or("").to_string();
         let id = msg.get("id").cloned();
         let params = &msg["params"];
@@ -198,7 +236,7 @@ pub fn run() {
             }
             "exit" => std::process::exit(if shutting_down { 0 } else { 1 }),
             "textDocument/didOpen" => {
-                if let Some(p) = doc_path() {
+                if let Some(p) = doc_path().filter(|p| server.open.contains_key(p) || server.open.len() < MAX_OPEN) {
                     let text = params["textDocument"]["text"].as_str().unwrap_or("").to_string();
                     server.open.insert(p.clone(), text);
                     server.check(&p, &mut out);
@@ -206,7 +244,7 @@ pub fn run() {
                 None
             }
             "textDocument/didChange" => {
-                if let Some(p) = doc_path() {
+                if let Some(p) = doc_path().filter(|p| server.open.contains_key(p)) {
                     if let Some(text) =
                         params["contentChanges"].as_array().and_then(|c| c.last()).and_then(|c| c["text"].as_str())
                     {
@@ -267,5 +305,22 @@ mod tests {
         assert_eq!(offset_of(text, 1, 7), 3 + 15 + 4);
         let p = PathBuf::from(if cfg!(windows) { "C:/a b/x.phx" } else { "/a b/x.phx" });
         assert_eq!(uri_to_path(&path_to_uri(&p)).unwrap(), p);
+    }
+
+    #[test]
+    fn refuses_remote_and_device_uris() {
+        for uri in [
+            "file://host/share/x.phx",
+            "file:///%5C%5Chost%5Cshare%5Cx.phx",
+            "file:///\\\\host\\share\\x.phx",
+            "file:////host/share/x.phx",
+            "file:///%5C%5C.%5Cpipe%5Cx",
+            "file:///%5C%5C%3F%5CC:%5Cx.phx",
+            "file:///C:/dir/CON",
+            "file:///C:/dir/../x.phx",
+            "http://example.com/x.phx",
+        ] {
+            assert!(uri_to_path(uri).is_none(), "{uri}");
+        }
     }
 }

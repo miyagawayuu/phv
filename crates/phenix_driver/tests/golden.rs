@@ -173,3 +173,110 @@ fn bytecode_cache_round_trip() {
     assert_eq!(out.output, "42");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn run_out(c: &phenix_driver::Compiled) -> String {
+    run(c, RunOptions { html: false, limits: Default::default(), http: None, host: None }).output
+}
+
+fn only_entry(dir: &Path) -> PathBuf {
+    std::fs::read_dir(dir.join(".phenix-cache"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "bin"))
+        .unwrap()
+}
+
+#[test]
+fn cache_entries_cannot_be_forged_or_reused() {
+    let dir = std::env::temp_dir().join(format!("phenix-cache-forge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let page = dir.join("page.phx");
+    std::fs::write(
+        &page,
+        "<?phx\nfunction is_admin(): bool { return false; }\necho is_admin() ? \"ADMIN\" : \"DENIED\";\n",
+    )
+    .unwrap();
+    assert_eq!(run_out(&phenix_driver::compile_cached(&dir, &page).ok().unwrap()), "DENIED");
+    let bin = only_entry(&dir);
+
+    // Same size, mtime put back: the content hash still notices.
+    let mtime = std::fs::metadata(&page).unwrap().modified().unwrap();
+    std::fs::write(
+        &page,
+        "<?phx\nfunction is_admin(): bool { return  true; }\necho is_admin() ? \"ADMIN\" : \"DENIED\";\n",
+    )
+    .unwrap();
+    std::fs::File::options().write(true).open(&page).unwrap().set_modified(mtime).unwrap();
+    assert_eq!(run_out(&phenix_driver::compile_cached(&dir, &page).ok().unwrap()), "ADMIN");
+
+    // A tampered entry (one flipped byte) is ignored.
+    let mut bytes = std::fs::read(&bin).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 1;
+    std::fs::write(&bin, &bytes).unwrap();
+    let c = phenix_driver::compile_cached(&dir, &page).ok().unwrap();
+    assert!(!c.from_cache);
+
+    // An entry built for one script is not used for another.
+    let other = dir.join("other.phx");
+    std::fs::write(&other, "<?phx\necho \"other\";\n").unwrap();
+    let good = std::fs::read(&bin).unwrap();
+    let other_bin = {
+        phenix_driver::compile_cached(&dir, &other).ok().unwrap();
+        std::fs::read_dir(dir.join(".phenix-cache"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "bin") && *p != bin)
+            .unwrap()
+    };
+    std::fs::write(&other_bin, &good).unwrap();
+    let c = phenix_driver::compile_cached(&dir, &other).ok().unwrap();
+    assert!(!c.from_cache);
+    assert_eq!(run_out(&c), "other");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_does_not_follow_links() {
+    let dir = std::env::temp_dir().join(format!("phenix-cache-link-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("proj")).unwrap();
+    std::fs::create_dir_all(dir.join("outside")).unwrap();
+    std::fs::write(dir.join("outside/.gitignore"), "keep me").unwrap();
+    std::os::unix::fs::symlink(dir.join("outside"), dir.join("proj/.phenix-cache")).unwrap();
+    let page = dir.join("proj/page.phx");
+    std::fs::write(&page, "<?phx\necho 1;\n").unwrap();
+    phenix_driver::compile_cached(&dir.join("proj"), &page).ok().unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join("outside/.gitignore")).unwrap(), "keep me");
+    assert_eq!(std::fs::read_dir(dir.join("outside")).unwrap().count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn cache_does_not_follow_junctions() {
+    let dir = std::env::temp_dir().join(format!("phenix-cache-junction-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("proj")).unwrap();
+    std::fs::create_dir_all(dir.join("outside")).unwrap();
+    std::fs::write(dir.join("outside/.gitignore"), "keep me").unwrap();
+    let made = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(dir.join("proj/.phenix-cache"))
+        .arg(dir.join("outside"))
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if made {
+        let page = dir.join("proj/page.phx");
+        std::fs::write(&page, "<?phx\necho 1;\n").unwrap();
+        phenix_driver::compile_cached(&dir.join("proj"), &page).ok().unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("outside/.gitignore")).unwrap(), "keep me");
+        assert_eq!(std::fs::read_dir(dir.join("outside")).unwrap().count(), 1);
+        let _ = std::fs::remove_dir(dir.join("proj/.phenix-cache"));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

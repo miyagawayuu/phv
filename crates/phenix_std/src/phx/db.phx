@@ -70,7 +70,8 @@ export class Row {
 }
 
 export class Database {
-    public function __construct(private int $handle) {}
+    /** Connections come from `Database::open()`; a handle number cannot be passed in. */
+    private function __construct(private int $handle) {}
 
     /** Opens (or creates) a database file, or ":memory:". */
     public static function open(string $path): Database {

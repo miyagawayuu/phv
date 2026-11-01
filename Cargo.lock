@@ -865,6 +865,7 @@ dependencies = [
  "percent-encoding",
  "phenix_driver",
  "phenix_server",
+ "phenix_std",
  "phenix_syntax",
  "phenix_types",
  "phenix_vm",
@@ -886,6 +887,8 @@ dependencies = [
 name = "phenix_driver"
 version = "0.2.0"
 dependencies = [
+ "getrandom",
+ "hmac",
  "phenix_compiler",
  "phenix_jit",
  "phenix_std",
@@ -894,6 +897,7 @@ dependencies = [
  "phenix_vm",
  "postcard",
  "serde",
+ "sha2",
  "toml",
 ]
 

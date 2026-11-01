@@ -9,6 +9,7 @@ name = "phenix"
 path = "src/main.rs"
 
 [dependencies]
+phenix_std.workspace = true
 phenix_syntax.workspace = true
 phenix_driver.workspace = true
 phenix_server.workspace = true

@@ -17,3 +17,6 @@ phenix_jit.workspace = true
 toml.workspace = true
 postcard.workspace = true
 serde.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+getrandom.workspace = true
