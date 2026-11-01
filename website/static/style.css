@@ -128,6 +128,7 @@ th, td { border-bottom: 1px solid var(--border); padding: 8px 10px; text-align: 
 th { background: var(--bg-soft); font-weight: 600; }
 
 .security { border-top: 1px solid var(--border); padding-top: 40px; }
+.notfound { min-height: 40vh; }
 
 /* Documentation pages */
 main.wide { max-width: 1240px; }

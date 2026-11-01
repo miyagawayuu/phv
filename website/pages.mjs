@@ -39,7 +39,7 @@ const text = {
     source: "Or build from source with a recent stable Rust and a C compiler: <code>cargo build --release</code>.",
     editor: "For VS Code, install the extension from <code>editors/vscode</code> for highlighting and live diagnostics.",
     securityTitle: "Security",
-    securityLead: `PHX has been through three security audits, each followed by fixes and regression tests. Read the <a href="docs/security.html">audit report</a>. To report a vulnerability, email <a href="mailto:security@phx-lang.org">security@phx-lang.org</a>.`,
+    securityLead: `PHX has been through three security audits, each followed by fixes and regression tests. Read the <a href="docs/security/">audit report</a>. To report a vulnerability, email <a href="mailto:security@phx-lang.org">security@phx-lang.org</a>.`,
     getStarted: "Get started",
   },
   ja: {
@@ -67,7 +67,7 @@ const text = {
     source: "ソースからビルドするなら、最近の安定版 Rust と C コンパイラで <code>cargo build --release</code>。",
     editor: "VS Code では <code>editors/vscode</code> の拡張を入れると、色分けと入力中のエラー表示が使えます。",
     securityTitle: "セキュリティ",
-    securityLead: `PHX は 3 回のセキュリティ監査を受け、そのたびに修正と回帰テストを加えています。<a href="docs/security.html">監査報告</a>をご覧ください。脆弱性の報告は <a href="mailto:security@phx-lang.org">security@phx-lang.org</a> へ。`,
+    securityLead: `PHX は 3 回のセキュリティ監査を受け、そのたびに修正と回帰テストを加えています。<a href="docs/security/">監査報告</a>をご覧ください。脆弱性の報告は <a href="mailto:security@phx-lang.org">security@phx-lang.org</a> へ。`,
     getStarted: "はじめる",
   },
 };
@@ -89,7 +89,7 @@ export function landing(lang, version, code) {
   <div class="hero-text">
     <h1>${t.tagline}</h1>
     <p class="lead">${t.lead}</p>
-    <p class="actions"><a class="button primary" href="#download">${t.download} ${version}</a> <a class="button" href="${docs}spec.html">${t.readSpec}</a></p>
+    <p class="actions"><a class="button primary" href="#download">${t.download} ${version}</a> <a class="button" href="${docs}spec/">${t.readSpec}</a></p>
   </div>
   <div class="hero-code">${code(sample("hero.phx"), "phx")}</div>
 </section>

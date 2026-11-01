@@ -25,7 +25,9 @@ http
     if (rel.endsWith("/")) rel += "index.html";
     const file = path.join(dist, path.normalize(rel));
     if (!file.startsWith(dist + path.sep) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
-      res.writeHead(404, { "content-type": "text/plain" }).end("not found");
+      // Like Cloudflare Pages: unknown paths get 404.html with status 404.
+      res.writeHead(404, { ...headers, "content-type": "text/html; charset=utf-8" });
+      fs.createReadStream(path.join(dist, "404.html")).pipe(res);
       return;
     }
     res.writeHead(200, { ...headers, "content-type": types[path.extname(file)] || "application/octet-stream" });

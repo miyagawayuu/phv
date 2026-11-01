@@ -1,7 +1,8 @@
 // Builds the static phx-lang.org site into dist/:
 //   /                 landing page (English)     /ja/              landing page (Japanese)
-//   /docs/spec.html   language specification     /ja/docs/spec.html
-//   /docs/security.html  security audit report   /ja/docs/security.html
+//   /docs/spec/       language specification     /ja/docs/spec/
+//   /docs/security/   security audit report      /ja/docs/security/
+//   /404.html         page for unknown paths
 // The specification and the audit report are rendered from ../docs/*.md, and
 // PHX code is highlighted with the VS Code extension's TextMate grammars.
 
@@ -57,8 +58,8 @@ function slug(text, seen) {
 
 // Where the Markdown files' relative links go on the site.
 const docLinks = {
-  en: { "spec.md": "spec.html", "spec.ja.md": "../ja/docs/spec.html", "security-audit.md": "security.html", "security-audit.ja.md": "../ja/docs/security.html" },
-  ja: { "spec.md": "../../docs/spec.html", "spec.ja.md": "spec.html", "security-audit.md": "../../docs/security.html", "security-audit.ja.md": "security.html" },
+  en: { "spec.md": "../spec/", "spec.ja.md": "../../ja/docs/spec/", "security-audit.md": "../security/", "security-audit.ja.md": "../../ja/docs/security/" },
+  ja: { "spec.md": "../../../docs/spec/", "spec.ja.md": "../spec/", "security-audit.md": "../../../docs/security/", "security-audit.ja.md": "../security/" },
 };
 
 /** Renders a Markdown document; returns the HTML and its table of contents. */
@@ -98,8 +99,10 @@ const strings = {
 };
 
 /** The page frame shared by every page. `depth` is how far the page is below the site root. */
-export function layout({ lang, title, description, body, depth, active, otherHref, wide }) {
-  const up = "../".repeat(depth);
+export function layout({ lang, title, description, body, depth, active, otherHref, wide, absolute }) {
+  // Links are relative so the site works from any directory; the 404 page,
+  // which is served at any path, uses root-relative links instead.
+  const up = absolute ? "/" : "../".repeat(depth);
   const t = strings[lang];
   const home = lang === "en" ? up || "./" : `${up}ja/`;
   const docs = lang === "en" ? `${up}docs/` : `${up}ja/docs/`;
@@ -121,8 +124,8 @@ export function layout({ lang, title, description, body, depth, active, otherHre
   <div class="inner">
     <a class="logo" href="${home}">PHX</a>
     <nav>
-      ${nav("spec", `${docs}spec.html`, t.spec)}
-      ${nav("security", `${docs}security.html`, t.security)}
+      ${nav("spec", `${docs}spec/`, t.spec)}
+      ${nav("security", `${docs}security/`, t.security)}
       ${nav("download", `${home}#download`, t.download)}
       <a class="lang" href="${otherHref}" hreflang="${t.otherLang}" lang="${t.otherLang}">${t.other}</a>
     </nav>
@@ -174,12 +177,26 @@ for (const lang of ["en", "ja"]) {
   const depth = lang === "en" ? 0 : 1;
   write(out, layout({ lang, ...page, depth, active: "home", otherHref: lang === "en" ? "ja/" : "../" }));
 }
-docPage("spec.md", "en", "docs/spec.html", "spec", "../ja/docs/spec.html");
-docPage("spec.ja.md", "ja", "ja/docs/spec.html", "spec", "../../docs/spec.html");
-docPage("security-audit.md", "en", "docs/security.html", "security", "../ja/docs/security.html");
-docPage("security-audit.ja.md", "ja", "ja/docs/security.html", "security", "../../docs/security.html");
-write("docs/index.html", `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=spec.html"><a href="spec.html">spec.html</a>\n`);
-write("ja/docs/index.html", `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=spec.html"><a href="spec.html">spec.html</a>\n`);
+docPage("spec.md", "en", "docs/spec/index.html", "spec", "../../ja/docs/spec/");
+docPage("spec.ja.md", "ja", "ja/docs/spec/index.html", "spec", "../../../docs/spec/");
+docPage("security-audit.md", "en", "docs/security/index.html", "security", "../../ja/docs/security/");
+docPage("security-audit.ja.md", "ja", "ja/docs/security/index.html", "security", "../../../docs/security/");
+for (const dir of ["docs", "ja/docs"]) {
+  write(`${dir}/index.html`, `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=spec/"><a href="spec/">spec/</a>
+`);
+}
+write(
+  "404.html",
+  layout({
+    lang: "en",
+    title: "Page not found · PHX",
+    description: "Page not found",
+    body: `<section class="notfound"><h1>Page not found</h1><p>There is no page at this address. <a href="/">Go to the PHX home page</a> or read the <a href="/docs/spec/">specification</a>.</p><p lang="ja">ページが見つかりません。<a href="/ja/">トップページ</a>へ。</p></section>`,
+    depth: 0,
+    absolute: true,
+    otherHref: "/ja/",
+  }),
+);
 
 const count = (dir) => fs.readdirSync(dir, { withFileTypes: true }).reduce((n, e) => n + (e.isDirectory() ? count(path.join(dir, e.name)) : 1), 0);
 console.log(`built ${count(dist)} files into ${path.relative(process.cwd(), dist) || "dist"}`);
