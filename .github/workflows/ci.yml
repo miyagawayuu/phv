@@ -51,6 +51,19 @@ jobs:
           ./target/release/phx test examples
           ./target/release/phx check examples/site/public/index.phx
 
+  editor:
+    name: VS Code extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Grammar tests
+        working-directory: editors/vscode
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm test
+
   fuzz:
     name: longer fuzzing
     runs-on: ubuntu-latest

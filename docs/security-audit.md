@@ -1,221 +1,222 @@
-# PHX セキュリティ監査報告 (v0.2)
+# PHX Security Audit Report (v0.2)
 
-この報告は 3 回の監査をまとめたもの。§1〜§6 が 1 回目(と残存リスクの解消)、§7 が 2 回目の脆弱性診断、
-§8 が 2 回目で対象外にした部分(`phx lsp`、`phx migrate`、バイトコードキャッシュ)の診断。
+English | [日本語](security-audit.ja.md)
 
-実施日: 2026-11-02
-対象: PHX 処理系のすべてのクレート(構文解析・型検査・コンパイラ・VM・JIT・標準ライブラリ・Web サーバー・CLI ツール)
+This report consolidates three audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+and §8 covers the parts excluded from the second assessment (`phx lsp`, `phx migrate`, bytecode cache).
 
-## 1. 方法
+Date: 2026-11-02
+Scope: All crates of the PHX implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
-1. **独立した 3 つのレビュー**。実装者の前提に引きずられないよう、担当を分けた 3 人のレビュアーがソースを読み、
-   実際に攻撃コード(PoC)を動かして確かめた。
-   - A: HTTP 層(ルーティング、静的ファイル、セッション、CSRF、multipart、ヘッダー)
-   - B: ランタイム(VM、JIT、メモリ・時間の上限、標準ライブラリ、ファイル権限、SQLite)
-   - C: 言語の保証とツール(エスケープ、型システムの健全性、`Html`/`Sql` 型、モジュール読み込み、`phx install`/`migrate`/`lsp`)
-2. **修正と再検証**。すべての指摘を修正し、レビュアーが残した PoC を修正後のビルドでもう一度実行した。
-3. **自動テスト**。ゴールデンテストに回帰テスト(`tests/cases/err_security.phx`、`security.phx`)を追加した。
-   ほかに、実サーバーへの HTTP 結合テストと、変異させたプログラムによるファジング(ローカルで約 22,000 件)を
-   CI で常に実行する。
+## 1. Method
 
-## 2. 結果の概要
+1. **Three independent reviews.** To avoid inheriting the implementer's assumptions, three reviewers with separate areas read the source
+   and confirmed each issue by running actual attack code (PoC).
+   - A: HTTP layer (routing, static files, sessions, CSRF, multipart, headers)
+   - B: Runtime (VM, JIT, memory and time limits, standard library, file permissions, SQLite)
+   - C: Language guarantees and tools (escaping, type-system soundness, `Html`/`Sql` types, module loading, `phx install`/`migrate`/`lsp`)
+2. **Fixes and re-verification.** All findings were fixed, and the reviewers' PoCs were rerun against the fixed build.
+3. **Automated tests.** Regression tests (`tests/cases/err_security.phx`, `security.phx`) were added to the golden tests.
+   In addition, HTTP integration tests against a real server and fuzzing with mutated programs (about 22,000 cases locally)
+   run on every CI build.
 
-| 重大度 | 件数 | 対応 |
+## 2. Summary of Results
+
+| Severity | Count | Fix |
 |---|---:|---|
-| Critical | 3 | すべて修正 |
-| High | 9 | すべて修正 |
-| Medium | 10 | すべて修正 |
-| Low / Info | 18 | すべて修正(2 件は最初は受容とし、§4 の追加対応で修正) |
-| 追加対応で見つかったもの | 1 | 修正(§4 の N1、Medium) |
+| Critical | 3 | All fixed |
+| High | 9 | All fixed |
+| Medium | 10 | All fixed |
+| Low / Info | 18 | All fixed (2 initially accepted, then fixed in the follow-up in §4) |
+| Found during follow-up | 1 | Fixed (N1 in §4, Medium) |
 
-Critical と High はすべて修正し、PoC で再現しないことを確認した。最初の報告で「残っているリスク」とした項目も、
-§4 の追加対応で、仕組みとして受け入れているもの(§5)を除いて解消した。
+All Critical and High findings were fixed, and PoCs verified that they no longer reproduce. The items listed as "residual risks" in the initial report
+were also resolved in the follow-up in §4, except those accepted by design (§5).
 
-## 3. 指摘と対応
+## 3. Findings and Fixes
 
 ### Critical
 
-| # | 内容 | 対応 | 確認 |
+| # | Finding | Fix | Verified |
 |---|---|---|---|
-| C1 | Windows で `/INDEX.PHX`、`/index.phx::$DATA`、8.3 短縮名 (`/DASHBO~1.PHX`、`/ENV~1`) のような別名で、`.phx` のソース・テンプレート・ドットファイルがそのまま配信された | 正規化したパスの各要素が、要求されたパスと**完全に同じ綴り**のときだけ配信する。`:` を含むパスは拒否。`.phx` / `.phx.html` / `.` で始まるファイルは静的ファイルとして扱わない | 実サーバーで全パターン 404、単体テストに追加 |
-| C2 | 30 万段入れ子の list を捨てると再帰的な解放でスタックが溢れ、サーバープロセスごと落ちた(`catch_unwind` では止められない) | `Value` の解放と `==` の比較を反復処理にした | 100 万段で正常終了(テスト `deep_values_do_not_overflow_the_stack`) |
-| C3 | `"a"->padStart(10^13, "b")` のような巨大確保の失敗でプロセスが abort した | 出力が入力より大きくなり得る組み込み関数は、確保する前に `reserve()` で上限を確認する(pad、repeat、replace、chars、split、join、concat、range、ファイル読み込み、文字列連結) | 捕捉できない致命的エラー(メモリ上限)になり、プロセスは生きている |
+| C1 | On Windows, `.phx` sources, templates, and dotfiles were served verbatim via aliases such as `/INDEX.PHX`, `/index.phx::$DATA`, and 8.3 short names (`/DASHBO~1.PHX`, `/ENV~1`) | Serve only when every component of the normalized path has **exactly the same spelling** as the requested path. Reject paths containing `:`. Never treat `.phx` / `.phx.html` / files starting with `.` as static files | All patterns return 404 on a real server; added to unit tests |
+| C2 | Dropping a list nested 300,000 levels deep overflowed the stack during recursive deallocation and crashed the whole server process (`catch_unwind` cannot stop it) | Made `Value` deallocation and `==` comparison iterative | Completes normally at 1,000,000 levels (test `deep_values_do_not_overflow_the_stack`) |
+| C3 | A failed huge allocation, such as `"a"->padStart(10^13, "b")`, aborted the process | Built-ins whose output can exceed their input check the limit with `reserve()` before allocating (pad, repeat, replace, chars, split, join, concat, range, file reads, string concatenation) | Raises an uncatchable fatal error (memory limit); the process stays alive |
 
 ### High
 
-| # | 内容 | 対応 | 確認 |
+| # | Finding | Fix | Verified |
 |---|---|---|---|
-| H1 | ジェネリックの型引数を `is` で絞り込むと `never` になり、任意の値を `Sql` や `Html` として通せた(SQL インジェクション、`raw()` を使わない XSS) | 型引数・`any` の絞り込みは検査対象の型にする。interface や `Sql` を考慮し、結果が `never` になる絞り込みは適用しない。`Html` の連結は実行時にも素の文字列をエスケープする | PoC はコンパイルエラーになる |
-| H2 | `&&` / `\|\|` の右辺や `render()` の中で呼び出しがあっても、プロパティの絞り込みが残った | 呼び出しのたびに世代番号を進め、呼び出しをまたいだプロパティの事実は捨てる | PoC 4 件ともコンパイルエラー |
-| H3 | `public/` の `.php` などが生のまま配信された | 静的ファイルは既知の拡張子(css、js、画像、フォント など)だけを配信する | `/config.php` は 404 |
-| H4 | 匿名の GET で CSRF トークンのためにサーバー側セッションが作られ、10 万件で満杯になり、新しい訪問者がログインやフォーム送信をできなくなった | CSRF トークンを「ブラウザごとのランダムな Cookie の HMAC」にして、サーバー側に状態を持たない。セッション保存領域は件数とバイト数の上限付きで、古いものから追い出す | 単体テスト(上限を超えても新しい訪問者がセッションを得られる) |
-| H5 | ヘッダー・本文の受信にタイムアウトがなく(slowloris)、接続数の上限もなかった | ヘッダー 10 秒(keep-alive の待ち時間も含む)、本文 30 秒、同時接続 1024 | 途中までのヘッダーは 10 秒で切断 |
-| H6 | メモリ上限が組み込み関数の中ではほとんど効いていなかった | 組み込み関数の呼び出しのたびに確認、確保前の `reserve()`、SQLite の文字列長・ヒープ上限 | 16 MB の設定で 1 GB 確保の PoC が止まる |
-| H7 | SQLite のクエリが実行時間の上限を無視した | SQLite の progress handler で上限時刻に中断する | 無限の再帰 CTE が 2 秒で止まる |
-| H8 | 実行時間の上限が命令数で数えられていて、遅い組み込み関数を繰り返すと何倍も延びた | 組み込み関数の呼び出しのたびに時刻を確認する | |
-| H9 | 書き込み可能なディレクトリに置かれた「リンク先が存在しない」シンボリックリンク経由で、サンドボックスの外にファイルを書けた | シンボリックリンクとリパースポイント(ジャンクション)を拒否し、解決済みのパスで操作する | リンクもジャンクションも拒否 |
+| H1 | Narrowing a generic type argument with `is` produced `never`, letting any value pass as `Sql` or `Html` (SQL injection, XSS without `raw()`) | Narrowing a type argument or `any` yields the tested type. Narrowing accounts for interfaces and `Sql`, and is not applied when the result would be `never`. `Html` concatenation also escapes plain strings at runtime | PoC fails to compile |
+| H2 | Property narrowing persisted even when a call occurred on the right side of `&&` / `\|\|` or inside `render()` | Advance a generation number on every call and discard property facts across calls | All 4 PoCs fail to compile |
+| H3 | `.php` and similar files under `public/` were served raw | Serve only known static extensions (css, js, images, fonts, etc.) | `/config.php` returns 404 |
+| H4 | Anonymous GETs created server-side sessions for CSRF tokens; at 100,000 sessions the store filled up, and new visitors could not log in or submit forms | Make the CSRF token an HMAC of a random per-browser cookie, keeping no server-side state. The session store has count and byte limits and evicts the oldest entries first | Unit test (new visitors still get a session past the limit) |
+| H5 | No timeout for receiving headers and body (slowloris), and no connection limit | Headers 10 s (including keep-alive idle time), body 30 s, 1024 concurrent connections | Partial headers are cut off after 10 s |
+| H6 | The memory limit was mostly ineffective inside built-ins | Check on every built-in call, `reserve()` before allocating, SQLite string-length and heap limits | With a 16 MB limit, a PoC allocating 1 GB is stopped |
+| H7 | SQLite queries ignored the execution time limit | Abort at the deadline via SQLite's progress handler | An infinite recursive CTE stops after 2 s |
+| H8 | The execution time limit counted instructions, so repeating slow built-ins stretched it many times over | Check the clock on every built-in call | |
+| H9 | A dangling symbolic link (target does not exist) placed in a writable directory allowed writing files outside the sandbox | Reject symbolic links and reparse points (junctions), and operate on the resolved path | Both links and junctions are rejected |
 
 ### Medium
 
-| # | 内容 | 対応 |
+| # | Finding | Fix |
 |---|---|---|
-| M1 | エスケープが文脈を見ていなかった(引用符なしの属性、`href="javascript:..."`、`<script>`、`<style>`、イベント属性) | `<?= ?>` の位置の HTML 文脈を構文解析時に判定し、安全でない場所への文字列の挿入をコンパイルエラーにする。`safe_url()` と `json_html()` を追加 |
-| M2 | `response()->type("image/svg+xml")` や `"text/plain, text/html"` でエスケープが外れた | エスケープを外すのは許可リスト(`text/plain`、`application/json`、`text/csv` など)の型だけ。カンマを含む Content-Type は拒否 |
-| M3 | `render()` が `.env` などプロジェクト内の任意のファイルを読めた。ジャンクションでプロジェクトの外も読めた | テンプレートは `.phx.html` だけ。正規化したパスがプロジェクトかパッケージの中にあることを確認する |
-| M4 | `phx install` が既存の `vendor/<名前>/.git` の中で git を実行し、同梱された hook が動いた | 毎回一時ディレクトリに新しく clone し、hook・fsmonitor を無効にし、プロトコルを許可リストで制限する。lock のコミットは 40 桁の 16 進数だけを受け付ける |
-| M5 | `phx migrate` が `require 'auth.php'` をコメントにして「型検査に通る」と表示した(認証チェックが黙って消える) | コンパイルできない `TODO_migrate(...)` 呼び出しにする。既存ファイルの上書きには `--force` が必要 |
-| M6 | スクリプトが `Content-Length` などを設定でき、keep-alive のレスポンスがずれた(レスポンス分割) | 通信の枠組みに関わるヘッダーは組み込み関数とサーバーの両方で拒否する |
-| M7 | 開発モード(エラー詳細の表示)が既定だった | 既定で開発モードになるのはループバックで待ち受けるときだけ。`--dev` / `--prod` で明示できる |
-| M8 | SQLite の `PRAGMA temp_store_directory` などでプロセス全体の設定を変えたり、ほかのディレクトリに書いたりできた | authorizer で `ATTACH`/`DETACH` と危険な pragma を拒否する |
-| M9 | 範囲外の `slice()` で内部パニックが起きた | 飽和演算にした。リリースビルドでも整数オーバーフローを検査する |
-| M10 | アップロードを `.phx` として保存したり、`write = ["."]` でソースを書き換えたりできた | `.phx` は書き込めない。`public/` 配下やプロジェクトのルートは `[permissions].write` に指定できない |
+| M1 | Escaping ignored context (unquoted attributes, `href="javascript:..."`, `<script>`, `<style>`, event attributes) | Determine the HTML context of each `<?= ?>` at parse time, and make inserting a string into an unsafe location a compile error. Added `safe_url()` and `json_html()` |
+| M2 | `response()->type("image/svg+xml")` or `"text/plain, text/html"` disabled escaping | Escaping is disabled only for allowlisted types (`text/plain`, `application/json`, `text/csv`, etc.). Reject Content-Type values containing commas |
+| M3 | `render()` could read any file in the project, such as `.env`. Junctions also allowed reading outside the project | Templates must be `.phx.html`. Verify that the normalized path is inside the project or a package |
+| M4 | `phx install` ran git inside an existing `vendor/<name>/.git`, executing bundled hooks | Always clone fresh into a temporary directory, disable hooks and fsmonitor, and restrict protocols with an allowlist. Lock-file commits accept only 40-digit hex |
+| M5 | `phx migrate` commented out `require 'auth.php'` and reported "passes type check" (auth checks silently disappear) | Emit an uncompilable `TODO_migrate(...)` call instead. Overwriting existing files requires `--force` |
+| M6 | Scripts could set `Content-Length` and similar headers, desynchronizing keep-alive responses (response splitting) | Reject framing-related headers in both built-ins and the server |
+| M7 | Development mode (detailed error display) was the default | Development mode is the default only when listening on loopback. Can be set explicitly with `--dev` / `--prod` |
+| M8 | SQLite `PRAGMA temp_store_directory` and similar could change process-wide settings or write to other directories | Reject `ATTACH`/`DETACH` and dangerous pragmas via an authorizer |
+| M9 | Out-of-range `slice()` caused an internal panic | Use saturating arithmetic. Check integer overflow in release builds too |
+| M10 | Uploads could be saved as `.phx`, and `write = ["."]` allowed rewriting source | `.phx` cannot be written. Paths under `public/` and the project root cannot be listed in `[permissions].write` |
 
-### Low / Info(主なもの)
+### Low / Info (main items)
 
-- **アップロードのファイル名**: `:`、Windows の予約名、末尾のドットを除去する(修正)。
-- **セッション**: ログイン(`regenerate()`)で CSRF の Cookie も更新、24 時間の絶対有効期限、HTTPS では `__Host-` 接頭辞と HSTS。
-  セッションのあるレスポンスには `Cache-Control: private, no-store` を付ける(修正)。
-- **リダイレクト**: `redirect()` はサイト内のパスだけ。外部へは `redirectExternal()`(オープンリダイレクト対策)。
-- **パスの依存パッケージ**: 絶対パスと UNC パスは指定できない。開いただけで SMB 接続が起きるのを防ぐ(修正)。
-- **bytecode キャッシュ**: JIT は読み込んだバイトコードのレジスタ・ジャンプ・呼び出しの範囲を検証する(修正)。
-  キャッシュ自体はソースコードと同じ信頼レベルとして扱う(仕様として受容)。
-- **`password_verify`**: 保存されたハッシュのコスト値に上限を設けた(修正)。
-- **その他**: `_` で始まるファイルはページとして公開しない。ステータス 1xx は拒否する。JSON の `\u` を厳密に解釈する。
-  LSP のヘッダー長を制限し、UNC の URI を拒否する。いずれも修正済み。
+- **Upload filenames**: Strip `:`, Windows reserved names, and trailing dots (fixed).
+- **Sessions**: Login (`regenerate()`) also rotates the CSRF cookie; 24-hour absolute expiry; `__Host-` prefix and HSTS over HTTPS.
+  Responses with a session get `Cache-Control: private, no-store` (fixed).
+- **Redirects**: `redirect()` accepts only same-site paths. External redirects use `redirectExternal()` (open-redirect defense).
+- **Path dependencies**: Absolute and UNC paths are not allowed. This prevents SMB connections triggered just by opening a project (fixed).
+- **Bytecode cache**: The JIT validates register, jump, and call ranges in loaded bytecode (fixed).
+  The cache itself is treated as having the same trust level as source code (accepted by design).
+- **`password_verify`**: Added a limit on the cost parameters of stored hashes (fixed).
+- **Other**: Files starting with `_` are not exposed as pages. Status 1xx is rejected. JSON `\u` escapes are parsed strictly.
+  LSP header length is limited, and UNC URIs are rejected. All fixed.
 
-## 4. 追加の対応(残っていたリスクの解消)
+## 4. Follow-up Fixes (Resolving Residual Risks)
 
-最初の報告で受容した項目を、あらためて修正した。
+Items accepted in the initial report were revisited and fixed.
 
-| # | 以前のリスク | 対応 | 確認 |
+| # | Previous risk | Fix | Verified |
 |---|---|---|---|
-| R1 | 書き込み可能なディレクトリに外部ファイルへのハードリンクが置かれていると、そこを読み書きできた | 開いたファイルのハンドルでリンク数を調べ、1 本でなければ拒否する(読み書きとも)。通常のファイル以外(ディレクトリ、FIFO、デバイス)も拒否 | 実ファイルへのハードリンク経由の読み書きが `PermissionError` になり、外のファイルは変わらない |
-| R2 | パスの検査からファイルを開くまでの間に、ディレクトリをリンクにすり替えられた(TOCTOU) | 新しい `safefs` モジュール。許可したディレクトリのハンドルから 1 段ずつ、リンクを拒否しながら開く。Unix は `openat` + `O_NOFOLLOW`、Windows は `FILE_FLAG_OPEN_REPARSE_POINT` で開き、各ディレクトリを `FILE_SHARE_DELETE` なしで開いたままにして、使用中の改名・削除・すり替えを防ぐ。書き込みは切り詰めずに開いて検査してから切り詰める | Windows: ジャンクション・シンボリックリンク経由をすべて拒否。ハンドルを持っている間はディレクトリを改名できないことを単体テストで確認。Linux(Docker): シンボリックリンク・FIFO・`o+w` ディレクトリの拒否をテスト |
-| R2' | SQLite はファイルを名前で開くため、R2 の方法をそのまま使えない | ディレクトリを開いたまま固定し、データベースと `-journal` / `-wal` / `-shm` が「存在しないか、リンクのない通常のファイル」であることを開く前後に確認。`SQLITE_OPEN_NOFOLLOW` を付ける。Unix では、ほかのユーザーが書き込めるディレクトリ(`o+w`)を拒否する | ジャンクション経由の `Database::open` が拒否される |
-| N1 | (今回見つかった、Medium)`file_put_contents("data/a.phx::$DATA", ...)` や `"data/b.phx."` で、`.phx` の書き込み禁止をすり抜けて `a.phx` を作れた。`CON` などのデバイス名も使えた | パスの各要素について、`:`、末尾のドット・空白、`CON` `NUL` `COM1` `LPT1` などのデバイス名、制御文字を拒否する(すべての OS で同じ規則) | 3 つの PoC とも `PermissionError` |
-| R3 | CSP が既定でオフだった | 既定で有効にした。テンプレートに書いた `<script>` タグには、構文解析の時点で位置を記録しておき、レスポンスごとの nonce を自動で付ける。`raw()` などで注入された `<script>` には付かないので動かない | HTTP 結合テストで、ヘッダーの nonce とテンプレートの 2 つの `<script>` が一致し、`raw()` の `<script>` には付かないことを確認。サンプルサイトはブラウザで動作 |
-| R4 | レート制限がなかった | `rate_limit($key, $max, $seconds)` / `rate_limit_reset($key)` と `request()->ip` を追加。サイト全体の上限 `[security] requests_per_minute`(超えると 429 と `Retry-After`)。カウンター表は 10 万キーまでで、古い時間枠から捨てる。サンプルのゲストブックで使用 | 単体テストと HTTP 結合テスト |
-| R5 | セッションがメモリ内だけだった | `[security] session_store = "dir/"` でファイルに保存。ファイル名は ID の SHA-256(一覧から ID が分からない)、書き込みは一時ファイルからの rename で原子的、読み書きは `safefs` 経由。件数・容量の上限と期限切れの掃除あり | 別のサーバープロセスから同じセッションを読めることを HTTP 結合テストで確認 |
+| R1 | A hard link to an external file placed in a writable directory allowed reading and writing that file | Check the link count on the opened file handle, and reject unless it is 1 (for both reads and writes). Also reject non-regular files (directories, FIFOs, devices) | Reads and writes via a hard link to a real file raise `PermissionError`; the outside file is unchanged |
+| R2 | A directory could be swapped for a link between the path check and the open (TOCTOU) | New `safefs` module. Opens one component at a time from the allowed directory's handle, rejecting links. Unix uses `openat` + `O_NOFOLLOW`; Windows opens with `FILE_FLAG_OPEN_REPARSE_POINT` and keeps each directory open without `FILE_SHARE_DELETE`, preventing rename, deletion, or swapping while in use. Writes open without truncation, check, then truncate | Windows: all access via junctions and symbolic links rejected; a unit test confirms a directory cannot be renamed while its handle is held. Linux (Docker): tests reject symbolic links, FIFOs, and `o+w` directories |
+| R2' | SQLite opens files by name, so the R2 approach cannot be used as is | Pin the directory by keeping it open, and before and after opening verify that the database and `-journal` / `-wal` / `-shm` are "absent, or regular files without links". Pass `SQLITE_OPEN_NOFOLLOW`. On Unix, reject directories writable by other users (`o+w`) | `Database::open` via a junction is rejected |
+| N1 | (Found in this round, Medium) `file_put_contents("data/a.phx::$DATA", ...)` and `"data/b.phx."` bypassed the `.phx` write ban and created `a.phx`. Device names such as `CON` were also usable | For each path component, reject `:`, trailing dots and spaces, device names such as `CON` `NUL` `COM1` `LPT1`, and control characters (same rules on all OSes) | All 3 PoCs raise `PermissionError` |
+| R3 | CSP was off by default | Enabled by default. The parser records the position of each `<script>` tag written in a template, and a per-response nonce is added automatically. A `<script>` injected via `raw()` or similar gets no nonce, so it does not run | HTTP integration test confirms the header nonce matches the template's two `<script>` tags and is absent from the `raw()` `<script>`. Sample site works in a browser |
+| R4 | No rate limiting | Added `rate_limit($key, $max, $seconds)` / `rate_limit_reset($key)` and `request()->ip`. Site-wide limit `[security] requests_per_minute` (429 with `Retry-After` when exceeded). The counter table holds up to 100,000 keys and discards the oldest windows first. Used in the sample guestbook | Unit tests and HTTP integration tests |
+| R5 | Sessions were memory-only | `[security] session_store = "dir/"` stores them in files. Filenames are the SHA-256 of the ID (IDs cannot be learned from a listing); writes are atomic via rename from a temp file; reads and writes go through `safefs`. Count and size limits, plus cleanup of expired sessions | HTTP integration test confirms another server process can read the same session |
 
-## 5. 残っているリスク
+## 5. Residual Risks
 
-| 項目 | 内容 | 判断 |
+| Item | Description | Decision |
 |---|---|---|
-| 文脈判定は近似 | `<?= ?>` の文脈判定はソースの出現順に基づく。`Html` 値を連結して動的に組み立てた HTML の中までは解析しない | `Html` は「信頼できる HTML」を表す型で、作れるのは `raw()`・`escape()`・テンプレートだけ。`raw()` の中身は利用者の責任として仕様に明記。既定の CSP が、注入されたスクリプトの実行を二重に防ぐ |
-| SQLite の補助ファイル(Windows) | 開く前後の検査の間に、ジャーナルファイルの名前でシンボリックリンクを作られる可能性がごくわずかに残る | Windows でファイルのシンボリックリンクを作るには管理者権限か開発者モードが必要で、ディレクトリ自体はすり替えられない。権限ディレクトリはスクリプト専用にする |
-| レート制限はプロセスごと | 複数のサーバープロセスでカウンターを共有しない | 今後の課題。リバースプロキシの後ろでは `request()->ip` がプロキシのアドレスになる点を仕様に明記 |
+| Context detection is approximate | Context detection for `<?= ?>` is based on source order. HTML built dynamically by concatenating `Html` values is not analyzed | `Html` is the type for "trusted HTML", and only `raw()`, `escape()`, and templates can create it. The spec states that `raw()` content is the user's responsibility. The default CSP adds a second layer against execution of injected scripts |
+| SQLite auxiliary files (Windows) | A very small window remains in which a symbolic link could be created under a journal file's name between the pre-open and post-open checks | On Windows, creating file symbolic links requires admin rights or Developer Mode, and the directory itself cannot be swapped. Dedicate the `[permissions]` directories to script data |
+| Rate limiting is per process | Counters are not shared across multiple server processes | Future work. The spec notes that behind a reverse proxy, `request()->ip` is the proxy's address |
 
-## 6. 継続的な確認
+## 6. Ongoing Verification
 
-- `cargo test --workspace`: ゴールデンテスト(インタプリタと JIT の両方)、セキュリティの回帰テスト、
-  実サーバーへの HTTP 結合テスト(別名・トラバーサル・CSRF・Cookie 属性・時間上限)、ファジング。
-- CI: Linux / Windows / macOS、`clippy -D warnings`、長時間のファジング、`cargo audit`(依存クレートの既知脆弱性)。
-- Unix 向けのコード(`safefs` の `openat` 経路)は、Linux の Docker コンテナでも全テストと clippy を実行して確認した。
-- `unsafe` を使うのは、メモリ使用量を数えるアロケータ(`phx_vm/src/alloc.rs`)、
-  JIT が生成したコードの呼び出し(`phx_jit`、`Vm::call_jit`)、OS のファイル API の呼び出し
-  (`phx_std/src/safefs.rs`)の 3 か所だけ。
+- `cargo test --workspace`: golden tests (both interpreter and JIT), security regression tests,
+  HTTP integration tests against a real server (aliases, traversal, CSRF, cookie attributes, time limits), and fuzzing.
+- CI: Linux / Windows / macOS, `clippy -D warnings`, long-running fuzzing, `cargo audit` (known vulnerabilities in dependency crates).
+- Unix-specific code (the `openat` path in `safefs`) was also verified by running all tests and clippy in a Linux Docker container.
+- `unsafe` is used in only three places: the memory-accounting allocator (`phx_vm/src/alloc.rs`),
+  calls into JIT-generated code (`phx_jit`, `Vm::call_jit`), and calls to OS file APIs
+  (`phx_std/src/safefs.rs`).
 
-## 7. 2 回目の脆弱性診断
+## 7. Second Vulnerability Assessment
 
-実施日: 2026-11-02(1 回目の修正と残存リスクの解消の後)
+Date: 2026-11-02 (after the first round of fixes and the resolution of residual risks)
 
-### 方法
+### Method
 
-1 回目の結論に引きずられないよう、新しいレビュアー 4 人にソースだけを渡し、それぞれ実際に攻撃して確かめた。
+To avoid anchoring on the first audit's conclusions, four new reviewers were given only the source, and each verified issues by actually attacking.
 
-- A: 1 回目の後に書いたコード(`safefs`、ファイル保存のセッション、レート制限、CSP の nonce)
-- B: Web サーバーとサンプルサイト(外からの攻撃)
-- C: テンプレートの文脈判定と型システム
-- D: SQL、実行時の上限、JIT、バイトコードキャッシュ、ツール
+- A: Code written after the first audit (`safefs`, file-backed sessions, rate limiting, CSP nonces)
+- B: Web server and sample site (external attacks)
+- C: Template context detection and the type system
+- D: SQL, runtime limits, JIT, bytecode cache, tools
 
-ほかに、依存クレートを `cargo audit` で調べた(既知の脆弱性 0 件。保守されていない `atomic-polyfill` を
-postcard の既定機能を外して取り除いた)。`unsafe` のコードと CI の設定も読んだ。修正の確認では、
-レビュアーが残した PoC を修正後のビルドでもう一度実行し、回帰テストに加えた。Linux(Docker)でも全テストを実行した。
+Dependency crates were also checked with `cargo audit` (0 known vulnerabilities; the unmaintained `atomic-polyfill` was removed
+by disabling postcard's default features). The `unsafe` code and the CI configuration were also reviewed. For fix verification,
+the reviewers' PoCs were rerun against the fixed build and added to the regression tests. All tests were also run on Linux (Docker).
 
-### 結果の概要
+### Summary of Results
 
-| 重大度 | 件数 | 対応 |
+| Severity | Count | Fix |
 |---|---:|---|
-| High | 6 | すべて修正 |
-| Medium | 9 | すべて修正 |
-| Low / Info | 11 | 9 件を修正、2 件はドキュメントで明記 |
+| High | 6 | All fixed |
+| Medium | 9 | All fixed |
+| Low / Info | 11 | 9 fixed, 2 documented |
 
 ### High
 
-| # | 内容 | 対応 |
+| # | Finding | Fix |
 |---|---|---|
-| R2-1 | `escape()`・`htmlspecialchars()`・`nl2br()` の結果(`Html`)を `href` の先頭や `<script>` の中に置けた。HTML エスケープでは `javascript:alert(1)` もスクリプトのコードも止まらず、テンプレートの `<script>` には nonce も付くので CSP でも防げなかった | 文脈ごとに安全と確かめた型 `SafeUrl`(`safe_url()`)と `SafeJs`(`json_html()`)を追加。URL の先頭には `SafeUrl` と数値、`<script>` の中には `SafeJs` と数値だけを許す。`json_html()` の値は属性値の中では拒否(`"` で属性が終わるため) |
-| R2-2 | テンプレートの HTML の間に書いた `echo`(`<?phx echo $x; ?>`)は文脈の検査を受けなかった | `echo` にも `<?= ?>` と同じ検査をする |
-| R2-3 | `file_put_contents("views/page.phx.html/", ...)`(末尾の `/`、`/.`、`\`)で `.phx` の書き込み禁止をすり抜け、テンプレートを書き換えてコードを実行できた。`unlink` と `Database::open` は禁止を確認していなかった | パスを正規化した後の最終的なファイル名で確認し、書き込み・削除・保存・データベースのすべてに適用。末尾が `/` `\` `/.` のパスは拒否 |
-| R2-4 | Windows の 8.3 短縮名(`views/GREETI~1.HTM`)で `.phx.html` のテンプレートを書き換えられた | 開いたハンドルから本当の名前を取り出し、要求した名前と違えば(短縮名などの別名)拒否する。ディレクトリにも適用 |
-| R2-5 | `join()`、`json_encode()`、`json_html()`、`dump()`、`echo`、文字列連結が確保前にメモリ上限を確認せず、1 回の呼び出しで数 GB を確保してプロセスごと落ちた(`serve` も停止) | 結果の大きさを先に計算して `reserve()` する(`join`)、出力が 64 KB を超えたら上限と時間を確認しながら進める(JSON・dump)、`echo` と連結はエスケープで 6 倍になる分を含めて確保前に確認する |
-| R2-6 | 共有された構造(`$a = [$a, $a]` を 60 回)どうしの `==` が指数時間かかり、時間制限も効かず、ワーカーを占有した | 比較済みのリストとマップの組を覚えて 1 回だけ比べる(線形時間)。`unique()` のような二乗の処理は時間制限を確認しながら進める |
+| R2-1 | Results of `escape()`, `htmlspecialchars()`, and `nl2br()` (`Html`) could be placed at the start of `href` or inside `<script>`. HTML escaping stops neither `javascript:alert(1)` nor script code, and template `<script>` tags get a nonce, so CSP did not block it either | Added context-verified types `SafeUrl` (`safe_url()`) and `SafeJs` (`json_html()`). URL starts accept only `SafeUrl` and numbers; `<script>` contents accept only `SafeJs` and numbers. `json_html()` values are rejected inside attribute values (a `"` would end the attribute) |
+| R2-2 | `echo` written between template HTML (`<?phx echo $x; ?>`) was not context-checked | `echo` gets the same checks as `<?= ?>` |
+| R2-3 | `file_put_contents("views/page.phx.html/", ...)` (trailing `/`, `/.`, `\`) bypassed the `.phx` write ban, allowing templates to be rewritten for code execution. `unlink` and `Database::open` did not check the ban | Check the final filename after path normalization, and apply it to all writes, deletes, saves, and databases. Reject paths ending in `/` `\` `/.` |
+| R2-4 | Windows 8.3 short names (`views/GREETI~1.HTM`) allowed rewriting `.phx.html` templates | Retrieve the real name from the opened handle, and reject if it differs from the requested name (8.3 short names and other aliases). Also applied to directories |
+| R2-5 | `join()`, `json_encode()`, `json_html()`, `dump()`, `echo`, and string concatenation did not check the memory limit before allocating; a single call could allocate several GB and crash the process (`serve` also stopped) | Compute the result size first and `reserve()` (`join`); once output exceeds 64 KB, proceed while checking the memory and time limits (JSON, dump); `echo` and concatenation check before allocating, including the up-to-6x growth from escaping |
+| R2-6 | `==` on shared structures (`$a = [$a, $a]` 60 times) took exponential time, ignored the time limit, and tied up a worker | Remember already-compared list and map pairs, and compare each pair once (linear time). Quadratic operations such as `unique()` check the time limit as they run |
 
 ### Medium
 
-| # | 内容 | 対応 |
+| # | Finding | Fix |
 |---|---|---|
-| R2-7 | テンプレートの文脈判定がブラウザと違った: `</scripts>` を終了タグとみなす、`<script>` 内の `<!--<script>`、`<!-->`・`--!>`、`<textarea>`・`<title>` の中身、`<svg>` の中、`srcdoc`、`href="&#x20;..."` や `href="j<?= ?>"` のように先頭の判定を文字でずらす方法 | WHATWG の字句解析に合わせて書き直した(終了タグの区切り、script の escaped / double escaped 状態、コメントと bogus コメント、RCDATA / RAWTEXT 要素、外部コンテンツ)。URL は、前に書いた文字列に `/ ? # :` が出るまで先頭とみなす。`javascript:` の URL と `srcdoc` は文字列を拒否 |
-| R2-8 | 関数やループの中で `<script>` を開いて閉じないと、呼び出し順で文脈がずれた | ブロックと関数の本体は、始まったときと同じ HTML の状態で終わらなければならない(関数は空の文書から始める) |
-| R2-9 | `<script<?= $x ?>>` でタグ名の途中に挿入でき、攻撃者の `src=` に nonce が付いた(CSP の回避) | タグ名の途中はタグの中とみなしてエラーにする |
-| R2-10 | 参照が循環するオブジェクト(`$n->next = $n`)がリクエストの後も解放されず、サーバーのメモリが増え続けた | VM が作ったオブジェクトを弱参照で覚え、実行の終わりにフィールドを空にして循環を切る |
-| R2-11 | 深い入れ子のソース(5 万段の `1+1+...`、`if`、`[[[...]]]` など)で構文解析・型検査・コンパイルのスタックがあふれた(捕捉できないので `serve` も停止)。エラー表示は 1 行 5 万文字を毎回引用し、出力が 8.5 GB になった | 入れ子は 500 段まで(超えたら 1 つのエラーで解析をやめる)。エラーは 50 件まで、長い行はエラーの周りだけを表示 |
-| R2-12 | `redirect("/<TAB>/evil.com")` がサイト内のパスとして通り、ブラウザはタブを取り除いて `//evil.com` へ移動した(オープンリダイレクト) | 制御文字・空白・`\` を含むパスを拒否。`redirectExternal()` も制御文字を拒否 |
-| R2-13 | `session_store = "."` や `"data/"` を指定でき、期限切れの掃除がプロジェクトのファイルを消し、`.gitignore` を `*` で上書きした。スクリプトの権限ディレクトリと重なるとセッションを偽造・閲覧できた | セッション用の専用ディレクトリだけを許す(ルート、`public/`、`[permissions]` と重なるものは不可)。掃除はセッションファイルの名前の形のものだけを消す。`.gitignore` はないときだけ作る |
-| R2-14 | ログアウトや `regenerate()` の直後に、並行して動いていたリクエストが保存するとセッションが復活した | 保存時に元のセッションが消えていれば保存しない(メモリ・ファイルとも) |
-| R2-15 | SQLite のメモリがスクリプトの上限に数えられず、`:memory:` のデータベースや `cache_size` で 1 リクエストが数百 MB を使えた | 接続ごとにページキャッシュを 2 MB にし、`:memory:` は上限に合わせて `max_page_count` を設定。`cache_size`・`temp_store`・`max_page_count` の pragma は拒否 |
+| R2-7 | Template context detection differed from browsers: treating `</scripts>` as an end tag, `<!--<script>` inside `<script>`, `<!-->` and `--!>`, `<textarea>` and `<title>` contents, inside `<svg>`, `srcdoc`, and shifting the URL-start detection with characters, as in `href="&#x20;..."` or `href="j<?= ?>"` | Rewrote to match WHATWG tokenization (end-tag delimiters, script escaped / double escaped states, comments and bogus comments, RCDATA / RAWTEXT elements, foreign content). A URL position counts as the start until `/ ? # :` appears in the preceding literal text. Strings are rejected in `javascript:` URLs and `srcdoc` |
+| R2-8 | Opening `<script>` inside a function or loop without closing it shifted the context depending on call order | Blocks and function bodies must end in the same HTML state they began in (functions start from an empty document) |
+| R2-9 | `<script<?= $x ?>>` allowed insertion inside a tag name, and the attacker's `src=` received a nonce (CSP bypass) | Treat the middle of a tag name as inside the tag, making it an error |
+| R2-10 | Objects with reference cycles (`$n->next = $n`) were not freed after the request, so server memory kept growing | The VM tracks the objects it creates via weak references, and clears their fields at the end of execution to break cycles |
+| R2-11 | Deeply nested source (50,000 levels of `1+1+...`, `if`, `[[[...]]]`, etc.) overflowed the stack in the parser, type checker, and compiler (uncatchable, so `serve` also stopped). Error output quoted the 50,000-character line every time, producing 8.5 GB of output | Nesting is limited to 500 levels (beyond that, parsing stops with a single error). Errors are capped at 50; long lines show only the area around the error |
+| R2-12 | `redirect("/<TAB>/evil.com")` passed as a same-site path; browsers stripped the tab and navigated to `//evil.com` (open redirect) | Reject paths containing control characters, whitespace, or `\`. `redirectExternal()` also rejects control characters |
+| R2-13 | `session_store = "."` or `"data/"` was allowed; expiry cleanup deleted project files and overwrote `.gitignore` with `*`. Overlapping with a script permission directory allowed forging or reading sessions | Allow only a dedicated session directory (not the root, `public/`, or anything overlapping `[permissions]`). Cleanup deletes only files named like session files. `.gitignore` is created only if absent |
+| R2-14 | Right after logout or `regenerate()`, a concurrent request that saved the session resurrected it | Skip saving if the original session is gone at save time (both memory and file stores) |
+| R2-15 | SQLite memory was not counted toward the script limit; `:memory:` databases or `cache_size` let one request use hundreds of MB | Set the page cache to 2 MB per connection, and set `max_page_count` for `:memory:` to match the limit. Reject the `cache_size`, `temp_store`, and `max_page_count` pragmas |
 
 ### Low / Info
 
-- **レート制限**(修正): 10 万個のキーで制限中のキーを追い出せた → 上限に達していないキーから捨てる。同じキーで時間枠を変えると数え直しになった → 時間枠ごとに数える。IPv6 は /64 ごとにまとめる。
-- **設定**(修正): `write = ["public."]` や `["..."]` が Windows で `public/` やルートを指した → パスの各要素にファイル名と同じ検査をする。巨大な `session_ttl` でオーバーフロー → 範囲を検査。
-- **型パラメータが 5 個以上**(修正): 型検査がパニックした → 範囲外は未束縛として扱う。
-- **`mktime` / `checkdate`**(修正): 範囲外の値が黙って折り返された → `ValueError`。
-- **`password_verify`**(修正): 保存されたハッシュのコストの上限を 64 MiB・8 回・並列 4 に下げた。
-- **セッションファイル**(修正): Unix で他のユーザーから読めた → 0600 で作る。30 秒ごとの掃除の間に大量に書かれたとき → 書き込み量で早めに掃除する。
-- **`phx fmt` / `phx test`**(修正): ディレクトリをたどるときにシンボリックリンク・ジャンクションをたどり、ループで止まらない、外のファイルを書き換える可能性があった → リンクはたどらない。
-- **CI**(修正): 第三者の GitHub Actions をタグで指定していた → GitHub 自身のアクションと rustup・`cargo audit` だけにし、checkout の認証情報を残さない。
-- **CSP の nonce**(修正): `<textarea>` の中の `<script` 文字列にも nonce が入った → RCDATA 要素の中は対象外。ドキュメントの `'nonce-{nonce}'` の書き方でも動くようにした。
-- **エスケープを外す Content-Type**(明記): 仕様に書いていない型(`text/markdown` など)があった。いずれもブラウザが HTML として表示しないので、仕様のほうを実装に合わせた。
-- **CSRF**(明記): Cookie の HMAC 方式なので、Cookie を書き換えられないことが前提。本番は HTTPS と `secure_cookies = true` を使うよう仕様に明記。
+- **Rate limiting** (fixed): 100,000 keys could evict keys currently being limited → discard keys that have not hit the limit first. Changing the window for the same key reset the count → count per window. IPv6 is grouped by /64.
+- **Configuration** (fixed): `write = ["public."]` or `["..."]` pointed to `public/` or the root on Windows → apply the same checks as for filenames to each path component. A huge `session_ttl` overflowed → range-checked.
+- **5 or more type parameters** (fixed): The type checker panicked → out-of-range parameters are treated as unbound.
+- **`mktime` / `checkdate`** (fixed): Out-of-range values silently wrapped around → `ValueError`.
+- **`password_verify`** (fixed): Lowered the cost limits for stored hashes to 64 MiB, 8 iterations, and parallelism 4.
+- **Session files** (fixed): Readable by other users on Unix → created with 0600. Mass writes between the 30-second cleanups → clean up early based on write volume.
+- **`phx fmt` / `phx test`** (fixed): Directory traversal followed symbolic links and junctions, which could loop forever or rewrite outside files → links are not followed.
+- **CI** (fixed): Third-party GitHub Actions were pinned by tag → use only GitHub's own actions plus rustup and `cargo audit`; checkout credentials are not persisted.
+- **CSP nonce** (fixed): `<script` strings inside `<textarea>` also got a nonce → RCDATA element contents are excluded. The documented `'nonce-{nonce}'` syntax now works too.
+- **Content-Type values that disable escaping** (documented): Some types (e.g. `text/markdown`) were missing from the spec. Browsers render none of them as HTML, so the spec was updated to match the implementation.
+- **CSRF** (documented): The cookie-HMAC scheme assumes cookies cannot be tampered with. The spec now states that production must use HTTPS and `secure_cookies = true`.
 
-### 問題がなかったもの(主なもの)
+### No Issues Found (main items)
 
-パストラバーサルとソースの露出(エンコード、大文字小文字、8.3、ADS、末尾のドット)、レスポンス分割、CSRF の各迂回、
-Cookie の属性、アップロード、本番モードのエラー表示、slowloris・巨大な multipart・深い JSON、`sql"..."` の
-パラメータ化(型システムで `Sql` を作る方法は見つからなかった)、SQLite の authorizer、JIT とインタプリタの結果の一致と
-上限、`phx install` の git 呼び出し(`--` の区切り、リビジョンの文字種、プロトコルの許可リスト)。
+Path traversal and source exposure (encoding, case, 8.3 short names, ADS, trailing dots), response splitting, CSRF bypasses,
+cookie attributes, uploads, production-mode error display, slowloris, huge multipart, deep JSON, `sql"..."`
+parameterization (no way to construct an `Sql` value through the type system was found), the SQLite authorizer, JIT/interpreter result parity and
+limits, and the `phx install` git invocation (`--` separator, revision character set, protocol allowlist).
 
-### 今回見ていないもの
+### Not Covered in This Round
 
-`phx lsp`、`phx migrate`、バイトコードキャッシュは対象外にした(§8 で診断)。
+`phx lsp`, `phx migrate`, and the bytecode cache were out of scope (assessed in §8).
 
-## 8. 3 回目の診断(lsp・migrate・キャッシュ)
+## 8. Third Assessment (lsp, migrate, cache)
 
-実施日: 2026-11-02。2 回目で対象外にした 3 つを、新しいレビュアー 1 人が PoC で確かめた。あわせて、2 回目の
-残りだった `new Database(整数)` による接続ハンドルの偽造を塞いだ。
+Date: 2026-11-02. One new reviewer verified, with PoCs, the three areas excluded from the second assessment. The item left over from the second
+assessment, forging connection handles via `new Database(<integer>)`, was also closed.
 
-| # | 重大度 | 内容 | 対応 |
+| # | Severity | Finding | Fix |
 |---|---|---|---|
-| R3-1 | High | キャッシュはソースと同じ信頼レベル、という前提が成り立っていなかった。エントリはどのスクリプト用かを確かめず(依存リストが空なら常に有効)、`stamp`(バージョン・本体のサイズと時刻)も公開情報なので、ほかの人から受け取ったプロジェクトの `.phx-cache/` に、ソースと違うバイトコードを入れておける(読んだソースとは別のコードが動く) | ユーザーごとの秘密鍵(プロジェクトの外、Unix は 0600)による HMAC で署名し、合わないものは読まない。エントリにスクリプトとルートの正規パスを記録して照合し、スクリプト自身が依存に含まれることを確かめる |
-| R3-2 | Medium | 依存ファイルを更新時刻だけで比べていたため、時刻を保つコピー(`cp -p`、`rsync -t`、展開)や同じ長さの書き換えで古いバイトコードが動き続けた(セキュリティ修正を配置しても効かない)。読み込みと時刻の取得の間に書き換わる競合もあった | 依存ファイルごとに、コンパイルした内容の SHA-256・サイズ・時刻を記録する。キャッシュを読むときは内容を必ず確かめ、サーバーのメモリ内の確認でも、記録の直前に変更されたファイル(時刻の分解能の内側)は内容を確かめる |
-| R3-3 | Medium | キャッシュの書き込みがリンクをたどり、`.phx-cache` をジャンクションにしたプロジェクトや `.gitignore` のシンボリックリンクで、プロジェクトの外のファイルを上書きできた。一時ファイルの名前も予測できた | `safefs` で読み書きし、リンク・ハードリンクを拒否する。`.phx-cache` 自体がリンクなら使わない。一時ファイルは乱数の名前、`.gitignore` はないときだけ作る |
-| R3-4 | Low | `[permissions].write` に `.phx-cache/` や `vendor/` を指定でき、スクリプトがコードとして読み込まれるファイルを書けた | `.` で始まるディレクトリ、`vendor/`、パッケージのディレクトリを `write` に指定できない |
-| R3-5 | Medium | `phx migrate` が `<?PHP` / `<?Php`(大文字)を変換せず、認証の `require` と `exit` を含む PHP がただの文字列として残り、「型検査に通る」と表示した(認証チェックが黙って消える) | 開始タグを大文字小文字を区別せずに変換する。変換できない `<?` は、コンパイルできない `TODO_migrate(...)` を付けて残す |
-| R3-6 | Medium | `phx migrate` の出力が、リンク先のない(dangling)シンボリックリンクをたどって任意の場所に書かれた。`self.PHX` のように綴りを変えると入力ファイル自体を上書きできた | `safefs` で書き、リンクやハードリンクには書かない。入力と出力は正規化したパスで比べる |
-| R3-7 | Low | `phx migrate` が、コメントや文字列の近くに日本語などの非 ASCII 文字があるとパニックした | 比較をバイト単位にした |
-| R3-8 | Low | `phx lsp` の URI の検査を、デコード後の UNC パス(`file:///%5C%5Chost%5Cshare`)や `\\?\`・`\\.\` で回避でき、開いていないファイルを読み、SMB 接続を起こし、名前付きパイプを指定すると応答しなくなった | デコード後にドライブ文字で始まるローカルパスだけを受け付け、デバイス名と `..` を拒否する。ホバーは開いている文書だけ。開ける文書は 1000 個まで。不正な JSON にはエラーを返して続ける |
-| R3-9 | Info | `new Database(0)` で接続ハンドルを偽造できた(同じリクエストの中だけ) | `private` / `protected` のコンストラクタを `new` で検査するようにし(これまで検査していなかった)、`Database` のコンストラクタを `private` にした |
+| R3-1 | High | The premise that the cache has the same trust level as source did not hold. Entries were not checked against the script they belong to (always valid when the dependency list was empty), and the `stamp` (version, executable size and mtime) is public information, so a `.phx-cache/` in a project received from someone else could hold bytecode that differs from the source (code other than the source you read runs) | Sign with an HMAC using a per-user secret key (outside the project; 0600 on Unix), and refuse entries whose signature does not match. Record the canonical paths of the script and the root in each entry and check them, and verify that the script itself is among the dependencies |
+| R3-2 | Medium | Dependencies were compared by mtime only, so mtime-preserving copies (`cp -p`, `rsync -t`, archive extraction) or same-length rewrites kept stale bytecode running (deployed security fixes would not take effect). There was also a race where a file changed between reading it and fetching its mtime | Record the SHA-256 of the compiled contents, the size, and the mtime of each dependency. Always verify contents when loading the cache; the server's in-memory check also verifies the contents of files modified just before recording (within the timestamp resolution) |
+| R3-3 | Medium | Cache writes followed links; a project with `.phx-cache` as a junction, or a symbolic-linked `.gitignore`, allowed overwriting files outside the project. Temp file names were also predictable | Read and write via `safefs`, rejecting links and hard links. Do not use `.phx-cache` if it is itself a link. Temp files get random names; `.gitignore` is created only if absent |
+| R3-4 | Low | `[permissions].write` could list `.phx-cache/` or `vendor/`, letting scripts write files that are later loaded as code | Directories starting with `.`, `vendor/`, and package directories cannot be listed in `write` |
+| R3-5 | Medium | `phx migrate` did not convert `<?PHP` / `<?Php` (uppercase), so PHP containing the auth `require` and `exit` remained as a plain string, and it reported "passes type check" (auth checks silently disappear) | Convert open tags case-insensitively. Keep any `<?` that cannot be converted, with an uncompilable `TODO_migrate(...)` attached |
+| R3-6 | Medium | `phx migrate` output followed dangling symbolic links and was written to arbitrary locations. Varying the spelling, as in `self.PHX`, allowed overwriting the input file itself | Write via `safefs`, never to links or hard links. Compare input and output by normalized path |
+| R3-7 | Low | `phx migrate` panicked on non-ASCII characters (e.g. Japanese) near comments or strings | Compare byte-wise |
+| R3-8 | Low | `phx lsp` URI checks could be bypassed with decoded UNC paths (`file:///%5C%5Chost%5Cshare`) or `\\?\` and `\\.\`, allowing reads of unopened files, triggering SMB connections, and hanging when given a named pipe | After decoding, accept only local paths that start with a drive letter; reject device names and `..`. Hover works only on open documents. Up to 1000 open documents. Return an error on malformed JSON and continue |
+| R3-9 | Info | `new Database(0)` could forge a connection handle (within the same request only) | `new` now checks `private` / `protected` constructors (previously unchecked), and the `Database` constructor is now `private` |
 
-### 問題がなかったもの
+### No Issues Found
 
-`phx lsp` はファイルを書かない。本文 64 MiB・ヘッダー行 8 KiB の上限、深い入れ子への耐性(構文解析の 500 段の
-上限)。`phx migrate` は `require`・`exit`・`eval`・`$$var`・`extract`・スーパーグローバルなどを、
-コンパイルできないコードにして残す。キャッシュの形式(postcard)の復号は安全で、敵対的なバイトコードでも
-インタプリタは境界検査のパニックで止まり(`catch_unwind` で捕捉)、JIT は `well_formed` の検査で拒否する。
+`phx lsp` does not write files. It has limits of 64 MiB per body and 8 KiB per header line, and resists deep nesting (the parser's 500-level
+limit). `phx migrate` leaves `require`, `exit`, `eval`, `$$var`, `extract`, superglobals, etc. as
+uncompilable code. Decoding the cache format (postcard) is safe; even with adversarial bytecode,
+the interpreter stops with a bounds-check panic (caught by `catch_unwind`), and the JIT rejects it via the `well_formed` check.
 
-### 確認
+### Verification
 
-修正後のビルドでレビュアーの PoC をすべて再実行し、再現しないことを確かめた。キャッシュの偽造・再利用・
-同じ長さの書き換え・ジャンクション、コンストラクタの可視性、`lsp` の URI、設定の検査を回帰テストに加えた。
-
+All reviewer PoCs were rerun against the fixed build and verified to no longer reproduce. Regression tests were added for cache forgery, reuse,
+same-length rewrites, junctions, constructor visibility, `lsp` URIs, and config validation.

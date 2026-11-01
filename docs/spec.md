@@ -1,93 +1,95 @@
-# PHX 言語仕様 (v0.2)
+# PHX Language Specification (v0.2)
 
-公式サイト: <https://phx-lang.org>
+English | [日本語](spec.ja.md)
 
-PHX は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋め込める」という良さを引き継ぎながら、
-型安全性・セキュリティ・実行速度・保守性を言語の側で保証する Web 向けの言語です。
-既存の PHP コードとの互換性はありませんが、PHP を書いてきた人がすぐ読めて書けることを目指しています。
+Website: <https://phx-lang.org>
 
-## 1. 設計方針
+PHX is a language for the web. It keeps what is good about PHP: you save a file and it runs, it is built for the web, and it embeds in HTML.
+On top of that, the language itself guarantees type safety, security, execution speed, and maintainability.
+It is not compatible with existing PHP code, but it aims to be something PHP programmers can read and write right away.
 
-| PHP の弱点 | PHX での解決 |
+## 1. Design Principles
+
+| PHP weakness | How PHX solves it |
 |---|---|
-| 暗黙の型変換 (`"1" + 1`、`"abc" == 0`) | 暗黙の変換はしない。`==` は常に厳密比較。違う型どうしの比較はコンパイルエラー |
-| null による実行時エラー | `?T` 型。null チェック (`!= null`、`is`、`??`、`?->`) をしないと使えない |
-| XSS | `<?= ?>` と Web ページへの `echo` は自動で HTML エスケープ。エスケープしないのは `Html` 型の値だけ |
-| `eval`、可変変数、`extract`、動的な `include` | 言語に存在しない。モジュールは静的な `import`、テンプレートはリテラルのパスだけ |
-| SQL インジェクション | SQL は `sql"..."` リテラル(`Sql` 型)でしか書けず、埋め込んだ値は必ずプレースホルダになる |
-| 文脈を無視したエスケープ | `<?= ?>` の位置(属性・URL・`<script>`・CSS)を判定し、エスケープでは守れない場所への挿入はコンパイルエラー |
-| CSRF・セッション固定 | フォームの POST はサーバーがトークンを自動で検査。セッション ID はサーバーが発行したものだけを受け付ける |
-| 何でもできるスクリプト | ファイル・環境変数へのアクセスは `phx.toml` の `[permissions]` で許可したものだけ |
-| 注入されたスクリプトの実行 | 既定の Content-Security-Policy で、テンプレートに書いた `<script>` 以外のインラインスクリプトを止める |
-| ヘッダーインジェクション | 改行を含むヘッダー値は `ValueError` |
-| パストラバーサル | サーバーは `public/` の外、ドットファイル、テンプレートを配信しない |
-| リクエスト間で状態が漏れる | リクエストごとに新しいヒープ。静的プロパティもグローバル変数もない |
-| 実行速度 | 静的型に特化したレジスタ型バイトコード VM |
-| 大規模化すると保守しにくい | 型注釈の付いた関数、モジュールと `export`、読みやすいエラーメッセージ |
+| Implicit conversion (`"1" + 1`, `"abc" == 0`) | No implicit conversion. `==` is always a strict comparison. Comparing values of different types is a compile error |
+| Runtime errors caused by null | The `?T` type. A value cannot be used until it is null-checked (`!= null`, `is`, `??`, `?->`) |
+| XSS | `<?= ?>` and `echo` to a web page are HTML-escaped automatically. Only values of type `Html` are not escaped |
+| `eval`, variable variables, `extract`, dynamic `include` | Not in the language. Modules use static `import`; templates use literal paths only |
+| SQL injection | SQL can only be written as an `sql"..."` literal (type `Sql`), and embedded values always become placeholders |
+| Escaping that ignores context | The position of `<?= ?>` (attribute, URL, `<script>`, CSS) is analyzed, and inserting into a place that escaping cannot protect is a compile error |
+| CSRF and session fixation | The server checks the token on form POSTs automatically. Only session IDs issued by the server are accepted |
+| Scripts that can do anything | Access to files and environment variables is limited to what `[permissions]` in `phx.toml` allows |
+| Execution of injected scripts | The default Content-Security-Policy blocks inline scripts other than the `<script>` elements written in templates |
+| Header injection | A header value that contains a newline raises `ValueError` |
+| Path traversal | The server does not serve files outside `public/`, dotfiles, or templates |
+| State leaking between requests | Each request gets a fresh heap. There are no static properties and no global variables |
+| Execution speed | A register-based bytecode VM specialized for static types |
+| Hard to maintain at scale | Functions with type annotations, modules and `export`, readable error messages |
 
-## 2. ファイル
+## 2. Files
 
-- `.phx` … スクリプトまたはモジュール。**コードモード**で始まる。先頭の `<?phx` は書いても書かなくてもよい。
-- `.phx.html` … テンプレート。**HTML モード**で始まる。
-- コードモードで `?>` を書くと HTML モードに切り替わる。HTML モードでは `<?phx`(または `<? `)でコードに、
-  `<?= 式 ?>` で値の出力に戻る。`?>` の直後の改行 1 つは出力されない(PHP と同じ)。
-- 文字コードは UTF-8。
+- `.phx` … A script or module. Starts in **code mode**. The leading `<?phx` is optional.
+- `.phx.html` … A template. Starts in **HTML mode**.
+- Writing `?>` in code mode switches to HTML mode. In HTML mode, `<?phx` (or `<? `) switches back to code,
+  and `<?= expr ?>` outputs a value. A single newline right after `?>` is not output (same as PHP).
+- The character encoding is UTF-8.
 
-## 3. 字句
+## 3. Lexical Structure
 
-- 変数は `$name`。`$$name`(可変変数)はない。
-- コメントは `// ...`、`# ...`、`/* ... */`。
-- 整数: `42`、`1_000_000`、`0xFF`、`0b1010`、`0o17`。64 ビット。オーバーフローは `ArithmeticError`。
-- 浮動小数点数: `1.5`、`1e-3`。
-- 文字列:
-  - `'...'` … 展開なし。エスケープは `\'` と `\\` だけ。
-  - `"..."` … `$name` と `{$式}` を展開する。エスケープは `\n \t \r \0 \e \\ \" \$ \{ \u{1F600}`。
-- 予約語: `function fn return if elseif else endif while endwhile do for endfor foreach endforeach as break continue
+- Variables are written `$name`. There is no `$$name` (variable variables).
+- Comments are `// ...`, `# ...`, and `/* ... */`.
+- Integers: `42`, `1_000_000`, `0xFF`, `0b1010`, `0o17`. 64-bit. Overflow raises `ArithmeticError`.
+- Floating-point numbers: `1.5`, `1e-3`.
+- Strings:
+  - `'...'` … No interpolation. The only escapes are `\'` and `\\`.
+  - `"..."` … Interpolates `$name` and `{$expr}`. Escapes are `\n \t \r \0 \e \\ \" \$ \{ \u{1F600}`.
+- Reserved words: `function fn return if elseif else endif while endwhile do for endfor foreach endforeach as break continue
   echo class extends new public private protected readonly static true false null match default try catch finally
   throw import export use is instanceof interface implements abstract final enum case const`
 
-## 4. 型
+## 4. Types
 
-| 型 | 説明 |
+| Type | Description |
 |---|---|
-| `int` | 64 ビット整数 |
-| `float` | 64 ビット浮動小数点数 |
-| `string` | UTF-8 文字列 |
+| `int` | 64-bit integer |
+| `float` | 64-bit floating-point number |
+| `string` | UTF-8 string |
 | `bool` | `true` / `false` |
-| `null` | null だけの型。普通は `?T` の一部として使う |
-| `void` | 戻り値がないことを表す(戻り値の型にだけ使える) |
-| `Html` | 安全な HTML として扱ってよい文字列。`raw()`、`escape()`、テンプレートが作る |
-| `SafeUrl` | URL 属性の先頭に置いてよい `Html`。`safe_url()` が作る |
-| `SafeJs` | `<script>` の中に置いてよい `Html`。`json_html()` が作る |
-| `any` | どんな値でも入る。使う前に `is` で絞り込む必要がある |
-| `list<T>` | 要素の型が `T` の配列(0 から始まる連番) |
-| `map<K, V>` | 挿入順を保つ連想配列。`K` は `int` か `string` |
-| `?T` | `T` または `null`(`T|null` と同じ) |
-| `A|B` | ユニオン型 |
-| `fn(A, B): R` | 関数(クロージャ)の型 |
-| クラス名 | オブジェクトの型。`self` はそのクラス自身 |
+| `null` | The type whose only value is null. Normally used as part of `?T` |
+| `void` | Indicates no return value (only allowed as a return type) |
+| `Html` | A string that may be treated as safe HTML. Created by `raw()`, `escape()`, and templates |
+| `SafeUrl` | An `Html` that may be placed at the start of a URL attribute. Created by `safe_url()` |
+| `SafeJs` | An `Html` that may be placed inside `<script>`. Created by `json_html()` |
+| `any` | Holds any value. Must be narrowed with `is` before use |
+| `list<T>` | An array whose elements have type `T` (sequential indexes starting at 0) |
+| `map<K, V>` | An associative array that preserves insertion order. `K` is `int` or `string` |
+| `?T` | `T` or `null` (same as `T|null`) |
+| `A|B` | Union type |
+| `fn(A, B): R` | Function (closure) type |
+| Class name | The type of an object. `self` is the class itself |
 
-PHP の `array` は `list<T>` と `map<K, V>` に分かれています。`mixed` は `any` です。
+PHP's `array` is split into `list<T>` and `map<K, V>`. `mixed` is `any`.
 
-### 代入できる条件
+### Assignability
 
-- 同じ型、サブクラスから親クラス、`T` から `?T` やそれを含むユニオン、任意の型から `any`。
-- **`int` は `float` が期待される場所では自動で `float` に変換される**(唯一の暗黙の変換。値の意味が変わらないため)。
-  `list<int>` を `list<float>` に渡すことはできない(要素の型は不変)。
-- それ以外の変換は明示的に書く: `(int)$float`、`(float)$int`、`(string)$x`、`$s->toInt()`、`$s->toFloat()`。
-  `(int)"12"` のような文字列からのキャストはできない(`->toInt()` は数値でなければ `null` を返す)。
-  `(bool)` キャストはない。
+- The same type, a subclass to its parent class, `T` to `?T` or to a union that contains it, and any type to `any`.
+- **`int` is automatically converted to `float` where a `float` is expected** (the only implicit conversion, because it does not change the meaning of the value).
+  A `list<int>` cannot be passed as a `list<float>` (element types are invariant).
+- All other conversions must be written explicitly: `(int)$float`, `(float)$int`, `(string)$x`, `$s->toInt()`, `$s->toFloat()`.
+  Casting from a string, as in `(int)"12"`, is not allowed (`->toInt()` returns `null` if the string is not a number).
+  There is no `(bool)` cast.
 
-## 5. 変数
+## 5. Variables
 
-- PHP と同じく、**最初の代入で変数が宣言される**。そのとき値の型が変数の型になり、あとから別の型は代入できない。
+- As in PHP, **a variable is declared by its first assignment**. The type of the value becomes the type of the variable, and a value of a different type cannot be assigned later.
 
   ```phx
   $count = 1;
-  $count = "two";   // エラー: expected `int`, found `string`
+  $count = "two";   // error: expected `int`, found `string`
   ```
 
-- 型を推論できないとき(`null` や空の `[]`)は型を書いて宣言する。
+- When the type cannot be inferred (`null` or an empty `[]`), declare the variable with a type.
 
   ```phx
   ?User $found = null;
@@ -95,66 +97,66 @@ PHP の `array` は `list<T>` と `map<K, V>` に分かれています。`mixed`
   map<string, int> $counts = [];
   ```
 
-- 変数のスコープは関数全体(PHP と同じ)。ただし **一部の経路でしか代入されない変数は使えない**。
+- A variable's scope is the whole function (same as PHP). However, **a variable that is assigned only on some paths cannot be used**.
 
   ```phx
   if ($ok) { $msg = "hi"; }
-  echo $msg;   // エラー: variable `$msg` might not be defined here
+  echo $msg;   // error: variable `$msg` might not be defined here
   ```
 
-- `foreach` と `catch` の変数は、同じ名前の既存の変数と型が違うとき、新しい変数としてそれを隠す
-  (`catch (A $e)` と `catch (B $e)` を続けて書ける)。
-- `$this` は非 static メソッドの中だけで使える。代入はできない。
+- A `foreach` or `catch` variable whose type differs from an existing variable with the same name is a new variable that shadows it
+  (so `catch (A $e)` and `catch (B $e)` can be written one after another).
+- `$this` can be used only inside non-static methods. It cannot be assigned.
 
-### 型の絞り込み (narrowing)
+### Type Narrowing
 
-条件によって、ローカル変数の型が狭められる。
+Conditions narrow the types of local variables.
 
 ```phx
 function greet(?User $u): string {
     if ($u == null) {
         return "guest";
     }
-    return $u->name;          // ここでは $u は User
+    return $u->name;          // $u is User here
 }
 
-if ($v is int) { ... }        // ここでは $v は int
+if ($v is int) { ... }        // $v is int here
 $name = $req->query("name") ?? "world";   // string
 $len = $user?->email?->len();             // ?int
 ```
 
-`!= null`、`== null`、`is`、`!`、`&&`、`||`、早期 `return` / `throw` / `break` / `continue` が絞り込みに使われる。
-絞り込みの対象はローカル変数と、ローカル変数のプロパティ(`$this->user != null`)。プロパティの絞り込みは、
-関数やメソッドの呼び出し、プロパティへの代入があると解除される(呼び出しが値を変えたかもしれないため)。
+`!= null`, `== null`, `is`, `!`, `&&`, `||`, and early `return` / `throw` / `break` / `continue` are used for narrowing.
+Narrowing applies to local variables and to properties of local variables (`$this->user != null`). Narrowing of a property
+is reset by a function or method call or by an assignment to a property (because the call may have changed the value).
 
-## 6. 演算子
+## 6. Operators
 
-優先順位の高い順:
+From highest to lowest precedence:
 
-| 演算子 | 説明 |
+| Operator | Description |
 |---|---|
-| `()` `[]` `->` `?->` `::` | 呼び出し、添字、メンバー |
-| `**` | べき乗(右結合) |
-| `is` `instanceof` | 型の判定 |
-| `!` `-` `~` `(int)` など | 単項演算子、キャスト |
-| `*` `/` `%` | `/` は常に `float` を返す。整数の割り算は `intdiv()` |
-| `+` `-` | 数値どうしだけ。`int` と `float` が混ざると `float` |
-| `.` | 文字列の連結。`string`、`int`、`float` を連結できる。`Html . Html` は `Html` |
-| `<<` `>>` | ビットシフト |
-| `..` `..=` | 範囲(`0..$n` は `$n` を含まない、`1..=$n` は含む) |
-| `<` `<=` `>` `>=` | 数値どうし、または文字列どうし |
-| `==` `!=` `<=>` | `==` は常に厳密。`===` は使わない(書くとエラーで `==` を案内する) |
-| `&` `^` `\|` | ビット演算(`int` だけ) |
-| `&&` | 論理積(`bool` だけ) |
-| `\|\|` | 論理和(`bool` だけ) |
-| `??` | 左辺が null なら右辺。`$m["k"] ?? $d` はキーがなくても例外にならない |
-| `? :` | 三項演算子 |
+| `()` `[]` `->` `?->` `::` | Call, index, member |
+| `**` | Exponentiation (right-associative) |
+| `is` `instanceof` | Type test |
+| `!` `-` `~` `(int)` etc. | Unary operators, casts |
+| `*` `/` `%` | `/` always returns `float`. Use `intdiv()` for integer division |
+| `+` `-` | Numbers only. Mixing `int` and `float` gives `float` |
+| `.` | String concatenation. Can concatenate `string`, `int`, and `float`. `Html . Html` is `Html` |
+| `<<` `>>` | Bit shift |
+| `..` `..=` | Range (`0..$n` excludes `$n`; `1..=$n` includes it) |
+| `<` `<=` `>` `>=` | Between numbers, or between strings |
+| `==` `!=` `<=>` | `==` is always strict. `===` is not used (writing it is an error that points you to `==`) |
+| `&` `^` `\|` | Bitwise operations (`int` only) |
+| `&&` | Logical AND (`bool` only) |
+| `\|\|` | Logical OR (`bool` only) |
+| `??` | The right operand if the left is null. `$m["k"] ?? $d` does not throw even if the key is missing |
+| `? :` | Ternary operator |
 
-- **真偽値への暗黙変換(truthiness)はない**。`if ($xs)` はエラーで、`if (!$xs->isEmpty())` と書く。
-- 代入は式ではなく文: `=`、`+=`、`-=`、`*=`、`/=`、`%=`、`**=`、`.=`、`??=`、`++`、`--`。
-- 文字列の添字アクセス(`$s[0]`)はない。`$s->slice(0, 1)` を使う。
+- **There is no implicit conversion to boolean (truthiness)**. `if ($xs)` is an error; write `if (!$xs->isEmpty())`.
+- Assignment is a statement, not an expression: `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `**=`, `.=`, `??=`, `++`, `--`.
+- There is no string indexing (`$s[0]`). Use `$s->slice(0, 1)`.
 
-## 7. 制御構文
+## 7. Control Flow
 
 ```phx
 if (...) { } elseif (...) { } else if (...) { } else { }
@@ -164,14 +166,14 @@ for ($i = 0; $i < 10; $i++) { }
 foreach ($list as $value) { }
 foreach ($list as $index => $value) { }
 foreach ($map as $key => $value) { }
-foreach (0..$n as $i) { }            // 範囲は配列を作らずにループする
+foreach (0..$n as $i) { }            // loops over a range without building an array
 break; continue; break 2; continue 2;
 ```
 
-テンプレート向けの書き方も使える: `if (...): ... elseif (...): ... else: ... endif;`、
-`foreach (...): ... endforeach;`、`while (...): ... endwhile;`、`for (...): ... endfor;`
+The template-oriented syntax is also available: `if (...): ... elseif (...): ... else: ... endif;`,
+`foreach (...): ... endforeach;`, `while (...): ... endwhile;`, `for (...): ... endfor;`
 
-`foreach` は開始時点の配列のコピーを回る(PHP と同じ値のセマンティクス)。
+`foreach` iterates over a copy of the array as it was when the loop started (the same value semantics as PHP).
 
 ### match
 
@@ -187,9 +189,9 @@ $size = match (true) {
 };
 ```
 
-比較は `==`(厳密)。どの腕にも当てはまらず `default` もないときは `UnhandledMatchError`。
+Comparison uses `==` (strict). If no arm matches and there is no `default`, `UnhandledMatchError` is thrown.
 
-### 例外
+### Exceptions
 
 ```phx
 try {
@@ -205,38 +207,38 @@ $port = $config["port"] ?? throw new ValueError("port is required");
 try {
     $db->execute(sql"...");
 } finally {
-    $lock->release();      // return / break / continue / 例外のどれで抜けても実行される
+    $lock->release();      // runs whether the block exits by return / break / continue / exception
 }
 ```
 
-投げられるのは `Exception` かそのサブクラスだけ。
+Only `Exception` and its subclasses can be thrown.
 
-## 8. 関数
+## 8. Functions
 
 ```phx
 function greet(string $name, int $times = 1): string { ... }
 greet("Ann");
-greet(name: "Bob", times: 3);       // 名前付き引数
+greet(name: "Bob", times: 3);       // named arguments
 ```
 
-- 引数の型は必須。戻り値の型を省略すると `void`。
-- 値を返す関数は、すべての経路で `return` しないとエラー。
-- デフォルト値は定数(リテラル、`null`、`[]`)だけ。
-- 関数は値ではない。関数を渡すときはクロージャで包む。
-- 型パラメータを持つジェネリック関数を書ける(§9 の「ジェネリック関数」)。
+- Parameter types are required. If the return type is omitted, it is `void`.
+- A function that returns a value must `return` on every path, or it is an error.
+- Default values must be constants (literals, `null`, `[]`).
+- Functions are not values. To pass a function, wrap it in a closure.
+- Generic functions with type parameters can be written (see "Generic Functions" in §9).
 
-### クロージャ
+### Closures
 
 ```phx
-$double = fn(int $x): int => $x * 2;           // 外側の変数を自動でキャプチャ
-$names->map(fn($n) => $n->upper());            // 引数の型は文脈から推論される
+$double = fn(int $x): int => $x * 2;           // captures outer variables automatically
+$names->map(fn($n) => $n->upper());            // parameter types are inferred from context
 $counter = function () use ($start): int { return $start + 1; };
 ```
 
-- キャプチャはすべて**値渡し**(作られた時点のコピー)。参照キャプチャ(`&$x`)はない。
-- メソッドの中で作ったクロージャは `$this` を使える。
+- All captures are **by value** (a copy taken when the closure is created). There is no capture by reference (`&$x`).
+- A closure created inside a method can use `$this`.
 
-## 9. クラス
+## 9. Classes
 
 ```phx
 class User {
@@ -244,7 +246,7 @@ class User {
     public readonly string $email;
 
     public function __construct(
-        public readonly int $id,      // コンストラクタでのプロパティ昇格
+        public readonly int $id,      // constructor property promotion
         public string $name,
         string $email,
     ) {
@@ -267,17 +269,17 @@ class Admin extends User {
 }
 ```
 
-- プロパティには型が必須。`null` を許さずデフォルト値もないプロパティは、コンストラクタの先頭で代入しなければならない
-  (コンパイル時にチェックされる)。
-- `readonly` プロパティは、そのクラスのコンストラクタの中でしか代入できない。
-- 可視性は `public` / `protected` / `private`(コンパイル時にチェック)。コンストラクタも同じで、
-  `private function __construct(...)` のクラスはそのクラスの中(static メソッドなど)でしか `new` できない
-  (`Database` はこのため `Database::open()` でしか作れない)。
-- 単一継承。メソッドのオーバーライドは引数の型が同じで、戻り値の型が互換であること。親のコンストラクタを持つ
-  クラスで初期化の必要なプロパティがある場合、子のコンストラクタは `parent::__construct(...)` を呼ぶ必要がある。
-- `static` メソッドは `ClassName::method()` で呼ぶ。**static プロパティはない**(リクエスト間で状態を共有させないため)。
-- オブジェクトは参照、`list` と `map` は値(コピーオンライト)。
-### interface と abstract
+- Properties must have a type. A property that does not allow `null` and has no default value must be assigned at the start of the constructor
+  (checked at compile time).
+- A `readonly` property can be assigned only inside the constructor of its class.
+- Visibility is `public` / `protected` / `private` (checked at compile time). The same applies to constructors:
+  a class with `private function __construct(...)` can be instantiated with `new` only inside that class (for example, in a static method)
+  (this is why a `Database` can be created only through `Database::open()`).
+- Single inheritance. A method override must have the same parameter types and a compatible return type. If a class whose parent
+  has a constructor has properties that need initialization, the child constructor must call `parent::__construct(...)`.
+- `static` methods are called as `ClassName::method()`. **There are no static properties** (so that state is not shared between requests).
+- Objects are references; `list` and `map` are values (copy-on-write).
+### interface and abstract
 
 ```phx
 interface Shape {
@@ -302,11 +304,11 @@ final class Square extends Base {
 }
 ```
 
-- interface はメソッドのシグネチャと定数だけを持つ。`extends` で複数の interface を継承できる。
-- `abstract` メソッドは本体を持たない。abstract メソッドを持つクラスは `abstract class` と宣言する。
-- 具象クラスが interface や abstract のメソッドを実装していない、またはシグネチャが合わないときはコンパイルエラー。
-- interface、abstract クラス、enum は `new` できない。
-- interface 型の値へのメソッド呼び出しは名前で振り分けられる。クラス型の値へは vtable で振り分けられる。
+- An interface contains only method signatures and constants. An interface can inherit from multiple interfaces with `extends`.
+- An `abstract` method has no body. A class that has an abstract method must be declared `abstract class`.
+- It is a compile error if a concrete class does not implement an interface or abstract method, or if the signature does not match.
+- Interfaces, abstract classes, and enums cannot be instantiated with `new`.
+- Method calls on a value of an interface type are dispatched by name. Method calls on a value of a class type are dispatched through a vtable.
 
 ### enum
 
@@ -323,33 +325,33 @@ enum Suit {
     }
 }
 
-enum Status: string {        // int か string の値を持つ enum
+enum Status: string {        // an enum backed by int or string values
     case Active = "active";
     case Banned = "banned";
 }
 
 Suit::Hearts->name;              // "Hearts"
 Status::Active->value;           // "active"
-Status::from("banned");          // Status::Banned(見つからなければ ValueError)
+Status::from("banned");          // Status::Banned (ValueError if not found)
 Status::tryFrom("x");            // null
 Status::cases();                 // list<Status>
 ```
 
-各 case は 1 回の実行(1 リクエスト)の中でただ 1 つのオブジェクトなので、`==` で比べられる。
+Each case is a single object within one execution (one request), so cases can be compared with `==`.
 
-### 定数
+### Constants
 
 ```phx
-const MAX_ITEMS = 50;            // ファイルの先頭レベル(export / import もできる)
+const MAX_ITEMS = 50;            // at the top level of a file (can also be exported / imported)
 class Config {
     const VERSION = "1.0";
 }
 echo MAX_ITEMS, Config::VERSION, self::VERSION;
 ```
 
-定数の値はリテラル(int、float、string、bool、null)だけ。
+Constant values must be literals (int, float, string, bool, null).
 
-### ジェネリック関数
+### Generic Functions
 
 ```phx
 function first_or<T>(list<T> $xs, T $fallback): T {
@@ -359,40 +361,39 @@ $n = first_or([5, 6], 0);        // int
 $s = first_or([], "none");       // string
 ```
 
-型引数は呼び出しの引数から推論される(最大 4 個)。関数の中では `T` は中身の分からない型として扱われ、
-`T` の値に演算子やメソッドは使えない。ジェネリッククラスはまだない。
+Type arguments are inferred from the call's arguments (up to 4). Inside the function, `T` is treated as an opaque type,
+and operators and methods cannot be used on values of type `T`. There are no generic classes yet.
 
 
-## 10. 例外クラス
+## 10. Exception Classes
 
-すべてのファイルから使える。
+Available from every file.
 
 ```
 Exception                    (getMessage(): string)
 ├── RuntimeException
+│   └── DatabaseError        SQL error
 ├── LogicException
 │   └── InvalidArgumentException
-├── ArithmeticError          整数のオーバーフローなど
-│   └── DivisionByZeroError  0 での割り算・剰余
-├── IndexError               list の範囲外アクセス
-├── KeyError                 map にないキー
-├── ValueError               不正な引数(ヘッダーの改行など)
+├── ArithmeticError          integer overflow, etc.
+│   └── DivisionByZeroError  division or remainder by 0
+├── IndexError               out-of-range access on a list
+├── KeyError                 key not in a map
+├── ValueError               invalid argument (a newline in a header, etc.)
 ├── UnhandledMatchError
-├── PermissionError          phx.toml で許可されていないファイル・環境変数へのアクセス
-├── AssertionError           assert() / assert_eq() の失敗
-└── RuntimeException
-    └── DatabaseError        SQL のエラー
+├── PermissionError          access to a file or environment variable not allowed in phx.toml
+└── AssertionError           failure of assert() / assert_eq()
 ```
 
-実行時間の上限を超えたときなどの致命的なエラーは捕捉できない。
+Fatal errors, such as exceeding the execution time limit, cannot be caught.
 
-## 11. モジュール
+## 11. Modules
 
 ```phx
 // lib/posts.phx
 export class Post { ... }
 export function all_posts(): list<Post> { ... }
-function helper(): int { ... }      // export しないものは外から見えない
+function helper(): int { ... }      // anything not exported is not visible from outside
 ```
 
 ```phx
@@ -401,14 +402,14 @@ import lib.posts.Post;
 import std.http.{request, response};
 ```
 
-- `import a.b.{x, y};` は、プロジェクトのルート(`phx.toml` のあるディレクトリ、なければ実行するファイルの
-  ディレクトリ)からの `a/b.phx` を読み込む。
-- import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`const`、`import`)
-  しか書けない。モジュールを読み込んでも副作用は起きない。
-- `std.*` は標準モジュール(`std.http`、`std.db`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
-- 読み込めるのはプロジェクトとパッケージのディレクトリの中のファイルだけ(シンボリックリンクで外に出ることはできない)。
+- `import a.b.{x, y};` loads `a/b.phx` relative to the project root (the directory that contains `phx.toml`, or, if there is none,
+  the directory of the file being run).
+- The top level of an imported module can contain only declarations (`function`, `class`, `interface`, `enum`, `const`, `import`).
+  Loading a module has no side effects.
+- `std.*` are the standard modules (`std.http`, `std.db`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
+- Only files inside the project and package directories can be loaded (symbolic links cannot be used to escape them).
 
-## 12. テンプレート
+## 12. Templates
 
 ```html
 <?phx
@@ -426,84 +427,84 @@ $html = render("views/list.phx.html", title: "Posts", posts: $posts);   // Html
 echo render("views/layout.phx.html", title: "Home", body: $html);
 ```
 
-- テンプレートは `params(...)` で型付きの引数を宣言する。`render()` の呼び出しはコンパイル時に型チェックされる。
-- `render()` のパスは文字列リテラルで、プロジェクトのルートからの相対パス(`..` は使えない)。拡張子は `.phx.html`。
-- `render()` は `Html` を返すので、別のテンプレートにそのまま渡して埋め込める(レイアウト)。
+- A template declares typed parameters with `params(...)`. Calls to `render()` are type-checked at compile time.
+- The path given to `render()` is a string literal, relative to the project root (`..` is not allowed). The extension is `.phx.html`.
+- `render()` returns `Html`, so the result can be passed directly to another template and embedded there (layouts).
 
-## 13. 出力とエスケープ
+## 13. Output and escaping
 
-出力先には「テキスト」と「HTML」の 2 種類がある。
+There are two kinds of output destination: text and HTML.
 
-| 状況 | 出力先 |
+| Situation | Output destination |
 |---|---|
-| `phx run` で実行したスクリプト | テキスト(`--html` を付けると HTML) |
-| Web サーバーが実行するページ | HTML(`response()->type("application/json")` などで HTML 以外にするとテキスト) |
-| テンプレートの中 | 常に HTML |
+| A script run with `phx run` | Text (HTML with `--html`) |
+| A page run by the web server | HTML (text if set to a non-HTML type, for example with `response()->type("application/json")`) |
+| Inside a template | Always HTML |
 
-HTML の出力先に `string` を書くと `& < > " '` がエスケープされる。`Html` 型の値と、テンプレート中の
-HTML 部分はそのまま出力される。`echo` と `<?= ?>` は同じ規則に従う。
+Writing a `string` to an HTML destination escapes `& < > " '`. Values of type `Html` and the HTML parts of a template
+are output as is. `echo` and `<?= ?>` follow the same rules.
 
-- `escape($s)` / `htmlspecialchars($s)` … エスケープ済みの `Html` を返す。
-- `raw($s)` … 信頼できるマークアップを `Html` として扱う(XSS に注意して使う)。
-- `nl2br($s)` … エスケープしてから改行を `<br>` にした `Html`。
-- `safe_url($url)` … `http(s)`、`mailto`、`tel`、相対 URL だけを通し、`javascript:` などは `#` にした `SafeUrl`。
-- `json_html($value)` … `<script>` の中に置いても安全な JavaScript の値(JSON)を `SafeJs` で返す。
-  文字列の `"` はそのままなので、属性値の中には置けない(コンパイルエラー。`escape(json_encode($v))` を使う)。
-- `SafeUrl` と `SafeJs` は `Html` としても使える(逆はできない)。`escape()` の結果は `Html` なので、
-  URL や `<script>` の中には置けない。HTML のエスケープでは `javascript:` やスクリプトのコードを止められないため。
-- `Html` と `string` は `.` で連結できない(エラーで `escape()` を案内する)。
-- エスケープを外す Content-Type は `text/plain`、`application/json`、`text/csv`、`text/css`、`text/javascript`、
-  `text/markdown`、`text/calendar`、`application/pdf`、`application/octet-stream`、画像・音声・動画などに限る
-  (どれもブラウザが HTML として表示しない型。`X-Content-Type-Options: nosniff` も常に付く)。
-  HTML・XML・SVG・知らない型ではエスケープしたまま。
+- `escape($s)` / `htmlspecialchars($s)` … Returns escaped `Html`.
+- `raw($s)` … Treats trusted markup as `Html` (use with care to avoid XSS).
+- `nl2br($s)` … Escapes the string, then returns `Html` with line breaks converted to `<br>`.
+- `safe_url($url)` … Returns a `SafeUrl` that lets through only `http(s)`, `mailto`, `tel`, and relative URLs, and replaces `javascript:` and others with `#`.
+- `json_html($value)` … Returns, as `SafeJs`, a JavaScript value (JSON) that is safe to place inside `<script>`.
+  The `"` in strings is left as is, so the value cannot be placed inside an attribute value (a compile error; use `escape(json_encode($v))`).
+- `SafeUrl` and `SafeJs` can also be used as `Html` (not the reverse). The result of `escape()` is `Html`, so it
+  cannot be placed in a URL or inside `<script>`. This is because HTML escaping cannot stop `javascript:` or script code.
+- `Html` and `string` cannot be concatenated with `.` (the error suggests `escape()`).
+- Escaping is turned off only for the Content-Types `text/plain`, `application/json`, `text/csv`, `text/css`, `text/javascript`,
+  `text/markdown`, `text/calendar`, `application/pdf`, `application/octet-stream`, and image, audio, and video types
+  (all types that browsers do not render as HTML; `X-Content-Type-Options: nosniff` is also always sent).
+  HTML, XML, SVG, and unknown types stay escaped.
 
-### HTML の文脈の検査
+### HTML context checks
 
-HTML エスケープが守れるのは、要素の中身と**引用符で囲んだ**属性値だけ。`<?= ?>` と `echo` がそれ以外の場所に
-あるとコンパイルエラーになる。場所の判定はブラウザの構文解析(WHATWG)に合わせている:
-`<textarea>`・`<title>` などの中身、`<script>` の中の `<!--`、`<!-->` や `--!>` のコメント、`<svg>` の中、
-`</scripts>` のように終了タグに見えて違うもの。
+HTML escaping protects only element content and **quoted** attribute values. `<?= ?>` and `echo` anywhere else
+are a compile error. Locations are determined according to the browser's parsing rules (WHATWG), including
+the content of `<textarea>`, `<title>`, and similar elements, `<!--` inside `<script>`, comments such as `<!-->` and `--!>`, the inside of `<svg>`,
+and text such as `</scripts>` that looks like an end tag but is not one.
 
-| 場所 | 例 | 扱い |
+| Location | Example | Treatment |
 |---|---|---|
-| 要素の中身・引用符付きの属性値 | `<p><?= $s ?></p>`、`title="<?= $s ?>"` | エスケープして出力 |
-| 引用符なしの属性値 | `href=<?= $u ?>` | エラー(引用符で囲む) |
-| タグの中(属性の間) | `<div <?= $attrs ?>>` | エラー |
-| URL 属性の先頭 | `href="<?= $u ?>"`、`src="<?= $u ?>"` | `SafeUrl`(`safe_url($u)`)と数値だけ。前に書いた文字列に `/` `?` `#` `:` があれば先頭ではない(`href="/post?id=<?= $id ?>"` は可)。`href="j<?= ?>"` や `&#106;` のような文字参照だけでは先頭のまま |
-| `javascript:` / `data:` の URL | `href="javascript:go(<?= $v ?>)"` | エラー(数値は可) |
-| `<script>` の中 | `var x = <?= $v ?>;` | `SafeJs`(`json_html($v)`)と数値だけ |
-| `<style>`・`style="..."` | | エラー(数値は可) |
-| イベント属性 | `onclick="go(<?= $v ?>)"` | エラー。`data-*` 属性に入れて JavaScript から読む |
-| `<iframe srcdoc="...">` | | エラー(値が別の HTML 文書として解析される) |
+| Element content, quoted attribute value | `<p><?= $s ?></p>`, `title="<?= $s ?>"` | Escaped and output |
+| Unquoted attribute value | `href=<?= $u ?>` | Error (add quotes) |
+| Inside a tag (between attributes) | `<div <?= $attrs ?>>` | Error |
+| Start of a URL attribute | `href="<?= $u ?>"`, `src="<?= $u ?>"` | Only `SafeUrl` (`safe_url($u)`) and numbers. If the preceding text contains `/` `?` `#` `:`, it is not the start (`href="/post?id=<?= $id ?>"` is allowed). `href="j<?= ?>"` or only a character reference such as `&#106;` still counts as the start |
+| `javascript:` / `data:` URL | `href="javascript:go(<?= $v ?>)"` | Error (numbers are allowed) |
+| Inside `<script>` | `var x = <?= $v ?>;` | Only `SafeJs` (`json_html($v)`) and numbers |
+| `<style>`, `style="..."` | | Error (numbers are allowed) |
+| Event attribute | `onclick="go(<?= $v ?>)"` | Error. Put the value in a `data-*` attribute and read it from JavaScript |
+| `<iframe srcdoc="...">` | | Error (the value is parsed as a separate HTML document) |
 
-- 関数・クロージャの本体、`if`・ループのブロックは、始まったときと同じ HTML の状態で終わらなければならない
-  (`<script>` や属性をブロックの中で開いたまま終えるとエラー)。呼び出し順や繰り返しで文脈がずれるのを防ぐ。
-- 式と文の入れ子は 500 段まで(深すぎるソースで処理系のスタックがあふれるのを防ぐ)。
+- The bodies of functions and closures, and `if` and loop blocks, must end in the same HTML state they started in
+  (leaving a `<script>` or an attribute open at the end of a block is an error). This prevents the context from drifting with call order or repetition.
+- Expressions and statements can be nested up to 500 levels (this prevents deeply nested source from overflowing the implementation's stack).
 
-## 14. Web サーバー
+## 14. Web server
 
 ```
 phx serve examples/site --port 8080
 ```
 
-- サイトのディレクトリには `public/` が必要。URL はファイル名で決まる:
-  `/` → `public/index.phx`、`/about` → `public/about.phx` または `public/about/index.phx`、`/about.phx` も可。
-- 静的ファイルとして配信するのは既知の拡張子(html、css、js、json、txt、画像、フォント、pdf、音声、動画、wasm)だけ。
-- 配信しないもの: `public/` の外、`.` や `_` で始まるファイルとディレクトリ(`_partial.phx` は部品に使える)、
-  `.phx.html`(テンプレート)、知らない拡張子(`.php`、`.bak`、`.sql` など)。URL はファイル名と完全に同じ綴り
-  でなければならない(`INDEX.PHX` や Windows の短縮名、`::$DATA` では開けない)。
-- リクエストごとに新しい VM(新しいヒープ)で実行する。コンパイル済みのバイトコードだけが共有される。
-- ファイルを保存すると次のリクエストで再コンパイルされる(依存する全ファイルの更新時刻を見る)。
-- 上限: 実行時間 30 秒(`--time-limit`)、メモリ 128 MB(`[security] memory_limit_mb`)、本文 8 MB、ヘッダーの受信 10 秒、
-  本文の受信 30 秒、同時接続 1024、クエリ・フォームの項目 1000 個。
-- `[security] requests_per_minute` を書くと、1 つの接続元アドレスから 1 分間に受け付けるリクエストをその数までにする
-  (超えると `429 Too Many Requests` と `Retry-After`)。既定は無制限。
-- 既定で付けるヘッダー: `X-Content-Type-Options: nosniff`、`X-Frame-Options: SAMEORIGIN`、
-  `Referrer-Policy: strict-origin-when-cross-origin`、Content-Security-Policy(下の「Content-Security-Policy」)。
-  `secure_cookies = true` なら HSTS。セッションや Cookie を使うレスポンスには `Cache-Control: private, no-store`。
-  `Server` / `X-Powered-By` のようなバージョン情報は出さない。スクリプトは `Content-Length` などの通信用ヘッダーを設定できない。
-- 開発モードではコンパイルエラーと実行時エラーの詳細をブラウザに表示する。開発モードが既定になるのは
-  `127.0.0.1` / `localhost` で待ち受けるときだけ(`--dev` / `--prod` で明示できる)。
+- The site directory must contain `public/`. URLs are determined by file names:
+  `/` → `public/index.phx`, `/about` → `public/about.phx` or `public/about/index.phx`. `/about.phx` also works.
+- Only files with known extensions (html, css, js, json, txt, images, fonts, pdf, audio, video, wasm) are served as static files.
+- Not served: anything outside `public/`, files and directories whose names start with `.` or `_` (`_partial.phx` can be used as a partial),
+  `.phx.html` (templates), and unknown extensions (`.php`, `.bak`, `.sql`, etc.). The URL must match the file name's spelling
+  exactly (`INDEX.PHX`, Windows short names, and `::$DATA` do not open the file).
+- Each request runs in a new VM (a new heap). Only the compiled bytecode is shared.
+- When a file is saved, it is recompiled on the next request (the modification times of all the files it depends on are checked).
+- Limits: execution time 30 seconds (`--time-limit`), memory 128 MB (`[security] memory_limit_mb`), body 8 MB, receiving headers 10 seconds,
+  receiving the body 30 seconds, 1024 concurrent connections, 1000 query and form fields.
+- If `[security] requests_per_minute` is set, the number of requests accepted per minute from a single client address is limited to that number
+  (beyond it, the response is `429 Too Many Requests` with `Retry-After`). The default is unlimited.
+- Headers sent by default: `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`,
+  `Referrer-Policy: strict-origin-when-cross-origin`, and Content-Security-Policy (see "Content-Security-Policy" below).
+  HSTS if `secure_cookies = true`. `Cache-Control: private, no-store` on responses that use sessions or cookies.
+  Version information such as `Server` / `X-Powered-By` is not sent. Scripts cannot set transport headers such as `Content-Length`.
+- In development mode, the details of compile errors and runtime errors are shown in the browser. Development mode is the default only
+  when listening on `127.0.0.1` / `localhost` (it can be set explicitly with `--dev` / `--prod`).
 
 ### std.http
 
@@ -515,49 +516,49 @@ $req->method;              // "GET"
 $req->path;                // "/post"
 $req->query("id");         // ?string
 $req->form("name");        // ?string (urlencoded / multipart)
-$req->header("Accept");    // ?string(名前の大文字小文字は区別しない)
+$req->header("Accept");    // ?string (header names are case-insensitive)
 $req->cookie("theme");     // ?string
 $req->file("avatar");      // ?UploadedFile
 $req->json();              // any
 $req->body;                // string
-$req->ip;                  // string(接続元の IP アドレス。リバースプロキシの後ろではプロキシのアドレス)
+$req->ip;                  // string (the client's IP address; behind a reverse proxy, the proxy's address)
 $req->isPost();            // bool
 
 response()->status(404);
 response()->header("Cache-Control", "no-store");
 response()->type("text/plain; charset=utf-8");
 response()->cookie("theme", "dark");
-response()->redirect("/login");                       // サイト内のパスだけ
-response()->redirectExternal("https://example.com/");  // 外部の URL
+response()->redirect("/login");                       // paths within the site only
+response()->redirectExternal("https://example.com/");  // external URL
 response()->json($value);
 ```
 
-### セッション
+### Sessions
 
 ```phx
 import std.http.session;
 
 session()->set("user_id", (string)$user->id);
 $id = session()->get("user_id");      // ?string
-session()->regenerate();              // ログイン直後に呼ぶ(セッション固定攻撃の対策)
-session()->flash("notice");           // 読んだら消えるメッセージ
-session()->destroy();                 // ログアウト
+session()->regenerate();              // call right after login (protects against session fixation)
+session()->flash("notice");           // a message that is removed once read
+session()->destroy();                 // log out
 ```
 
-- 値はサーバー側に保存され、Cookie には 256 ビットの乱数の ID だけが入る
-  (`PHXSESSID`、`HttpOnly`、`SameSite=Lax`、`[security] secure_cookies = true` で `Secure`)。
-- サーバーが発行していない ID は受け付けない。1 セッションの値は合計 64 KB まで。
-- `[security] session_ttl` 秒アクセスがないと消える。アクセスが続いても 24 時間で消える。
-- 既定の保存先はメモリで、サーバーを再起動すると消える。`[security] session_store = "sessions/"` のように
-  プロジェクト内のディレクトリを書くと、1 セッション 1 ファイルで保存する。再起動しても残り、同じディレクトリを使う
-  複数のサーバープロセスで共有できる。ファイル名は ID のハッシュなので、ディレクトリの一覧から ID は分からない。
-  `public/` の中は指定できない。
+- Values are stored on the server. The cookie holds only a 256-bit random ID
+  (`PHXSESSID`, `HttpOnly`, `SameSite=Lax`, and `Secure` with `[security] secure_cookies = true`).
+- IDs that the server did not issue are rejected. The values in one session can total at most 64 KB.
+- A session is removed after `[security] session_ttl` seconds without access. Even with continued access, it is removed after 24 hours.
+- By default, sessions are stored in memory and are lost when the server restarts. If you set a directory in the project,
+  as in `[security] session_store = "sessions/"`, each session is stored in its own file. Sessions then survive restarts and can be shared by
+  multiple server processes that use the same directory. File names are hashes of the IDs, so the IDs cannot be learned from a directory listing.
+  A directory inside `public/` cannot be specified.
 
-### CSRF 対策
+### CSRF protection
 
-`POST`・`PUT`・`PATCH`・`DELETE` のうち、ブラウザがほかのサイトから送れる形式
-(`application/x-www-form-urlencoded`、`multipart/form-data`、`text/plain`、Content-Type なし)のリクエストは、
-スクリプトを実行する前にサーバーがトークンを確認する。トークンがない、または違うときは 403 になる。
+For `POST`, `PUT`, `PATCH`, and `DELETE` requests in a format that browsers can send from other sites
+(`application/x-www-form-urlencoded`, `multipart/form-data`, `text/plain`, or no Content-Type),
+the server checks a token before running the script. If the token is missing or wrong, the response is 403.
 
 ```html
 <form method="post">
@@ -566,41 +567,41 @@ session()->destroy();                 // ログアウト
 </form>
 ```
 
-JavaScript から送るときは `csrf_token()` の値を `X-CSRF-Token` ヘッダーに入れる。
-JSON のリクエストは CORS のプリフライトが必要なので、ほかのサイトからは送れない。
+When sending from JavaScript, put the value of `csrf_token()` in the `X-CSRF-Token` header.
+JSON requests require a CORS preflight, so other sites cannot send them.
 
-トークンはブラウザごとの Cookie(`PHXCSRF`)の HMAC なので、攻撃者がその Cookie を書き換えられないことが前提になる。
-本番では HTTPS で配信して `secure_cookies = true` にする(Cookie が `__Host-` 付きになり、平文の通信や
-サブドメインから上書きされなくなる)。
-`[security] csrf = false` で無効にできる。
+The token is an HMAC of a per-browser cookie (`PHXCSRF`), so this relies on attackers being unable to overwrite that cookie.
+In production, serve over HTTPS and set `secure_cookies = true` (the cookie gets the `__Host-` prefix and can no longer be overwritten
+over plaintext connections or from subdomains).
+It can be disabled with `[security] csrf = false`.
 
 ### Cookie
 
 ```phx
 request()->cookie("theme");                                   // ?string
-response()->cookie("theme", "dark", maxAge: 86400 * 30);      // HttpOnly; SameSite=Lax が既定
+response()->cookie("theme", "dark", maxAge: 86400 * 30);      // HttpOnly; SameSite=Lax by default
 response()->deleteCookie("theme");
 ```
 
-名前に使えない文字、改行、`SameSite=None` で `Secure` なし、は `ValueError`。
+Characters not allowed in names, line breaks, and `SameSite=None` without `Secure` raise `ValueError`.
 
-### アップロード
+### Uploads
 
 ```phx
 $file = request()->file("avatar");     // ?UploadedFile
 if ($file != null) {
     echo $file->name, $file->type, $file->size;
-    $file->saveTo("storage/avatars/" . random_token(16) . ".png");   // [permissions].write が必要
+    $file->saveTo("storage/avatars/" . random_token(16) . ".png");   // requires [permissions].write
 }
 ```
 
-`name` はクライアントが送ったファイル名からディレクトリ部分と制御文字を取り除いたもの。
-保存先のパスには使わないこと。リクエスト本文は合計 8 MB まで。
+`name` is the file name sent by the client, with the directory part and control characters removed.
+Do not use it in the destination path. The request body is limited to 8 MB in total.
 
 ### JSON
 
 ```phx
-$data = request()->json();             // any(不正な JSON は ValueError)
+$data = request()->json();             // any (invalid JSON raises ValueError)
 if ($data is map) {
     $name = $data["name"] ?? null;
     if ($name is string) { ... }
@@ -608,12 +609,12 @@ if ($data is map) {
 response()->json(["ok" => true]);
 ```
 
-### データベース(std.db)
+### Database (std.db)
 
 ```phx
 import std.db.Database;
 
-$db = Database::open("data/app.db");      // [permissions].write = ["data/"] が必要。":memory:" も可
+$db = Database::open("data/app.db");      // requires [permissions].write = ["data/"]. ":memory:" is also allowed
 $db->execute(sql"CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY, title TEXT)");
 $db->execute(sql"INSERT INTO posts (title) VALUES ({$title})");
 $id = $db->lastInsertId();
@@ -625,31 +626,31 @@ $one = $db->first(sql"SELECT * FROM posts WHERE id = {$id}");   // ?Row
 
 $db->transaction(function () use ($db): void {
     $db->execute(sql"UPDATE posts SET title = 'x'");
-});                                         // 例外が出たら ROLLBACK
+});                                         // ROLLBACK if an exception is thrown
 ```
 
-- **SQL は `sql"..."` リテラル(`Sql` 型)でしか書けない。** `{$x}` で埋め込んだ値は必ずプレースホルダとして
-  渡されるので、SQL インジェクションは起こらない。`string` を `query()` に渡すことはできない。
-- `Sql` どうしは `.` で連結できる(パラメータも引き継がれる)。`Sql` と `string` は連結できない。
-- 列名やテーブル名を動的に決めたいときは `sql_ident($name)`(英数字と `_` だけを許可して引用する)。
-- `ATTACH` は無効になっていて、許可されたファイル以外のデータベースには触れない。
-- SQL のエラーは `DatabaseError`。
+- **SQL can be written only as `sql"..."` literals (type `Sql`).** Values embedded with `{$x}` are always passed
+  as placeholders, so SQL injection cannot occur. A `string` cannot be passed to `query()`.
+- `Sql` values can be concatenated with `.` (their parameters are carried over). `Sql` and `string` cannot be concatenated.
+- To choose a column or table name dynamically, use `sql_ident($name)` (it allows only alphanumerics and `_`, and quotes the name).
+- `ATTACH` is disabled, so databases other than the permitted files cannot be accessed.
+- SQL errors raise `DatabaseError`.
 
-### 日付・暗号・エンコード
+### Dates, cryptography, and encoding
 
-| 関数 | 説明 |
+| Function | Description |
 |---|---|
-| `date($format, ?$ts)` / `gmdate(...)` | PHP と同じ書式(`Y-m-d H:i:s`、`D, d M Y`、`c`、`U` など)。`date` はサーバーのローカル時刻 |
-| `mktime($h, $i, $s, $m, $d, $y)`, `strtotime($s): ?int`, `checkdate($m, $d, $y)` | `strtotime` は ISO 形式と `now`/`today`/`tomorrow`/`yesterday` |
-| `random_int($min, $max)`, `random_token($bytes = 32)` | OS の暗号論的乱数(`rand()` は暗号用途に使わない) |
+| `date($format, ?$ts)` / `gmdate(...)` | Same format as PHP (`Y-m-d H:i:s`, `D, d M Y`, `c`, `U`, etc.). `date` uses the server's local time |
+| `mktime($h, $i, $s, $m, $d, $y)`, `strtotime($s): ?int`, `checkdate($m, $d, $y)` | `strtotime` accepts ISO formats and `now`/`today`/`tomorrow`/`yesterday` |
+| `random_int($min, $max)`, `random_token($bytes = 32)` | The OS's cryptographic random number generator (do not use `rand()` for cryptography) |
 | `password_hash($pw)`, `password_verify($pw, $hash)` | Argon2id |
-| `hash("sha256" \| "sha384" \| "sha512", $data)`, `hash_hmac($algo, $data, $key)`, `hash_equals($a, $b)` | `hash_equals` は比較時間が内容に依存しない |
+| `hash("sha256" \| "sha384" \| "sha512", $data)`, `hash_hmac($algo, $data, $key)`, `hash_equals($a, $b)` | `hash_equals` takes a comparison time that does not depend on the contents |
 | `base64_encode`, `base64_decode: ?string`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | |
-| `json_decode($s): any` | 深さ 128 まで |
+| `json_decode($s): any` | Depth up to 128 |
 
 ### Content-Security-Policy
 
-ページのレスポンスには既定で次のポリシーが付く(`{nonce}` はレスポンスごとの `'nonce-...'`。`'nonce-{nonce}'` と書いても同じ)。
+Page responses get the following policy by default (`{nonce}` is a per-response `'nonce-...'`; writing `'nonce-{nonce}'` is equivalent).
 
 ```
 default-src 'self'; script-src 'self' {nonce}; style-src 'self' 'unsafe-inline';
@@ -657,57 +658,57 @@ img-src 'self' data: https:; font-src 'self' data:; object-src 'none'; base-uri 
 form-action 'self'; frame-ancestors 'self'
 ```
 
-- テンプレート(`.phx.html` と `.phx` の HTML 部分)に書いた `<script>` タグには、PHX が自動で
-  `nonce="..."` を付ける。そのため、自分で書いたインラインスクリプトはそのまま動き、エスケープをすり抜けて
-  注入されたスクリプト(`raw()` に入った `<script>` など)は動かない。
-- `onclick="..."` のようなイベント属性と `javascript:` の URL は止まる。`addEventListener` を使う。
-  テンプレートに書くとコンパイル時に警告が出る(`csp` でインラインのコードを許可しているときは出ない)。
-- 文字列から組み立てた `<script>` に nonce が必要なときは `csp_nonce()` を使う
-  (`raw("<script nonce=\"" . csp_nonce() . "\">...</script>")`)。
-- 静的ファイルとエラーページには nonce のないポリシーが付く(静的な `.html` のインラインスクリプトは動かない)。
-- 変更: `[security] csp = "off"` で付けない。`csp = "default-src 'self'; script-src 'self' {nonce}"` のように
-  書くとそのポリシーを使う(`{nonce}` は `'nonce-...'` になる)。
+- PHX automatically adds `nonce="..."` to `<script>` tags written in templates (`.phx.html` and the HTML parts of `.phx`).
+  As a result, inline scripts you write yourself work as is, while scripts injected by getting
+  past escaping (such as a `<script>` passed to `raw()`) do not run.
+- Event attributes such as `onclick="..."` and `javascript:` URLs are blocked. Use `addEventListener`.
+  Writing them in a template produces a compile-time warning (not when `csp` allows inline code).
+- When a `<script>` built from strings needs a nonce, use `csp_nonce()`
+  (`raw("<script nonce=\"" . csp_nonce() . "\">...</script>")`).
+- Static files and error pages get a policy without a nonce (inline scripts in static `.html` files do not run).
+- Changing the policy: `[security] csp = "off"` omits it. Writing a policy, as in `csp = "default-src 'self'; script-src 'self' {nonce}"`,
+  uses that policy (`{nonce}` becomes `'nonce-...'`).
 
-### レート制限
+### Rate limiting
 
 ```phx
-if (!rate_limit("login:" . request()->ip, 5, 60)) {     // 60 秒に 5 回まで
+if (!rate_limit("login:" . request()->ip, 5, 60)) {     // up to 5 times per 60 seconds
     response()->status(429);
-    echo "しばらく待ってからやり直してください。";
+    echo "Please wait a moment and try again.";
     return;
 }
-// ログインに成功したら
+// after a successful login
 rate_limit_reset("login:" . request()->ip);
 ```
 
-- `rate_limit($key, $max, $seconds)` は、そのキーの今の時間枠でまだ `$max` 回に達していなければ 1 回数えて `true`、
-  達していれば `false` を返す。カウンターはサーバープロセスの中で共有され、再起動で消える。
-- 同じキーでも時間枠の長さごとに別に数える(1 分 5 回と 1 日 50 回を両方かけられる)。キーが 10 万個を超えると、
-  上限に達していないものから捨てるので、大量のキーを使っても制限中のキーは外れない。
-- `requests_per_minute` は IPv6 のアドレスを /64 ごとにまとめて数える。
-- サイト全体の制限は `[security] requests_per_minute`(§14)。
+- `rate_limit($key, $max, $seconds)` counts one use and returns `true` if the key has not yet reached `$max` in the current window,
+  and returns `false` if it has. Counters are shared within the server process and are lost on restart.
+- The same key is counted separately for each window length (you can apply both 5 per minute and 50 per day). When there are more than 100,000 keys,
+  keys that have not reached their limit are discarded first, so using a large number of keys does not release keys that are currently limited.
+- `requests_per_minute` counts IPv6 addresses grouped by /64.
+- The site-wide limit is `[security] requests_per_minute` (§14).
 
-### 権限(phx.toml)
+### Permissions (phx.toml)
 
-スクリプトがヒープの外に触れるものは、すべて `phx.toml` で許可したものだけ。**何も書かなければ何も許可されない。**
+A script can touch nothing outside the heap unless it is permitted in `phx.toml`. **If nothing is written, nothing is permitted.**
 
 ```toml
 [permissions]
-read = ["content/"]         # file_get_contents / file_exists で読めるディレクトリ
-write = ["data/", "storage/"]  # file_put_contents / unlink / saveTo / Database::open(読み取りも可)
-env = ["APP_*"]             # getenv で読める環境変数(末尾 * は前方一致)
+read = ["content/"]         # directories readable with file_get_contents / file_exists
+write = ["data/", "storage/"]  # file_put_contents / unlink / saveTo / Database::open (reading is also allowed)
+env = ["APP_*"]             # environment variables readable with getenv (a trailing * is a prefix match)
 ```
 
-- パスはプロジェクトからの相対パスで、`..` と絶対パスは使えない。
-- 許可したディレクトリの下にあるシンボリックリンクとジャンクションはたどらない(リンクを経由するパスは `PermissionError`)。
-  パスは許可したディレクトリから 1 段ずつ、リンクを拒否しながら開くので、検査と使用の間にディレクトリを
-  すり替えられることもない。
-- 開けるのは通常のファイルで、ハードリンクが 1 本だけのもの。外のファイルへのハードリンクを置かれても読み書きしない。
-- ファイル名に `:`(Windows の代替データストリーム)、末尾のドットや空白、`CON` `NUL` `COM1` などのデバイス名は使えない。
-- Unix では、ほかのユーザーが書き込めるディレクトリ(`o+w`)は使えない。
-- コードとして読み込まれる場所は `write` に指定できない: `public/`、プロジェクトのルート、`.` で始まるディレクトリ
-  (`.phx-cache/`、`.git/` など)、`vendor/`、`[dependencies]` のパッケージのディレクトリ。
-- 許可されていないときは `PermissionError`(メッセージに `phx.toml` に書くべき内容が出る)。
+- Paths are relative to the project. `..` and absolute paths are not allowed.
+- Symbolic links and junctions under a permitted directory are not followed (a path through a link raises `PermissionError`).
+  Paths are opened one level at a time from the permitted directory, rejecting links, so a directory cannot be swapped
+  between the check and the use.
+- Only regular files with exactly one hard link can be opened. If a hard link to a file outside is planted, it is neither read nor written.
+- File names cannot contain `:` (Windows alternate data streams), trailing dots or spaces, or device names such as `CON` `NUL` `COM1`.
+- On Unix, directories that other users can write to (`o+w`) cannot be used.
+- Locations that are loaded as code cannot be specified in `write`: `public/`, the project root, directories whose names start with `.`
+  (`.phx-cache/`, `.git/`, etc.), `vendor/`, and the directories of packages in `[dependencies]`.
+- Anything not permitted raises `PermissionError` (the message shows what to write in `phx.toml`).
 
 ### phx.toml
 
@@ -716,13 +717,13 @@ env = ["APP_*"]             # getenv で読める環境変数(末尾 * は前方
 name = "blog"
 
 [security]
-csrf = true             # 既定: true
-secure_cookies = false  # HTTPS で配信するときは true
-session_ttl = 7200      # 秒
-memory_limit_mb = 128   # 1 リクエスト(1 回の実行)あたり
-csp = "default"         # "off" か、{nonce} を含められる独自のポリシー
-requests_per_minute = 0 # 接続元アドレスごとの上限(0 は無制限)
-session_store = "memory"  # またはディレクトリ("sessions/")
+csrf = true             # default: true
+secure_cookies = false  # true when serving over HTTPS
+session_ttl = 7200      # seconds
+memory_limit_mb = 128   # per request (one execution)
+csp = "default"         # "off" or a custom policy that may contain {nonce}
+requests_per_minute = 0 # limit per client address (0 means unlimited)
+session_store = "memory"  # or a directory ("sessions/")
 
 [permissions]
 write = ["data/"]
@@ -732,80 +733,80 @@ utils = { path = "../utils" }
 markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 ```
 
-`phx.toml` のあるディレクトリがプロジェクトのルートになる。知らないキーはエラー(書き間違いに気づける)。
-`phx serve` は起動時に読み込むので、変更したらサーバーを再起動する。
+The directory that contains `phx.toml` is the project root. Unknown keys are errors (so typos are caught).
+`phx serve` reads the file at startup, so restart the server after changing it.
 
-## 15. 組み込み関数
+## 15. Builtin functions
 
-### グローバル関数
+### Global functions
 
-| 関数 | 説明 |
+| Function | Description |
 |---|---|
-| `count(list\|map): int` | 要素数 |
-| `strlen(string): int` | バイト数(文字数は `->len()`) |
-| `implode(string $sep, list<string>): string` / `explode(string $sep, string): list<string>` | 結合 / 分割 |
-| `str_repeat`, `str_contains`, `str_starts_with`, `str_ends_with`, `str_replace(search, replace, subject)` | PHP と同じ |
-| `strtoupper`, `strtolower`, `ucfirst`, `trim` | PHP と同じ |
-| `json_encode(any): string` | オブジェクトは public プロパティだけを出力 |
-| `dump(any): void` | `var_dump` に相当 |
+| `count(list\|map): int` | Number of elements |
+| `strlen(string): int` | Number of bytes (use `->len()` for the number of characters) |
+| `implode(string $sep, list<string>): string` / `explode(string $sep, string): list<string>` | Join / split |
+| `str_repeat`, `str_contains`, `str_starts_with`, `str_ends_with`, `str_replace(search, replace, subject)` | Same as PHP |
+| `strtoupper`, `strtolower`, `ucfirst`, `trim` | Same as PHP |
+| `json_encode(any): string` | Outputs only the public properties of objects |
+| `dump(any): void` | Equivalent to `var_dump` |
 | `raw(string): Html`, `escape(string): Html`, `htmlspecialchars(string): Html`, `nl2br(string): Html` | §13 |
-| `intdiv`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `sqrt`, `fmod` | 数値 |
+| `intdiv`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `sqrt`, `fmod` | Numeric |
 | `number_format(float, int $decimals = 0): string` | `1,234.50` |
-| `range(int, int): list<int>` | 両端を含む |
-| `time(): int`, `microtime(): float` | 現在時刻 |
-| `rand(int, int): int` | 疑似乱数(暗号用途には使わない。`random_int` を使う) |
-| `json_decode(string): any`, `json_html(any): SafeJs`, `safe_url(string): SafeUrl` | §13、§14 |
+| `range(int, int): list<int>` | Includes both ends |
+| `time(): int`, `microtime(): float` | Current time |
+| `rand(int, int): int` | Pseudo-random number (not for cryptography; use `random_int`) |
+| `json_decode(string): any`, `json_html(any): SafeJs`, `safe_url(string): SafeUrl` | §13, §14 |
 | `csrf_token(): string`, `csrf_field(): Html` | §14 |
-| `csp_nonce(): string` | このレスポンスの CSP の nonce(§14) |
+| `csp_nonce(): string` | The CSP nonce for this response (§14) |
 | `rate_limit(string, int, int): bool`, `rate_limit_reset(string)` | §14 |
-| `date`, `gmdate`, `mktime`, `strtotime`, `checkdate` | 日付(§14 の表) |
-| `random_int`, `random_token`, `password_hash`, `password_verify`, `hash`, `hash_hmac`, `hash_equals` | 暗号(§14 の表) |
-| `base64_encode`, `base64_decode`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | エンコード |
-| `file_get_contents`, `file_put_contents`, `file_exists`, `unlink`, `getenv` | `[permissions]` が必要 |
-| `sql_ident(string): Sql` | 列名・テーブル名 |
-| `assert(bool, ?string)`, `assert_eq(any, any, ?string)` | テスト用 |
+| `date`, `gmdate`, `mktime`, `strtotime`, `checkdate` | Dates (table in §14) |
+| `random_int`, `random_token`, `password_hash`, `password_verify`, `hash`, `hash_hmac`, `hash_equals` | Cryptography (table in §14) |
+| `base64_encode`, `base64_decode`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | Encoding |
+| `file_get_contents`, `file_put_contents`, `file_exists`, `unlink`, `getenv` | Require `[permissions]` |
+| `sql_ident(string): Sql` | Column and table names |
+| `assert(bool, ?string)`, `assert_eq(any, any, ?string)` | For tests |
 
-### string のメソッド
+### string methods
 
-`len()`(文字数)、`isEmpty()`、`upper()`、`lower()`、`ucfirst()`、`trim()`、`ltrim()`、`rtrim()`、
-`contains($s)`、`startsWith($s)`、`endsWith($s)`、`replace($search, $replace)`、`split($sep)`、
-`slice($start, $length?)`(文字単位、負の値は末尾から)、`indexOf($s): ?int`、`repeat($n)`、
-`padStart($len, $pad)`、`padEnd($len, $pad)`、`toInt(): ?int`、`toFloat(): ?float`、`chars()`
+`len()` (number of characters), `isEmpty()`, `upper()`, `lower()`, `ucfirst()`, `trim()`, `ltrim()`, `rtrim()`,
+`contains($s)`, `startsWith($s)`, `endsWith($s)`, `replace($search, $replace)`, `split($sep)`,
+`slice($start, $length?)` (in characters; negative values count from the end), `indexOf($s): ?int`, `repeat($n)`,
+`padStart($len, $pad)`, `padEnd($len, $pad)`, `toInt(): ?int`, `toFloat(): ?float`, `chars()`
 
-### list のメソッド
+### list methods
 
-`len()`、`isEmpty()`、`contains($v)`、`indexOf($v): ?int`、`first(): ?T`、`last(): ?T`、
-`slice($start, $length?)`、`reverse()`、`concat($other)`、`unique()`、`sorted()`、`sortBy(fn($a, $b) => int)`、
-`map(fn($x) => ...)`、`filter(fn($x) => bool)`、`find(fn($x) => bool): ?T`、`any(...)`、`all(...)`、
-`join($sep)`、`sum()`
+`len()`, `isEmpty()`, `contains($v)`, `indexOf($v): ?int`, `first(): ?T`, `last(): ?T`,
+`slice($start, $length?)`, `reverse()`, `concat($other)`, `unique()`, `sorted()`, `sortBy(fn($a, $b) => int)`,
+`map(fn($x) => ...)`, `filter(fn($x) => bool)`, `find(fn($x) => bool): ?T`, `any(...)`, `all(...)`,
+`join($sep)`, `sum()`
 
-要素の追加は `$xs[] = $v;`、更新は `$xs[$i] = $v;`(範囲外は `IndexError`)。
+Append an element with `$xs[] = $v;` and update one with `$xs[$i] = $v;` (an index out of range raises `IndexError`).
 
-### map のメソッド
+### map methods
 
-`len()`、`isEmpty()`、`has($k)`、`get($k): ?V`、`keys()`、`values()`、`merge($other)`
+`len()`, `isEmpty()`, `has($k)`, `get($k): ?V`, `keys()`, `values()`, `merge($other)`
 
-追加・更新は `$m[$k] = $v;`。存在しないキーの読み取り `$m[$k]` は `KeyError`、`$m[$k] ?? $default` は例外にならない。
+Add or update with `$m[$k] = $v;`. Reading a missing key with `$m[$k]` raises `KeyError`; `$m[$k] ?? $default` does not throw.
 
-PHP の関数名で書いたときは、エラーメッセージで代わりの書き方を案内する
-(例: `strpos` → `->indexOf()`、`isset` → `??`、`var_dump` → `dump()`、`eval` → 使えない)。
+When code uses a PHP function name, the error message suggests the alternative
+(for example, `strpos` → `->indexOf()`, `isset` → `??`, `var_dump` → `dump()`, `eval` → not available).
 
-## 16. ツール
+## 16. Tools
 
-| コマンド | 説明 |
+| Command | Description |
 |---|---|
-| `phx run file.phx` | 型検査して実行(`--html`、`--time-limit 秒`) |
-| `phx check file.phx` | 型検査だけ(import しているモジュールとテンプレートも) |
-| `phx serve dir` | Web サーバー(`--port`、`--host`、`--prod`、`--time-limit`) |
-| `phx test [paths]` | `*_test.phx` の `test_*` 関数を実行(1 テストごとに新しい VM) |
-| `phx fmt [paths] [--check]` | インデントと空白を整える(文字列・コメント・HTML は変えない) |
-| `phx lsp` | エディタ用の Language Server(入力中のエラー表示、ホバーで型を表示) |
-| `phx install` | `[dependencies]` を取得して `phx.lock` に固定 |
-| `phx migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
-| `phx disasm file.phx` | バイトコードを表示 |
-| `phx parse file.phx` | 構文木を表示 |
+| `phx run file.phx` | Type-check and run (`--html`, `--time-limit seconds`) |
+| `phx check file.phx` | Type-check only (including imported modules and templates) |
+| `phx serve dir` | Web server (`--port`, `--host`, `--prod`, `--time-limit`) |
+| `phx test [paths]` | Run the `test_*` functions in `*_test.phx` files (a new VM for each test) |
+| `phx fmt [paths] [--check]` | Normalize indentation and whitespace (strings, comments, and HTML are not changed) |
+| `phx lsp` | Language Server for editors (errors as you type, types on hover) |
+| `phx install` | Fetch `[dependencies]` and pin them in `phx.lock` |
+| `phx migrate file.php` | Convert PHP mechanically and list the places that need manual work |
+| `phx disasm file.phx` | Show the bytecode |
+| `phx parse file.phx` | Show the syntax tree |
 
-### テスト
+### Testing
 
 ```phx
 // tests/posts_test.phx
@@ -817,9 +818,9 @@ function test_find_post(): void {
 }
 ```
 
-`assert(bool, ?message)` と `assert_eq(expected, actual, ?message)` が失敗すると `AssertionError`。
+When `assert(bool, ?message)` or `assert_eq(expected, actual, ?message)` fails, it raises `AssertionError`.
 
-### パッケージ
+### Packages
 
 ```toml
 [dependencies]
@@ -831,60 +832,60 @@ local = { path = "../shared" }
 import textutils.strings.slugify;      // vendor/textutils/strings.phx
 ```
 
-- `git` のパッケージは `vendor/<名前>` に取得され、正確なコミットが `phx.lock` に記録される。
-  2 回目以降は lock のコミットを取得し、違っていればエラーになる。
-- 使える URL は `https://`、`ssh://`、`git@host:...`、`file://` だけ。
-- パッケージは PHX のソースコードで、インストール時にパッケージのコードが実行されることはない。
-- パッケージの依存はアプリの `phx.toml` に並べて書く(推移的な依存の解決はまだない)。
+- `git` packages are fetched into `vendor/<name>`, and the exact commit is recorded in `phx.lock`.
+  From the second install on, the commit in the lock file is fetched, and a mismatch is an error.
+- Only `https://`, `ssh://`, `git@host:...`, and `file://` URLs are allowed.
+- Packages are PHX source code. No package code runs at install time.
+- List a package's dependencies alongside it in the app's `phx.toml` (transitive dependency resolution is not yet supported).
 
-### 移行
+### Migration
 
 ```
-phx migrate legacy/page.php      # page.phx を書き出す
+phx migrate legacy/page.php      # writes page.phx
 ```
 
-`<?php`→`<?phx`、`===`→`==`、`array(...)`→`[...]`、`isset($x)`→`($x != null)`、`$_GET`/`$_POST`/`$_COOKIE`/`$_SESSION`
-→ `request()`/`session()`、`var_dump`/`print_r`→`dump`、`print`→`echo` を変換し、`require` や `global` には
-`TODO(migrate)` コメントを付ける。そのあと型検査を実行して、型注釈などの手作業が必要な箇所を表示する。
+Converts `<?php`→`<?phx`, `===`→`==`, `array(...)`→`[...]`, `isset($x)`→`($x != null)`, `$_GET`/`$_POST`/`$_COOKIE`/`$_SESSION`
+→ `request()`/`session()`, `var_dump`/`print_r`→`dump`, and `print`→`echo`, and adds `TODO(migrate)` comments to `require` and `global`.
+It then runs the type checker and shows the places that need manual work, such as type annotations.
 
-## 17. 実行の仕組み
+## 17. How execution works
 
-1. 字句解析・構文解析(手書きの再帰下降 + Pratt パーサ)
-2. 型検査(名前解決、推論、絞り込み、確定代入の解析)→ 型付き中間表現 (HIR)
-3. レジスタ型バイトコードへのコンパイル(`AddI`、`LtI`、`JumpIfNotLtIImm` などの型に特化した命令)
-4. 実行
-   - **インタプリタ**: 安全な Rust だけで書かれている。文字列・list・map は参照カウント + コピーオンライト。
-   - **JIT**(Cranelift): すべての値が `int`/`bool` の関数(数値計算のループや再帰)はネイティブコードになる。
-     オーバーフロー、0 での剰余、負のシフト、再帰の深さ、実行時間・メモリの上限は JIT でも同じように検査される。
-     `PHX_JIT=0` で無効にできる。JIT の中で起きた例外のスタックトレースは呼び出し元までになる。
-5. **バイトコードキャッシュ**: `phx run` と `phx serve` はコンパイル結果を `.phx-cache/` に保存し、
-   ソースファイルと `phx` 本体が変わっていなければ再利用する。
-   - キャッシュはユーザーごとの鍵(`%LOCALAPPDATA%\phx\cache.key`、`~/.cache/phx/cache.key`)の HMAC で
-     署名し、署名が合わないものは読まない。ほかの人から受け取ったプロジェクトに `.phx-cache/` が入っていても、
-     ソースと違うコードが動くことはない。
-   - エントリはスクリプトとプロジェクトごと。依存するすべてのファイルの内容(SHA-256)を記録し、読み込むときに
-     確かめる(更新時刻を保つコピーや、同じ長さの書き換えでも古いコードは使われない)。
-   - `.phx-cache/` がリンクなら使わない。中のファイルも、リンクやハードリンクなら読み書きしない。
+1. Lexing and parsing (hand-written recursive descent + Pratt parser)
+2. Type checking (name resolution, inference, narrowing, definite assignment analysis) → typed intermediate representation (HIR)
+3. Compilation to register-based bytecode (type-specialized instructions such as `AddI`, `LtI`, and `JumpIfNotLtIImm`)
+4. Execution
+   - **Interpreter**: written entirely in safe Rust. Strings, lists, and maps use reference counting + copy-on-write.
+   - **JIT** (Cranelift): functions in which every value is an `int`/`bool` (numeric loops and recursion) are compiled to native code.
+     Overflow, modulo by zero, negative shifts, recursion depth, and the execution time and memory limits are checked in the JIT just as in the interpreter.
+     It can be disabled with `PHX_JIT=0`. The stack trace of an exception raised inside the JIT goes back only as far as the caller.
+5. **Bytecode cache**: `phx run` and `phx serve` save compiled output in `.phx-cache/` and reuse it
+   if neither the source files nor the `phx` binary have changed.
+   - The cache is signed with an HMAC using a per-user key (`%LOCALAPPDATA%\phx\cache.key`, `~/.cache/phx/cache.key`), and entries whose
+     signature does not match are not read. Even if a project received from someone else contains `.phx-cache/`,
+     code that differs from the source never runs.
+   - Entries are per script and per project. Each records the contents (SHA-256) of all the files it depends on, and these are verified on load
+     (old code is not used even after a copy that preserves modification times or a rewrite that keeps the same length).
+   - If `.phx-cache/` is a link, it is not used. Files inside it are neither read nor written if they are links or hard links.
 
-### 実行時の上限
+### Runtime limits
 
-| 上限 | 既定 | 超えたとき |
+| Limit | Default | When exceeded |
 |---|---|---|
-| 実行時間 | `serve`: 30 秒(`--time-limit`)、`run`: なし | 致命的エラー(捕捉できない) |
-| メモリ | 128 MB(`[security] memory_limit_mb`) | 致命的エラー |
-| 呼び出しの深さ | 10,000 | 致命的エラー |
-| リクエスト本文 | 8 MB | 413 |
+| Execution time | `serve`: 30 seconds (`--time-limit`), `run`: none | Fatal error (cannot be caught) |
+| Memory | 128 MB (`[security] memory_limit_mb`) | Fatal error |
+| Call depth | 10,000 | Fatal error |
+| Request body | 8 MB | 413 |
 
-`unsafe` を使っているのは、メモリ使用量を数えるアロケータ(`phx_vm/src/alloc.rs`)と JIT
-(`phx_jit`、生成したコードの呼び出し)だけ。
+`unsafe` is used only in the allocator that counts memory usage (`phx_vm/src/alloc.rs`) and in the JIT
+(`phx_jit`, for calling generated code).
 
-## 18. 今後の予定
+## 18. Roadmap
 
-- ジェネリッククラス、アノテーション(属性)
-- 非同期 I/O、HTTP クライアント(`[permissions].net`)
-- JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
-- 推移的な依存関係の解決、パッケージレジストリ
-- LSP の定義ジャンプ・補完、`phx fmt` の行の折り返し
-- 複数プロセスで共有できるレート制限、データベースに保存するセッション
+- Generic classes, annotations (attributes)
+- Asynchronous I/O, HTTP client (`[permissions].net`)
+- Wider JIT coverage (functions that handle floats and strings), AOT compilation
+- Transitive dependency resolution, a package registry
+- Go-to-definition and completion in the LSP, line wrapping in `phx fmt`
+- Rate limiting shared across multiple processes, sessions stored in a database
 
-セキュリティ監査の結果と残っているリスクは [security-audit.md](security-audit.md) を参照。
+See [security-audit.md](security-audit.md) for the results of the security audit and the remaining risks.
