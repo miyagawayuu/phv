@@ -1,0 +1,8 @@
+error: a URL attribute cannot start with an unchecked value
+ --> profile.phx:5:14
+  |
+5 | <a href="<?= $site ?>">Website</a>
+  |              ^^^^^
+  = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
+
+1 error found

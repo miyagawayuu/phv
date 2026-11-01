@@ -50,6 +50,13 @@ jobs:
           ./target/release/phx fmt --check examples
           ./target/release/phx test examples
           ./target/release/phx check examples/site/public/index.phx
+      - name: Website samples match the compiler
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          ./target/release/phx check website/samples/hero.phx
+          ./target/release/phx check website/samples/profile.phx > profile.out 2>&1 && exit 1
+          diff -u website/samples/profile.err profile.out
 
   editor:
     name: VS Code extension
@@ -63,6 +70,19 @@ jobs:
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
           npm test
+
+  website:
+    name: website
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build phx-lang.org
+        working-directory: website
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
 
   fuzz:
     name: longer fuzzing

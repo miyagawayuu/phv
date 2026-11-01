@@ -1,0 +1,15 @@
+{
+  "name": "phx-lang-website",
+  "private": true,
+  "description": "The phx-lang.org website: a static site built from docs/ and the landing pages.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "serve": "node build.mjs && node serve.mjs"
+  },
+  "devDependencies": {
+    "marked": "18.1.1",
+    "shiki": "4.5.0"
+  }
+}

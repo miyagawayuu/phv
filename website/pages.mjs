@@ -1,0 +1,132 @@
+// Content of the landing pages (English and Japanese). The code samples live in
+// samples/; CI type-checks them with `phx check` (see .github/workflows/ci.yml).
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const sample = (name) => fs.readFileSync(path.join(here, "samples", name), "utf8").trimEnd();
+
+const releases = "https://github.com/miyagawayuu/phx/releases";
+
+// What `phx check samples/profile.phx` prints (CI checks that it still does).
+const errorOutput = sample("profile.err");
+
+const text = {
+  en: {
+    title: "PHX — PHP's ease, with safety built in",
+    description: "PHX is a web language that keeps the feel of PHP while the compiler guarantees type safety, safe output and speed.",
+    tagline: "PHP's ease, with safety built in.",
+    lead: "PHX keeps what made PHP productive — <code>$variables</code>, HTML templates, routing by file, save and reload — and makes the compiler responsible for type safety, safe output and speed.",
+    download: "Download",
+    readSpec: "Read the specification",
+    features: [
+      ["Typed, without ceremony", "A variable's type comes from its first assignment. No implicit conversions, strict <code>==</code>, null safety with <code>?T</code>, <code>?-&gt;</code> and <code>??</code>, generics, interfaces and enums."],
+      ["Escaping that knows where it is", "Output is escaped automatically, and the compiler tracks the HTML around every <code>&lt;?= ?&gt;</code>. A string at the start of a URL, inside <code>&lt;script&gt;</code> or in an event handler is a compile error."],
+      ["SQL without injection", "Queries are <code>sql\"...\"</code> literals. Interpolated values always become bound parameters — there is no way to build SQL text from a string."],
+      ["Locked down by default", "A Content-Security-Policy with automatic nonces, CSRF checks, server-side sessions, rate limiting, and file access only where <code>phx.toml</code> allows it."],
+      ["Fast", "A typed register VM, a Cranelift JIT for numeric code, and a signed bytecode cache. <code>fib(30)</code> runs in about 7 ms."],
+      ["Everything in one command", "<code>phx serve</code>, <code>test</code>, <code>fmt</code>, <code>lsp</code>, <code>install</code> and <code>migrate</code> (from PHP), plus a VS Code extension."],
+    ],
+    mistakesTitle: "Mistakes are compile errors",
+    mistakesLead: "Escaping alone cannot make a URL safe: <code>javascript:alert(1)</code> contains nothing to escape. PHX knows the value lands at the start of an <code>href</code> and refuses to compile until it is checked.",
+    downloadTitle: "Download",
+    downloadLead: (v) => `PHX ${v} for Windows, Linux and macOS. Unpack the archive and put <code>phx</code> on your <code>PATH</code>.`,
+    platform: "Platform",
+    archive: "Archive",
+    verify: "Check the archive against <code>SHA256SUMS</code> from the same release, then run it:",
+    source: "Or build from source with a recent stable Rust and a C compiler: <code>cargo build --release</code>.",
+    editor: "For VS Code, install the extension from <code>editors/vscode</code> for highlighting and live diagnostics.",
+    securityTitle: "Security",
+    securityLead: `PHX has been through three security audits, each followed by fixes and regression tests. Read the <a href="docs/security.html">audit report</a>. To report a vulnerability, email <a href="mailto:security@phx-lang.org">security@phx-lang.org</a>.`,
+    getStarted: "Get started",
+  },
+  ja: {
+    title: "PHX — PHP の手軽さに、安全を組み込んだ言語",
+    description: "PHX は、PHP の書き味のまま、型安全・安全な出力・速度をコンパイラが保証する Web 向けの言語です。",
+    tagline: "PHP の手軽さに、安全を組み込む。",
+    lead: "<code>$変数</code>、HTML テンプレート、ファイル単位のルーティング、保存してすぐ反映 — PHP の生産性はそのままに、型安全・安全な出力・速度をコンパイラが引き受けます。",
+    download: "ダウンロード",
+    readSpec: "言語仕様を読む",
+    features: [
+      ["気負わない型安全", "変数の型は最初の代入で決まります。暗黙の型変換なし、<code>==</code> は常に厳密、<code>?T</code>・<code>?-&gt;</code>・<code>??</code> による null 安全、ジェネリクス、interface、enum。"],
+      ["場所を知っているエスケープ", "出力は自動でエスケープされ、コンパイラはすべての <code>&lt;?= ?&gt;</code> の周りの HTML を追跡します。URL の先頭、<code>&lt;script&gt;</code> の中、イベント属性に文字列を置くとコンパイルエラーです。"],
+      ["SQL インジェクションのない SQL", "クエリは <code>sql\"...\"</code> リテラルで書きます。埋め込んだ値は必ずプレースホルダになり、文字列から SQL を組み立てる方法はありません。"],
+      ["既定で守りが固い", "nonce 付きの Content-Security-Policy、CSRF の検査、サーバー側のセッション、レート制限。ファイルに触れるのは <code>phx.toml</code> で許可した場所だけ。"],
+      ["速い", "型に特化したレジスタ VM、数値計算向けの Cranelift JIT、署名付きのバイトコードキャッシュ。<code>fib(30)</code> は約 7 ms。"],
+      ["ひとつのコマンドで全部", "<code>phx serve</code>・<code>test</code>・<code>fmt</code>・<code>lsp</code>・<code>install</code>・<code>migrate</code>(PHP からの移行)。VS Code 拡張もあります。"],
+    ],
+    mistakesTitle: "間違いはコンパイルエラーに",
+    mistakesLead: "エスケープだけでは URL は安全になりません。<code>javascript:alert(1)</code> にはエスケープする文字がないからです。PHX は値が <code>href</code> の先頭に入ることを知っていて、確認されるまでコンパイルを通しません。",
+    downloadTitle: "ダウンロード",
+    downloadLead: (v) => `Windows・Linux・macOS 向けの PHX ${v}。アーカイブを展開して、<code>phx</code> を <code>PATH</code> の通った場所に置いてください。`,
+    platform: "プラットフォーム",
+    archive: "アーカイブ",
+    verify: "同じリリースの <code>SHA256SUMS</code> でアーカイブを確かめてから実行します:",
+    source: "ソースからビルドするなら、最近の安定版 Rust と C コンパイラで <code>cargo build --release</code>。",
+    editor: "VS Code では <code>editors/vscode</code> の拡張を入れると、色分けと入力中のエラー表示が使えます。",
+    securityTitle: "セキュリティ",
+    securityLead: `PHX は 3 回のセキュリティ監査を受け、そのたびに修正と回帰テストを加えています。<a href="docs/security.html">監査報告</a>をご覧ください。脆弱性の報告は <a href="mailto:security@phx-lang.org">security@phx-lang.org</a> へ。`,
+    getStarted: "はじめる",
+  },
+};
+
+export function landing(lang, version, code) {
+  const t = text[lang];
+  const platforms = [
+    ["Windows x64", `phx-${version}-x86_64-pc-windows-msvc.zip`],
+    ["Linux x64", `phx-${version}-x86_64-unknown-linux-gnu.tar.gz`],
+    ["macOS (Apple Silicon)", `phx-${version}-aarch64-apple-darwin.tar.gz`],
+    ["macOS (Intel)", `phx-${version}-x86_64-apple-darwin.tar.gz`],
+  ];
+  const rows = platforms
+    .map(([p, file]) => `<tr><td>${p}</td><td><a href="${releases}/download/v${version}/${file}"><code>${file}</code></a></td></tr>`)
+    .join("\n");
+  const cards = t.features.map(([h, p]) => `<div class="card"><h3>${h}</h3><p>${p}</p></div>`).join("\n");
+  const docs = lang === "en" ? "docs/" : "docs/";
+  const body = `<section class="hero">
+  <div class="hero-text">
+    <h1>${t.tagline}</h1>
+    <p class="lead">${t.lead}</p>
+    <p class="actions"><a class="button primary" href="#download">${t.download} ${version}</a> <a class="button" href="${docs}spec.html">${t.readSpec}</a></p>
+  </div>
+  <div class="hero-code">${code(sample("hero.phx"), "phx")}</div>
+</section>
+
+<section class="features">
+${cards}
+</section>
+
+<section class="split">
+  <div>
+    <h2>${t.mistakesTitle}</h2>
+    <p>${t.mistakesLead}</p>
+  </div>
+  <div>
+    ${code(sample("profile.phx"), "phx")}
+    <pre class="terminal"><code>${errorOutput.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</code></pre>
+  </div>
+</section>
+
+<section id="download" class="download">
+  <h2>${t.downloadTitle}</h2>
+  <p>${t.downloadLead(version)}</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>${t.platform}</th><th>${t.archive}</th></tr></thead>
+    <tbody>
+${rows}
+    </tbody>
+  </table></div>
+  <p>${t.verify}</p>
+  ${code(`sha256sum -c SHA256SUMS --ignore-missing\ntar -xzf phx-${version}-x86_64-unknown-linux-gnu.tar.gz\n./phx-${version}-x86_64-unknown-linux-gnu/phx --version\n./phx-${version}-x86_64-unknown-linux-gnu/phx serve mysite   # http://127.0.0.1:8080`, "bash")}
+  <p>${t.source}</p>
+  <p>${t.editor}</p>
+</section>
+
+<section class="security">
+  <h2>${t.securityTitle}</h2>
+  <p>${t.securityLead}</p>
+</section>`;
+  return { title: t.title, description: t.description, body };
+}
