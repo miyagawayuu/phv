@@ -34,6 +34,8 @@ export class Request {
         public readonly map<string, string> $cookies,
         public readonly list<UploadedFile> $files,
         public readonly string $body,
+        /** The client's IP address (the proxy's, behind a reverse proxy). */
+        public readonly string $ip,
     ) {}
 
     /** A query string parameter (`?name=value`), or null. */
@@ -199,6 +201,7 @@ export function request(): Request {
         __req_cookies(),
         $files,
         __req_body(),
+        __req_ip(),
     );
 }
 

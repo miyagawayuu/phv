@@ -90,8 +90,12 @@ impl HtmlTracker {
         self.state = if !closing && (tag == "script" || tag == "style") { State::Raw(tag) } else { State::Text };
     }
 
-    pub fn feed(&mut self, text: &str) {
+    /// Advances over literal HTML. Returns the byte offsets just after the
+    /// name of each opening `<script` tag, where the server's CSP nonce goes.
+    pub fn feed(&mut self, text: &str) -> Vec<usize> {
         let chars: Vec<char> = text.chars().collect();
+        let offsets: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+        let mut scripts = Vec::new();
         let mut i = 0;
         while i < chars.len() {
             let c = chars[i];
@@ -107,6 +111,9 @@ impl HtmlTracker {
                     Some(t) => (true, t.to_string()),
                     None => (false, raw),
                 };
+                if !closing && tag == "script" {
+                    scripts.push(offsets[i]);
+                }
                 self.state = State::Tag { name: tag, closing };
                 continue;
             }
@@ -215,6 +222,7 @@ impl HtmlTracker {
             };
             i += 1;
         }
+        scripts
     }
 }
 
@@ -245,5 +253,15 @@ mod tests {
         assert_eq!(ctx("<!-- <script> --><p>"), EchoContext::Text);
         assert_eq!(ctx("<input value='a' disabled>"), EchoContext::Text);
         assert_eq!(ctx("<p>1 < 2 and "), EchoContext::Text);
+    }
+
+    #[test]
+    fn finds_script_tags() {
+        let mut t = HtmlTracker::default();
+        let html = "<p>é</p><SCRIPT src=a.js></script><!-- <script> --><p title=\"<script\"></p><script>";
+        let at = t.feed(html);
+        assert_eq!(at.len(), 2);
+        assert_eq!(&html[..at[0]], "<p>é</p><SCRIPT");
+        assert_eq!(&html[at[1]..], ">");
     }
 }

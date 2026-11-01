@@ -28,11 +28,19 @@ fn to_sql(v: &Value) -> SqlValue {
     }
 }
 
+/// An open database. The directory guard keeps the database's directory
+/// pinned (see `safefs`) while SQLite uses files in it by name.
+struct Db {
+    conn: Connection,
+    _dir: Option<crate::safefs::DirGuard>,
+}
+
 fn conn<'v>(vm: &'v Vm, h: &Value) -> Result<&'v Connection, VmError> {
     vm.resources
         .get(int(h) as usize)
         .and_then(|r| r.as_ref())
-        .and_then(|b| b.downcast_ref::<Connection>())
+        .and_then(|b| b.downcast_ref::<Db>())
+        .map(|d| &d.conn)
         .ok_or_else(|| vm.throw("DatabaseError", "the database connection is closed"))
 }
 
@@ -92,14 +100,30 @@ fn execute(vm: &mut Vm, a: &[Value]) -> R {
 
 fn open(vm: &mut Vm, a: &[Value]) -> R {
     let rel = s(&a[0]).to_string();
-    let c = if rel == ":memory:" {
-        Connection::open_in_memory()
+    let (c, dir) = if rel == ":memory:" {
+        (Connection::open_in_memory().map_err(|e| db_error(vm, e))?, None)
     } else {
-        let path = crate::sys::resolve_path(vm, &rel, true)?;
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        Connection::open_with_flags(path, flags)
-    }
-    .map_err(|e| db_error(vm, e))?;
+        let (dir, name) = crate::sys::resolve_path(vm, &rel, true)?;
+        // SQLite opens the database and its journal files by name, so each must
+        // be missing or a plain file (no link, no second hard link) before and
+        // after opening. The directory itself cannot change meanwhile.
+        let check = |vm: &Vm| -> Result<(), VmError> {
+            for suffix in ["", "-journal", "-wal", "-shm"] {
+                let mut n = name.clone();
+                n.push(suffix);
+                dir.check_plain_or_missing(&n).map_err(|e| crate::sys::fs_error(vm, &rel, "", e))?;
+            }
+            Ok(())
+        };
+        check(vm)?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let c = Connection::open_with_flags(dir.path().join(&name), flags).map_err(|e| db_error(vm, e))?;
+        check(vm)?;
+        (c, Some(dir))
+    };
     c.busy_timeout(Duration::from_secs(5)).map_err(|e| db_error(vm, e))?;
     use rusqlite::limits::Limit;
     // Prevent `ATTACH 'other.db'` from reaching files outside the permissions.
@@ -138,7 +162,7 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
             _ => Authorization::Allow,
         }
     }));
-    vm.resources.push(Some(Box::new(c)));
+    vm.resources.push(Some(Box::new(Db { conn: c, _dir: dir })));
     Ok(Value::Int(vm.resources.len() as i64 - 1))
 }
 

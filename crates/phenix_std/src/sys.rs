@@ -1,12 +1,15 @@
 //! Dates, cryptography, encoding, files and environment variables.
 
+use crate::safefs::{self, DirGuard, FsError};
 use crate::{int, s};
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, Offset, TimeZone, Timelike, Utc};
 use hmac::{Hmac, Mac};
 use phenix_vm::{BuiltinFn, Key, Value, Vm, VmError};
 use sha2::{Digest, Sha256, Sha384, Sha512};
+use std::ffi::OsString;
 use std::fmt::Write;
-use std::path::{Component, Path, PathBuf};
+use std::io::{Read, Write as _};
+use std::path::{Component, Path};
 
 // ----- dates ----------------------------------------------------------------
 
@@ -132,6 +135,11 @@ fn strtotime(text: &str) -> Option<i64> {
 
 // ----- crypto -----------------------------------------------------------------
 
+/// SHA-256 of `data` as lowercase hex.
+pub fn sha256_hex(data: &[u8]) -> String {
+    hex(&Sha256::digest(data))
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -205,8 +213,10 @@ fn permission_error(vm: &Vm, msg: String) -> VmError {
 }
 
 /// Resolves a project-relative path, checking `[permissions]` in phenix.toml
-/// and refusing `..`, absolute paths and symlinks that leave the allowed directory.
-pub fn resolve_path(vm: &Vm, rel: &str, write: bool) -> Result<PathBuf, VmError> {
+/// and refusing `..` and absolute paths. The directory that holds the file is
+/// opened without following links (see `safefs`) and returned with the file
+/// name; the guard keeps it pinned while the file is used.
+pub fn resolve_path(vm: &Vm, rel: &str, write: bool) -> Result<(DirGuard, OsString), VmError> {
     let p = Path::new(rel);
     let simple = !rel.is_empty()
         && !rel.contains('\0')
@@ -230,39 +240,36 @@ pub fn resolve_path(vm: &Vm, rel: &str, write: bool) -> Result<PathBuf, VmError>
         };
         return Err(permission_error(vm, msg));
     };
-    let root = &vm.host.root;
-    let base = root
-        .join(dir.trim_end_matches('/'))
-        .canonicalize()
-        .map_err(|_| permission_error(vm, format!("the allowed directory \"{dir}\" does not exist")))?;
-    let full = root.join(p);
-    // Links are refused outright (a dangling link would otherwise be followed
-    // when writing). The parent is resolved and checked, and the returned path
-    // is built from that resolved parent, so later operations use it.
-    if let Ok(meta) = std::fs::symlink_metadata(&full) {
-        if meta.file_type().is_symlink() || is_reparse_point(&meta) {
-            return Err(permission_error(vm, format!("\"{rel}\" is a link; links are not followed")));
+    let dir = dir.trim_end_matches('/');
+    let inner = p.strip_prefix(dir).unwrap_or(p);
+    let base = vm.host.root.join(dir);
+    safefs::open_parent(&base, inner).map_err(|e| fs_error(vm, rel, dir, e))
+}
+
+/// Turns a `safefs` refusal into the exception a script sees.
+pub fn fs_error(vm: &Vm, rel: &str, dir: &str, e: FsError) -> VmError {
+    match e {
+        FsError::Link => permission_error(vm, format!("\"{rel}\" goes through a link; links are not followed")),
+        FsError::HardLink => {
+            permission_error(vm, format!("\"{rel}\" has several hard links; only files with one link can be used"))
         }
+        FsError::NotFile => vm.throw("RuntimeException", format!("\"{rel}\" is not a regular file")),
+        FsError::NoDir if dir.is_empty() => {
+            vm.throw("RuntimeException", format!("directory of \"{rel}\" does not exist"))
+        }
+        FsError::NoDir => {
+            vm.throw("RuntimeException", format!("directory of \"{rel}\" does not exist (or \"{dir}\" is missing)"))
+        }
+        FsError::BadName => permission_error(
+            vm,
+            format!("\"{rel}\" is not a safe file name (no `:`, trailing dots or spaces, or device names like CON)"),
+        ),
+        FsError::Shared => permission_error(
+            vm,
+            format!("\"{dir}/\" is writable by other users; remove that permission (chmod o-w) before using it"),
+        ),
+        FsError::Io(e) => vm.throw("RuntimeException", format!("cannot access \"{rel}\": {}", e.kind())),
     }
-    let (Some(parent), Some(name)) = (full.parent(), full.file_name()) else {
-        return Err(permission_error(vm, format!("\"{rel}\" is not a file path")));
-    };
-    match parent.canonicalize() {
-        Ok(c) if c.starts_with(&base) => Ok(c.join(name)),
-        Ok(_) => Err(permission_error(vm, format!("\"{rel}\" points outside \"{dir}\""))),
-        Err(_) => Err(vm.throw("RuntimeException", format!("directory of \"{rel}\" does not exist"))),
-    }
-}
-
-#[cfg(windows)]
-fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    meta.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT (junctions, symlinks)
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(_: &std::fs::Metadata) -> bool {
-    false
 }
 
 fn refuse_code(vm: &Vm, rel: &str) -> Result<(), VmError> {
@@ -371,10 +378,12 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "file_get_contents" => |vm, a| {
             let rel = s(&a[0]).to_string();
-            let path = resolve_path(vm, &rel, false)?;
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let (dir, name) = resolve_path(vm, &rel, false)?;
+            let mut f = dir.open(&name, false).map_err(|e| fs_error(vm, &rel, "", e))?;
+            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
             vm.reserve(size as usize)?;
-            let bytes = std::fs::read(&path).map_err(|e| io_error(vm, "cannot read", &rel, e))?;
+            let mut bytes = Vec::with_capacity(size as usize);
+            f.read_to_end(&mut bytes).map_err(|e| io_error(vm, "cannot read", &rel, e))?;
             String::from_utf8(bytes)
                 .map(Value::str)
                 .map_err(|_| vm.throw("ValueError", format!("\"{rel}\" is not UTF-8 text")))
@@ -382,18 +391,26 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         "file_put_contents" => |vm, a| {
             let rel = s(&a[0]).to_string();
             refuse_code(vm, &rel)?;
-            let path = resolve_path(vm, &rel, true)?;
-            std::fs::write(&path, s(&a[1])).map_err(|e| io_error(vm, "cannot write", &rel, e))?;
+            let (dir, name) = resolve_path(vm, &rel, true)?;
+            let mut f = dir.open(&name, true).map_err(|e| fs_error(vm, &rel, "", e))?;
+            f.write_all(s(&a[1]).as_bytes()).map_err(|e| io_error(vm, "cannot write", &rel, e))?;
             Ok(Value::Null)
         },
         "file_exists" => |vm, a| {
-            let path = resolve_path(vm, s(&a[0]), false)?;
-            Ok(Value::Bool(path.exists()))
+            let rel = s(&a[0]).to_string();
+            let (dir, name) = resolve_path(vm, &rel, false)?;
+            match dir.exists(&name) {
+                Ok(b) => Ok(Value::Bool(b)),
+                Err(e) => Err(fs_error(vm, &rel, "", e)),
+            }
         },
         "unlink" => |vm, a| {
             let rel = s(&a[0]).to_string();
-            let path = resolve_path(vm, &rel, true)?;
-            std::fs::remove_file(&path).map_err(|e| io_error(vm, "cannot delete", &rel, e))?;
+            let (dir, name) = resolve_path(vm, &rel, true)?;
+            dir.remove(&name).map_err(|e| match e {
+                FsError::Io(e) => io_error(vm, "cannot delete", &rel, e),
+                e => fs_error(vm, &rel, "", e),
+            })?;
             Ok(Value::Null)
         },
         "getenv" => |vm, a| {

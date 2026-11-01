@@ -23,7 +23,7 @@
 use phenix_vm::{Host, Permissions};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Deserialize, Default)]
@@ -56,9 +56,17 @@ struct Security {
     session_ttl: u64,
     #[serde(default = "default_memory")]
     memory_limit_mb: u64,
-    /// Content-Security-Policy header added to every page (none by default).
+    /// Content-Security-Policy: "default" (when missing), "off", or a policy
+    /// in which `{nonce}` becomes this response's nonce.
     #[serde(default)]
     csp: Option<String>,
+    /// Requests per minute accepted from one client address (0 = no limit).
+    #[serde(default)]
+    requests_per_minute: u32,
+    /// "memory" (default) or a directory inside the project for session files,
+    /// so sessions survive restarts and are shared by several server processes.
+    #[serde(default)]
+    session_store: Option<String>,
 }
 
 impl Default for Security {
@@ -69,6 +77,38 @@ impl Default for Security {
             session_ttl: default_ttl(),
             memory_limit_mb: default_memory(),
             csp: None,
+            requests_per_minute: 0,
+            session_store: None,
+        }
+    }
+}
+
+/// Policy used when phenix.toml does not set `csp`. Inline scripts run only
+/// with the response's nonce, which Phenix adds to every `<script>` tag
+/// written in a template; injected markup (via `raw()`) never has it.
+pub const DEFAULT_CSP: &str = "default-src 'self'; script-src 'self' {nonce}; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'";
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Csp {
+    Off,
+    /// A policy; `{nonce}` is replaced per response.
+    Policy(String),
+}
+
+impl Csp {
+    /// Whether responses need a nonce (the policy mentions `{nonce}`).
+    pub fn uses_nonce(&self) -> bool {
+        matches!(self, Csp::Policy(p) if p.contains("{nonce}"))
+    }
+
+    /// The header value for a response with `nonce` (None: no inline scripts allowed).
+    pub fn header(&self, nonce: Option<&str>) -> Option<String> {
+        match self {
+            Csp::Off => None,
+            Csp::Policy(p) => {
+                let n = nonce.map(|n| format!("'nonce-{n}'")).unwrap_or_default();
+                Some(p.replace("{nonce}", &n).replace("  ", " ").replace(" ;", ";"))
+            }
         }
     }
 }
@@ -113,7 +153,10 @@ pub struct Config {
     pub secure_cookies: bool,
     pub session_ttl: u64,
     pub memory_limit_mb: u64,
-    pub csp: Option<String>,
+    pub csp: Csp,
+    pub requests_per_minute: u32,
+    /// Directory for session files; None keeps sessions in memory.
+    pub session_dir: Option<PathBuf>,
     pub dependencies: BTreeMap<String, Dependency>,
 }
 
@@ -126,7 +169,9 @@ impl Config {
             secure_cookies: false,
             session_ttl: default_ttl(),
             memory_limit_mb: default_memory(),
-            csp: None,
+            csp: Csp::Policy(DEFAULT_CSP.into()),
+            requests_per_minute: 0,
+            session_dir: None,
             dependencies: BTreeMap::new(),
         }
     }
@@ -195,6 +240,23 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
             }
         }
     }
+    let csp = match file.security.csp.as_deref().map(str::trim) {
+        None | Some("default") => Csp::Policy(DEFAULT_CSP.into()),
+        Some("off") | Some("") => Csp::Off,
+        Some(p) if p.contains(['\r', '\n']) => return Err("[security].csp must be on one line".into()),
+        Some(p) => Csp::Policy(p.to_string()),
+    };
+    let session_dir = match file.security.session_store.as_deref() {
+        None | Some("memory") => None,
+        Some(d) => {
+            check_dir("session_store", d).map_err(|e| e.replace("[permissions].", "[security]."))?;
+            let first = Path::new(d).components().find(|c| !matches!(c, std::path::Component::CurDir));
+            if first.is_some_and(|c| c.as_os_str().eq_ignore_ascii_case("public")) {
+                return Err(format!("[security].session_store: \"{d}\" is inside public/, where files are served"));
+            }
+            Some(root.join(d))
+        }
+    };
     let permissions =
         Permissions { read: file.permissions.read, write: file.permissions.write, env: file.permissions.env };
     Ok(Config {
@@ -204,7 +266,9 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
         secure_cookies: file.security.secure_cookies,
         session_ttl: file.security.session_ttl,
         memory_limit_mb: file.security.memory_limit_mb,
-        csp: file.security.csp,
+        csp,
+        requests_per_minute: file.security.requests_per_minute,
+        session_dir,
         dependencies: file.dependencies,
     })
 }

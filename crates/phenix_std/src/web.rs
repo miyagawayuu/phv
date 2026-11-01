@@ -387,12 +387,13 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             if name.ends_with(".phx") || name.ends_with(".phx.html") {
                 return Err(vm.throw("PermissionError", "uploads cannot be saved as .phx files"));
             }
-            // A file that is a link is refused inside resolve_path.
             let i = int(&a[0]) as usize;
-            let path = crate::sys::resolve_path(vm, s(&a[1]), true)?;
+            let rel = s(&a[1]).to_string();
+            let (dir, name) = crate::sys::resolve_path(vm, &rel, true)?;
             let Some(f) = vm.http.files.get(i) else { return Ok(Value::Null) };
-            std::fs::write(&path, &f.data)
-                .map_err(|e| vm.throw("RuntimeException", format!("cannot save upload: {e}")))?;
+            let mut out = dir.open(&name, true).map_err(|e| crate::sys::fs_error(vm, &rel, "", e))?;
+            std::io::Write::write_all(&mut out, &f.data)
+                .map_err(|e| vm.throw("RuntimeException", format!("cannot save upload: {}", e.kind())))?;
             Ok(Value::Null)
         },
         _ => return None,

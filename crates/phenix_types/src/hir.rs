@@ -155,7 +155,8 @@ pub struct HCatch {
 pub enum HStmt {
     Expr(HExpr),
     Echo(HExpr),
-    Html(String),
+    /// Literal HTML and the offsets of its opening `<script` tags.
+    Html(String, Vec<usize>),
     Assign(HPlace, HExpr),
     Compound(HPlace, BinKind, HExpr),
     CoalesceAssign(HPlace, HExpr),

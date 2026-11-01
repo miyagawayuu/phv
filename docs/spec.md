@@ -16,6 +16,7 @@ Phenix は、PHP の「保存してすぐ動く」「Web に特化」「HTML に
 | 文脈を無視したエスケープ | `<?= ?>` の位置(属性・URL・`<script>`・CSS)を判定し、エスケープでは守れない場所への挿入はコンパイルエラー |
 | CSRF・セッション固定 | フォームの POST はサーバーがトークンを自動で検査。セッション ID はサーバーが発行したものだけを受け付ける |
 | 何でもできるスクリプト | ファイル・環境変数へのアクセスは `phenix.toml` の `[permissions]` で許可したものだけ |
+| 注入されたスクリプトの実行 | 既定の Content-Security-Policy で、テンプレートに書いた `<script>` 以外のインラインスクリプトを止める |
 | ヘッダーインジェクション | 改行を含むヘッダー値は `ValueError` |
 | パストラバーサル | サーバーは `public/` の外、ドットファイル、テンプレートを配信しない |
 | リクエスト間で状態が漏れる | リクエストごとに新しいヒープ。静的プロパティもグローバル変数もない |
@@ -476,9 +477,11 @@ phenix serve examples/site --port 8080
 - ファイルを保存すると次のリクエストで再コンパイルされる(依存する全ファイルの更新時刻を見る)。
 - 上限: 実行時間 30 秒(`--time-limit`)、メモリ 128 MB(`[security] memory_limit_mb`)、本文 8 MB、ヘッダーの受信 10 秒、
   本文の受信 30 秒、同時接続 1024、クエリ・フォームの項目 1000 個。
+- `[security] requests_per_minute` を書くと、1 つの接続元アドレスから 1 分間に受け付けるリクエストをその数までにする
+  (超えると `429 Too Many Requests` と `Retry-After`)。既定は無制限。
 - 既定で付けるヘッダー: `X-Content-Type-Options: nosniff`、`X-Frame-Options: SAMEORIGIN`、
-  `Referrer-Policy: strict-origin-when-cross-origin`。`secure_cookies = true` なら HSTS、`[security] csp` を書けば
-  Content-Security-Policy。セッションや Cookie を使うレスポンスには `Cache-Control: private, no-store`。
+  `Referrer-Policy: strict-origin-when-cross-origin`、Content-Security-Policy(下の「Content-Security-Policy」)。
+  `secure_cookies = true` なら HSTS。セッションや Cookie を使うレスポンスには `Cache-Control: private, no-store`。
   `Server` / `X-Powered-By` のようなバージョン情報は出さない。スクリプトは `Content-Length` などの通信用ヘッダーを設定できない。
 - 開発モードではコンパイルエラーと実行時エラーの詳細をブラウザに表示する。開発モードが既定になるのは
   `127.0.0.1` / `localhost` で待ち受けるときだけ(`--dev` / `--prod` で明示できる)。
@@ -498,6 +501,7 @@ $req->cookie("theme");     // ?string
 $req->file("avatar");      // ?UploadedFile
 $req->json();              // any
 $req->body;                // string
+$req->ip;                  // string(接続元の IP アドレス。リバースプロキシの後ろではプロキシのアドレス)
 $req->isPost();            // bool
 
 response()->status(404);
@@ -521,10 +525,14 @@ session()->flash("notice");           // 読んだら消えるメッセージ
 session()->destroy();                 // ログアウト
 ```
 
-- 値はサーバーのメモリに保存され、Cookie には 256 ビットの乱数の ID だけが入る
+- 値はサーバー側に保存され、Cookie には 256 ビットの乱数の ID だけが入る
   (`PHXSESSID`、`HttpOnly`、`SameSite=Lax`、`[security] secure_cookies = true` で `Secure`)。
 - サーバーが発行していない ID は受け付けない。1 セッションの値は合計 64 KB まで。
-- `[security] session_ttl` 秒アクセスがないと消える。サーバーを再起動すると消える。
+- `[security] session_ttl` 秒アクセスがないと消える。アクセスが続いても 24 時間で消える。
+- 既定の保存先はメモリで、サーバーを再起動すると消える。`[security] session_store = "sessions/"` のように
+  プロジェクト内のディレクトリを書くと、1 セッション 1 ファイルで保存する。再起動しても残り、同じディレクトリを使う
+  複数のサーバープロセスで共有できる。ファイル名は ID のハッシュなので、ディレクトリの一覧から ID は分からない。
+  `public/` の中は指定できない。
 
 ### CSRF 対策
 
@@ -616,6 +624,42 @@ $db->transaction(function () use ($db): void {
 | `base64_encode`, `base64_decode: ?string`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | |
 | `json_decode($s): any` | 深さ 128 まで |
 
+### Content-Security-Policy
+
+ページのレスポンスには既定で次のポリシーが付く(`{nonce}` はレスポンスごとの乱数)。
+
+```
+default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'unsafe-inline';
+img-src 'self' data: https:; font-src 'self' data:; object-src 'none'; base-uri 'self';
+form-action 'self'; frame-ancestors 'self'
+```
+
+- テンプレート(`.phx.html` と `.phx` の HTML 部分)に書いた `<script>` タグには、Phenix が自動で
+  `nonce="..."` を付ける。そのため、自分で書いたインラインスクリプトはそのまま動き、エスケープをすり抜けて
+  注入されたスクリプト(`raw()` に入った `<script>` など)は動かない。
+- `onclick="..."` のようなイベント属性と `javascript:` の URL は止まる。`addEventListener` を使う。
+- 文字列から組み立てた `<script>` に nonce が必要なときは `csp_nonce()` を使う
+  (`raw("<script nonce=\"" . csp_nonce() . "\">...</script>")`)。
+- 静的ファイルとエラーページには nonce のないポリシーが付く(静的な `.html` のインラインスクリプトは動かない)。
+- 変更: `[security] csp = "off"` で付けない。`csp = "default-src 'self'; script-src 'self' {nonce}"` のように
+  書くとそのポリシーを使う(`{nonce}` は `'nonce-...'` になる)。
+
+### レート制限
+
+```phx
+if (!rate_limit("login:" . request()->ip, 5, 60)) {     // 60 秒に 5 回まで
+    response()->status(429);
+    echo "しばらく待ってからやり直してください。";
+    return;
+}
+// ログインに成功したら
+rate_limit_reset("login:" . request()->ip);
+```
+
+- `rate_limit($key, $max, $seconds)` は、そのキーの今の時間枠でまだ `$max` 回に達していなければ 1 回数えて `true`、
+  達していれば `false` を返す。カウンターはサーバープロセスの中で共有され、再起動で消える。
+- サイト全体の制限は `[security] requests_per_minute`(§14)。
+
 ### 権限(phenix.toml)
 
 スクリプトがヒープの外に触れるものは、すべて `phenix.toml` で許可したものだけ。**何も書かなければ何も許可されない。**
@@ -627,8 +671,13 @@ write = ["data/", "storage/"]  # file_put_contents / unlink / saveTo / Database:
 env = ["APP_*"]             # getenv で読める環境変数(末尾 * は前方一致)
 ```
 
-- パスはプロジェクトからの相対パスで、`..` と絶対パスは使えない。シンボリックリンクで許可されたディレクトリの外を
-  指している場合も拒否される。
+- パスはプロジェクトからの相対パスで、`..` と絶対パスは使えない。
+- 許可したディレクトリの下にあるシンボリックリンクとジャンクションはたどらない(リンクを経由するパスは `PermissionError`)。
+  パスは許可したディレクトリから 1 段ずつ、リンクを拒否しながら開くので、検査と使用の間にディレクトリを
+  すり替えられることもない。
+- 開けるのは通常のファイルで、ハードリンクが 1 本だけのもの。外のファイルへのハードリンクを置かれても読み書きしない。
+- ファイル名に `:`(Windows の代替データストリーム)、末尾のドットや空白、`CON` `NUL` `COM1` などのデバイス名は使えない。
+- Unix では、ほかのユーザーが書き込めるディレクトリ(`o+w`)は使えない。
 - 許可されていないときは `PermissionError`(メッセージに `phenix.toml` に書くべき内容が出る)。
 
 ### phenix.toml
@@ -642,6 +691,9 @@ csrf = true             # 既定: true
 secure_cookies = false  # HTTPS で配信するときは true
 session_ttl = 7200      # 秒
 memory_limit_mb = 128   # 1 リクエスト(1 回の実行)あたり
+csp = "default"         # "off" か、{nonce} を含められる独自のポリシー
+requests_per_minute = 0 # 接続元アドレスごとの上限(0 は無制限)
+session_store = "memory"  # またはディレクトリ("sessions/")
 
 [permissions]
 write = ["data/"]
@@ -675,6 +727,8 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 | `rand(int, int): int` | 疑似乱数(暗号用途には使わない。`random_int` を使う) |
 | `json_decode(string): any`, `json_html(any): Html`, `safe_url(string): Html` | §13、§14 |
 | `csrf_token(): string`, `csrf_field(): Html` | §14 |
+| `csp_nonce(): string` | このレスポンスの CSP の nonce(§14) |
+| `rate_limit(string, int, int): bool`, `rate_limit_reset(string)` | §14 |
 | `date`, `gmdate`, `mktime`, `strtotime`, `checkdate` | 日付(§14 の表) |
 | `random_int`, `random_token`, `password_hash`, `password_verify`, `hash`, `hash_hmac`, `hash_equals` | 暗号(§14 の表) |
 | `base64_encode`, `base64_decode`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | エンコード |
@@ -796,6 +850,6 @@ phenix migrate legacy/page.php      # page.phx を書き出す
 - JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
 - 推移的な依存関係の解決、パッケージレジストリ
 - LSP の定義ジャンプ・補完、`phenix fmt` の行の折り返し
-- 複数プロセスで共有できるセッション保存先、レート制限
+- 複数プロセスで共有できるレート制限、データベースに保存するセッション
 
 セキュリティ監査の結果と残っているリスクは [security-audit.md](security-audit.md) を参照。

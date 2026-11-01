@@ -3,13 +3,22 @@
 //!
 //! The store is bounded by count and by bytes; when full, the least recently
 //! used sessions are evicted, so a flood of new sessions cannot lock out
-//! real visitors or exhaust memory.
+//! real visitors or exhaust memory or disk.
+//!
+//! Sessions live in memory unless `[security] session_store` names a
+//! directory: then each session is a file (named by a hash of its id, so a
+//! directory listing reveals no ids), and sessions survive restarts and are
+//! shared by every server process using the directory.
 
 use indexmap::IndexMap;
+use phenix_std::safefs;
 use phenix_vm::SessionData;
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_SESSIONS: usize = 50_000;
 const MAX_BYTES: usize = 256 * 1024 * 1024;
@@ -35,6 +44,7 @@ pub struct Store {
     pub cookie: &'static str,
     secure: bool,
     inner: Mutex<Inner>,
+    files: Option<FileStore>,
 }
 
 fn valid_id(id: &str) -> bool {
@@ -53,13 +63,124 @@ pub fn cookie_value<'a>(header: Option<&'a str>, name: &str) -> Option<&'a str> 
     })
 }
 
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// One session file: `{"created": t, "last": t, "values": {...}}` (Unix times).
+struct Record {
+    created: u64,
+    last: u64,
+    values: IndexMap<String, String>,
+}
+
+struct FileStore {
+    dir: PathBuf,
+    /// Unix time of the last sweep for expired and excess files.
+    swept: AtomicU64,
+}
+
+impl FileStore {
+    fn name(id: &str) -> String {
+        format!("{}.json", phenix_std::sha256_hex(format!("phenix-session:{id}").as_bytes()))
+    }
+
+    fn read(&self, id: &str) -> Option<Record> {
+        let (dir, name) = safefs::open_parent(&self.dir, Path::new(&Self::name(id))).ok()?;
+        let mut text = String::new();
+        dir.open(&name, false).ok()?.take(1 << 20).read_to_string(&mut text).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let values = v["values"]
+            .as_object()?
+            .iter()
+            .map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+            .collect::<Option<IndexMap<_, _>>>()?;
+        Some(Record { created: v["created"].as_u64()?, last: v["last"].as_u64()?, values })
+    }
+
+    /// Writes the file atomically: a temporary file renamed over the old one.
+    fn write(&self, id: &str, r: &Record) -> std::io::Result<()> {
+        let text = serde_json::json!({"created": r.created, "last": r.last, "values": r.values}).to_string();
+        let name = Self::name(id);
+        let tmp = format!(".{name}.{}", phenix_std::random_hex(8));
+        let fail = |e: safefs::FsError| std::io::Error::other(format!("{e:?}"));
+        let (dir, tmp_name) = safefs::open_parent(&self.dir, Path::new(&tmp)).map_err(fail)?;
+        let mut f = dir.open(&tmp_name, true).map_err(fail)?;
+        f.write_all(text.as_bytes())?;
+        drop(f);
+        let result = std::fs::rename(dir.path().join(&tmp_name), dir.path().join(&name));
+        if result.is_err() {
+            let _ = std::fs::remove_file(dir.path().join(&tmp_name));
+        }
+        result
+    }
+
+    fn remove(&self, id: &str) {
+        if let Ok((dir, name)) = safefs::open_parent(&self.dir, Path::new(&Self::name(id))) {
+            let _ = dir.remove(&name);
+        }
+    }
+
+    /// At most every 30 seconds: deletes expired files, then the oldest ones
+    /// while there are too many or they take too much space.
+    fn sweep(&self, ttl: Duration) {
+        let now = now_secs();
+        let last = self.swept.load(Ordering::Relaxed);
+        if now < last + 30 || self.swept.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(&self.dir) else { return };
+        let limit = SystemTime::now() - ttl.min(MAX_LIFETIME);
+        let mut live: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+        for e in rd.flatten() {
+            let Ok(meta) = e.metadata() else { continue };
+            let name = e.file_name().to_string_lossy().into_owned();
+            let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+            if !meta.is_file() || name.starts_with('.') {
+                // Temporary files left by a crash are removed once old.
+                if meta.is_file() && name != ".gitignore" && modified < limit {
+                    let _ = std::fs::remove_file(e.path());
+                }
+                continue;
+            }
+            if modified < limit {
+                let _ = std::fs::remove_file(e.path());
+            } else {
+                live.push((modified, meta.len(), e.path()));
+            }
+        }
+        let mut bytes: u64 = live.iter().map(|l| l.1).sum();
+        if live.len() <= MAX_SESSIONS && bytes <= MAX_BYTES as u64 {
+            return;
+        }
+        live.sort();
+        let mut count = live.len();
+        for (_, len, path) in live {
+            if count <= MAX_SESSIONS * 9 / 10 && bytes <= MAX_BYTES as u64 * 9 / 10 {
+                break;
+            }
+            let _ = std::fs::remove_file(path);
+            count -= 1;
+            bytes -= len;
+        }
+    }
+}
+
 impl Store {
-    pub fn new(ttl: Duration, secure: bool) -> Store {
+    pub fn new(ttl: Duration, secure: bool, dir: Option<PathBuf>) -> Store {
+        let files = dir.map(|dir| {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("warning: cannot create session directory {}: {e}", dir.display());
+            }
+            let _ = std::fs::write(dir.join(".gitignore"), "*\n");
+            FileStore { dir, swept: AtomicU64::new(0) }
+        });
         Store {
             ttl,
             cookie: if secure { "__Host-PHXSESSID" } else { "PHXSESSID" },
             secure,
             inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, requests: 0 }),
+            files,
         }
     }
 
@@ -70,6 +191,21 @@ impl Store {
     /// The session named by the request's cookie, if it exists and has not expired.
     pub fn load(&self, cookie_header: Option<&str>) -> SessionData {
         let id = cookie_value(cookie_header, self.cookie).filter(|v| valid_id(v)).map(str::to_string);
+        if let Some(files) = &self.files {
+            let Some(id) = id else { return SessionData::default() };
+            let Some(mut r) = files.read(&id) else { return SessionData::default() };
+            let now = now_secs();
+            if now >= r.last + self.ttl.as_secs() || now >= r.created + MAX_LIFETIME.as_secs() {
+                files.remove(&id);
+                return SessionData::default();
+            }
+            // Refresh the expiry, at most once a minute per session.
+            if now >= r.last + 60 {
+                r.last = now;
+                let _ = files.write(&id, &r);
+            }
+            return SessionData { id: Some(id), values: r.values, ..SessionData::default() };
+        }
         let mut inner = self.inner.lock().unwrap();
         if let Some(id) = id {
             let alive = inner.map.get(&id).map(|e| self.alive(e));
@@ -110,10 +246,19 @@ impl Store {
         }
     }
 
+    fn cookie_for(&self, id: Option<&str>) -> String {
+        let flags = if self.secure { "; Secure" } else { "" };
+        match id {
+            Some(id) => format!("{}={id}; Path=/; HttpOnly; SameSite=Lax{flags}", self.cookie),
+            None => format!("{}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{flags}", self.cookie),
+        }
+    }
+
     /// Stores the session after a request. Returns the `Set-Cookie` value to send, if any.
     pub fn save(&self, s: SessionData) -> Option<String> {
-        let flags = if self.secure { "; Secure" } else { "" };
-        let name = self.cookie;
+        if let Some(files) = &self.files {
+            return self.save_file(files, s);
+        }
         let mut inner = self.inner.lock().unwrap();
         inner.requests += 1;
         if inner.requests.is_multiple_of(1024) {
@@ -125,7 +270,7 @@ impl Store {
                     inner.bytes -= e.bytes;
                 }
             }
-            return s.id.map(|_| format!("{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{flags}"));
+            return s.id.map(|_| self.cookie_for(None));
         }
         if !s.changed || (s.id.is_none() && s.values.is_empty()) {
             return None;
@@ -148,7 +293,40 @@ impl Store {
         let issue_cookie = s.id.as_deref() != Some(new_id.as_str());
         inner.bytes += bytes;
         inner.map.insert(new_id.clone(), Entry { values: s.values, created, last: Instant::now(), bytes });
-        issue_cookie.then(|| format!("{name}={new_id}; Path=/; HttpOnly; SameSite=Lax{flags}"))
+        issue_cookie.then(|| self.cookie_for(Some(&new_id)))
+    }
+
+    fn save_file(&self, files: &FileStore, s: SessionData) -> Option<String> {
+        files.sweep(self.ttl);
+        if s.destroyed {
+            if let Some(id) = &s.id {
+                files.remove(id);
+            }
+            return s.id.map(|_| self.cookie_for(None));
+        }
+        if !s.changed || (s.id.is_none() && s.values.is_empty()) {
+            return None;
+        }
+        let new_id = match (&s.id, s.regenerate) {
+            (Some(id), false) => id.clone(),
+            _ => phenix_std::random_hex(32),
+        };
+        let now = now_secs();
+        let mut created = now;
+        if let Some(old) = &s.id {
+            if let Some(r) = files.read(old) {
+                created = r.created;
+            }
+            if old != &new_id {
+                files.remove(old);
+            }
+        }
+        if let Err(e) = files.write(&new_id, &Record { created, last: now, values: s.values }) {
+            eprintln!("warning: cannot save session: {e}");
+            return None;
+        }
+        let issue_cookie = s.id.as_deref() != Some(new_id.as_str());
+        issue_cookie.then(|| self.cookie_for(Some(&new_id)))
     }
 }
 
@@ -158,7 +336,7 @@ mod tests {
 
     #[test]
     fn issues_and_reuses_ids() {
-        let store = Store::new(Duration::from_secs(60), true);
+        let store = Store::new(Duration::from_secs(60), true, None);
         assert_eq!(store.cookie, "__Host-PHXSESSID");
         // A request without a session that sets nothing gets no cookie.
         assert!(store.save(store.load(None)).is_none());
@@ -185,7 +363,7 @@ mod tests {
 
     #[test]
     fn a_flood_of_sessions_evicts_old_ones() {
-        let store = Store::new(Duration::from_secs(600), false);
+        let store = Store::new(Duration::from_secs(600), false, None);
         let mut first = None;
         for i in 0..MAX_SESSIONS + 10 {
             let mut s = SessionData::default();
@@ -201,5 +379,40 @@ mod tests {
         drop(inner);
         let id = first.unwrap().split(['=', ';']).nth(1).unwrap().to_string();
         assert!(store.load(Some(&format!("PHXSESSID={id}"))).id.is_none(), "oldest session was evicted");
+    }
+
+    #[test]
+    fn file_store_survives_restarts() {
+        let dir = std::env::temp_dir().join(format!("phenix-sessions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(Duration::from_secs(60), false, Some(dir.clone()));
+        let mut s = SessionData::default();
+        s.values.insert("user".into(), "ann".into());
+        s.changed = true;
+        let cookie = store.save(s).unwrap();
+        let id = cookie.split(['=', ';']).nth(1).unwrap().to_string();
+        let header = format!("PHXSESSID={id}");
+        // Files are named by a hash, never by the id itself.
+        let names: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.iter().all(|n| !n.contains(&id)));
+        // A second store (another process, or after a restart) sees the session.
+        let again = Store::new(Duration::from_secs(60), false, Some(dir.clone()));
+        let loaded = again.load(Some(&header));
+        assert_eq!(loaded.values.get("user").map(String::as_str), Some("ann"));
+        assert!(again.load(Some(&format!("PHXSESSID={}", "b".repeat(64)))).id.is_none());
+        // regenerate() moves it to a new id; destroying removes it.
+        let mut s = again.load(Some(&header));
+        s.regenerate = true;
+        s.changed = true;
+        let cookie2 = again.save(s).unwrap();
+        assert!(again.load(Some(&header)).id.is_none());
+        let header2 = format!("PHXSESSID={}", cookie2.split(['=', ';']).nth(1).unwrap());
+        let mut s = again.load(Some(&header2));
+        assert!(s.id.is_some());
+        s.destroyed = true;
+        assert!(again.save(s).unwrap().contains("Max-Age=0"));
+        assert!(again.load(Some(&header2)).id.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

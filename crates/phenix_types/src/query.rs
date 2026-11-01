@@ -108,7 +108,7 @@ impl<'a> Finder<'a> {
     fn stmt(&mut self, s: &'a HStmt) {
         match s {
             HStmt::Expr(e) | HStmt::Echo(e) | HStmt::Throw(e) => self.expr(e),
-            HStmt::Html(_) | HStmt::Break(_) | HStmt::Continue(_) => {}
+            HStmt::Html(..) | HStmt::Break(_) | HStmt::Continue(_) => {}
             HStmt::Assign(p, e) | HStmt::Compound(p, _, e) | HStmt::CoalesceAssign(p, e) => {
                 self.place(p);
                 self.expr(e);

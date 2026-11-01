@@ -62,6 +62,8 @@ pub struct SessionData {
 pub struct HttpCtx {
     pub method: String,
     pub path: String,
+    /// Address of the connected client (the proxy's, behind a reverse proxy).
+    pub remote_ip: String,
     pub query: Vec<(String, String)>,
     pub form: Vec<(String, String)>,
     pub headers: Vec<(String, String)>,
@@ -74,6 +76,8 @@ pub struct HttpCtx {
     pub csrf_cookie: Option<String>,
     /// A CSRF cookie the server must set (new visitor, or rotated after login).
     pub new_csrf_cookie: Option<String>,
+    /// Nonce of this response's Content-Security-Policy, added to `<script>` tags.
+    pub csp_nonce: Option<String>,
     pub status: u16,
     pub resp_headers: Vec<(String, String)>,
     pub content_type: Option<String>,
@@ -84,6 +88,7 @@ impl Default for HttpCtx {
         HttpCtx {
             method: "GET".into(),
             path: "/".into(),
+            remote_ip: String::new(),
             query: Vec::new(),
             form: Vec::new(),
             headers: Vec::new(),
@@ -93,6 +98,7 @@ impl Default for HttpCtx {
             csrf_secret: Vec::new(),
             csrf_cookie: None,
             new_csrf_cookie: None,
+            csp_nonce: None,
             status: 200,
             resp_headers: Vec::new(),
             content_type: None,
@@ -1196,6 +1202,14 @@ impl Vm {
                     Instr::EchoHtml(c) => {
                         if let Const::Str(s) = &prog.consts[*c as usize] {
                             self.out.last_mut().unwrap().buf.push_str(s);
+                        }
+                    }
+                    Instr::EchoNonce => {
+                        if let Some(n) = &self.http.csp_nonce {
+                            let buf = &mut self.out.last_mut().unwrap().buf;
+                            buf.push_str(" nonce=\"");
+                            buf.push_str(n);
+                            buf.push('"');
                         }
                     }
                     Instr::PushOut => self.out.push(OutBuf { buf: String::new(), html: true }),

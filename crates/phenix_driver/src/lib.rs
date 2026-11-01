@@ -5,7 +5,7 @@ mod cache;
 pub mod config;
 
 pub use cache::compile_cached;
-pub use config::{load_config, Config};
+pub use config::{load_config, Config, Csp, DEFAULT_CSP};
 use phenix_syntax::ast::{Module, StmtKind};
 use phenix_syntax::{diag, parse_module, Diagnostic, SourceMap, Span};
 use phenix_types::{CheckInput, ModuleInput, ModuleKind};

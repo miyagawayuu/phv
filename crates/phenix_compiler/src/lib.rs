@@ -718,9 +718,19 @@ impl<'a> FnC<'a> {
                 let r = self.operand(e);
                 self.emit(Instr::Echo(r));
             }
-            HStmt::Html(text) => {
-                let c = self.pc.str_const(text);
-                self.emit(Instr::EchoHtml(c));
+            HStmt::Html(text, scripts) => {
+                // `<script` tags get the request's CSP nonce: `<script nonce="...">`.
+                let mut from = 0;
+                for &at in scripts {
+                    let c = self.pc.str_const(&text[from..at]);
+                    self.emit(Instr::EchoHtml(c));
+                    self.emit(Instr::EchoNonce);
+                    from = at;
+                }
+                if from < text.len() || scripts.is_empty() {
+                    let c = self.pc.str_const(&text[from..]);
+                    self.emit(Instr::EchoHtml(c));
+                }
             }
             HStmt::Assign(p, value) => {
                 if let (HPlaceBase::Local(id), true) = (&p.base, p.path.is_empty()) {

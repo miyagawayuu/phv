@@ -912,7 +912,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phenix_cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "percent-encoding",
@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "phenix_compiler"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "phenix_syntax",
  "phenix_types",
@@ -937,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "phenix_driver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "phenix_compiler",
  "phenix_jit",
@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "phenix_jit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -964,7 +964,7 @@ dependencies = [
 
 [[package]]
 name = "phenix_server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "form_urlencoded",
@@ -978,12 +978,13 @@ dependencies = [
  "phenix_std",
  "phenix_syntax",
  "phenix_vm",
+ "serde_json",
  "tokio",
 ]
 
 [[package]]
 name = "phenix_std"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "base64",
@@ -991,27 +992,29 @@ dependencies = [
  "getrandom",
  "hmac",
  "indexmap",
+ "libc",
  "percent-encoding",
  "phenix_types",
  "phenix_vm",
  "rusqlite",
  "sha2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "phenix_syntax"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "phenix_types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "phenix_syntax",
 ]
 
 [[package]]
 name = "phenix_vm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "indexmap",
  "serde",

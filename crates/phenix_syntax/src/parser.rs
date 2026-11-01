@@ -282,8 +282,8 @@ impl Parser {
         let kind = match self.peek().clone() {
             Tok::InlineHtml(text) => {
                 self.advance();
-                self.html.feed(&text);
-                StmtKind::InlineHtml(text)
+                let scripts = self.html.feed(&text);
+                StmtKind::InlineHtml(text, scripts)
             }
             Tok::EchoOpen => {
                 self.advance();

@@ -58,7 +58,7 @@ impl Checker<'_> {
                     out.push(HStmt::Echo(h));
                 }
             }
-            StmtKind::InlineHtml(text) => out.push(HStmt::Html(text.clone())),
+            StmtKind::InlineHtml(text, scripts) => out.push(HStmt::Html(text.clone(), scripts.clone())),
             StmtKind::Assign { target, op, value } => self.assign(target, *op, value, out),
             StmtKind::TypedDecl { ty, name, name_span, value } => {
                 let class = self.cx().class;

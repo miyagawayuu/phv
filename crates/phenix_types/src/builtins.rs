@@ -81,6 +81,9 @@ pub static BUILTINS: &[BuiltinSig] = &[
     f("json_decode", "fn(string): any", "json_decode"),
     f("csrf_token", "fn(): string", "csrf_token"),
     f("csrf_field", "fn(): Html", "csrf_field"),
+    f("csp_nonce", "fn(): string", "csp_nonce"),
+    f("rate_limit", "fn(string, int, int): bool", "rate_limit"),
+    f("rate_limit_reset", "fn(string): void", "rate_limit_reset"),
     f("date", "fn(string): string", "date"),
     f("date", "fn(string, int): string", "date_ts"),
     f("gmdate", "fn(string): string", "gmdate"),
@@ -172,6 +175,7 @@ pub static BUILTINS: &[BuiltinSig] = &[
     // std.http internals
     internal("__req_method", "fn(): string"),
     internal("__req_path", "fn(): string"),
+    internal("__req_ip", "fn(): string"),
     internal("__req_query", "fn(): map<string, string>"),
     internal("__req_form", "fn(): map<string, string>"),
     internal("__req_headers", "fn(): map<string, string>"),

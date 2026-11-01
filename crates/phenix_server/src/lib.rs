@@ -66,7 +66,11 @@ impl State {
         getrandom::fill(&mut secret).expect("operating system random number generator failed");
         State {
             public: root.join("public"),
-            sessions: session::Store::new(Duration::from_secs(config.session_ttl), config.secure_cookies),
+            sessions: session::Store::new(
+                Duration::from_secs(config.session_ttl),
+                config.secure_cookies,
+                config.session_dir.clone(),
+            ),
             csrf_cookie: if config.secure_cookies { "__Host-PHXCSRF" } else { "PHXCSRF" },
             csrf_secret: secret,
             config,
@@ -113,7 +117,7 @@ pub fn serve_on(listener: std::net::TcpListener, opts: ServeOptions) -> Result<(
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         loop {
             let permit = slots.clone().acquire_owned().await.expect("semaphore is never closed");
-            let (stream, _) = match listener.accept().await {
+            let (stream, peer) = match listener.accept().await {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("accept failed: {e}");
@@ -122,7 +126,7 @@ pub fn serve_on(listener: std::net::TcpListener, opts: ServeOptions) -> Result<(
             };
             let state = state.clone();
             tokio::spawn(async move {
-                let service = service_fn(move |req| handle(state.clone(), req));
+                let service = service_fn(move |req| handle(state.clone(), peer, req));
                 let _ = http1::Builder::new()
                     .timer(TokioTimer::new())
                     .header_read_timeout(HEADER_TIMEOUT)
@@ -136,11 +140,20 @@ pub fn serve_on(listener: std::net::TcpListener, opts: ServeOptions) -> Result<(
 
 type Resp = Response<Full<Bytes>>;
 
-async fn handle(state: Arc<State>, req: Request<Incoming>) -> Result<Resp, Infallible> {
+async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> Result<Resp, Infallible> {
     let start = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let mut resp = route(&state, req).await;
+    let ip = peer.ip().to_canonical().to_string();
+    let limit = state.config.requests_per_minute;
+    let mut resp = if limit > 0 && !phenix_std::ratelimit::hit(&format!("ip:{ip}"), limit, Duration::from_secs(60)) {
+        let mut r = simple(StatusCode::TOO_MANY_REQUESTS, "text/plain", "too many requests".into());
+        let wait = phenix_std::ratelimit::retry_after(&format!("ip:{ip}"));
+        r.headers_mut().insert("retry-after", HeaderValue::from(wait));
+        r
+    } else {
+        route(&state, ip, req).await
+    };
     add_security_headers(&state, &mut resp);
     eprintln!("{method} {path} {} {:.1}ms", resp.status().as_u16(), start.elapsed().as_secs_f64() * 1000.0);
     Ok(resp)
@@ -183,8 +196,9 @@ fn add_security_headers(state: &State, resp: &mut Resp) {
     if state.config.secure_cookies {
         set("strict-transport-security", "max-age=31536000");
     }
-    if let Some(csp) = &state.config.csp {
-        set("content-security-policy", csp);
+    // Pages set their own policy with a nonce; everything else gets one without.
+    if let Some(csp) = state.config.csp.header(None) {
+        set("content-security-policy", &csp);
     }
 }
 
@@ -272,7 +286,7 @@ fn content_type(path: &Path) -> Option<&'static str> {
     })
 }
 
-async fn route(state: &Arc<State>, req: Request<Incoming>) -> Resp {
+async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
     let target = resolve(state, req.uri().path());
     match target {
         None => not_found(),
@@ -293,7 +307,7 @@ async fn route(state: &Arc<State>, req: Request<Incoming>) -> Resp {
                 Err(_) => not_found(),
             }
         }
-        Some(Target::Script(p)) => run_script(state, p, req).await,
+        Some(Target::Script(p)) => run_script(state, p, ip, req).await,
     }
 }
 
@@ -329,7 +343,7 @@ impl State {
 
     /// Parses the request, checks CSRF, runs the page and builds the response.
     /// Runs on a blocking thread: everything here may take CPU time.
-    fn execute(&self, script: &Path, parts: hyper::http::request::Parts, body: Bytes) -> Resp {
+    fn execute(&self, script: &Path, ip: String, parts: hyper::http::request::Parts, body: Bytes) -> Resp {
         let headers: Vec<(String, String)> = parts
             .headers
             .iter()
@@ -405,6 +419,8 @@ impl State {
             session,
             csrf_secret: self.csrf_secret.clone(),
             csrf_cookie,
+            remote_ip: ip,
+            csp_nonce: self.config.csp.uses_nonce().then(|| phenix_std::random_hex(16)),
             body: if raw_body { String::from_utf8_lossy(&body).into_owned() } else { String::new() },
             ..HttpCtx::default()
         };
@@ -432,6 +448,7 @@ impl State {
         }
 
         let mut http = outcome.http;
+        let csp = self.config.csp.header(http.csp_nonce.as_deref());
         let flags = if self.config.secure_cookies { "; Secure" } else { "" };
         let session = std::mem::take(&mut http.session);
         let touched_session = had_session || session.changed;
@@ -471,6 +488,11 @@ impl State {
                 h.append(n, v);
             }
         }
+        if let Some(v) = csp.and_then(|c| HeaderValue::from_str(&c).ok()) {
+            if !h.contains_key("content-security-policy") {
+                h.insert("content-security-policy", v);
+            }
+        }
         // Personalized responses must not be stored by shared caches.
         if (touched_session || sets_cookie) && !h.contains_key("cache-control") {
             h.insert("cache-control", HeaderValue::from_static("private, no-store"));
@@ -479,7 +501,7 @@ impl State {
     }
 }
 
-async fn run_script(state: &Arc<State>, script: PathBuf, req: Request<Incoming>) -> Resp {
+async fn run_script(state: &Arc<State>, script: PathBuf, ip: String, req: Request<Incoming>) -> Resp {
     let (parts, body) = req.into_parts();
     let body = match tokio::time::timeout(BODY_TIMEOUT, Limited::new(body, MAX_BODY).collect()).await {
         Ok(Ok(b)) => b.to_bytes(),
@@ -487,7 +509,7 @@ async fn run_script(state: &Arc<State>, script: PathBuf, req: Request<Incoming>)
         Err(_) => return simple(StatusCode::REQUEST_TIMEOUT, "text/plain", "request body timed out".into()),
     };
     let st = state.clone();
-    match tokio::task::spawn_blocking(move || st.execute(&script, parts, body)).await {
+    match tokio::task::spawn_blocking(move || st.execute(&script, ip, parts, body)).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("internal error: {e}");

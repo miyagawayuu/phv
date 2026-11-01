@@ -10,10 +10,12 @@ use std::fmt::Write;
 use std::rc::Rc;
 
 mod db;
+pub mod ratelimit;
+pub mod safefs;
 mod sys;
 mod web;
 
-pub use sys::constant_time_eq;
+pub use sys::{constant_time_eq, sha256_hex};
 pub use web::{csrf_expected, json_decode, random_hex};
 
 pub const PRELUDE: &str = include_str!("phx/prelude.phx");
@@ -743,6 +745,23 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::map(m))
         },
         "__req_method" => |vm, _| Ok(Value::str(vm.http.method.as_str())),
+        "__req_ip" => |vm, _| Ok(Value::str(vm.http.remote_ip.as_str())),
+        "csp_nonce" => |vm, _| Ok(Value::str(vm.http.csp_nonce.clone().unwrap_or_default())),
+        "rate_limit" => |vm, a| {
+            let (max, secs) = (int(&a[1]), int(&a[2]));
+            if !(1..=1_000_000).contains(&max) || !(1..=86_400).contains(&secs) {
+                return Err(vm.throw(
+                    "ValueError",
+                    "rate_limit(): the limit must be 1..1000000 and the window 1..86400 seconds",
+                ));
+            }
+            let key = format!("app:{}", s(&a[0]));
+            Ok(Value::Bool(ratelimit::hit(&key, max as u32, std::time::Duration::from_secs(secs as u64))))
+        },
+        "rate_limit_reset" => |_, a| {
+            ratelimit::reset(&format!("app:{}", s(&a[0])));
+            Ok(Value::Null)
+        },
         "__req_path" => |vm, _| Ok(Value::str(vm.http.path.as_str())),
         "__req_query" => |vm, _| Ok(string_map(&vm.http.query)),
         "__req_form" => |vm, _| Ok(string_map(&vm.http.form)),

@@ -190,6 +190,8 @@ pub enum Instr {
 
     Echo(Reg),
     EchoHtml(u32),
+    /// ` nonce="..."` when the server sent a CSP nonce, else nothing.
+    EchoNonce,
     PushOut,
     PopOutHtml(Reg),
 }

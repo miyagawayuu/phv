@@ -115,3 +115,77 @@ fn serves_pages_safely() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn start(dir: &Path) -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let opts = ServeOptions {
+        root: dir.to_path_buf(),
+        host: "127.0.0.1".into(),
+        port: 0,
+        dev: true,
+        time_limit: Duration::from_secs(5),
+    };
+    std::thread::spawn(move || serve_on(listener, opts).unwrap());
+    addr
+}
+
+#[test]
+fn csp_nonces_and_rate_limits() {
+    let dir = std::env::temp_dir().join(format!("phenix-http-csp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phenix.toml", "[security]\nrequests_per_minute = 6\n");
+    write(
+        &dir,
+        "public/index.phx",
+        "<?phx\n?>\n<script src=\"/app.js\"></script>\n<script>var ok = 1;</script>\n<?= raw(\"<script>injected()</script>\") ?>\n",
+    );
+    write(&dir, "public/login.phx", "<?phx\necho rate_limit(\"login\", 2, 60) ? \"ok\" : \"limited\";\n");
+    write(&dir, "public/app.js", "console.log(1);");
+    let addr = start(&dir);
+
+    let r = get(addr, "/", "");
+    let csp = r.header("content-security-policy").expect("CSP is on by default").to_string();
+    let nonce = csp.split("'nonce-").nth(1).unwrap_or_else(|| panic!("{csp}\n{}", r.body));
+    let nonce = nonce.split('\'').next().unwrap().to_string();
+    assert!(csp.contains("default-src 'self'") && csp.contains("object-src 'none'"), "{csp}");
+    assert_eq!(r.body.matches(&format!("<script nonce=\"{nonce}\"")).count(), 2, "{}", r.body);
+    assert!(r.body.contains("<script>injected()</script>"), "markup from raw() gets no nonce: {}", r.body);
+    let again = get(addr, "/", "");
+    assert!(!again.header("content-security-policy").unwrap().contains(&nonce), "a new nonce per response");
+    let js = get(addr, "/app.js", "");
+    assert!(!js.header("content-security-policy").unwrap().contains("nonce-"));
+
+    assert_eq!(get(addr, "/login", "").body, "ok");
+    assert_eq!(get(addr, "/login", "").body, "ok");
+    assert_eq!(get(addr, "/login", "").body, "limited");
+    // Six requests so far: the next one from this address is refused.
+    let r = get(addr, "/", "");
+    assert_eq!(r.status, 429);
+    assert!(r.header("retry-after").is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_sessions_survive_a_restart() {
+    let dir = std::env::temp_dir().join(format!("phenix-http-sess-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phenix.toml", "[security]\ncsrf = false\nsession_store = \"sessions/\"\n");
+    write(
+        &dir,
+        "public/index.phx",
+        "<?phx\nimport std.http.{request, session};\n$v = request()->query(\"set\");\nif ($v != null) {\n    session()->set(\"v\", $v);\n}\necho session()->get(\"v\") ?? \"none\";\n",
+    );
+    let first = start(&dir);
+    let r = get(first, "/?set=kept", "");
+    let cookie = r.header("set-cookie").unwrap().split(';').next().unwrap().to_string();
+    assert_eq!(r.body, "kept");
+    // Another server process on the same directory sees the session.
+    let second = start(&dir);
+    assert_eq!(get(second, "/", &cookie).body, "kept");
+    assert_eq!(
+        get(second, "/", "PHXSESSID=0000000000000000000000000000000000000000000000000000000000000000").body,
+        "none"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -34,7 +34,8 @@ pub enum StmtKind {
     Echo(Vec<Expr>),
     /// `<?= ... ?>` with the HTML context it appears in.
     HtmlEcho(Vec<Expr>, EchoContext),
-    InlineHtml(String),
+    /// Literal HTML, with the offsets of opening `<script` tags (for CSP nonces).
+    InlineHtml(String, Vec<usize>),
     Assign {
         target: Expr,
         op: AssignOp,
