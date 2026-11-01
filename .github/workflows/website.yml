@@ -44,8 +44,18 @@ jobs:
             echo "::notice::CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID are not set; skipping the deploy"
             exit 0
           fi
+          # Checks that explain a failure without printing either secret.
+          if ! [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "::error::CLOUDFLARE_ACCOUNT_ID should be 32 hex characters (it has ${#CLOUDFLARE_ACCOUNT_ID}); copy it again from the dashboard"
+            exit 1
+          fi
+          api() { curl -sS -o /tmp/cf.json -w '%{http_code}' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/$1"; }
+          echo "token verify: HTTP $(api user/tokens/verify), $(jq -c '{success, status: .result.status, errors: [.errors[]?.code]}' /tmp/cf.json)"
+          echo "pages projects: HTTP $(api accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects), $(jq -c '{success, errors: [.errors[]? | {code, message}], projects: [.result[]?.name]}' /tmp/cf.json)"
+
           wrangler="npx --yes wrangler@4.151.1"
           # The first deploy creates the project; later runs find it.
-          $wrangler pages project list | grep -qw phx-lang \
-            || $wrangler pages project create phx-lang --production-branch main
+          if ! jq -e '.result[]? | select(.name == "phx-lang")' /tmp/cf.json > /dev/null; then
+            $wrangler pages project create phx-lang --production-branch main
+          fi
           $wrangler pages deploy dist --project-name phx-lang --branch main --commit-dirty=true
