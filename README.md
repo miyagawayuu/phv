@@ -1,9 +1,12 @@
 # PHX
 
-PHP の書き味をそのままに、**型安全・安全な既定値・高速**を言語の側で保証する Web 向けプログラミング言語です。
-処理系は Rust で書かれています。
+English | [日本語](README.ja.md)
 
-公式サイト: <https://phx-lang.org>
+PHX is a programming language for the web that keeps the feel of PHP while
+the language itself guarantees **type safety, safe defaults and speed**.
+The implementation is written in Rust.
+
+Website: <https://phx-lang.org>
 
 ```phx
 <?phx
@@ -18,79 +21,82 @@ function greet(string $name, int $times = 1): string {
     return $out;
 }
 
-$name = request()->query("name") ?? "world";      // ?string を ?? で string に
+$name = request()->query("name") ?? "world";      // ?string becomes string with ??
 $db = Database::open("data/app.db");
-$rows = $db->query(sql"SELECT * FROM users WHERE name = {$name}");   // 値は必ずプレースホルダ
-echo greet($name);                                 // Web ページでは自動で HTML エスケープ
+$rows = $db->query(sql"SELECT * FROM users WHERE name = {$name}");   // values are always placeholders
+echo greet($name);                                 // HTML-escaped automatically in web pages
 ```
 
-## 特長
+## Features
 
-- **PHP から引き継いだもの**: `$変数`、`[1, 2]` / `["k" => v]`、`echo`、`foreach`、`match`、HTML への埋め込み、
-  ファイル単位のルーティング、保存したらすぐ反映、リクエストごとに何も共有しない実行モデル
-- **型安全**: 変数の型は最初の代入で固定。暗黙の型変換なし、`==` は常に厳密、truthiness なし、null 安全(`?T`)、
-  interface・abstract・enum・ジェネリック関数、`finally`
-- **セキュリティ**:
-  - **XSS 対策**: 出力は自動でエスケープされる。加えて、エスケープでは守れない場所(引用符なしの属性、URL、
-    `<script>`)への挿入はコンパイルエラーになる。URL には `safe_url()`、`<script>` には `json_html()` の値
-    (型 `SafeUrl` / `SafeJs`)だけを置ける。場所の判定はブラウザの HTML 構文解析に合わせている。
-  - **SQL インジェクション対策**: SQL は `sql"..."` でしか書けない。
-  - **CSRF 対策**: フォームの POST をサーバーが自動で検査する。
-  - **CSP**: Content-Security-Policy が既定で有効。テンプレートの `<script>` には自動で nonce が付くので、
-    注入されたスクリプトだけが止まる。
-  - **セッション**: サーバー側に保存し、固定攻撃を防ぐ(メモリ、またはファイルで再起動後も保持)。
-  - **レート制限**: `rate_limit()` と、接続元ごとの上限 `requests_per_minute`。
-  - **権限**: ファイルや環境変数には `phx.toml` で許可したものしか触れない。リンクやハードリンクはたどらず、
-    パスの検査と使用の間にすり替えられることもない。
-  - **上限**: メモリ・時間・再帰の深さに上限がある。
-  - **動的な実行がない**: `eval` や可変変数はない。
-  - 3 回の監査と脆弱性診断の結果は [docs/security-audit.md](docs/security-audit.md) にある。
-- **速度**: 型に特化したレジスタ型バイトコード VM、Cranelift による JIT、バイトコードのディスクキャッシュ
-- **ツール**: テストランナー、フォーマッタ、Language Server、パッケージマネージャ、PHP からの移行ツール
+- **What comes from PHP**: `$variables`, `[1, 2]` / `["k" => v]`, `echo`, `foreach`, `match`, embedding in HTML,
+  routing by file name, changes take effect on save, and a share-nothing model where each request starts fresh.
+- **Type safety**: a variable's type is fixed by its first assignment. No implicit conversions, `==` is always
+  strict, no truthiness, null safety (`?T`), interfaces, abstract classes, enums, generic functions, `finally`.
+- **Security**:
+  - **XSS**: output is escaped automatically, and inserting a value where escaping cannot protect it (unquoted
+    attributes, URLs, `<script>`) is a compile error. Only `safe_url()` values may start a URL and only
+    `json_html()` values may go into `<script>` (types `SafeUrl` / `SafeJs`). The position is determined the way
+    browsers parse HTML.
+  - **SQL injection**: SQL can only be written as `sql"..."` literals.
+  - **CSRF**: the server checks form POSTs automatically.
+  - **CSP**: a Content-Security-Policy is on by default. `<script>` tags written in templates get a nonce
+    automatically, so only injected scripts are blocked.
+  - **Sessions**: stored on the server, with protection against fixation (in memory, or in files that survive
+    restarts).
+  - **Rate limiting**: `rate_limit()`, and a per-client limit with `requests_per_minute`.
+  - **Permissions**: scripts can only touch the files and environment variables allowed in `phx.toml`. Links and
+    hard links are not followed, and paths cannot be swapped between the check and the use.
+  - **Limits**: memory, time and recursion depth are limited.
+  - **No dynamic execution**: there is no `eval` and no variable variables.
+  - The results of three security audits are in [docs/security-audit.md](docs/security-audit.md) (Japanese).
+    To report a vulnerability, see [SECURITY.md](SECURITY.md).
+- **Speed**: a register-based bytecode VM specialized by type, a Cranelift JIT, and an on-disk bytecode cache.
+- **Tools**: test runner, formatter, Language Server, package manager, and a migration tool from PHP.
 
-詳しくは [言語仕様 (docs/spec.md)](docs/spec.md) を参照してください。
+The full language specification is in [docs/spec.md](docs/spec.md) (Japanese).
 
-## ビルド
+## Building
 
-最近の安定版 Rust が必要です(1.97 で確認)。SQLite を同梱してビルドするため、C コンパイラ
-(Windows では Visual Studio Build Tools)も必要です。
+You need a recent stable Rust (tested with 1.97). SQLite is built in, so a C compiler is also needed
+(Visual Studio Build Tools on Windows).
 
 ```bash
 cargo build --release
 ```
 
-実行ファイルは `target/release/phx`(Windows では `phx.exe`)です。
+The executable is `target/release/phx` (`phx.exe` on Windows).
 
-## 使い方
+## Usage
 
 ```bash
-phx run examples/hello/hello.phx         # 型検査して実行
-phx check examples/site/public/index.phx # 型検査だけ
-phx serve examples/site                  # http://127.0.0.1:8080 でサイトを配信
-phx test examples                        # *_test.phx の test_* 関数を実行
-phx fmt examples                         # インデントと空白を整える(--check で確認だけ)
-phx lsp                                  # エディタ用の Language Server
-phx install                              # phx.toml の [dependencies] を取得
-phx migrate legacy/page.php              # PHP を変換し、手作業が必要な箇所を一覧にする
-phx disasm examples/bench/bench.phx      # バイトコードを表示
+phx run examples/hello/hello.phx         # type-check and run
+phx check examples/site/public/index.phx # type-check only
+phx serve examples/site                  # serve the site on http://127.0.0.1:8080
+phx test examples                        # run the test_* functions in *_test.phx files
+phx fmt examples                         # fix indentation and spacing (--check only reports)
+phx lsp                                  # Language Server for editors
+phx install                              # fetch the [dependencies] in phx.toml
+phx migrate legacy/page.php              # convert PHP and list what needs manual work
+phx disasm examples/bench/bench.phx      # show the bytecode
 ```
 
-## サンプルサイト
+## Example site
 
-`examples/site/` は小さなブログです。中身は、記事一覧、記事ページ、SQLite を使ったゲストブック
-(セッション・CSRF・フラッシュメッセージを使う)、入力チェック付きのお問い合わせフォーム、JSON API です。
+`examples/site/` is a small blog: a post list, post pages, a guestbook stored in SQLite (using sessions, CSRF
+protection and flash messages), a contact form with validation, and a JSON API.
 
 ```
 examples/site/
-├── phx.toml          セキュリティ設定と権限([permissions].write = ["data/"])
-├── public/              URL に対応するページ(/ → index.phx, /guestbook → guestbook.phx)
-├── lib/                 import するモジュール(posts.phx, guestbook.phx)
-├── views/*.phx.html     型付きテンプレート
-├── tests/posts_test.phx phx test で実行するテスト
-└── data/                SQLite のデータベース(スクリプトが書き込めるのはここだけ)
+├── phx.toml             security settings and permissions ([permissions].write = ["data/"])
+├── public/              pages, one per URL (/ -> index.phx, /guestbook -> guestbook.phx)
+├── lib/                 imported modules (posts.phx, guestbook.phx)
+├── views/*.phx.html     typed templates
+├── tests/posts_test.phx tests run by phx test
+└── data/                the SQLite database (the only place scripts may write)
 ```
 
-## エラーメッセージの例
+## Error messages
 
 ```
 error: cannot call `->upper()` on `?string` because it might be null
@@ -100,51 +106,60 @@ error: cannot call `->upper()` on `?string` because it might be null
   |      ^^^^^
   = note: check `!= null` first, or use `?->`
 
-error: a URL attribute cannot start with an unchecked string
- --> err_security.phx:45:16
-   = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`)
+error: a URL attribute cannot start with an unchecked value
+  --> err_security.phx:45:14
+   |
+45 | <a href="<?= $name ?>">url</a>
+   |              ^^^^^
+   = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
 ```
 
-## 構成
+## Project layout
 
-| クレート | 役割 |
+| Crate | Purpose |
 |---|---|
-| `phx_syntax` | ソース管理、診断メッセージ、字句解析(コード / HTML モード)、構文解析、HTML の文脈判定、フォーマッタ |
-| `phx_types` | 名前解決、型検査、絞り込み、確定代入の解析 → 型付き HIR。組み込み関数のシグネチャ |
-| `phx_compiler` | HIR → レジスタ型バイトコード |
-| `phx_vm` | 値、バイトコード形式、インタプリタ、実行時の上限 |
-| `phx_jit` | int/bool だけを扱う関数を Cranelift でネイティブコードにする |
-| `phx_std` | 組み込み関数(文字列・JSON・日付・暗号・ファイル・SQLite・セッション)と、PHX で書かれた prelude・`std.http`・`std.db` |
-| `phx_driver` | モジュールとテンプレートの読み込み、`phx.toml`、バイトコードキャッシュ、実行 |
-| `phx_server` | Web サーバー(hyper + tokio)、ルーティング、セッション、CSRF、アップロード |
-| `phx_cli` | `phx` コマンド(run / check / serve / test / fmt / lsp / install / migrate) |
+| `phx_syntax` | Sources, diagnostics, lexer (code / HTML modes), parser, HTML context tracking, formatter |
+| `phx_types` | Name resolution, type checking, narrowing, definite assignment → typed HIR; builtin signatures |
+| `phx_compiler` | HIR → register bytecode |
+| `phx_vm` | Values, bytecode format, interpreter, runtime limits |
+| `phx_jit` | Native code for functions that only use int/bool values (Cranelift) |
+| `phx_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, sessions) and the prelude, `std.http` and `std.db` written in PHX |
+| `phx_driver` | Loading modules and templates, `phx.toml`, bytecode cache, running programs |
+| `phx_server` | Web server (hyper + tokio), routing, sessions, CSRF, uploads |
+| `phx_cli` | The `phx` command (run / check / serve / test / fmt / lsp / install / migrate) |
 
-## テスト
+## Tests
 
 ```bash
 cargo test --workspace
 ```
 
-- `tests/cases/*.phx` を実行して `.out` と比べるゴールデンテスト。JIT を有効にした実行と、
-  `phx fmt` をかけた後の実行でも同じ結果になることを確かめる。
-- セキュリティの回帰テスト(`err_security.phx`、`security.phx`)。
-- 実サーバーを起動して HTTP で確かめる結合テスト。
-- 変異させたプログラムによるファジング(`PHX_FUZZ_ITERATIONS` で回数を変えられる)。
+- Golden tests: each `tests/cases/*.phx` is run and compared with its `.out` file, also with the JIT on and
+  after `phx fmt`, which must not change the behavior.
+- Security regression tests (`err_security.phx`, `err_context.phx`, `security.phx`, and others).
+- Integration tests that start the real server and talk HTTP to it.
+- Fuzzing with mutated programs (set the number of runs with `PHX_FUZZ_ITERATIONS`).
 
-期待値を更新するときは `PHX_BLESS=1 cargo test -p phx_driver --test golden golden` を実行し、差分を確認してください。
-CI(`.github/workflows/ci.yml`)は Linux / Windows / macOS でこれらと clippy・rustfmt・`cargo audit` を実行します。
+To update the expected output, run `PHX_BLESS=1 cargo test -p phx_driver --test golden golden` and review the
+diff. CI (`.github/workflows/ci.yml`) runs all of this plus clippy, rustfmt and `cargo audit` on Linux, Windows
+and macOS.
 
-## ベンチマーク
+## Benchmarks
 
-`examples/bench/bench.phx` と同じ内容の `bench.py` を比べた結果です(Windows 11、リリースビルド、参考値)。
+`examples/bench/bench.phx` compared with the equivalent `bench.py` (Windows 11, release build; indicative only).
 
-| 項目 | PHX (JIT) | PHX (インタプリタ) | CPython 3.13 |
+| Benchmark | PHX (JIT) | PHX (interpreter) | CPython 3.13 |
 |---|---:|---:|---:|
-| `fib(30)`(再帰呼び出し) | 6.7 ms | 80 ms | 94 ms |
-| 1,000 万回のループ | 13 ms | 284 ms | 326 ms |
-| 100 万文字の連結 | 24 ms | 25 ms | 65 ms |
-| 100 万要素の map / filter / sum | 184 ms | 179 ms | 87 ms |
-| map の更新 20 万回 | 44 ms | 46 ms | 34 ms |
+| `fib(30)` (recursive calls) | 6.7 ms | 80 ms | 94 ms |
+| 10 million loop iterations | 13 ms | 284 ms | 326 ms |
+| Concatenating 1 million characters | 24 ms | 25 ms | 65 ms |
+| map / filter / sum over 1 million elements | 184 ms | 179 ms | 87 ms |
+| 200,000 map updates | 44 ms | 46 ms | 34 ms |
 
-JIT の対象は、扱う値がすべて `int` / `bool` の関数です。クロージャや文字列を多く使う処理はインタプリタで動き、
-上の表のとおり CPython より遅いものがあります(今後の課題)。`PHX_JIT=0` で JIT を無効にできます。
+The JIT compiles functions whose values are all `int` / `bool`. Code that relies on closures or strings runs in
+the interpreter and, as the table shows, can be slower than CPython (to be improved). Set `PHX_JIT=0` to turn
+the JIT off.
+
+## License
+
+[MIT](LICENSE)
