@@ -104,6 +104,12 @@ pub enum HExprKind {
     CallVirtual(u32, Vec<HExpr>),
     CallBuiltin(String, Vec<HExpr>),
     CallClosure(Box<HExpr>, Vec<HExpr>),
+    /// Method call through an interface type, dispatched by name. Receiver first.
+    CallNamed(String, Vec<HExpr>),
+    EnumCase(ClassId, u32),
+    /// `E::from($v)` / `E::tryFrom($v)` (the flag is true for `tryFrom`).
+    EnumFrom(ClassId, Box<HExpr>, bool),
+    EnumCases(ClassId),
     New(ClassId, Option<FuncId>, Vec<HExpr>),
     Closure(FuncId, Vec<HExpr>),
     Match { subject: Option<Box<HExpr>>, arms: Vec<(Vec<HExpr>, HExpr)>, default: Option<Box<HExpr>> },
@@ -119,7 +125,8 @@ pub enum HPlaceBase {
 
 #[derive(Clone, Debug)]
 pub enum HPathElem {
-    Index(HExpr),
+    /// The constant creates a missing intermediate entry (`$m["a"]["b"] = 1`).
+    Index(HExpr, Option<HConst>),
     Push,
 }
 
@@ -154,7 +161,7 @@ pub enum HStmt {
     Continue(u32),
     Return(Option<HExpr>, Span),
     Throw(HExpr),
-    Try { body: Vec<HStmt>, catches: Vec<HCatch> },
+    Try { body: Vec<HStmt>, catches: Vec<HCatch>, finally: Option<Vec<HStmt>> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +207,12 @@ pub struct HClass {
     pub parent: Option<ClassId>,
     pub fields: Vec<HField>,
     pub vtable: Vec<FuncId>,
+    /// The class itself, its ancestors and every interface it implements.
+    pub supers: Vec<ClassId>,
+    /// Non-static methods by name, for calls through interfaces.
+    pub by_name: Vec<(String, FuncId)>,
+    /// Enum cases: name and backing value (`Null` for pure enums).
+    pub cases: Vec<(String, HConst)>,
 }
 
 #[derive(Clone, Debug, Default)]

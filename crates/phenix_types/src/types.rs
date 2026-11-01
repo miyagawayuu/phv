@@ -25,8 +25,13 @@ pub enum Type {
     Func(Vec<Type>, Box<Type>),
     /// Normalized: flat, sorted, deduplicated, at least two members.
     Union(Vec<Type>),
-    /// A type parameter in a built-in signature (`T`, `U`, `K`, `V`).
+    /// A type parameter in a built-in signature (`T`, `U`, `K`, `V`), or a
+    /// user type parameter while a call is being inferred.
     Generic(u8),
+    /// A user type parameter inside its generic function (opaque).
+    Param(String),
+    /// A parameterized SQL query built with `sql"..."`.
+    Sql,
     /// "Not known yet" inside an expected type, e.g. a closure's return type.
     Infer,
 }
@@ -167,7 +172,9 @@ impl fmt::Display for TypeDisplay<'_> {
                 }
                 Ok(())
             }
-            Type::Generic(i) => write!(f, "{}", ["T", "U", "K", "V"][*i as usize]),
+            Type::Generic(i) => write!(f, "{}", ["T", "U", "K", "V"].get(*i as usize).copied().unwrap_or("T")),
+            Type::Param(n) => write!(f, "{n}"),
+            Type::Sql => write!(f, "Sql"),
             Type::Infer => write!(f, "_"),
         }
     }

@@ -18,6 +18,8 @@ pub enum Tok {
     Float(f64),
     Str(String),
     Interp(Vec<StrPart>),
+    /// `sql"..."`: interpolations become query parameters.
+    Sql(Vec<StrPart>),
     InlineHtml(String),
     /// `<?=`
     EchoOpen,
@@ -65,6 +67,13 @@ pub enum Tok {
     Use,
     Is,
     Instanceof,
+    Interface,
+    Implements,
+    Abstract,
+    Enum,
+    Case,
+    Const,
+    Final,
 
     // Punctuation.
     LParen,
@@ -169,6 +178,13 @@ impl Tok {
             "use" => Tok::Use,
             "is" => Tok::Is,
             "instanceof" => Tok::Instanceof,
+            "interface" => Tok::Interface,
+            "implements" => Tok::Implements,
+            "abstract" => Tok::Abstract,
+            "enum" => Tok::Enum,
+            "case" => Tok::Case,
+            "const" => Tok::Const,
+            "final" => Tok::Final,
             _ => return None,
         })
     }
@@ -180,6 +196,7 @@ impl Tok {
             Tok::Ident(n) => format!("`{n}`"),
             Tok::Int(_) | Tok::Float(_) => "number".into(),
             Tok::Str(_) | Tok::Interp(_) => "string".into(),
+            Tok::Sql(_) => "SQL literal".into(),
             Tok::InlineHtml(_) => "inline HTML".into(),
             Tok::EchoOpen => "`<?=`".into(),
             Tok::CloseTag => "`?>`".into(),
@@ -230,6 +247,13 @@ impl Tok {
             Tok::Use => "use",
             Tok::Is => "is",
             Tok::Instanceof => "instanceof",
+            Tok::Interface => "interface",
+            Tok::Implements => "implements",
+            Tok::Abstract => "abstract",
+            Tok::Enum => "enum",
+            Tok::Case => "case",
+            Tok::Const => "const",
+            Tok::Final => "final",
             Tok::LParen => "(",
             Tok::RParen => ")",
             Tok::LBracket => "[",

@@ -113,6 +113,8 @@ pub struct Vm {
     pub rng: u64,
     native_depth: u32,
     argbuf: Vec<Value>,
+    /// Enum cases are singletons within one VM (one request).
+    enum_cache: std::collections::HashMap<(u32, u32), Value>,
 }
 
 #[cold]
@@ -155,6 +157,7 @@ impl Vm {
             rng: seed,
             native_depth: 0,
             argbuf: Vec::new(),
+            enum_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -270,6 +273,25 @@ impl Vm {
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
 
+    /// The singleton object for case `idx` of enum `class`.
+    pub fn enum_case(&mut self, class: u32, idx: u32) -> Value {
+        if let Some(v) = self.enum_cache.get(&(class, idx)) {
+            return v.clone();
+        }
+        let cls = &self.prog.classes[class as usize];
+        let (name, value) = &cls.cases[idx as usize];
+        let mut fields: Vec<Value> = cls.fields.iter().map(|f| const_value(&f.default)).collect();
+        if let Some(i) = cls.fields.iter().position(|f| f.name == "name") {
+            fields[i] = Value::str(name.as_str());
+        }
+        if let Some(i) = cls.fields.iter().position(|f| f.name == "value") {
+            fields[i] = const_value(value);
+        }
+        let v = Value::Object(Rc::new(RefCell::new(Object { class, fields })));
+        self.enum_cache.insert((class, idx), v.clone());
+        v
+    }
+
     fn load_const(&mut self, c: u32) -> Value {
         if let Some(v) = &self.consts[c as usize] {
             return v.clone();
@@ -366,14 +388,14 @@ impl Vm {
         let keys: Vec<Value> = p.keys.iter().map(|k| self.regs[base + *k as usize].clone()).collect();
         let val = self.regs[base + p.val as usize].clone();
         let r = match p.base {
-            PathBase::Local(r) => path_assign(&mut self.regs[base + r as usize], &keys, p.push, val),
+            PathBase::Local(r) => path_assign(&mut self.regs[base + r as usize], &keys, &p.create, p.push, val),
             PathBase::Prop(o, slot) => {
                 let obj = match &self.regs[base + o as usize] {
                     Value::Object(o) => o.clone(),
                     v => bad("object", v),
                 };
                 let mut ob = obj.borrow_mut();
-                path_assign(&mut ob.fields[slot as usize], &keys, p.push, val)
+                path_assign(&mut ob.fields[slot as usize], &keys, &p.create, p.push, val)
             }
         };
         r.map_err(|(class, msg)| self.throw(class, msg))
@@ -725,6 +747,23 @@ impl Vm {
                         let v = tri!(r);
                         reg!(*dst) = v;
                     }
+                    Instr::CallNamed { dst, name, args, argc } => {
+                        let class = match &reg!(*args) {
+                            Value::Object(o) => o.borrow().class,
+                            v => bad("object", v),
+                        };
+                        let callee = match prog.classes[class as usize].by_name.get(name) {
+                            Some(f) => *f,
+                            None => {
+                                let msg = format!(
+                                    "{} has no method {}",
+                                    prog.classes[class as usize].name, prog.method_names[*name as usize]
+                                );
+                                tri!(Err(VmError::Fatal(msg)))
+                            }
+                        };
+                        call!(callee, *dst, *args, *argc, &[])
+                    }
                     Instr::Ret(r) => ret!(std::mem::take(&mut reg!(*r))),
                     Instr::RetNull => ret!(Value::Null),
 
@@ -865,6 +904,33 @@ impl Vm {
                         tri!(Err(self.throw("UnhandledMatchError", msg)))
                     }
 
+                    Instr::EnumCase(d, class, idx) => {
+                        let v = self.enum_case(*class, *idx);
+                        reg!(*d) = v;
+                    }
+                    Instr::EnumCases(d, class) => {
+                        let n = prog.classes[*class as usize].cases.len() as u32;
+                        let items = (0..n).map(|i| self.enum_case(*class, i)).collect();
+                        reg!(*d) = Value::list(items);
+                    }
+                    Instr::EnumFrom { dst, class, val, try_ } => {
+                        let wanted = reg!(*val).clone();
+                        let cls = &prog.classes[*class as usize];
+                        let found = cls.cases.iter().position(|(_, c)| values_equal(&const_value(c), &wanted));
+                        let v = match found {
+                            Some(i) => self.enum_case(*class, i as u32),
+                            None if *try_ => Value::Null,
+                            None => {
+                                let msg = format!(
+                                    "{} is not a valid value for enum {}",
+                                    short_repr(&wanted),
+                                    cls.name
+                                );
+                                tri!(Err(self.throw("ValueError", msg)))
+                            }
+                        };
+                        reg!(*dst) = v;
+                    }
                     Instr::MakeClosure { dst, func: f, caps, n } => {
                         let caps = (0..*n as usize).map(|i| self.regs[base + *caps as usize + i].clone()).collect();
                         reg!(*dst) = Value::Closure(Rc::new(Closure { func: *f, caps }));
@@ -890,11 +956,17 @@ impl Vm {
     }
 }
 
-fn path_assign(target: &mut Value, keys: &[Value], push: bool, val: Value) -> Result<(), (&'static str, String)> {
+fn path_assign(
+    target: &mut Value,
+    keys: &[Value],
+    create: &[Option<Const>],
+    push: bool,
+    val: Value,
+) -> Result<(), (&'static str, String)> {
     let (inner, last) = if push { (keys, None) } else { (&keys[..keys.len() - 1], keys.last()) };
     let mut cur = target;
-    for k in inner {
-        cur = index_mut(cur, k)?;
+    for (i, k) in inner.iter().enumerate() {
+        cur = index_mut(cur, k, create.get(i).and_then(|c| c.as_ref()))?;
     }
     match (cur, last) {
         (Value::List(l), None) => Rc::make_mut(l).push(val),
@@ -913,7 +985,7 @@ fn path_assign(target: &mut Value, keys: &[Value], push: bool, val: Value) -> Re
     Ok(())
 }
 
-fn index_mut<'v>(v: &'v mut Value, k: &Value) -> Result<&'v mut Value, (&'static str, String)> {
+fn index_mut<'v>(v: &'v mut Value, k: &Value, create: Option<&Const>) -> Result<&'v mut Value, (&'static str, String)> {
     match v {
         Value::List(l) => {
             let len = l.len();
@@ -926,10 +998,17 @@ fn index_mut<'v>(v: &'v mut Value, k: &Value) -> Result<&'v mut Value, (&'static
                 None => Err(("IndexError", format!("list index {i} is out of range (length {len})"))),
             }
         }
-        Value::Map(m) => match Rc::make_mut(m).get_mut(&k.to_key()) {
-            Some(v) => Ok(v),
-            None => Err(("KeyError", format!("undefined map key {}", key_repr(k)))),
-        },
+        Value::Map(m) => {
+            let m = Rc::make_mut(m);
+            let key = k.to_key();
+            if let (false, Some(c)) = (m.contains_key(&key), create) {
+                m.insert(key.clone(), const_value(c));
+            }
+            match m.get_mut(&key) {
+                Some(v) => Ok(v),
+                None => Err(("KeyError", format!("undefined map key {}", key_repr(k)))),
+            }
+        }
         v => bad("list or map", v),
     }
 }

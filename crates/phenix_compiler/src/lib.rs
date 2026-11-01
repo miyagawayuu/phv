@@ -10,8 +10,20 @@ use phenix_vm::bytecode::*;
 use std::collections::HashMap;
 
 pub fn compile(h: &HProgram, sources: &SourceMap) -> Program {
-    let mut pc = ProgCtx { consts: Vec::new(), str_consts: HashMap::new(), builtins: Vec::new(), builtin_ids: HashMap::new() };
+    let mut pc = ProgCtx {
+        consts: Vec::new(),
+        str_consts: HashMap::new(),
+        builtins: Vec::new(),
+        builtin_ids: HashMap::new(),
+        methods: Vec::new(),
+        method_ids: HashMap::new(),
+    };
     let funcs = h.funcs.iter().map(|f| FnC::compile(&mut pc, f)).collect();
+    for c in &h.classes {
+        for (name, _) in &c.by_name {
+            pc.method(name);
+        }
+    }
     let classes = h
         .classes
         .iter()
@@ -24,6 +36,9 @@ pub fn compile(h: &HProgram, sources: &SourceMap) -> Program {
                 .map(|f| Field { name: f.name.clone(), default: to_const(&f.default), public: f.public })
                 .collect(),
             vtable: c.vtable.clone(),
+            supers: c.supers.clone(),
+            by_name: c.by_name.iter().map(|(n, f)| (pc.method_ids[n], *f)).collect(),
+            cases: c.cases.iter().map(|(n, v)| (n.clone(), to_const(v))).collect(),
         })
         .collect();
     let files = sources
@@ -37,6 +52,7 @@ pub fn compile(h: &HProgram, sources: &SourceMap) -> Program {
         consts: pc.consts,
         main: h.main,
         builtin_names: pc.builtins,
+        method_names: pc.methods,
         files,
         exc_classes: h.exc_classes.clone(),
     }
@@ -59,6 +75,8 @@ struct ProgCtx {
     str_consts: HashMap<String, u32>,
     builtins: Vec<String>,
     builtin_ids: HashMap<String, u32>,
+    methods: Vec<String>,
+    method_ids: HashMap<String, u32>,
 }
 
 impl ProgCtx {
@@ -80,6 +98,16 @@ impl ProgCtx {
         self.consts.len() as u32 - 1
     }
 
+    fn method(&mut self, name: &str) -> u32 {
+        if let Some(&i) = self.method_ids.get(name) {
+            return i;
+        }
+        let i = self.methods.len() as u32;
+        self.methods.push(name.to_string());
+        self.method_ids.insert(name.to_string(), i);
+        i
+    }
+
     fn builtin(&mut self, name: &str) -> u32 {
         if let Some(&i) = self.builtin_ids.get(name) {
             return i;
@@ -94,7 +122,15 @@ impl ProgCtx {
 struct LoopCtx {
     breaks: Vec<usize>,
     continues: Vec<usize>,
-    try_depth: u32,
+    /// `tries.len()` when the loop started.
+    tries: usize,
+}
+
+/// An enclosing `try` statement while its body or catches are compiled.
+struct TryCtx {
+    /// Exception handlers of this statement that are currently installed.
+    active: u32,
+    finally: Option<Vec<HStmt>>,
 }
 
 struct FnC<'a> {
@@ -106,7 +142,7 @@ struct FnC<'a> {
     next: u16,
     max: u16,
     loops: Vec<LoopCtx>,
-    try_depth: u32,
+    tries: Vec<TryCtx>,
     off: u32,
 }
 
@@ -134,7 +170,7 @@ impl<'a> FnC<'a> {
             next,
             max: next,
             loops: Vec::new(),
-            try_depth: 0,
+            tries: Vec::new(),
             off: f.span.start,
         };
         match f.kind {
@@ -409,6 +445,25 @@ impl<'a> FnC<'a> {
                 self.off = off;
                 self.emit(Instr::CallBuiltin { dst, id, args: start, argc: args.len() as u16 });
             }
+            HExprKind::CallNamed(name, args) => {
+                let start = self.args(args);
+                let id = self.pc.method(name);
+                self.off = off;
+                self.emit(Instr::CallNamed { dst, name: id, args: start, argc: args.len() as u16 });
+            }
+            HExprKind::EnumCase(class, idx) => {
+                self.off = off;
+                self.emit(Instr::EnumCase(dst, *class, *idx));
+            }
+            HExprKind::EnumCases(class) => {
+                self.off = off;
+                self.emit(Instr::EnumCases(dst, *class));
+            }
+            HExprKind::EnumFrom(class, v, try_) => {
+                let r = self.operand(v);
+                self.off = off;
+                self.emit(Instr::EnumFrom { dst, class: *class, val: r, try_: *try_ });
+            }
             HExprKind::CallClosure(callee, args) => {
                 let rc = self.operand(callee);
                 let start = self.args(args);
@@ -593,23 +648,27 @@ impl<'a> FnC<'a> {
     }
 
     /// Evaluates the object and keys of a place into registers.
-    fn place_regs(&mut self, p: &HPlace) -> (PathBase, Vec<Reg>, bool) {
+    fn place_regs(&mut self, p: &HPlace) -> (PathBase, Vec<Reg>, Vec<Option<Const>>, bool) {
         let base = match &p.base {
             HPlaceBase::Local(id) => PathBase::Local(self.reg(*id)),
             HPlaceBase::Prop(obj, slot) => PathBase::Prop(self.operand(obj), *slot as u16),
         };
         let mut keys = Vec::new();
+        let mut create = Vec::new();
         let mut push = false;
         for el in &p.path {
             match el {
-                HPathElem::Index(k) => keys.push(self.operand(k)),
+                HPathElem::Index(k, c) => {
+                    keys.push(self.operand(k));
+                    create.push(c.as_ref().map(to_const));
+                }
                 HPathElem::Push => push = true,
             }
         }
-        (base, keys, push)
+        (base, keys, create, push)
     }
 
-    fn store(&mut self, base: &PathBase, keys: Vec<Reg>, push: bool, val: Reg) {
+    fn store(&mut self, base: &PathBase, keys: Vec<Reg>, create: Vec<Option<Const>>, push: bool, val: Reg) {
         match (base, keys.is_empty() && !push) {
             (PathBase::Local(r), true) => {
                 if *r != val {
@@ -620,7 +679,7 @@ impl<'a> FnC<'a> {
                 self.emit(Instr::SetProp(*o, *slot, val));
             }
             _ => {
-                self.emit(Instr::SetPath(Box::new(PathSet { base: base.clone(), keys, push, val })));
+                self.emit(Instr::SetPath(Box::new(PathSet { base: base.clone(), keys, create, push, val })));
             }
         }
     }
@@ -662,10 +721,10 @@ impl<'a> FnC<'a> {
                     self.expr_into(value, r);
                     return;
                 }
-                let (base, keys, push) = self.place_regs(p);
+                let (base, keys, create, push) = self.place_regs(p);
                 let v = self.operand(value);
                 self.off = value.span.start;
-                self.store(&base, keys, push, v);
+                self.store(&base, keys, create, push, v);
             }
             HStmt::Compound(p, kind, rhs) => {
                 if let (HPlaceBase::Local(id), true) = (&p.base, p.path.is_empty()) {
@@ -686,7 +745,7 @@ impl<'a> FnC<'a> {
                     }
                     return;
                 }
-                let (base, keys, push) = self.place_regs(p);
+                let (base, keys, create, push) = self.place_regs(p);
                 let cur = self.load_place(&base, &keys);
                 let rr = self.operand(rhs);
                 self.off = rhs.span.start;
@@ -698,14 +757,14 @@ impl<'a> FnC<'a> {
                 } else {
                     self.emit(bin_instr(*kind, cur, cur, rr));
                 }
-                self.store(&base, keys, push, cur);
+                self.store(&base, keys, create, push, cur);
             }
             HStmt::CoalesceAssign(p, rhs) => {
-                let (base, keys, push) = self.place_regs(p);
+                let (base, keys, create, push) = self.place_regs(p);
                 let cur = self.load_place(&base, &keys);
                 let j = self.emit(Instr::JumpIfNotNull(cur, 0));
                 self.expr_into(rhs, cur);
-                self.store(&base, keys, push, cur);
+                self.store(&base, keys, create, push, cur);
                 let end = self.here();
                 self.patch(j, end);
             }
@@ -731,7 +790,7 @@ impl<'a> FnC<'a> {
             }
             HStmt::Loop { cond, body, step, do_while } => {
                 let top = self.here();
-                self.loops.push(LoopCtx { breaks: Vec::new(), continues: Vec::new(), try_depth: self.try_depth });
+                self.loops.push(LoopCtx { breaks: Vec::new(), continues: Vec::new(), tries: self.tries.len() });
                 if *do_while {
                     self.block(body);
                     let cont = self.here();
@@ -766,7 +825,7 @@ impl<'a> FnC<'a> {
                 } else {
                     self.emit(Instr::JumpIfNotLtI(v, end_reg, 0))
                 };
-                self.loops.push(LoopCtx { breaks: Vec::new(), continues: Vec::new(), try_depth: self.try_depth });
+                self.loops.push(LoopCtx { breaks: Vec::new(), continues: Vec::new(), tries: self.tries.len() });
                 self.block(body);
                 let cont = self.here();
                 self.emit(Instr::IncI(v, 1));
@@ -786,7 +845,7 @@ impl<'a> FnC<'a> {
                 let key = key.map(|k| self.reg(k)).unwrap_or(NO_REG);
                 let val = self.reg(*val);
                 let next = self.emit(Instr::IterNext { it, key, val, end: 0 });
-                self.loops.push(LoopCtx { breaks: Vec::new(), continues: Vec::new(), try_depth: self.try_depth });
+                self.loops.push(LoopCtx { breaks: Vec::new(), continues: Vec::new(), tries: self.tries.len() });
                 self.block(body);
                 self.emit(Instr::Jump(top));
                 let end = self.here();
@@ -798,10 +857,8 @@ impl<'a> FnC<'a> {
             HStmt::Break(level) | HStmt::Continue(level) => {
                 let is_break = matches!(s, HStmt::Break(_));
                 let idx = self.loops.len() - *level as usize;
-                let pops = self.try_depth - self.loops[idx].try_depth;
-                for _ in 0..pops {
-                    self.emit(Instr::TryEnd);
-                }
+                let down_to = self.loops[idx].tries;
+                self.unwind_tries(down_to);
                 let j = self.emit(Instr::Jump(0));
                 if is_break {
                     self.loops[idx].breaks.push(j);
@@ -812,11 +869,21 @@ impl<'a> FnC<'a> {
             HStmt::Return(value, span) => {
                 self.off = span.start;
                 match value {
+                    Some(e) if !self.tries.is_empty() => {
+                        // The value is computed before `finally` blocks run.
+                        let t = self.alloc();
+                        self.expr_into(e, t);
+                        self.unwind_tries(0);
+                        self.off = span.start;
+                        self.emit(Instr::Ret(t));
+                    }
                     Some(e) => {
                         let r = self.operand(e);
                         self.emit(Instr::Ret(r));
                     }
                     None => {
+                        self.unwind_tries(0);
+                        self.off = span.start;
                         self.emit(Instr::RetNull);
                     }
                 }
@@ -826,38 +893,83 @@ impl<'a> FnC<'a> {
                 self.off = e.span.start;
                 self.emit(Instr::Throw(r));
             }
-            HStmt::Try { body, catches } => {
+            HStmt::Try { body, catches, finally } => {
+                let has_catch = !catches.is_empty();
+                // Layout: [TryBegin finally] [TryBegin catch] body ...
+                let (exc_f, begin_f) = match finally {
+                    Some(_) => {
+                        let r = self.alloc();
+                        (r, Some(self.emit(Instr::TryBegin { catch: 0, exc: r })))
+                    }
+                    None => (0, None),
+                };
                 let exc = self.alloc();
-                let begin = self.emit(Instr::TryBegin { catch: 0, exc });
-                self.try_depth += 1;
+                let begin_c = if has_catch { Some(self.emit(Instr::TryBegin { catch: 0, exc })) } else { None };
+                self.tries.push(TryCtx {
+                    active: has_catch as u32 + finally.is_some() as u32,
+                    finally: finally.clone(),
+                });
                 self.block(body);
-                self.try_depth -= 1;
-                self.emit(Instr::TryEnd);
-                let mut ends = vec![self.emit(Instr::Jump(0))];
-                let catch_at = self.here();
-                self.patch(begin, catch_at);
-                for c in catches {
-                    let t = self.alloc();
-                    let mut to_body = Vec::new();
-                    for class in &c.classes {
-                        self.emit(Instr::InstanceOf(t, exc, *class));
-                        to_body.push(self.emit(Instr::JumpIfTrue(t, 0)));
-                    }
-                    let skip = self.emit(Instr::Jump(0));
-                    let body_at = self.here();
-                    self.patch_all(to_body, body_at);
-                    if let Some(v) = c.var {
-                        let r = self.reg(v);
-                        self.emit(Instr::Move(r, exc));
-                    }
-                    self.block(&c.body);
+                let mut ends = Vec::new();
+                if let Some(begin) = begin_c {
+                    self.emit(Instr::TryEnd);
+                    self.tries.last_mut().unwrap().active -= 1;
                     ends.push(self.emit(Instr::Jump(0)));
-                    let next = self.here();
-                    self.patch(skip, next);
+                    let catch_at = self.here();
+                    self.patch(begin, catch_at);
+                    for c in catches {
+                        let t = self.alloc();
+                        let mut to_body = Vec::new();
+                        for class in &c.classes {
+                            self.emit(Instr::InstanceOf(t, exc, *class));
+                            to_body.push(self.emit(Instr::JumpIfTrue(t, 0)));
+                        }
+                        let skip = self.emit(Instr::Jump(0));
+                        let body_at = self.here();
+                        self.patch_all(to_body, body_at);
+                        if let Some(v) = c.var {
+                            let r = self.reg(v);
+                            self.emit(Instr::Move(r, exc));
+                        }
+                        self.block(&c.body);
+                        ends.push(self.emit(Instr::Jump(0)));
+                        let next = self.here();
+                        self.patch(skip, next);
+                    }
+                    // No catch matched: rethrow (into the `finally` handler, if any).
+                    self.emit(Instr::Throw(exc));
                 }
-                self.emit(Instr::Throw(exc));
-                let end = self.here();
-                self.patch_all(ends, end);
+                let after = self.here();
+                self.patch_all(ends, after);
+                self.tries.pop();
+                if let (Some(begin), Some(f)) = (begin_f, finally) {
+                    self.emit(Instr::TryEnd);
+                    self.block(f);
+                    let j = self.emit(Instr::Jump(0));
+                    let handler = self.here();
+                    self.patch(begin, handler);
+                    self.block(f);
+                    self.emit(Instr::Throw(exc_f));
+                    let end = self.here();
+                    self.patch(j, end);
+                }
+            }
+        }
+    }
+
+    /// Before leaving enclosing `try` statements with `return`, `break` or
+    /// `continue`: removes their handlers and runs their `finally` blocks.
+    fn unwind_tries(&mut self, down_to: usize) {
+        let mut i = self.tries.len();
+        while i > down_to {
+            i -= 1;
+            for _ in 0..self.tries[i].active {
+                self.emit(Instr::TryEnd);
+            }
+            if let Some(f) = self.tries[i].finally.clone() {
+                let outer = self.tries.split_off(i);
+                self.block(&f);
+                self.tries.extend(outer);
             }
         }
     }

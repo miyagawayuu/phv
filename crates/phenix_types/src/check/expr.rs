@@ -1,9 +1,12 @@
-use super::flow::{Facts, FnCtx};
+use super::flow::{FactKey, Facts, FnCtx};
 use super::{Body, Checker, FieldInfo, FuncInfo, ParamInfo};
 use crate::builtins::{php_hint, Recv};
 use crate::hir::*;
 use crate::types::*;
-use phenix_syntax::ast::{self, Arg, BinOp, CastKind, ClosureBody, Expr, ExprKind, InterpPart, MatchArm, TypeExpr, TypeExprKind, UnOp, Visibility};
+use phenix_syntax::ast::{
+    self, Arg, BinOp, CastKind, ClassKind, ClosureBody, Expr, ExprKind, InterpPart, MatchArm, TypeExpr, TypeExprKind, UnOp,
+    Visibility,
+};
 use phenix_syntax::{normalize_template_path, Span};
 
 type Bindings = [Option<Type>; 4];
@@ -49,6 +52,21 @@ fn in_nullsafe_chain(e: &Expr) -> bool {
         ExprKind::MethodCall { obj, .. } | ExprKind::Prop { obj, .. } => in_nullsafe_chain(obj),
         ExprKind::Index { base, .. } => in_nullsafe_chain(base),
         _ => false,
+    }
+}
+
+/// Replaces a function's own type parameters with inference variables.
+fn instantiate(t: &Type, tps: &[String]) -> Type {
+    match t {
+        Type::Param(n) => match tps.iter().position(|p| p == n) {
+            Some(i) => Type::Generic(i as u8),
+            None => t.clone(),
+        },
+        Type::List(x) => Type::list(instantiate(x, tps)),
+        Type::Map(k, v) => Type::map(instantiate(k, tps), instantiate(v, tps)),
+        Type::Func(ps, r) => Type::Func(ps.iter().map(|p| instantiate(p, tps)).collect(), Box::new(instantiate(r, tps))),
+        Type::Union(ms) => Type::union(ms.iter().map(|m| instantiate(m, tps)).collect()),
+        other => other.clone(),
     }
 }
 
@@ -123,6 +141,9 @@ impl<'a> Checker<'a> {
     }
 
     pub(crate) fn coerce(&mut self, h: HExpr, target: &Type) -> HExpr {
+        if target.has_unknown() {
+            return h;
+        }
         if h.ty == Type::Int && target.contains(&Type::Float) && !target.contains(&Type::Int) {
             let span = h.span;
             return HExpr { kind: HExprKind::IntToFloat(Box::new(h)), ty: Type::Float, span };
@@ -280,14 +301,9 @@ impl<'a> Checker<'a> {
                 let h = self.binary(*op, l, r, None, span);
                 let mut is_null = Vec::new();
                 let mut not_null = Vec::new();
-                if let ExprKind::Var(name) = &var_side.kind {
-                    if let Some(&id) = self.cx().names.get(name) {
-                        if self.cx().flow.is_assigned(id) {
-                            let cur = self.cx().current_type(id);
-                            is_null.push((id, Type::Null));
-                            not_null.push((id, cur.without_null()));
-                        }
-                    }
+                if let Some((key, cur)) = self.fact_target(var_side) {
+                    is_null.push((key, Type::Null));
+                    not_null.push((key, cur.without_null()));
                 }
                 if *op == BinOp::Eq {
                     (h, is_null, not_null)
@@ -300,21 +316,67 @@ impl<'a> Checker<'a> {
                 let test = self.resolve_test(ty);
                 let mut then_facts = Vec::new();
                 let mut else_facts = Vec::new();
-                if let (ExprKind::Var(name), Some(test)) = (&x.kind, test) {
-                    if let Some(&id) = self.cx().names.get(name) {
-                        let cur = self.cx().current_type(id);
-                        then_facts.push((id, self.narrow_to(&cur, test)));
-                        else_facts.push((id, self.remove_test(&cur, test)));
-                    }
+                if let (Some((key, cur)), Some(test)) = (self.fact_target(x), test) {
+                    then_facts.push((key, self.narrow_to(&cur, test)));
+                    else_facts.push((key, self.remove_test(&cur, test)));
                 }
                 let test = test.unwrap_or(TestKind::Null);
                 (bool_expr(HExprKind::Is(Box::new(hx), test)), then_facts, else_facts)
             }
+            ExprKind::Paren(x) => self.cond(x),
             _ => {
                 let h = self.expr(e, Some(&Type::Bool));
                 (self.require_bool(h), Vec::new(), Vec::new())
             }
         }
+    }
+
+    /// What a condition on `e` can narrow: a local variable, or a property
+    /// of a local (`$this->user != null`).
+    fn fact_target(&self, e: &Expr) -> Option<(FactKey, Type)> {
+        let cx = self.ctx.last()?;
+        match &e.kind {
+            ExprKind::Var(name) => {
+                let id = *cx.names.get(name)?;
+                cx.flow.is_assigned(id).then(|| (FactKey::Local(id), cx.current_type(id)))
+            }
+            ExprKind::Prop { obj, name, nullsafe: false, .. } => {
+                let ExprKind::Var(v) = &obj.kind else { return None };
+                let id = *cx.names.get(v)?;
+                if !cx.flow.is_assigned(id) {
+                    return None;
+                }
+                let obj_ty = cx.current_type(id);
+                let obj_ty = self.as_single_class(&obj_ty).unwrap_or(obj_ty);
+                let Type::Class(c) = obj_ty else { return None };
+                let slot = self.field_slot(c, name)?;
+                let ty = match cx.flow.prop_narrowed.get(&(id, slot)) {
+                    Some(t) => t.clone(),
+                    None => self.classes[c as usize].fields[slot as usize].ty.clone(),
+                };
+                Some((FactKey::Prop(id, slot), ty))
+            }
+            ExprKind::Paren(x) => self.fact_target(x),
+            _ => None,
+        }
+    }
+
+    /// Forgets property narrowings: a call or assignment may have changed them.
+    pub(crate) fn clear_prop_facts(&mut self) {
+        if let Some(c) = self.ctx.last_mut() {
+            c.flow.prop_narrowed.clear();
+        }
+    }
+
+    fn apply_prop_fact(&self, h: HExpr) -> HExpr {
+        if let HExprKind::Prop(o, slot) = &h.kind {
+            if let HExprKind::Local(id) = o.kind {
+                if let Some(t) = self.ctx.last().and_then(|c| c.flow.prop_narrowed.get(&(id, *slot))) {
+                    return HExpr { ty: t.clone(), ..h };
+                }
+            }
+        }
+        h
     }
 
     fn resolve_test(&mut self, ty: &TypeExpr) -> Option<TestKind> {
@@ -431,7 +493,41 @@ impl<'a> Checker<'a> {
                 Some((id, ty)) => mk(HExprKind::Local(id), ty),
                 None => err(span),
             },
+            ExprKind::Paren(x) => {
+                let h = self.expr(x, expect);
+                HExpr { span, ..h }
+            }
+            ExprKind::ClassConst { class, class_span, name, name_span } => {
+                self.class_const(class, *class_span, name, *name_span, span)
+            }
+            ExprKind::Sql(parts) => {
+                let mut text = String::new();
+                let mut params = Vec::new();
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(s) => text.push_str(s),
+                        InterpPart::Expr(x) => {
+                            let h = self.expr(x, None);
+                            let ok = h.ty.members().iter().all(|m| {
+                                matches!(m, Type::Int | Type::Float | Type::Str | Type::Bool | Type::Null | Type::Error)
+                            });
+                            if !ok {
+                                let msg = format!("`{}` cannot be used as an SQL parameter", self.tn(&h.ty));
+                                self.error(msg, h.span).add_note("parameters must be int, float, string, bool or null");
+                            }
+                            text.push('?');
+                            params.push(h);
+                        }
+                    }
+                }
+                let query = hconst(HConst::Str(text), Type::Str, span);
+                let params = HExpr { kind: HExprKind::List(params), ty: Type::list(Type::Any), span };
+                mk(HExprKind::List(vec![query, params]), Type::Sql)
+            }
             ExprKind::Name(n) => {
+                if let Some((c, t)) = self.lookup_const(n) {
+                    return hconst(c, t, span);
+                }
                 if self.lookup_func(n).is_some() || self.builtin_overloads(n, None).is_some() {
                     self.error(format!("`{n}` is a function, not a value"), span)
                         .add_note(format!("call it, or wrap it in a closure: `fn($x) => {n}($x)`"));
@@ -487,7 +583,9 @@ impl<'a> Checker<'a> {
             ExprKind::Prop { obj, name, name_span, nullsafe } => {
                 let ho = self.expr(obj, None);
                 let f = |c: &mut Self, recv: HExpr| match c.prop_access(&recv, name, *name_span) {
-                    Some((slot, f)) => HExpr { kind: HExprKind::Prop(Box::new(recv), slot), ty: f.ty, span },
+                    Some((slot, f)) => {
+                        c.apply_prop_fact(HExpr { kind: HExprKind::Prop(Box::new(recv), slot), ty: f.ty, span })
+                    }
                     None => err(span),
                 };
                 if !*nullsafe && in_nullsafe_chain(obj) && matches!(ho.kind, HExprKind::NullSafe { .. }) {
@@ -554,7 +652,7 @@ impl<'a> Checker<'a> {
     fn list_lit(&mut self, items: &[Expr], expect: Option<&Type>, span: Span) -> HExpr {
         let expected = expect.map(|t| t.without_null());
         match expected {
-            Some(Type::List(t)) => {
+            Some(Type::List(t)) if !t.has_unknown() => {
                 let hs = items.iter().map(|i| self.expr_to(i, &t)).collect();
                 return HExpr { kind: HExprKind::List(hs), ty: Type::List(t), span };
             }
@@ -581,7 +679,7 @@ impl<'a> Checker<'a> {
     }
 
     fn map_lit(&mut self, pairs: &[(Expr, Expr)], expect: Option<&Type>, span: Span) -> HExpr {
-        if let Some(Type::Map(k, v)) = expect.map(|t| t.without_null()) {
+        if let Some(Type::Map(k, v)) = expect.map(|t| t.without_null()).filter(|t| !t.has_unknown()) {
             let hs = pairs.iter().map(|(ke, ve)| (self.expr_to(ke, &k), self.expr_to(ve, &v))).collect();
             return HExpr { kind: HExprKind::Map(hs), ty: Type::Map(k, v), span };
         }
@@ -661,6 +759,14 @@ impl<'a> Checker<'a> {
                 }
             }
             BinOp::Concat => {
+                if hl.ty == Type::Sql && hr.ty == Type::Sql {
+                    return mk(HExprKind::CallBuiltin("sql_concat".into(), vec![hl, hr]), Type::Sql);
+                }
+                if hl.ty == Type::Sql || hr.ty == Type::Sql {
+                    self.error("cannot join `Sql` with a plain string", span)
+                        .add_note("write the extra part as `sql\"...\"` so values stay parameters");
+                    return err(span);
+                }
                 if hl.ty == Type::Html && hr.ty == Type::Html {
                     return mk(HExprKind::Concat(vec![hl, hr], true), Type::Html);
                 }
@@ -852,9 +958,7 @@ impl<'a> Checker<'a> {
                 return self.render(args, span);
             }
             if let Some(fid) = self.lookup_func(name) {
-                let info = &self.funcs[fid as usize];
-                let (params, ret, fname) = (info.params.clone(), info.ret.clone(), info.name.clone());
-                let hargs = self.call_args(&fname, &params, args, span);
+                let (hargs, ret) = self.invoke(fid, args, span);
                 return HExpr { kind: HExprKind::Call(fid, hargs), ty: ret, span };
             }
             if self.builtin_overloads(name, None).is_some() {
@@ -883,6 +987,7 @@ impl<'a> Checker<'a> {
                     }
                     hargs.push(self.expr_to(&a.value, p));
                 }
+                self.clear_prop_facts();
                 HExpr { kind: HExprKind::CallClosure(Box::new(hc), hargs), ty: *r, span }
             }
             Type::Error => err(span),
@@ -894,15 +999,67 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Checks the arguments of a call to `fid` (inferring type parameters of
+    /// generic functions) and returns them with the call's result type.
+    pub(crate) fn invoke(&mut self, fid: FuncId, args: &[Arg], span: Span) -> (Vec<HExpr>, Type) {
+        let info = &self.funcs[fid as usize];
+        let (mut params, mut ret, fname, tps) =
+            (info.params.clone(), info.ret.clone(), info.name.clone(), info.type_params.clone());
+        if !tps.is_empty() {
+            for p in params.iter_mut() {
+                p.ty = instantiate(&p.ty, &tps);
+            }
+            ret = instantiate(&ret, &tps);
+        }
+        let (hargs, b) = self.call_args_b(&fname, &params, args, span);
+        let mut ret = subst(&ret, &b);
+        if ret.has_unknown() {
+            self.error(format!("cannot infer the type parameters of `{fname}` from its arguments"), span);
+            ret = Type::Error;
+        }
+        self.clear_prop_facts();
+        (hargs, ret)
+    }
+
+    fn arg_to(&mut self, e: &Expr, p: &Type, b: &mut Bindings) -> HExpr {
+        let expected = subst(p, b);
+        let h = self.expr(e, Some(&expected));
+        unify(p, &h.ty, b);
+        let target = subst(p, b);
+        if target.has_unknown() {
+            h
+        } else {
+            self.coerce(h, &target)
+        }
+    }
+
     fn call_args(&mut self, fname: &str, params: &[ParamInfo], args: &[Arg], span: Span) -> Vec<HExpr> {
+        self.call_args_b(fname, params, args, span).0
+    }
+
+    fn call_args_b(&mut self, fname: &str, params: &[ParamInfo], args: &[Arg], span: Span) -> (Vec<HExpr>, Bindings) {
+        let mut b: Bindings = Default::default();
         let mut slots: Vec<Option<HExpr>> = vec![None; params.len()];
-        let mut seen_named = false;
         let mut reported_count = false;
-        for (i, a) in args.iter().enumerate() {
+        // Arguments that need the other arguments to infer their type (`[]`,
+        // closures without parameter types) are checked last.
+        let deferred = |a: &Arg| match &a.value.kind {
+            ExprKind::List(items) => items.is_empty(),
+            ExprKind::Map(items) => items.is_empty(),
+            ExprKind::Closure(c) => c.params.iter().any(|p| p.ty.is_none()),
+            _ => false,
+        };
+        let mut order: Vec<usize> = (0..args.len()).filter(|i| !deferred(&args[*i])).collect();
+        order.extend((0..args.len()).filter(|i| deferred(&args[*i])));
+        let positional = args.iter().take_while(|a| a.name.is_none()).count();
+        for i in order {
+            let a = &args[i];
+            let i = if a.name.is_none() && i >= positional { usize::MAX } else { i };
             match &a.name {
                 None => {
-                    if seen_named {
+                    if i == usize::MAX {
                         self.error("positional arguments cannot follow named arguments", a.value.span);
+                        continue;
                     }
                     if i >= params.len() {
                         if !reported_count {
@@ -914,10 +1071,9 @@ impl<'a> Checker<'a> {
                         continue;
                     }
                     let ty = params[i].ty.clone();
-                    slots[i] = Some(self.expr_to(&a.value, &ty));
+                    slots[i] = Some(self.arg_to(&a.value, &ty, &mut b));
                 }
                 Some((n, nspan)) => {
-                    seen_named = true;
                     match params.iter().position(|p| &p.name == n) {
                         None => {
                             self.error(format!("`{fname}` has no parameter named `{n}`"), *nspan);
@@ -928,7 +1084,7 @@ impl<'a> Checker<'a> {
                         }
                         Some(j) => {
                             let ty = params[j].ty.clone();
-                            slots[j] = Some(self.expr_to(&a.value, &ty));
+                            slots[j] = Some(self.arg_to(&a.value, &ty, &mut b));
                         }
                     }
                 }
@@ -939,7 +1095,7 @@ impl<'a> Checker<'a> {
             match slot {
                 Some(h) => out.push(h),
                 None => match &params[j].default {
-                    Some(d) => out.push(hconst(d.clone(), params[j].ty.clone(), span)),
+                    Some(d) => out.push(hconst(d.clone(), subst(&params[j].ty, &b), span)),
                     None => {
                         let msg = format!("missing argument `${}` for `{fname}`", params[j].name);
                         self.error(msg, span);
@@ -948,7 +1104,7 @@ impl<'a> Checker<'a> {
                 },
             }
         }
-        out
+        (out, b)
     }
 
     fn call_builtin(&mut self, name: &str, recv_kind: Option<Recv>, recv: Option<HExpr>, args: &[Arg], span: Span) -> HExpr {
@@ -1002,6 +1158,9 @@ impl<'a> Checker<'a> {
             }
             let ret = subst(&ret, &b);
             let ret = if ret.has_unknown() { Type::Error } else { ret };
+            if out.iter().any(|h| matches!(h.ty, Type::Func(..))) {
+                self.clear_prop_facts();
+            }
             return HExpr { kind: HExprKind::CallBuiltin(imp.to_string(), out), ty: ret, span };
         }
         // Several overloads with the same arity: pick by argument types.
@@ -1078,8 +1237,7 @@ impl<'a> Checker<'a> {
                     }
                     return err(span);
                 };
-                let info = &self.funcs[m.func as usize];
-                let (params, ret, fname) = (info.params.clone(), info.ret.clone(), info.name.clone());
+                let fname = self.funcs[m.func as usize].name.clone();
                 if !self.can_access(m.owner, m.vis) {
                     self.error(format!("method `{fname}` is {}", Self::vis_word(m.vis)), name_span);
                 }
@@ -1087,9 +1245,14 @@ impl<'a> Checker<'a> {
                     self.error(format!("`{fname}` is static; call it as `{fname}(...)`"), name_span);
                     return err(span);
                 }
+                let (rest, ret) = self.invoke(m.func, args, span);
                 let mut hargs = vec![recv];
-                hargs.extend(self.call_args(&fname, &params, args, span));
-                let kind = HExprKind::CallVirtual(m.slot.unwrap_or(0), hargs);
+                hargs.extend(rest);
+                let kind = if self.class_kind(c) == ClassKind::Interface {
+                    HExprKind::CallNamed(name.to_string(), hargs)
+                } else {
+                    HExprKind::CallVirtual(m.slot.unwrap_or(0), hargs)
+                };
                 HExpr { kind, ty: ret, span }
             }
             Type::Error => err(span),
@@ -1151,7 +1314,9 @@ impl<'a> Checker<'a> {
                 let (id, ty) = self.read_var(name, e.span)?;
                 Some((HPlace { base: HPlaceBase::Local(id), path: Vec::new() }, ty))
             }
+            ExprKind::Paren(x) => self.place(x),
             ExprKind::Prop { obj, name, name_span, nullsafe } => {
+                self.clear_prop_facts();
                 if *nullsafe {
                     self.error("cannot assign through `?->`", e.span);
                     return None;
@@ -1176,7 +1341,7 @@ impl<'a> Checker<'a> {
                         match index {
                             Some(k) => {
                                 let hk = self.expr_to(k, &Type::Int);
-                                p.path.push(HPathElem::Index(hk));
+                                p.path.push(HPathElem::Index(hk, None));
                             }
                             None => p.path.push(HPathElem::Push),
                         }
@@ -1185,7 +1350,13 @@ impl<'a> Checker<'a> {
                     Type::Map(kt, vt) => match index {
                         Some(k) => {
                             let hk = self.expr_to(k, &kt);
-                            p.path.push(HPathElem::Index(hk));
+                            // `$m["a"]["b"] = 1` creates `$m["a"]` when it is missing.
+                            let create = match &*vt {
+                                Type::List(_) => Some(HConst::EmptyList),
+                                Type::Map(..) => Some(HConst::EmptyMap),
+                                _ => None,
+                            };
+                            p.path.push(HPathElem::Index(hk, create));
                             Some((p, *vt))
                         }
                         None => {
@@ -1270,14 +1441,17 @@ impl<'a> Checker<'a> {
                 self.error(format!("the parent class has no method `{name}`"), span);
                 return err(span);
             };
-            let info = &self.funcs[fid as usize];
-            let (params, ret, fname) = (info.params.clone(), info.ret.clone(), info.name.clone());
+            if self.func_is_abstract(fid) {
+                self.error(format!("cannot call abstract method `parent::{name}()`"), span);
+                return err(span);
+            }
             let mut hargs = Vec::new();
             if !is_static {
                 let Some((tid, tty)) = this else { return err(span) };
                 hargs.push(HExpr { kind: HExprKind::Local(tid), ty: tty, span: class_span });
             }
-            hargs.extend(self.call_args(&fname, &params, args, span));
+            let (rest, ret) = self.invoke(fid, args, span);
+            hargs.extend(rest);
             return HExpr { kind: HExprKind::Call(fid, hargs), ty: ret, span };
         }
         let cid = if class == "self" {
@@ -1297,13 +1471,17 @@ impl<'a> Checker<'a> {
                 }
             }
         };
+        if self.class_kind(cid) == ClassKind::Enum && !self.classes[cid as usize].methods.contains_key(name) {
+            if let Some(h) = self.enum_static(cid, name, args, span) {
+                return h;
+            }
+        }
         let Some(m) = self.classes[cid as usize].methods.get(name).cloned() else {
             let cname = self.class_names[cid as usize].clone();
             self.error(format!("class `{cname}` has no method `{name}`"), span);
             return err(span);
         };
-        let info = &self.funcs[m.func as usize];
-        let (params, ret, fname) = (info.params.clone(), info.ret.clone(), info.name.clone());
+        let fname = self.funcs[m.func as usize].name.clone();
         if !m.is_static {
             self.error(format!("`{fname}` is not static; call it on an object with `->{name}()`"), span);
             return err(span);
@@ -1311,8 +1489,60 @@ impl<'a> Checker<'a> {
         if !self.can_access(m.owner, m.vis) {
             self.error(format!("method `{fname}` is {}", Self::vis_word(m.vis)), span);
         }
-        let hargs = self.call_args(&fname, &params, args, span);
+        let (hargs, ret) = self.invoke(m.func, args, span);
         HExpr { kind: HExprKind::Call(m.func, hargs), ty: ret, span }
+    }
+
+    /// `E::cases()`, `E::from($v)` and `E::tryFrom($v)`.
+    fn enum_static(&mut self, cid: ClassId, name: &str, args: &[Arg], span: Span) -> Option<HExpr> {
+        let cty = Type::Class(cid);
+        match name {
+            "cases" => {
+                if !args.is_empty() {
+                    self.error("`cases()` takes no arguments", span);
+                }
+                Some(HExpr { kind: HExprKind::EnumCases(cid), ty: Type::list(cty), span })
+            }
+            "from" | "tryFrom" => {
+                let cname = self.class_names[cid as usize].clone();
+                let Some(backing) = self.classes[cid as usize].backing.clone() else {
+                    self.error(format!("`{cname}` is a pure enum; only backed enums have `{name}()`"), span);
+                    return Some(err(span));
+                };
+                if args.len() != 1 {
+                    self.error(format!("`{cname}::{name}()` takes 1 argument"), span);
+                    return Some(err(span));
+                }
+                let h = self.expr_to(&args[0].value, &backing);
+                let is_try = name == "tryFrom";
+                let ty = if is_try { Type::nullable(cty) } else { cty };
+                Some(HExpr { kind: HExprKind::EnumFrom(cid, Box::new(h), is_try), ty, span })
+            }
+            _ => None,
+        }
+    }
+
+    /// `Suit::Hearts`, `Config::MAX`, `self::LIMIT`.
+    fn class_const(&mut self, class: &str, class_span: Span, name: &str, name_span: Span, span: Span) -> HExpr {
+        let cur = self.ctx.last().and_then(|c| c.class);
+        let cid = match class {
+            "self" | "static" => cur,
+            "parent" => cur.and_then(|c| self.classes[c as usize].parent),
+            other => self.lookup_class(other),
+        };
+        let Some(cid) = cid else {
+            self.error(format!("unknown class `{class}`"), class_span);
+            return err(span);
+        };
+        if let Some(idx) = self.classes[cid as usize].cases.iter().position(|(n, _)| n == name) {
+            return HExpr { kind: HExprKind::EnumCase(cid, idx as u32), ty: Type::Class(cid), span };
+        }
+        if let Some((c, t)) = self.classes[cid as usize].consts.get(name).cloned() {
+            return hconst(c, t, span);
+        }
+        let cname = self.class_names[cid as usize].clone();
+        self.error(format!("`{cname}` has no constant or case named `{name}`"), name_span);
+        err(span)
     }
 
     fn new_expr(&mut self, class: &str, class_span: Span, args: &[Arg], span: Span) -> HExpr {
@@ -1328,11 +1558,23 @@ impl<'a> Checker<'a> {
             return err(span);
         };
         let ty = Type::Class(cid);
+        let what = match self.class_kind(cid) {
+            ClassKind::Abstract => Some("an abstract class"),
+            ClassKind::Interface => Some("an interface"),
+            ClassKind::Enum => Some("an enum"),
+            ClassKind::Class => None,
+        };
+        if let Some(what) = what {
+            let cname = self.class_names[cid as usize].clone();
+            let e = self.error(format!("cannot create an instance of `{cname}`: it is {what}"), class_span);
+            if what == "an enum" {
+                e.add_note(format!("use a case, e.g. `{cname}::Name`"));
+            }
+            return err(span);
+        }
         match self.classes[cid as usize].ctor {
             Some(fid) => {
-                let info = &self.funcs[fid as usize];
-                let (params, fname) = (info.params.clone(), info.name.clone());
-                let hargs = self.call_args(&fname, &params, args, span);
+                let (hargs, _) = self.invoke(fid, args, span);
                 HExpr { kind: HExprKind::New(cid, Some(fid), hargs), ty, span }
             }
             None => {
@@ -1447,6 +1689,8 @@ impl<'a> Checker<'a> {
         let param_tys: Vec<Type> = param_infos.iter().map(|p| p.ty.clone()).collect();
         let fid = self.add_func(FuncInfo {
             name: "{closure}".into(),
+            type_params: Vec::new(),
+            is_abstract: false,
             params: param_infos,
             ret: ret.clone(),
             body: Body::Done,

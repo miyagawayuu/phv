@@ -185,11 +185,6 @@ impl Checker<'_> {
                 self.cx().flow.dead = true;
             }
             StmtKind::Try { body, catches, finally } => {
-                if let Some(f) = finally {
-                    if let Some(first) = f.first() {
-                        self.error("`finally` is not supported yet", first.span);
-                    }
-                }
                 let mut names = HashSet::new();
                 assigned_vars(body, &mut names);
                 let entry = self.cx().flow.clone();
@@ -226,8 +221,27 @@ impl Checker<'_> {
                     result = Flow::merge(result, f);
                     hcatches.push(HCatch { classes, var, body: hb });
                 }
+                let mut hfinally = None;
+                if let Some(f) = finally {
+                    // `finally` runs after normal completion, and also when an
+                    // exception escapes at any point of the `try` or `catch`.
+                    for c in catches {
+                        assigned_vars(&c.body, &mut names);
+                    }
+                    self.cx().flow = entry.clone();
+                    self.cx().invalidate(&names);
+                    let escape = std::mem::take(&mut self.cx().flow);
+                    self.cx().flow = Flow::merge(result.clone(), escape);
+                    self.cx().flow.dead = false;
+                    let mut hf = Vec::new();
+                    self.block(f, &mut hf);
+                    if self.cx().flow.dead {
+                        result.dead = true;
+                    }
+                    hfinally = Some(hf);
+                }
                 self.cx().flow = result;
-                out.push(HStmt::Try { body: hbody, catches: hcatches });
+                out.push(HStmt::Try { body: hbody, catches: hcatches, finally: hfinally });
             }
             StmtKind::Block(b) => self.block(b, out),
             StmtKind::Function(d) => {
@@ -238,6 +252,9 @@ impl Checker<'_> {
             }
             StmtKind::Import(d) => {
                 self.error("`import` must be at the top level of a file", d.span);
+            }
+            StmtKind::Const(d) => {
+                self.error("constants must be declared at the top level of a file", d.name_span);
             }
             StmtKind::Params(_) => {
                 self.error("`params(...)` must be at the top level of a template", s.span);
@@ -280,6 +297,7 @@ impl Checker<'_> {
     pub(crate) fn set_local(&mut self, id: LocalId, declared: &Type, value_ty: Type) {
         let cx = self.cx();
         cx.flow.mark(id);
+        cx.flow.prop_narrowed.retain(|(l, _), _| *l != id);
         if value_ty != *declared && value_ty != Type::Error && value_ty != Type::Never {
             cx.flow.narrowed.insert(id, value_ty);
         } else {
@@ -397,6 +415,10 @@ impl Checker<'_> {
             self.expr(value, None);
             return;
         };
+        if op != AssignOp::Set && matches!(place.path.last(), Some(HPathElem::Push)) {
+            self.error("`[]` can only be used with `=`", target.span);
+            return;
+        }
         match op {
             AssignOp::Set => {
                 let h = self.expr_to(value, &pty);

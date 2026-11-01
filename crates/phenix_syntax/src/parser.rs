@@ -206,7 +206,7 @@ impl Parser {
                     self.advance();
                     return;
                 }
-                Tok::Function | Tok::Class | Tok::If | Tok::Foreach | Tok::While | Tok::For | Tok::Return
+                Tok::Function | Tok::Class | Tok::Interface | Tok::Enum | Tok::Const | Tok::If | Tok::Foreach | Tok::While | Tok::For | Tok::Return
                 | Tok::Echo | Tok::Import | Tok::Export => return,
                 _ => {
                     self.advance();
@@ -343,13 +343,19 @@ impl Parser {
             Tok::Function if matches!(self.peek_at(1), Tok::Ident(_)) => {
                 StmtKind::Function(self.function_decl(false, Visibility::Public, false)?)
             }
-            Tok::Class => StmtKind::Class(self.class_decl(false)?),
+            Tok::Class | Tok::Interface | Tok::Enum | Tok::Abstract | Tok::Final => {
+                StmtKind::Class(self.class_decl(false)?)
+            }
+            Tok::Const => StmtKind::Const(self.const_decl(false)?),
             Tok::Export => {
                 self.advance();
                 match self.peek() {
                     Tok::Function => StmtKind::Function(self.function_decl(true, Visibility::Public, false)?),
-                    Tok::Class => StmtKind::Class(self.class_decl(true)?),
-                    _ => return Err(self.error_here("expected `function` or `class` after `export`")),
+                    Tok::Class | Tok::Interface | Tok::Enum | Tok::Abstract | Tok::Final => {
+                        StmtKind::Class(self.class_decl(true)?)
+                    }
+                    Tok::Const => StmtKind::Const(self.const_decl(true)?),
+                    _ => return Err(self.error_here("expected a declaration after `export`")),
                 }
             }
             Tok::Import => StmtKind::Import(self.import_decl()?),
@@ -596,12 +602,24 @@ impl Parser {
     fn function_decl(&mut self, exported: bool, visibility: Visibility, is_static: bool) -> PResult<FunctionDecl> {
         let start = self.expect(Tok::Function)?;
         let (name, name_span) = self.expect_ident("a function name")?;
+        let mut type_params = Vec::new();
+        if self.eat(&Tok::Lt) {
+            loop {
+                type_params.push(self.expect_ident("a type parameter")?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect_gt()?;
+        }
         let params = self.params()?;
         let ret = if self.eat(&Tok::Colon) { Some(self.ty()?) } else { None };
-        let body = self.block()?;
+        let (body, is_abstract) = if self.eat(&Tok::Semi) { (Vec::new(), true) } else { (self.block()?, false) };
         Ok(FunctionDecl {
             name,
             name_span,
+            type_params,
+            is_abstract,
             params,
             ret,
             body,
@@ -613,18 +631,77 @@ impl Parser {
     }
 
     fn class_decl(&mut self, exported: bool) -> PResult<ClassDecl> {
-        let start = self.expect(Tok::Class)?;
-        let (name, name_span) = self.expect_ident("a class name")?;
-        let parent = if self.eat(&Tok::Extends) { Some(self.expect_ident("a parent class")?) } else { None };
+        let start = self.span();
+        let mut kind = ClassKind::Class;
+        while matches!(self.peek(), Tok::Abstract | Tok::Final) {
+            if self.at(&Tok::Abstract) {
+                kind = ClassKind::Abstract;
+            }
+            self.advance();
+        }
+        match self.peek() {
+            Tok::Interface => kind = ClassKind::Interface,
+            Tok::Enum => kind = ClassKind::Enum,
+            Tok::Class => {}
+            other => {
+                let found = other.describe();
+                return Err(self.error_here(format!("expected `class`, `interface` or `enum`, found {found}")));
+            }
+        }
+        self.advance();
+        let (name, name_span) = self.expect_ident("a type name")?;
+        let mut backing = None;
+        if kind == ClassKind::Enum && self.eat(&Tok::Colon) {
+            backing = Some(self.ty()?);
+        }
+        let mut parent = None;
+        let mut interfaces = Vec::new();
+        if self.eat(&Tok::Extends) {
+            if kind == ClassKind::Interface {
+                loop {
+                    interfaces.push(self.expect_ident("an interface")?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+            } else {
+                parent = Some(self.expect_ident("a parent class")?);
+            }
+        }
+        if self.eat(&Tok::Implements) {
+            loop {
+                interfaces.push(self.expect_ident("an interface")?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
         self.expect(Tok::LBrace)?;
         let mut props = Vec::new();
         let mut methods = Vec::new();
+        let mut consts = Vec::new();
+        let mut cases = Vec::new();
         while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
             let member_start = self.pos;
             let mstart = self.span();
+            if self.at(&Tok::Case) {
+                let r: PResult<()> = (|| {
+                    self.advance();
+                    let (cname, _) = self.expect_ident("a case name")?;
+                    let value = if self.eat(&Tok::Eq) { Some(self.expr()?) } else { None };
+                    self.expect(Tok::Semi)?;
+                    cases.push(EnumCase { name: cname, value, span: mstart.to(self.prev_span()) });
+                    Ok(())
+                })();
+                if r.is_err() {
+                    self.recover(member_start);
+                }
+                continue;
+            }
             let mut vis = Visibility::Public;
             let mut is_static = false;
             let mut readonly = false;
+            let mut is_abstract = kind == ClassKind::Interface;
             loop {
                 match self.peek() {
                     Tok::Public => vis = Visibility::Public,
@@ -632,12 +709,26 @@ impl Parser {
                     Tok::Private => vis = Visibility::Private,
                     Tok::Static => is_static = true,
                     Tok::Readonly => readonly = true,
+                    Tok::Abstract => is_abstract = true,
+                    Tok::Final => {}
                     _ => break,
                 }
                 self.advance();
             }
             let result = if self.at(&Tok::Function) {
-                self.function_decl(false, vis, is_static).map(|f| methods.push(f))
+                self.function_decl(false, vis, is_static).map(|f| {
+                    if f.is_abstract != is_abstract {
+                        let msg = if is_abstract {
+                            "abstract and interface methods cannot have a body"
+                        } else {
+                            "this method needs a body (or mark it `abstract`)"
+                        };
+                        self.diags.push(Diagnostic::error(msg, f.name_span));
+                    }
+                    methods.push(f);
+                })
+            } else if self.at(&Tok::Const) {
+                self.const_decl(false).map(|c| consts.push(c))
             } else if matches!(self.peek(), Tok::Var(_)) {
                 Err(self.error_here("properties must declare a type, e.g. `public string $name;`"))
             } else {
@@ -647,10 +738,13 @@ impl Parser {
                     let default = if self.eat(&Tok::Eq) { Some(self.expr()?) } else { None };
                     self.expect(Tok::Semi)?;
                     if is_static {
-                        self.diags.push(Diagnostic::error(
-                            "static properties are not supported (they would share state between requests)",
-                            mstart,
-                        ));
+                        self.diags.push(
+                            Diagnostic::error(
+                                "static properties are not supported (they would share state between requests)",
+                                mstart,
+                            )
+                            .note("use a class constant (`const MAX = 10;`) for fixed values"),
+                        );
                     }
                     props.push(PropDecl {
                         name: pname,
@@ -668,7 +762,34 @@ impl Parser {
             }
         }
         self.expect(Tok::RBrace)?;
-        Ok(ClassDecl { name, name_span, parent, props, methods, exported, span: start.to(self.prev_span()) })
+        Ok(ClassDecl {
+            name,
+            name_span,
+            kind,
+            parent,
+            interfaces,
+            props,
+            methods,
+            consts,
+            cases,
+            backing,
+            exported,
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    fn const_decl(&mut self, exported: bool) -> PResult<ConstDecl> {
+        let start = self.expect(Tok::Const)?;
+        let ty = if matches!(self.peek_at(1), Tok::Ident(_) | Tok::Lt | Tok::Pipe) || self.at(&Tok::Question) {
+            Some(self.ty()?)
+        } else {
+            None
+        };
+        let (name, name_span) = self.expect_ident("a constant name")?;
+        self.expect(Tok::Eq)?;
+        let value = self.expr()?;
+        self.semi()?;
+        Ok(ConstDecl { name, name_span, ty, value, exported, span: start.to(self.prev_span()) })
     }
 
     fn import_decl(&mut self) -> PResult<ImportDecl> {
@@ -952,9 +1073,11 @@ impl Parser {
                     let class = class.clone();
                     let class_span = e.span;
                     self.advance();
-                    let (name, _) = self.member_name()?;
+                    let (name, name_span) = self.member_name()?;
                     if !self.at(&Tok::LParen) {
-                        return Err(self.error_here("expected `(`: only static method calls are supported after `::`"));
+                        let span = e.span.to(self.prev_span());
+                        e = Expr { kind: ExprKind::ClassConst { class, class_span, name, name_span }, span };
+                        continue;
                     }
                     let args = self.args()?;
                     let span = e.span.to(self.prev_span());
@@ -972,7 +1095,8 @@ impl Parser {
         match t {
             Tok::Ident(name) => Ok((name, self.advance().span)),
             Tok::Default | Tok::Match | Tok::Is | Tok::New | Tok::Echo | Tok::Use | Tok::Import | Tok::Export
-            | Tok::Static | Tok::Class | Tok::As | Tok::Do | Tok::Try | Tok::Catch | Tok::Throw => {
+            | Tok::Static | Tok::Class | Tok::As | Tok::Do | Tok::Try | Tok::Catch | Tok::Throw | Tok::Interface
+            | Tok::Enum | Tok::Case | Tok::Const | Tok::Abstract | Tok::Final | Tok::Implements => {
                 let span = self.advance().span;
                 let text = t.describe().trim_matches('`').to_string();
                 Ok((text, span))
@@ -1056,7 +1180,28 @@ impl Parser {
                 self.advance();
                 let e = self.expr()?;
                 self.expect(Tok::RParen)?;
-                return Ok(Expr { kind: e.kind, span: start.to(self.prev_span()) });
+                let span = start.to(self.prev_span());
+                let kind = match e.kind {
+                    ExprKind::MethodCall { .. } | ExprKind::Prop { .. } | ExprKind::Index { .. } => {
+                        ExprKind::Paren(Box::new(Expr { kind: e.kind, span: e.span }))
+                    }
+                    other => other,
+                };
+                return Ok(Expr { kind, span });
+            }
+            Tok::Sql(parts) => {
+                self.advance();
+                let mut out = Vec::new();
+                for part in parts {
+                    match part {
+                        StrPart::Lit(s) => out.push(InterpPart::Lit(s)),
+                        StrPart::Var(name, span) => {
+                            out.push(InterpPart::Expr(Expr { kind: ExprKind::Var(name), span }))
+                        }
+                        StrPart::Expr(code, offset) => out.push(InterpPart::Expr(self.sub_expr(&code, offset)?)),
+                    }
+                }
+                ExprKind::Sql(out)
             }
             Tok::LBracket => self.array_literal()?,
             Tok::New => {

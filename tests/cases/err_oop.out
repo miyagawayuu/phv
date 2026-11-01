@@ -1,0 +1,72 @@
+error: `Loud::greet` does not match the signature of `Greeter::greet`
+ --> err_oop.phx:6:7
+  |
+6 | class Loud implements Greeter {
+  |       ^^^^
+
+error: `Loud::greet` overrides `Greeter::greet` with an incompatible signature
+ --> err_oop.phx:7:21
+  |
+7 |     public function greet(int $name): string {
+  |                     ^^^^^
+  = note: overriding methods must keep the same parameter types and a compatible return type
+
+error: class `Silent` does not implement Greeter::greet
+  --> err_oop.phx:12:7
+   |
+12 | class Silent implements Greeter {}
+   |       ^^^^^^
+   = note: implement the methods, or declare the class `abstract`
+
+error: class `Dog` does not implement Animal::sound
+  --> err_oop.phx:18:7
+   |
+18 | class Dog extends Animal {}
+   |       ^^^
+   = note: implement the methods, or declare the class `abstract`
+
+error: two cases have the same value
+  --> err_oop.phx:22:5
+   |
+22 |     case High = 1;
+   |     ^^^^^^^^^^^^^^
+
+error: cannot create an instance of `Animal`: it is an abstract class
+  --> err_oop.phx:25:10
+   |
+25 | $a = new Animal();
+   |          ^^^^^^
+
+error: cannot create an instance of `Greeter`: it is an interface
+  --> err_oop.phx:26:10
+   |
+26 | $g = new Greeter();
+   |          ^^^^^^^
+
+error: cannot create an instance of `Level`: it is an enum
+  --> err_oop.phx:27:10
+   |
+27 | $l = new Level();
+   |          ^^^^^
+   = note: use a case, e.g. `Level::Name`
+
+error: `Level` has no constant or case named `Medium`
+  --> err_oop.phx:28:13
+   |
+28 | echo Level::Medium;
+   |             ^^^^^^
+
+error: cannot join `Sql` with a plain string
+  --> err_oop.phx:29:6
+   |
+29 | $q = sql"SELECT * FROM t WHERE x = " . "1";
+   |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: write the extra part as `sql"..."` so values stay parameters
+
+error: cannot apply `+` to `T` and `int`
+  --> err_oop.phx:31:12
+   |
+31 |     return $x + 1;
+   |            ^^^^^^
+
+11 errors found

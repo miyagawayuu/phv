@@ -1,0 +1,11 @@
+shape:circle (3.1)
+shape:square (4)
+21.57
+is Shape not circle
+3.14159 shape:
+Hearts is red; same case: yes
+Banned unknown
+active,banned
+{"status":"active"}
+"x" is not a valid value for enum Status
+max 3

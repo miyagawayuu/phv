@@ -1,0 +1,12 @@
+[finally 0] body end
+[finally 1] returned
+[finally 2] caught end
+i=1 (f1) (f2) (f3) 
+inner finally
+outer caught inner
+6 NONE {"first":1,"second":"x"}
+a -> b / z
+{"alice":{"math":90,"art":75},"bob":{"math":60}}
+{"php":["web","classic"]}
+(none)
+sql value

@@ -1,0 +1,32 @@
+<?phx
+interface Greeter {
+    public function greet(string $name): string;
+}
+
+class Loud implements Greeter {
+    public function greet(int $name): string {
+        return "HI";
+    }
+}
+
+class Silent implements Greeter {}
+
+abstract class Animal {
+    abstract public function sound(): string;
+}
+
+class Dog extends Animal {}
+
+enum Level: int {
+    case Low = 1;
+    case High = 1;
+}
+
+$a = new Animal();
+$g = new Greeter();
+$l = new Level();
+echo Level::Medium;
+$q = sql"SELECT * FROM t WHERE x = " . "1";
+function bad<T>(T $x): int {
+    return $x + 1;
+}

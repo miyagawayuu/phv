@@ -16,9 +16,9 @@ use crate::builtins::{BuiltinSig, Recv, BUILTINS};
 use crate::hir::*;
 use crate::types::*;
 use flow::FnCtx;
-use phenix_syntax::ast::{self, ClassDecl, ExprKind, FunctionDecl, StmtKind, TypeExpr, TypeExprKind, Visibility};
+use phenix_syntax::ast::{self, ClassDecl, ClassKind, ExprKind, FunctionDecl, StmtKind, TypeExpr, TypeExprKind, Visibility};
 use phenix_syntax::{parse_type_str, Diagnostic, Span};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ModuleKind {
@@ -64,8 +64,10 @@ pub fn check(input: &CheckInput) -> (HProgram, Vec<Diagnostic>) {
 struct Scope {
     funcs: HashMap<String, FuncId>,
     classes: HashMap<String, ClassId>,
+    consts: HashMap<String, (HConst, Type)>,
     export_funcs: HashMap<String, FuncId>,
     export_classes: HashMap<String, ClassId>,
+    export_consts: HashMap<String, (HConst, Type)>,
 }
 
 #[derive(Clone)]
@@ -92,12 +94,20 @@ struct MethodInfo {
 struct ClassInfo<'a> {
     name: String,
     decl: Option<&'a ClassDecl>,
+    kind: ClassKind,
     module: usize,
     parent: Option<ClassId>,
+    /// Directly implemented (or, for interfaces, extended) interfaces.
+    ifaces: Vec<ClassId>,
+    /// Itself, ancestors and all interfaces; filled when the class is resolved.
+    supers: HashSet<ClassId>,
     fields: Vec<FieldInfo>,
     methods: HashMap<String, MethodInfo>,
     vtable: Vec<FuncId>,
     ctor: Option<FuncId>,
+    consts: HashMap<String, (HConst, Type)>,
+    cases: Vec<(String, HConst)>,
+    backing: Option<Type>,
     span: Span,
 }
 
@@ -119,6 +129,9 @@ struct ParamInfo {
 
 struct FuncInfo<'a> {
     name: String,
+    /// Names of the function's type parameters (`function f<T>(...)`).
+    type_params: Vec<String>,
+    is_abstract: bool,
     params: Vec<ParamInfo>,
     ret: Type,
     body: Body<'a>,
@@ -148,6 +161,8 @@ pub(crate) struct Checker<'a> {
     module: usize,
     template_funcs: HashMap<usize, FuncId>,
     main: Option<FuncId>,
+    /// Type parameters in scope while resolving or checking a generic function.
+    type_params: Vec<String>,
 }
 
 fn sig_type(t: &TypeExpr) -> Type {
@@ -195,6 +210,7 @@ impl<'a> Checker<'a> {
             module: 0,
             template_funcs: HashMap::new(),
             main: None,
+            type_params: Vec::new(),
         }
     }
 
@@ -261,16 +277,49 @@ impl<'a> Checker<'a> {
         self.builtins.get(name).is_some_and(|l| l.iter().any(|b| b.sig.recv.is_none()))
     }
 
-    pub(crate) fn is_subclass(&self, mut c: ClassId, target: ClassId) -> bool {
-        loop {
-            if c == target {
-                return true;
-            }
-            match self.classes[c as usize].parent {
-                Some(p) => c = p,
-                None => return false,
-            }
+    pub(crate) fn is_subclass(&self, c: ClassId, target: ClassId) -> bool {
+        if c == target {
+            return true;
         }
+        let ci = &self.classes[c as usize];
+        if !ci.supers.is_empty() {
+            return ci.supers.contains(&target);
+        }
+        ci.parent.is_some_and(|p| self.is_subclass(p, target)) || ci.ifaces.iter().any(|i| self.is_subclass(*i, target))
+    }
+
+    pub(crate) fn lookup_const(&self, name: &str) -> Option<(HConst, Type)> {
+        if let Some(c) = self.scopes[self.module].consts.get(name) {
+            return Some(c.clone());
+        }
+        self.prelude().and_then(|p| self.scopes[p].consts.get(name).cloned())
+    }
+
+    pub(crate) fn class_kind(&self, c: ClassId) -> ClassKind {
+        self.classes[c as usize].kind
+    }
+
+    pub(crate) fn func_is_abstract(&self, f: FuncId) -> bool {
+        self.funcs[f as usize].is_abstract
+    }
+
+    /// The value of a `const` declaration: a scalar literal.
+    fn literal_const(&mut self, e: &ast::Expr, ty: Option<&TypeExpr>, self_class: Option<ClassId>) -> Option<(HConst, Type)> {
+        let (c, t) = match &e.kind {
+            ExprKind::Int(i) => (HConst::Int(*i), Type::Int),
+            ExprKind::Float(f) => (HConst::Float(*f), Type::Float),
+            ExprKind::Str(s) => (HConst::Str(s.clone()), Type::Str),
+            ExprKind::Bool(b) => (HConst::Bool(*b), Type::Bool),
+            ExprKind::Null => (HConst::Null, Type::Null),
+            _ => {
+                self.error("constants must be literals (int, float, string, bool or null)", e.span);
+                return None;
+            }
+        };
+        let Some(ty) = ty else { return Some((c, t)) };
+        let declared = self.resolve_type(ty, self_class);
+        let c = self.const_default(e, &declared)?;
+        Some((c, declared))
     }
 
     /// The closest class that every class in `classes` extends.
@@ -301,7 +350,14 @@ impl<'a> Checker<'a> {
         match &t.kind {
             TypeExprKind::Named(n, args) => {
                 let simple = |ty: Type| (ty, 0usize);
+                if self.type_params.iter().any(|p| p == n) {
+                    if !args.is_empty() {
+                        self.error(format!("type parameter `{n}` does not take type arguments"), t.span);
+                    }
+                    return Type::Param(n.clone());
+                }
                 let (ty, arity) = match n.as_str() {
+                    "Sql" => simple(Type::Sql),
                     "int" => simple(Type::Int),
                     "float" => simple(Type::Float),
                     "string" => simple(Type::Str),
@@ -463,6 +519,8 @@ impl<'a> Checker<'a> {
                 ModuleKind::Template => {
                     let fid = self.add_func(FuncInfo {
                         name: format!("template {}", m.name),
+                        type_params: Vec::new(),
+                        is_abstract: false,
                         params: Vec::new(),
                         ret: Type::Html,
                         body: Body::Template(m.ast),
@@ -477,6 +535,8 @@ impl<'a> Checker<'a> {
                 ModuleKind::Entry => {
                     let fid = self.add_func(FuncInfo {
                         name: "{main}".into(),
+                        type_params: Vec::new(),
+                        is_abstract: false,
                         params: Vec::new(),
                         ret: Type::Void,
                         body: Body::Main(m.ast),
@@ -503,6 +563,8 @@ impl<'a> Checker<'a> {
                         }
                         let fid = self.add_func(FuncInfo {
                             name: d.name.clone(),
+                            type_params: d.type_params.iter().map(|(n, _)| n.clone()).collect(),
+                            is_abstract: false,
                             params: Vec::new(),
                             ret: Type::Void,
                             body: Body::Function(d),
@@ -529,12 +591,18 @@ impl<'a> Checker<'a> {
                         self.classes.push(ClassInfo {
                             name: d.name.clone(),
                             decl: Some(d),
+                            kind: d.kind,
                             module: mi,
                             parent: None,
+                            ifaces: Vec::new(),
+                            supers: HashSet::new(),
                             fields: Vec::new(),
                             methods: HashMap::new(),
                             vtable: Vec::new(),
                             ctor: None,
+                            consts: HashMap::new(),
+                            cases: Vec::new(),
+                            backing: None,
                             span: d.name_span,
                         });
                         self.class_names.push(d.name.clone());
@@ -548,6 +616,15 @@ impl<'a> Checker<'a> {
                             self.scopes[mi].export_classes.insert(d.name.clone(), cid);
                         }
                     }
+                    StmtKind::Const(d) => {
+                        let Some(value) = self.literal_const(&d.value, d.ty.as_ref(), None) else { continue };
+                        if self.scopes[mi].consts.insert(d.name.clone(), value.clone()).is_some() {
+                            self.error(format!("constant `{}` is defined more than once", d.name), d.name_span);
+                        }
+                        if d.exported {
+                            self.scopes[mi].export_consts.insert(d.name.clone(), value);
+                        }
+                    }
                     StmtKind::Import(_) | StmtKind::Params(_) => {}
                     _ => {
                         let code_allowed = matches!(m.kind, ModuleKind::Entry | ModuleKind::Template);
@@ -557,7 +634,7 @@ impl<'a> Checker<'a> {
                                 "only declarations are allowed at the top level of an imported module",
                                 s.span,
                             )
-                            .add_note("imported modules may contain `function`, `class` and `import`; code runs only in the entry script");
+                            .add_note("imported modules may contain `function`, `class`, `interface`, `enum`, `const` and `import`; code runs only in the entry script");
                         }
                     }
                 }
@@ -580,9 +657,16 @@ impl<'a> Checker<'a> {
                 for (name, span) in &d.names {
                     let f = self.scopes[target].export_funcs.get(name).copied();
                     let c = self.scopes[target].export_classes.get(name).copied();
+                    if let Some(k) = self.scopes[target].export_consts.get(name).cloned() {
+                        if self.scopes[mi].consts.insert(name.clone(), k).is_some() {
+                            self.error(format!("`{name}` is already defined in this module"), *span);
+                        }
+                        continue;
+                    }
                     if f.is_none() && c.is_none() {
                         let declared = self.scopes[target].funcs.contains_key(name)
-                            || self.scopes[target].classes.contains_key(name);
+                            || self.scopes[target].classes.contains_key(name)
+                            || self.scopes[target].consts.contains_key(name);
                         let e = self.error(format!("module `{key}` has no exported `{name}`"), *span);
                         if declared {
                             e.add_note(format!("`{name}` exists but is not exported; add `export` to its declaration"));
@@ -608,12 +692,21 @@ impl<'a> Checker<'a> {
     fn order_classes(&mut self) -> Vec<ClassId> {
         for cid in 0..self.classes.len() {
             let Some(decl) = self.classes[cid].decl else { continue };
-            let Some((pname, pspan)) = &decl.parent else { continue };
             self.module = self.classes[cid].module;
-            match self.lookup_class(pname) {
-                Some(p) => self.classes[cid].parent = Some(p),
-                None => {
-                    self.error(format!("unknown parent class `{pname}`"), *pspan);
+            if let Some((pname, pspan)) = &decl.parent {
+                match self.lookup_class(pname) {
+                    Some(p) => self.classes[cid].parent = Some(p),
+                    None => {
+                        self.error(format!("unknown parent class `{pname}`"), *pspan);
+                    }
+                }
+            }
+            for (iname, ispan) in &decl.interfaces {
+                match self.lookup_class(iname) {
+                    Some(i) => self.classes[cid].ifaces.push(i),
+                    None => {
+                        self.error(format!("unknown interface `{iname}`"), *ispan);
+                    }
                 }
             }
         }
@@ -632,8 +725,9 @@ impl<'a> Checker<'a> {
             1 => {
                 let span = self.classes[cid as usize].span;
                 let name = self.classes[cid as usize].name.clone();
-                self.error(format!("class `{name}` inherits from itself"), span);
+                self.error(format!("`{name}` inherits from itself"), span);
                 self.classes[cid as usize].parent = None;
+                self.classes[cid as usize].ifaces.clear();
                 return;
             }
             _ => {}
@@ -642,8 +736,19 @@ impl<'a> Checker<'a> {
         if let Some(p) = self.classes[cid as usize].parent {
             self.visit_class(p, state, order);
         }
+        for i in self.classes[cid as usize].ifaces.clone() {
+            self.visit_class(i, state, order);
+        }
         state[cid as usize] = 2;
         order.push(cid);
+    }
+
+    /// Whether method `sub` can stand in for `base` (same parameters, compatible return).
+    fn compatible_override(&self, sub: FuncId, base: FuncId) -> bool {
+        let (a, b) = (&self.funcs[sub as usize], &self.funcs[base as usize]);
+        a.params.len() == b.params.len()
+            && a.params.iter().zip(&b.params).all(|(x, y)| x.ty == y.ty)
+            && self.assignable(&a.ret, &b.ret)
     }
 
     fn resolve_classes(&mut self, order: &[ClassId]) {
@@ -651,15 +756,150 @@ impl<'a> Checker<'a> {
             let ci = cid as usize;
             let Some(decl) = self.classes[ci].decl else { continue };
             self.module = self.classes[ci].module;
+            let kind = decl.kind;
+            let class_name = self.classes[ci].name.clone();
             if let Some(p) = self.classes[ci].parent {
+                match self.classes[p as usize].kind {
+                    ClassKind::Interface => {
+                        let span = decl.parent.as_ref().unwrap().1;
+                        self.error("a class cannot extend an interface; use `implements`", span);
+                    }
+                    ClassKind::Enum => {
+                        let span = decl.parent.as_ref().unwrap().1;
+                        self.error("enums cannot be extended", span);
+                    }
+                    _ => {}
+                }
                 let parent = &self.classes[p as usize];
-                let (fields, methods, vtable, ctor) =
-                    (parent.fields.clone(), parent.methods.clone(), parent.vtable.clone(), parent.ctor);
+                let (fields, methods, vtable, ctor, consts) = (
+                    parent.fields.clone(),
+                    parent.methods.clone(),
+                    parent.vtable.clone(),
+                    parent.ctor,
+                    parent.consts.clone(),
+                );
                 let c = &mut self.classes[ci];
                 c.fields = fields;
                 c.methods = methods;
                 c.vtable = vtable;
                 c.ctor = ctor;
+                c.consts = consts;
+            }
+            let mut supers: HashSet<ClassId> = HashSet::from([cid]);
+            if let Some(p) = self.classes[ci].parent {
+                supers.extend(self.classes[p as usize].supers.iter().copied());
+            }
+            for (i, (_, ispan)) in self.classes[ci].ifaces.clone().into_iter().zip(&decl.interfaces) {
+                if self.classes[i as usize].kind != ClassKind::Interface {
+                    let iname = self.classes[i as usize].name.clone();
+                    self.error(format!("`{iname}` is not an interface"), *ispan);
+                    continue;
+                }
+                supers.extend(self.classes[i as usize].supers.iter().copied());
+                for (k, v) in self.classes[i as usize].consts.clone() {
+                    self.classes[ci].consts.entry(k).or_insert(v);
+                }
+                if kind == ClassKind::Interface {
+                    for (name, m) in self.classes[i as usize].methods.clone() {
+                        self.classes[ci].methods.entry(name).or_insert(m);
+                    }
+                }
+            }
+            // Classes get a vtable slot for every interface method they do not
+            // define yet, so abstract classes can call them on `$this`.
+            if kind != ClassKind::Interface {
+                let mut ifs: Vec<ClassId> = supers
+                    .iter()
+                    .copied()
+                    .filter(|s| self.classes[*s as usize].kind == ClassKind::Interface)
+                    .collect();
+                ifs.sort();
+                for i in ifs {
+                    let mut ms: Vec<(String, MethodInfo)> =
+                        self.classes[i as usize].methods.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    ms.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (name, m) in ms {
+                        if self.classes[ci].methods.contains_key(&name) {
+                            continue;
+                        }
+                        let c = &mut self.classes[ci];
+                        c.vtable.push(m.func);
+                        let slot = Some(c.vtable.len() as u32 - 1);
+                        c.methods.insert(name, MethodInfo { slot, ..m });
+                    }
+                }
+            }
+            self.classes[ci].supers = supers;
+            if matches!(kind, ClassKind::Interface | ClassKind::Enum) {
+                if let Some(prop) = decl.props.first() {
+                    let what = if kind == ClassKind::Interface { "interfaces" } else { "enums" };
+                    self.error(format!("{what} cannot have properties"), prop.span);
+                }
+            }
+            if kind == ClassKind::Enum {
+                let backing = decl.backing.as_ref().map(|t| {
+                    let ty = self.resolve_type(t, Some(cid));
+                    if !matches!(ty, Type::Int | Type::Str | Type::Error) {
+                        self.error("enum backing type must be `int` or `string`", t.span);
+                    }
+                    ty
+                });
+                let name_field = FieldInfo {
+                    name: "name".into(),
+                    ty: Type::Str,
+                    vis: Visibility::Public,
+                    readonly: true,
+                    owner: cid,
+                    default: Some(HConst::Str(String::new())),
+                    required: false,
+                };
+                self.classes[ci].fields.push(name_field);
+                if let Some(b) = &backing {
+                    let value_field = FieldInfo {
+                        name: "value".into(),
+                        ty: b.clone(),
+                        vis: Visibility::Public,
+                        readonly: true,
+                        owner: cid,
+                        default: Some(HConst::Null),
+                        required: false,
+                    };
+                    self.classes[ci].fields.push(value_field);
+                }
+                for case in &decl.cases {
+                    let value = match (&backing, &case.value) {
+                        (Some(b), Some(v)) => self.const_default(v, &b.clone()).unwrap_or(HConst::Null),
+                        (Some(_), None) => {
+                            self.error(format!("case `{}` of a backed enum needs a value", case.name), case.span);
+                            HConst::Null
+                        }
+                        (None, Some(v)) => {
+                            self.error("cases of a pure enum cannot have values; add a backing type, e.g. `enum E: string`", v.span);
+                            HConst::Null
+                        }
+                        (None, None) => HConst::Null,
+                    };
+                    let dup_name = self.classes[ci].cases.iter().any(|(n, _)| *n == case.name);
+                    let dup_value = value != HConst::Null && self.classes[ci].cases.iter().any(|(_, v)| *v == value);
+                    if dup_name {
+                        self.error(format!("case `{}` is declared more than once", case.name), case.span);
+                    } else if dup_value {
+                        self.error("two cases have the same value", case.span);
+                    }
+                    self.classes[ci].cases.push((case.name.clone(), value));
+                }
+                self.classes[ci].backing = backing;
+            } else if let Some(case) = decl.cases.first() {
+                self.error("`case` can only be used in an enum", case.span);
+            }
+            for c in &decl.consts {
+                let Some(value) = self.literal_const(&c.value, c.ty.as_ref(), Some(cid)) else { continue };
+                let own_dup = self.classes[ci].consts.contains_key(&c.name)
+                    && decl.consts.iter().filter(|o| o.name == c.name).count() > 1;
+                if own_dup {
+                    self.error(format!("constant `{}` is declared more than once", c.name), c.name_span);
+                }
+                self.classes[ci].consts.insert(c.name.clone(), value);
             }
             for prop in &decl.props {
                 let ty = self.resolve_type(&prop.ty, Some(cid));
@@ -677,21 +917,36 @@ impl<'a> Checker<'a> {
             }
             let mut own_ctor = false;
             for m in &decl.methods {
+                self.type_params = m.type_params.iter().map(|(n, _)| n.clone()).collect();
                 let params = self.resolve_params(&m.params, Some(cid));
                 let is_ctor = m.name == "__construct";
                 let ret = match &m.ret {
                     Some(t) => self.resolve_type(t, Some(cid)),
                     None => Type::Void,
                 };
+                let type_params = std::mem::take(&mut self.type_params);
+                if type_params.len() > 4 {
+                    self.error("at most 4 type parameters are supported", m.name_span);
+                }
+                if is_ctor && matches!(kind, ClassKind::Interface | ClassKind::Enum) {
+                    self.error("interfaces and enums cannot have constructors", m.name_span);
+                }
+                if m.is_abstract && matches!(kind, ClassKind::Class | ClassKind::Enum) {
+                    self.error(format!("`{class_name}` must be declared `abstract` to have abstract methods"), m.name_span);
+                }
+                if m.is_static && kind == ClassKind::Interface {
+                    self.error("interface methods cannot be static", m.name_span);
+                }
                 if is_ctor && ret != Type::Void {
                     self.error("constructors cannot declare a return type", m.name_span);
                 }
                 if is_ctor && m.is_static {
                     self.error("constructors cannot be static", m.name_span);
                 }
-                let class_name = self.classes[ci].name.clone();
                 let fid = self.add_func(FuncInfo {
                     name: format!("{class_name}::{}", m.name),
+                    type_params,
+                    is_abstract: m.is_abstract,
                     params: params.clone(),
                     ret: ret.clone(),
                     body: Body::Function(m),
@@ -734,12 +989,8 @@ impl<'a> Checker<'a> {
                         if old.is_static != m.is_static {
                             self.error(format!("`{}` changes between static and non-static when overriding", m.name), m.name_span);
                         }
-                        let old_info = &self.funcs[old.func as usize];
-                        let compatible = old_info.params.len() == params.len()
-                            && old_info.params.iter().zip(&params).all(|(a, b)| a.ty == b.ty)
-                            && self.assignable(&ret, &old_info.ret.clone());
-                        if !compatible {
-                            let parent_name = old_info.name.clone();
+                        if !self.compatible_override(fid, old.func) {
+                            let parent_name = self.funcs[old.func as usize].name.clone();
                             self.error(format!("`{class_name}::{}` overrides `{parent_name}` with an incompatible signature", m.name), m.name_span)
                                 .add_note("overriding methods must keep the same parameter types and a compatible return type");
                         }
@@ -767,6 +1018,9 @@ impl<'a> Checker<'a> {
                     MethodInfo { func: fid, slot, vis: m.visibility, is_static: m.is_static, owner: cid },
                 );
             }
+            if matches!(kind, ClassKind::Class | ClassKind::Enum) {
+                self.check_implemented(cid);
+            }
             if !own_ctor {
                 let missing: Vec<String> = self.classes[ci]
                     .fields
@@ -784,6 +1038,53 @@ impl<'a> Checker<'a> {
                     .add_note("give them a default value, make them nullable, or assign them in `__construct`");
                 }
             }
+        }
+    }
+
+    /// A concrete class must implement every abstract and interface method.
+    fn check_implemented(&mut self, cid: ClassId) {
+        let ci = cid as usize;
+        let span = self.classes[ci].span;
+        let name = self.classes[ci].name.clone();
+        let mut missing = Vec::new();
+        let mut methods: Vec<(String, MethodInfo)> =
+            self.classes[ci].methods.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        methods.sort_by(|a, b| a.0.cmp(&b.0));
+        for (mname, m) in &methods {
+            if !m.is_static && self.funcs[m.func as usize].is_abstract {
+                missing.push(self.funcs[m.func as usize].name.clone());
+            }
+            let _ = mname;
+        }
+        let mut supers: Vec<ClassId> = self.classes[ci].supers.iter().copied().collect();
+        supers.sort();
+        for s in supers {
+            if self.classes[s as usize].kind != ClassKind::Interface {
+                continue;
+            }
+            let mut imethods: Vec<(String, MethodInfo)> =
+                self.classes[s as usize].methods.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            imethods.sort_by(|a, b| a.0.cmp(&b.0));
+            for (mname, im) in imethods {
+                match self.classes[ci].methods.get(&mname).cloned() {
+                    Some(cm) if cm.func == im.func => missing.push(self.funcs[im.func as usize].name.clone()),
+                    Some(cm) => {
+                        if cm.vis != Visibility::Public {
+                            self.error(format!("`{name}::{mname}` must be public to implement an interface"), span);
+                        } else if !self.compatible_override(cm.func, im.func) {
+                            let iname = self.funcs[im.func as usize].name.clone();
+                            self.error(format!("`{name}::{mname}` does not match the signature of `{iname}`"), span);
+                        }
+                    }
+                    None => missing.push(self.funcs[im.func as usize].name.clone()),
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        if !missing.is_empty() {
+            self.error(format!("class `{name}` does not implement {}", missing.join(", ")), span)
+                .add_note("implement the methods, or declare the class `abstract`");
         }
     }
 
@@ -810,11 +1111,16 @@ impl<'a> Checker<'a> {
             self.module = info.module;
             match (info.kind, info.body) {
                 (FuncKind::Normal, Body::Function(d)) => {
+                    self.type_params = info.type_params.clone();
+                    if self.type_params.len() > 4 {
+                        self.error("at most 4 type parameters are supported", d.name_span);
+                    }
                     let params = self.resolve_params(&d.params, None);
                     let ret = match &d.ret {
                         Some(t) => self.resolve_type(t, None),
                         None => Type::Void,
                     };
+                    self.type_params.clear();
                     let f = &mut self.funcs[fid];
                     f.params = params;
                     f.ret = ret;
@@ -862,6 +1168,8 @@ impl<'a> Checker<'a> {
         let file = self.input.modules[info.module].ast.file;
         let span = info.span;
         let name = info.name.clone();
+        let is_abstract = info.is_abstract;
+        self.type_params = info.type_params.clone();
 
         let mut ctx = FnCtx::new(ret.clone(), class, kind);
         let mut param_ids = Vec::new();
@@ -881,6 +1189,7 @@ impl<'a> Checker<'a> {
 
         let mut out = Vec::new();
         match body {
+            Body::Function(_) if is_abstract => {}
             Body::Function(d) => {
                 if kind == FuncKind::Ctor {
                     let this = this.unwrap();
@@ -903,7 +1212,11 @@ impl<'a> Checker<'a> {
             Body::Template(m) | Body::Main(m) => {
                 for s in &m.stmts {
                     match &s.kind {
-                        StmtKind::Function(_) | StmtKind::Class(_) | StmtKind::Import(_) | StmtKind::Params(_) => {}
+                        StmtKind::Function(_)
+                        | StmtKind::Class(_)
+                        | StmtKind::Import(_)
+                        | StmtKind::Params(_)
+                        | StmtKind::Const(_) => {}
                         _ => self.stmt(s, &mut out),
                     }
                 }
@@ -912,7 +1225,8 @@ impl<'a> Checker<'a> {
         }
 
         let ctx = self.ctx.pop().unwrap();
-        if !ctx.flow.dead && !matches!(ret, Type::Void | Type::Error) && kind != FuncKind::Template {
+        self.type_params.clear();
+        if !ctx.flow.dead && !matches!(ret, Type::Void | Type::Error) && kind != FuncKind::Template && !is_abstract {
             let msg = format!("`{name}` must return a value of type `{}` on every path", self.tn(&ret));
             self.error(msg, span);
         }
@@ -998,6 +1312,18 @@ impl<'a> Checker<'a> {
                     })
                     .collect(),
                 vtable: c.vtable.clone(),
+                supers: {
+                    let mut v: Vec<ClassId> = c.supers.iter().copied().collect();
+                    v.sort();
+                    v
+                },
+                by_name: {
+                    let mut v: Vec<(String, FuncId)> =
+                        c.methods.iter().filter(|(_, m)| !m.is_static).map(|(n, m)| (n.clone(), m.func)).collect();
+                    v.sort();
+                    v
+                },
+                cases: c.cases.clone(),
             })
             .collect();
         let mut exc_classes = HashMap::new();

@@ -51,6 +51,7 @@ pub enum StmtKind {
     Function(FunctionDecl),
     Class(ClassDecl),
     Import(ImportDecl),
+    Const(ConstDecl),
     /// `params(string $title, list<Item> $items);` at the top of a template.
     Params(Vec<Param>),
 }
@@ -84,6 +85,10 @@ pub struct Param {
 pub struct FunctionDecl {
     pub name: String,
     pub name_span: Span,
+    /// `function first<T>(list<T> $xs): ?T`
+    pub type_params: Vec<(String, Span)>,
+    /// Declared without a body (`abstract` methods and interface methods).
+    pub is_abstract: bool,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
     pub body: Vec<Stmt>,
@@ -93,14 +98,46 @@ pub struct FunctionDecl {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassKind {
+    Class,
+    Abstract,
+    Interface,
+    Enum,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClassDecl {
     pub name: String,
     pub name_span: Span,
+    pub kind: ClassKind,
     pub parent: Option<(String, Span)>,
+    /// `implements` list (or the `extends` list of an interface).
+    pub interfaces: Vec<(String, Span)>,
     pub props: Vec<PropDecl>,
     pub methods: Vec<FunctionDecl>,
+    pub consts: Vec<ConstDecl>,
+    pub cases: Vec<EnumCase>,
+    /// `enum Status: string`
+    pub backing: Option<TypeExpr>,
     pub exported: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: Option<TypeExpr>,
+    pub value: Expr,
+    pub exported: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumCase {
+    pub name: String,
+    pub value: Option<Expr>,
     pub span: Span,
 }
 
@@ -267,6 +304,12 @@ pub enum ExprKind {
     MethodCall { obj: Box<Expr>, name: String, name_span: Span, args: Vec<Arg>, nullsafe: bool },
     Prop { obj: Box<Expr>, name: String, name_span: Span, nullsafe: bool },
     StaticCall { class: String, class_span: Span, name: String, args: Vec<Arg> },
+    /// `Suit::Hearts` (enum case) or `Config::MAX` (class constant).
+    ClassConst { class: String, class_span: Span, name: String, name_span: Span },
+    /// A parenthesized member access; stops a `?->` chain like in PHP.
+    Paren(Box<Expr>),
+    /// `sql"SELECT * FROM t WHERE id = {$id}"`
+    Sql(Vec<InterpPart>),
     New { class: String, class_span: Span, args: Vec<Arg> },
     /// `$a[$k]`, or `$a[]` (push, only valid as an assignment target).
     Index { base: Box<Expr>, index: Option<Box<Expr>> },

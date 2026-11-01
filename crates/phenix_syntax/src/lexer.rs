@@ -202,6 +202,17 @@ impl<'a> Lexer<'a> {
         }
         if is_ident_start(b) {
             let word = self.ident();
+            if word == "sql" && self.peek(0) == b'"' {
+                self.double_quoted();
+                let last = self.toks.pop().unwrap();
+                let parts = match last.tok {
+                    Tok::Str(s) => vec![StrPart::Lit(s)],
+                    Tok::Interp(p) => p,
+                    _ => Vec::new(),
+                };
+                self.push(Tok::Sql(parts), start);
+                return;
+            }
             let tok = Tok::keyword(word).unwrap_or_else(|| Tok::Ident(word.to_string()));
             self.push(tok, start);
             return;

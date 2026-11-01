@@ -43,6 +43,8 @@ pub enum PathBase {
 pub struct PathSet {
     pub base: PathBase,
     pub keys: Vec<Reg>,
+    /// For each key: the empty container to create when it is missing.
+    pub create: Vec<Option<Const>>,
     pub push: bool,
     pub val: Reg,
 }
@@ -111,6 +113,8 @@ pub enum Instr {
     CallVirtual { dst: Reg, slot: u32, args: Reg, argc: u16 },
     CallClosure { dst: Reg, callee: Reg, args: Reg, argc: u16 },
     CallBuiltin { dst: Reg, id: u32, args: Reg, argc: u16 },
+    /// Method call through an interface: looked up by interned name.
+    CallNamed { dst: Reg, name: u32, args: Reg, argc: u16 },
     Ret(Reg),
     RetNull,
 
@@ -134,6 +138,9 @@ pub enum Instr {
     InstanceOf(Reg, Reg, u32),
     IsType(Reg, Reg, TypeTag),
     MatchError(Reg),
+    EnumCase(Reg, u32, u32),
+    EnumFrom { dst: Reg, class: u32, val: Reg, try_: bool },
+    EnumCases(Reg, u32),
 
     MakeClosure { dst: Reg, func: u32, caps: Reg, n: u16 },
 
@@ -167,6 +174,11 @@ pub struct Class {
     pub parent: Option<u32>,
     pub fields: Vec<Field>,
     pub vtable: Vec<u32>,
+    /// Sorted: the class, its ancestors and its interfaces.
+    pub supers: Vec<u32>,
+    /// Method name id to function, for interface calls.
+    pub by_name: HashMap<u32, u32>,
+    pub cases: Vec<(String, Const)>,
 }
 
 #[derive(Debug)]
@@ -182,21 +194,15 @@ pub struct Program {
     pub consts: Vec<Const>,
     pub main: u32,
     pub builtin_names: Vec<String>,
+    /// Interned method names used by `CallNamed`.
+    pub method_names: Vec<String>,
     pub files: Vec<FileInfo>,
     /// Built-in exception classes the VM throws itself (`DivisionByZeroError`, ...).
     pub exc_classes: HashMap<String, u32>,
 }
 
 impl Program {
-    pub fn is_subclass(&self, mut class: u32, target: u32) -> bool {
-        loop {
-            if class == target {
-                return true;
-            }
-            match self.classes[class as usize].parent {
-                Some(p) => class = p,
-                None => return false,
-            }
-        }
+    pub fn is_subclass(&self, class: u32, target: u32) -> bool {
+        class == target || self.classes[class as usize].supers.binary_search(&target).is_ok()
     }
 }

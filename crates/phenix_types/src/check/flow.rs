@@ -13,6 +13,9 @@ pub(crate) struct Flow {
     pub assigned: Vec<bool>,
     /// Narrower types proven by conditions or assignments.
     pub narrowed: HashMap<LocalId, Type>,
+    /// Narrowed property types (`$x->p != null`), keyed by local and field
+    /// slot. Cleared by any call or property assignment.
+    pub prop_narrowed: HashMap<(LocalId, u32), Type>,
     /// This point is unreachable (after return/throw/break/continue).
     pub dead: bool,
 }
@@ -46,11 +49,23 @@ impl Flow {
                 narrowed.insert(*id, Type::union(vec![ta.clone(), tb.clone()]));
             }
         }
-        Flow { assigned, narrowed, dead: false }
+        let mut prop_narrowed = HashMap::new();
+        for (k, ta) in &a.prop_narrowed {
+            if let Some(tb) = b.prop_narrowed.get(k) {
+                prop_narrowed.insert(*k, Type::union(vec![ta.clone(), tb.clone()]));
+            }
+        }
+        Flow { assigned, narrowed, prop_narrowed, dead: false }
     }
 }
 
-pub(crate) type Facts = Vec<(LocalId, Type)>;
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum FactKey {
+    Local(LocalId),
+    Prop(LocalId, u32),
+}
+
+pub(crate) type Facts = Vec<(FactKey, Type)>;
 
 pub(crate) struct FnCtx {
     pub locals: Vec<HLocal>,
@@ -103,26 +118,40 @@ impl FnCtx {
         self.flow.narrowed.get(&id).cloned().unwrap_or_else(|| self.locals[id as usize].ty.clone())
     }
 
-    pub fn apply(&mut self, facts: &Facts) -> Vec<(LocalId, Option<Type>)> {
+    pub fn apply(&mut self, facts: &Facts) -> Vec<(FactKey, Option<Type>)> {
         let mut saved = Vec::new();
-        for (id, ty) in facts {
-            saved.push((*id, self.flow.narrowed.get(id).cloned()));
-            self.flow.narrowed.insert(*id, ty.clone());
+        for (key, ty) in facts {
+            let old = match key {
+                FactKey::Local(id) => self.flow.narrowed.insert(*id, ty.clone()),
+                FactKey::Prop(id, slot) => self.flow.prop_narrowed.insert((*id, *slot), ty.clone()),
+            };
+            saved.push((*key, old));
         }
         saved
     }
 
-    pub fn restore(&mut self, saved: Vec<(LocalId, Option<Type>)>) {
-        for (id, ty) in saved.into_iter().rev() {
-            match ty {
-                Some(t) => self.flow.narrowed.insert(id, t),
-                None => self.flow.narrowed.remove(&id),
-            };
+    pub fn restore(&mut self, saved: Vec<(FactKey, Option<Type>)>) {
+        for (key, ty) in saved.into_iter().rev() {
+            match (key, ty) {
+                (FactKey::Local(id), Some(t)) => {
+                    self.flow.narrowed.insert(id, t);
+                }
+                (FactKey::Local(id), None) => {
+                    self.flow.narrowed.remove(&id);
+                }
+                (FactKey::Prop(id, s), Some(t)) => {
+                    self.flow.prop_narrowed.insert((id, s), t);
+                }
+                (FactKey::Prop(id, s), None) => {
+                    self.flow.prop_narrowed.remove(&(id, s));
+                }
+            }
         }
     }
 
     /// Forgets narrowings of variables a loop or `try` body may reassign.
     pub fn invalidate(&mut self, names: &HashSet<String>) {
+        self.flow.prop_narrowed.clear();
         for n in names {
             if let Some(id) = self.names.get(n) {
                 self.flow.narrowed.remove(id);
