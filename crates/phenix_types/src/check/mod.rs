@@ -1240,6 +1240,7 @@ impl<'a> Checker<'a> {
             captures: Vec::new(),
             locals: ctx.locals,
             body: out,
+            ret,
         });
         self.funcs[fid as usize].body = Body::Done;
     }
@@ -1346,6 +1347,7 @@ impl<'a> Checker<'a> {
                     captures: Vec::new(),
                     locals: Vec::new(),
                     body: Vec::new(),
+                    ret: Type::Void,
                 })
             })
             .collect();

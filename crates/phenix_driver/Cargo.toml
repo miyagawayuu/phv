@@ -13,5 +13,7 @@ phenix_types.workspace = true
 phenix_compiler.workspace = true
 phenix_vm.workspace = true
 phenix_std.workspace = true
+phenix_jit.workspace = true
 toml.workspace = true
+postcard.workspace = true
 serde.workspace = true

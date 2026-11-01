@@ -7,4 +7,7 @@ pub mod vm;
 
 pub use bytecode::*;
 pub use value::{Key, Map, Value};
-pub use vm::{BuiltinFn, Exc, Host, HttpCtx, Limits, OutBuf, Permissions, SessionData, TraceLine, UploadedFile, Vm, VmError};
+pub use vm::{
+    BuiltinFn, Exc, Host, HttpCtx, JitCtx, JitEntry, JitLimits, JitTable, Limits, OutBuf, Permissions, SessionData,
+    TraceLine, UploadedFile, Vm, VmError,
+};

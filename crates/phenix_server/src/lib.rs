@@ -13,7 +13,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use phenix_driver::{compile, load_config, run, Compiled, Config, RunOptions};
+use phenix_driver::{compile_cached, load_config, run, Compiled, Config, RunOptions};
 use phenix_vm::value::html_escape;
 use phenix_vm::{HttpCtx, Limits};
 use std::collections::HashMap;
@@ -235,7 +235,9 @@ impl State {
                 return Ok(c.clone());
             }
         }
-        let c = Arc::new(compile(&self.root, script).map_err(|e| e.render(false))?);
+        let mut c = compile_cached(&self.root, script).map_err(|e| e.render(false))?;
+        c.enable_jit();
+        let c = Arc::new(c);
         if !c.warnings.is_empty() {
             eprint!("{}", c.warnings);
         }

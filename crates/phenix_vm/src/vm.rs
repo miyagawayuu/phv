@@ -123,6 +123,63 @@ pub struct Host {
 }
 
 const MAX_NATIVE_DEPTH: u32 = 200;
+
+// ----- JIT interface -------------------------------------------------------
+
+/// Shared state between the VM and natively compiled code (layout is fixed:
+/// the JIT reads and writes these fields by offset).
+#[repr(C)]
+pub struct JitCtx {
+    /// Set by native code: 0 = ok, see `JIT_ERR_*`.
+    pub error: i64,
+    pub depth: i64,
+    pub max_depth: i64,
+    /// Decremented at loop back-edges and calls; at zero `phenix_jit_tick` runs.
+    pub budget: i64,
+    pub limits: *const JitLimits,
+}
+
+pub const JIT_ERR_OVERFLOW: i64 = 1;
+pub const JIT_ERR_DIV_ZERO: i64 = 2;
+pub const JIT_ERR_DEPTH: i64 = 3;
+pub const JIT_ERR_TIME: i64 = 4;
+pub const JIT_ERR_MEMORY: i64 = 5;
+pub const JIT_ERR_SHIFT: i64 = 6;
+
+pub struct JitLimits {
+    pub deadline: Option<Instant>,
+    pub max_memory: Option<usize>,
+    pub mem_base: isize,
+}
+
+/// Called by native code when its budget runs out: checks the time and memory limits.
+///
+/// # Safety
+/// `ctx` must point to a live `JitCtx` whose `limits` points to live `JitLimits`.
+pub unsafe extern "C" fn phenix_jit_tick(ctx: *mut JitCtx) -> i64 {
+    let ctx = &mut *ctx;
+    ctx.budget = BUDGET as i64;
+    let limits = &*ctx.limits;
+    if limits.deadline.is_some_and(|d| Instant::now() > d) {
+        return JIT_ERR_TIME;
+    }
+    if let Some(max) = limits.max_memory {
+        if crate::alloc::thread_allocated() - limits.mem_base > max as isize {
+            return JIT_ERR_MEMORY;
+        }
+    }
+    0
+}
+
+/// Entry point of a compiled function: `(ctx, pointer to the i64 arguments) -> result`.
+pub type JitEntry = unsafe extern "C" fn(*mut JitCtx, *const i64) -> i64;
+
+/// Native code for the functions the JIT compiled, indexed by function id.
+pub struct JitTable {
+    pub entries: Vec<Option<JitEntry>>,
+    /// Owns the executable memory the entries point into.
+    pub keep_alive: Box<dyn std::any::Any + Send + Sync>,
+}
 const BUDGET: u32 = 10_000;
 
 struct Frame {
@@ -154,6 +211,7 @@ pub struct Vm {
     pub host: Arc<Host>,
     /// Native handles owned by this run (e.g. database connections).
     pub resources: Vec<Option<Box<dyn std::any::Any>>>,
+    pub jit: Option<Arc<JitTable>>,
     limits: Limits,
     mem_base: isize,
     deadline: Option<Instant>,
@@ -201,6 +259,7 @@ impl Vm {
             http: HttpCtx::default(),
             host: Arc::new(Host::default()),
             resources: Vec::new(),
+            jit: None,
             limits,
             mem_base: crate::alloc::thread_allocated(),
             deadline: limits.max_time.map(|d| Instant::now() + d),
@@ -376,6 +435,56 @@ impl Vm {
             return self.check_deadline();
         }
         Ok(())
+    }
+
+    /// Runs natively compiled function `func` with arguments from `args`.
+    fn call_jit(&mut self, entry: JitEntry, func: u32, args: &[Value]) -> Result<Value, VmError> {
+        let mut raw = [0i64; 16];
+        for (i, a) in args.iter().enumerate() {
+            raw[i] = match a {
+                Value::Int(n) => *n,
+                Value::Bool(b) => *b as i64,
+                v => bad("int or bool", v),
+            };
+        }
+        let limits = JitLimits {
+            deadline: self.deadline,
+            max_memory: self.limits.max_memory,
+            mem_base: self.mem_base,
+        };
+        let mut ctx = JitCtx {
+            error: 0,
+            depth: self.frames.len() as i64,
+            max_depth: self.limits.max_frames as i64,
+            budget: self.budget as i64,
+            limits: &limits,
+        };
+        // SAFETY: the JIT only creates entries for functions whose arguments
+        // are all ints/bools (checked above), and `ctx`/`limits` outlive the call.
+        let r = unsafe { entry(&mut ctx, raw.as_ptr()) };
+        self.budget = ctx.budget.clamp(1, BUDGET as i64) as u32;
+        match ctx.error {
+            0 => {}
+            JIT_ERR_OVERFLOW => return Err(self.throw("ArithmeticError", "integer overflow")),
+            JIT_ERR_DIV_ZERO => return Err(self.throw("DivisionByZeroError", "modulo by zero")),
+            JIT_ERR_SHIFT => return Err(self.throw("ArithmeticError", "bit shift by a negative number")),
+            JIT_ERR_DEPTH => return Err(VmError::Fatal("maximum call stack depth exceeded".into())),
+            JIT_ERR_MEMORY => {
+                return Err(VmError::Fatal(format!(
+                    "allowed memory size of {} MB exhausted",
+                    self.limits.max_memory.unwrap_or(0) / (1024 * 1024)
+                )))
+            }
+            _ => {
+                let secs = self.limits.max_time.map(|t| t.as_secs_f64()).unwrap_or(0.0);
+                return Err(VmError::Fatal(format!("maximum execution time of {secs} seconds exceeded")));
+            }
+        }
+        Ok(match self.prog.funcs[func as usize].native.as_ref().map(|s| s.ret) {
+            Some(ValKind::Int) => Value::Int(r),
+            Some(ValKind::Bool) => Value::Bool(r != 0),
+            _ => Value::Null,
+        })
     }
 
     /// Fails when the script has allocated more than its memory limit.
@@ -794,7 +903,18 @@ impl Vm {
                         }
                     }
 
-                    Instr::Call { dst, func: callee, args, argc } => call!(*callee, *dst, *args, *argc, &[]),
+                    Instr::Call { dst, func: callee, args, argc } => {
+                        let entry = self.jit.as_ref().and_then(|j| j.entries.get(*callee as usize).copied().flatten());
+                        if let Some(entry) = entry {
+                            let start = base + *args as usize;
+                            let argv: Vec<Value> = self.regs[start..start + *argc as usize].to_vec();
+                            self.frames[fi].pc = pc as u32;
+                            let v = tri!(self.call_jit(entry, *callee, &argv));
+                            reg!(*dst) = v;
+                            continue;
+                        }
+                        call!(*callee, *dst, *args, *argc, &[])
+                    }
                     Instr::CallVirtual { dst, slot, args, argc } => {
                         let class = match &reg!(*args) {
                             Value::Object(o) => o.borrow().class,

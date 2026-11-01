@@ -1,13 +1,14 @@
 //! Compiled program format. A `Program` holds no `Rc` values, so it can be
 //! shared between request threads behind an `Arc`.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub type Reg = u16;
 /// Placeholder register for an absent operand (e.g. no foreach key).
 pub const NO_REG: Reg = u16::MAX;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Const {
     Null,
     Bool(bool),
@@ -18,7 +19,7 @@ pub enum Const {
     EmptyMap,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TypeTag {
     Null,
     Bool,
@@ -32,14 +33,14 @@ pub enum TypeTag {
     Object,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PathBase {
     Local(Reg),
     Prop(Reg, u16),
 }
 
 /// `$a[k1][k2] = v` or `$a[k1][] = v` on a local or a property.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PathSet {
     pub base: PathBase,
     pub keys: Vec<Reg>,
@@ -49,7 +50,7 @@ pub struct PathSet {
     pub val: Reg,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Instr {
     Const(Reg, u32),
     Null(Reg),
@@ -150,8 +151,25 @@ pub enum Instr {
     PopOutHtml(Reg),
 }
 
-#[derive(Debug, Default)]
+/// Kinds of values a natively compiled function takes and returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ValKind {
+    Int,
+    Bool,
+    Void,
+}
+
+/// Present when every register of a function holds an `int` or `bool`, so
+/// the JIT may compile it to native code.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NativeSig {
+    pub params: Vec<ValKind>,
+    pub ret: ValKind,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Function {
+    pub native: Option<NativeSig>,
     pub name: String,
     pub file: u32,
     pub num_params: u16,
@@ -161,14 +179,14 @@ pub struct Function {
     pub offsets: Vec<u32>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Field {
     pub name: String,
     pub default: Const,
     pub public: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Class {
     pub name: String,
     pub parent: Option<u32>,
@@ -181,13 +199,13 @@ pub struct Class {
     pub cases: Vec<(String, Const)>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FileInfo {
     pub name: String,
     pub line_starts: Vec<u32>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Program {
     pub funcs: Vec<Function>,
     pub classes: Vec<Class>,

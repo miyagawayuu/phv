@@ -187,6 +187,7 @@ impl<'a> FnC<'a> {
             }
         }
         Function {
+            native: native_sig(f),
             name: f.name.clone(),
             file: f.file,
             num_params: (f.captures.len() + f.params.len()) as u16,
@@ -973,6 +974,27 @@ impl<'a> FnC<'a> {
             }
         }
     }
+}
+
+/// A function whose every local is an int or bool may be compiled natively.
+fn native_sig(f: &HFunc) -> Option<NativeSig> {
+    let kind = |t: &Type| match t {
+        Type::Int => Some(ValKind::Int),
+        Type::Bool => Some(ValKind::Bool),
+        _ => None,
+    };
+    if f.kind != FuncKind::Normal || !f.captures.is_empty() || f.params.len() > 16 {
+        return None;
+    }
+    if !f.locals.iter().all(|l| kind(&l.ty).is_some()) {
+        return None;
+    }
+    let params = f.params.iter().map(|p| kind(&f.locals[*p as usize].ty)).collect::<Option<Vec<_>>>()?;
+    let ret = match &f.ret {
+        Type::Void => ValKind::Void,
+        t => kind(t)?,
+    };
+    Some(NativeSig { params, ret })
 }
 
 /// An int constant that fits an immediate operand.

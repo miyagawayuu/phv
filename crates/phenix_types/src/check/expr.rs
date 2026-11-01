@@ -1719,6 +1719,7 @@ impl<'a> Checker<'a> {
             captures,
             locals: ctx.locals,
             body,
+            ret: ret.clone(),
         });
         HExpr { kind: HExprKind::Closure(fid, cap_values), ty: Type::Func(param_tys, Box::new(ret)), span }
     }

@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 #[global_allocator]
 static ALLOC: phenix_vm::alloc::CountingAlloc = phenix_vm::alloc::CountingAlloc;
 
-use phenix_driver::{compile, find_root, load_config, run, RunOptions};
+use phenix_driver::{compile, compile_cached, find_root, load_config, run, RunOptions};
 use phenix_vm::Limits;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -105,7 +105,7 @@ fn exec(cmd: Command) -> ExitCode {
     match cmd {
         Command::Run { file, html, time_limit } => {
             let root = find_root(&file);
-            let compiled = match compile(&root, &file) {
+            let mut compiled = match compile_cached(&root, &file) {
                 Ok(c) => c,
                 Err(e) => {
                     eprint!("{}", e.render(color));
@@ -113,6 +113,7 @@ fn exec(cmd: Command) -> ExitCode {
                 }
             };
             eprint!("{}", compiled.warnings);
+            compiled.enable_jit();
             let config = match load_config(&root) {
                 Ok(c) => c,
                 Err(e) => {

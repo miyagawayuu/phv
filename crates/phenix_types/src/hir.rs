@@ -192,6 +192,7 @@ pub struct HFunc {
     pub captures: Vec<LocalId>,
     pub locals: Vec<HLocal>,
     pub body: Vec<HStmt>,
+    pub ret: Type,
 }
 
 #[derive(Clone, Debug)]

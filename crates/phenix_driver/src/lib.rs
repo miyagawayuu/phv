@@ -1,8 +1,10 @@
 //! Loads a script with its imports and templates, type-checks it, compiles it
 //! to bytecode and runs it.
 
+mod cache;
 pub mod config;
 
+pub use cache::compile_cached;
 pub use config::{load_config, Config};
 use phenix_syntax::ast::{Module, StmtKind};
 use phenix_syntax::{diag, parse_module, Diagnostic, SourceMap, Span};
@@ -23,9 +25,26 @@ pub struct Compiled {
     pub warnings: String,
     /// Source file id of the entry script.
     pub entry_file: u32,
+    /// Native code for int/bool-only functions (see `enable_jit`).
+    pub jit: Option<Arc<phenix_vm::JitTable>>,
+    /// Loaded from the on-disk bytecode cache.
+    pub from_cache: bool,
 }
 
 impl Compiled {
+    /// Compiles eligible functions to native code. Disabled by `PHENIX_JIT=0`.
+    pub fn enable_jit(&mut self) {
+        if std::env::var("PHENIX_JIT").is_ok_and(|v| v == "0") {
+            return;
+        }
+        self.jit = phenix_jit::build(&self.program).map(Arc::new);
+    }
+
+    /// Number of functions compiled to native code.
+    pub fn jit_count(&self) -> usize {
+        self.jit.as_ref().map(|j| j.entries.iter().filter(|e| e.is_some()).count()).unwrap_or(0)
+    }
+
     /// Top-level functions of the entry file whose names start with `prefix`
     /// and take no parameters (used by `phenix test`).
     pub fn entry_functions(&self, prefix: &str) -> Vec<(u32, String)> {
@@ -356,6 +375,8 @@ pub fn compile_with_overlay(
         deps: a.deps,
         warnings,
         entry_file: a.entry_file.unwrap_or(0),
+        jit: None,
+        from_cache: false,
     })
 }
 
@@ -404,6 +425,7 @@ pub fn run_func(c: &Compiled, func: u32, opts: RunOptions) -> RunOutcome {
     if let Some(host) = opts.host {
         vm.host = host;
     }
+    vm.jit = c.jit.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.call_function(func, &[]).map(|_| ())));
     let error = match result {
         Ok(Ok(())) => None,

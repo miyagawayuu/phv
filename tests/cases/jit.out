@@ -1,0 +1,6 @@
+75025 21 prime 111
+59640 219 5000050000 -1 0
+0 -9223372036854775808 500
+overflow: integer overflow
+division: modulo by zero
+shift: bit shift by a negative number

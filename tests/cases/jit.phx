@@ -1,0 +1,92 @@
+<?phx
+// These functions only use int and bool, so they are compiled to native
+// code when the JIT is on; the results must match the interpreter.
+
+function fib(int $n): int {
+    if ($n < 2) {
+        return $n;
+    }
+    return fib($n - 1) + fib($n - 2);
+}
+
+function gcd(int $a, int $b): int {
+    while ($b != 0) {
+        $t = $a % $b;
+        $a = $b;
+        $b = $t;
+    }
+    return $a;
+}
+
+function is_prime(int $n): bool {
+    if ($n < 2) {
+        return false;
+    }
+    for ($i = 2; $i * $i <= $n; $i++) {
+        if ($n % $i == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function collatz(int $n): int {
+    $steps = 0;
+    while ($n != 1) {
+        $n = $n % 2 == 0 ? intdiv_free($n) : 3 * $n + 1;
+        $steps++;
+    }
+    return $steps;
+}
+
+function intdiv_free(int $n): int {
+    return $n >> 1;
+}
+
+function bits(int $x): int {
+    return ($x & 0xFF) ^ ($x | 3) ^ (~$x << 2) ^ (-$x >> 1) ^ ($x <=> 7);
+}
+
+function sum_to(int $n): int {
+    $s = 0;
+    foreach (0..=$n as $i) {
+        $s += $i;
+    }
+    return $s;
+}
+
+function mul(int $a, int $b): int {
+    return $a * $b;
+}
+
+function rem(int $a, int $b): int {
+    return $a % $b;
+}
+
+function shift(int $a, int $b): int {
+    return $a << $b;
+}
+
+function down(int $n): int {
+    return $n == 0 ? 0 : 1 + down($n - 1);
+}
+
+echo fib(25), " ", gcd(1071, 462), " ", is_prime(7919) ? "prime" : "composite", " ", collatz(27), "\n";
+echo bits(12345), " ", bits(-9), " ", sum_to(100000), " ", rem(-7, 3), " ", rem(-9223372036854775807 - 1, -1), "\n";
+echo shift(1, 70), " ", shift(-1, 63), " ", down(500), "\n";
+
+try {
+    echo mul(9223372036854775807, 2);
+} catch (ArithmeticError $e) {
+    echo "overflow: ", $e->getMessage(), "\n";
+}
+try {
+    echo rem(1, 0);
+} catch (DivisionByZeroError $e) {
+    echo "division: ", $e->getMessage(), "\n";
+}
+try {
+    echo shift(1, -1);
+} catch (ArithmeticError $e) {
+    echo "shift: ", $e->getMessage(), "\n";
+}

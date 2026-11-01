@@ -8,6 +8,32 @@ def fib(n):
     return fib(n - 1) + fib(n - 2)
 
 
+def loop_sum(n):
+    total = 0
+    for i in range(n):
+        total += i % 7
+    return total
+
+
+def build_string(n):
+    s = ""
+    for _ in range(n):
+        s += "x"
+    return s
+
+
+def map_filter(n):
+    return sum(x for x in map(lambda x: x * 2, range(1, n + 1)) if x % 3 == 0)
+
+
+def count_keys(n):
+    counts = {}
+    for i in range(n):
+        key = "k" + str(i % 1000)
+        counts[key] = counts.get(key, 0) + 1
+    return len(counts)
+
+
 def ms(start):
     return f"{(time.perf_counter() - start) * 1000:,.1f} ms"
 
@@ -17,25 +43,17 @@ r = fib(30)
 print(f"fib(30) = {r}: {ms(t)}")
 
 t = time.perf_counter()
-total = 0
-for i in range(10_000_000):
-    total += i % 7
-print(f"loop 10M: {total}: {ms(t)}")
+r = loop_sum(10_000_000)
+print(f"loop 10M: {r}: {ms(t)}")
 
 t = time.perf_counter()
-s = ""
-for i in range(1_000_000):
-    s += "x"
-print(f"append 1M chars ({len(s)}): {ms(t)}")
+r = len(build_string(1_000_000))
+print(f"append 1M chars ({r}): {ms(t)}")
 
 t = time.perf_counter()
-xs = list(range(1, 1_000_001))
-total = sum(x for x in map(lambda x: x * 2, xs) if x % 3 == 0)
-print(f"map/filter 1M ({total}): {ms(t)}")
+r = map_filter(1_000_000)
+print(f"map/filter 1M ({r}): {ms(t)}")
 
 t = time.perf_counter()
-counts = {}
-for i in range(200_000):
-    key = "k" + str(i % 1000)
-    counts[key] = counts.get(key, 0) + 1
-print(f"map updates 200k ({len(counts)} keys): {ms(t)}")
+r = count_keys(200_000)
+print(f"map updates 200k ({r} keys): {ms(t)}")

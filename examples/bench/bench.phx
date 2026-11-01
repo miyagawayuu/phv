@@ -1,12 +1,41 @@
 <?phx
 // Micro-benchmarks. Run with: phenix run examples/bench/bench.phx
-// (use a release build: cargo build --release)
+// (use a release build: cargo build --release; PHENIX_JIT=0 disables the JIT)
 
 function fib(int $n): int {
     if ($n < 2) {
         return $n;
     }
     return fib($n - 1) + fib($n - 2);
+}
+
+function loop_sum(int $n): int {
+    $sum = 0;
+    for ($i = 0; $i < $n; $i++) {
+        $sum += $i % 7;
+    }
+    return $sum;
+}
+
+function build_string(int $n): string {
+    $s = "";
+    foreach (0..$n as $i) {
+        $s .= "x";
+    }
+    return $s;
+}
+
+function map_filter(int $n): int {
+    return range(1, $n)->map(fn($x) => $x * 2)->filter(fn($x) => $x % 3 == 0)->sum();
+}
+
+function count_keys(int $n): int {
+    map<string, int> $counts = [];
+    foreach (0..$n as $i) {
+        $key = "k" . ($i % 1000);
+        $counts[$key] = ($counts[$key] ?? 0) + 1;
+    }
+    return count($counts);
 }
 
 function ms(float $start): string {
@@ -18,28 +47,17 @@ $r = fib(30);
 echo "fib(30) = $r: ", ms($t), "\n";
 
 $t = microtime();
-$sum = 0;
-for ($i = 0; $i < 10000000; $i++) {
-    $sum += $i % 7;
-}
-echo "loop 10M: $sum: ", ms($t), "\n";
+$r = loop_sum(10000000);
+echo "loop 10M: $r: ", ms($t), "\n";
 
 $t = microtime();
-$s = "";
-foreach (0..1000000 as $i) {
-    $s .= "x";
-}
-echo "append 1M chars (", $s->len(), "): ", ms($t), "\n";
+$r = build_string(1000000)->len();
+echo "append 1M chars ($r): ", ms($t), "\n";
 
 $t = microtime();
-$xs = range(1, 1000000);
-$total = $xs->map(fn($x) => $x * 2)->filter(fn($x) => $x % 3 == 0)->sum();
-echo "map/filter 1M ($total): ", ms($t), "\n";
+$r = map_filter(1000000);
+echo "map/filter 1M ($r): ", ms($t), "\n";
 
 $t = microtime();
-map<string, int> $counts = [];
-foreach (0..200000 as $i) {
-    $key = "k" . ($i % 1000);
-    $counts[$key] = ($counts[$key] ?? 0) + 1;
-}
-echo "map updates 200k (", count($counts), " keys): ", ms($t), "\n";
+$r = count_keys(200000);
+echo "map updates 200k ($r keys): ", ms($t), "\n";

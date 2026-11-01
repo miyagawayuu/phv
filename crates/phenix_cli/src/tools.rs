@@ -53,7 +53,7 @@ pub fn test(paths: Vec<PathBuf>, color: bool) -> ExitCode {
     for file in files {
         let root = find_root(&file);
         println!("{}", file.display());
-        let compiled = match compile(&root, &file) {
+        let mut compiled = match compile(&root, &file) {
             Ok(c) => c,
             Err(e) => {
                 print!("{}", e.render(color));
@@ -61,6 +61,7 @@ pub fn test(paths: Vec<PathBuf>, color: bool) -> ExitCode {
                 continue;
             }
         };
+        compiled.enable_jit();
         let config = load_config(&root).unwrap_or_else(|_| phenix_driver::Config::default_for(&root));
         let tests = compiled.entry_functions("test_");
         if tests.is_empty() {
