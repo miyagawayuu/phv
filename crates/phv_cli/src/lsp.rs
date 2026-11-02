@@ -127,6 +127,22 @@ fn text_position(text: &str, offset: usize) -> Value {
     json!({ "line": line, "character": character })
 }
 
+/// `path` with `.` and `..` components removed, without touching the file system.
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -365,8 +381,9 @@ impl Server {
         let src = a.sources.get(def.file);
         // Built-in modules have no file to open.
         let Some(p) = &src.path else { return Value::Null };
-        // A normalized path (`dir/../x` is a URI the editor could not send back).
-        let p = p.canonicalize().unwrap_or_else(|_| p.clone());
+        // Without `.` and `..` (`dir/../x` is a URI the editor could not send back), but
+        // otherwise spelled as the editor knows it (not resolved through links or short names).
+        let p = normalize(p);
         json!({
             "uri": path_to_uri(&p),
             "range": { "start": position(src, def.start), "end": position(src, def.end) },
@@ -717,6 +734,8 @@ mod tests {
         assert_eq!(offset_of(text, 1, 7), 3 + 15 + 4);
         let p = PathBuf::from(if cfg!(windows) { "C:/a b/x.phv" } else { "/a b/x.phv" });
         assert_eq!(uri_to_path(&path_to_uri(&p)).unwrap(), p);
+        let dotted = PathBuf::from(if cfg!(windows) { "C:/a b/./c/../x.phv" } else { "/a b/./c/../x.phv" });
+        assert_eq!(normalize(&dotted), p);
     }
 
     #[test]
