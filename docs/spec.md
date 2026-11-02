@@ -654,6 +654,8 @@ $db->transaction(function () use ($db): void {
 | `random_int($min, $max)`, `random_token($bytes = 32)` | The OS's cryptographic random number generator (do not use `rand()` for cryptography) |
 | `password_hash($pw)`, `password_verify($pw, $hash)` | Argon2id |
 | `hash("sha256" \| "sha384" \| "sha512", $data)`, `hash_hmac($algo, $data, $key)`, `hash_equals($a, $b)` | `hash_equals` takes a comparison time that does not depend on the contents |
+| `totp_secret()`, `totp_code($secret, ?$time)`, `totp_verify($secret, $code): ?int` | Two-factor codes of authenticator apps (TOTP, RFC 6238: HMAC-SHA1, 6 digits, 30 seconds). The secret is 160 random bits as Base32. `totp_verify` accepts one step of clock drift either way, compares in constant time, and returns the time step it matched (or `null`): store it and refuse a step that is not newer, so a code cannot be used twice |
+| `qr_svg($text): Html` | A QR code as an `<svg>` element (for example of an `otpauth://` URI). The markup holds only the modules, not the text, so it is safe to output |
 | `base64_encode`, `base64_decode: ?string`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | |
 | `json_decode($s): any` | Depth up to 128 |
 
@@ -769,7 +771,7 @@ The directory that contains `phx.toml` is the project root. Unknown keys are err
 | `csp_nonce(): string` | The CSP nonce for this response (§14) |
 | `rate_limit(string, int, int): bool`, `rate_limit_reset(string)` | §14 |
 | `date`, `gmdate`, `mktime`, `strtotime`, `checkdate` | Dates (table in §14) |
-| `random_int`, `random_token`, `password_hash`, `password_verify`, `hash`, `hash_hmac`, `hash_equals` | Cryptography (table in §14) |
+| `random_int`, `random_token`, `password_hash`, `password_verify`, `hash`, `hash_hmac`, `hash_equals`, `totp_secret`, `totp_code`, `totp_verify`, `qr_svg` | Cryptography and two-factor authentication (table in §14) |
 | `base64_encode`, `base64_decode`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | Encoding |
 | `file_get_contents`, `file_put_contents`, `file_exists`, `unlink`, `getenv` | Require `[permissions]` |
 | `sql_ident(string): Sql` | Column and table names |

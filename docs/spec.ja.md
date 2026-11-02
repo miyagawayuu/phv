@@ -654,6 +654,8 @@ $db->transaction(function () use ($db): void {
 | `random_int($min, $max)`, `random_token($bytes = 32)` | OS の暗号論的乱数(`rand()` は暗号用途に使わない) |
 | `password_hash($pw)`, `password_verify($pw, $hash)` | Argon2id |
 | `hash("sha256" \| "sha384" \| "sha512", $data)`, `hash_hmac($algo, $data, $key)`, `hash_equals($a, $b)` | `hash_equals` は比較時間が内容に依存しない |
+| `totp_secret()`, `totp_code($secret, ?$time)`, `totp_verify($secret, $code): ?int` | 認証アプリの 2 段階認証コード(TOTP、RFC 6238: HMAC-SHA1、6 桁、30 秒)。秘密鍵は 160 ビットの乱数を Base32 にしたもの。`totp_verify` は前後 1 ステップの時刻のずれを許し、比較時間は内容に依存せず、一致した時刻ステップ(なければ `null`)を返す。これを保存して、それより新しくないステップを拒めば、同じコードを二度使えない |
+| `qr_svg($text): Html` | QR コードを `<svg>` 要素で返す(`otpauth://` の URI など)。中身は模様だけで文字列そのものは含まないので、そのまま出力してよい |
 | `base64_encode`, `base64_decode: ?string`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | |
 | `json_decode($s): any` | 深さ 128 まで |
 
@@ -769,7 +771,7 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 | `csp_nonce(): string` | このレスポンスの CSP の nonce(§14) |
 | `rate_limit(string, int, int): bool`, `rate_limit_reset(string)` | §14 |
 | `date`, `gmdate`, `mktime`, `strtotime`, `checkdate` | 日付(§14 の表) |
-| `random_int`, `random_token`, `password_hash`, `password_verify`, `hash`, `hash_hmac`, `hash_equals` | 暗号(§14 の表) |
+| `random_int`, `random_token`, `password_hash`, `password_verify`, `hash`, `hash_hmac`, `hash_equals`, `totp_secret`, `totp_code`, `totp_verify`, `qr_svg` | 暗号と 2 段階認証(§14 の表) |
 | `base64_encode`, `base64_decode`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | エンコード |
 | `file_get_contents`, `file_put_contents`, `file_exists`, `unlink`, `getenv` | `[permissions]` が必要 |
 | `sql_ident(string): Sql` | 列名・テーブル名 |

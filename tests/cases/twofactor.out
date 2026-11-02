@@ -1,0 +1,12 @@
+287082
+081804
+005924
+verified
+short code rejected
+non-digits rejected
+32 different
+6
+the TOTP secret must be Base32 text (from totp_secret())
+svg no declaration
+text not in markup
+qr_svg(): the text is too long for a QR code

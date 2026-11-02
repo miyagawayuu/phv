@@ -13,6 +13,7 @@ mod db;
 pub mod ratelimit;
 pub mod safefs;
 mod sys;
+mod twofactor;
 mod web;
 
 pub use sys::{constant_time_eq, sha256_hex};
@@ -472,7 +473,11 @@ pub fn is_local_path(p: &str) -> bool {
 }
 
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
-    core_lookup(name).or_else(|| web::lookup(name)).or_else(|| sys::lookup(name)).or_else(|| db::lookup(name))
+    core_lookup(name)
+        .or_else(|| web::lookup(name))
+        .or_else(|| sys::lookup(name))
+        .or_else(|| db::lookup(name))
+        .or_else(|| twofactor::lookup(name))
 }
 
 fn core_lookup(name: &str) -> Option<BuiltinFn> {

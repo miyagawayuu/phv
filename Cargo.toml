@@ -32,6 +32,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 getrandom = "0.3"
 sha2 = "0.10"
 hmac = "0.12"
+sha1 = "0.10"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 argon2 = "0.5"
 base64 = "0.22"
 rusqlite = { version = "0.37", features = ["bundled", "limits", "hooks"] }
