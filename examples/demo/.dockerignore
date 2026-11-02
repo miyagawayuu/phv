@@ -1,0 +1,5 @@
+data/
+.phx-cache/
+Dockerfile
+fly.toml
+README.md

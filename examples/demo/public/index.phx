@@ -1,0 +1,17 @@
+<?phx
+import std.http.request;
+import lib.source.sources;
+
+$name = (request()->query("name") ?? "")->trim();
+if ($name->isEmpty() || $name->len() > 40) {
+    $name = "world";
+}
+
+$body = render("views/home.phx.html", name: $name);
+echo render(
+    "views/layout.phx.html",
+    title: "Live demo",
+    path: "/",
+    body: $body,
+    files: sources(["public/index.phx", "views/home.phx.html"]),
+);

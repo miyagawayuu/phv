@@ -1,0 +1,14 @@
+import std.http.request;
+
+// The visitor's address. Behind Fly.io's proxy, request()->ip is the proxy's
+// address; the proxy puts the real one in Fly-Client-IP (replacing any value
+// the client sent).
+export function client_ip(): string {
+    $req = request();
+    return $req->header("Fly-Client-IP") ?? $req->ip;
+}
+
+// The region serving this request ("nrt" for Tokyo), or "local".
+export function region(): string {
+    return getenv("FLY_REGION") ?? "local";
+}

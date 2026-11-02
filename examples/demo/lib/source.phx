@@ -1,0 +1,13 @@
+// Reads the files shown in the "Source" panel under each demo.
+// Needs [permissions].read for public/, views/ and lib/ in phx.toml.
+
+export class SourceFile {
+    public function __construct(
+        public readonly string $path,
+        public readonly string $code,
+    ) {}
+}
+
+export function sources(list<string> $paths): list<SourceFile> {
+    return $paths->map(fn($p) => new SourceFile($p, file_get_contents($p)));
+}

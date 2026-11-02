@@ -1,0 +1,35 @@
+<?phx params(string $name) ?>
+<section class="hero">
+  <p class="eyebrow">Live demo</p>
+  <h1>Hello, <?= $name ?>!</h1>
+  <p class="lead">This site is written in <a href="https://phx-lang.org">PHX</a>, a language for the web that keeps
+  the feel of PHP while the compiler guarantees type safety and safe output. Every page runs on the server as you
+  load it, and shows its own source at the bottom.</p>
+  <form method="get" action="/" class="inline">
+    <label for="name">Your name</label>
+    <input id="name" name="name" value="<?= $name == "world" ? "" : $name ?>" maxlength="40" autocomplete="off"
+      placeholder="Try &lt;b&gt;you&lt;/b&gt;">
+    <button>Greet me</button>
+  </form>
+</section>
+
+<div class="grid">
+  <a class="card" href="/escape">
+    <h2>Escaping</h2>
+    <p>Type <code>&lt;script&gt;</code> anywhere: output is escaped for where it lands — text, attribute, URL or
+    script — and the unsafe spots do not compile.</p>
+  </a>
+  <a class="card" href="/board">
+    <h2>Message board</h2>
+    <p>SQLite with <code>sql"..."</code> literals, automatic CSRF checks, sessions, flash messages and rate
+    limiting.</p>
+  </a>
+  <a class="card" href="/totp">
+    <h2>Two-factor codes</h2>
+    <p>TOTP secrets, a QR code for your authenticator app and replay-safe verification, all built in.</p>
+  </a>
+  <a class="card" href="/api">
+    <h2>JSON API</h2>
+    <p>Endpoints that return JSON, called from a script that gets its CSP nonce automatically.</p>
+  </a>
+</div>

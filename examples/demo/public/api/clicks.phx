@@ -1,0 +1,22 @@
+<?phx
+import std.http.{request, response, session};
+import lib.client.client_ip;
+import lib.store.{demo_db, bump_counter, counter};
+
+// GET  /api/clicks -> {"total": 12}
+// POST /api/clicks -> {"total": 13, "yours": 1}
+$db = demo_db();
+
+if (!request()->isPost()) {
+    response()->json(["total" => counter($db, "clicks")]);
+    return;
+}
+
+if (!rate_limit("clicks:" . client_ip(), 60, 60)) {
+    response()->status(429)->json(["error" => "Slow down: at most 60 clicks a minute."]);
+    return;
+}
+
+$yours = (session()->get("clicks")?->toInt() ?? 0) + 1;
+session()->set("clicks", (string)$yours);
+response()->json(["total" => bump_counter($db, "clicks"), "yours" => $yours]);

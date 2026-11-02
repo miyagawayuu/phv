@@ -1,0 +1,239 @@
+/* Same palette as phx-lang.org. */
+:root {
+  --bg: #ffffff;
+  --bg-soft: #f6f7f9;
+  --fg: #1d2129;
+  --muted: #5c6370;
+  --border: #e3e6ea;
+  --accent: #6d28d9;
+  --accent-soft: #ede9fe;
+  --code-bg: #f6f8fa;
+  --term-bg: #16181d;
+  --term-fg: #e6e6e6;
+  --ok-bg: #ecfdf3;
+  --ok-fg: #14532d;
+  --err-bg: #fef2f2;
+  --err-fg: #991b1b;
+  --radius: 10px;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", "Noto Sans JP", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115;
+    --bg-soft: #161920;
+    --fg: #e6e8eb;
+    --muted: #9aa1ac;
+    --border: #262a33;
+    --accent: #a78bfa;
+    --accent-soft: #241d3a;
+    --code-bg: #161b22;
+    --ok-bg: #12301f;
+    --ok-fg: #bbf7d0;
+    --err-bg: #3a1717;
+    --err-fg: #fecaca;
+  }
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.65 var(--sans);
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code { font-family: var(--mono); font-size: 0.9em; }
+:not(pre) > code {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.05em 0.35em;
+  overflow-wrap: anywhere;
+}
+
+pre {
+  margin: 0 0 1.2em;
+  padding: 1rem 1.1rem;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-x: auto;
+  font-size: 0.875rem;
+  line-height: 1.55;
+}
+
+pre.term {
+  background: var(--term-bg);
+  color: var(--term-fg);
+  border-color: var(--term-bg);
+}
+
+h1 { font-size: 2rem; line-height: 1.25; margin: 1.5rem 0 0.75rem; }
+h2 { font-size: 1.2rem; margin: 1.75rem 0 0.5rem; }
+
+header.site, main, footer {
+  max-width: 52rem;
+  margin: 0 auto;
+  padding-left: 16px;
+  padding-right: 16px;
+}
+
+header.site {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 1rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 700;
+  font-size: 1.15rem;
+  color: var(--fg);
+}
+.brand:hover { text-decoration: none; }
+.brand span { color: var(--muted); font-weight: 500; }
+
+nav { display: flex; flex-wrap: wrap; gap: 0.25rem 1.1rem; }
+nav a { color: var(--muted); }
+nav a:hover { color: var(--fg); text-decoration: none; }
+nav a[aria-current="page"] { color: var(--accent); font-weight: 600; }
+
+main { padding-bottom: 2rem; }
+
+footer {
+  padding-top: 1rem;
+  padding-bottom: 2rem;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+footer p { margin: 0.25rem 0; }
+
+.lead { font-size: 1.05rem; color: var(--muted); max-width: 44rem; }
+.muted { color: var(--muted); }
+.small { font-size: 0.875rem; }
+
+.hero { padding: 1rem 0 0.5rem; }
+.eyebrow {
+  margin: 1.5rem 0 0;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 0.875rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.hero h1 { margin-top: 0.25rem; overflow-wrap: anywhere; }
+
+input, textarea, button {
+  font: inherit;
+  color: inherit;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.45rem 0.7rem;
+  max-width: 100%;
+}
+input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+button {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+}
+@media (prefers-color-scheme: dark) {
+  button { color: #0f1115; }
+}
+button:disabled { opacity: 0.6; cursor: progress; }
+button.secondary {
+  background: transparent;
+  color: var(--accent);
+}
+
+form.inline { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 1rem 0; }
+.stack { display: grid; gap: 0.35rem; max-width: 32rem; margin: 1rem 0; }
+.stack button { justify-self: start; margin-top: 0.5rem; }
+.stack .small { margin: 0; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.card {
+  display: block;
+  color: inherit;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.25rem 1.25rem 0.5rem;
+}
+a.card:hover { border-color: var(--accent); text-decoration: none; }
+.card h2 { color: var(--accent); margin-top: 1rem; }
+
+.demo {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.25rem 1.25rem 0.75rem;
+  margin: 1.5rem 0;
+}
+.demo h2 { font-size: 1.05rem; }
+.out {
+  background: var(--accent-soft);
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.notice { border-radius: 8px; padding: 0.75rem 1.25rem; margin: 1rem 0; }
+.notice.ok { background: var(--ok-bg); color: var(--ok-fg); }
+.notice.error { background: var(--err-bg); color: var(--err-fg); }
+ul.notice { padding-left: 2.25rem; }
+
+.message {
+  border-top: 1px solid var(--border);
+  padding: 0.5rem 0;
+  overflow-wrap: anywhere;
+}
+.message p { margin: 0.25rem 0; }
+.message .meta span { color: var(--muted); font-size: 0.875rem; margin-left: 0.5rem; }
+
+.totp { display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: flex-start; margin: 1.5rem 0; }
+.totp > div:last-child { flex: 1 1 18rem; }
+.qr {
+  width: 200px;
+  max-width: 100%;
+  padding: 12px;
+  background: #fff;   /* QR codes need a light background in both themes */
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.qr svg { display: block; width: 100%; height: auto; }
+.secret { word-break: break-all; }
+details { margin: 1rem 0; }
+summary { cursor: pointer; color: var(--accent); }
+
+.counter { display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: center; }
+.counter button { min-width: 4rem; font-size: 1.1rem; }
+
+.source { margin-top: 3rem; border-top: 1px solid var(--border); }
+.source details { margin: 0.5rem 0; }
+.source summary { font-family: var(--mono); font-size: 0.9rem; }
+.source pre { margin-top: 0.5rem; }

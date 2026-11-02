@@ -1,0 +1,78 @@
+import std.db.Database;
+
+// One SQLite file holds the message board and the click counter.
+// Each request opens it again: nothing is shared between requests.
+
+export class Message {
+    public function __construct(
+        public readonly int $id,
+        public readonly string $name,
+        public readonly string $text,
+        public readonly int $createdAt,
+    ) {}
+
+    public function time(): string {
+        return gmdate("Y-m-d H:i", $this->createdAt) . " UTC";
+    }
+}
+
+const KEEP_SECONDS = 86400;
+
+export function demo_db(): Database {
+    $db = Database::open("data/demo.db");
+    $db->execute(sql"CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )");
+    $db->execute(sql"CREATE TABLE IF NOT EXISTS counters (
+        name TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
+    )");
+    return $db;
+}
+
+// Messages are kept for a day.
+export function recent_messages(Database $db, int $limit = 30): list<Message> {
+    $cutoff = time() - KEEP_SECONDS;
+    $db->execute(sql"DELETE FROM messages WHERE created_at < {$cutoff}");
+    $rows = $db->query(sql"SELECT id, name, text, created_at FROM messages ORDER BY id DESC LIMIT {$limit}");
+    return $rows->map(fn($r) => new Message(
+        $r->int("id") ?? 0,
+        $r->string("name") ?? "",
+        $r->string("text") ?? "",
+        $r->int("created_at") ?? 0,
+    ));
+}
+
+export function add_message(Database $db, string $name, string $text): void {
+    $now = time();
+    $db->execute(sql"INSERT INTO messages (name, text, created_at) VALUES ({$name}, {$text}, {$now})");
+}
+
+// Returns the problems with a message, or an empty list.
+export function validate_message(string $name, string $text): list<string> {
+    list<string> $errors = [];
+    if ($name->isEmpty() || $name->len() > 40) {
+        $errors[] = "Please enter a name (up to 40 characters).";
+    }
+    if ($text->isEmpty() || $text->len() > 280) {
+        $errors[] = "Please write a message (up to 280 characters).";
+    }
+    $lower = $text->lower();
+    if ($lower->contains("http://") || $lower->contains("https://") || $lower->contains("www.")) {
+        $errors[] = "Links are not allowed on this board.";
+    }
+    return $errors;
+}
+
+export function bump_counter(Database $db, string $name): int {
+    $db->execute(sql"INSERT INTO counters (name, value) VALUES ({$name}, 1)
+        ON CONFLICT(name) DO UPDATE SET value = value + 1");
+    return counter($db, $name);
+}
+
+export function counter(Database $db, string $name): int {
+    return $db->first(sql"SELECT value FROM counters WHERE name = {$name}")?->int("value") ?? 0;
+}

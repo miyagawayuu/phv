@@ -1,0 +1,52 @@
+<?phx params(string $input, string $url) ?>
+<h1>Escaping by position</h1>
+<p class="lead">Whatever you type below is placed into the page in four different spots. PHX knows, at compile
+time, where each <code>&lt;?= ?&gt;</code> lands in the HTML and treats the value accordingly.</p>
+
+<form method="get" action="/escape" class="stack">
+  <label for="input">Any text</label>
+  <input id="input" name="input" value="<?= $input ?>" maxlength="200">
+  <label for="url">A link target</label>
+  <input id="url" name="url" value="<?= $url ?>">
+  <button>Update the page</button>
+</form>
+
+<div class="demo">
+  <h2>1. Element content</h2>
+  <p>Written as <code>&lt;p&gt;&lt;?= $input ?&gt;&lt;/p&gt;</code>. Tags show up as text:</p>
+  <p class="out"><?= $input ?></p>
+
+  <h2>2. Quoted attribute</h2>
+  <p>Written as <code>title="&lt;?= $input ?&gt;"</code>. Quotes cannot end the attribute:</p>
+  <p class="out"><span title="<?= $input ?>">Hover this text to see the attribute value.</span></p>
+
+  <h2>3. URL</h2>
+  <p>The start of <code>href</code> only accepts a <code>SafeUrl</code>, made by <code>safe_url($url)</code>,
+  which lets through <code>http(s)</code>, <code>mailto</code>, <code>tel</code> and relative URLs and turns
+  anything else into <code>#</code>:</p>
+  <p class="out"><a href="<?= safe_url($url) ?>">this link</a> points to <code><?= safe_url($url) ?></code></p>
+
+  <h2>4. Inside &lt;script&gt;</h2>
+  <p>A <code>&lt;script&gt;</code> only accepts a <code>SafeJs</code>, made by <code>json_html($input)</code>. The
+  script below reads your text as a JavaScript string and counts its characters:</p>
+  <p class="out" id="js-out">(the script did not run)</p>
+  <script>
+    const input = <?= json_html($input) ?>;
+    document.getElementById("js-out").textContent =
+      "JavaScript received a string of " + [...input].length + " characters.";
+  </script>
+  <p class="muted">That <code>&lt;script&gt;</code> runs because PHX added a CSP nonce to it. A script that got in
+  through <code>raw()</code> would not get one, so the browser would block it.</p>
+</div>
+
+<h2>What does not compile</h2>
+<p>Putting a plain <code>string</code> where escaping cannot protect it is an error, not a warning:</p>
+<pre class="term"><code>$ phx check bad.phx
+error: a URL attribute cannot start with an unchecked value
+ --> bad.phx:4:14
+  |
+4 | &lt;a href="&lt;?= $url ?&gt;"&gt;this link&lt;/a&gt;
+  |              ^^^^
+  = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe</code></pre>
+<p>The same goes for unquoted attributes, event handlers such as <code>onclick</code>, <code>style</code> and
+plain strings inside <code>&lt;script&gt;</code>.</p>
