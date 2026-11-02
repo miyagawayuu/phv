@@ -10,10 +10,16 @@ Language support for [PHX](https://phx-lang.org):
 
 ## Installing
 
-Download `phx-<version>.vsix` from the [releases](https://github.com/miyagawayuu/phx/releases) and install it:
+Install **PHX Language** from the Visual Studio Marketplace: search for it in the Extensions view, or run
 
 ```bash
-code --install-extension phx-0.2.6.vsix
+code --install-extension phx-lang.phx-language
+```
+
+Or download `phx-<version>.vsix` from the [releases](https://github.com/miyagawayuu/phx/releases) and install it:
+
+```bash
+code --install-extension phx-0.2.7.vsix
 ```
 
 Or, in VS Code, run **Extensions: Install from VSIX...** from the Command Palette.
@@ -36,6 +42,6 @@ your `PATH` (or set `phx.path`). Highlighting works without it.
 ```bash
 npm install
 npm test          # checks the grammars
-npx vsce package  # writes phx-<version>.vsix
-code --install-extension phx-0.2.6.vsix
+npx vsce package  # writes phx-language-<version>.vsix
+code --install-extension phx-language-0.2.7.vsix
 ```
