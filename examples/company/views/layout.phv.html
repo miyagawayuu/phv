@@ -1,0 +1,56 @@
+<?phv params(string $title, Html $body) ?>
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title><?= $title ?></title>
+  <meta name="description" content="株式会社ハルカゼは、Webサービスと業務システムの企画・設計・開発を通じて、ビジネスを前へ進めるソフトウェア開発会社です。">
+  <meta property="og:title" content="<?= $title ?>">
+  <meta property="og:type" content="website">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="site">
+    <div class="wrap bar">
+      <a class="brand" href="/" aria-label="株式会社ハルカゼ トップ">
+        <img src="/logo.svg" alt="" width="34" height="34">
+        <span>Harukaze<small>株式会社ハルカゼ</small></span>
+      </a>
+      <nav aria-label="ページ内">
+        <a href="#services">事業内容</a>
+        <a href="#strengths">強み</a>
+        <a href="#works">導入事例</a>
+        <a href="#news">ニュース</a>
+        <a href="#company">会社概要</a>
+      </nav>
+      <a class="button small" href="#contact">お問い合わせ</a>
+    </div>
+  </header>
+  <main>
+<?= $body ?>
+  </main>
+  <footer class="site">
+    <div class="wrap foot">
+      <div>
+        <a class="brand" href="/">
+          <img src="/logo.svg" alt="" width="30" height="30">
+          <span>Harukaze<small>株式会社ハルカゼ</small></span>
+        </a>
+        <p class="muted">ビジネスを前へ進めるソフトウェアを。</p>
+      </div>
+      <nav aria-label="フッター">
+        <a href="#services">事業内容</a>
+        <a href="#works">導入事例</a>
+        <a href="#company">会社概要</a>
+        <a href="#contact">お問い合わせ</a>
+      </nav>
+    </div>
+    <div class="wrap legal">
+      <p>© <?= date("Y") ?> Harukaze Inc.（架空の会社です）</p>
+      <p>このサイトは <a href="https://phv-lang.org">PHV</a> で書かれています。</p>
+    </div>
+  </footer>
+</body>
+</html>

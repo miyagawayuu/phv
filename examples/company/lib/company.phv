@@ -1,0 +1,175 @@
+// The content of the landing page. A real site might load it from a CMS or a database.
+
+export class Stat {
+    public function __construct(
+        public readonly string $value,
+        public readonly string $unit,
+        public readonly string $label,
+    ) {}
+}
+
+export class Service {
+    public function __construct(
+        public readonly string $icon,
+        public readonly string $title,
+        public readonly string $text,
+        public readonly list<string> $points,
+    ) {}
+}
+
+export class Strength {
+    public function __construct(
+        public readonly string $title,
+        public readonly string $text,
+    ) {}
+}
+
+export class Work {
+    public function __construct(
+        public readonly string $tone,
+        public readonly string $client,
+        public readonly string $title,
+        public readonly string $text,
+        public readonly string $result,
+        public readonly list<string> $tags,
+    ) {}
+}
+
+export class Step {
+    public function __construct(
+        public readonly string $title,
+        public readonly string $text,
+        public readonly string $term,
+    ) {}
+}
+
+export class News {
+    public function __construct(
+        public readonly string $date,
+        public readonly string $category,
+        public readonly string $title,
+    ) {}
+
+    // "2026-10-15" → "2026.10.15"
+    public function displayDate(): string {
+        return $this->date->replace("-", ".");
+    }
+}
+
+export class Fact {
+    public function __construct(
+        public readonly string $label,
+        public readonly string $value,
+    ) {}
+}
+
+export function stats(): list<Stat> {
+    return [
+        new Stat("120", "社+", "お取引企業"),
+        new Stat("96", "%", "プロジェクト継続率"),
+        new Stat("8", "週間", "初回リリースまでの平均"),
+    ];
+}
+
+export function services(): list<Service> {
+    return [
+        new Service(
+            "web",
+            "Webサービス開発",
+            "新規事業の立ち上げから既存サービスのリニューアルまで。小さく作って素早く検証し、育てていく開発を得意としています。",
+            ["MVP・プロトタイプ開発", "SaaS・会員サイト・EC", "既存システムの改修と移行"],
+        ),
+        new Service(
+            "system",
+            "業務システム・DX支援",
+            "紙とExcelに散らばった業務を整理し、現場の方が毎日使いたくなるシステムに置き換えます。",
+            ["業務フローの可視化と設計", "基幹システム・社内ツール開発", "データ連携と業務の自動化"],
+        ),
+        new Service(
+            "design",
+            "UI/UXデザイン",
+            "使う人へのインタビューから画面設計、デザインシステムの構築まで、エンジニアと同じチームで進めます。",
+            ["ユーザーリサーチ", "画面設計・プロトタイピング", "デザインシステム構築"],
+        ),
+    ];
+}
+
+export function strengths(): list<Strength> {
+    return [
+        new Strength(
+            "企画から運用まで、ひとつのチームで",
+            "ディレクター、デザイナー、エンジニアが最初から同じチームに入ります。伝言ゲームがないので、決めたことがそのまま形になります。",
+        ),
+        new Strength(
+            "2週間ごとに、動くものをお見せします",
+            "仕様書だけで何か月も待たせることはしません。2週間ごとに実際に触れる画面をお渡しし、ご意見をすぐ次に反映します。",
+        ),
+        new Strength(
+            "安全で、長く使える技術を選びます",
+            "型安全な言語とテストの自動化で、作ったあとも安心して手を入れられるシステムにします。このサイトも PHV で書かれています。",
+        ),
+    ];
+}
+
+export function works(): list<Work> {
+    return [
+        new Work(
+            "sunrise",
+            "物流会社 A社",
+            "配送管理システムの刷新",
+            "電話とFAXで受けていた配送依頼をWebに集約し、ドライバーにはスマートフォンで指示が届く仕組みを作りました。",
+            "受付業務の時間を 62% 削減",
+            ["業務システム", "モバイル"],
+        ),
+        new Work(
+            "ocean",
+            "教育スタートアップ B社",
+            "オンライン学習サービスの立ち上げ",
+            "企画段階からご一緒し、8週間で最初の版をリリース。受講者の声をもとに毎週改善を続けています。",
+            "リリース後1年で会員数 4万人",
+            ["新規事業", "SaaS"],
+        ),
+        new Work(
+            "forest",
+            "地域スーパー C社",
+            "ネットスーパーとアプリの開発",
+            "店舗の在庫と連動したネットスーパーを開発。高齢のお客様にも使いやすい大きな文字の画面にしました。",
+            "オンライン売上が前年の 3.1 倍",
+            ["EC", "UI/UX"],
+        ),
+    ];
+}
+
+export function steps(): list<Step> {
+    return [
+        new Step("ご相談", "課題やアイデアをお聞かせください。まだ形になっていなくても大丈夫です。", "無料"),
+        new Step("ご提案・お見積り", "進め方、体制、スケジュール、費用をまとめてご提案します。", "約1週間"),
+        new Step("設計・開発", "2週間ごとに動くものをお見せしながら、一緒に作り上げます。", "2〜6か月"),
+        new Step("リリース・改善", "公開後も数字とお客様の声を見ながら、改善を続けます。", "継続"),
+    ];
+}
+
+export function news(): list<News> {
+    return [
+        new News("2026-10-15", "お知らせ", "福岡オフィスを開設しました"),
+        new News("2026-09-01", "導入事例", "地域スーパー C社のネットスーパー事例を公開しました"),
+        new News("2026-07-20", "採用", "Webエンジニア・デザイナーの通年採用を始めました"),
+    ];
+}
+
+export function facts(): list<Fact> {
+    return [
+        new Fact("会社名", "株式会社ハルカゼ（Harukaze Inc.）"),
+        new Fact("設立", "2016年4月"),
+        new Fact("代表者", "代表取締役　春風 一郎"),
+        new Fact("資本金", "3,000万円"),
+        new Fact("従業員数", "48名（2026年10月現在）"),
+        new Fact("所在地", "東京本社　東京都渋谷区神南 0-0-0 ハルカゼビル 5F\n福岡オフィス　福岡県福岡市中央区天神 0-0-0"),
+        new Fact("事業内容", "Webサービス・業務システムの企画、設計、開発、運用\nUI/UXデザイン"),
+    ];
+}
+
+// The choices of the "ご相談の種類" field of the contact form.
+export function topics(): list<string> {
+    return ["Webサービス開発", "業務システム・DX", "UI/UXデザイン", "採用について", "その他"];
+}

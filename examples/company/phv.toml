@@ -1,0 +1,14 @@
+# A landing page for a fictional company, Harukaze Inc.
+
+[project]
+name = "harukaze-lp"
+
+[security]
+csrf = true            # the contact form must include csrf_field()
+secure_cookies = false # set to true when the site is served over HTTPS
+session_ttl = 3600
+memory_limit_mb = 64
+
+[permissions]
+write = ["data/"]      # inquiries are saved to data/inquiries.db
+env = []

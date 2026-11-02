@@ -1,0 +1,72 @@
+import std.db.Database;
+import lib.company.topics;
+
+// What a visitor typed into the contact form.
+export class Inquiry {
+    public function __construct(
+        public readonly string $name,
+        public readonly string $company,
+        public readonly string $email,
+        public readonly string $topic,
+        public readonly string $message,
+        public readonly bool $agreed,
+    ) {}
+}
+
+export function empty_inquiry(): Inquiry {
+    return new Inquiry("", "", "", "", "", false);
+}
+
+// Returns the problems with an inquiry, or an empty list.
+export function validate_inquiry(Inquiry $q): list<string> {
+    list<string> $errors = [];
+    if ($q->name->isEmpty() || $q->name->len() > 50) {
+        $errors[] = "お名前を入力してください（50文字まで）。";
+    }
+    if ($q->company->len() > 100) {
+        $errors[] = "会社名は100文字までで入力してください。";
+    }
+    if (!looks_like_email($q->email)) {
+        $errors[] = "メールアドレスを正しく入力してください。";
+    }
+    if (!topics()->contains($q->topic)) {
+        $errors[] = "ご相談の種類を選んでください。";
+    }
+    if ($q->message->len() < 10 || $q->message->len() > 2000) {
+        $errors[] = "ご相談内容を10〜2000文字で入力してください。";
+    }
+    if (!$q->agreed) {
+        $errors[] = "個人情報の取り扱いへの同意が必要です。";
+    }
+    return $errors;
+}
+
+// A light check: one "@", something before it and a dot after it.
+function looks_like_email(string $email): bool {
+    $parts = $email->split("@");
+    if ($email->len() > 254 || $parts->len() != 2 || $email->contains(" ")) {
+        return false;
+    }
+    $domain = $parts[1];
+    return !$parts[0]->isEmpty() && $domain->contains(".") && !$domain->startsWith(".") && !$domain->endsWith(".");
+}
+
+export function inquiry_db(): Database {
+    $db = Database::open("data/inquiries.db");
+    $db->execute(sql"CREATE TABLE IF NOT EXISTS inquiries (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        company TEXT NOT NULL,
+        email TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        message TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )");
+    return $db;
+}
+
+export function save_inquiry(Database $db, Inquiry $q): void {
+    $now = time();
+    $db->execute(sql"INSERT INTO inquiries (name, company, email, topic, message, created_at)
+        VALUES ({$q->name}, {$q->company}, {$q->email}, {$q->topic}, {$q->message}, {$now})");
+}

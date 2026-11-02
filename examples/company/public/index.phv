@@ -1,0 +1,46 @@
+<?phv
+import std.http.{request, response, session};
+import lib.company.{stats, services, strengths, works, steps, news, facts, topics};
+import lib.inquiry.{Inquiry, empty_inquiry, validate_inquiry, inquiry_db, save_inquiry};
+
+$req = request();
+$inquiry = empty_inquiry();
+list<string> $errors = [];
+
+// The server has already checked the CSRF token before this line runs.
+if ($req->isPost()) {
+    $inquiry = new Inquiry(
+        ($req->form("name") ?? "")->trim(),
+        ($req->form("company") ?? "")->trim(),
+        ($req->form("email") ?? "")->trim(),
+        $req->form("topic") ?? "",
+        ($req->form("message") ?? "")->trim(),
+        $req->form("agree") == "yes",
+    );
+    $errors = validate_inquiry($inquiry);
+    if ($errors->isEmpty() && !rate_limit("inquiry:" . $req->ip, 5, 3600)) {
+        $errors[] = "送信回数が多すぎます。しばらくしてからもう一度お試しください。";
+    }
+    if ($errors->isEmpty()) {
+        save_inquiry(inquiry_db(), $inquiry);
+        session()->set("notice", "お問い合わせありがとうございます。2営業日以内に担当者よりご連絡いたします。");
+        response()->redirect("/#contact");   // post/redirect/get
+        return;
+    }
+}
+
+$body = render(
+    "views/home.phv.html",
+    stats: stats(),
+    services: services(),
+    strengths: strengths(),
+    works: works(),
+    steps: steps(),
+    news: news(),
+    facts: facts(),
+    topics: topics(),
+    inquiry: $inquiry,
+    errors: $errors,
+    notice: session()->flash("notice"),
+);
+echo render("views/layout.phv.html", title: "株式会社ハルカゼ | ビジネスを前へ進めるソフトウェアを", body: $body);
