@@ -81,6 +81,8 @@ pub struct HttpCtx {
     pub status: u16,
     pub resp_headers: Vec<(String, String)>,
     pub content_type: Option<String>,
+    /// A file sent with `response()->file()`; replaces the written output.
+    pub body_file: Option<Vec<u8>>,
 }
 
 impl Default for HttpCtx {
@@ -102,6 +104,7 @@ impl Default for HttpCtx {
             status: 200,
             resp_headers: Vec::new(),
             content_type: None,
+            body_file: None,
         }
     }
 }

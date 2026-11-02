@@ -185,6 +185,7 @@ pub static BUILTINS: &[BuiltinSig] = &[
     internal("__resp_status", "fn(int): void"),
     internal("__resp_header", "fn(string, string): void"),
     internal("__resp_type", "fn(string): void"),
+    internal("__resp_file", "fn(string, string): void"),
     internal("__resp_cookie", "fn(string, string, int, string, bool, bool, string): void"),
     internal("__req_cookies", "fn(): map<string, string>"),
     internal("__req_files", "fn(): list<map<string, string>>"),

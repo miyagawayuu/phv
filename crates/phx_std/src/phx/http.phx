@@ -133,6 +133,16 @@ export class Response {
         __resp_header("Location", $url);
     }
 
+    /**
+     * Sends a file instead of the page output, for example an uploaded image kept
+     * in `data/`. The path needs [permissions].read or write. Without `$type` the
+     * Content-Type comes from the extension; HTML, SVG and unknown files are sent
+     * as `application/octet-stream`.
+     */
+    public function file(string $path, string $type = ""): void {
+        __resp_file($path, $type);
+    }
+
     /** Sends `$value` as JSON. */
     public function json(any $value): void {
         __resp_type("application/json");

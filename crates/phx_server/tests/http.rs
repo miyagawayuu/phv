@@ -218,3 +218,50 @@ fn scripts_cannot_write_source_files() {
     assert_eq!(get(addr, "/?p=views%2Fnotes.txt", "").body, "wrote");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The raw response: status line and headers as text, the body as bytes.
+fn get_bytes(addr: SocketAddr, path: &str) -> (String, Vec<u8>) {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).unwrap();
+    let split = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    (String::from_utf8_lossy(&buf[..split]).into_owned(), buf[split + 4..].to_vec())
+}
+
+#[test]
+fn scripts_send_files() {
+    let dir = std::env::temp_dir().join(format!("phx-http-file-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phx.toml", "[permissions]\nwrite = [\"data/\"]\n");
+    // Not valid UTF-8, so it could not go through echo.
+    let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0xfe];
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    std::fs::write(dir.join("data/a.png"), &png).unwrap();
+    write(&dir, "data/page.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>");
+    write(&dir, "secret/key.txt", "secret");
+    write(
+        &dir,
+        "public/file.phx",
+        "<?phx\nimport std.http.{request, response};\necho \"<p>ignored</p>\";\n$p = request()->query(\"p\") ?? \"\";\n$t = request()->query(\"t\") ?? \"\";\ntry {\n    response()->file($p, $t);\n} catch (PermissionError $e) {\n    response()->status(403);\n    echo \"refused\";\n}\n",
+    );
+    let addr = start(&dir);
+
+    let (head, body) = get_bytes(addr, "/file?p=data%2Fa.png");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(head.to_ascii_lowercase().contains("content-type: image/png"), "{head}");
+    assert_eq!(body, png, "the bytes are sent as they are, without the page output");
+
+    // Types a browser would render as a page are only sent as downloads by default.
+    let (head, _) = get_bytes(addr, "/file?p=data%2Fpage.svg");
+    assert!(head.to_ascii_lowercase().contains("content-type: application/octet-stream"), "{head}");
+    let (head, _) = get_bytes(addr, "/file?p=data%2Fa.png&t=image%2Fwebp");
+    assert!(head.to_ascii_lowercase().contains("content-type: image/webp"), "{head}");
+
+    for p in ["secret%2Fkey.txt", "data%2F..%2Fsecret%2Fkey.txt", "phx.toml", "public%2Ffile.phx"] {
+        let r = get(addr, &format!("/file?p={p}"), "");
+        assert!(r.status == 403 && r.body.ends_with("refused"), "{p}: {} {}", r.status, r.body);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

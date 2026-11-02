@@ -531,6 +531,7 @@ response()->cookie("theme", "dark");
 response()->redirect("/login");                       // サイト内のパスだけ
 response()->redirectExternal("https://example.com/");  // 外部の URL
 response()->json($value);
+response()->file("data/photos/1.jpg");                // 出力の代わりにファイルを送る
 ```
 
 ### セッション
@@ -597,6 +598,12 @@ if ($file != null) {
 
 `name` はクライアントが送ったファイル名からディレクトリ部分と制御文字を取り除いたもの。
 保存先のパスには使わないこと。リクエスト本文は合計 8 MB まで。
+
+保存したファイルは `public/` の外にあるので、`response()->file($path, $type = "")` で返す。ファイルのバイト列が
+スクリプトの出力の代わりに送られるため、画像などのバイナリファイルも返せる（`echo` は UTF-8 のテキストだけ）。
+パスには `[permissions].read` か `write` が必要。`$type` を省くと拡張子から Content-Type を決める（画像・音声・動画・
+フォント・PDF・txt・csv・json）。HTML・SVG・XML と未知の拡張子は、アップロードされたファイルがサイト上のページとして
+動かないよう `application/octet-stream` で送る。
 
 ### JSON
 

@@ -291,6 +291,34 @@ fn env_allowed(vm: &Vm, name: &str) -> bool {
     })
 }
 
+/// The Content-Type `response()->file()` sends when none is given. Types a
+/// browser could run as a page (HTML, SVG, XML) are sent as downloads.
+fn file_type(path: &str) -> &'static str {
+    let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        "pdf" => "application/pdf",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "txt" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "json" => "application/json",
+        _ => "application/octet-stream",
+    }
+}
+
 fn io_error(vm: &Vm, what: &str, path: &str, e: std::io::Error) -> VmError {
     vm.throw("RuntimeException", format!("{what} \"{path}\": {}", e.kind()))
 }
@@ -400,6 +428,23 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             String::from_utf8(bytes)
                 .map(Value::str)
                 .map_err(|_| vm.throw("ValueError", format!("\"{rel}\" is not UTF-8 text")))
+        },
+        "__resp_file" => |vm, a| {
+            let rel = s(&a[0]).to_string();
+            let ct = match s(&a[1]) {
+                "" => file_type(&rel).to_string(),
+                given => given.to_string(),
+            };
+            crate::check_header(vm, "Content-Type", &ct)?;
+            let (dir, name) = resolve_path(vm, &rel, false)?;
+            let mut f = dir.open(&name, false).map_err(|e| fs_error(vm, &rel, "", e))?;
+            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            vm.reserve(size as usize)?;
+            let mut bytes = Vec::with_capacity(size as usize);
+            f.read_to_end(&mut bytes).map_err(|e| io_error(vm, "cannot read", &rel, e))?;
+            crate::set_type(vm, &ct)?;
+            vm.http.body_file = Some(bytes);
+            Ok(Value::Null)
         },
         "file_put_contents" => |vm, a| {
             let rel = s(&a[0]).to_string();

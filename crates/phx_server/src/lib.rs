@@ -466,6 +466,8 @@ impl State {
         let status = StatusCode::from_u16(http.status).unwrap_or(StatusCode::OK);
         let body = if matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED) {
             Bytes::new()
+        } else if let Some(file) = http.body_file.take() {
+            Bytes::from(file)
         } else {
             Bytes::from(outcome.output)
         };

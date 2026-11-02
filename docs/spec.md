@@ -531,6 +531,7 @@ response()->cookie("theme", "dark");
 response()->redirect("/login");                       // paths within the site only
 response()->redirectExternal("https://example.com/");  // external URL
 response()->json($value);
+response()->file("data/photos/1.jpg");                // sends a file instead of the output
 ```
 
 ### Sessions
@@ -597,6 +598,12 @@ if ($file != null) {
 
 `name` is the file name sent by the client, with the directory part and control characters removed.
 Do not use it in the destination path. The request body is limited to 8 MB in total.
+
+Saved files are outside `public/`, so send them back with `response()->file($path, $type = "")`. The bytes of the file
+replace everything the script writes, so images and other binary files can be served (`echo` only sends UTF-8 text).
+The path needs `[permissions].read` or `write`. Without `$type`, the Content-Type comes from the extension (images,
+audio, video, fonts, PDF, txt, csv, json); HTML, SVG, XML and unknown extensions are sent as `application/octet-stream`
+so that an uploaded file cannot run as a page on the site.
 
 ### JSON
 
