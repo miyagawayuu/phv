@@ -146,8 +146,8 @@ static REDIS_POOLS: Registry<RedisConn> = LazyLock::new(Default::default);
 // ----- Connections held by a script ------------------------------------------
 
 enum Link {
-    Pg(Pooled<PgConn>),
-    My(Pooled<MyConn>),
+    Pg(Box<Pooled<PgConn>>),
+    My(Box<Pooled<MyConn>>),
     Redis(Pooled<RedisConn>),
 }
 
@@ -239,10 +239,10 @@ fn open(vm: &mut Vm, name: &str, want_redis: bool) -> R {
     let result = match kind {
         Kind::Postgres => pool_for(&PG_POOLS, &key, spec.pool_size)
             .acquire(until, || pg_connect(&url, &spec, connect_timeout))
-            .map(Link::Pg),
+            .map(|p| Link::Pg(Box::new(p))),
         Kind::MySql => pool_for(&MY_POOLS, &key, spec.pool_size)
             .acquire(until, || my_connect(&url, &spec, connect_timeout))
-            .map(Link::My),
+            .map(|p| Link::My(Box::new(p))),
         Kind::Redis => pool_for(&REDIS_POOLS, &key, spec.pool_size)
             .acquire(until, || redis_connect(&url, &spec, connect_timeout))
             .map(Link::Redis),
@@ -335,6 +335,11 @@ fn remaining(vm: &Vm) -> Result<Option<Duration>, VmError> {
     vm.check_limits()?;
     Ok(vm.deadline().map(|d| d.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))))
 }
+
+/// Server timeouts end this long after the script's deadline, so the script's
+/// own limit has always passed when the server stops a statement (otherwise a
+/// statement cut a moment early would look like an ordinary error).
+const TIMEOUT_MARGIN_MS: u64 = 100;
 
 /// Whether the server timeout must be set again: it is lowered as the
 /// deadline approaches, so a statement never runs much past the time limit.
@@ -430,7 +435,7 @@ fn pg_limit_time(vm: &Vm, c: &mut Pooled<PgConn>) -> Result<(), VmError> {
     let Some(left) = remaining(vm)? else { return Ok(()) };
     let ms = left.as_millis().min(i32::MAX as u128) as u64;
     if needs_new_timeout(c.get().timeout_ms, ms) {
-        let r = c.get().client.batch_execute(&format!("SET statement_timeout = {ms}"));
+        let r = c.get().client.batch_execute(&format!("SET statement_timeout = {}", ms + TIMEOUT_MARGIN_MS));
         r.map_err(|e| pg_error(vm, c, e))?;
         c.get().timeout_ms = Some(ms);
     }
@@ -878,7 +883,7 @@ fn my_limit_time(vm: &Vm, c: &mut Pooled<MyConn>) -> Result<(), VmError> {
     let Some(left) = remaining(vm)? else { return Ok(()) };
     let ms = left.as_millis().min(u32::MAX as u128) as u64;
     if needs_new_timeout(c.get().timeout_ms, ms) {
-        let r = c.get().conn.query_drop(format!("SET SESSION max_execution_time = {ms}"));
+        let r = c.get().conn.query_drop(format!("SET SESSION max_execution_time = {}", ms + TIMEOUT_MARGIN_MS));
         r.map_err(|e| my_error(vm, c, e))?;
         c.get().timeout_ms = Some(ms);
     }

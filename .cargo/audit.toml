@@ -1,0 +1,5 @@
+[advisories]
+# rustls-pemfile is unmaintained (no known vulnerability; its code moved into
+# rustls-pki-types). It comes in through the mysql crate's TLS support and only
+# reads PEM files named in a MySQL URL, which comes from phx.toml.
+ignore = ["RUSTSEC-2025-0134"]
