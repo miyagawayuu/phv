@@ -213,6 +213,10 @@ pub static BUILTINS: &[BuiltinSig] = &[
     internal("__db_connect", "fn(string): int"),
     internal("__redis_connect", "fn(string): int"),
     internal("__redis", "fn(int, string, list<string>): any"),
+    internal("__ws_connect", "fn(string): int"),
+    internal("__ws_send", "fn(int, string): void"),
+    internal("__ws_receive", "fn(int, float): ?string"),
+    internal("__ws_close", "fn(int): void"),
 ];
 
 /// Hints for PHP functions that do not exist in PHV.

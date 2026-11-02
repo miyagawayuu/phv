@@ -21,4 +21,5 @@ class ValueError extends Exception {}
 class UnhandledMatchError extends Exception {}
 class PermissionError extends Exception {}
 class DatabaseError extends RuntimeException {}
+class NetworkError extends RuntimeException {}
 class AssertionError extends Exception {}

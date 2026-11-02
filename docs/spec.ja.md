@@ -372,7 +372,8 @@ $s = first_or([], "none");       // string
 ```
 Exception                    (getMessage(): string)
 ├── RuntimeException
-│   └── DatabaseError        SQL のエラー
+│   ├── DatabaseError        SQL のエラー
+│   └── NetworkError         WebSocket の接続エラー
 ├── LogicException
 │   └── InvalidArgumentException
 ├── ArithmeticError          整数のオーバーフローなど
@@ -406,7 +407,7 @@ import std.http.{request, response};
   ディレクトリ)からの `a/b.phv` を読み込む。
 - import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`const`、`import`)
   しか書けない。モジュールを読み込んでも副作用は起きない。
-- `std.*` は標準モジュール(`std.http`、`std.db`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
+- `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
 - 読み込めるのはプロジェクトとパッケージのディレクトリの中のファイルだけ(シンボリックリンクで外に出ることはできない)。
 
 ## 12. テンプレート
@@ -710,6 +711,34 @@ $redis->rpush("jobs", "a");  $redis->lpop("jobs");  $redis->lrange("jobs", 0, -1
 `rpush`、`lpop`、`lrange`、`close`。送れるのはこれらのコマンドだけで、`KEYS`、`FLUSHALL`、`CONFIG`、`EVAL`
 などは使えません。リモートのサーバーには `rediss://` の URL が必要です(または `tls = false`)。エラーは `DatabaseError`。
 
+### WebSocket (std.net)
+
+WebSocket のサーバーはデータベースと同じく `phv.toml` で名前を付けます。スクリプトは名前だけを使うので、パスワードを含む
+URL(`ws://host:port/secret`)がコードに現れることはなく、スクリプトがそれ以外の場所に接続することもできません。
+
+```toml
+[websockets.game]
+url_env = "GAME_WS_URL"       # ws:// または wss://
+# url = "ws://127.0.0.1:28016/secret"   # または URL そのもの(ローカル開発用)
+# tls = false                 # リモートのホストへの ws:// を許す(非推奨)
+```
+
+```phv
+import std.net.WebSocket;
+
+$ws = WebSocket::connect("game");
+$ws->send(json_encode(["Identifier" => 1, "Message" => "status"]));
+$reply = $ws->receive(5.0);       // ?string: 5 秒以内にメッセージが来なければ null
+$ws->close();
+```
+
+- `connect()` のたびに新しい接続を開き、`close()` かスクリプトの終了で閉じる。リクエストの間で共有されるものはない。
+- 送受信できるのはテキストメッセージだけ。サーバーからのバイナリメッセージは `NetworkError`。ping には受信中に応答する。
+- `receive()` が待つのはスクリプトの時間制限まで。メッセージは最大 16 MB、1 つのスクリプトが同時に持てる接続は 16 まで。
+- **`localhost` 以外のホストには TLS(`wss://`)が必要**で、サーバー証明書は公開 CA で検証する。`tls = false` でそのホストへの
+  `ws://` を許す。
+- 接続の失敗、サーバーによる切断、ネットワークのエラーは `NetworkError`。メッセージに URL は出ない。
+
 ### 日付・暗号・エンコード
 
 | 関数 | 説明 |
@@ -958,7 +987,7 @@ phv migrate legacy/page.php      # page.phv を書き出す
 ## 18. 今後の予定
 
 - ジェネリッククラス、アノテーション(属性)
-- 非同期 I/O、HTTP クライアント(`[permissions].net`)
+- 非同期 I/O、HTTP クライアント
 - JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
 - 推移的な依存関係の解決、パッケージレジストリ
 - LSP の定義ジャンプ・補完、`phv fmt` の行の折り返し

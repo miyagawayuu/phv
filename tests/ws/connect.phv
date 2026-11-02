@@ -1,0 +1,3 @@
+import std.net.WebSocket;
+
+WebSocket::connect("main");

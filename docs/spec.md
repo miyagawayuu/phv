@@ -372,7 +372,8 @@ Available from every file.
 ```
 Exception                    (getMessage(): string)
 ├── RuntimeException
-│   └── DatabaseError        SQL error
+│   ├── DatabaseError        SQL error
+│   └── NetworkError         WebSocket connection failure
 ├── LogicException
 │   └── InvalidArgumentException
 ├── ArithmeticError          integer overflow, etc.
@@ -406,7 +407,7 @@ import std.http.{request, response};
   the directory of the file being run).
 - The top level of an imported module can contain only declarations (`function`, `class`, `interface`, `enum`, `const`, `import`).
   Loading a module has no side effects.
-- `std.*` are the standard modules (`std.http`, `std.db`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
+- `std.*` are the standard modules (`std.http`, `std.db`, `std.net`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
 - Only files inside the project and package directories can be loaded (symbolic links cannot be used to escape them).
 
 ## 12. Templates
@@ -711,6 +712,38 @@ Methods: `get`, `set`, `delete`, `exists`, `incr`, `expire`, `ttl`, `hget`, `hse
 `lpop`, `lrange`, `close`. Only these commands can be sent: commands such as `KEYS`, `FLUSHALL`, `CONFIG` or
 `EVAL` are not available. A remote server needs a `rediss://` URL (or `tls = false`). Errors raise `DatabaseError`.
 
+### WebSocket (std.net)
+
+WebSocket servers are named in `phv.toml` like database servers. Scripts only use the name, so a URL with a
+password in it (`ws://host:port/secret`) never appears in the code, and scripts cannot connect anywhere else.
+
+```toml
+[websockets.game]
+url_env = "GAME_WS_URL"       # ws:// or wss://
+# url = "ws://127.0.0.1:28016/secret"   # or the URL itself (for local development)
+# tls = false                 # allow ws:// to a remote host (not recommended)
+```
+
+```phv
+import std.net.WebSocket;
+
+$ws = WebSocket::connect("game");
+$ws->send(json_encode(["Identifier" => 1, "Message" => "status"]));
+$reply = $ws->receive(5.0);       // ?string: null when no message arrives within 5 seconds
+$ws->close();
+```
+
+- Each `connect()` opens a new connection, which is closed by `close()` or when the script ends. Nothing is shared
+  between requests.
+- Only text messages are sent and received. A binary message from the server raises `NetworkError`. Pings are
+  answered while reading.
+- `receive()` waits at most until the script's time limit. A message is at most 16 MB, and a script can hold
+  16 connections at once.
+- **TLS (`wss://`) is required for every host except `localhost`**, with the server certificate checked against the
+  public CAs. `tls = false` allows `ws://` to such a host.
+- Connection failures, a server that closes the connection, and network errors raise `NetworkError`. The URL is
+  never shown in messages.
+
 ### Dates, cryptography, and encoding
 
 | Function | Description |
@@ -959,7 +992,7 @@ It then runs the type checker and shows the places that need manual work, such a
 ## 18. Roadmap
 
 - Generic classes, annotations (attributes)
-- Asynchronous I/O, HTTP client (`[permissions].net`)
+- Asynchronous I/O, HTTP client
 - Wider JIT coverage (functions that handle floats and strings), AOT compilation
 - Transitive dependency resolution, a package registry
 - Go-to-definition and completion in the LSP, line wrapping in `phv fmt`

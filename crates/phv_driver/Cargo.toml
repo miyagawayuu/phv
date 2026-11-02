@@ -8,6 +8,7 @@ documentation.workspace = true
 
 [dev-dependencies]
 phv_syntax.workspace = true
+tungstenite.workspace = true
 
 [dependencies]
 phv_syntax.workspace = true

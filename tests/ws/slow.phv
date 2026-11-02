@@ -1,0 +1,4 @@
+import std.net.WebSocket;
+
+$ws = WebSocket::connect("main");
+echo $ws->receive(60.0) ?? "(nothing)";

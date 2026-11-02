@@ -16,6 +16,7 @@ pub mod safefs;
 mod sys;
 mod twofactor;
 mod web;
+mod websocket;
 
 pub use sys::{constant_time_eq, sha256_hex};
 pub use web::{csrf_expected, json_decode, random_hex};
@@ -27,6 +28,7 @@ pub fn std_module(name: &str) -> Option<&'static str> {
     match name {
         "std.http" => Some(include_str!("phv/http.phv")),
         "std.db" => Some(include_str!("phv/db.phv")),
+        "std.net" => Some(include_str!("phv/net.phv")),
         _ => None,
     }
 }
@@ -479,6 +481,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         .or_else(|| sys::lookup(name))
         .or_else(|| db::lookup(name))
         .or_else(|| twofactor::lookup(name))
+        .or_else(|| websocket::lookup(name))
 }
 
 fn core_lookup(name: &str) -> Option<BuiltinFn> {

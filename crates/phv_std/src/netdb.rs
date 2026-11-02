@@ -176,14 +176,14 @@ fn kind_of(url: &str) -> Kind {
     }
 }
 
-fn is_local_host(host: &str) -> bool {
+pub(crate) fn is_local_host(host: &str) -> bool {
     let h = host.trim_start_matches('[').trim_end_matches(']');
     h.eq_ignore_ascii_case("localhost") || h.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The rustls provider every TLS connection uses (ring; installed once as the
 /// process default for the clients that build their own configuration).
-fn tls_init() {
+pub(crate) fn tls_init() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();

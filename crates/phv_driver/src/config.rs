@@ -21,9 +21,12 @@
 //!
 //! [databases.main]
 //! url_env = "DATABASE_URL"  # postgres://, mysql://, redis:// or rediss://
+//!
+//! [websockets.game]
+//! url_env = "GAME_WS_URL"   # ws:// or wss://
 //! ```
 
-use phv_vm::{DatabaseSpec, Host, Permissions};
+use phv_vm::{DatabaseSpec, Host, Permissions, WebSocketSpec};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,6 +45,8 @@ struct File {
     dependencies: BTreeMap<String, Dependency>,
     #[serde(default)]
     databases: BTreeMap<String, DatabaseSection>,
+    #[serde(default)]
+    websockets: BTreeMap<String, WebSocketSection>,
 }
 
 /// `[databases.<name>]`: a server scripts reach with `Database::connect("<name>")`
@@ -62,19 +67,10 @@ struct DatabaseSection {
 const DATABASE_SCHEMES: &[&str] = &["postgres://", "postgresql://", "mysql://", "redis://", "rediss://"];
 
 fn database_spec(name: &str, d: DatabaseSection) -> Result<DatabaseSpec, String> {
-    let valid_name = !name.is_empty()
-        && name.len() <= 64
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-    if !valid_name {
+    if !valid_server_name(name) {
         return Err(format!("[databases]: invalid name \"{name}\" (letters, digits, `_` and `-`)"));
     }
-    let url = match (d.url, &d.url_env) {
-        (Some(u), None) => Some(u),
-        // An unset variable is reported when a script connects, so `phv check`
-        // and the editor work without the production credentials.
-        (None, Some(var)) => std::env::var(var).ok().filter(|u| !u.is_empty()),
-        _ => return Err(format!("[databases.{name}]: give exactly one of `url` or `url_env`")),
-    };
+    let url = server_url("databases", name, d.url, &d.url_env)?;
     if let Some(u) = &url {
         if !DATABASE_SCHEMES.iter().any(|s| u.starts_with(s)) {
             let from = d.url_env.as_deref().map(|v| format!(" (from ${v})")).unwrap_or_default();
@@ -88,6 +84,50 @@ fn database_spec(name: &str, d: DatabaseSection) -> Result<DatabaseSpec, String>
         return Err(format!("[databases.{name}].pool_size must be between 1 and 256"));
     }
     Ok(DatabaseSpec { url, url_env: d.url_env, tls: d.tls, pool_size })
+}
+
+/// `[websockets.<name>]`: a server scripts reach with `WebSocket::connect("<name>")`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebSocketSection {
+    url: Option<String>,
+    url_env: Option<String>,
+    /// `false` allows `ws://` to a remote host; by default only localhost may skip TLS.
+    tls: Option<bool>,
+}
+
+fn valid_server_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The URL of a `[databases]` or `[websockets]` entry: `url`, or the value of
+/// `url_env`. An unset variable is reported when a script connects, so
+/// `phv check` and the editor work without the production credentials.
+fn server_url(
+    section: &str,
+    name: &str,
+    url: Option<String>,
+    url_env: &Option<String>,
+) -> Result<Option<String>, String> {
+    match (url, url_env) {
+        (Some(u), None) => Ok(Some(u)),
+        (None, Some(var)) => Ok(std::env::var(var).ok().filter(|u| !u.is_empty())),
+        _ => Err(format!("[{section}.{name}]: give exactly one of `url` or `url_env`")),
+    }
+}
+
+fn websocket_spec(name: &str, w: WebSocketSection) -> Result<WebSocketSpec, String> {
+    if !valid_server_name(name) {
+        return Err(format!("[websockets]: invalid name \"{name}\" (letters, digits, `_` and `-`)"));
+    }
+    let url = server_url("websockets", name, w.url, &w.url_env)?;
+    if let Some(u) = &url {
+        if !u.starts_with("ws://") && !u.starts_with("wss://") {
+            let from = w.url_env.as_deref().map(|v| format!(" (from ${v})")).unwrap_or_default();
+            return Err(format!("[websockets.{name}]: the URL{from} must start with ws:// or wss://"));
+        }
+    }
+    Ok(WebSocketSpec { url, url_env: w.url_env, tls: w.tls })
 }
 
 #[derive(Deserialize, Default)]
@@ -398,9 +438,14 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
         let spec = database_spec(&name, d)?;
         databases.insert(name, spec);
     }
+    let mut websockets = BTreeMap::new();
+    for (name, w) in file.websockets {
+        let spec = websocket_spec(&name, w)?;
+        websockets.insert(name, spec);
+    }
     Ok(Config {
         name: file.project.name,
-        host: Arc::new(Host { root: root.to_path_buf(), permissions, databases }),
+        host: Arc::new(Host { root: root.to_path_buf(), permissions, databases, websockets }),
         csrf: file.security.csrf,
         secure_cookies: file.security.secure_cookies,
         session_ttl: file.security.session_ttl,
@@ -417,7 +462,10 @@ mod tests {
     use super::*;
 
     fn load(toml: &str) -> Result<Config, String> {
-        let dir = std::env::temp_dir().join(format!("phv-config-{}-{}", std::process::id(), toml.len()));
+        // A directory per call: tests run in parallel.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("phv-config-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("phv.toml"), toml).unwrap();
         let r = load_config(&dir);
@@ -440,6 +488,45 @@ mod tests {
         assert!(ok.session_dir.is_some());
         assert!(load("[security]\nsession_ttl = 99999999999\n").is_err());
         assert!(load("[security]\nmemory_limit_mb = 0\n").is_err());
+    }
+
+    #[test]
+    fn websocket_servers() {
+        let c = load(
+            "[websockets.game]
+url = \"ws://127.0.0.1:28016/secret\"
+",
+        )
+        .unwrap();
+        let spec = &c.host.websockets["game"];
+        assert_eq!(spec.url.as_deref(), Some("ws://127.0.0.1:28016/secret"));
+        assert!(!format!("{spec:?}").contains("secret"));
+        assert!(load(
+            "[websockets.game]
+url = \"http://example.com/\"
+"
+        )
+        .is_err());
+        assert!(load(
+            "[websockets.game]
+url = \"ws://a/\"
+url_env = \"X\"
+"
+        )
+        .is_err());
+        assert!(load(
+            "[websockets.\"a b\"]
+url = \"ws://a/\"
+"
+        )
+        .is_err());
+        assert!(load(
+            "[websockets.game]
+url = \"ws://a/\"
+pool_size = 2
+"
+        )
+        .is_err());
     }
 
     #[test]

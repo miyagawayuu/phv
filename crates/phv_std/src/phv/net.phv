@@ -1,0 +1,34 @@
+// std.net — WebSocket servers named in phv.toml.
+//
+//   import std.net.WebSocket;
+//   $ws = WebSocket::connect("game");       // [websockets.game] in phv.toml
+//   $ws->send("hello");
+//   $reply = $ws->receive(5.0);             // ?string: null when nothing arrives within 5 seconds
+//   $ws->close();
+//
+// Each connect() opens a new connection, closed by close() or when the script ends.
+// Network failures and a server closing the connection raise NetworkError.
+
+export class WebSocket {
+    /** Connections come from `WebSocket::connect()`; a handle number cannot be passed in. */
+    private function __construct(private int $handle) {}
+
+    /** Connects to the server named `[websockets.<name>]` in phv.toml. */
+    public static function connect(string $name): WebSocket {
+        return new WebSocket(__ws_connect($name));
+    }
+
+    /** Sends one text message. */
+    public function send(string $text): void {
+        __ws_send($this->handle, $text);
+    }
+
+    /** The next text message, or null when none arrives within `$timeout` seconds. */
+    public function receive(float $timeout = 5.0): ?string {
+        return __ws_receive($this->handle, $timeout);
+    }
+
+    public function close(): void {
+        __ws_close($this->handle);
+    }
+}

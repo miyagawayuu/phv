@@ -1,0 +1,8 @@
+echo: hello
+echo: ping-then-echo
+(nothing within 0.2s)
+NetworkError: the server closed the connection
+NetworkError: the WebSocket connection is closed
+NetworkError: no WebSocket server named "other" in [websockets] of phv.toml
+NetworkError: the server sent a binary message; only text messages are supported
+NetworkError: the WebSocket connection is closed

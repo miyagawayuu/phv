@@ -1,0 +1,38 @@
+import std.net.WebSocket;
+
+$ws = WebSocket::connect("main");
+$ws->send("hello");
+echo $ws->receive() ?? "(nothing)", "\n";
+$ws->send("ping-then-echo");
+echo $ws->receive() ?? "(nothing)", "\n";
+echo $ws->receive(0.2) ?? "(nothing within 0.2s)", "\n";
+$ws->send("bye");
+try {
+    $ws->receive();
+} catch (NetworkError $e) {
+    echo "NetworkError: ", $e->getMessage(), "\n";
+}
+try {
+    $ws->send("again");
+} catch (NetworkError $e) {
+    echo "NetworkError: ", $e->getMessage(), "\n";
+}
+try {
+    WebSocket::connect("other");
+} catch (NetworkError $e) {
+    echo "NetworkError: ", $e->getMessage(), "\n";
+}
+$ws2 = WebSocket::connect("main");
+$ws2->send("binary");
+try {
+    $ws2->receive();
+} catch (NetworkError $e) {
+    echo "NetworkError: ", $e->getMessage(), "\n";
+}
+$ws3 = WebSocket::connect("main");
+$ws3->close();
+try {
+    $ws3->send("closed");
+} catch (NetworkError $e) {
+    echo "NetworkError: ", $e->getMessage(), "\n";
+}

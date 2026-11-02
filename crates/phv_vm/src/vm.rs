@@ -140,6 +140,8 @@ pub struct Host {
     pub permissions: Permissions,
     /// Database servers scripts may connect to, by name (`[databases]` in phv.toml).
     pub databases: std::collections::BTreeMap<String, DatabaseSpec>,
+    /// WebSocket servers scripts may connect to, by name (`[websockets]` in phv.toml).
+    pub websockets: std::collections::BTreeMap<String, WebSocketSpec>,
 }
 
 /// A database server named in phv.toml. Scripts only ever see the name: the
@@ -165,6 +167,30 @@ impl std::fmt::Debug for DatabaseSpec {
             .field("url_env", &self.url_env)
             .field("tls", &self.tls)
             .field("pool_size", &self.pool_size)
+            .finish()
+    }
+}
+
+/// A WebSocket server named in phv.toml. Like a database URL, the URL may hold
+/// a password (in its path or user info), so it is never shown.
+#[derive(Clone)]
+pub struct WebSocketSpec {
+    /// `ws://` or `wss://` URL, or None when the environment variable named by
+    /// `url_env` is not set.
+    pub url: Option<String>,
+    /// The environment variable the URL comes from, for error messages.
+    pub url_env: Option<String>,
+    /// Some(false) allows `ws://` to remote hosts; None means TLS for every
+    /// host except localhost.
+    pub tls: Option<bool>,
+}
+
+impl std::fmt::Debug for WebSocketSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSocketSpec")
+            .field("url", &self.url.as_ref().map(|_| "<redacted>"))
+            .field("url_env", &self.url_env)
+            .field("tls", &self.tls)
             .finish()
     }
 }
