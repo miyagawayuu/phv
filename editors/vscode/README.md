@@ -13,7 +13,7 @@ Language support for [PHX](https://phx-lang.org):
 Download `phx-<version>.vsix` from the [releases](https://github.com/miyagawayuu/phx/releases) and install it:
 
 ```bash
-code --install-extension phx-0.2.2.vsix
+code --install-extension phx-0.2.3.vsix
 ```
 
 Or, in VS Code, run **Extensions: Install from VSIX...** from the Command Palette.
@@ -37,5 +37,5 @@ your `PATH` (or set `phx.path`). Highlighting works without it.
 npm install
 npm test          # checks the grammars
 npx vsce package  # writes phx-<version>.vsix
-code --install-extension phx-0.2.2.vsix
+code --install-extension phx-0.2.3.vsix
 ```

@@ -2,7 +2,7 @@
   "name": "phx",
   "displayName": "PHX",
   "description": "PHX language support: syntax highlighting for .phx and .phx.html, and diagnostics and hover types from `phx lsp`.",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "publisher": "phx-lang",
   "license": "MIT",
   "icon": "images/icon.png",
