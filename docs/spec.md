@@ -645,6 +645,72 @@ $db->transaction(function () use ($db): void {
 - `ATTACH` is disabled, so databases other than the permitted files cannot be accessed.
 - SQL errors raise `DatabaseError`.
 
+#### PostgreSQL and MySQL
+
+Database servers are named in `phx.toml`; scripts only use the name, so passwords never appear in the code.
+
+```toml
+[databases.main]
+url_env = "DATABASE_URL"      # postgres://user:pass@host/db, mysql://user:pass@host/db
+# url = "postgres://app@localhost/app"   # or the URL itself (for local development)
+# tls = false                 # allow a plain connection to a remote host (not recommended)
+# pool_size = 8               # connections kept per server process (1 to 256)
+```
+
+```phx
+$db = Database::connect("main");
+$row = $db->first(sql"INSERT INTO posts (title) VALUES ({$title}) RETURNING id");   // PostgreSQL
+$db->execute(sql"INSERT INTO posts (title) VALUES ({$title})");
+$id = $db->lastInsertId();                                                          // MySQL
+```
+
+The methods are the same as for SQLite (`query`, `first`, `execute`, `transaction`, `close`).
+
+- Values are always sent as bound parameters (`$1` in PostgreSQL, `?` in MySQL). A `?` written in the SQL text,
+  such as PostgreSQL's `jsonb ? 'key'`, stays as written.
+- **TLS is required for every host except `localhost`**, and the server certificate is checked against the
+  public CAs (webpki-roots). Servers with a certificate from a private CA are not supported yet; `tls = false`
+  turns TLS off for such hosts.
+- With `url_env`, an unset variable is reported when a script connects, so `phx check` works without the
+  production credentials. The URL is never shown to scripts or in error messages.
+- Connections are pooled per server process. When a script ends (or calls `close()`), its connection goes back
+  to the pool after the session is reset: an open transaction is rolled back, and temporary tables and session
+  settings are cleared (PostgreSQL `DISCARD ALL`, MySQL `COM_RESET_CONNECTION`). Connecting to the same name
+  twice in one script gives the same connection. When every connection is in use, `connect()` waits up to the
+  script's time limit (30 seconds at most) and then raises `DatabaseError`.
+- A statement running past the script's time limit is stopped by the server (PostgreSQL `statement_timeout`,
+  MySQL `max_execution_time`, which applies to `SELECT`).
+- Each call runs a single statement (MySQL multi-statements are off), and `LOAD DATA LOCAL INFILE` is refused.
+- Value types: PostgreSQL `bool` → `bool`; integer types → `int`; `real`/`double precision` → `float`;
+  `numeric`, `json`/`jsonb`, `uuid`, dates and times (`YYYY-MM-DD HH:MM:SS[.ffffff]`, `timestamptz` in UTC),
+  `bytea` (`\x...` hex) and text types → `string`. Other types (arrays, `interval`, ...) raise `DatabaseError`:
+  cast them in the SQL (`col::text`). Parameters are converted to the column type, so a string can be passed for
+  a `date`, `numeric`, `uuid` or `jsonb` column. MySQL `DECIMAL`, `JSON`, dates and times are `string`, and
+  `TINYINT(1)` is `int` (`Row::bool()` accepts it).
+- Give the application a database user with only the privileges it needs (no `SUPERUSER`, no `FILE`).
+
+#### Redis
+
+```toml
+[databases.cache]
+url_env = "REDIS_URL"         # redis://localhost, or rediss://user:pass@host for TLS
+```
+
+```phx
+import std.db.Redis;
+
+$redis = Redis::connect("cache");
+$redis->set("greeting", "hello", 60);          // expires after 60 seconds (0: never)
+$redis->get("greeting");                       // ?string
+$redis->incr("visits");                        // int (incr($key, $by = 1))
+$redis->hset("user:1", "name", "Ann");  $redis->hgetAll("user:1");   // map<string, string>
+$redis->rpush("jobs", "a");  $redis->lpop("jobs");  $redis->lrange("jobs", 0, -1);
+```
+
+Methods: `get`, `set`, `delete`, `exists`, `incr`, `expire`, `ttl`, `hget`, `hset`, `hdel`, `hgetAll`, `rpush`,
+`lpop`, `lrange`, `close`. Only these commands can be sent: commands such as `KEYS`, `FLUSHALL`, `CONFIG` or
+`EVAL` are not available. A remote server needs a `rediss://` URL (or `tls = false`). Errors raise `DatabaseError`.
+
 ### Dates, cryptography, and encoding
 
 | Function | Description |

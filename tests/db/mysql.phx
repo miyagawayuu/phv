@@ -1,0 +1,68 @@
+// Run by crates/phx_driver/tests/databases.rs against a MySQL server.
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->execute(sql"DROP TABLE IF EXISTS phx_items");
+$db->execute(sql"CREATE TABLE phx_items (
+    id int AUTO_INCREMENT PRIMARY KEY, name varchar(100) NOT NULL, qty int, price decimal(10, 2),
+    ratio double, big bigint unsigned, active tinyint(1), meta json, day date, at datetime(6), t time,
+    raw blob
+)");
+
+$name = "widget's \"best\" ?";
+$qty = 3;
+$price = "19.99";
+$ratio = 0.25;
+$big = 9000000000;
+$active = true;
+$meta = "{\"a\": [1, 2]}";
+$day = "2026-11-02";
+$at = "2026-11-02 10:30:00.123456";
+$t = "-26:15:00";
+?string $none = null;
+$n = $db->execute(sql"INSERT INTO phx_items (name, qty, price, ratio, big, active, meta, day, at, t, raw)
+    VALUES ({$name}, {$qty}, {$price}, {$ratio}, {$big}, {$active}, {$meta}, {$day}, {$at}, {$t}, {$none})");
+echo "inserted: ", $n, " id: ", $db->lastInsertId(), "\n";
+
+$r = $db->first(sql"SELECT * FROM phx_items WHERE name = {$name}");
+if ($r != null) {
+    foreach ($r->toMap() as $k => $v) {
+        echo $k, " = ", json_encode($v), "\n";
+    }
+    echo "active: ", $r->bool("active") == true ? "yes" : "no", "\n";
+}
+
+$col = "qty";
+echo "qty: ", $db->first(sql"SELECT " . sql_ident($col) . sql" FROM phx_items")?->int("qty") ?? -1, "\n";
+
+try {
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"DELETE FROM phx_items");
+        throw new RuntimeException("stop");
+    });
+} catch (RuntimeException $e) {
+    echo "rolled back: ", $e->message, "\n";
+}
+echo "rows: ", count($db->query(sql"SELECT id FROM phx_items")), "\n";
+
+try {
+    $db->execute(sql"INSERT INTO phx_items (name) VALUES ({$none})");
+} catch (DatabaseError $e) {
+    echo "error: ", $e->message, "\n";
+}
+// Only one statement per call.
+try {
+    $db->execute(sql"SELECT 1; DROP TABLE phx_items");
+} catch (DatabaseError $e) {
+    echo "multi-statement refused\n";
+}
+echo "table still there: ", count($db->query(sql"SELECT id FROM phx_items")), "\n";
+
+$again = Database::connect("main");
+echo "shared: ", $again->first(sql"SELECT 1 AS one")?->int("one") ?? 0, "\n";
+
+// State left for the next script: it must not see it.
+$db->execute(sql"CREATE TEMPORARY TABLE phx_temp (x int)");
+$db->execute(sql"SET @leaked = 'yes'");
+$db->execute(sql"BEGIN");
+$db->execute(sql"INSERT INTO phx_items (name) VALUES ('uncommitted')");

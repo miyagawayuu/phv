@@ -130,7 +130,7 @@ error: a URL attribute cannot start with an unchecked value
 | `phx_compiler` | HIR → register bytecode |
 | `phx_vm` | Values, bytecode format, interpreter, runtime limits |
 | `phx_jit` | Native code for functions that only use int/bool values (Cranelift) |
-| `phx_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, sessions) and the prelude, `std.http` and `std.db` written in PHX |
+| `phx_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, PostgreSQL, MySQL, Redis, sessions) and the prelude, `std.http` and `std.db` written in PHX |
 | `phx_driver` | Loading modules and templates, `phx.toml`, bytecode cache, running programs |
 | `phx_server` | Web server (hyper + tokio), routing, sessions, CSRF, uploads |
 | `phx_cli` | The `phx` command (run / check / serve / test / fmt / lsp / install / migrate) |

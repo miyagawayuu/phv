@@ -645,6 +645,71 @@ $db->transaction(function () use ($db): void {
 - `ATTACH` は無効になっていて、許可されたファイル以外のデータベースには触れない。
 - SQL のエラーは `DatabaseError`。
 
+#### PostgreSQL と MySQL
+
+データベースサーバーは `phx.toml` に名前を付けて書きます。スクリプトは名前だけを使うので、パスワードがコードに出てきません。
+
+```toml
+[databases.main]
+url_env = "DATABASE_URL"      # postgres://user:pass@host/db、mysql://user:pass@host/db
+# url = "postgres://app@localhost/app"   # URL を直接書くこともできる(ローカル開発向け)
+# tls = false                 # リモートのホストへ暗号化なしで接続する(非推奨)
+# pool_size = 8               # サーバープロセスごとに保つ接続数(1〜256)
+```
+
+```phx
+$db = Database::connect("main");
+$row = $db->first(sql"INSERT INTO posts (title) VALUES ({$title}) RETURNING id");   // PostgreSQL
+$db->execute(sql"INSERT INTO posts (title) VALUES ({$title})");
+$id = $db->lastInsertId();                                                          // MySQL
+```
+
+メソッドは SQLite と同じです(`query`、`first`、`execute`、`transaction`、`close`)。
+
+- 値は必ずバインドパラメータとして送ります(PostgreSQL は `$1`、MySQL は `?`)。SQL の本文に書いた `?`
+  (PostgreSQL の `jsonb ? 'key'` など)はそのまま残ります。
+- **`localhost` 以外のホストには TLS が必須**で、サーバー証明書は公開 CA(webpki-roots)で検証します。
+  プライベート CA の証明書を使うサーバーにはまだ対応していません。そうしたホストでは `tls = false` で TLS を切れます。
+- `url_env` の環境変数が設定されていないことは、スクリプトが接続したときにエラーになります。そのため本番の
+  認証情報がなくても `phx check` は通ります。URL はスクリプトにもエラーメッセージにも出ません。
+- 接続はサーバープロセスごとにプールします。スクリプトが終わる(または `close()` する)と、セッションを
+  リセットしてからプールに戻します。開いたままのトランザクションはロールバックし、一時テーブルとセッション設定も
+  消します(PostgreSQL は `DISCARD ALL`、MySQL は `COM_RESET_CONNECTION`)。1 つのスクリプトで同じ名前に
+  2 回接続すると同じ接続になります。接続がすべて使用中のときは、スクリプトの制限時間(最大 30 秒)まで待ってから
+  `DatabaseError` になります。
+- スクリプトの制限時間を超えた文はサーバー側で止まります(PostgreSQL は `statement_timeout`、MySQL は
+  `SELECT` に効く `max_execution_time`)。
+- 1 回の呼び出しで実行できる文は 1 つだけです(MySQL の複数文は無効)。`LOAD DATA LOCAL INFILE` も拒否します。
+- 値の型: PostgreSQL の `bool` → `bool`、整数型 → `int`、`real`/`double precision` → `float`。
+  `numeric`、`json`/`jsonb`、`uuid`、日付と時刻(`YYYY-MM-DD HH:MM:SS[.ffffff]`。`timestamptz` は UTC)、
+  `bytea`(`\x...` の 16 進)、文字列型 → `string`。それ以外の型(配列や `interval` など)は `DatabaseError`
+  になるので、SQL でキャストしてください(`col::text`)。パラメータは列の型に合わせて変換するので、`date`、
+  `numeric`、`uuid`、`jsonb` の列にも文字列を渡せます。MySQL の `DECIMAL`、`JSON`、日付と時刻は `string`、
+  `TINYINT(1)` は `int` です(`Row::bool()` で読めます)。
+- アプリケーションには必要な権限だけを持つデータベースユーザーを使ってください(`SUPERUSER` や `FILE` は不要)。
+
+#### Redis
+
+```toml
+[databases.cache]
+url_env = "REDIS_URL"         # redis://localhost。TLS なら rediss://user:pass@host
+```
+
+```phx
+import std.db.Redis;
+
+$redis = Redis::connect("cache");
+$redis->set("greeting", "hello", 60);          // 60 秒後に消える(0 なら消えない)
+$redis->get("greeting");                       // ?string
+$redis->incr("visits");                        // int(incr($key, $by = 1))
+$redis->hset("user:1", "name", "Ann");  $redis->hgetAll("user:1");   // map<string, string>
+$redis->rpush("jobs", "a");  $redis->lpop("jobs");  $redis->lrange("jobs", 0, -1);
+```
+
+メソッド: `get`、`set`、`delete`、`exists`、`incr`、`expire`、`ttl`、`hget`、`hset`、`hdel`、`hgetAll`、
+`rpush`、`lpop`、`lrange`、`close`。送れるのはこれらのコマンドだけで、`KEYS`、`FLUSHALL`、`CONFIG`、`EVAL`
+などは使えません。リモートのサーバーには `rediss://` の URL が必要です(または `tls = false`)。エラーは `DatabaseError`。
+
 ### 日付・暗号・エンコード
 
 | 関数 | 説明 |

@@ -41,6 +41,12 @@ toml = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
+postgres = { version = "0.19.14", features = ["with-chrono-0_4"] }
+tokio-postgres-rustls = "0.14.0"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1.0.10"
+mysql = { version = "28.0.4", default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
+redis = { version = "1.7.1", default-features = false, features = ["tls-rustls", "tls-rustls-webpki-roots"] }
 
 [profile.release]
 # Arithmetic bugs in the runtime become caught panics instead of silent wraps.

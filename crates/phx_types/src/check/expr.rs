@@ -610,11 +610,20 @@ impl<'a> Checker<'a> {
                 self.class_const(class, *class_span, name, *name_span, span)
             }
             ExprKind::Sql(parts) => {
+                // Placeholders and identifiers are marked with private-use
+                // characters; each database renders them in its own syntax
+                // (`?` or `$1`, `"name"` or `` `name` ``), so a `?` written in
+                // the SQL (a PostgreSQL operator, a quoted string) stays as written.
                 let mut text = String::new();
                 let mut params = Vec::new();
                 for p in parts {
                     match p {
-                        InterpPart::Lit(s) => text.push_str(s),
+                        InterpPart::Lit(s) => {
+                            if s.contains(['\u{E000}', '\u{E001}', '\u{E002}']) {
+                                self.error("SQL text cannot contain the characters U+E000 to U+E002", span);
+                            }
+                            text.push_str(s)
+                        }
                         InterpPart::Expr(x) => {
                             let h = self.expr(x, None);
                             let ok = h.ty.members().iter().all(|m| {
@@ -624,7 +633,7 @@ impl<'a> Checker<'a> {
                                 let msg = format!("`{}` cannot be used as an SQL parameter", self.tn(&h.ty));
                                 self.error(msg, h.span).add_note("parameters must be int, float, string, bool or null");
                             }
-                            text.push('?');
+                            text.push('\u{E000}');
                             params.push(h);
                         }
                     }

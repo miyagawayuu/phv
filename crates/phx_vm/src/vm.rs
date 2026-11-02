@@ -138,6 +138,35 @@ pub struct Permissions {
 pub struct Host {
     pub root: std::path::PathBuf,
     pub permissions: Permissions,
+    /// Database servers scripts may connect to, by name (`[databases]` in phx.toml).
+    pub databases: std::collections::BTreeMap<String, DatabaseSpec>,
+}
+
+/// A database server named in phx.toml. Scripts only ever see the name: the
+/// URL holds credentials and is never shown (not even in Debug output).
+#[derive(Clone)]
+pub struct DatabaseSpec {
+    /// `postgres://`, `mysql://`, `redis://` or `rediss://` URL, or None when
+    /// the environment variable named by `url_env` is not set.
+    pub url: Option<String>,
+    /// The environment variable the URL comes from, for error messages.
+    pub url_env: Option<String>,
+    /// Some(false) allows plain connections to remote hosts; None means TLS
+    /// for every host except localhost.
+    pub tls: Option<bool>,
+    /// Connections kept per server process.
+    pub pool_size: usize,
+}
+
+impl std::fmt::Debug for DatabaseSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseSpec")
+            .field("url", &self.url.as_ref().map(|_| "<redacted>"))
+            .field("url_env", &self.url_env)
+            .field("tls", &self.tls)
+            .field("pool_size", &self.pool_size)
+            .finish()
+    }
 }
 
 const MAX_NATIVE_DEPTH: u32 = 200;

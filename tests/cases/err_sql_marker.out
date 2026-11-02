@@ -1,0 +1,7 @@
+error: SQL text cannot contain the characters U+E000 to U+E002
+ --> err_sql_marker.phx:2:6
+  |
+2 | $q = sql"SELECT ";
+  |      ^^^^^^^^^^^^^
+
+1 error found

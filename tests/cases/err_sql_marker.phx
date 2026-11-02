@@ -1,0 +1,2 @@
+// SQL text cannot contain the characters that mark parameters.
+$q = sql"SELECT ";

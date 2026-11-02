@@ -18,9 +18,12 @@
 //! [dependencies]
 //! utils = { path = "../utils" }
 //! markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
+//!
+//! [databases.main]
+//! url_env = "DATABASE_URL"  # postgres://, mysql://, redis:// or rediss://
 //! ```
 
-use phx_vm::{Host, Permissions};
+use phx_vm::{DatabaseSpec, Host, Permissions};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,6 +40,54 @@ struct File {
     permissions: PermissionsSection,
     #[serde(default)]
     dependencies: BTreeMap<String, Dependency>,
+    #[serde(default)]
+    databases: BTreeMap<String, DatabaseSection>,
+}
+
+/// `[databases.<name>]`: a server scripts reach with `Database::connect("<name>")`
+/// or `Redis::connect("<name>")`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DatabaseSection {
+    /// The URL itself (convenient for local development; it may contain a password).
+    url: Option<String>,
+    /// The environment variable holding the URL (recommended: keeps credentials out of the project).
+    url_env: Option<String>,
+    /// `false` allows a plain connection to a remote host; by default only localhost may skip TLS.
+    tls: Option<bool>,
+    /// Connections kept per server process (default 8).
+    pool_size: Option<usize>,
+}
+
+const DATABASE_SCHEMES: &[&str] = &["postgres://", "postgresql://", "mysql://", "redis://", "rediss://"];
+
+fn database_spec(name: &str, d: DatabaseSection) -> Result<DatabaseSpec, String> {
+    let valid_name = !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if !valid_name {
+        return Err(format!("[databases]: invalid name \"{name}\" (letters, digits, `_` and `-`)"));
+    }
+    let url = match (d.url, &d.url_env) {
+        (Some(u), None) => Some(u),
+        // An unset variable is reported when a script connects, so `phx check`
+        // and the editor work without the production credentials.
+        (None, Some(var)) => std::env::var(var).ok().filter(|u| !u.is_empty()),
+        _ => return Err(format!("[databases.{name}]: give exactly one of `url` or `url_env`")),
+    };
+    if let Some(u) = &url {
+        if !DATABASE_SCHEMES.iter().any(|s| u.starts_with(s)) {
+            let from = d.url_env.as_deref().map(|v| format!(" (from ${v})")).unwrap_or_default();
+            return Err(format!(
+                "[databases.{name}]: the URL{from} must start with postgres://, mysql://, redis:// or rediss://"
+            ));
+        }
+    }
+    let pool_size = d.pool_size.unwrap_or(8);
+    if !(1..=256).contains(&pool_size) {
+        return Err(format!("[databases.{name}].pool_size must be between 1 and 256"));
+    }
+    Ok(DatabaseSpec { url, url_env: d.url_env, tls: d.tls, pool_size })
 }
 
 #[derive(Deserialize, Default)]
@@ -194,7 +245,7 @@ impl Config {
     pub fn default_for(root: &Path) -> Config {
         Config {
             name: None,
-            host: Arc::new(Host { root: root.to_path_buf(), permissions: Permissions::default() }),
+            host: Arc::new(Host { root: root.to_path_buf(), ..Host::default() }),
             csrf: true,
             secure_cookies: false,
             session_ttl: default_ttl(),
@@ -342,9 +393,14 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
     }
     let permissions =
         Permissions { read: file.permissions.read, write: file.permissions.write, env: file.permissions.env };
+    let mut databases = BTreeMap::new();
+    for (name, d) in file.databases {
+        let spec = database_spec(&name, d)?;
+        databases.insert(name, spec);
+    }
     Ok(Config {
         name: file.project.name,
-        host: Arc::new(Host { root: root.to_path_buf(), permissions }),
+        host: Arc::new(Host { root: root.to_path_buf(), permissions, databases }),
         csrf: file.security.csrf,
         secure_cookies: file.security.secure_cookies,
         session_ttl: file.security.session_ttl,

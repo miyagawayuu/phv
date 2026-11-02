@@ -1,0 +1,5 @@
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->query(sql"SELECT SLEEP(10) AS s");
+echo "not reached\n";

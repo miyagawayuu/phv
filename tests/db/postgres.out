@@ -1,0 +1,29 @@
+inserted id: 1
+id = 1
+name = "widget's \"best\" ?"
+qty = 3
+price = "19.99"
+ratio = 0.25
+big = 9000000000
+small = 7
+active = true
+tags = "{\"a\": [1, 2]}"
+meta = "{\"a\": [1, 2]}"
+uid = "550e8400-e29b-41d4-a716-446655440000"
+day = "2026-11-02"
+at = "2026-11-02 10:30:00"
+atz = "2026-11-02 01:30:00+00:00"
+raw = null
+label = null
+bin = "\\x0aff"
+has_a = true
+updated: 1
+qty: 4
+rolled back: stop
+rows: 1
+error: null value in column "name" of relation "phx_items" violates not-null constraint (Failing row contains (2, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null).)
+error: error serializing parameter 0: cannot pass a string as a parameter of type int4; cast it in the SQL, e.g. ({$value}::text)::int4
+error: error deserializing column 0: PHX cannot read values of type interval; cast the column in the SQL, e.g. column::text
+error: PostgreSQL has no last insert id; use `INSERT ... RETURNING id` with first()
+cast: 1 day
+shared: 1

@@ -10,6 +10,7 @@ use std::fmt::Write;
 use std::rc::Rc;
 
 mod db;
+mod netdb;
 pub mod ratelimit;
 pub mod safefs;
 mod sys;

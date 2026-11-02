@@ -1,7 +1,8 @@
-// std.db — SQLite databases.
+// std.db — SQLite databases, database servers named in phx.toml, and Redis.
 //
 //   import std.db.Database;
 //   $db = Database::open("data/app.db");      // needs [permissions].write = ["data/"]
+//   $db = Database::connect("main");          // PostgreSQL / MySQL from [databases.main]
 //   $db->execute(sql"INSERT INTO posts (title) VALUES ({$title})");
 //   foreach ($db->query(sql"SELECT id, title FROM posts WHERE id > {$min}") as $row) {
 //       echo $row->int("id"), " ", $row->string("title");
@@ -58,6 +59,9 @@ export class Row {
 
     public function bool(string $column): ?bool {
         $v = $this->values[$column] ?? null;
+        if ($v is bool) {
+            return $v;
+        }
         if ($v is int) {
             return $v != 0;
         }
@@ -78,6 +82,11 @@ export class Database {
         return new Database(__db_open($path));
     }
 
+    /** Connects to the PostgreSQL or MySQL server named `[databases.<name>]` in phx.toml. */
+    public static function connect(string $name): Database {
+        return new Database(__db_connect($name));
+    }
+
     /** Runs a SELECT and returns all rows. */
     public function query(Sql $query): list<Row> {
         return __db_query($this->handle, $query)->map(fn($m) => new Row($m));
@@ -93,6 +102,7 @@ export class Database {
         return __db_execute($this->handle, $query);
     }
 
+    /** The id of the last inserted row (SQLite, MySQL; with PostgreSQL use `RETURNING id`). */
     public function lastInsertId(): int {
         return __db_last_id($this->handle);
     }
@@ -107,6 +117,132 @@ export class Database {
             throw $e;
         }
         __db_raw($this->handle, "COMMIT");
+    }
+
+    public function close(): void {
+        __db_close($this->handle);
+    }
+}
+
+/**
+ * A Redis server named `[databases.<name>]` in phx.toml.
+ *
+ *   $redis = Redis::connect("cache");
+ *   $redis->set("greeting", "hello", 60);   // expires after 60 seconds
+ *   echo $redis->get("greeting") ?? "(gone)";
+ */
+export class Redis {
+    private function __construct(private int $handle) {}
+
+    public static function connect(string $name): Redis {
+        return new Redis(__redis_connect($name));
+    }
+
+    private function run(string $command, list<string> $args): any {
+        return __redis($this->handle, $command, $args);
+    }
+
+    private static function text(any $v): ?string {
+        if ($v is string) {
+            return $v;
+        }
+        return null;
+    }
+
+    private static function number(any $v): int {
+        if ($v is int) {
+            return $v;
+        }
+        return 0;
+    }
+
+    private static function texts(any $v): list<string> {
+        if ($v is list) {
+            return $v->map(fn($x) => Redis::text($x) ?? "");
+        }
+        return [];
+    }
+
+    /** The value of `$key`, or null when it does not exist. */
+    public function get(string $key): ?string {
+        return Redis::text($this->run("GET", [$key]));
+    }
+
+    /** Sets `$key`; with `$ttl` > 0 it expires after that many seconds. */
+    public function set(string $key, string $value, int $ttl = 0): void {
+        if ($ttl > 0) {
+            $this->run("SET", [$key, $value, "EX", (string)$ttl]);
+        } else {
+            $this->run("SET", [$key, $value]);
+        }
+    }
+
+    /** Deletes `$key`; true when it existed. */
+    public function delete(string $key): bool {
+        return Redis::number($this->run("DEL", [$key])) > 0;
+    }
+
+    public function exists(string $key): bool {
+        return Redis::number($this->run("EXISTS", [$key])) > 0;
+    }
+
+    /** Adds `$by` to the integer stored at `$key` (0 when missing) and returns the new value. */
+    public function incr(string $key, int $by = 1): int {
+        return Redis::number($this->run("INCRBY", [$key, (string)$by]));
+    }
+
+    /** Makes `$key` expire after `$seconds`; false when it does not exist. */
+    public function expire(string $key, int $seconds): bool {
+        return Redis::number($this->run("EXPIRE", [$key, (string)$seconds])) == 1;
+    }
+
+    /** Seconds until `$key` expires: -1 without an expiry, -2 when it does not exist. */
+    public function ttl(string $key): int {
+        return Redis::number($this->run("TTL", [$key]));
+    }
+
+    public function hget(string $key, string $field): ?string {
+        return Redis::text($this->run("HGET", [$key, $field]));
+    }
+
+    /** Sets a field of the hash at `$key`; true when the field is new. */
+    public function hset(string $key, string $field, string $value): bool {
+        return Redis::number($this->run("HSET", [$key, $field, $value])) == 1;
+    }
+
+    /** Deletes a field of the hash at `$key`; true when it existed. */
+    public function hdel(string $key, string $field): bool {
+        return Redis::number($this->run("HDEL", [$key, $field])) == 1;
+    }
+
+    /** All fields of the hash at `$key`. */
+    public function hgetAll(string $key): map<string, string> {
+        map<string, string> $out = [];
+        $v = $this->run("HGETALL", [$key]);
+        if ($v is map) {
+            foreach ($v as $field => $value) {
+                $text = Redis::text($value);
+                if ($field is string && $text is string) {
+                    $out[$field] = $text;
+                }
+            }
+        }
+        return $out;
+    }
+
+    /** Appends to the list at `$key` and returns its new length. */
+    public function rpush(string $key, string $value): int {
+        return Redis::number($this->run("RPUSH", [$key, $value]));
+    }
+
+    /** Removes and returns the first element of the list at `$key`, or null when it is empty. */
+    public function lpop(string $key): ?string {
+        return Redis::text($this->run("LPOP", [$key]));
+    }
+
+    /** Elements `$start` to `$stop` (inclusive; negative counts from the end) of the list at `$key`. */
+    public function lrange(string $key, int $start, int $stop): list<string> {
+        return Redis::texts($this->run("LRANGE", [$key, (string)$start, (string)$stop]));
     }
 
     public function close(): void {

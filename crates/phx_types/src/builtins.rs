@@ -210,6 +210,9 @@ pub static BUILTINS: &[BuiltinSig] = &[
     internal("__db_last_id", "fn(int): int"),
     internal("__db_raw", "fn(int, string): void"),
     internal("__db_close", "fn(int): void"),
+    internal("__db_connect", "fn(string): int"),
+    internal("__redis_connect", "fn(string): int"),
+    internal("__redis", "fn(int, string, list<string>): any"),
 ];
 
 /// Hints for PHP functions that do not exist in PHX.

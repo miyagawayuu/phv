@@ -1,0 +1,21 @@
+inserted: 1 id: 1
+id = 1
+name = "widget's \"best\" ?"
+qty = 3
+price = "19.99"
+ratio = 0.25
+big = 9000000000
+active = 1
+meta = "{\"a\": [1, 2]}"
+day = "2026-11-02"
+at = "2026-11-02 10:30:00.123456"
+t = "-26:15:00"
+raw = null
+active: yes
+qty: 3
+rolled back: stop
+rows: 1
+error: Column 'name' cannot be null
+multi-statement refused
+table still there: 1
+shared: 1

@@ -1,0 +1,19 @@
+missing: null
+get: hello ?
+exists: yes
+ttl ok: yes
+ttl after plain set: -1
+expire: yes
+delete: yes no
+incr: 1 11 8
+error: ResponseError: value is not an integer or out of range
+hset: new old
+hget: Bo null
+hgetAll: {"name":"Bo","city":"Kyoto"}
+hdel: yes
+rpush: 3
+lrange: ["a","b","c"]
+lpop: a
+lrange: ["b","c"]
+error: database "main" is a Redis server; use Redis::connect()
+error: the database connection is closed

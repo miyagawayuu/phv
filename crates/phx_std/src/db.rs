@@ -12,7 +12,47 @@ use std::time::Duration;
 
 type R = Result<Value, VmError>;
 
-fn parts(v: &Value) -> (&str, &[Value]) {
+/// Marks a bound parameter in `Sql` text (see the type checker).
+pub(crate) const PARAM: char = '\u{E000}';
+/// Start and end of an identifier from `sql_ident()`.
+pub(crate) const IDENT_START: char = '\u{E001}';
+pub(crate) const IDENT_END: char = '\u{E002}';
+
+/// How a database writes placeholders and quoted identifiers.
+#[derive(Clone, Copy)]
+pub(crate) enum Dialect {
+    /// `?` and `"name"`.
+    Sqlite,
+    /// `$1, $2, ...` and `"name"`.
+    Postgres,
+    /// `?` and `` `name` ``.
+    MySql,
+}
+
+/// The SQL text a database receives for an `Sql` value.
+pub(crate) fn render_sql(text: &str, dialect: Dialect) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut n = 0;
+    for c in text.chars() {
+        match c {
+            PARAM => {
+                n += 1;
+                match dialect {
+                    Dialect::Postgres => {
+                        out.push('$');
+                        out.push_str(&n.to_string());
+                    }
+                    _ => out.push('?'),
+                }
+            }
+            IDENT_START | IDENT_END => out.push(if matches!(dialect, Dialect::MySql) { '`' } else { '"' }),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+pub(crate) fn parts(v: &Value) -> (&str, &[Value]) {
     let Value::List(l) = v else { panic!("Sql value expected") };
     let Value::List(params) = &l[1] else { panic!("Sql parameters expected") };
     (s(&l[0]), params)
@@ -33,6 +73,11 @@ fn to_sql(v: &Value) -> SqlValue {
 struct Db {
     conn: Connection,
     _dir: Option<crate::safefs::DirGuard>,
+}
+
+/// Whether handle `h` is an SQLite database (otherwise a server connection, see `netdb`).
+fn is_sqlite(vm: &Vm, h: &Value) -> bool {
+    vm.resources.get(int(h) as usize).and_then(|r| r.as_ref()).is_some_and(|b| b.is::<Db>())
 }
 
 fn conn<'v>(vm: &'v Vm, h: &Value) -> Result<&'v Connection, VmError> {
@@ -63,9 +108,13 @@ impl rusqlite::ToSql for Param<'_> {
 }
 
 fn query(vm: &mut Vm, a: &[Value]) -> R {
+    if !is_sqlite(vm, &a[0]) {
+        return crate::netdb::query(vm, a);
+    }
     let (text, params) = parts(&a[1]);
+    let text = render_sql(text, Dialect::Sqlite);
     let c = conn(vm, &a[0])?;
-    let mut stmt = c.prepare(text).map_err(|e| db_error(vm, e))?;
+    let mut stmt = c.prepare(&text).map_err(|e| db_error(vm, e))?;
     let names: Vec<Rc<String>> = stmt.column_names().iter().map(|n| Rc::new(n.to_string())).collect();
     let bound: Vec<Param> = params.iter().map(Param).collect();
     let mut rows = stmt.query(rusqlite::params_from_iter(bound.iter())).map_err(|e| db_error(vm, e))?;
@@ -91,10 +140,14 @@ fn query(vm: &mut Vm, a: &[Value]) -> R {
 }
 
 fn execute(vm: &mut Vm, a: &[Value]) -> R {
+    if !is_sqlite(vm, &a[0]) {
+        return crate::netdb::execute(vm, a);
+    }
     let (text, params) = parts(&a[1]);
+    let text = render_sql(text, Dialect::Sqlite);
     let c = conn(vm, &a[0])?;
     let bound: Vec<Param> = params.iter().map(Param).collect();
-    let n = c.execute(text, rusqlite::params_from_iter(bound.iter())).map_err(|e| db_error(vm, e))?;
+    let n = c.execute(&text, rusqlite::params_from_iter(bound.iter())).map_err(|e| db_error(vm, e))?;
     Ok(Value::Int(n as i64))
 }
 
@@ -188,12 +241,23 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         "__db_open" => open,
         "__db_query" => query,
         "__db_execute" => execute,
-        "__db_last_id" => |vm, a| Ok(Value::Int(conn(vm, &a[0])?.last_insert_rowid())),
+        "__db_connect" => crate::netdb::connect,
+        "__redis_connect" => crate::netdb::connect_redis,
+        "__redis" => crate::netdb::redis_command,
+        "__db_last_id" => |vm, a| {
+            if !is_sqlite(vm, &a[0]) {
+                return crate::netdb::last_insert_id(vm, a);
+            }
+            Ok(Value::Int(conn(vm, &a[0])?.last_insert_rowid()))
+        },
         "__db_raw" => |vm, a| {
             // Only BEGIN / COMMIT / ROLLBACK, used by Database::transaction().
             let cmd = s(&a[1]);
             if !matches!(cmd, "BEGIN" | "COMMIT" | "ROLLBACK") {
                 return Err(VmError::Fatal(format!("__db_raw: unexpected statement {cmd}")));
+            }
+            if !is_sqlite(vm, &a[0]) {
+                return crate::netdb::raw(vm, a);
             }
             conn(vm, &a[0])?.execute_batch(cmd).map_err(|e| db_error(vm, e))?;
             Ok(Value::Null)
@@ -215,7 +279,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             if !is_identifier(t) {
                 return Err(vm.throw("ValueError", format!("\"{t}\" is not a valid SQL identifier")));
             }
-            Ok(Value::list(vec![Value::str(format!("\"{t}\"")), Value::list(Vec::new())]))
+            Ok(Value::list(vec![Value::str(format!("{IDENT_START}{t}{IDENT_END}")), Value::list(Vec::new())]))
         },
         _ => return None,
     };

@@ -1,0 +1,5 @@
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->query(sql"SELECT pg_sleep(10)");
+echo "not reached\n";
