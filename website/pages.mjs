@@ -9,6 +9,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const sample = (name) => fs.readFileSync(path.join(here, "samples", name), "utf8").trimEnd();
 
 const releases = "https://github.com/miyagawayuu/phx/releases";
+const marketplace = "https://marketplace.visualstudio.com/items?itemName=phx-lang.phx-language";
 
 // What `phx check samples/profile.phx` prints (CI checks that it still does).
 const errorOutput = sample("profile.err");
@@ -37,7 +38,7 @@ const text = {
     archive: "Archive",
     verify: "Check the archive against <code>SHA256SUMS</code> from the same release, then run it:",
     source: "Or build from source with a recent stable Rust and a C compiler: <code>cargo build --release</code>.",
-    editor: (version) => `For VS Code, download <a href="${releases}/download/v${version}/phx-${version}.vsix"><code>phx-${version}.vsix</code></a> from the same release and install it (<code>code --install-extension phx-${version}.vsix</code>) for highlighting and live diagnostics.`,
+    editor: (version) => `For VS Code, install <a href="${marketplace}">PHX Language</a> from the Marketplace (<code>code --install-extension phx-lang.phx-language</code>) for highlighting and live diagnostics. It is also attached to each release as <a href="${releases}/download/v${version}/phx-${version}.vsix"><code>phx-${version}.vsix</code></a>.`,
     securityTitle: "Security",
     securityLead: `PHX has been through three security audits, each followed by fixes and regression tests. Read the <a href="docs/security/">audit report</a>. To report a vulnerability, email <a href="mailto:security@phx-lang.org">security@phx-lang.org</a>.`,
     getStarted: "Get started",
@@ -65,7 +66,7 @@ const text = {
     archive: "アーカイブ",
     verify: "同じリリースの <code>SHA256SUMS</code> でアーカイブを確かめてから実行します:",
     source: "ソースからビルドするなら、最近の安定版 Rust と C コンパイラで <code>cargo build --release</code>。",
-    editor: (version) => `VS Code では、同じリリースの <a href="${releases}/download/v${version}/phx-${version}.vsix"><code>phx-${version}.vsix</code></a> を入れると(<code>code --install-extension phx-${version}.vsix</code>)、色分けと入力中のエラー表示が使えます。`,
+    editor: (version) => `VS Code では、Marketplace から <a href="${marketplace}">PHX Language</a> を入れると(<code>code --install-extension phx-lang.phx-language</code>)、色分けと入力中のエラー表示が使えます。各リリースにも <a href="${releases}/download/v${version}/phx-${version}.vsix"><code>phx-${version}.vsix</code></a> として付いています。`,
     securityTitle: "セキュリティ",
     securityLead: `PHX は 3 回のセキュリティ監査を受け、そのたびに修正と回帰テストを加えています。<a href="docs/security/">監査報告</a>をご覧ください。脆弱性の報告は <a href="mailto:security@phx-lang.org">security@phx-lang.org</a> へ。`,
     getStarted: "はじめる",
