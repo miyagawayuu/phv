@@ -10,7 +10,9 @@ use std::fmt::Write;
 use std::rc::Rc;
 
 mod db;
+mod httpclient;
 mod netdb;
+mod netio;
 pub mod ratelimit;
 pub mod safefs;
 mod sys;
@@ -18,6 +20,7 @@ mod twofactor;
 mod web;
 mod websocket;
 
+pub use httpclient::{check_header_name, check_http_url};
 pub use sys::{constant_time_eq, sha256_hex};
 pub use web::{csrf_expected, json_decode, random_hex};
 
@@ -482,6 +485,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         .or_else(|| db::lookup(name))
         .or_else(|| twofactor::lookup(name))
         .or_else(|| websocket::lookup(name))
+        .or_else(|| httpclient::lookup(name))
 }
 
 fn core_lookup(name: &str) -> Option<BuiltinFn> {

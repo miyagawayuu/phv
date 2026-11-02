@@ -132,7 +132,7 @@ error: a URL attribute cannot start with an unchecked value
 | `phv_compiler` | HIR → register bytecode |
 | `phv_vm` | Values, bytecode format, interpreter, runtime limits |
 | `phv_jit` | Native code for functions that only use int/bool values (Cranelift) |
-| `phv_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, PostgreSQL, MySQL, Redis, WebSocket, sessions) and the prelude, `std.http`, `std.db` and `std.net` written in PHV |
+| `phv_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, PostgreSQL, MySQL, Redis, WebSocket, HTTP client, sessions) and the prelude, `std.http`, `std.db` and `std.net` written in PHV |
 | `phv_driver` | Loading modules and templates, `phv.toml`, bytecode cache, running programs |
 | `phv_server` | Web server (hyper + tokio), routing, sessions, CSRF, uploads |
 | `phv_cli` | The `phv` command (run / check / serve / test / fmt / lsp / install / migrate) |

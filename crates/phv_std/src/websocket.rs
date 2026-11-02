@@ -6,12 +6,10 @@
 //! calls `close()` or ends, so nothing received for one request can reach the
 //! next. Only text messages are exchanged; pings are answered while reading.
 
-use crate::netdb::{is_local_host, tls_init};
+use crate::netio::{check_plain, dial, until, Stream};
 use crate::{float, int, s};
 use phv_vm::{Value, Vm, VmError};
-use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Arc, LazyLock};
+use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::HandshakeError;
@@ -29,45 +27,6 @@ const MAX_MESSAGE: usize = 16 << 20;
 /// Connections one script may hold open at once.
 const MAX_OPEN: usize = 16;
 
-enum Stream {
-    Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
-}
-
-impl Stream {
-    fn tcp(&self) -> &TcpStream {
-        match self {
-            Stream::Plain(t) => t,
-            Stream::Tls(t) => &t.sock,
-        }
-    }
-}
-
-impl Read for Stream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Stream::Plain(t) => t.read(buf),
-            Stream::Tls(t) => t.read(buf),
-        }
-    }
-}
-
-impl Write for Stream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Stream::Plain(t) => t.write(buf),
-            Stream::Tls(t) => t.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Stream::Plain(t) => t.flush(),
-            Stream::Tls(t) => t.flush(),
-        }
-    }
-}
-
 /// A script's connection, kept in `vm.resources`.
 struct Conn {
     ws: WebSocket<Stream>,
@@ -81,17 +40,6 @@ impl Drop for Conn {
         let _ = self.ws.flush();
     }
 }
-
-static TLS: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .expect("TLS protocol versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Arc::new(config)
-});
 
 fn closed(vm: &Vm) -> VmError {
     vm.throw("NetworkError", "the WebSocket connection is closed")
@@ -116,12 +64,6 @@ fn with_conn(vm: &mut Vm, h: &Value, f: impl FnOnce(&mut Vm, &mut Conn) -> Resul
     result
 }
 
-/// The script's deadline, or `cap` from now when it has none.
-fn until(vm: &Vm, cap: Duration) -> Instant {
-    let now = Instant::now();
-    vm.deadline().map_or(now + cap, |d| d.min(now + cap))
-}
-
 fn io_message(e: &tungstenite::Error) -> String {
     match e {
         tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
@@ -142,35 +84,8 @@ fn open(url: &str, tls_setting: Option<bool>, until: Instant) -> Result<WebSocke
     let tls = uri.scheme_str() == Some("wss");
     let host = uri.host().ok_or("the URL has no host")?.to_string();
     let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
-    if !tls && tls_setting.unwrap_or(!is_local_host(&host)) {
-        return Err("the server is not on this machine: use a wss:// URL (TLS), or set tls = false".into());
-    }
-    let left = || until.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    let addrs: Vec<_> = (bare, port).to_socket_addrs().map_err(|e| format!("cannot resolve {host}: {e}"))?.collect();
-    let mut last = format!("cannot resolve {host}");
-    let mut tcp = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, left()) {
-            Ok(t) => {
-                tcp = Some(t);
-                break;
-            }
-            Err(e) => last = e.to_string(),
-        }
-    }
-    let tcp = tcp.ok_or(last)?;
-    let _ = tcp.set_nodelay(true);
-    tcp.set_read_timeout(Some(left())).map_err(|e| e.to_string())?;
-    tcp.set_write_timeout(Some(left())).map_err(|e| e.to_string())?;
-    let stream = if tls {
-        tls_init();
-        let name = rustls::pki_types::ServerName::try_from(bare.to_string()).map_err(|_| "invalid host name")?;
-        let session = rustls::ClientConnection::new(TLS.clone(), name).map_err(|e| e.to_string())?;
-        Stream::Tls(Box::new(rustls::StreamOwned::new(session, tcp)))
-    } else {
-        Stream::Plain(tcp)
-    };
+    check_plain(&host, tls, tls_setting, "wss://")?;
+    let stream = dial(&host, port, tls, until)?;
     let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
     match tungstenite::client::client_with_config(request, stream, Some(config)) {
         Ok((ws, _)) => Ok(ws),

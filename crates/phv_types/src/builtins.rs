@@ -217,6 +217,10 @@ pub static BUILTINS: &[BuiltinSig] = &[
     internal("__ws_send", "fn(int, string): void"),
     internal("__ws_receive", "fn(int, float): ?string"),
     internal("__ws_close", "fn(int): void"),
+    internal(
+        "__http_request",
+        "fn(string, string, string, map<string, string>, map<string, string>, string): map<string, any>",
+    ),
 ];
 
 /// Hints for PHP functions that do not exist in PHV.

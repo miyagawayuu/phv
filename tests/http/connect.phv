@@ -1,0 +1,3 @@
+import std.net.HttpClient;
+
+HttpClient::connect("api")->get("/echo");

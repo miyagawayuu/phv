@@ -9,6 +9,8 @@ documentation.workspace = true
 [dev-dependencies]
 phv_syntax.workspace = true
 tungstenite.workspace = true
+httparse.workspace = true
+serde_json.workspace = true
 
 [dependencies]
 phv_syntax.workspace = true

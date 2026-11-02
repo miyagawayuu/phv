@@ -142,6 +142,8 @@ pub struct Host {
     pub databases: std::collections::BTreeMap<String, DatabaseSpec>,
     /// WebSocket servers scripts may connect to, by name (`[websockets]` in phv.toml).
     pub websockets: std::collections::BTreeMap<String, WebSocketSpec>,
+    /// HTTP services scripts may send requests to, by name (`[http]` in phv.toml).
+    pub http: std::collections::BTreeMap<String, HttpSpec>,
 }
 
 /// A database server named in phv.toml. Scripts only ever see the name: the
@@ -191,6 +193,39 @@ impl std::fmt::Debug for WebSocketSpec {
             .field("url", &self.url.as_ref().map(|_| "<redacted>"))
             .field("url_env", &self.url_env)
             .field("tls", &self.tls)
+            .finish()
+    }
+}
+
+/// An HTTP service named in phv.toml. Scripts give only the name and a path;
+/// the base URL and the headers from environment variables (API keys) stay
+/// in the configuration and are never shown.
+#[derive(Clone)]
+pub struct HttpSpec {
+    /// `http://` or `https://` base URL, or None when the environment variable
+    /// named by `url_env` is not set.
+    pub url: Option<String>,
+    /// The environment variable the URL comes from, for error messages.
+    pub url_env: Option<String>,
+    /// Some(false) allows `http://` to remote hosts; None means TLS for every
+    /// host except localhost.
+    pub tls: Option<bool>,
+    /// Headers sent with every request: name, and the value (None when it
+    /// comes from an environment variable that is not set).
+    pub headers: Vec<(String, Option<String>)>,
+    /// For each header whose value comes from an environment variable: the
+    /// header name and the variable (scripts cannot replace these headers).
+    pub headers_env: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for HttpSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.headers.iter().map(|(n, _)| n.as_str()).collect();
+        f.debug_struct("HttpSpec")
+            .field("url", &self.url.as_ref().map(|_| "<redacted>"))
+            .field("url_env", &self.url_env)
+            .field("tls", &self.tls)
+            .field("headers", &names)
             .finish()
     }
 }

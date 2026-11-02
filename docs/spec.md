@@ -744,6 +744,59 @@ $ws->close();
 - Connection failures, a server that closes the connection, and network errors raise `NetworkError`. The URL is
   never shown in messages.
 
+### HTTP client (std.net)
+
+HTTP services are named in `phv.toml` too. Scripts give the name and a path; the base URL and the API keys stay in
+the configuration, so they never appear in the code, and scripts cannot send requests to any other host.
+
+```toml
+[http.weather]
+url = "https://api.example.com/v1"                 # or url_env = "WEATHER_URL"
+headers = { "User-Agent" = "my-site" }             # sent with every request
+headers_env = { Authorization = "WEATHER_AUTH" }   # values from environment variables (API keys)
+# tls = false                                      # allow http:// to a remote host (not recommended)
+```
+
+```phv
+import std.net.HttpClient;
+
+$api = HttpClient::connect("weather");
+$res = $api->get("/forecast", ["city" => "Tokyo"]);   // GET https://api.example.com/v1/forecast?city=Tokyo
+if ($res->ok()) {
+    $data = $res->json();                              // any
+}
+$res = $api->postJson("/reports", ["city" => "Tokyo", "temp" => 21]);
+echo $res->status, " ", $res->header("content-type") ?? "", "\n", $res->body;
+```
+
+| Method | Sends |
+|---|---|
+| `get($path, $query = [], $headers = [])`, `delete(...)` | A request without a body; `$query` is added as `?k=v&...` |
+| `post($path, $body = "", $headers = [])`, `put(...)`, `patch(...)` | `$body` as it is |
+| `postJson($path, $data, $headers = [])`, `putJson(...)` | `json_encode($data)` with `Content-Type: application/json` |
+| `postForm($path, $fields, $headers = [])` | A form (`application/x-www-form-urlencoded`) |
+| `request($method, $path, $body = "", $headers = [], $query = [])` | GET, HEAD, POST, PUT, PATCH, DELETE or OPTIONS |
+
+The result is an `HttpResponse`: `status` (int), `headers` (`map<string, string>`, lowercase names; repeated headers
+joined with `, `), `body` (string), `ok()` (2xx), `header($name)` (`?string`, any case) and `json()` (`ValueError`
+when the body is not JSON).
+
+- The path must start with `/` and is added to the base URL's path. Paths that could leave it are refused with
+  `ValueError` before anything is sent: `//host`, `.` and `..` segments (also percent-encoded), encoded slashes, and
+  `?` or `#` (give the query as `$query`).
+- Header names and values are checked (no line breaks). `Host`, `Content-Length`, `Transfer-Encoding`,
+  `Connection` and the other headers that frame the message are set by PHV. Scripts can replace the `headers` of
+  `phv.toml`, but not those of `headers_env`.
+- Errors come back as responses: a 4xx or 5xx status does not throw. **Redirects are not followed**: a 3xx response
+  is returned with its `Location` header.
+- **TLS (`https://`) is required for every host except `localhost`**, with the server certificate checked against the
+  public CAs. `tls = false` allows `http://` to such a host.
+- Each request uses its own connection and waits at most until the script's time limit (30 seconds when it has none).
+  Request and response bodies are at most 16 MB. The body is read as UTF-8 text.
+- Connection failures and network errors raise `NetworkError`, naming the service but never its URL or headers. An
+  unset `url_env` or `headers_env` variable is reported when a request is sent, so `phv check` works without the
+  production keys.
+
 ### Dates, cryptography, and encoding
 
 | Function | Description |
@@ -992,7 +1045,7 @@ It then runs the type checker and shows the places that need manual work, such a
 ## 18. Roadmap
 
 - Generic classes, annotations (attributes)
-- Asynchronous I/O, HTTP client
+- Asynchronous I/O
 - Wider JIT coverage (functions that handle floats and strings), AOT compilation
 - Transitive dependency resolution, a package registry
 - Line wrapping in `phv fmt`

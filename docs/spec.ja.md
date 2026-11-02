@@ -739,6 +739,58 @@ $ws->close();
   `ws://` を許す。
 - 接続の失敗、サーバーによる切断、ネットワークのエラーは `NetworkError`。メッセージに URL は出ない。
 
+### HTTP クライアント (std.net)
+
+HTTP のサービスも `phv.toml` で名前を付けます。スクリプトが書くのは名前とパスだけで、ベース URL と API キーは設定に残るので
+コードに現れることはなく、スクリプトがそれ以外のホストにリクエストを送ることもできません。
+
+```toml
+[http.weather]
+url = "https://api.example.com/v1"                 # または url_env = "WEATHER_URL"
+headers = { "User-Agent" = "my-site" }             # すべてのリクエストに付けるヘッダー
+headers_env = { Authorization = "WEATHER_AUTH" }   # 値を環境変数から取るヘッダー(API キー)
+# tls = false                                      # リモートのホストへの http:// を許す(非推奨)
+```
+
+```phv
+import std.net.HttpClient;
+
+$api = HttpClient::connect("weather");
+$res = $api->get("/forecast", ["city" => "Tokyo"]);   // GET https://api.example.com/v1/forecast?city=Tokyo
+if ($res->ok()) {
+    $data = $res->json();                              // any
+}
+$res = $api->postJson("/reports", ["city" => "Tokyo", "temp" => 21]);
+echo $res->status, " ", $res->header("content-type") ?? "", "\n", $res->body;
+```
+
+| メソッド | 送るもの |
+|---|---|
+| `get($path, $query = [], $headers = [])`、`delete(...)` | 本文のないリクエスト。`$query` は `?k=v&...` として付く |
+| `post($path, $body = "", $headers = [])`、`put(...)`、`patch(...)` | `$body` をそのまま |
+| `postJson($path, $data, $headers = [])`、`putJson(...)` | `json_encode($data)` を `Content-Type: application/json` で |
+| `postForm($path, $fields, $headers = [])` | フォーム(`application/x-www-form-urlencoded`) |
+| `request($method, $path, $body = "", $headers = [], $query = [])` | GET、HEAD、POST、PUT、PATCH、DELETE、OPTIONS |
+
+結果は `HttpResponse` で、`status`(int)、`headers`(`map<string, string>`。名前は小文字、同じヘッダーが複数あれば `, ` で
+つなぐ)、`body`(string)、`ok()`(2xx)、`header($name)`(`?string`、大文字小文字は区別しない)、`json()`(本文が JSON で
+なければ `ValueError`)を持ちます。
+
+- パスは `/` で始め、ベース URL のパスの後ろに付く。そこから出られるパスは、何も送る前に `ValueError` にする:`//host`、
+  `.` と `..` のセグメント(パーセントエンコードしたものも)、エンコードしたスラッシュ、`?` と `#`(クエリは `$query` で渡す)。
+- ヘッダーの名前と値を検査する(改行は不可)。`Host`、`Content-Length`、`Transfer-Encoding`、`Connection` など
+  メッセージの区切りに関わるヘッダーは PHV が付ける。`phv.toml` の `headers` はスクリプトで置き換えられるが、`headers_env` の
+  ものは置き換えられない。
+- エラーもレスポンスとして返る(4xx や 5xx で例外にはならない)。**リダイレクトはたどらない**:3xx はその `Location`
+  ヘッダーとともにそのまま返す。
+- **`localhost` 以外のホストには TLS(`https://`)が必要**で、サーバー証明書は公開 CA で検証する。`tls = false` でそのホストへの
+  `http://` を許す。
+- リクエストごとに新しい接続を使い、待つのはスクリプトの時間制限まで(制限がなければ 30 秒)。リクエストとレスポンスの本文は
+  最大 16 MB。本文は UTF-8 のテキストとして読む。
+- 接続の失敗やネットワークのエラーは `NetworkError`。メッセージにはサービスの名前が出るが、URL やヘッダーは出ない。
+  `url_env` や `headers_env` の環境変数が設定されていないことはリクエストを送るときに報告するので、`phv check` は本番の
+  キーなしで使える。
+
 ### 日付・暗号・エンコード
 
 | 関数 | 説明 |
@@ -987,7 +1039,7 @@ phv migrate legacy/page.php      # page.phv を書き出す
 ## 18. 今後の予定
 
 - ジェネリッククラス、アノテーション(属性)
-- 非同期 I/O、HTTP クライアント
+- 非同期 I/O
 - JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
 - 推移的な依存関係の解決、パッケージレジストリ
 - `phv fmt` の行の折り返し

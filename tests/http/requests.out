@@ -1,0 +1,33 @@
+200 ok application/json
+repeated header: a, b
+method: "GET"
+target: "/v1/echo?city=T%C5%8Dky%C5%8D%20%26%20%C5%8Csaka&n=3"
+headers: ["accept-encoding: identity","authorization: Bearer test-key","connection: close","host: HOST","user-agent: phv/VERSION","x-site: phv-test"]
+request: ["POST","/v1/echo","{\"name\":\"Ann\",\"tags\":[\"a\",\"b\"]}"]
+  headers: ["content-type: application/json","x-site: phv-test"]
+request: ["POST","/v1/echo","q=a+b&x=1%262"]
+  headers: ["content-type: application/x-www-form-urlencoded","x-site: phv-test"]
+request: ["PUT","/v1/echo/7","plain text"]
+  headers: ["content-type: text/plain","x-site: replaced"]
+request: ["PATCH","/v1/echo/7","{}"]
+  headers: ["content-type: application/merge-patch+json","x-site: phv-test"]
+request: ["DELETE","/v1/echo/7",""]
+  headers: ["x-site: phv-test"]
+request: ["OPTIONS","/v1/echo",""]
+  headers: ["x-site: phv-test"]
+HEAD: 200 body length 0
+chunked: chunks together
+missing: 404 not found
+redirect: 302 http://elsewhere.invalid/
+0: ValueError: the path must start with a single `/`
+1: ValueError: the path must start with a single `/`
+2: ValueError: the path cannot contain `.` or `..` segments or encoded slashes
+3: ValueError: the path cannot contain `.` or `..` segments or encoded slashes
+4: ValueError: put the query in the `query` argument, not in the path
+5: ValueError: the Host header is set by PHV
+6: ValueError: the value of the X-Bad header contains a line break
+7: ValueError: the authorization header comes from phv.toml and cannot be replaced
+8: ValueError: unsupported HTTP method "TRACE"
+NetworkError: no HTTP service named "other" in [http] of phv.toml
+NetworkError: HTTP service "broken": the environment variable UNSET_VAR (for the X-Unset header) is not set
+json(): ValueError

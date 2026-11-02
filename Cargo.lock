@@ -1536,6 +1536,7 @@ version = "0.3.0"
 dependencies = [
  "getrandom 0.3.4",
  "hmac 0.12.1",
+ "httparse",
  "phv_compiler",
  "phv_jit",
  "phv_std",
@@ -1544,6 +1545,7 @@ dependencies = [
  "phv_vm",
  "postcard",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "toml",
  "tungstenite",
@@ -1591,6 +1593,7 @@ dependencies = [
  "chrono",
  "getrandom 0.3.4",
  "hmac 0.12.1",
+ "httparse",
  "indexmap",
  "libc",
  "mysql",

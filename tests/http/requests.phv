@@ -1,0 +1,81 @@
+import std.net.{HttpClient, HttpResponse};
+
+function show(string $label, any $v): void {
+    echo $label, ": ", json_encode($v), "\n";
+}
+
+$api = HttpClient::connect("api");
+
+// GET with a query; the server echoes what it received.
+$res = $api->get("/echo", ["city" => "Tōkyō & Ōsaka", "n" => "3"]);
+echo $res->status, " ", $res->ok() ? "ok" : "not ok", " ", $res->header("Content-Type") ?? "-", "\n";
+echo "repeated header: ", $res->header("x-multi") ?? "-", "\n";
+$data = $res->json();
+if ($data is map) {
+    show("method", $data["method"] ?? null);
+    show("target", $data["target"] ?? null);
+    show("headers", $data["headers"] ?? null);
+}
+
+// Bodies: JSON, a form, raw text with a header, and other methods.
+foreach ([
+    $api->postJson("/echo", ["name" => "Ann", "tags" => ["a", "b"]]),
+    $api->postForm("/echo", ["q" => "a b", "x" => "1&2"]),
+    $api->put("/echo/7", "plain text", ["Content-Type" => "text/plain", "X-Site" => "replaced"]),
+    $api->patch("/echo/7", "{}", ["content-type" => "application/merge-patch+json"]),
+    $api->delete("/echo/7"),
+    $api->request("OPTIONS", "/echo"),
+] as $r) {
+    $d = $r->json();
+    if ($d is map) {
+        show("request", [$d["method"] ?? "", $d["target"] ?? "", $d["body"] ?? ""]);
+        $hs = $d["headers"] ?? null;
+        if ($hs is list) {
+            show("  headers", $hs->filter(fn($h) => $h is string && ($h->startsWith("content-type") || $h->startsWith("x-site"))));
+        }
+    }
+}
+
+// HEAD has no body.
+$head = $api->request("HEAD", "/echo");
+echo "HEAD: ", $head->status, " body length ", $head->body->len(), "\n";
+
+// Chunked bodies, errors and redirects are returned as they are.
+echo "chunked: ", $api->get("/chunked")->body, "\n";
+$missing = $api->get("/missing");
+echo "missing: ", $missing->status, " ", $missing->body, "\n";
+$moved = $api->get("/redirect");
+echo "redirect: ", $moved->status, " ", $moved->header("location") ?? "-", "\n";
+
+// Mistakes are reported before anything is sent.
+foreach ([
+    fn() => $api->get("../admin"),
+    fn() => $api->get("//elsewhere.invalid/"),
+    fn() => $api->get("/a/../b"),
+    fn() => $api->get("/a/%2e%2e/b"),
+    fn() => $api->get("/a?x=1"),
+    fn() => $api->get("/echo", [], ["Host" => "elsewhere.invalid"]),
+    fn() => $api->get("/echo", [], ["X-Bad" => "a\r\nInjected: 1"]),
+    fn() => $api->get("/echo", [], ["authorization" => "Bearer stolen"]),
+    fn() => $api->request("TRACE", "/echo"),
+] as $i => $f) {
+    try {
+        $f();
+        echo $i, ": sent\n";
+    } catch (ValueError $e) {
+        echo $i, ": ValueError: ", $e->getMessage(), "\n";
+    }
+}
+
+foreach (["other", "broken"] as $name) {
+    try {
+        HttpClient::connect($name)->get("/echo");
+    } catch (NetworkError $e) {
+        echo "NetworkError: ", $e->getMessage(), "\n";
+    }
+}
+try {
+    $api->get("/missing")->json();
+} catch (ValueError $e) {
+    echo "json(): ValueError\n";
+}

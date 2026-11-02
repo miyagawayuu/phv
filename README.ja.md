@@ -128,7 +128,7 @@ error: a URL attribute cannot start with an unchecked value
 | `phv_compiler` | HIR → レジスタ型バイトコード |
 | `phv_vm` | 値、バイトコード形式、インタプリタ、実行時の上限 |
 | `phv_jit` | int/bool だけを扱う関数を Cranelift でネイティブコードにする |
-| `phv_std` | 組み込み関数(文字列・JSON・日付・暗号・ファイル・SQLite・PostgreSQL・MySQL・Redis・WebSocket・セッション)と、PHV で書かれた prelude・`std.http`・`std.db`・`std.net` |
+| `phv_std` | 組み込み関数(文字列・JSON・日付・暗号・ファイル・SQLite・PostgreSQL・MySQL・Redis・WebSocket・HTTP クライアント・セッション)と、PHV で書かれた prelude・`std.http`・`std.db`・`std.net` |
 | `phv_driver` | モジュールとテンプレートの読み込み、`phv.toml`、バイトコードキャッシュ、実行 |
 | `phv_server` | Web サーバー(hyper + tokio)、ルーティング、セッション、CSRF、アップロード |
 | `phv_cli` | `phv` コマンド(run / check / serve / test / fmt / lsp / install / migrate) |

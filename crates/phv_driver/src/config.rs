@@ -24,9 +24,13 @@
 //!
 //! [websockets.game]
 //! url_env = "GAME_WS_URL"   # ws:// or wss://
+//!
+//! [http.weather]
+//! url = "https://api.example.com/v1"
+//! headers_env = { Authorization = "WEATHER_AUTH" }
 //! ```
 
-use phv_vm::{DatabaseSpec, Host, Permissions, WebSocketSpec};
+use phv_vm::{DatabaseSpec, Host, HttpSpec, Permissions, WebSocketSpec};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -47,6 +51,8 @@ struct File {
     databases: BTreeMap<String, DatabaseSection>,
     #[serde(default)]
     websockets: BTreeMap<String, WebSocketSection>,
+    #[serde(default)]
+    http: BTreeMap<String, HttpSection>,
 }
 
 /// `[databases.<name>]`: a server scripts reach with `Database::connect("<name>")`
@@ -100,7 +106,7 @@ fn valid_server_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// The URL of a `[databases]` or `[websockets]` entry: `url`, or the value of
+/// The URL of a `[databases]`, `[websockets]` or `[http]` entry: `url`, or the value of
 /// `url_env`. An unset variable is reported when a script connects, so
 /// `phv check` and the editor work without the production credentials.
 fn server_url(
@@ -128,6 +134,55 @@ fn websocket_spec(name: &str, w: WebSocketSection) -> Result<WebSocketSpec, Stri
         }
     }
     Ok(WebSocketSpec { url, url_env: w.url_env, tls: w.tls })
+}
+
+/// `[http.<name>]`: a service scripts reach with `HttpClient::connect("<name>")`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpSection {
+    url: Option<String>,
+    url_env: Option<String>,
+    /// `false` allows `http://` to a remote host; by default only localhost may skip TLS.
+    tls: Option<bool>,
+    /// Headers sent with every request.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    /// Headers whose values come from environment variables (API keys).
+    #[serde(default)]
+    headers_env: BTreeMap<String, String>,
+}
+
+fn http_spec(name: &str, h: HttpSection) -> Result<HttpSpec, String> {
+    if !valid_server_name(name) {
+        return Err(format!("[http]: invalid name \"{name}\" (letters, digits, `_` and `-`)"));
+    }
+    let url = server_url("http", name, h.url, &h.url_env)?;
+    if let Some(u) = &url {
+        if let Err(e) = phv_std::check_http_url(u) {
+            let from = h.url_env.as_deref().map(|v| format!(" (from ${v})")).unwrap_or_default();
+            return Err(format!("[http.{name}]: the URL{from}: {e}"));
+        }
+    }
+    let mut headers = Vec::new();
+    for (header, value) in h.headers {
+        phv_std::check_header_name(&header).map_err(|e| format!("[http.{name}] headers: {e}"))?;
+        if value.contains(['\r', '\n', '\0']) {
+            return Err(format!("[http.{name}] headers: the value of {header} contains a line break"));
+        }
+        headers.push((header, Some(value)));
+    }
+    let mut headers_env = Vec::new();
+    for (header, var) in h.headers_env {
+        phv_std::check_header_name(&header).map_err(|e| format!("[http.{name}] headers_env: {e}"))?;
+        if headers.iter().any(|(n, _): &(String, Option<String>)| n.eq_ignore_ascii_case(&header)) {
+            return Err(format!("[http.{name}]: {header} is in both headers and headers_env"));
+        }
+        // Like `url_env`, an unset variable is reported when a request is sent.
+        let value = std::env::var(&var).ok().filter(|v| !v.is_empty() && !v.contains(['\r', '\n', '\0']));
+        headers.push((header.clone(), value));
+        headers_env.push((header, var));
+    }
+    Ok(HttpSpec { url, url_env: h.url_env, tls: h.tls, headers, headers_env })
 }
 
 #[derive(Deserialize, Default)]
@@ -443,9 +498,14 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
         let spec = websocket_spec(&name, w)?;
         websockets.insert(name, spec);
     }
+    let mut http = BTreeMap::new();
+    for (name, h) in file.http {
+        let spec = http_spec(&name, h)?;
+        http.insert(name, spec);
+    }
     Ok(Config {
         name: file.project.name,
-        host: Arc::new(Host { root: root.to_path_buf(), permissions, databases, websockets }),
+        host: Arc::new(Host { root: root.to_path_buf(), permissions, databases, websockets, http }),
         csrf: file.security.csrf,
         secure_cookies: file.security.secure_cookies,
         session_ttl: file.security.session_ttl,
@@ -527,6 +587,36 @@ pool_size = 2
 "
         )
         .is_err());
+    }
+
+    #[test]
+    fn http_services() {
+        std::env::set_var("PHV_TEST_HTTP_KEY", "Bearer secret-token");
+        let c = load(
+            "[http.api]
+url = \"https://api.example.com/v1\"
+headers = { \"User-Agent\" = \"site\" }
+headers_env = { Authorization = \"PHV_TEST_HTTP_KEY\", X-Missing = \"PHV_TEST_HTTP_UNSET\" }
+",
+        )
+        .unwrap();
+        let spec = &c.host.http["api"];
+        assert_eq!(spec.url.as_deref(), Some("https://api.example.com/v1"));
+        assert!(spec.headers.contains(&("Authorization".into(), Some("Bearer secret-token".into()))));
+        assert!(spec.headers.contains(&("X-Missing".into(), None)));
+        let shown = format!("{spec:?}");
+        assert!(!shown.contains("secret") && !shown.contains("example.com"), "{shown}");
+        for bad in [
+            "[http.api]\nurl = \"ftp://a/\"\n",
+            "[http.api]\nurl = \"https://user:pw@a/\"\n",
+            "[http.api]\nurl = \"https://a/\"\nheaders = { Host = \"b\" }\n",
+            "[http.api]\nurl = \"https://a/\"\nheaders = { \"Bad Name\" = \"b\" }\n",
+            "[http.api]\nurl = \"https://a/\"\nheaders = { X = \"1\" }\nheaders_env = { x = \"V\" }\n",
+            "[http.api]\nurl = \"https://a/\"\ntimeout = 3\n",
+            "[http.\"a b\"]\nurl = \"https://a/\"\n",
+        ] {
+            assert!(load(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
