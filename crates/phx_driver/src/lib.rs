@@ -142,20 +142,36 @@ impl CompileError {
 /// The project root: the nearest directory containing `phx.toml`, or the
 /// directory of the entry file.
 pub fn find_root(entry: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    find_root_in(&cwd, entry)
+}
+
+/// `find_root` with relative paths resolved against `cwd`.
+fn find_root_in(cwd: &Path, entry: &Path) -> PathBuf {
     let start = match entry.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     };
     let mut dir = start.clone();
     loop {
-        if dir.join("phx.toml").is_file() {
+        if cwd.join(&dir).join("phx.toml").is_file() {
             return dir;
         }
         match dir.parent() {
             Some(p) if !p.as_os_str().is_empty() => dir = p.to_path_buf(),
-            _ => return start,
+            _ => break,
         }
     }
+    // A relative path runs out before the current directory and the ones above
+    // it (`public/index.phx` stops at `public`), so go on along the absolute path.
+    if entry.is_relative() {
+        if let Ok(abs) = cwd.join(&start).canonicalize() {
+            if let Some(dir) = abs.ancestors().find(|d| d.join("phx.toml").is_file()) {
+                return dir.to_path_buf();
+            }
+        }
+    }
+    start
 }
 
 fn display_name(root: &Path, path: &Path) -> String {
@@ -533,4 +549,31 @@ pub fn run_func(c: &Compiled, func: u32, opts: RunOptions) -> RunOutcome {
     let output = vm.take_output();
     let http = std::mem::take(&mut vm.http);
     RunOutcome { output, error, http }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_root_from_relative_paths() {
+        let tmp = std::env::temp_dir().join(format!("phx-root-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("public/admin")).unwrap();
+        std::fs::write(tmp.join("phx.toml"), "").unwrap();
+        let site = tmp.canonicalize().unwrap();
+        let public = site.join("public");
+
+        // From the project root: the path as written reaches `.` only with `./`.
+        assert_eq!(find_root_in(&site, Path::new("./public/index.phx")), PathBuf::from("."));
+        assert_eq!(find_root_in(&site, Path::new("index.phx")), PathBuf::from("."));
+        assert_eq!(find_root_in(&site, Path::new("public/index.phx")), site);
+        // From a directory inside the project.
+        assert_eq!(find_root_in(&public, Path::new("index.phx")), site);
+        assert_eq!(find_root_in(&public, Path::new("admin/index.phx")), site);
+        assert_eq!(find_root_in(&public.join("admin"), Path::new("../index.phx")), site);
+        // Absolute paths do not depend on the current directory.
+        assert_eq!(find_root_in(Path::new("/"), &public.join("index.phx")), public.parent().unwrap());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
