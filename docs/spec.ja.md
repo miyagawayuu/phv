@@ -515,7 +515,9 @@ $req = request();
 $req->method;              // "GET"
 $req->path;                // "/post"
 $req->query("id");         // ?string
-$req->form("name");        // ?string (urlencoded / multipart)
+$req->form("name");        // ?string (urlencoded / multipart。同じ名前が複数あれば最後の値)
+$req->formAll("ids");      // list<string>: 同じ名前で送られたすべての値（チェックボックスなど）
+$req->queryAll("tag");     // list<string>: ?tag=a&tag=b のすべての値
 $req->header("Accept");    // ?string(名前の大文字小文字は区別しない)
 $req->cookie("theme");     // ?string
 $req->file("avatar");      // ?UploadedFile

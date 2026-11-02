@@ -48,6 +48,23 @@ export class Request {
         return $this->formParams[$name] ?? null;
     }
 
+    /**
+     * Every value of a query parameter that appears more than once
+     * (`?tag=a&tag=b`), in order. query() returns only one of them.
+     */
+    public function queryAll(string $name): list<string> {
+        return __req_query_all($name);
+    }
+
+    /**
+     * Every value of a form field sent more than once, such as checkboxes that
+     * share a name (`<input type="checkbox" name="ids" value="3">`), in order.
+     * form() returns only one of them.
+     */
+    public function formAll(string $name): list<string> {
+        return __req_form_all($name);
+    }
+
     /** A request header (case-insensitive), or null. */
     public function header(string $name): ?string {
         return $this->headers[$name->lower()] ?? null;

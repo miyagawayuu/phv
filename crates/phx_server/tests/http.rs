@@ -265,3 +265,32 @@ fn scripts_send_files() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn repeated_fields_are_all_read() {
+    let dir = std::env::temp_dir().join(format!("phx-http-multi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phx.toml", "[security]\ncsrf = false\n");
+    write(
+        &dir,
+        "public/index.phx",
+        "<?phx\nimport std.http.request;\n$r = request();\necho implode(\",\", $r->queryAll(\"tag\")), \"|\", implode(\",\", $r->formAll(\"ids\")), \"|\", $r->form(\"ids\") ?? \"-\", \"|\", count($r->formAll(\"none\"));\n",
+    );
+    let addr = start(&dir);
+    let r = post(addr, "/?tag=a&tag=b%20c&other=x", "", "ids=3&name=x&ids=1&ids=2");
+    assert_eq!(r.body, "a,b c|3,1,2|2|0");
+
+    let boundary = "XBOUNDARY";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"ids\"\r\n\r\n7\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"ids\"\r\n\r\n8\r\n--{boundary}--\r\n"
+    );
+    let r = request(
+        addr,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: test\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(r.body.starts_with("|7,8|"), "{}", r.body);
+    let _ = std::fs::remove_dir_all(&dir);
+}

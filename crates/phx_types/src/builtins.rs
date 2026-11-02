@@ -180,6 +180,8 @@ pub static BUILTINS: &[BuiltinSig] = &[
     internal("__is_http_url", "fn(string): bool"),
     internal("__req_query", "fn(): map<string, string>"),
     internal("__req_form", "fn(): map<string, string>"),
+    internal("__req_query_all", "fn(string): list<string>"),
+    internal("__req_form_all", "fn(string): list<string>"),
     internal("__req_headers", "fn(): map<string, string>"),
     internal("__req_body", "fn(): string"),
     internal("__resp_status", "fn(int): void"),

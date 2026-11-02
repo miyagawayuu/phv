@@ -84,6 +84,12 @@ fn string_map(pairs: &[(String, String)]) -> Value {
     Value::map(m)
 }
 
+/// Every value sent under `name`, in order (checkboxes and multiple selects
+/// send one pair per checked item).
+fn values_named(pairs: &[(String, String)], name: &str) -> Value {
+    Value::list(pairs.iter().filter(|(k, _)| k == name).map(|(_, v)| Value::str(v.as_str())).collect())
+}
+
 /// Character-based slice with PHP `substr` semantics for negative values.
 fn char_slice(text: &str, start: i64, len: Option<i64>) -> String {
     let chars: Vec<char> = text.chars().collect();
@@ -800,6 +806,8 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         "__req_path" => |vm, _| Ok(Value::str(vm.http.path.as_str())),
         "__req_query" => |vm, _| Ok(string_map(&vm.http.query)),
         "__req_form" => |vm, _| Ok(string_map(&vm.http.form)),
+        "__req_query_all" => |vm, a| Ok(values_named(&vm.http.query, s(&a[0]))),
+        "__req_form_all" => |vm, a| Ok(values_named(&vm.http.form, s(&a[0]))),
         "__req_headers" => |vm, _| Ok(string_map(&vm.http.headers)),
         "__req_body" => |vm, _| Ok(Value::str(vm.http.body.as_str())),
         "__resp_status" => |vm, a| {

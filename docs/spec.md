@@ -515,7 +515,9 @@ $req = request();
 $req->method;              // "GET"
 $req->path;                // "/post"
 $req->query("id");         // ?string
-$req->form("name");        // ?string (urlencoded / multipart)
+$req->form("name");        // ?string (urlencoded / multipart; the last one if repeated)
+$req->formAll("ids");      // list<string>: every value of a repeated field, such as checkboxes
+$req->queryAll("tag");     // list<string>: every value of ?tag=a&tag=b
 $req->header("Accept");    // ?string (header names are case-insensitive)
 $req->cookie("theme");     // ?string
 $req->file("avatar");      // ?UploadedFile
