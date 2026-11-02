@@ -2,7 +2,7 @@
   "name": "phv-language",
   "displayName": "PHV Language",
   "description": "PHV language support: syntax highlighting for .phv and .phv.html, and diagnostics and hover types from `phv lsp`.",
-  "version": "0.2.7",
+  "version": "0.3.0",
   "publisher": "phv-lang",
   "license": "MIT",
   "icon": "images/icon.png",

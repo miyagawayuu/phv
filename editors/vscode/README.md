@@ -19,7 +19,7 @@ code --install-extension phv-lang.phv-language
 Or download `phv-<version>.vsix` from the [releases](https://github.com/miyagawayuu/phv/releases) and install it:
 
 ```bash
-code --install-extension phv-0.2.7.vsix
+code --install-extension phv-0.3.0.vsix
 ```
 
 Or, in VS Code, run **Extensions: Install from VSIX...** from the Command Palette.
@@ -43,5 +43,5 @@ your `PATH` (or set `phv.path`). Highlighting works without it.
 npm install
 npm test          # checks the grammars
 npx vsce package  # writes phv-language-<version>.vsix
-code --install-extension phv-language-0.2.7.vsix
+code --install-extension phv-language-0.3.0.vsix
 ```
