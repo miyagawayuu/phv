@@ -859,7 +859,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phx_cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "percent-encoding",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "phx_compiler"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "phx_syntax",
  "phx_types",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "phx_driver"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "getrandom",
  "hmac",
@@ -903,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "phx_jit"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "phx_server"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "form_urlencoded",
@@ -935,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "phx_std"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "argon2",
  "base64",
@@ -954,18 +954,18 @@ dependencies = [
 
 [[package]]
 name = "phx_syntax"
-version = "0.2.1"
+version = "0.2.2"
 
 [[package]]
 name = "phx_types"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "phx_syntax",
 ]
 
 [[package]]
 name = "phx_vm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "indexmap",
  "serde",

@@ -8,6 +8,16 @@ Language support for [PHX](https://phx-lang.org):
   (`phx lsp`).
 - Comment toggling, bracket matching and auto-closing pairs.
 
+## Installing
+
+Download `phx-<version>.vsix` from the [releases](https://github.com/miyagawayuu/phx/releases) and install it:
+
+```bash
+code --install-extension phx-0.2.2.vsix
+```
+
+Or, in VS Code, run **Extensions: Install from VSIX...** from the Command Palette.
+
 ## Requirements
 
 The language server needs the `phx` executable. Download it from the
@@ -27,5 +37,5 @@ your `PATH` (or set `phx.path`). Highlighting works without it.
 npm install
 npm test          # checks the grammars
 npx vsce package  # writes phx-<version>.vsix
-code --install-extension phx-0.2.0.vsix
+code --install-extension phx-0.2.2.vsix
 ```

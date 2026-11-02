@@ -37,7 +37,7 @@ const text = {
     archive: "Archive",
     verify: "Check the archive against <code>SHA256SUMS</code> from the same release, then run it:",
     source: "Or build from source with a recent stable Rust and a C compiler: <code>cargo build --release</code>.",
-    editor: "For VS Code, install the extension from <code>editors/vscode</code> for highlighting and live diagnostics.",
+    editor: (version) => `For VS Code, download <a href="${releases}/download/v${version}/phx-${version}.vsix"><code>phx-${version}.vsix</code></a> from the same release and install it (<code>code --install-extension phx-${version}.vsix</code>) for highlighting and live diagnostics.`,
     securityTitle: "Security",
     securityLead: `PHX has been through three security audits, each followed by fixes and regression tests. Read the <a href="docs/security/">audit report</a>. To report a vulnerability, email <a href="mailto:security@phx-lang.org">security@phx-lang.org</a>.`,
     getStarted: "Get started",
@@ -65,7 +65,7 @@ const text = {
     archive: "アーカイブ",
     verify: "同じリリースの <code>SHA256SUMS</code> でアーカイブを確かめてから実行します:",
     source: "ソースからビルドするなら、最近の安定版 Rust と C コンパイラで <code>cargo build --release</code>。",
-    editor: "VS Code では <code>editors/vscode</code> の拡張を入れると、色分けと入力中のエラー表示が使えます。",
+    editor: (version) => `VS Code では、同じリリースの <a href="${releases}/download/v${version}/phx-${version}.vsix"><code>phx-${version}.vsix</code></a> を入れると(<code>code --install-extension phx-${version}.vsix</code>)、色分けと入力中のエラー表示が使えます。`,
     securityTitle: "セキュリティ",
     securityLead: `PHX は 3 回のセキュリティ監査を受け、そのたびに修正と回帰テストを加えています。<a href="docs/security/">監査報告</a>をご覧ください。脆弱性の報告は <a href="mailto:security@phx-lang.org">security@phx-lang.org</a> へ。`,
     getStarted: "はじめる",
@@ -121,7 +121,7 @@ ${rows}
   <p>${t.verify}</p>
   ${code(`sha256sum -c SHA256SUMS --ignore-missing\ntar -xzf phx-${version}-x86_64-unknown-linux-gnu.tar.gz\n./phx-${version}-x86_64-unknown-linux-gnu/phx --version\n./phx-${version}-x86_64-unknown-linux-gnu/phx serve mysite   # http://127.0.0.1:8080`, "bash")}
   <p>${t.source}</p>
-  <p>${t.editor}</p>
+  <p>${t.editor(version)}</p>
 </section>
 
 <section class="security">

@@ -53,7 +53,8 @@ echo greet($name);                                 // HTML-escaped automatically
     To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - **Speed**: a register-based bytecode VM specialized by type, a Cranelift JIT, and an on-disk bytecode cache.
 - **Tools**: test runner, formatter, Language Server, package manager, and a migration tool from PHP.
-  A VS Code extension (highlighting and the language server) is in [editors/vscode](editors/vscode).
+  A VS Code extension (highlighting and the language server) is in [editors/vscode](editors/vscode); each release
+  includes it as `phx-<version>.vsix`.
 
 The full language specification is in [docs/spec.md](docs/spec.md).
 
