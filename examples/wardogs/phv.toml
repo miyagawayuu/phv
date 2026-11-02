@@ -1,0 +1,19 @@
+# WARDOGS match status: phv run status.phv, or phv serve examples/wardogs for the web page.
+
+[project]
+name = "wardogs-status"
+
+[security]
+# Every page view sends two requests to the game server, whose listener allows 600 a minute per
+# address. This keeps one visitor from using that up.
+requests_per_minute = 60
+
+# The RCON listener of the WARDOGS server.
+# WARDOGS_RCON_URL:  http://203.0.113.10:7776 (the address and the Port of [/Script/WDRCON.WDRCONSettings])
+# WARDOGS_RCON_AUTH: Bearer <the Password of [/Script/WDRCON.WDRCONSettings]>
+[http.wardogs]
+url_env = "WARDOGS_RCON_URL"
+headers_env = { Authorization = "WARDOGS_RCON_AUTH" }
+# The listener only speaks plain HTTP. Put it behind a TLS proxy and remove this line when the
+# server is reached over the internet: otherwise the password crosses the network as it is.
+tls = false

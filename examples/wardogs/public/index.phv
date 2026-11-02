@@ -1,0 +1,13 @@
+// The match on the WARDOGS server, refreshed every few seconds.
+
+import std.net.HttpClient;
+import lib.wardogs.{fetch_snapshot, RconError, Snapshot};
+
+?Snapshot $snap = null;
+$error = "";
+try {
+    $snap = fetch_snapshot(HttpClient::connect("wardogs"));
+} catch (RconError | NetworkError $e) {
+    $error = $e->getMessage();
+}
+echo render("views/status.phv.html", snap: $snap, error: $error, refresh: 10);

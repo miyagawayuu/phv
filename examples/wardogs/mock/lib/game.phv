@@ -1,0 +1,77 @@
+// A made-up match that moves on with the clock: a new one every 30 minutes.
+
+import std.http.{request, response};
+
+const PASSWORD = "mock-password";
+const MATCH_SECONDS = 1800;
+
+function factions(): list<string> {
+    return ["Valkyra", "Lonestar", "Manticore"];
+}
+
+function names(): list<string> {
+    return ["Ash", "Birch", "Cedar", "Dune", "Ember", "Flint", "Gale", "Haze", "Iron", "Jade", "Kite",
+        "Lynx", "Moss", "Nova", "Onyx", "Pike", "Quill", "Rook", "Slate", "Thorn", "Umber", "Vale"];
+}
+
+/** Answers like the real listener when the password is missing or wrong. Returns false then. */
+export function authorized(): bool {
+    $auth = request()->header("Authorization") ?? "";
+    if (hash_equals("Bearer " . PASSWORD, $auth)) {
+        return true;
+    }
+    response()->status(401);
+    response()->json(["error" => ["code" => "unauthorized", "message" => "Missing or invalid bearer token."]]);
+    return false;
+}
+
+export function elapsed(): int {
+    return time() % MATCH_SECONDS;
+}
+
+export function scores(): list<int> {
+    $t = elapsed();
+    return [intdiv($t * 7, 180), intdiv($t * 5, 180), intdiv($t * 3, 180)];
+}
+
+export function status(): map<string, any> {
+    $scores = scores();
+    $factions = factions();
+    return [
+        "serverName" => "PHV Mock #1 | KOTH",
+        "map" => "Kavkazi",
+        "experiences" => ["Kavkazi_KOTH_01", "KOTH_InfantryOnly"],
+        "lighting" => "DayLateClear",
+        "alternator" => "ZoneAlternator.Bakurani.Default.Circle",
+        "scoreTick" => ["current" => 20, "min" => 18, "max" => 30],
+        "scoreCap" => 100,
+        "matchSeconds" => (float)elapsed() + 0.25,
+        "players" => ["current" => names()->len(), "max" => 98],
+        "factionScores" => [
+            ["name" => $factions[0], "colorHex" => "#3d7bd9", "score" => $scores[0]],
+            ["name" => $factions[1], "colorHex" => "#d9a13d", "score" => $scores[1]],
+            ["name" => $factions[2], "colorHex" => "#c4453b", "score" => $scores[2]],
+        ],
+        "rotation" => ["nowIndex" => 0, "nextIndex" => 1],
+    ];
+}
+
+export function players(): map<string, any> {
+    $t = elapsed();
+    $factions = factions();
+    $names = names();
+    list<map<string, any>> $list = [];
+    foreach ($names as $i => $name) {
+        $list[] = [
+            "name" => $name,
+            "steamId" => "7656119800000" . ((string)$i)->padStart(4, "0"),
+            // the last one has just joined and has not picked a side
+            "faction" => $i == $names->len() - 1 ? "" : $factions[$i % 3],
+            "kills" => intdiv($t * (($i * 7) % 11 + 1), 400),
+            "deaths" => intdiv($t * (($i * 5) % 7 + 2), 500),
+            "cash" => 2500 + intdiv($t * ($i + 3), 10) * 5,
+            "pingMs" => 18 + ($i * 13) % 90,
+        ];
+    }
+    return ["players" => $list, "count" => $list->len()];
+}

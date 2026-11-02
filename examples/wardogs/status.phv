@@ -1,0 +1,70 @@
+// Prints the state of the match on a WARDOGS server:  phv run examples/wardogs/status.phv
+//
+// Needs WARDOGS_RCON_URL (http://host:7776) and WARDOGS_RCON_AUTH ("Bearer <RCON password>").
+
+import std.net.HttpClient;
+import lib.wardogs.{fetch_snapshot, format_clock, Player, RconError, Snapshot};
+
+function row(string $name, string $k, string $d, string $kd, string $cash, string $ping): string {
+    return "  " . $name->padEnd(24, " ") . $k->padStart(5, " ") . $d->padStart(5, " ") . $kd->padStart(6, " ")
+        . $cash->padStart(9, " ") . $ping->padStart(6, " ") . "\n";
+}
+
+function players_table(string $title, list<Player> $players): string {
+    $out = "\n{$title} ({$players->len()})\n";
+    if ($players->isEmpty()) {
+        return $out;
+    }
+    $out .= row("Name", "K", "D", "K/D", "Cash", "Ping");
+    foreach ($players as $p) {
+        $name = $p->name->len() > 23 ? $p->name->slice(0, 22) . "…" : $p->name;
+        $out .= row($name, (string)$p->kills, (string)$p->deaths, number_format($p->ratio(), 2),
+            number_format((float)$p->cash), "{$p->pingMs}ms");
+    }
+    return $out;
+}
+
+function report(Snapshot $snap): string {
+    $st = $snap->status;
+    $out = "{$st->serverName}\n";
+    $out .= "  Map      {$st->mapName()} ({$st->map})" . ($st->lighting->isEmpty() ? "" : " · {$st->lighting}") . "\n";
+    if (!$st->experiences->isEmpty()) {
+        $out .= "  Mode     " . $st->experiences->join(", ") . "\n";
+    }
+    $out .= "  Players  {$st->playerCount} / {$st->maxPlayers}\n";
+    if ($st->matchSeconds != null) {
+        $out .= "  Time     " . format_clock($st->matchSeconds) . "\n";
+    }
+
+    // Bars are scaled to the score cap when the server reports one, else to the leader.
+    $top = $st->scoreCap ?? 0;
+    foreach ($st->factions as $f) {
+        $top = max($top, $f->score);
+    }
+    $out .= "\nScore" . ($st->scoreCap != null ? " (first to {$st->scoreCap})" : "") . "\n";
+    foreach ($st->factions as $f) {
+        $filled = $top > 0 ? intdiv($f->score * 30, $top) : 0;
+        $out .= "  " . $f->name->padEnd(12, " ") . ((string)$f->score)->padStart(5, " ") . "  "
+            . str_repeat("#", $filled) . str_repeat(".", 30 - $filled) . "\n";
+    }
+    $leader = $st->leader();
+    if ($leader != null) {
+        $out .= "  Leading: {$leader->name}\n";
+    }
+
+    foreach ($st->factions as $f) {
+        $out .= players_table($f->name, $snap->team($f->name));
+    }
+    $others = $snap->unassigned();
+    if (!$others->isEmpty()) {
+        $out .= players_table("No faction", $others);
+    }
+    $out .= "\nRead at " . date("Y-m-d H:i:s", $snap->takenAt) . "\n";
+    return $out;
+}
+
+try {
+    echo report(fetch_snapshot(HttpClient::connect("wardogs")));
+} catch (RconError | NetworkError $e) {
+    echo "Could not read the server: ", $e->getMessage(), "\n";
+}

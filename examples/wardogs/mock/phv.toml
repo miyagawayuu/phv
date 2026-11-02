@@ -1,0 +1,6 @@
+# A stand-in for the RCON listener of a WARDOGS server, for trying the tool without one:
+#   phv serve examples/wardogs/mock --port 7776
+# It answers GET /v1/status and GET /v1/players to "Authorization: Bearer mock-password".
+
+[project]
+name = "wardogs-mock"

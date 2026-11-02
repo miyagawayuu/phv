@@ -1,0 +1,282 @@
+// A client for the RCON API of WARDOGS dedicated servers (plain HTTP and JSON, port 7776 by default).
+// The server is `[http.wardogs]` in phv.toml: its URL and the `Authorization: Bearer <password>`
+// header come from environment variables, so neither appears in the code.
+//
+// Live builds leave out some fields (`scoreCap` and `matchSeconds` on CL-499480 and later), so
+// every field is read with a default instead of trusting the shape of the reply.
+
+import std.net.{HttpClient, HttpResponse};
+
+/** The RCON listener answered with an error, or with something that is not the expected JSON. */
+export class RconError extends RuntimeException {}
+
+export class FactionScore {
+    public function __construct(
+        public readonly string $name,
+        public readonly string $color,   // "#rrggbb", or "" when the server sent none
+        public readonly int $score,
+    ) {}
+}
+
+export class MatchStatus {
+    public function __construct(
+        public readonly string $serverName,
+        public readonly string $map,             // map id, such as "Kavkazi"
+        public readonly string $lighting,
+        public readonly list<string> $experiences,
+        public readonly int $playerCount,
+        public readonly int $maxPlayers,
+        public readonly list<FactionScore> $factions,
+        public readonly ?int $scoreCap,          // not sent by live builds
+        public readonly ?float $matchSeconds,    // not sent by live builds
+    ) {}
+
+    /** The map's name as players know it ("Bakurani" for "Kavkazi"). */
+    public function mapName(): string {
+        return map_name($this->map);
+    }
+
+    /** The faction with the highest score, or null when there are none or the top is tied. */
+    public function leader(): ?FactionScore {
+        $sorted = $this->factions->sortBy(fn($a, $b) => $b->score <=> $a->score);
+        $first = $sorted->first();
+        if ($first == null) {
+            return null;
+        }
+        if ($sorted->len() > 1 && $sorted[1]->score == $first->score) {
+            return null;
+        }
+        return $first;
+    }
+}
+
+export class Player {
+    public function __construct(
+        public readonly string $name,
+        public readonly string $steamId,
+        public readonly string $faction,
+        public readonly int $kills,
+        public readonly int $deaths,
+        public readonly int $cash,
+        public readonly int $pingMs,
+    ) {}
+
+    /** Kills per death, with no deaths counted as one. */
+    public function ratio(): float {
+        return $this->kills / max($this->deaths, 1);
+    }
+}
+
+/** Everything one look at the server shows. */
+export class Snapshot {
+    public function __construct(
+        public readonly MatchStatus $status,
+        public readonly list<Player> $players,
+        public readonly int $takenAt,
+    ) {}
+
+    /** Players of one faction, best first (kills, then fewer deaths). */
+    public function team(string $faction): list<Player> {
+        return $this->players
+            ->filter(fn($p) => $p->faction == $faction)
+            ->sortBy(fn($a, $b) => ($a->kills == $b->kills ? $a->deaths <=> $b->deaths : $b->kills <=> $a->kills));
+    }
+
+    /** Players whose faction is not on the scoreboard (still choosing a side, for example). */
+    public function unassigned(): list<Player> {
+        $names = $this->status->factions->map(fn($f) => $f->name);
+        return $this->players->filter(fn($p) => !$names->contains($p->faction));
+    }
+}
+
+/** Reads the match status and the player list. Throws RconError or NetworkError. */
+export function fetch_snapshot(HttpClient $rcon): Snapshot {
+    $status = parse_status(get_json($rcon, "/v1/status"));
+    $players = parse_players(get_json($rcon, "/v1/players"));
+    return new Snapshot($status, $players, time());
+}
+
+export function fetch_status(HttpClient $rcon): MatchStatus {
+    return parse_status(get_json($rcon, "/v1/status"));
+}
+
+export function fetch_players(HttpClient $rcon): list<Player> {
+    return parse_players(get_json($rcon, "/v1/players"));
+}
+
+/** GET a route and decode its JSON, turning the listener's `{ error: { code, message } }` into RconError. */
+function get_json(HttpClient $rcon, string $path): any {
+    $res = $rcon->get($path);
+    if (!$res->ok()) {
+        throw new RconError(describe_error($path, $res));
+    }
+    try {
+        return $res->json();
+    } catch (ValueError $e) {
+        throw new RconError("{$path}: the reply is not JSON");
+    }
+}
+
+function describe_error(string $path, HttpResponse $res): string {
+    $text = match ($res->status) {
+        401, 403 => "the RCON password was refused",
+        404 => "this server does not serve the route",
+        429 => "too many requests; retry after " . ($res->header("retry-after") ?? "a few") . " seconds",
+        default => "HTTP {$res->status}",
+    };
+    try {
+        $body = $res->json();
+        if ($body is map) {
+            $err = $body["error"] ?? null;
+            if ($err is map) {
+                $message = $err["message"] ?? null;
+                if ($message is string && !$message->isEmpty()) {
+                    $text .= " ({$message})";
+                }
+            }
+        }
+    } catch (ValueError $e) {
+        // not JSON: the status says enough
+    }
+    return "{$path}: {$text}";
+}
+
+/** Builds a MatchStatus from the JSON of GET /v1/status. */
+export function parse_status(any $data): MatchStatus {
+    if (!($data is map)) {
+        throw new RconError("/v1/status: expected a JSON object");
+    }
+    $players = $data["players"] ?? null;
+    $current = 0;
+    $max = 0;
+    if ($players is map) {
+        $current = int_of($players["current"] ?? null) ?? 0;
+        $max = int_of($players["max"] ?? null) ?? 0;
+    }
+
+    list<FactionScore> $factions = [];
+    $scores = $data["factionScores"] ?? null;
+    if ($scores is list) {
+        foreach ($scores as $f) {
+            if ($f is map) {
+                $factions[] = new FactionScore(
+                    string_of($f["name"] ?? null),
+                    color_of($f["colorHex"] ?? null),
+                    int_of($f["score"] ?? null) ?? 0,
+                );
+            }
+        }
+    }
+
+    list<string> $experiences = [];
+    $exps = $data["experiences"] ?? null;
+    if ($exps is list) {
+        foreach ($exps as $e) {
+            if ($e is string) {
+                $experiences[] = $e;
+            }
+        }
+    }
+
+    $seconds = $data["matchSeconds"] ?? null;
+    ?float $matchSeconds = null;
+    if ($seconds is float) {
+        $matchSeconds = $seconds;
+    } elseif ($seconds is int) {
+        $matchSeconds = (float)$seconds;
+    }
+
+    return new MatchStatus(
+        string_of($data["serverName"] ?? null),
+        string_of($data["map"] ?? null),
+        string_of($data["lighting"] ?? null),
+        $experiences,
+        $current,
+        $max,
+        $factions,
+        int_of($data["scoreCap"] ?? null),
+        $matchSeconds,
+    );
+}
+
+/** Builds the player list from the JSON of GET /v1/players. */
+export function parse_players(any $data): list<Player> {
+    if (!($data is map)) {
+        throw new RconError("/v1/players: expected a JSON object");
+    }
+    $items = $data["players"] ?? null;
+    if (!($items is list)) {
+        throw new RconError("/v1/players: no player list in the reply");
+    }
+    list<Player> $players = [];
+    foreach ($items as $p) {
+        if ($p is map) {
+            $players[] = new Player(
+                string_of($p["name"] ?? null),
+                string_of($p["steamId"] ?? null),
+                string_of($p["faction"] ?? null),
+                int_of($p["kills"] ?? null) ?? 0,
+                int_of($p["deaths"] ?? null) ?? 0,
+                int_of($p["cash"] ?? null) ?? 0,
+                int_of($p["pingMs"] ?? null) ?? 0,
+            );
+        }
+    }
+    return $players;
+}
+
+/** The names players know the maps by. Unknown ids are shown as they are. */
+export function map_name(string $id): string {
+    return match ($id) {
+        "Kavkazi" => "Bakurani",
+        "Europe" => "Ozeti",
+        "NorthAmerica" => "Zestafona",
+        default => $id,
+    };
+}
+
+/** 754.2 → "12:34", 4000 → "1:06:40". */
+export function format_clock(float $seconds): string {
+    $total = (int)floor(max($seconds, 0.0));
+    $h = intdiv($total, 3600);
+    $m = intdiv($total % 3600, 60);
+    $s = ((string)($total % 60))->padStart(2, "0");
+    if ($h > 0) {
+        return "{$h}:" . ((string)$m)->padStart(2, "0") . ":{$s}";
+    }
+    return "{$m}:{$s}";
+}
+
+function string_of(any $v): string {
+    if ($v is string) {
+        return $v;
+    }
+    return "";
+}
+
+function int_of(any $v): ?int {
+    if ($v is int) {
+        return $v;
+    }
+    if ($v is float) {
+        return (int)round($v);
+    }
+    return null;
+}
+
+/** "#rrggbb" from "rrggbb", "#RRGGBB" or "rrggbbaa"; "" for anything else, so it is safe to put in markup. */
+function color_of(any $v): string {
+    if (!($v is string)) {
+        return "";
+    }
+    $hex = $v->startsWith("#") ? $v->slice(1) : $v;
+    if ($hex->len() != 6 && $hex->len() != 8) {
+        return "";
+    }
+    foreach ($hex->lower()->chars() as $c) {
+        if (!str_contains("0123456789abcdef", $c)) {
+            return "";
+        }
+    }
+    return "#" . $hex->slice(0, 6)->lower();
+}

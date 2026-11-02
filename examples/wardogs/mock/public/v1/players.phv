@@ -1,0 +1,6 @@
+import std.http.response;
+import lib.game.{authorized, players};
+
+if (authorized()) {
+    response()->json(players());
+}

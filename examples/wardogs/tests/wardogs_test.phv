@@ -1,0 +1,71 @@
+import lib.wardogs.{format_clock, map_name, parse_players, parse_status, RconError, Snapshot};
+
+// What a live build sends: no scoreCap and no matchSeconds.
+const LIVE_STATUS = '{"serverName": "TLR #1", "map": "Kavkazi", "experiences": ["Kavkazi_KOTH_01"],
+    "lighting": "DayEarlyFog", "alternator": "x", "scoreTick": {"current": 20, "min": 18, "max": 30},
+    "players": {"current": 3, "max": 98},
+    "factionScores": [{"name": "Valkyra", "colorHex": "3D7BD9", "score": 41},
+                      {"name": "Lonestar", "colorHex": "#d9a13d", "score": 57},
+                      {"name": "Manticore", "colorHex": "red;}", "score": 12}],
+    "rotation": {"nowIndex": 0, "nextIndex": 1}}';
+
+const PLAYERS = '{"players": [
+    {"name": "Ash", "steamId": "1", "faction": "Valkyra", "kills": 3, "deaths": 4, "cash": 900, "pingMs": 31},
+    {"name": "Birch", "steamId": "2", "faction": "Valkyra", "kills": 9, "deaths": 0, "cash": 1200, "pingMs": 45},
+    {"name": "Cedar", "steamId": "3", "faction": "Lonestar", "kills": 3, "deaths": 1, "cash": 300, "pingMs": 12.6},
+    {"name": "Dune", "steamId": "4", "faction": "", "kills": 0, "deaths": 0, "cash": 0, "pingMs": 80}], "count": 4}';
+
+function test_status_of_a_live_build(): void {
+    $st = parse_status(json_decode(LIVE_STATUS));
+    assert_eq("TLR #1", $st->serverName);
+    assert_eq("Bakurani", $st->mapName());
+    assert_eq(3, $st->playerCount);
+    assert_eq(98, $st->maxPlayers);
+    assert($st->scoreCap == null, "no scoreCap on live builds");
+    assert($st->matchSeconds == null, "no matchSeconds on live builds");
+    assert_eq(["Valkyra", "Lonestar", "Manticore"], $st->factions->map(fn($f) => $f->name));
+    assert_eq("Lonestar", $st->leader()?->name);
+}
+
+function test_colors_are_checked(): void {
+    $st = parse_status(json_decode(LIVE_STATUS));
+    assert_eq(["#3d7bd9", "#d9a13d", ""], $st->factions->map(fn($f) => $f->color));
+}
+
+function test_optional_fields_when_present(): void {
+    $st = parse_status(json_decode('{"serverName": "x", "map": "Europe", "scoreCap": 100, "matchSeconds": 754.9,
+        "factionScores": [{"name": "A", "score": 5}, {"name": "B", "score": 5}]}'));
+    assert_eq(100, $st->scoreCap);
+    assert_eq("12:34", format_clock($st->matchSeconds ?? 0.0));
+    assert_eq("Ozeti", $st->mapName());
+    assert($st->leader() == null, "a tie has no leader");
+    assert_eq(0, $st->playerCount);
+}
+
+function test_teams_are_sorted_and_split(): void {
+    $snap = new Snapshot(parse_status(json_decode(LIVE_STATUS)), parse_players(json_decode(PLAYERS)), 0);
+    assert_eq(["Birch", "Ash"], $snap->team("Valkyra")->map(fn($p) => $p->name));
+    assert_eq(["Cedar"], $snap->team("Lonestar")->map(fn($p) => $p->name));
+    assert_eq(["Dune"], $snap->unassigned()->map(fn($p) => $p->name));
+    assert_eq(13, $snap->players[2]->pingMs);
+    assert_eq(9.0, $snap->players[1]->ratio());
+}
+
+function test_unexpected_replies(): void {
+    foreach (['[]', '"text"', '{"count": 0}'] as $body) {
+        try {
+            parse_players(json_decode($body));
+            assert(false, "accepted {$body}");
+        } catch (RconError $e) {
+            assert($e->getMessage()->startsWith("/v1/players"));
+        }
+    }
+}
+
+function test_clock_and_names(): void {
+    assert_eq("0:00", format_clock(-3.0));
+    assert_eq("0:59", format_clock(59.99));
+    assert_eq("1:06:40", format_clock(4000.0));
+    assert_eq("Zestafona", map_name("NorthAmerica"));
+    assert_eq("SomeNewMap", map_name("SomeNewMap"));
+}

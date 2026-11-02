@@ -1,0 +1,95 @@
+<?phv
+import lib.wardogs.{format_clock, Snapshot};
+params(?Snapshot $snap, string $error, int $refresh);
+?>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="<?= $refresh ?>">
+<?phv if ($snap != null): ?>
+  <title><?= $snap->status->serverName ?> · WARDOGS</title>
+<?phv else: ?>
+  <title>WARDOGS</title>
+<?phv endif; ?>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+<?phv if ($snap == null): ?>
+    <h1>WARDOGS</h1>
+    <p class="error"><?= $error ?></p>
+    <p class="muted">Trying again every <?= $refresh ?> seconds.</p>
+<?phv else: ?>
+<?phv $st = $snap->status; ?>
+    <header>
+      <h1><?= $st->serverName ?></h1>
+      <dl class="facts">
+        <div><dt>Map</dt><dd><?= $st->mapName() ?></dd></div>
+<?phv if (!$st->lighting->isEmpty()): ?>
+        <div><dt>Lighting</dt><dd><?= $st->lighting ?></dd></div>
+<?phv endif; ?>
+        <div><dt>Players</dt><dd><?= $st->playerCount ?> / <?= $st->maxPlayers ?></dd></div>
+<?phv if ($st->matchSeconds != null): ?>
+        <div><dt>Time</dt><dd><?= format_clock($st->matchSeconds) ?></dd></div>
+<?phv endif; ?>
+      </dl>
+<?phv if (!$st->experiences->isEmpty()): ?>
+      <p class="muted"><?= $st->experiences->join(" · ") ?></p>
+<?phv endif; ?>
+    </header>
+
+<?phv
+$top = $st->scoreCap ?? 0;
+foreach ($st->factions as $f) {
+    $top = max($top, $f->score);
+}
+$leader = $st->leader();
+?>
+    <section class="scores">
+      <h2>Score<?phv if ($st->scoreCap != null): ?> <span class="muted">first to <?= $st->scoreCap ?></span><?phv endif; ?></h2>
+<?phv foreach ($st->factions as $f): ?>
+      <div class="score">
+        <span class="name"><?= $f->name ?><?phv if ($leader != null && $leader->name == $f->name): ?> <small>leading</small><?phv endif; ?></span>
+        <svg viewBox="0 0 100 6" preserveAspectRatio="none" aria-hidden="true">
+          <rect width="100" height="6" class="track"></rect>
+          <rect width="<?= $top > 0 ? intdiv($f->score * 100, $top) : 0 ?>" height="6" fill="<?= $f->color->isEmpty() ? "#9aa59a" : $f->color ?>"></rect>
+        </svg>
+        <span class="points"><?= $f->score ?></span>
+      </div>
+<?phv endforeach; ?>
+    </section>
+
+    <section class="teams">
+<?phv foreach ($st->factions as $f): ?>
+<?phv $team = $snap->team($f->name); ?>
+      <div class="team">
+        <h2><svg viewBox="0 0 10 10" aria-hidden="true"><rect width="10" height="10" fill="<?= $f->color->isEmpty() ? "#9aa59a" : $f->color ?>"></rect></svg> <?= $f->name ?> <span class="muted"><?= $team->len() ?></span></h2>
+<?phv if ($team->isEmpty()): ?>
+        <p class="muted">Nobody yet.</p>
+<?phv else: ?>
+        <table>
+          <thead><tr><th>Name</th><th>K</th><th>D</th><th>K/D</th><th>Cash</th><th>Ping</th></tr></thead>
+          <tbody>
+<?phv foreach ($team as $p): ?>
+            <tr><td><?= $p->name ?></td><td><?= $p->kills ?></td><td><?= $p->deaths ?></td><td><?= number_format($p->ratio(), 2) ?></td><td><?= number_format((float)$p->cash) ?></td><td><?= $p->pingMs ?></td></tr>
+<?phv endforeach; ?>
+          </tbody>
+        </table>
+<?phv endif; ?>
+      </div>
+<?phv endforeach; ?>
+<?phv $others = $snap->unassigned(); ?>
+<?phv if (!$others->isEmpty()): ?>
+      <div class="team">
+        <h2>No faction <span class="muted"><?= $others->len() ?></span></h2>
+        <p class="muted"><?= $others->map(fn($p) => $p->name)->join(", ") ?></p>
+      </div>
+<?phv endif; ?>
+    </section>
+    <p class="muted">Read at <?= date("H:i:s", $snap->takenAt) ?>, refreshed every <?= $refresh ?> seconds.</p>
+<?phv endif; ?>
+  </main>
+</body>
+</html>
