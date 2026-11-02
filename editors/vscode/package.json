@@ -5,6 +5,7 @@
   "version": "0.2.2",
   "publisher": "phx-lang",
   "license": "MIT",
+  "icon": "images/icon.png",
   "homepage": "https://phx-lang.org",
   "repository": {
     "type": "git",
@@ -29,13 +30,15 @@
         "id": "phx",
         "aliases": ["PHX", "phx"],
         "extensions": [".phx"],
-        "configuration": "./language-configuration.json"
+        "configuration": "./language-configuration.json",
+        "icon": { "light": "./images/phx-file.svg", "dark": "./images/phx-file.svg" }
       },
       {
         "id": "phx-template",
         "aliases": ["PHX Template"],
         "filenamePatterns": ["*.phx.html"],
-        "configuration": "./language-configuration.json"
+        "configuration": "./language-configuration.json",
+        "icon": { "light": "./images/phx-file.svg", "dark": "./images/phx-file.svg" }
       }
     ],
     "grammars": [

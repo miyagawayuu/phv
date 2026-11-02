@@ -1,4 +1,9 @@
-# PHX
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/phx-lockup-on-dark.svg">
+    <img src="assets/logo/phx-lockup-on-light.svg" alt="PHX" height="64">
+  </picture>
+</h1>
 
 English | [日本語](README.ja.md)
 

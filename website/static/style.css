@@ -79,7 +79,8 @@ pre code { font-size: inherit; }
   border-bottom: 1px solid var(--border);
 }
 .site-header .inner { display: flex; align-items: center; justify-content: space-between; height: 60px; gap: 16px; }
-.logo { font-weight: 800; font-size: 1.35rem; letter-spacing: 0.04em; color: var(--fg); }
+.logo { display: inline-flex; align-items: center; gap: 8px; font-weight: 800; font-size: 1.35rem; letter-spacing: 0.04em; color: var(--fg); }
+.logo img { display: block; }
 .logo:hover { text-decoration: none; }
 nav { display: flex; gap: 20px; flex-wrap: wrap; font-size: 0.95rem; }
 nav a { color: var(--muted); }

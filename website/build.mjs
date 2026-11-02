@@ -116,13 +116,14 @@ export function layout({ lang, title, description, body, depth, active, otherHre
 <meta name="description" content="${escape(description)}">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="${up}favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="${up}apple-touch-icon.png">
 <link rel="stylesheet" href="${up}style.css">
 <script src="${up}site.js" defer></script>
 </head>
 <body>
 <header class="site-header">
   <div class="inner">
-    <a class="logo" href="${home}">PHX</a>
+    <a class="logo" href="${home}"><img src="${up}logo.svg" alt="" width="30" height="30">PHX</a>
     <nav>
       ${nav("spec", `${docs}spec/`, t.spec)}
       ${nav("security", `${docs}security/`, t.security)}
@@ -166,7 +167,7 @@ ${html}</article>
 
 fs.rmSync(dist, { recursive: true, force: true });
 fs.mkdirSync(dist, { recursive: true });
-// style.css, site.js, favicon.svg, and _headers (HTTP headers for Cloudflare Pages).
+// style.css, site.js, the logo and icons, and _headers (HTTP headers for Cloudflare Pages).
 for (const f of fs.readdirSync(path.join(here, "static"))) {
   fs.copyFileSync(path.join(here, "static", f), path.join(dist, f));
 }
