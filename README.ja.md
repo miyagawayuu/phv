@@ -10,7 +10,7 @@
 PHP の書き味をそのままに、**型安全・安全な既定値・高速**を言語の側で保証する Web 向けプログラミング言語です。
 処理系は Rust で書かれています。
 
-v0.2.7 までは PHX という名前でした([miyagawayuu/phx](https://github.com/miyagawayuu/phx))。
+v0.2.7 までは PHX という名前でした。
 
 公式サイト: <https://phv-lang.org>
 

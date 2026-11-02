@@ -11,7 +11,7 @@ PHV is a programming language for the web that keeps the feel of PHP while
 the language itself guarantees **type safety, safe defaults and speed**.
 The implementation is written in Rust.
 
-PHV was called PHX until v0.2.7 ([miyagawayuu/phx](https://github.com/miyagawayuu/phx)).
+PHV was called PHX until v0.2.7.
 
 Website: <https://phv-lang.org>
 
