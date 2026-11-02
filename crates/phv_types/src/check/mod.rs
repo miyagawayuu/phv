@@ -14,6 +14,7 @@ mod stmt;
 
 use crate::builtins::{BuiltinSig, Recv, BUILTINS};
 use crate::hir::*;
+use crate::index::{EditorIndex, Item, ItemKind, Member, MemberSite, VarScope};
 use crate::types::*;
 use flow::FnCtx;
 use phv_syntax::ast::{
@@ -53,13 +54,18 @@ pub struct CheckInput<'a> {
 
 pub fn check(input: &CheckInput) -> (HProgram, Vec<Diagnostic>) {
     let mut c = Checker::new(input);
-    c.collect();
-    c.resolve_imports();
-    let order = c.order_classes();
-    c.resolve_classes(&order);
-    c.resolve_functions();
-    c.check_bodies();
+    c.run();
     c.finish()
+}
+
+/// Like `check`, also recording what editors need (see `crate::index`).
+pub fn check_for_editor(input: &CheckInput) -> (HProgram, Vec<Diagnostic>, EditorIndex) {
+    let mut c = Checker::new(input);
+    c.index = Some(EditorIndex::default());
+    c.run();
+    let index = c.build_index();
+    let (hir, diags) = c.finish();
+    (hir, diags, index)
 }
 
 #[derive(Default)]
@@ -67,6 +73,8 @@ struct Scope {
     funcs: HashMap<String, FuncId>,
     classes: HashMap<String, ClassId>,
     consts: HashMap<String, (HConst, Type)>,
+    /// Where each constant in `consts` is declared.
+    const_spans: HashMap<String, Span>,
     export_funcs: HashMap<String, FuncId>,
     export_classes: HashMap<String, ClassId>,
     export_consts: HashMap<String, (HConst, Type)>,
@@ -82,6 +90,7 @@ struct FieldInfo {
     default: Option<HConst>,
     /// Non-nullable without a default: the constructor must assign it.
     required: bool,
+    span: Span,
 }
 
 #[derive(Clone)]
@@ -130,6 +139,7 @@ struct ParamInfo {
     ty: Type,
     default: Option<HConst>,
     promote: Option<(Visibility, bool)>,
+    span: Span,
 }
 
 struct FuncInfo<'a> {
@@ -168,6 +178,8 @@ pub(crate) struct Checker<'a> {
     main: Option<FuncId>,
     /// Type parameters in scope while resolving or checking a generic function.
     type_params: Vec<String>,
+    /// Only built for editors (`check_for_editor`).
+    index: Option<EditorIndex>,
 }
 
 fn sig_type(t: &TypeExpr) -> Type {
@@ -219,7 +231,226 @@ impl<'a> Checker<'a> {
             template_funcs: HashMap::new(),
             main: None,
             type_params: Vec::new(),
+            index: None,
         }
+    }
+
+    fn run(&mut self) {
+        self.collect();
+        self.resolve_imports();
+        let order = self.order_classes();
+        self.resolve_classes(&order);
+        self.resolve_functions();
+        self.check_bodies();
+    }
+
+    // ----- editor index ----------------------------------------------------
+
+    /// Records that the name at `use_` refers to the definition at `def`.
+    pub(crate) fn note_ref(&mut self, use_: Span, def: Span) {
+        if let Some(ix) = &mut self.index {
+            if use_ != def {
+                ix.refs.push((use_, def));
+            }
+        }
+    }
+
+    /// Records a `->name` (or `::name`) looked up on `recv`.
+    pub(crate) fn note_site(&mut self, span: Span, recv: &Type, is_static: bool) {
+        if self.index.is_none() {
+            return;
+        }
+        let class = self.ctx.last().and_then(|c| c.class);
+        if let Some(ix) = &mut self.index {
+            ix.sites.push(MemberSite { span, recv: recv.clone(), is_static, class });
+        }
+    }
+
+    /// Records the variables of a function whose code covers `span`.
+    pub(crate) fn note_scope(&mut self, span: Span, ctx: &FnCtx) {
+        if self.index.is_none() {
+            return;
+        }
+        let vars = ctx
+            .locals
+            .iter()
+            .zip(&ctx.spans)
+            .filter(|(l, _)| !l.name.starts_with('%'))
+            .map(|(l, s)| Item {
+                name: l.name.clone(),
+                kind: ItemKind::Variable,
+                detail: self.tn(&l.ty),
+                def: Some(*s),
+            })
+            .collect();
+        if let Some(ix) = &mut self.index {
+            ix.scopes.push(VarScope { span, sees_outer: ctx.auto_capture, vars });
+        }
+    }
+
+    /// `lookup_class`, recording the use of the name at `span`.
+    pub(crate) fn class_ref(&mut self, name: &str, span: Span) -> Option<ClassId> {
+        let c = self.lookup_class(name)?;
+        let def = self.classes[c as usize].span;
+        self.note_ref(span, def);
+        Some(c)
+    }
+
+    /// Where the constant `name` visible in the current module is declared.
+    pub(crate) fn const_span(&self, name: &str) -> Option<Span> {
+        if let Some(s) = self.scopes[self.module].const_spans.get(name) {
+            return Some(*s);
+        }
+        self.prelude().and_then(|p| self.scopes[p].const_spans.get(name).copied())
+    }
+
+    /// Where the enum case or class constant `cid::name` is declared.
+    pub(crate) fn member_const_span(&self, cid: ClassId, name: &str) -> Option<Span> {
+        let mut c = Some(cid);
+        while let Some(id) = c {
+            let info = &self.classes[id as usize];
+            if let Some(d) = info.decl {
+                if let Some(case) = d.cases.iter().find(|k| k.name == name) {
+                    return Some(case.span);
+                }
+                if let Some(k) = d.consts.iter().find(|k| k.name == name) {
+                    return Some(k.name_span);
+                }
+            }
+            c = info.parent;
+        }
+        None
+    }
+
+    fn signature(&self, f: FuncId) -> String {
+        let info = &self.funcs[f as usize];
+        let params: Vec<String> = info.params.iter().map(|p| format!("{} ${}", self.tn(&p.ty), p.name)).collect();
+        if info.kind == FuncKind::Ctor {
+            return format!("({})", params.join(", "));
+        }
+        format!("({}): {}", params.join(", "), self.tn(&info.ret))
+    }
+
+    fn builtin_items(&self, recv: Option<Recv>) -> Vec<Item> {
+        let mut out: Vec<Item> = Vec::new();
+        for sig in BUILTINS.iter().filter(|b| b.recv == recv && !b.internal) {
+            if out.iter().any(|i| i.name == sig.name) {
+                continue;
+            }
+            let Some(b) = self.builtins.get(sig.name).and_then(|l| l.iter().find(|b| b.sig.recv == recv)) else {
+                continue;
+            };
+            let skip = usize::from(recv.is_some());
+            let params: Vec<String> = b.params.iter().skip(skip).map(|t| self.tn(t)).collect();
+            out.push(Item {
+                name: sig.name.to_string(),
+                kind: if recv.is_some() { ItemKind::Method } else { ItemKind::Function },
+                detail: format!("({}): {}", params.join(", "), self.tn(&b.ret)),
+                def: None,
+            });
+        }
+        out
+    }
+
+    /// Fills in the members of every class and the names visible in the entry module.
+    fn build_index(&mut self) -> EditorIndex {
+        let mut ix = self.index.take().unwrap_or_default();
+        for (cid, c) in self.classes.iter().enumerate() {
+            let cid = cid as ClassId;
+            let mut members = Vec::new();
+            for f in &c.fields {
+                members.push(Member {
+                    item: Item {
+                        name: f.name.clone(),
+                        kind: ItemKind::Property,
+                        detail: self.tn(&f.ty),
+                        def: Some(f.span),
+                    },
+                    is_static: false,
+                    vis: f.vis,
+                    owner: f.owner,
+                });
+            }
+            let mut methods: Vec<(&String, &MethodInfo)> = c.methods.iter().collect();
+            methods.sort_by_key(|(n, _)| n.as_str());
+            for (name, m) in methods {
+                members.push(Member {
+                    item: Item {
+                        name: name.clone(),
+                        kind: ItemKind::Method,
+                        detail: self.signature(m.func),
+                        def: Some(self.funcs[m.func as usize].span),
+                    },
+                    is_static: m.is_static,
+                    vis: m.vis,
+                    owner: m.owner,
+                });
+            }
+            for case in c.decl.map(|d| d.cases.as_slice()).unwrap_or_default() {
+                members.push(Member {
+                    item: Item {
+                        name: case.name.clone(),
+                        kind: ItemKind::EnumCase,
+                        detail: c.name.clone(),
+                        def: Some(case.span),
+                    },
+                    is_static: true,
+                    vis: Visibility::Public,
+                    owner: cid,
+                });
+            }
+            let mut consts: Vec<(&String, &(HConst, Type))> = c.consts.iter().collect();
+            consts.sort_by_key(|(n, _)| n.as_str());
+            for (name, (_, ty)) in consts {
+                members.push(Member {
+                    item: Item {
+                        name: name.clone(),
+                        kind: ItemKind::Constant,
+                        detail: self.tn(ty),
+                        def: self.member_const_span(cid, name),
+                    },
+                    is_static: true,
+                    vis: Visibility::Public,
+                    owner: cid,
+                });
+            }
+            ix.classes.push(members);
+        }
+        // A template opened on its own is the first template (it is loaded before the ones it renders).
+        let entry = self
+            .input
+            .modules
+            .iter()
+            .position(|m| m.kind == ModuleKind::Entry)
+            .or_else(|| self.input.modules.iter().position(|m| m.kind == ModuleKind::Template));
+        for scope in entry.into_iter().chain(self.prelude()) {
+            let s = &self.scopes[scope];
+            for (name, f) in &s.funcs {
+                let def = Some(self.funcs[*f as usize].span);
+                ix.globals.push(Item { name: name.clone(), kind: ItemKind::Function, detail: self.signature(*f), def });
+            }
+            for (name, c) in &s.classes {
+                let info = &self.classes[*c as usize];
+                let kind = match info.kind {
+                    ClassKind::Interface => ItemKind::Interface,
+                    ClassKind::Enum => ItemKind::Enum,
+                    ClassKind::Class | ClassKind::Abstract => ItemKind::Class,
+                };
+                let detail = info.ctor.map(|f| self.signature(f)).unwrap_or_default();
+                ix.globals.push(Item { name: name.clone(), kind, detail, def: Some(info.span) });
+            }
+            for (name, (_, ty)) in &s.consts {
+                let def = s.const_spans.get(name).copied();
+                ix.globals.push(Item { name: name.clone(), kind: ItemKind::Constant, detail: self.tn(ty), def });
+            }
+        }
+        ix.globals.extend(self.builtin_items(None));
+        ix.globals.sort_by(|a, b| a.name.cmp(&b.name));
+        ix.globals.dedup_by(|a, b| a.name == b.name);
+        ix.string_methods = self.builtin_items(Some(Recv::Str));
+        ix.list_methods = self.builtin_items(Some(Recv::List));
+        ix.map_methods = self.builtin_items(Some(Recv::Map));
+        ix
     }
 
     // ----- helpers -------------------------------------------------------
@@ -425,7 +656,7 @@ impl<'a> Checker<'a> {
                             .add_note("use a function type such as `fn(int): string`");
                         return Type::Error;
                     }
-                    other => match self.lookup_class(other) {
+                    other => match self.class_ref(other, t.span) {
                         Some(c) => simple(Type::Class(c)),
                         None => {
                             self.error(format!("unknown type `{other}`"), t.span);
@@ -520,7 +751,7 @@ impl<'a> Checker<'a> {
             if out.iter().any(|o| o.name == p.name) {
                 self.error(format!("duplicate parameter `${}`", p.name), p.span);
             }
-            out.push(ParamInfo { name: p.name.clone(), ty, default, promote: p.promote });
+            out.push(ParamInfo { name: p.name.clone(), ty, default, promote: p.promote, span: p.span });
         }
         out
     }
@@ -644,6 +875,7 @@ impl<'a> Checker<'a> {
                     }
                     StmtKind::Const(d) => {
                         let Some(value) = self.literal_const(&d.value, d.ty.as_ref(), None) else { continue };
+                        self.scopes[mi].const_spans.insert(d.name.clone(), d.name_span);
                         if self.scopes[mi].consts.insert(d.name.clone(), value.clone()).is_some() {
                             self.error(format!("constant `{}` is defined more than once", d.name), d.name_span);
                         }
@@ -680,10 +912,22 @@ impl<'a> Checker<'a> {
                     self.error(format!("unknown module `{key}`"), d.span);
                     continue;
                 };
+                self.note_ref(d.span, Span::new(self.input.modules[target].ast.file, 0, 0));
                 for (name, span) in &d.names {
                     let f = self.scopes[target].export_funcs.get(name).copied();
                     let c = self.scopes[target].export_classes.get(name).copied();
+                    let def = match (f, c) {
+                        (Some(f), _) => Some(self.funcs[f as usize].span),
+                        (_, Some(c)) => Some(self.classes[c as usize].span),
+                        _ => self.scopes[target].const_spans.get(name).copied(),
+                    };
+                    if let Some(def) = def {
+                        self.note_ref(*span, def);
+                    }
                     if let Some(k) = self.scopes[target].export_consts.get(name).cloned() {
+                        if let Some(def) = def {
+                            self.scopes[mi].const_spans.insert(name.clone(), def);
+                        }
                         if self.scopes[mi].consts.insert(name.clone(), k).is_some() {
                             self.error(format!("`{name}` is already defined in this module"), *span);
                         }
@@ -720,7 +964,7 @@ impl<'a> Checker<'a> {
             let Some(decl) = self.classes[cid].decl else { continue };
             self.module = self.classes[cid].module;
             if let Some((pname, pspan)) = &decl.parent {
-                match self.lookup_class(pname) {
+                match self.class_ref(pname, *pspan) {
                     Some(p) => self.classes[cid].parent = Some(p),
                     None => {
                         self.error(format!("unknown parent class `{pname}`"), *pspan);
@@ -728,7 +972,7 @@ impl<'a> Checker<'a> {
                 }
             }
             for (iname, ispan) in &decl.interfaces {
-                match self.lookup_class(iname) {
+                match self.class_ref(iname, *ispan) {
                     Some(i) => self.classes[cid].ifaces.push(i),
                     None => {
                         self.error(format!("unknown interface `{iname}`"), *ispan);
@@ -828,8 +1072,10 @@ impl<'a> Checker<'a> {
                     self.classes[ci].consts.entry(k).or_insert(v);
                 }
                 if kind == ClassKind::Interface {
+                    // Calls through interfaces dispatch by name; the slot belongs to the
+                    // other interface's vtable, so it is not copied (a redeclaration gets its own).
                     for (name, m) in self.classes[i as usize].methods.clone() {
-                        self.classes[ci].methods.entry(name).or_insert(m);
+                        self.classes[ci].methods.entry(name).or_insert(MethodInfo { slot: None, ..m });
                     }
                 }
             }
@@ -877,6 +1123,7 @@ impl<'a> Checker<'a> {
                     owner: cid,
                     default: Some(HConst::Str(String::new())),
                     required: false,
+                    span: decl.name_span,
                 };
                 self.classes[ci].fields.push(name_field);
                 if let Some(b) = &backing {
@@ -888,6 +1135,7 @@ impl<'a> Checker<'a> {
                         owner: cid,
                         default: Some(HConst::Null),
                         required: false,
+                        span: decl.name_span,
                     };
                     self.classes[ci].fields.push(value_field);
                 }
@@ -943,8 +1191,8 @@ impl<'a> Checker<'a> {
                         owner: cid,
                         default,
                         required,
+                        span: prop.span,
                     },
-                    prop.span,
                 );
             }
             let mut own_ctor = false;
@@ -987,7 +1235,8 @@ impl<'a> Checker<'a> {
                     body: Body::Function(m),
                     module: self.module,
                     class: Some(cid),
-                    is_static: m.is_static,
+                    // A `static` constructor was reported above; its body is checked as a constructor.
+                    is_static: m.is_static && !is_ctor,
                     kind: if is_ctor { FuncKind::Ctor } else { FuncKind::Method },
                     span: m.name_span,
                 });
@@ -1005,8 +1254,8 @@ impl<'a> Checker<'a> {
                                     owner: cid,
                                     default: None,
                                     required: !p.ty.is_nullable() && p.ty != Type::Error,
+                                    span: ap.span,
                                 },
-                                ap.span,
                             );
                         }
                     }
@@ -1139,7 +1388,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn add_field(&mut self, cid: ClassId, field: FieldInfo, span: Span) {
+    fn add_field(&mut self, cid: ClassId, field: FieldInfo) {
+        let span = field.span;
         let c = &mut self.classes[cid as usize];
         if let Some(existing) = c.fields.iter().find(|f| f.name == field.name) {
             let inherited = existing.owner != cid;
@@ -1227,13 +1477,13 @@ impl<'a> Checker<'a> {
         let mut param_ids = Vec::new();
         let mut this = None;
         if matches!(kind, FuncKind::Method | FuncKind::Ctor) && !is_static {
-            let id = ctx.declare("this", Type::Class(class.unwrap()));
+            let id = ctx.declare("this", Type::Class(class.unwrap()), span);
             ctx.flow.mark(id);
             param_ids.push(id);
             this = Some(id);
         }
         for p in &params {
-            let id = ctx.declare(&p.name, p.ty.clone());
+            let id = ctx.declare(&p.name, p.ty.clone(), p.span);
             ctx.flow.mark(id);
             param_ids.push(id);
         }
@@ -1280,6 +1530,11 @@ impl<'a> Checker<'a> {
         }
 
         let ctx = self.ctx.pop().unwrap();
+        let code_span = match body {
+            Body::Function(d) => d.span,
+            _ => Span::new(file, 0, u32::MAX),
+        };
+        self.note_scope(code_span, &ctx);
         self.type_params.clear();
         if !ctx.flow.dead && !matches!(ret, Type::Void | Type::Error) && kind != FuncKind::Template && !is_abstract {
             let msg = format!("`{name}` must return a value of type `{}` on every path", self.tn(&ret));

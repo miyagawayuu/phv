@@ -1223,7 +1223,7 @@ impl Parser {
                     }
                     let args = self.args()?;
                     let span = e.span.to(self.prev_span());
-                    e = Expr { kind: ExprKind::StaticCall { class, class_span, name, args }, span };
+                    e = Expr { kind: ExprKind::StaticCall { class, class_span, name, name_span, args }, span };
                 }
                 _ => break,
             }

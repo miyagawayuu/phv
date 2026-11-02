@@ -1,8 +1,12 @@
 //! `phv lsp`: a Language Server Protocol server over stdin/stdout.
-//! It publishes type errors as you type and shows types on hover.
+//! It publishes type errors as you type, shows types on hover, completes
+//! names and jumps to definitions.
 
-use phv_driver::{analyze, find_root};
+use phv_driver::{analyze, analyze_for_editor, find_root, Analysis};
+use phv_syntax::lexer::{lex_with_comments, Mode};
+use phv_syntax::token::Tok;
 use phv_syntax::{Severity, SourceFile};
+use phv_types::index::{Item, ItemKind};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Write};
@@ -114,6 +118,127 @@ fn offset_of(text: &str, line: u64, character: u64) -> u32 {
     text.len() as u32
 }
 
+/// A byte offset in `text` to an LSP position.
+fn text_position(text: &str, offset: usize) -> Value {
+    let before = &text[..offset.min(text.len())];
+    let line = before.matches('\n').count();
+    let start = before.rfind('\n').map_or(0, |i| i + 1);
+    let character: usize = before[start..].chars().map(char::len_utf16).sum();
+    json!({ "line": line, "character": character })
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// What is being typed at the cursor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Want {
+    /// After `$`.
+    Variable,
+    /// After `->`, `?->` or (static) `::`.
+    Member { is_static: bool },
+    /// A bare name: functions, classes, constants and keywords.
+    Name,
+}
+
+/// The kind of completion at `offset` and the start of the partial name there.
+fn completion_context(text: &str, offset: usize, template: bool) -> Option<(Want, usize)> {
+    let before = text.get(..offset)?;
+    let partial: usize = before.chars().rev().take_while(|c| is_ident_char(*c)).map(char::len_utf8).sum();
+    let start = offset - partial;
+    let head = &text[..start];
+    let want = if head.ends_with('$') {
+        Want::Variable
+    } else if head.ends_with("->") {
+        Want::Member { is_static: false }
+    } else if head.ends_with("::") {
+        Want::Member { is_static: true }
+    } else if text[start..offset].starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    } else {
+        Want::Name
+    };
+    in_code(text, start, template).then_some((want, start))
+}
+
+/// Whether `offset` is in PHV code (not in HTML, a string or a comment).
+fn in_code(text: &str, offset: usize, template: bool) -> bool {
+    let mode = if template { Mode::Html } else { Mode::Code };
+    let (toks, comments, _) = lex_with_comments(text, 0, 0, mode);
+    let at = offset as u32;
+    if comments.iter().any(|c| c.start < at && at <= c.end) {
+        return false;
+    }
+    !toks.iter().any(|t| match t.tok {
+        Tok::InlineHtml(_) => t.span.start < at && at <= t.span.end,
+        Tok::Str(_) | Tok::Interp(_) => t.span.start < at && at < t.span.end,
+        _ => false,
+    })
+}
+
+const KEYWORDS: &[&str] = &[
+    "abstract",
+    "as",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "echo",
+    "else",
+    "elseif",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "fn",
+    "for",
+    "foreach",
+    "function",
+    "if",
+    "implements",
+    "import",
+    "interface",
+    "is",
+    "match",
+    "new",
+    "null",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "return",
+    "static",
+    "throw",
+    "true",
+    "try",
+    "use",
+    "while",
+];
+
+/// Written instead of the partial name, so that `$user->` parses as a member access.
+const PLACEHOLDER: &str = "__phv_complete";
+
+fn completion_kind(k: ItemKind) -> u32 {
+    match k {
+        ItemKind::Function => 3,
+        ItemKind::Method => 2,
+        ItemKind::Property => 10,
+        ItemKind::Class => 7,
+        ItemKind::Interface => 8,
+        ItemKind::Enum => 13,
+        ItemKind::EnumCase => 20,
+        ItemKind::Constant => 21,
+        ItemKind::Variable => 6,
+        ItemKind::Keyword => 14,
+    }
+}
+
 fn position(file: &SourceFile, offset: u32) -> Value {
     let (line, _) = file.line_col(offset);
     let start = file.line_starts()[line - 1] as usize;
@@ -131,6 +256,119 @@ struct Server {
 impl Server {
     fn overlay(&self) -> HashMap<PathBuf, String> {
         self.open.iter().filter_map(|(p, t)| p.canonicalize().ok().map(|c| (c, t.clone()))).collect()
+    }
+
+    /// Analyzes `path` as if its text were `text`.
+    fn analyze_text(&self, path: &Path, text: String) -> Analysis {
+        let mut overlay = self.overlay();
+        if let Ok(c) = path.canonicalize() {
+            overlay.insert(c, text);
+        }
+        analyze_for_editor(&find_root(path), path, overlay)
+    }
+
+    fn completion(&self, path: &Path, line: u64, character: u64, invoked: bool) -> Value {
+        let Some(text) = self.open.get(path) else {
+            return Value::Null;
+        };
+        let template = path.to_string_lossy().ends_with(".phv.html");
+        let offset = offset_of(text, line, character) as usize;
+        let Some((want, start)) = completion_context(text, offset, template) else {
+            return json!([]);
+        };
+        // The name being edited, up to its end (the cursor may be in the middle of it).
+        let end = offset + text[offset..].chars().take_while(|c| is_ident_char(*c)).map(char::len_utf8).sum::<usize>();
+        if want == Want::Name && start == offset && !invoked {
+            return json!([]);
+        }
+        let items: Vec<Item> = match want {
+            Want::Member { .. } => {
+                // Try the line as it is, then with a `;` in case the statement is unfinished.
+                let mut found = None;
+                for tail in ["", ";"] {
+                    let patched = format!("{}{PLACEHOLDER}{tail}{}", &text[..start], &text[end..]);
+                    let a = self.analyze_text(path, patched);
+                    let (Some(ix), Some(file)) = (&a.index, a.entry_file) else { continue };
+                    if let Some(items) = ix.members_at(file, start as u32) {
+                        found = Some(items);
+                        break;
+                    }
+                }
+                found.unwrap_or_default()
+            }
+            Want::Variable => {
+                // Use the first version in which the checker reached `$__phv_complete`
+                // (it reports it as undefined), so its function is known.
+                let mut found = Vec::new();
+                for tail in ["", ";"] {
+                    let patched = format!("{}{PLACEHOLDER}{tail}{}", &text[..start], &text[end..]);
+                    let a = self.analyze_text(path, patched);
+                    let (Some(ix), Some(file)) = (&a.index, a.entry_file) else { continue };
+                    let dollar = start as u32 - 1;
+                    found = ix.variables_at(file, start as u32);
+                    if a.diags.iter().any(|d| d.span.file == file && d.span.start == dollar) {
+                        break;
+                    }
+                }
+                found
+            }
+            Want::Name => {
+                let a = self.analyze_text(path, text.clone());
+                let mut items = a.index.map(|ix| ix.globals).unwrap_or_default();
+                items.extend(KEYWORDS.iter().map(|k| Item {
+                    name: k.to_string(),
+                    kind: ItemKind::Keyword,
+                    detail: String::new(),
+                    def: None,
+                }));
+                items
+            }
+        };
+        let range = json!({ "start": text_position(text, start), "end": text_position(text, end) });
+        let call_follows = text[end..].starts_with('(');
+        let out: Vec<Value> = items
+            .into_iter()
+            .filter(|i| i.name != PLACEHOLDER)
+            .map(|i| {
+                let callable = matches!(i.kind, ItemKind::Function | ItemKind::Method);
+                let (new_text, snippet) = if callable && !call_follows {
+                    if i.detail.starts_with("()") {
+                        (format!("{}()", i.name), false)
+                    } else {
+                        (format!("{}($1)$0", i.name), true)
+                    }
+                } else {
+                    (i.name.clone(), false)
+                };
+                let label = if i.kind == ItemKind::Variable { format!("${}", i.name) } else { i.name.clone() };
+                json!({
+                    "label": label,
+                    "kind": completion_kind(i.kind),
+                    "detail": i.detail,
+                    "filterText": i.name,
+                    "insertTextFormat": if snippet { 2 } else { 1 },
+                    "textEdit": { "range": range, "newText": new_text },
+                })
+            })
+            .collect();
+        json!(out)
+    }
+
+    fn definition(&self, path: &Path, line: u64, character: u64) -> Value {
+        let Some(text) = self.open.get(path) else {
+            return Value::Null;
+        };
+        let offset = offset_of(text, line, character);
+        let a = self.analyze_text(path, text.clone());
+        let (Some(ix), Some(file)) = (&a.index, a.entry_file) else { return Value::Null };
+        let Some(def) = ix.definition(file, offset) else { return Value::Null };
+        let src = a.sources.get(def.file);
+        // Built-in modules have no file to open.
+        let Some(p) = &src.path else { return Value::Null };
+        json!({
+            "uri": path_to_uri(p),
+            "range": { "start": position(src, def.start), "end": position(src, def.end) },
+        })
     }
 
     fn check(&mut self, path: &Path, out: &mut impl Write) {
@@ -227,6 +465,8 @@ pub fn run() {
                 "capabilities": {
                     "textDocumentSync": { "openClose": true, "change": 1, "save": { "includeText": false } },
                     "hoverProvider": true,
+                    "completionProvider": { "triggerCharacters": ["$", ">", ":"] },
+                    "definitionProvider": true,
                 },
                 "serverInfo": { "name": "phv", "version": env!("CARGO_PKG_VERSION") },
             })),
@@ -266,6 +506,23 @@ pub fn run() {
                 }
                 None
             }
+            "textDocument/completion" => match doc_path() {
+                Some(p) => Some(server.completion(
+                    &p,
+                    params["position"]["line"].as_u64().unwrap_or(0),
+                    params["position"]["character"].as_u64().unwrap_or(0),
+                    params["context"]["triggerKind"].as_u64() == Some(1),
+                )),
+                None => Some(Value::Null),
+            },
+            "textDocument/definition" => match doc_path() {
+                Some(p) => Some(server.definition(
+                    &p,
+                    params["position"]["line"].as_u64().unwrap_or(0),
+                    params["position"]["character"].as_u64().unwrap_or(0),
+                )),
+                None => Some(Value::Null),
+            },
             "textDocument/hover" => match doc_path() {
                 Some(p) => Some(server.hover(
                     &p,
@@ -296,6 +553,147 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SHAPES: &str = "export class Shape {\n    private int $secret = 0;\n\
+        \x20   public function __construct(public string $name) {}\n\
+        \x20   public function area(): float { return 0.0; }\n\
+        \x20   public static function unit(): Shape { return new Shape(\"unit\"); }\n}\n\
+        export enum Color { case Red; case Green; }\n\
+        export function make(string $name): Shape { return new Shape($name); }\n";
+
+    /// A project in a temporary directory with `lib/shapes.phv` and a template;
+    /// each call opens `text` (`|` marks the cursor) as `page.phv` or `view.phv.html`.
+    struct Project {
+        dir: PathBuf,
+    }
+
+    impl Project {
+        fn new(name: &str) -> Project {
+            let dir = std::env::temp_dir().join(format!("phv-lsp-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(dir.join("lib")).unwrap();
+            std::fs::write(dir.join("phv.toml"), "[project]\nname = \"t\"\n").unwrap();
+            std::fs::write(dir.join("lib/shapes.phv"), SHAPES).unwrap();
+            std::fs::write(dir.join("page.phv"), "").unwrap();
+            std::fs::write(dir.join("view.phv.html"), "").unwrap();
+            Project { dir }
+        }
+
+        fn open(&self, file: &str, text: &str) -> (Server, PathBuf, u64, u64) {
+            let cursor = text.find('|').unwrap();
+            let text = text.replacen('|', "", 1);
+            let before = &text[..cursor];
+            let line = before.matches('\n').count() as u64;
+            let character = before[before.rfind('\n').map_or(0, |i| i + 1)..].encode_utf16().count() as u64;
+            let path = self.dir.join(file);
+            let mut server = Server { open: HashMap::new(), reported: HashMap::new() };
+            server.open.insert(path.clone(), text);
+            (server, path, line, character)
+        }
+
+        fn complete(&self, file: &str, text: &str) -> Vec<String> {
+            let (server, path, line, character) = self.open(file, text);
+            let result = server.completion(&path, line, character, true);
+            result.as_array().unwrap().iter().map(|i| i["label"].as_str().unwrap().to_string()).collect()
+        }
+
+        /// The file name and the text of the definition found at the cursor.
+        fn definition(&self, file: &str, text: &str) -> Option<(String, String)> {
+            let (server, path, line, character) = self.open(file, text);
+            let loc = server.definition(&path, line, character);
+            let target = uri_to_path(loc["uri"].as_str()?)?;
+            let content = server.open.get(&target).cloned().or_else(|| std::fs::read_to_string(&target).ok())?;
+            let start = offset_of(
+                &content,
+                loc["range"]["start"]["line"].as_u64()?,
+                loc["range"]["start"]["character"].as_u64()?,
+            );
+            let end =
+                offset_of(&content, loc["range"]["end"]["line"].as_u64()?, loc["range"]["end"]["character"].as_u64()?);
+            let name = target.file_name()?.to_string_lossy().into_owned();
+            Some((name, content[start as usize..end as usize].to_string()))
+        }
+    }
+
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn completes_members() {
+        let p = Project::new("members");
+        let import = "<?phv\nimport lib.shapes.{Shape, Color, make};\n";
+        // The statement is unfinished: the next line follows without a `;`.
+        let got = p.complete("page.phv", &format!("{import}$s = make(\"a\");\n$s->|\necho 1;\n"));
+        assert_eq!(got, ["name", "area"]);
+        let got = p.complete("page.phv", &format!("{import}echo make(\"a\")->na|;\n"));
+        assert_eq!(got, ["name", "area"]);
+        let got = p.complete("page.phv", &format!("{import}$c = Color::|"));
+        assert_eq!(got, ["Red", "Green"]);
+        let got = p.complete("page.phv", &format!("{import}$u = Shape::|"));
+        assert_eq!(got, ["unit"]);
+        let got = p.complete("page.phv", "<?phv\n$t = \"x\";\necho $t->|;\n");
+        assert!(got.contains(&"trim".to_string()) && got.contains(&"len".to_string()), "{got:?}");
+        // Private members are listed inside the class only.
+        let got = p.complete(
+            "page.phv",
+            "class A {\n    private int $x = 1;\n    public function f(): int { return $this->|; }\n}\n",
+        );
+        assert_eq!(got, ["x", "f"]);
+    }
+
+    #[test]
+    fn completes_variables_in_scope() {
+        let p = Project::new("vars");
+        let got = p.complete(
+            "page.phv",
+            "<?phv\n$a = 1;\nfunction f(string $param): int {\n    $local = 2;\n    return $|;\n}\n$b = 2;\n",
+        );
+        assert_eq!(got, ["$param", "$local"]);
+        let got = p.complete("page.phv", "<?phv\n$a = 1;\necho $|\n$later = 2;\n");
+        assert_eq!(got, ["$a"]);
+        // Arrow functions see the variables around them.
+        let got = p.complete("page.phv", "<?phv\n$outer = 1;\n$xs = [1, 2]->map(fn(int $x) => $x + $|);\n");
+        assert!(got.starts_with(&["$x".to_string(), "$outer".to_string()]), "{got:?}");
+        // A template opened on its own knows its parameters.
+        let got = p.complete("view.phv.html", "<?phv params(string $title, int $count) ?>\n<h1><?= $| ?></h1>\n");
+        assert_eq!(got, ["$title", "$count"]);
+    }
+
+    #[test]
+    fn completes_names_only_in_code() {
+        let p = Project::new("names");
+        let got = p.complete("page.phv", "<?phv\nimport lib.shapes.{make};\nma|\n");
+        assert!(got.contains(&"make".to_string()) && got.contains(&"match".to_string()), "{got:?}");
+        assert!(p.complete("page.phv", "<?phv ?>\n<p>He|llo</p>\n").is_empty());
+        assert!(p.complete("page.phv", "<?phv\n$s = \"ab|c\";\n").is_empty());
+        assert!(p.complete("page.phv", "<?phv\n// a com|ment\n").is_empty());
+        assert!(p.complete("view.phv.html", "<p>Hel|lo</p>\n").is_empty());
+    }
+
+    #[test]
+    fn finds_definitions() {
+        let p = Project::new("defs");
+        let import = "<?phv\nimport lib.shapes.{Shape, Color, make};\n";
+        let def = |text: &str| p.definition("page.phv", &format!("{import}{text}"));
+        let shapes = |s: &str| Some(("shapes.phv".to_string(), s.to_string()));
+        assert_eq!(def("$s = ma|ke(\"a\");\n"), shapes("make"));
+        assert_eq!(def("$s = new Sh|ape(\"a\");\n"), shapes("Shape"));
+        assert_eq!(def("echo make(\"a\")->ar|ea();\n"), shapes("area"));
+        assert_eq!(def("echo make(\"a\")->na|me;\n"), shapes("public string $name"));
+        assert_eq!(def("$c = Color::Gr|een;\n"), shapes("case Green;"));
+        assert_eq!(def("$u = Shape::un|it();\n"), shapes("unit"));
+        assert_eq!(
+            p.definition("page.phv", "<?phv\n$total = 1;\n$total = 2;\necho $to|tal;\n"),
+            Some(("page.phv".into(), "$total".into()))
+        );
+        assert_eq!(
+            p.definition("page.phv", "<?phv\necho render(\"vi|ew.phv.html\");\n"),
+            Some(("view.phv.html".into(), String::new()))
+        );
+        assert_eq!(def("echo 1|;\n"), None);
+    }
 
     #[test]
     fn converts_positions() {

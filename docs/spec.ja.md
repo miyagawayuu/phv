@@ -905,7 +905,7 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
 | `phv serve dir` | Web サーバー(`--port`、`--host`、`--prod`、`--time-limit`) |
 | `phv test [paths]` | `*_test.phv` の `test_*` 関数を実行(1 テストごとに新しい VM) |
 | `phv fmt [paths] [--check]` | インデントと空白を整える(文字列・コメント・HTML は変えない) |
-| `phv lsp` | エディタ用の Language Server(入力中のエラー表示、ホバーで型を表示) |
+| `phv lsp` | エディタ用の Language Server(入力中のエラー表示、ホバーで型を表示、補完、定義へのジャンプ) |
 | `phv install` | `[dependencies]` を取得して `phv.lock` に固定 |
 | `phv migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
 | `phv disasm file.phv` | バイトコードを表示 |
@@ -990,7 +990,7 @@ phv migrate legacy/page.php      # page.phv を書き出す
 - 非同期 I/O、HTTP クライアント
 - JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
 - 推移的な依存関係の解決、パッケージレジストリ
-- LSP の定義ジャンプ・補完、`phv fmt` の行の折り返し
+- `phv fmt` の行の折り返し
 - 複数プロセスで共有できるレート制限、データベースに保存するセッション
 
 セキュリティ監査の結果と残っているリスクは [security-audit.ja.md](security-audit.ja.md) を参照。

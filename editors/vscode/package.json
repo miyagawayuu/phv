@@ -1,7 +1,7 @@
 {
   "name": "phv-language",
   "displayName": "PHV Language",
-  "description": "PHV language support: syntax highlighting for .phv and .phv.html, and diagnostics and hover types from `phv lsp`.",
+  "description": "PHV language support: syntax highlighting for .phv and .phv.html, and diagnostics, hover types, completion and go to definition from `phv lsp`.",
   "version": "0.3.0",
   "publisher": "phv-lang",
   "license": "MIT",
@@ -77,7 +77,7 @@
         "phv.lsp.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Start `phv lsp` for diagnostics and hover types."
+          "description": "Start `phv lsp` for diagnostics, hover types, completion and go to definition."
         }
       }
     }

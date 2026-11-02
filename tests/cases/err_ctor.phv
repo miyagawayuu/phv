@@ -12,6 +12,11 @@ class Token {
 
 class MyDb extends Database {}
 
+// A static constructor is an error (it must not stop the checker).
+class Point {
+    static public function __construct(public int $x) {}
+}
+
 echo Token::make()->value, "\n";
 $t = new Token("forged");
 $db = new Database(0);

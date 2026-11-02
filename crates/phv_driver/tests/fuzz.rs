@@ -1,8 +1,9 @@
 //! Deterministic fuzzing of the front end: mutated versions of the golden
-//! programs go through lexing, parsing, type checking, compilation and the
-//! JIT. Any panic is a bug (bad input must become a diagnostic).
+//! programs go through lexing, parsing, type checking (also the way an editor
+//! does, past syntax errors), compilation and the JIT. Any panic is a bug
+//! (bad input must become a diagnostic).
 
-use phv_driver::compile_with_overlay;
+use phv_driver::{analyze_for_editor, compile_with_overlay};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -158,6 +159,8 @@ fn front_end_never_panics() {
                     let overlay = HashMap::from([(key.clone(), text.clone())]);
                     let r = std::panic::catch_unwind(|| {
                         let _ = phv_syntax::format::format_source(&text);
+                        // Editors check code even when it has syntax errors.
+                        let _ = analyze_for_editor(&root, case, overlay.clone());
                         if let Ok(mut c) = compile_with_overlay(&root, case, overlay) {
                             c.enable_jit();
                         }

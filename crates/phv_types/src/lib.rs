@@ -3,7 +3,8 @@
 pub mod builtins;
 mod check;
 pub mod hir;
+pub mod index;
 pub mod query;
 pub mod types;
 
-pub use check::{check, CheckInput, ModuleInput, ModuleKind};
+pub use check::{check, check_for_editor, CheckInput, ModuleInput, ModuleKind};

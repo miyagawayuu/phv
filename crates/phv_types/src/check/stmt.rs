@@ -71,7 +71,7 @@ impl Checker<'_> {
                 }
                 let h = self.expr_to(value, &ty);
                 let vt = h.ty.clone();
-                let id = self.cx().declare(name, ty.clone());
+                let id = self.cx().declare(name, ty.clone(), *name_span);
                 self.set_local(id, &ty, vt);
                 out.push(HStmt::Assign(HPlace { base: HPlaceBase::Local(id), path: Vec::new() }, h));
             }
@@ -208,7 +208,7 @@ impl Checker<'_> {
                     let exc = self.exception_class();
                     let mut classes = Vec::new();
                     for (name, span) in &c.classes {
-                        match self.lookup_class(name) {
+                        match self.class_ref(name, *span) {
                             Some(cid) if exc.is_some_and(|e| self.is_subclass(cid, e)) => classes.push(cid),
                             Some(_) => {
                                 self.error(format!("`{name}` is not an exception class"), *span);
@@ -292,11 +292,11 @@ impl Checker<'_> {
     /// Declares (or reuses) a variable that a loop or `catch` binds. When an
     /// existing variable of the same name has a different type, the loop or
     /// `catch` binds a new variable that shadows it from here on.
-    fn loop_var(&mut self, name: &str, ty: Type, _span: Span) -> LocalId {
+    fn loop_var(&mut self, name: &str, ty: Type, span: Span) -> LocalId {
         let existing = self.cx().names.get(name).copied();
         let id = match existing {
             Some(id) if self.assignable_exact(&ty, &self.ctx.last().unwrap().locals[id as usize].ty) => id,
-            _ => self.cx().declare(name, ty.clone()),
+            _ => self.cx().declare(name, ty.clone(), span),
         };
         let declared = self.cx().locals[id as usize].ty.clone();
         self.set_local(id, &declared, ty);
@@ -412,7 +412,7 @@ impl Checker<'_> {
                             }
                             t => t.clone(),
                         };
-                        let id = self.cx().declare(name, ty);
+                        let id = self.cx().declare(name, ty, target.span);
                         self.cx().flow.mark(id);
                         out.push(HStmt::Assign(HPlace { base: HPlaceBase::Local(id), path: Vec::new() }, h));
                     }

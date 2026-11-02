@@ -4,8 +4,11 @@ Language support for [PHV](https://phv-lang.org):
 
 - Syntax highlighting for `.phv` files and `.phv.html` templates, including HTML around `<?phv ... ?>` /
   `<?= ... ?>`, string interpolation (`"Hello, {$name}"`) and SQL in `sql"..."` literals.
-- Errors and warnings as you type, and the type of an expression on hover, from the PHV language server
-  (`phv lsp`).
+- From the PHV language server (`phv lsp`):
+  - errors and warnings as you type, and the type of an expression on hover;
+  - completion of variables, properties and methods after `->` and `::`, functions, classes and keywords;
+  - go to definition (F12) for variables, functions, classes, methods, properties, imports and the templates
+    passed to `render()`.
 - Comment toggling, bracket matching and auto-closing pairs.
 
 ## Installing

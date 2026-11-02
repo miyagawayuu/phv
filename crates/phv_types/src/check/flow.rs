@@ -75,6 +75,8 @@ pub(crate) struct Saved {
 
 pub(crate) struct FnCtx {
     pub locals: Vec<HLocal>,
+    /// Where each local is first assigned or declared.
+    pub spans: Vec<Span>,
     pub names: HashMap<String, LocalId>,
     pub flow: Flow,
     pub ret: Type,
@@ -94,6 +96,7 @@ impl FnCtx {
     pub fn new(ret: Type, class: Option<ClassId>, kind: FuncKind) -> FnCtx {
         FnCtx {
             locals: Vec::new(),
+            spans: Vec::new(),
             names: HashMap::new(),
             flow: Flow::default(),
             ret,
@@ -107,9 +110,10 @@ impl FnCtx {
         }
     }
 
-    pub fn declare(&mut self, name: &str, ty: Type) -> LocalId {
+    pub fn declare(&mut self, name: &str, ty: Type, span: Span) -> LocalId {
         let id = self.locals.len() as LocalId;
         self.locals.push(HLocal { name: name.to_string(), ty });
+        self.spans.push(span);
         self.names.insert(name.to_string(), id);
         id
     }
@@ -119,6 +123,7 @@ impl FnCtx {
         let id = self.locals.len() as LocalId;
         self.temps += 1;
         self.locals.push(HLocal { name: format!("%t{}", self.temps), ty });
+        self.spans.push(Span::default());
         self.flow.mark(id);
         id
     }
@@ -249,7 +254,12 @@ impl Checker<'_> {
     /// Reads a variable, capturing it from enclosing functions for arrow functions.
     pub(crate) fn read_var(&mut self, name: &str, span: Span) -> Option<(LocalId, Type)> {
         let level = self.ctx.len() - 1;
-        self.read_var_at(level, name, span, true)
+        let found = self.read_var_at(level, name, span, true);
+        if let Some((id, _)) = found {
+            let def = self.ctx[level].spans[id as usize];
+            self.note_ref(span, def);
+        }
+        found
     }
 
     fn read_var_at(&mut self, level: usize, name: &str, span: Span, report: bool) -> Option<(LocalId, Type)> {
@@ -267,8 +277,9 @@ impl Checker<'_> {
         }
         if (ctx.auto_capture || name == "this") && level > 0 {
             if let Some((outer, ty)) = self.read_var_at(level - 1, name, span, false) {
+                let def = self.ctx[level - 1].spans[outer as usize];
                 let ctx = &mut self.ctx[level];
-                let id = ctx.declare(name, ty.clone());
+                let id = ctx.declare(name, ty.clone(), def);
                 ctx.flow.mark(id);
                 ctx.captures.push((id, outer));
                 return Some((id, ty));

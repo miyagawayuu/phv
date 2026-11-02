@@ -1,4 +1,4 @@
-// PHV for VS Code: starts `phv lsp` for diagnostics and hover types.
+// PHV for VS Code: starts `phv lsp` for diagnostics, hover types, completion and go to definition.
 // Syntax highlighting needs no code; it comes from the grammars in syntaxes/.
 
 const vscode = require("vscode");

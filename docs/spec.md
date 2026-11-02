@@ -910,7 +910,7 @@ When code uses a PHP function name, the error message suggests the alternative
 | `phv serve dir` | Web server (`--port`, `--host`, `--prod`, `--time-limit`) |
 | `phv test [paths]` | Run the `test_*` functions in `*_test.phv` files (a new VM for each test) |
 | `phv fmt [paths] [--check]` | Normalize indentation and whitespace (strings, comments, and HTML are not changed) |
-| `phv lsp` | Language Server for editors (errors as you type, types on hover) |
+| `phv lsp` | Language Server for editors (errors as you type, types on hover, completion, go to definition) |
 | `phv install` | Fetch `[dependencies]` and pin them in `phv.lock` |
 | `phv migrate file.php` | Convert PHP mechanically and list the places that need manual work |
 | `phv disasm file.phv` | Show the bytecode |
@@ -995,7 +995,7 @@ It then runs the type checker and shows the places that need manual work, such a
 - Asynchronous I/O, HTTP client
 - Wider JIT coverage (functions that handle floats and strings), AOT compilation
 - Transitive dependency resolution, a package registry
-- Go-to-definition and completion in the LSP, line wrapping in `phv fmt`
+- Line wrapping in `phv fmt`
 - Rate limiting shared across multiple processes, sessions stored in a database
 
 See [security-audit.md](security-audit.md) for the results of the security audit and the remaining risks.

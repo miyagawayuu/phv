@@ -386,6 +386,7 @@ pub enum ExprKind {
         class: String,
         class_span: Span,
         name: String,
+        name_span: Span,
         args: Vec<Arg>,
     },
     /// `Suit::Hearts` (enum case) or `Config::MAX` (class constant).

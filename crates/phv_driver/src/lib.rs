@@ -357,6 +357,8 @@ pub struct Analysis {
     pub hir: Option<phv_types::hir::HProgram>,
     pub entry_file: Option<u32>,
     pub messages: Vec<String>,
+    /// Only from `analyze_for_editor`.
+    pub index: Option<phv_types::index::EditorIndex>,
     deps: Vec<Dep>,
 }
 
@@ -378,6 +380,17 @@ pub fn package_dirs(root: &Path, config: &Config) -> HashMap<String, PathBuf> {
 /// Loads and type-checks `entry`, using `overlay` (canonical path to text)
 /// instead of files on disk where given.
 pub fn analyze(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>) -> Analysis {
+    analyze_with(root, entry, overlay, false)
+}
+
+/// Like `analyze`, also building the editor index. Code with syntax errors is
+/// still checked (the parser skips the broken statements), so completion
+/// works while a line is half written.
+pub fn analyze_for_editor(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>) -> Analysis {
+    analyze_with(root, entry, overlay, true)
+}
+
+fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, editor: bool) -> Analysis {
     let mut messages = Vec::new();
     let config = load_config(root).unwrap_or_else(|e| {
         messages.push(e);
@@ -413,20 +426,25 @@ pub fn analyze(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>) -> 
                 hir: None,
                 entry_file: None,
                 messages,
+                index: None,
                 deps: Vec::new(),
             };
         }
     };
     let name = display_name(root, entry);
-    let entry_module = loader.add(name, Some(entry.to_path_buf()), text, ModuleKind::Entry);
+    // An editor can open a template on its own; it is checked as a template.
+    let template = editor && entry.to_string_lossy().ends_with(".phv.html");
+    let kind = if template { ModuleKind::Template } else { ModuleKind::Entry };
+    let entry_module = loader.add(name, Some(entry.to_path_buf()), text, kind);
     let entry_file = Some(loader.modules[entry_module].0.file);
-    if loader.diags.iter().any(|d| d.is_error()) {
+    if !editor && loader.diags.iter().any(|d| d.is_error()) {
         return Analysis {
             sources: loader.sources,
             diags: loader.diags,
             hir: None,
             entry_file,
             messages,
+            index: None,
             deps: loader.deps,
         };
     }
@@ -439,13 +457,27 @@ pub fn analyze(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>) -> 
         imports: loader.imports.clone(),
         templates: loader.templates.clone(),
     };
-    let (hir, diags) = phv_types::check(&input);
+    let (hir, diags, index) = if editor {
+        let (hir, diags, index) = phv_types::check_for_editor(&input);
+        (hir, diags, Some(index))
+    } else {
+        let (hir, diags) = phv_types::check(&input);
+        (hir, diags, None)
+    };
     drop(input);
     loader.diags.extend(diags);
     if config.csp.allows_inline_code() {
         loader.diags.retain(|d| d.code != Some(phv_syntax::diag::CSP_INLINE));
     }
-    Analysis { sources: loader.sources, diags: loader.diags, hir: Some(hir), entry_file, messages, deps: loader.deps }
+    Analysis {
+        sources: loader.sources,
+        diags: loader.diags,
+        hir: Some(hir),
+        entry_file,
+        messages,
+        index,
+        deps: loader.deps,
+    }
 }
 
 /// Loads, checks and compiles `entry` (and everything it uses).

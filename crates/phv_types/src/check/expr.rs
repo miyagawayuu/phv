@@ -496,7 +496,7 @@ impl<'a> Checker<'a> {
             "Html" => TestKind::Html,
             "list" => TestKind::List,
             "map" => TestKind::Map,
-            other => match self.lookup_class(other) {
+            other => match self.class_ref(other, ty.span) {
                 Some(c) => TestKind::Class(c),
                 None => {
                     self.error(format!("unknown type `{other}`"), ty.span);
@@ -644,6 +644,9 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Name(n) => {
                 if let Some((c, t)) = self.lookup_const(n) {
+                    if let Some(def) = self.const_span(n) {
+                        self.note_ref(span, def);
+                    }
                     return hconst(c, t, span);
                 }
                 if self.lookup_func(n).is_some() || self.builtin_overloads(n, None).is_some() {
@@ -711,8 +714,8 @@ impl<'a> Checker<'a> {
                 }
                 self.nullsafe(ho, *nullsafe, span, f)
             }
-            ExprKind::StaticCall { class, class_span, name, args } => {
-                self.static_call(class, *class_span, name, args, span)
+            ExprKind::StaticCall { class, class_span, name, name_span, args } => {
+                self.static_call(class, *class_span, name, *name_span, args, span)
             }
             ExprKind::New { class, class_span, args } => self.new_expr(class, *class_span, args, span),
             ExprKind::Index { base, index } => self.index(base, index.as_deref(), span),
@@ -1087,6 +1090,7 @@ impl<'a> Checker<'a> {
                 return self.render(args, span);
             }
             if let Some(fid) = self.lookup_func(name) {
+                self.note_ref(callee.span, self.funcs[fid as usize].span);
                 let (hargs, ret) = self.invoke(fid, args, span);
                 return HExpr { kind: HExprKind::Call(fid, hargs), ty: ret, span };
             }
@@ -1344,6 +1348,7 @@ impl<'a> Checker<'a> {
     }
 
     fn method_on(&mut self, recv: HExpr, name: &str, name_span: Span, args: &[Arg], span: Span) -> HExpr {
+        self.note_site(name_span, &recv.ty, false);
         let recv = match self.as_single_class(&recv.ty) {
             Some(t) => HExpr { ty: t, ..recv },
             None => recv,
@@ -1373,6 +1378,7 @@ impl<'a> Checker<'a> {
                     }
                     return err(span);
                 };
+                self.note_ref(name_span, self.funcs[m.func as usize].span);
                 let fname = self.funcs[m.func as usize].name.clone();
                 if !self.can_access(m.owner, m.vis) {
                     self.error(format!("method `{fname}` is {}", Self::vis_word(m.vis)), name_span);
@@ -1407,6 +1413,7 @@ impl<'a> Checker<'a> {
 
     /// Resolves `$obj->name` to a field slot, checking visibility.
     fn prop_access(&mut self, obj: &HExpr, name: &str, name_span: Span) -> Option<(u32, FieldInfo)> {
+        self.note_site(name_span, &obj.ty, false);
         let ty = self.as_single_class(&obj.ty).unwrap_or_else(|| obj.ty.clone());
         match ty {
             Type::Class(c) => {
@@ -1420,6 +1427,7 @@ impl<'a> Checker<'a> {
                     return None;
                 };
                 let f = self.classes[c as usize].fields[slot as usize].clone();
+                self.note_ref(name_span, f.span);
                 if !self.can_access(f.owner, f.vis) {
                     self.error(format!("property `{cname}::${name}` is {}", Self::vis_word(f.vis)), name_span);
                 }
@@ -1554,7 +1562,15 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn static_call(&mut self, class: &str, class_span: Span, name: &str, args: &[Arg], span: Span) -> HExpr {
+    fn static_call(
+        &mut self,
+        class: &str,
+        class_span: Span,
+        name: &str,
+        name_span: Span,
+        args: &[Arg],
+        span: Span,
+    ) -> HExpr {
         let cur = self.cx().class;
         if class == "parent" {
             let Some(parent) = cur.and_then(|c| self.classes[c as usize].parent) else {
@@ -1599,7 +1615,7 @@ impl<'a> Checker<'a> {
                 }
             }
         } else {
-            match self.lookup_class(class) {
+            match self.class_ref(class, class_span) {
                 Some(c) => c,
                 None => {
                     self.error(format!("unknown class `{class}`"), class_span);
@@ -1612,11 +1628,13 @@ impl<'a> Checker<'a> {
                 return h;
             }
         }
+        self.note_site(name_span, &Type::Class(cid), true);
         let Some(m) = self.classes[cid as usize].methods.get(name).cloned() else {
             let cname = self.class_names[cid as usize].clone();
-            self.error(format!("class `{cname}` has no method `{name}`"), span);
+            self.error(format!("class `{cname}` has no method `{name}`"), name_span);
             return err(span);
         };
+        self.note_ref(name_span, self.funcs[m.func as usize].span);
         let fname = self.funcs[m.func as usize].name.clone();
         if !m.is_static {
             self.error(format!("`{fname}` is not static; call it on an object with `->{name}()`"), span);
@@ -1664,12 +1682,16 @@ impl<'a> Checker<'a> {
         let cid = match class {
             "self" | "static" => cur,
             "parent" => cur.and_then(|c| self.classes[c as usize].parent),
-            other => self.lookup_class(other),
+            other => self.class_ref(other, class_span),
         };
         let Some(cid) = cid else {
             self.error(format!("unknown class `{class}`"), class_span);
             return err(span);
         };
+        self.note_site(name_span, &Type::Class(cid), true);
+        if let Some(def) = self.member_const_span(cid, name) {
+            self.note_ref(name_span, def);
+        }
         if let Some(idx) = self.classes[cid as usize].cases.iter().position(|(n, _)| n == name) {
             return HExpr { kind: HExprKind::EnumCase(cid, idx as u32), ty: Type::Class(cid), span };
         }
@@ -1682,7 +1704,7 @@ impl<'a> Checker<'a> {
     }
 
     fn new_expr(&mut self, class: &str, class_span: Span, args: &[Arg], span: Span) -> HExpr {
-        let cid = if class == "self" { self.cx().class } else { self.lookup_class(class) };
+        let cid = if class == "self" { self.cx().class } else { self.class_ref(class, class_span) };
         let Some(cid) = cid else {
             let e = self.error(format!("unknown class `{class}`"), class_span);
             if class == "stdClass" {
@@ -1744,6 +1766,7 @@ impl<'a> Checker<'a> {
             self.error(format!("template `{key}` was not found"), args[0].value.span);
             return err(span);
         };
+        self.note_ref(args[0].value.span, Span::new(self.input.modules[mi].ast.file, 0, 0));
         let fid = self.template_funcs[&mi];
         let params = self.funcs[fid as usize].params.clone();
         let hargs = self.call_args(&format!("template `{key}`"), &params, &args[1..], span);
@@ -1780,7 +1803,7 @@ impl<'a> Checker<'a> {
             if p.promote.is_some() {
                 self.error("closure parameters cannot be promoted", p.span);
             }
-            param_infos.push(ParamInfo { name: p.name.clone(), ty, default: None, promote: None });
+            param_infos.push(ParamInfo { name: p.name.clone(), ty, default: None, promote: None, span: p.span });
         }
         let declared_ret = c.ret.as_ref().map(|t| self.resolve_type(t, class));
         let ret_known = declared_ret.or_else(|| exp_ret.filter(|r| !r.has_unknown()));
@@ -1789,14 +1812,14 @@ impl<'a> Checker<'a> {
         ctx.auto_capture = c.arrow;
         for (u, uspan) in &c.uses {
             if let Some((outer, ty)) = self.read_var(u, *uspan) {
-                let id = ctx.declare(u, ty);
+                let id = ctx.declare(u, ty, *uspan);
                 ctx.flow.mark(id);
                 ctx.captures.push((id, outer));
             }
         }
         let mut param_ids = Vec::new();
         for p in &param_infos {
-            let id = ctx.declare(&p.name, p.ty.clone());
+            let id = ctx.declare(&p.name, p.ty.clone(), p.span);
             ctx.flow.mark(id);
             param_ids.push(id);
         }
@@ -1830,6 +1853,7 @@ impl<'a> Checker<'a> {
             }
         };
         let ctx = self.ctx.pop().unwrap();
+        self.note_scope(span, &ctx);
         let file = self.input.modules[self.module].ast.file;
         let param_tys: Vec<Type> = param_infos.iter().map(|p| p.ty.clone()).collect();
         let fid = self.add_func(FuncInfo {

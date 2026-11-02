@@ -1,22 +1,28 @@
-error: the constructor of `Token` is private
-  --> err_ctor.phv:16:10
+error: constructors cannot be static
+  --> err_ctor.phv:17:28
    |
-16 | $t = new Token("forged");
+17 |     static public function __construct(public int $x) {}
+   |                            ^^^^^^^^^^^
+
+error: the constructor of `Token` is private
+  --> err_ctor.phv:21:10
+   |
+21 | $t = new Token("forged");
    |          ^^^^^
    = note: create it with one of its static methods, e.g. `Token::open(...)`
 
 error: the constructor of `Database` is private
-  --> err_ctor.phv:17:11
+  --> err_ctor.phv:22:11
    |
-17 | $db = new Database(0);
+22 | $db = new Database(0);
    |           ^^^^^^^^
    = note: create it with one of its static methods, e.g. `Database::open(...)`
 
 error: the constructor of `MyDb` is private
-  --> err_ctor.phv:18:10
+  --> err_ctor.phv:23:10
    |
-18 | $d = new MyDb(1);
+23 | $d = new MyDb(1);
    |          ^^^^
    = note: create it with one of its static methods, e.g. `MyDb::open(...)`
 
-3 errors found
+4 errors found
