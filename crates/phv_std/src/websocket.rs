@@ -6,7 +6,7 @@
 //! calls `close()` or ends, so nothing received for one request can reach the
 //! next. Only text messages are exchanged; pings are answered while reading.
 
-use crate::netio::{check_plain, dial, until, Stream};
+use crate::netio::{check_plain, describe, dial, until, Stream};
 use crate::{float, int, s};
 use phv_vm::{Value, Vm, VmError};
 use std::io::ErrorKind;
@@ -35,7 +35,7 @@ struct Conn {
 impl Drop for Conn {
     fn drop(&mut self) {
         // A polite close; the server's reply is not awaited.
-        let _ = self.ws.get_ref().tcp().set_write_timeout(Some(Duration::from_secs(1)));
+        self.ws.get_mut().set_deadline(Instant::now() + Duration::from_secs(1));
         let _ = self.ws.close(None);
         let _ = self.ws.flush();
     }
@@ -69,9 +69,7 @@ fn io_message(e: &tungstenite::Error) -> String {
         tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
             "the server closed the connection".into()
         }
-        tungstenite::Error::Io(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-            "timed out".into()
-        }
+        tungstenite::Error::Io(e) => describe(e),
         tungstenite::Error::Capacity(_) => format!("the server sent a message larger than {} MB", MAX_MESSAGE >> 20),
         e => e.to_string(),
     }
@@ -132,8 +130,7 @@ pub fn connect(vm: &mut Vm, a: &[Value]) -> R {
 pub fn send(vm: &mut Vm, a: &[Value]) -> R {
     let text = s(&a[1]).to_string();
     with_conn(vm, &a[0], |vm, c| {
-        let left = until(vm, SEND_TIMEOUT).saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-        let _ = c.ws.get_ref().tcp().set_write_timeout(Some(left));
+        c.ws.get_mut().set_deadline(until(vm, SEND_TIMEOUT));
         match c.ws.send(Message::text(text)) {
             Ok(()) => Ok((Ok(Value::Null), false)),
             Err(e) => {
@@ -156,8 +153,8 @@ pub fn receive(vm: &mut Vm, a: &[Value]) -> R {
         let now = Instant::now();
         let stop = vm.deadline().map_or(wait_until, |d| d.min(wait_until));
         // A zero timeout still picks up a message that has already arrived.
-        let left = stop.saturating_duration_since(now).max(Duration::from_millis(1));
-        let _ = c.ws.get_ref().tcp().set_read_timeout(Some(left));
+        // Every socket read and write (also the pongs sent while reading) stops at `stop`.
+        c.ws.get_mut().set_deadline(stop.max(now + Duration::from_millis(1)));
         match c.ws.read() {
             Ok(Message::Text(t)) => return Ok((Ok(Value::str(t.as_str())), false)),
             Ok(Message::Binary(_)) => {
@@ -168,10 +165,16 @@ pub fn receive(vm: &mut Vm, a: &[Value]) -> R {
                 return Ok((Err(vm.throw("NetworkError", "the server closed the connection")), true))
             }
             // Pings are answered by the library; pongs and raw frames carry nothing for the script.
-            Ok(_) => {}
+            // A stream of them still ends at `stop`.
+            Ok(_) => {
+                if Instant::now() >= stop {
+                    vm.check_limits()?;
+                    return Ok((Ok(Value::Null), false));
+                }
+            }
             Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 vm.check_limits()?;
-                if Instant::now() >= wait_until {
+                if Instant::now() >= stop {
                     return Ok((Ok(Value::Null), false));
                 }
             }

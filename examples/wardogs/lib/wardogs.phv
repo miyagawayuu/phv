@@ -237,7 +237,8 @@ export function map_name(string $id): string {
 
 /** 754.2 → "12:34", 4000 → "1:06:40". */
 export function format_clock(float $seconds): string {
-    $total = (int)floor(max($seconds, 0.0));
+    // The server's number, capped: a huge or broken value must not stop the page.
+    $total = (int)floor(min(max($seconds, 0.0), 1.0e9));
     $h = intdiv($total, 3600);
     $m = intdiv($total % 3600, 60);
     $s = ((string)($total % 60))->padStart(2, "0");
@@ -258,7 +259,8 @@ function int_of(any $v): ?int {
     if ($v is int) {
         return $v;
     }
-    if ($v is float) {
+    // Out-of-range (or NaN) numbers from the server count as missing.
+    if ($v is float && $v > -1.0e15 && $v < 1.0e15) {
         return (int)round($v);
     }
     return null;

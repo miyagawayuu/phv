@@ -1,0 +1,9 @@
+// Leaves a custom type looked up on the pooled connection (see postgres_types_after.phv).
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->execute(sql"DROP TYPE IF EXISTS phv_mood");
+$db->execute(sql"DROP TYPE IF EXISTS phv_color");
+$db->execute(sql"CREATE TYPE phv_mood AS ENUM ('sad', 'ok')");
+$db->execute(sql"CREATE TYPE phv_color AS ENUM ('red', 'blue')");
+echo "mood: ", $db->first(sql"SELECT 'sad'::phv_mood AS m")?->string("m") ?? "", "\n";

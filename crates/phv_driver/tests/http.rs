@@ -111,6 +111,21 @@ fn server() -> String {
                         std::thread::sleep(Duration::from_secs(60));
                         return;
                     }
+                    // One byte of the headers every 300 ms: each read finishes in time,
+                    // the response never does.
+                    "/v1/drip" => {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\n");
+                        for _ in 0..200 {
+                            if s.write_all(b"X").is_err() {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(300));
+                        }
+                        return;
+                    }
+                    "/v1/chunk-overflow" => {
+                        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\nffffffffffffffff\r\n".into()
+                    }
                     _ => {
                         // Headers the script cannot see otherwise, sorted for a stable output.
                         let mut hs: Vec<String> = headers
@@ -172,13 +187,24 @@ fn requests() {
     golden("requests", &actual);
 }
 
-/// Waiting for an answer stops at the script's time limit.
+/// Waiting for an answer stops at the script's time limit, also when the
+/// server keeps sending a byte now and then.
 #[test]
 fn requests_stop_at_the_time_limit() {
-    let start = Instant::now();
-    let out = run_script(&host(&server(), None), "slow", Some(Duration::from_secs(1)));
-    assert!(out.contains("maximum execution time"), "{out}");
-    assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+    for script in ["slow", "drip"] {
+        let start = Instant::now();
+        let out = run_script(&host(&server(), None), script, Some(Duration::from_secs(1)));
+        assert!(out.contains("maximum execution time"), "{script}: {out}");
+        assert!(start.elapsed() < Duration::from_secs(5), "{script} took {:?}", start.elapsed());
+    }
+}
+
+/// A chunk size near the largest integer is an error, not a crash.
+#[test]
+fn huge_chunk_sizes_are_errors() {
+    let out = run_script(&host(&server(), None), "chunk_overflow", Some(Duration::from_secs(10)));
+    assert!(out.contains("NetworkError") && out.contains("larger than 16 MB"), "{out}");
+    assert!(!out.contains("with overflow") && !out.contains("panicked"), "{out}");
 }
 
 /// Remote services need TLS unless the configuration says otherwise, and

@@ -25,7 +25,7 @@ redirect: 302 http://elsewhere.invalid/
 3: ValueError: the path cannot contain `.` or `..` segments or encoded slashes
 4: ValueError: put the query in the `query` argument, not in the path
 5: ValueError: the Host header is set by PHV
-6: ValueError: the value of the X-Bad header contains a line break
+6: ValueError: the value of the X-Bad header contains a line break or a control character
 7: ValueError: the authorization header comes from phv.toml and cannot be replaced
 8: ValueError: unsupported HTTP method "TRACE"
 NetworkError: no HTTP service named "other" in [http] of phv.toml

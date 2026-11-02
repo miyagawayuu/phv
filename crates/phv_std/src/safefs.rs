@@ -132,8 +132,12 @@ impl DirGuard {
         if !self.exists(name)? {
             return Ok(());
         }
-        let f = imp::open_file(self, name, false)?;
-        check_plain(&f)
+        match imp::open_file(self, name, false) {
+            Ok(f) => check_plain(&f),
+            // Deleted meanwhile (SQLite removes its journal when a transaction ends).
+            Err(FsError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn remove(&self, name: &OsStr) -> Result<(), FsError> {
@@ -345,6 +349,11 @@ mod imp {
     /// fine). Otherwise checks on the name (like "no .phv") could be bypassed.
     fn check_real_name(f: &File, name: &OsStr) -> Result<(), FsError> {
         let real = final_path(f)?;
+        // A file deleted while it is open (POSIX delete semantics) is moved there:
+        // it is gone, not an alias.
+        if real.to_string_lossy().to_ascii_lowercase().contains(r"\$extend\$deleted\") {
+            return Err(FsError::Io(io::ErrorKind::NotFound.into()));
+        }
         let real = real.file_name().map(|n| n.to_string_lossy().to_lowercase());
         if real.as_deref() == Some(name.to_string_lossy().to_lowercase().as_str()) {
             Ok(())
@@ -397,8 +406,11 @@ mod imp {
         if f.metadata()?.file_attributes() & ATTR_REPARSE_POINT != 0 {
             return Err(FsError::Link);
         }
-        check_real_name(&f, name)?;
-        Ok(true)
+        match check_real_name(&f, name) {
+            Ok(()) => Ok(true),
+            Err(FsError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn remove(g: &DirGuard, name: &OsStr) -> Result<(), FsError> {

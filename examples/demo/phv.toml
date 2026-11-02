@@ -14,4 +14,4 @@ memory_limit_mb = 32
 [permissions]
 read = ["public/", "views/", "lib/"]  # the "Source" panels show the code of each page
 write = ["data/"]
-env = ["FLY_REGION"]
+env = ["FLY_REGION", "FLY_APP_NAME"]

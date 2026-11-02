@@ -13,14 +13,16 @@ mod db;
 mod httpclient;
 mod netdb;
 mod netio;
+mod pgmeter;
 pub mod ratelimit;
+mod redisclient;
 pub mod safefs;
 mod sys;
 mod twofactor;
 mod web;
 mod websocket;
 
-pub use httpclient::{check_header_name, check_http_url};
+pub use httpclient::{check_header_name, check_header_value, check_http_url};
 pub use sys::{constant_time_eq, sha256_hex};
 pub use web::{csrf_expected, json_decode, random_hex};
 
@@ -463,7 +465,10 @@ fn safe_url(url: &str) -> String {
         // Relative; `//host` would be protocol-relative (another site).
         _ => !cleaned.starts_with("//"),
     };
-    let ok = ok && !cleaned.starts_with("\\\\") && !cleaned.starts_with("/\\");
+    // Browsers read `\` as `/` here, so `\\host`, `/\host` and `\/host` are `//host` too.
+    let b = cleaned.as_bytes();
+    let slash = |c: u8| c == b'/' || c == b'\\';
+    let ok = ok && !(b.len() >= 2 && slash(b[0]) && slash(b[1]));
     if ok {
         cleaned
     } else {
@@ -801,6 +806,15 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::Bool(scheme && !u.chars().any(|c| c.is_control() || c.is_whitespace())))
         },
         "csp_nonce" => |vm, _| Ok(Value::str(vm.http.csp_nonce.clone().unwrap_or_default())),
+        // An IPv6 address stands for its /64 (one network hands out many), like the
+        // server's own per-client limit; IPv4 addresses and other text are kept.
+        "ip_group" => |_, a| {
+            let ip = s(&a[0]);
+            Ok(Value::str(match ip.parse::<std::net::IpAddr>() {
+                Ok(addr) => ratelimit::client_key(addr),
+                Err(_) => ip.to_string(),
+            }))
+        },
         "rate_limit" => |vm, a| {
             let (max, secs) = (int(&a[1]), int(&a[2]));
             if !(1..=1_000_000).contains(&max) || !(1..=86_400).contains(&secs) {
@@ -881,6 +895,7 @@ mod tests {
             "//evil.com",
             "\\\\evil\\x",
             "/\\evil.com",
+            "\\/evil.com",
         ] {
             assert_eq!(safe_url(bad), "#", "{bad:?}");
         }

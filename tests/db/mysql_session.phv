@@ -1,0 +1,10 @@
+// Changes the role and the database (see mysql_session_after.phv).
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->execute(sql"CREATE DATABASE IF NOT EXISTS phv_other");
+$db->execute(sql"CREATE ROLE IF NOT EXISTS phv_role");
+$db->execute(sql"GRANT phv_role TO CURRENT_USER()");
+$db->execute(sql"SET ROLE phv_role");
+$db->execute(sql"USE phv_other");
+echo "db: ", $db->first(sql"SELECT DATABASE() AS d")?->string("d") ?? "", " role: ", $db->first(sql"SELECT CURRENT_ROLE() AS r")?->string("r") ?? "", "\n";

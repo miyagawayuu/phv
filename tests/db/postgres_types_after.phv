@@ -1,0 +1,7 @@
+// After the pool reset, a type not seen before still works.
+import std.db.Database;
+
+$db = Database::connect("main");
+echo "color: ", $db->first(sql"SELECT 'red'::phv_color AS c")?->string("c") ?? "", "\n";
+$db->execute(sql"DROP TYPE phv_mood");
+$db->execute(sql"DROP TYPE phv_color");

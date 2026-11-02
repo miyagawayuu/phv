@@ -9,11 +9,16 @@
 //! `PHV_BLESS=1` rewrites the expected files.
 
 use phv_driver::{compile_with_overlay, run, RunOptions};
+use phv_vm::alloc::CountingAlloc;
 use phv_vm::{DatabaseSpec, Host, Limits};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+// Memory limits are enforced through the counting allocator.
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc;
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/db")
@@ -25,12 +30,16 @@ fn host(url: &str) -> Arc<Host> {
 }
 
 fn run_script(host: &Arc<Host>, name: &str, max_time: Option<Duration>) -> String {
+    run_limited(host, name, max_time, None)
+}
+
+fn run_limited(host: &Arc<Host>, name: &str, max_time: Option<Duration>, max_memory: Option<usize>) -> String {
     let path = root().join(format!("{name}.phv"));
     let c = match compile_with_overlay(&root(), &path, HashMap::new()) {
         Ok(c) => c,
         Err(e) => return e.render(false),
     };
-    let limits = Limits { max_time, ..Limits::default() };
+    let limits = Limits { max_time, max_memory, ..Limits::default() };
     let outcome = run(&c, RunOptions { html: false, limits, http: None, host: Some(host.clone()) });
     let mut out = outcome.output;
     if let Some(err) = outcome.error {
@@ -59,6 +68,17 @@ fn check_time_limit(host: &Arc<Host>, name: &str) {
     assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
 }
 
+/// A result larger than the memory limit stops the script at the limit while it
+/// is read: the process does not grow far past it, and the connection is not reused.
+fn check_memory_limit(host: &Arc<Host>, name: &str) {
+    phv_vm::alloc::reset_thread_peak();
+    let before = phv_vm::alloc::thread_allocated();
+    let out = run_limited(host, name, Some(Duration::from_secs(30)), Some(16 << 20));
+    assert!(out.contains("allowed memory size of 16 MB exhausted"), "{name}: {out}");
+    let peak = phv_vm::alloc::thread_peak() - before;
+    assert!(peak < 64 << 20, "{name}: {} MB allocated at the peak", peak >> 20);
+}
+
 fn server(var: &str) -> Option<String> {
     let url = std::env::var(var).ok().filter(|u| !u.is_empty());
     if url.is_none() {
@@ -74,6 +94,11 @@ fn postgres() {
     check(&host, "postgres");
     check(&host, "postgres_after");
     check_time_limit(&host, "postgres_slow");
+    check_time_limit(&host, "postgres_timeout_off");
+    check_memory_limit(&host, "postgres_big");
+    check_memory_limit(&host, "postgres_notify");
+    check(&host, "postgres_types");
+    check(&host, "postgres_types_after");
 }
 
 #[test]
@@ -83,12 +108,18 @@ fn mysql() {
     check(&host, "mysql");
     check(&host, "mysql_after");
     check_time_limit(&host, "mysql_slow");
+    check_time_limit(&host, "mysql_timeout_off");
+    check_memory_limit(&host, "mysql_big");
+    check(&host, "mysql_session");
+    check(&host, "mysql_session_after");
 }
 
 #[test]
 fn redis() {
     let Some(url) = server("PHV_TEST_REDIS_URL") else { return };
-    check(&host(&url), "redis");
+    let host = host(&url);
+    check(&host, "redis");
+    check_memory_limit(&host, "redis_big");
 }
 
 /// Remote servers need TLS unless the configuration says otherwise.

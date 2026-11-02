@@ -276,6 +276,11 @@ fn exec(cmd: Command) -> ExitCode {
         }
         Command::Serve { dir, host, port, prod, dev, time_limit } => {
             let loopback = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+            if !dev && !prod && loopback {
+                eprintln!(
+                    "note: development mode (error details are shown in the browser); behind a reverse proxy, run with --prod"
+                );
+            }
             let opts = phv_server::ServeOptions {
                 root: dir,
                 host,

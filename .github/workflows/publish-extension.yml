@@ -5,6 +5,10 @@ name: Publish VS Code extension
 # Marketplace Trusted Publishing: GitHub's OIDC token proves this repository,
 # this workflow file and the `marketplace` environment, so no token is stored.
 # Run it by hand with a tag to publish an earlier release's extension.
+#
+# Every step of this job can ask for the OIDC token, so nothing here runs code
+# that is not pinned: vsce comes from editors/vscode/package-lock.json of the
+# released tag, installed without install scripts.
 on:
   release:
     types: [published]
@@ -25,14 +29,27 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Download the .vsix from the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'phv-*.vsix' --dir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'phv-*.vsix' --pattern SHA256SUMS --dir dist
           ls -l dist
-          # The release must contain exactly one extension package.
+          # The release must contain exactly one extension package, and it must
+          # match the checksum the release workflow recorded.
           test "$(ls dist/*.vsix | wc -l)" -eq 1
+          cd dist && grep ' phv-[0-9.]*\.vsix$' SHA256SUMS | sha256sum -c -
+      - name: Install the pinned vsce
+        working-directory: editors/vscode
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Publish to the Visual Studio Marketplace
-        run: npx --yes @vscode/vsce@4.1.0 publish --oidc --packagePath dist/*.vsix
+        working-directory: editors/vscode
+        run: npx --no-install vsce publish --oidc --packagePath ../../dist/*.vsix

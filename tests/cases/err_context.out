@@ -140,4 +140,39 @@ error: only `json_html()` values and numbers can be inserted into `<script>`
    |                                 ^^
    = note: use `json_html($value)`, which produces a JavaScript value that is safe inside a script; `escape()` does not make code safe
 
-18 errors found
+error: values cannot be inserted into the URL of a `<script>`
+  --> err_context.phv:24:18
+   |
+24 | <script src="<?= safe_url($q) ?>"></script>
+   |                  ^^^^^^^^^^^^
+   = note: the tag gets the CSP nonce, so any URL there runs as a trusted script; write the URL in the template, and pass data with `json_html()` or a `data-*` attribute
+
+error: values cannot be inserted into the URL of a `<script>`
+  --> err_context.phv:25:22
+   |
+25 | <script src="/js/<?= $q ?>.js"></script>
+   |                      ^^
+   = note: the tag gets the CSP nonce, so any URL there runs as a trusted script; write the URL in the template, and pass data with `json_html()` or a `data-*` attribute
+
+error: values cannot be inserted into the URL of a `<script>`
+  --> err_context.phv:26:24
+   |
+26 | <svg><script href="<?= safe_url($q) ?>"></script></svg>
+   |                        ^^^^^^^^^^^^
+   = note: the tag gets the CSP nonce, so any URL there runs as a trusted script; write the URL in the template, and pass data with `json_html()` or a `data-*` attribute
+
+error: values cannot be inserted into the `content` of this `<meta>`
+  --> err_context.phv:27:47
+   |
+27 | <meta http-equiv="refresh" content="0;url=<?= $q ?>">
+   |                                               ^^
+   = note: only a `<meta>` with `name`, `property` or `itemprop` (written before `content`) takes inserted text, and others a number; `http-equiv="refresh"` would redirect to a URL
+
+error: values cannot be inserted into the `content` of this `<meta>`
+  --> err_context.phv:28:26
+   |
+28 | <meta content="0;url=<?= $q ?>" http-equiv="refresh">
+   |                          ^^
+   = note: only a `<meta>` with `name`, `property` or `itemprop` (written before `content`) takes inserted text, and others a number; `http-equiv="refresh"` would redirect to a URL
+
+23 errors found

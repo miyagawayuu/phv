@@ -3,7 +3,9 @@
 //!
 //! The store is bounded by count and by bytes; when full, the least recently
 //! used sessions are evicted, so a flood of new sessions cannot lock out
-//! real visitors or exhaust memory or disk.
+//! real visitors or exhaust memory or disk. Sessions whose visitor never came
+//! back go first: a flood of requests without a cookie (each making a new
+//! session) then evicts its own sessions, not those of returning visitors.
 //!
 //! Sessions live in memory unless `[security] session_store` names a
 //! directory: then each session is a file (named by a hash of its id, so a
@@ -30,6 +32,8 @@ struct Entry {
     created: Instant,
     last: Instant,
     bytes: usize,
+    /// The visitor sent the session's cookie back at least once.
+    returned: bool,
 }
 
 struct Inner {
@@ -243,6 +247,7 @@ impl Store {
                 Some(true) => {
                     let e = inner.map.get_mut(&id).unwrap();
                     e.last = Instant::now();
+                    e.returned = true;
                     return SessionData { id: Some(id), values: e.values.clone(), ..SessionData::default() };
                 }
                 Some(false) => {
@@ -266,10 +271,11 @@ impl Store {
         if inner.map.len() < MAX_SESSIONS && inner.bytes + room <= MAX_BYTES {
             return;
         }
-        // Drop the least recently used tenth.
-        let mut by_age: Vec<(Instant, String)> = inner.map.iter().map(|(k, e)| (e.last, k.clone())).collect();
+        // Drop a tenth: first sessions that were never used again, then the least recently used.
+        let mut by_age: Vec<(bool, Instant, String)> =
+            inner.map.iter().map(|(k, e)| (e.returned, e.last, k.clone())).collect();
         by_age.sort();
-        for (_, k) in by_age.into_iter().take((MAX_SESSIONS / 10).max(1)) {
+        for (_, _, k) in by_age.into_iter().take((MAX_SESSIONS / 10).max(1)) {
             if let Some(e) = inner.map.remove(&k) {
                 inner.bytes -= e.bytes;
             }
@@ -310,12 +316,14 @@ impl Store {
             _ => phv_std::random_hex(32),
         };
         let mut created = Instant::now();
+        let mut returned = false;
         if let Some(old) = &s.id {
             // Gone meanwhile (logged out, regenerated or expired by another
             // request): saving would bring it back for whoever holds the old id.
             let e = inner.map.remove(old)?;
             inner.bytes -= e.bytes;
             created = e.created;
+            returned = e.returned;
         }
         let bytes = size(&s.values);
         if inner.map.len() >= MAX_SESSIONS || inner.bytes + bytes > MAX_BYTES {
@@ -323,7 +331,7 @@ impl Store {
         }
         let issue_cookie = s.id.as_deref() != Some(new_id.as_str());
         inner.bytes += bytes;
-        inner.map.insert(new_id.clone(), Entry { values: s.values, created, last: Instant::now(), bytes });
+        inner.map.insert(new_id.clone(), Entry { values: s.values, created, last: Instant::now(), bytes, returned });
         issue_cookie.then(|| self.cookie_for(Some(&new_id)))
     }
 
@@ -444,6 +452,25 @@ mod tests {
         drop(inner);
         let id = first.unwrap().split(['=', ';']).nth(1).unwrap().to_string();
         assert!(store.load(Some(&format!("PHVSESSID={id}"))).id.is_none(), "oldest session was evicted");
+    }
+
+    /// A visitor who came back keeps their session through a flood of new ones.
+    #[test]
+    fn a_flood_does_not_evict_returning_visitors() {
+        let store = Store::new(Duration::from_secs(600), false, None);
+        let mut s = SessionData::default();
+        s.values.insert("user".into(), "ann".into());
+        s.changed = true;
+        let cookie = store.save(s).unwrap();
+        let header = format!("PHVSESSID={}", cookie.split(['=', ';']).nth(1).unwrap());
+        assert!(store.load(Some(&header)).id.is_some());
+        for i in 0..MAX_SESSIONS + 10 {
+            let mut s = SessionData::default();
+            s.values.insert("n".into(), i.to_string());
+            s.changed = true;
+            store.save(s);
+        }
+        assert_eq!(store.load(Some(&header)).values.get("user").map(String::as_str), Some("ann"));
     }
 
     #[test]

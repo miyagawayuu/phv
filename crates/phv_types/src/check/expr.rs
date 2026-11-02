@@ -306,6 +306,16 @@ impl<'a> Checker<'a> {
                 "values cannot be inserted into `srcdoc`",
                 "its value is parsed as a separate HTML document, where escaping does not apply; serve the content as its own page and use `src`",
             ),
+            ScriptSrc => (
+                "values cannot be inserted into the URL of a `<script>`",
+                "the tag gets the CSP nonce, so any URL there runs as a trusted script; write the URL in the template, and pass data with `json_html()` or a `data-*` attribute",
+            ),
+            // A number (`content="10"`, seconds to refresh) cannot name a URL.
+            MetaContent if numeric => return,
+            MetaContent => (
+                "values cannot be inserted into the `content` of this `<meta>`",
+                "only a `<meta>` with `name`, `property` or `itemprop` (written before `content`) takes inserted text, and others a number; `http-equiv=\"refresh\"` would redirect to a URL",
+            ),
         };
         self.error(msg, h.span).add_note(note);
     }

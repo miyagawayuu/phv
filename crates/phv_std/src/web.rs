@@ -302,6 +302,7 @@ pub fn csrf_expected(secret: &[u8], cookie: &str) -> String {
 }
 
 pub fn csrf_token(vm: &mut Vm) -> Result<String, VmError> {
+    vm.http.personalized = true;
     let cookie = match (&vm.http.new_csrf_cookie, &vm.http.csrf_cookie) {
         (Some(c), _) | (None, Some(c)) => c.clone(),
         (None, None) => {

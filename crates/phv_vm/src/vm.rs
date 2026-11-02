@@ -81,8 +81,12 @@ pub struct HttpCtx {
     pub status: u16,
     pub resp_headers: Vec<(String, String)>,
     pub content_type: Option<String>,
-    /// A file sent with `response()->file()`; replaces the written output.
-    pub body_file: Option<Vec<u8>>,
+    /// A file sent with `response()->file()`, already opened and checked; it
+    /// replaces the written output and is streamed from disk.
+    pub body_file: Option<std::sync::Arc<std::fs::File>>,
+    /// The response is for this visitor only (it carries a CSRF token), so it
+    /// gets `Cache-Control: private, no-store`.
+    pub personalized: bool,
 }
 
 impl Default for HttpCtx {
@@ -105,6 +109,7 @@ impl Default for HttpCtx {
             resp_headers: Vec::new(),
             content_type: None,
             body_file: None,
+            personalized: false,
         }
     }
 }
@@ -174,7 +179,7 @@ impl std::fmt::Debug for DatabaseSpec {
 }
 
 /// A WebSocket server named in phv.toml. Like a database URL, the URL may hold
-/// a password (in its path or user info), so it is never shown.
+/// a password (in its path or query), so it is never shown.
 #[derive(Clone)]
 pub struct WebSocketSpec {
     /// `ws://` or `wss://` URL, or None when the environment variable named by
@@ -622,6 +627,18 @@ impl Vm {
     /// The per-run memory limit in bytes, if any.
     pub fn memory_limit(&self) -> Option<usize> {
         self.limits.max_memory
+    }
+
+    /// Bytes the script may still allocate (4 GB when there is no limit).
+    pub fn memory_left(&self) -> usize {
+        let limit = self.limits.max_memory.unwrap_or(4 << 30);
+        let used = (crate::alloc::thread_allocated() - self.mem_base).max(0) as usize;
+        limit.saturating_sub(used)
+    }
+
+    /// The time limit of a run, if any.
+    pub fn time_limit(&self) -> Option<Duration> {
+        self.limits.max_time
     }
 
     /// The time limit as an instant (for code outside the interpreter loop, e.g. SQLite).

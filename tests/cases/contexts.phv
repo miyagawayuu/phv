@@ -14,3 +14,6 @@ function item(string $label): void { ?><li class="item"><?= $label ?></li><?phv 
 <textarea><?= "</textarea><b>" ?></textarea>
 <svg><a href="<?= $u ?>">svg link</a></svg>
 <p title="<?= escape("\"q\"") ?>"><?= nl2br("a\nb") ?></p>
+<meta name="description" content="<?= "a page" ?>">
+<meta property="og:title" content="<?= "a title" ?>">
+<meta http-equiv="refresh" content="<?= 10 ?>">

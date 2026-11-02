@@ -1,0 +1,6 @@
+// DO is not stopped by max_execution_time (only SELECT is): KILL QUERY stops it.
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->execute(sql"DO SLEEP(10)");
+echo "not reached\n";

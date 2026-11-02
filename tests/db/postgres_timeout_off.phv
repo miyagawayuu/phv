@@ -1,0 +1,7 @@
+// The script switches the server timeout off; the client still stops at the time limit.
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->execute(sql"SET statement_timeout = 0");
+$db->query(sql"SELECT pg_sleep(10)");
+echo "not reached\n";

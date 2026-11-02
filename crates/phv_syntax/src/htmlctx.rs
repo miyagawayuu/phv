@@ -86,6 +86,8 @@ pub struct HtmlTracker {
     mark: usize,
     /// Inline JavaScript found in the last `feed` (see `InlineCode`).
     found: Vec<(usize, InlineCode)>,
+    /// Names of the attributes of the current tag seen so far.
+    attrs: Vec<String>,
 }
 
 /// JavaScript written directly in template HTML, which a Content-Security-Policy
@@ -100,7 +102,7 @@ pub enum InlineCode {
 
 impl Default for HtmlTracker {
     fn default() -> Self {
-        HtmlTracker { state: State::Text, pending: None, foreign: 0, mark: 0, found: Vec::new() }
+        HtmlTracker { state: State::Text, pending: None, foreign: 0, mark: 0, found: Vec::new(), attrs: Vec::new() }
     }
 }
 
@@ -178,6 +180,20 @@ impl HtmlTracker {
             State::Raw { .. } => EchoContext::Text,
             State::Tag { .. } | State::AttrName { .. } => EchoContext::Tag,
             State::BeforeValue { .. } | State::Unquoted { .. } => EchoContext::Unquoted,
+            State::Quoted { tag, name, .. }
+                if tag == "script" && matches!(name.as_str(), "src" | "href" | "xlink:href") =>
+            {
+                EchoContext::ScriptSrc
+            }
+            // A `<meta>` that describes the page (name, property, itemprop) may take any text;
+            // others, such as `http-equiv="refresh"`, act on their `content`.
+            State::Quoted { tag, name, .. }
+                if tag == "meta"
+                    && name == "content"
+                    && !self.attrs.iter().any(|a| matches!(a.as_str(), "name" | "property" | "itemprop")) =>
+            {
+                EchoContext::MetaContent
+            }
             State::Quoted { name, url, .. } => {
                 if name.starts_with("on") {
                     EchoContext::Handler
@@ -284,6 +300,7 @@ impl HtmlTracker {
                 if !closing && tag == "script" {
                     scripts.push(offsets[i]);
                 }
+                self.attrs.clear();
                 self.state = State::Tag { name: tag, closing };
                 continue;
             }
@@ -394,6 +411,7 @@ impl HtmlTracker {
                         if handler && !closing {
                             self.found.push((self.mark, InlineCode::Handler(name.clone())));
                         }
+                        self.attrs.push(name.clone());
                         State::BeforeValue { tag, closing, name }
                     } else if c == '>' {
                         self.end_tag(tag, closing);
@@ -406,6 +424,7 @@ impl HtmlTracker {
                         if next == Some(&'=') {
                             State::AttrName { tag, closing, name }
                         } else {
+                            self.attrs.push(name);
                             State::Tag { name: tag, closing }
                         }
                     } else {

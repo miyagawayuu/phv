@@ -84,6 +84,7 @@ pub static BUILTINS: &[BuiltinSig] = &[
     f("csp_nonce", "fn(): string", "csp_nonce"),
     f("rate_limit", "fn(string, int, int): bool", "rate_limit"),
     f("rate_limit_reset", "fn(string): void", "rate_limit_reset"),
+    f("ip_group", "fn(string): string", "ip_group"),
     f("date", "fn(string): string", "date"),
     f("date", "fn(string, int): string", "date_ts"),
     f("gmdate", "fn(string): string", "gmdate"),

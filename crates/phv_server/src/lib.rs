@@ -2,11 +2,13 @@
 //! each request in a fresh VM (nothing is shared between requests except the
 //! compiled, immutable bytecode).
 
+mod body;
 mod multipart;
 mod session;
 
+use body::{RespBody, StallGuard};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue, CONTENT_TYPE};
 use hyper::server::conn::http1;
@@ -36,6 +38,8 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Query and form fields accepted per request.
 const MAX_FIELDS: usize = 1000;
+/// A connection is closed when the client accepts no data for this long.
+const WRITE_STALL: Duration = Duration::from_secs(30);
 
 pub struct ServeOptions {
     /// Site directory; pages live in `<root>/public`.
@@ -130,7 +134,7 @@ pub fn serve_on(listener: std::net::TcpListener, opts: ServeOptions) -> Result<(
                 let _ = http1::Builder::new()
                     .timer(TokioTimer::new())
                     .header_read_timeout(HEADER_TIMEOUT)
-                    .serve_connection(TokioIo::new(stream), service)
+                    .serve_connection(TokioIo::new(StallGuard::new(stream, WRITE_STALL)), service)
                     .await;
                 drop(permit);
             });
@@ -138,7 +142,7 @@ pub fn serve_on(listener: std::net::TcpListener, opts: ServeOptions) -> Result<(
     })
 }
 
-type Resp = Response<Full<Bytes>>;
+type Resp = Response<RespBody>;
 
 async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> Result<Resp, Infallible> {
     let start = Instant::now();
@@ -162,7 +166,7 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
 }
 
 fn simple(status: StatusCode, content_type: &str, body: String) -> Resp {
-    let mut r = Response::new(Full::new(Bytes::from(body)));
+    let mut r = Response::new(RespBody::full(body));
     *r.status_mut() = status;
     r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_str(content_type).unwrap());
     r
@@ -296,18 +300,19 @@ async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
             if req.method() != Method::GET && req.method() != Method::HEAD {
                 return simple(StatusCode::METHOD_NOT_ALLOWED, "text/plain", "method not allowed".into());
             }
-            if tokio::fs::metadata(&p).await.map(|m| m.len() > MAX_STATIC).unwrap_or(true) {
+            let Ok(file) = tokio::fs::File::open(&p).await else { return not_found() };
+            let len = match file.metadata().await {
+                Ok(m) if m.is_file() => m.len(),
+                _ => return not_found(),
+            };
+            if len > MAX_STATIC {
                 return simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "file too large to serve".into());
             }
-            match tokio::fs::read(&p).await {
-                Ok(bytes) => {
-                    let mut r = Response::new(Full::new(Bytes::from(bytes)));
-                    let ct = content_type(&p).unwrap_or("application/octet-stream");
-                    r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ct));
-                    r
-                }
-                Err(_) => not_found(),
-            }
+            // Streamed from the open file: memory does not grow with the file or the number of downloads.
+            let mut r = Response::new(RespBody::file(file, len));
+            let ct = content_type(&p).unwrap_or("application/octet-stream");
+            r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+            r
         }
         Some(Target::Script(p)) => run_script(state, p, ip, req).await,
     }
@@ -465,13 +470,20 @@ impl State {
         }
         let status = StatusCode::from_u16(http.status).unwrap_or(StatusCode::OK);
         let body = if matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED) {
-            Bytes::new()
+            RespBody::full(Bytes::new())
         } else if let Some(file) = http.body_file.take() {
-            Bytes::from(file)
+            // The file the script opened (and the checks passed for) is streamed as it is sent.
+            match std::sync::Arc::try_unwrap(file).map_err(|f| f.try_clone()) {
+                Ok(f) | Err(Ok(f)) => {
+                    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                    RespBody::file(tokio::fs::File::from_std(f), len)
+                }
+                Err(Err(_)) => RespBody::full(Bytes::new()),
+            }
         } else {
-            Bytes::from(outcome.output)
+            RespBody::full(outcome.output)
         };
-        let mut r = Response::new(Full::new(body));
+        let mut r = Response::new(body);
         *r.status_mut() = status;
         let ct = http.content_type.unwrap_or_else(|| "text/html; charset=utf-8".into());
         let h = r.headers_mut();
@@ -497,8 +509,9 @@ impl State {
                 h.insert("content-security-policy", v);
             }
         }
-        // Personalized responses must not be stored by shared caches.
-        if (touched_session || sets_cookie) && !h.contains_key("cache-control") {
+        // Personalized responses must not be stored by shared caches: those that use the
+        // session or cookies, or carry a CSRF token (it is tied to the visitor's cookie).
+        if (touched_session || sets_cookie || http.personalized) && !h.contains_key("cache-control") {
             h.insert("cache-control", HeaderValue::from_static("private, no-store"));
         }
         r

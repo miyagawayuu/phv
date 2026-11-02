@@ -180,7 +180,13 @@ pub(crate) struct Checker<'a> {
     type_params: Vec<String>,
     /// Only built for editors (`check_for_editor`).
     index: Option<EditorIndex>,
+    /// Members copied into subclasses so far (see `MAX_INHERITED_MEMBERS`).
+    inherited_members: usize,
+    reported_hierarchy: bool,
 }
+
+/// Members (fields, methods, constants) all classes may inherit together.
+const MAX_INHERITED_MEMBERS: usize = 200_000;
 
 fn sig_type(t: &TypeExpr) -> Type {
     match &t.kind {
@@ -232,6 +238,8 @@ impl<'a> Checker<'a> {
             main: None,
             type_params: Vec::new(),
             index: None,
+            inherited_members: 0,
+            reported_hierarchy: false,
         }
     }
 
@@ -1021,6 +1029,44 @@ impl<'a> Checker<'a> {
             && self.assignable(&a.ret, &b.ret)
     }
 
+    /// Counts `n` more inherited members; true (after reporting it once) when
+    /// that goes over `MAX_INHERITED_MEMBERS`, and the members are then not copied.
+    fn over_inherit_limit(&mut self, n: usize, decl: &ClassDecl) -> bool {
+        self.inherited_members += n;
+        if self.inherited_members <= MAX_INHERITED_MEMBERS {
+            return false;
+        }
+        if !self.reported_hierarchy {
+            self.reported_hierarchy = true;
+            self.error(
+                format!("the classes inherit more than {MAX_INHERITED_MEMBERS} members in total"),
+                decl.name_span,
+            )
+            .add_note("split the program into smaller class hierarchies");
+        }
+        true
+    }
+
+    /// Copies what class `ci` inherits from its parent `p` (already resolved).
+    fn inherit_from(&mut self, ci: usize, p: ClassId) {
+        let parent = &self.classes[p as usize];
+        let (fields, methods, vtable, ctor, ctor_access, consts) = (
+            parent.fields.clone(),
+            parent.methods.clone(),
+            parent.vtable.clone(),
+            parent.ctor,
+            parent.ctor_access,
+            parent.consts.clone(),
+        );
+        let c = &mut self.classes[ci];
+        c.fields = fields;
+        c.methods = methods;
+        c.vtable = vtable;
+        c.ctor = ctor;
+        c.ctor_access = ctor_access;
+        c.consts = consts;
+    }
+
     fn resolve_classes(&mut self, order: &[ClassId]) {
         for &cid in order {
             let ci = cid as usize;
@@ -1041,21 +1087,15 @@ impl<'a> Checker<'a> {
                     _ => {}
                 }
                 let parent = &self.classes[p as usize];
-                let (fields, methods, vtable, ctor, ctor_access, consts) = (
-                    parent.fields.clone(),
-                    parent.methods.clone(),
-                    parent.vtable.clone(),
-                    parent.ctor,
-                    parent.ctor_access,
-                    parent.consts.clone(),
-                );
-                let c = &mut self.classes[ci];
-                c.fields = fields;
-                c.methods = methods;
-                c.vtable = vtable;
-                c.ctor = ctor;
-                c.ctor_access = ctor_access;
-                c.consts = consts;
+                // Each class holds a copy of what it inherits; a long chain or a wide fan of
+                // classes would otherwise take memory and time far out of proportion to the source.
+                let inherited = parent.fields.len() + parent.methods.len() + parent.consts.len();
+                if self.over_inherit_limit(inherited, decl) {
+                    // Checked as if it had no parent; the error stops the program anyway.
+                    self.classes[ci].parent = None;
+                } else {
+                    self.inherit_from(ci, p);
+                }
             }
             let mut supers: HashSet<ClassId> = HashSet::from([cid]);
             if let Some(p) = self.classes[ci].parent {
@@ -1071,7 +1111,9 @@ impl<'a> Checker<'a> {
                 for (k, v) in self.classes[i as usize].consts.clone() {
                     self.classes[ci].consts.entry(k).or_insert(v);
                 }
-                if kind == ClassKind::Interface {
+                if kind == ClassKind::Interface
+                    && !self.over_inherit_limit(self.classes[i as usize].methods.len(), decl)
+                {
                     // Calls through interfaces dispatch by name; the slot belongs to the
                     // other interface's vtable, so it is not copied (a redeclaration gets its own).
                     for (name, m) in self.classes[i as usize].methods.clone() {
@@ -1086,6 +1128,9 @@ impl<'a> Checker<'a> {
                     supers.iter().copied().filter(|s| self.classes[*s as usize].kind == ClassKind::Interface).collect();
                 ifs.sort();
                 for i in ifs {
+                    if self.over_inherit_limit(self.classes[i as usize].methods.len(), decl) {
+                        break;
+                    }
                     let mut ms: Vec<(String, MethodInfo)> =
                         self.classes[i as usize].methods.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                     ms.sort_by(|a, b| a.0.cmp(&b.0));

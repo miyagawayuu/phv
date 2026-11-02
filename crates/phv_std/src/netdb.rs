@@ -7,8 +7,15 @@
 //! connection goes back to the pool when the script ends or closes it, after
 //! its session is reset (open transaction rolled back, settings cleared), so
 //! nothing carries over from one request to the next.
+//!
+//! The script's limits hold on the client side too: statements stop at its
+//! deadline even when the server ignores (or the script switched off) the
+//! server's own timeout, and a result larger than the memory left to the
+//! script is refused while it is read, before it fills the process.
 
 use crate::db::{parts, render_sql, Dialect};
+use crate::pgmeter::{Meter, PgClient, Trip};
+use crate::redisclient::{RedisError, Reply};
 use crate::{int, list, s};
 use indexmap::IndexMap;
 use phv_vm::{DatabaseSpec, Key, Value, Vm, VmError};
@@ -27,6 +34,10 @@ const MAX_WAIT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A connection idle for longer is checked before it is handed out again.
 const CHECK_AFTER: Duration = Duration::from_secs(30);
+/// Longest time for the statements that reset or check a pooled connection.
+const RESET_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bytes those statements (and a connection's setup) may read.
+const RESET_BUDGET: usize = 16 << 20;
 
 // ----- Pool ------------------------------------------------------------------
 
@@ -235,13 +246,14 @@ fn open(vm: &mut Vm, name: &str, want_redis: bool) -> R {
     let now = Instant::now();
     let until = vm.deadline().map_or(now + MAX_WAIT, |d| d.min(now + MAX_WAIT));
     let connect_timeout = until.saturating_duration_since(now).clamp(Duration::from_millis(100), CONNECT_TIMEOUT);
-    let key = format!("{:?}|{}", spec.tls, url);
+    let key = format!("{:?}|{}|{}", spec.tls, spec.pool_size, url);
+    let (memory, time_limit) = (vm.memory_limit(), vm.time_limit());
     let result = match kind {
         Kind::Postgres => pool_for(&PG_POOLS, &key, spec.pool_size)
             .acquire(until, || pg_connect(&url, &spec, connect_timeout))
             .map(|p| Link::Pg(Box::new(p))),
         Kind::MySql => pool_for(&MY_POOLS, &key, spec.pool_size)
-            .acquire(until, || my_connect(&url, &spec, connect_timeout))
+            .acquire(until, || my_connect(&url, &spec, connect_timeout, memory, time_limit))
             .map(|p| Link::My(Box::new(p))),
         Kind::Redis => pool_for(&REDIS_POOLS, &key, spec.pool_size)
             .acquire(until, || redis_connect(&url, &spec, connect_timeout))
@@ -330,6 +342,25 @@ pub fn last_insert_id(vm: &mut Vm, a: &[Value]) -> R {
     }
 }
 
+/// The fatal error for a result that does not fit in the memory left to the script.
+fn out_of_memory(vm: &Vm) -> VmError {
+    match vm.check_memory() {
+        Err(e) => e,
+        Ok(()) => vm.reserve(usize::MAX).expect_err("reserving usize::MAX fails"),
+    }
+}
+
+/// The bytes a statement may read: about half the memory left to the script
+/// (the values made from them take about as much again).
+fn read_budget(vm: &Vm) -> usize {
+    (vm.memory_left() / 2).max(64 << 10)
+}
+
+/// When a statement must end on the client side: just after the script's deadline.
+fn statement_deadline(vm: &Vm) -> Option<Instant> {
+    vm.deadline().map(|d| d + Duration::from_millis(TIMEOUT_MARGIN_MS))
+}
+
 /// The time left before the script's limit, or None without a limit.
 fn remaining(vm: &Vm) -> Result<Option<Duration>, VmError> {
     vm.check_limits()?;
@@ -350,9 +381,42 @@ fn needs_new_timeout(current: Option<u64>, ms: u64) -> bool {
 // ----- PostgreSQL ------------------------------------------------------------
 
 struct PgConn {
-    client: postgres::Client,
+    client: PgClient,
     /// The `statement_timeout` last set on the session, in milliseconds.
     timeout_ms: Option<u64>,
+    /// Stops reads and writes at the statement's deadline and byte budget.
+    meter: Meter,
+}
+
+/// Clears what a script can leave on a session. This is `DISCARD ALL` without
+/// its `DEALLOCATE ALL`, which would also remove the statements the client
+/// prepares for itself (to look up types) and break the connection for the
+/// next script; the statements scripts prepare are deallocated by name.
+const PG_RESET: &str = "CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; \
+    SELECT pg_advisory_unlock_all(); DISCARD PLANS; DISCARD TEMP; DISCARD SEQUENCES";
+
+impl PgConn {
+    /// Meters the statements PHV runs on its own (reset, check).
+    fn meter_internal(&self) {
+        self.meter.set(Some(Instant::now() + RESET_TIMEOUT), RESET_BUDGET);
+    }
+
+    fn reset_session(&mut self) -> bool {
+        // Outside a transaction ROLLBACK only warns; inside one it ends it, so the
+        // reset itself does not run inside the script's transaction.
+        if self.client.batch_execute("ROLLBACK").is_err() || self.client.batch_execute(PG_RESET).is_err() {
+            return false;
+        }
+        let names: Vec<String> = match self.client.query("SELECT name FROM pg_prepared_statements WHERE from_sql", &[])
+        {
+            Ok(rows) => match rows.iter().map(|r| r.try_get::<_, String>(0)).collect() {
+                Ok(n) => n,
+                Err(_) => return false,
+            },
+            Err(_) => return false,
+        };
+        names.iter().all(|n| self.client.batch_execute(&format!("DEALLOCATE \"{}\"", n.replace('"', "\"\""))).is_ok())
+    }
 }
 
 impl Driver for PgConn {
@@ -361,13 +425,17 @@ impl Driver for PgConn {
             return false;
         }
         self.timeout_ms = None;
-        // DISCARD ALL cannot run inside a transaction: roll back first if one is open.
-        self.client.batch_execute("DISCARD ALL").is_ok()
-            || (self.client.batch_execute("ROLLBACK").is_ok() && self.client.batch_execute("DISCARD ALL").is_ok())
+        self.meter_internal();
+        let ok = self.reset_session();
+        self.meter.set(None, RESET_BUDGET);
+        ok && !self.client.is_closed()
     }
 
     fn check(&mut self) -> bool {
-        self.client.is_valid(Duration::from_secs(5)).is_ok()
+        self.meter_internal();
+        let ok = self.client.is_valid(Duration::from_secs(5));
+        self.meter.set(None, RESET_BUDGET);
+        ok
     }
 }
 
@@ -383,33 +451,33 @@ static PG_TLS: LazyLock<tokio_postgres_rustls::MakeRustlsConnect> = LazyLock::ne
 });
 
 fn pg_connect(url: &str, spec: &DatabaseSpec, timeout: Duration) -> Result<PgConn, String> {
-    use postgres::config::{Host, SslMode};
+    use tokio_postgres::config::{Host, SslMode};
     // The parser's own message could quote the URL, which may hold a password.
-    let mut config: postgres::Config = url.parse().map_err(|_| "the URL is not a valid PostgreSQL URL".to_string())?;
+    let mut config: tokio_postgres::Config =
+        url.parse().map_err(|_| "the URL is not a valid PostgreSQL URL".to_string())?;
     let local = config.get_hosts().iter().all(|h| match h {
         Host::Tcp(name) => is_local_host(name),
         #[allow(unreachable_patterns)]
         _ => true,
     }) && config.get_hostaddrs().iter().all(|ip| ip.is_loopback());
-    let tls = spec.tls.unwrap_or(!local);
-    config.connect_timeout(timeout);
-    let client = if tls {
-        config.ssl_mode(SslMode::Require);
-        config.connect(PG_TLS.clone())
-    } else {
-        config.ssl_mode(SslMode::Disable);
-        config.connect(postgres::NoTls)
-    }
-    .map_err(|e| pg_message(&e))?;
-    Ok(PgConn { client, timeout_ms: None })
+    // `sslmode=require` in the URL is kept even when phv.toml would allow plain connections.
+    let tls = config.get_ssl_mode() == SslMode::Require || spec.tls.unwrap_or(!local);
+    config.ssl_mode(if tls { SslMode::Require } else { SslMode::Disable });
+    let meter = Meter::default();
+    meter.set(Some(Instant::now() + timeout + RESET_TIMEOUT), RESET_BUDGET);
+    let client = PgClient::connect(&config, tls.then(|| PG_TLS.clone()), timeout, meter.clone())?;
+    meter.set(None, RESET_BUDGET);
+    Ok(PgConn { client, timeout_ms: None, meter })
 }
 
-fn pg_message(e: &postgres::Error) -> String {
+pub(crate) fn pg_message(e: &postgres::Error) -> String {
     match e.as_db_error() {
         Some(db) => match db.detail() {
             Some(d) => format!("{} ({d})", db.message()),
             None => db.message().to_string(),
         },
+        // Network and TLS errors are described without the server's address.
+        None if network_cause(e).is_some() => network_cause(e).unwrap_or_default(),
         // Conversion errors keep the reason in the source ("error serializing parameter 0: ...").
         None => match std::error::Error::source(e) {
             Some(cause) => format!("{e}: {cause}"),
@@ -418,9 +486,38 @@ fn pg_message(e: &postgres::Error) -> String {
     }
 }
 
+/// A network or TLS failure somewhere in an error's sources, in fixed words.
+fn network_cause(e: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return Some(crate::netio::describe(io));
+        }
+        if err.downcast_ref::<rustls::Error>().is_some() {
+            return Some("the TLS connection failed".into());
+        }
+        cur = err.source();
+    }
+    None
+}
+
 fn pg_error(vm: &Vm, c: &mut Pooled<PgConn>, e: postgres::Error) -> VmError {
     if c.get().client.is_closed() {
         c.broken = true;
+    }
+    match c.get().meter.tripped() {
+        Some(Trip::Budget) => {
+            c.broken = true;
+            return out_of_memory(vm);
+        }
+        Some(Trip::Deadline) => {
+            c.broken = true;
+            if let Err(fatal) = vm.check_limits() {
+                return fatal;
+            }
+            return vm.throw("DatabaseError", "the statement ran out of time");
+        }
+        None => {}
     }
     if e.code() == Some(&postgres::error::SqlState::QUERY_CANCELED) {
         // Stopped by the statement_timeout set from the script's time limit.
@@ -431,7 +528,11 @@ fn pg_error(vm: &Vm, c: &mut Pooled<PgConn>, e: postgres::Error) -> VmError {
     vm.throw("DatabaseError", pg_message(&e))
 }
 
+/// Before a statement: the client-side deadline and budget, and the server's
+/// `statement_timeout` (which stops the statement without closing the
+/// connection when the script has not changed it).
 fn pg_limit_time(vm: &Vm, c: &mut Pooled<PgConn>) -> Result<(), VmError> {
+    c.get().meter.set(statement_deadline(vm), read_budget(vm));
     let Some(left) = remaining(vm)? else { return Ok(()) };
     let ms = left.as_millis().min(i32::MAX as u128) as u64;
     if needs_new_timeout(c.get().timeout_ms, ms) {
@@ -443,7 +544,6 @@ fn pg_limit_time(vm: &Vm, c: &mut Pooled<PgConn>) -> Result<(), VmError> {
 }
 
 fn pg_query(vm: &mut Vm, c: &mut Pooled<PgConn>, q: &Value) -> R {
-    use postgres::fallible_iterator::FallibleIterator;
     use postgres::types::ToSql;
     let (text, params) = parts(q);
     let text = render_sql(text, Dialect::Postgres);
@@ -453,23 +553,26 @@ fn pg_query(vm: &mut Vm, c: &mut Pooled<PgConn>, q: &Value) -> R {
     let names: Vec<Rc<String>> = stmt.columns().iter().map(|col| Rc::new(col.name().to_string())).collect();
     let bound: Vec<PgParam> = params.iter().map(PgParam::new).collect();
     let mut out = Vec::new();
-    let result: Result<(), postgres::Error> = (|| {
-        let mut rows = c.get().client.query_raw(&stmt, bound.iter().map(|p| p as &dyn ToSql))?;
-        while let Some(row) = rows.next()? {
-            let mut m = IndexMap::with_capacity(names.len());
-            for (i, n) in names.iter().enumerate() {
-                let PgOut(v) = row.try_get(i)?;
-                m.insert(Key::Str(n.clone()), v);
-            }
-            out.push(Value::map(m));
-            if out.len() % 256 == 0 && vm.check_memory().is_err() {
-                break;
-            }
+    let mut over = false;
+    let result = c.get().client.query_each(&stmt, bound.iter().map(|p| p as &dyn ToSql), |row| {
+        let mut m = IndexMap::with_capacity(names.len());
+        for (i, n) in names.iter().enumerate() {
+            let PgOut(v) = row.try_get(i)?;
+            m.insert(Key::Str(n.clone()), v);
         }
-        Ok(())
-    })();
+        out.push(Value::map(m));
+        if vm.check_memory().is_err() {
+            over = true;
+            return Ok(false);
+        }
+        Ok(true)
+    });
     result.map_err(|e| pg_error(vm, c, e))?;
-    vm.check_memory()?;
+    if over {
+        // The rest of the result is not read: the connection is closed, not reused.
+        c.broken = true;
+        return Err(out_of_memory(vm));
+    }
     Ok(Value::list(out))
 }
 
@@ -823,13 +926,28 @@ struct MyConn {
     conn: mysql::Conn,
     /// The `max_execution_time` last set on the session, in milliseconds.
     timeout_ms: Option<u64>,
+    /// For the side connection that stops a statement at the deadline.
+    opts: mysql::Opts,
 }
 
 impl Driver for MyConn {
     fn reset(&mut self) -> bool {
+        use mysql::prelude::Queryable;
         self.timeout_ms = None;
         // Rolls back an open transaction and clears session variables and temporary tables.
-        self.conn.reset().is_ok()
+        if self.conn.reset().is_err() {
+            return false;
+        }
+        // COM_RESET_CONNECTION keeps the active role and the current database.
+        if self.conn.query_drop("SET ROLE DEFAULT").is_err() {
+            return false;
+        }
+        match self.opts.get_db_name() {
+            Some(db) => self.conn.select_db(db).is_ok(),
+            // Without a database in the URL there is none to go back to: a script that
+            // chose one leaves a connection that is not reused.
+            None => matches!(self.conn.query_first::<Option<String>, _>("SELECT DATABASE()"), Ok(Some(None))),
+        }
     }
 
     fn check(&mut self) -> bool {
@@ -837,37 +955,103 @@ impl Driver for MyConn {
     }
 }
 
-fn my_connect(url: &str, spec: &DatabaseSpec, timeout: Duration) -> Result<MyConn, String> {
+fn my_connect(
+    url: &str,
+    spec: &DatabaseSpec,
+    timeout: Duration,
+    memory: Option<usize>,
+    time_limit: Option<Duration>,
+) -> Result<MyConn, String> {
     // The parser's own message could quote the URL, which may hold a password.
     let opts = mysql::Opts::from_url(url).map_err(|_| "the URL is not a valid MySQL URL".to_string())?;
     let local = opts.get_socket().is_some() || is_local_host(&opts.get_ip_or_hostname());
-    let tls = spec.tls.unwrap_or(!local);
+    // `require_ssl` in the URL is kept even when phv.toml would allow plain connections.
+    let tls = opts.get_ssl_opts().is_some() || spec.tls.unwrap_or(!local);
     let ssl = match (tls, opts.get_ssl_opts().cloned()) {
         (false, _) => None,
         (true, Some(o)) => Some(o),
         (true, None) => Some(mysql::SslOpts::default()),
     };
+    // A server that stops answering is given up on a little after the time limit
+    // (statements are stopped at the deadline with KILL QUERY before that).
+    let io_timeout = time_limit.map_or(Duration::from_secs(300), |t| t + Duration::from_secs(10));
+    // No packet (one row, mostly) larger than half the script's memory.
+    let packet = memory.unwrap_or(128 << 20) / 2;
     let builder = mysql::OptsBuilder::from_opts(opts)
         .ssl_opts(ssl)
         .tcp_connect_timeout(Some(timeout))
-        .read_timeout(Some(Duration::from_secs(300)))
-        .write_timeout(Some(Duration::from_secs(300)));
+        .read_timeout(Some(io_timeout))
+        .write_timeout(Some(io_timeout))
+        .max_allowed_packet(Some(packet));
+    let opts = mysql::Opts::from(builder.clone());
     let conn = mysql::Conn::new(builder).map_err(|e| my_message(&e))?;
-    Ok(MyConn { conn, timeout_ms: None })
+    Ok(MyConn { conn, timeout_ms: None, opts })
 }
 
 fn my_message(e: &mysql::Error) -> String {
     match e {
         mysql::Error::MySqlError(m) => m.message.clone(),
+        // Network, TLS and connection errors are described without the server's address.
+        mysql::Error::IoError(io) => crate::netio::describe(io),
+        mysql::Error::TlsError(_) => "the TLS connection failed".into(),
+        mysql::Error::CodecError(c) => match network_cause(c) {
+            Some(m) => m,
+            None => "the server sent an invalid packet (larger than the memory left to the script?)".into(),
+        },
+        mysql::Error::DriverError(mysql::DriverError::CouldNotConnect(_)) => "cannot connect to the server".into(),
         e => e.to_string(),
     }
+}
+
+/// Stops the statement running on connection `id` with `KILL QUERY` (from a
+/// second connection) when it is still running at `deadline`. Dropping the
+/// guard before then cancels it.
+struct KillAt {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl KillAt {
+    fn arm(opts: &mysql::Opts, id: u32, deadline: Option<Instant>) -> KillAt {
+        let Some(deadline) = deadline else { return KillAt { stop: None } };
+        let (stop, wait) = std::sync::mpsc::channel::<()>();
+        let opts = opts.clone();
+        std::thread::spawn(move || {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if wait.recv_timeout(left) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                return;
+            }
+            use mysql::prelude::Queryable;
+            let side = mysql::OptsBuilder::from_opts(opts)
+                .tcp_connect_timeout(Some(Duration::from_secs(5)))
+                .read_timeout(Some(Duration::from_secs(5)))
+                .write_timeout(Some(Duration::from_secs(5)));
+            if let Ok(mut side) = mysql::Conn::new(side) {
+                let _ = side.query_drop(format!("KILL QUERY {id}"));
+            }
+        });
+        KillAt { stop: Some(stop) }
+    }
+}
+
+impl Drop for KillAt {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+fn my_kill_at(vm: &Vm, c: &mut Pooled<MyConn>) -> KillAt {
+    let id = c.get().conn.connection_id();
+    KillAt::arm(&c.get().opts, id, statement_deadline(vm))
 }
 
 fn my_error(vm: &Vm, c: &mut Pooled<MyConn>, e: mysql::Error) -> VmError {
     match &e {
         mysql::Error::MySqlError(m) => {
-            // 3024: stopped by the max_execution_time set from the script's time limit.
-            if m.code == 3024 {
+            // 3024: stopped by the max_execution_time set from the script's time limit;
+            // 1317: stopped by KILL QUERY at the deadline.
+            if m.code == 3024 || m.code == 1317 {
                 if let Err(fatal) = vm.check_limits() {
                     return fatal;
                 }
@@ -941,8 +1125,10 @@ fn my_query(vm: &mut Vm, c: &mut Pooled<MyConn>, q: &Value) -> R {
     let (text, params) = parts(q);
     let text = render_sql(text, Dialect::MySql);
     my_limit_time(vm, c)?;
+    let kill = my_kill_at(vm, c);
     let mut out = Vec::new();
     let mut convert_error = None;
+    let mut over = false;
     let result: Result<(), mysql::Error> = (|| {
         let mut result = c.get().conn.exec_iter(text, my_params(params))?;
         let Some(set) = result.iter() else { return Ok(()) };
@@ -963,21 +1149,23 @@ fn my_query(vm: &mut Vm, c: &mut Pooled<MyConn>, q: &Value) -> R {
                 }
             }
             out.push(Value::map(m));
-            if out.len() % 256 == 0 && vm.check_memory().is_err() {
+            if vm.check_memory().is_err() {
+                over = true;
                 return Ok(());
             }
         }
         Ok(())
     })();
+    drop(kill);
     result.map_err(|e| my_error(vm, c, e))?;
     if let Some(e) = convert_error {
         // The rest of the result was not read: the connection is out of step.
         c.broken = true;
         return Err(vm.throw("DatabaseError", e));
     }
-    if let Err(e) = vm.check_memory() {
+    if over {
         c.broken = true;
-        return Err(e);
+        return Err(out_of_memory(vm));
     }
     Ok(Value::list(out))
 }
@@ -987,6 +1175,7 @@ fn my_execute(vm: &mut Vm, c: &mut Pooled<MyConn>, q: &Value) -> R {
     let (text, params) = parts(q);
     let text = render_sql(text, Dialect::MySql);
     my_limit_time(vm, c)?;
+    let kill = my_kill_at(vm, c);
     let mut r = c.get().conn.exec_drop(&text, my_params(params));
     // Statements such as BEGIN cannot be prepared (error 1295). Without
     // parameters they run as plain text, but only when the text holds no `;`,
@@ -995,13 +1184,14 @@ fn my_execute(vm: &mut Vm, c: &mut Pooled<MyConn>, q: &Value) -> R {
     if unsupported && params.is_empty() && !text.contains(';') {
         r = c.get().conn.query_drop(&text);
     }
+    drop(kill);
     r.map_err(|e| my_error(vm, c, e))?;
     Ok(Value::Int(c.get().conn.affected_rows().try_into().unwrap_or(i64::MAX)))
 }
 
 // ----- Redis -----------------------------------------------------------------
 
-struct RedisConn(redis::Connection);
+use crate::redisclient::RedisConn;
 
 impl Driver for RedisConn {
     fn reset(&mut self) -> bool {
@@ -1010,23 +1200,12 @@ impl Driver for RedisConn {
     }
 
     fn check(&mut self) -> bool {
-        redis::cmd("PING").query::<String>(&mut self.0).is_ok()
+        self.command(&[b"PING"], Instant::now() + RESET_TIMEOUT, 1024).is_ok()
     }
 }
 
 fn redis_connect(url: &str, spec: &DatabaseSpec, timeout: Duration) -> Result<RedisConn, String> {
-    use redis::ConnectionAddr;
-    let client = redis::Client::open(url).map_err(|_| "the URL is not a valid Redis URL".to_string())?;
-    let (local, tls) = match client.get_connection_info().addr() {
-        ConnectionAddr::Tcp(host, _) => (is_local_host(host), false),
-        ConnectionAddr::TcpTls { host, .. } => (is_local_host(host), true),
-        _ => (true, false),
-    };
-    if !tls && spec.tls.unwrap_or(!local) {
-        return Err("the server is not on this machine: use a rediss:// URL (TLS), or set tls = false".into());
-    }
-    let conn = client.get_connection_with_timeout(timeout).map_err(|e| e.to_string())?;
-    Ok(RedisConn(conn))
+    RedisConn::connect(url, spec.tls, Instant::now() + timeout)
 }
 
 /// Commands scripts may run, with their argument counts.
@@ -1047,25 +1226,14 @@ const REDIS_COMMANDS: &[(&str, usize, usize)] = &[
     ("LRANGE", 3, 3),
 ];
 
-fn redis_value(v: redis::Value) -> Value {
+fn redis_value(v: Reply) -> Value {
     match v {
-        redis::Value::Nil => Value::Null,
-        redis::Value::Int(i) => Value::Int(i),
-        redis::Value::BulkString(b) => Value::str(String::from_utf8_lossy(&b).into_owned()),
-        redis::Value::SimpleString(s) => Value::str(s),
-        redis::Value::Okay => Value::Bool(true),
-        redis::Value::Boolean(b) => Value::Bool(b),
-        redis::Value::Double(f) => Value::Float(f),
-        redis::Value::Array(items) | redis::Value::Set(items) => {
-            Value::list(items.into_iter().map(redis_value).collect())
-        }
-        redis::Value::Map(pairs) => Value::map(
-            pairs
-                .into_iter()
-                .map(|(k, v)| (Key::Str(Rc::new(redis_value(k).to_display_string())), redis_value(v)))
-                .collect(),
-        ),
-        _ => Value::Null,
+        Reply::Nil => Value::Null,
+        Reply::Int(i) => Value::Int(i),
+        Reply::Bulk(b) => Value::str(String::from_utf8_lossy(&b).into_owned()),
+        Reply::Simple(s) if s == "OK" => Value::Bool(true),
+        Reply::Simple(s) => Value::str(s),
+        Reply::Array(items) => Value::list(items.into_iter().map(redis_value).collect()),
     }
 }
 
@@ -1081,28 +1249,26 @@ pub fn redis_command(vm: &mut Vm, a: &[Value]) -> R {
         return Err(VmError::Fatal(format!("__redis: unexpected command {name}")));
     }
     let left = remaining(vm)?;
-    let mut cmd = redis::cmd(name);
-    for arg in args.iter() {
-        cmd.arg(s(arg));
-    }
-    let conn = &mut c.get().0;
-    let r = conn
-        .set_read_timeout(left)
-        .and_then(|_| conn.set_write_timeout(left))
-        .and_then(|_| cmd.query::<redis::Value>(conn));
-    let v = match r {
+    let until = Instant::now() + left.unwrap_or(MAX_WAIT);
+    let mut argv: Vec<&[u8]> = vec![name.as_bytes()];
+    argv.extend(args.iter().map(|a| s(a).as_bytes()));
+    let budget = read_budget(vm);
+    let v = match c.get().command(&argv, until, budget) {
         Ok(v) => v,
-        Err(e) => {
-            if e.is_io_error() || e.is_timeout() || e.is_connection_dropped() || e.is_unrecoverable_error() {
-                c.broken = true;
-                vm.check_limits()?;
-            }
-            return Err(vm.throw("DatabaseError", e.to_string()));
+        Err(RedisError::Server(m)) => return Err(vm.throw("DatabaseError", m)),
+        Err(RedisError::TooLarge) => {
+            c.broken = true;
+            return Err(out_of_memory(vm));
+        }
+        Err(RedisError::Broken(m)) => {
+            c.broken = true;
+            vm.check_limits()?;
+            return Err(vm.throw("DatabaseError", m));
         }
     };
     let out = match (name, v) {
         // RESP2 answers HGETALL with a flat list of fields and values.
-        ("HGETALL", redis::Value::Array(items)) => {
+        ("HGETALL", Reply::Array(items)) => {
             let mut m = IndexMap::with_capacity(items.len() / 2);
             let mut it = items.into_iter().map(redis_value);
             while let (Some(k), Some(v)) = (it.next(), it.next()) {

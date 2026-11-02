@@ -8,3 +8,6 @@
 <svg><a href="https://example.com/a?b=1">svg link</a></svg>
 <p title="&quot;q&quot;">a<br>
 b</p>
+<meta name="description" content="a page">
+<meta property="og:title" content="a title">
+<meta http-equiv="refresh" content="10">

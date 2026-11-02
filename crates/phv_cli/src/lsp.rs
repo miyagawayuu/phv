@@ -365,8 +365,10 @@ impl Server {
         let src = a.sources.get(def.file);
         // Built-in modules have no file to open.
         let Some(p) = &src.path else { return Value::Null };
+        // A normalized path (`dir/../x` is a URI the editor could not send back).
+        let p = p.canonicalize().unwrap_or_else(|_| p.clone());
         json!({
-            "uri": path_to_uri(p),
+            "uri": path_to_uri(&p),
             "range": { "start": position(src, def.start), "end": position(src, def.end) },
         })
     }
@@ -460,7 +462,8 @@ pub fn run() {
         let id = msg.get("id").cloned();
         let params = &msg["params"];
         let doc_path = || params["textDocument"]["uri"].as_str().and_then(uri_to_path);
-        let result = match method.as_str() {
+        // A bug in the checker must not take the editor's language server down.
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match method.as_str() {
             "initialize" => Some(json!({
                 "capabilities": {
                     "textDocumentSync": { "openClose": true, "change": 1, "save": { "includeText": false } },
@@ -495,7 +498,8 @@ pub fn run() {
                 None
             }
             "textDocument/didSave" => {
-                if let Some(p) = doc_path() {
+                // Only documents the editor opened are checked.
+                if let Some(p) = doc_path().filter(|p| server.open.contains_key(p)) {
                     server.check(&p, &mut out);
                 }
                 None
@@ -503,6 +507,7 @@ pub fn run() {
             "textDocument/didClose" => {
                 if let Some(p) = doc_path() {
                     server.open.remove(&p);
+                    server.reported.remove(&p);
                 }
                 None
             }
@@ -543,6 +548,15 @@ pub fn run() {
                 }
                 None
             }
+        }));
+        let Ok(result) = handled else {
+            if id.is_some() {
+                send(
+                    &mut out,
+                    &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": "internal error" } }),
+                );
+            }
+            continue;
         };
         if let (Some(id), Some(result)) = (id, result) {
             send(&mut out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));

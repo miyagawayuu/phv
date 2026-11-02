@@ -28,17 +28,32 @@
     "languages": [
       {
         "id": "phv",
-        "aliases": ["PHV", "phv"],
-        "extensions": [".phv"],
+        "aliases": [
+          "PHV",
+          "phv"
+        ],
+        "extensions": [
+          ".phv"
+        ],
         "configuration": "./language-configuration.json",
-        "icon": { "light": "./images/phv-file.svg", "dark": "./images/phv-file.svg" }
+        "icon": {
+          "light": "./images/phv-file.svg",
+          "dark": "./images/phv-file.svg"
+        }
       },
       {
         "id": "phv-template",
-        "aliases": ["PHV Template"],
-        "filenamePatterns": ["*.phv.html"],
+        "aliases": [
+          "PHV Template"
+        ],
+        "filenamePatterns": [
+          "*.phv.html"
+        ],
         "configuration": "./language-configuration.json",
-        "icon": { "light": "./images/phv-file.svg", "dark": "./images/phv-file.svg" }
+        "icon": {
+          "light": "./images/phv-file.svg",
+          "dark": "./images/phv-file.svg"
+        }
       }
     ],
     "grammars": [
@@ -90,7 +105,7 @@
     "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
-    "@vscode/vsce": "^3.2.1",
+    "@vscode/vsce": "4.1.0",
     "vscode-oniguruma": "^2.0.1",
     "vscode-textmate": "^9.1.0"
   },

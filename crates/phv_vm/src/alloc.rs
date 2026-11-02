@@ -13,15 +13,34 @@ thread_local! {
     // Const-initialized and without a destructor, so it is safe to use from
     // inside the allocator (no lazy initialization, never torn down).
     static ALLOCATED: Cell<isize> = const { Cell::new(0) };
+    /// The highest value of ALLOCATED since the last `reset_thread_peak()`.
+    static PEAK: Cell<isize> = const { Cell::new(0) };
 }
 
 fn add(n: isize) {
-    let _ = ALLOCATED.try_with(|a| a.set(a.get() + n));
+    let _ = ALLOCATED.try_with(|a| {
+        let now = a.get() + n;
+        a.set(now);
+        if n > 0 {
+            let _ = PEAK.try_with(|p| p.set(p.get().max(now)));
+        }
+    });
 }
 
 /// Bytes currently allocated (minus freed) by this thread.
 pub fn thread_allocated() -> isize {
     ALLOCATED.try_with(|a| a.get()).unwrap_or(0)
+}
+
+/// The most bytes this thread had allocated at once since `reset_thread_peak()`.
+pub fn thread_peak() -> isize {
+    PEAK.try_with(|p| p.get()).unwrap_or(0)
+}
+
+/// Starts measuring the peak from the bytes allocated now.
+pub fn reset_thread_peak() {
+    let now = thread_allocated();
+    let _ = PEAK.try_with(|p| p.set(now));
 }
 
 pub struct CountingAlloc;

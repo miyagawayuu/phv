@@ -1,14 +1,14 @@
 <?phv
 import std.http.{request, response, session};
-import lib.client.client_ip;
+import lib.client.client_key;
 import lib.source.sources;
+import lib.store.{demo_db, use_totp_step};
 
 $req = request();
 $s = session();
 
 if ($req->isPost() && $req->form("action") == "reset") {
     $s->remove("totp_secret");
-    $s->remove("totp_step");
     response()->redirect("/totp");
     return;
 }
@@ -24,17 +24,16 @@ if ($secret->isEmpty()) {
 $ok = false;
 if ($req->isPost()) {
     $code = ($req->form("code") ?? "")->replace(" ", "");
-    if (!rate_limit("totp:" . client_ip(), 10, 60)) {
+    if (!rate_limit("totp:" . client_key(), 10, 60)) {
         $result = "Too many attempts; please wait a minute.";
     } else {
         $step = totp_verify($secret, $code);   // ?int: the time step it matched
-        $last = ($s->get("totp_step") ?? "")->toInt() ?? 0;
         if ($step == null) {
             $result = "That code is not valid for this secret.";
-        } elseif ($step <= $last) {
+        } elseif (!use_totp_step(demo_db(), $secret, $step)) {
+            // Stored in the database in one statement, so the same code cannot be used twice.
             $result = "That code was already used. Wait for the next one.";
         } else {
-            $s->set("totp_step", (string)$step);   // so the same code cannot be used twice
             $result = "Correct! The code matched time step {$step}.";
             $ok = true;
         }
@@ -57,5 +56,5 @@ echo render(
     title: "Two-factor codes",
     path: "/totp",
     body: $body,
-    files: sources(["public/totp.phv", "views/totp.phv.html"]),
+    files: sources(["public/totp.phv", "lib/store.phv", "views/totp.phv.html"]),
 );

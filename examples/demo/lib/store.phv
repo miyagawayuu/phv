@@ -30,6 +30,11 @@ export function demo_db(): Database {
         name TEXT PRIMARY KEY,
         value INTEGER NOT NULL
     )");
+    $db->execute(sql"CREATE TABLE IF NOT EXISTS totp_steps (
+        secret TEXT PRIMARY KEY,
+        step INTEGER NOT NULL,
+        used_at INTEGER NOT NULL
+    )");
     return $db;
 }
 
@@ -75,4 +80,18 @@ export function bump_counter(Database $db, string $name): int {
 
 export function counter(Database $db, string $name): int {
     return $db->first(sql"SELECT value FROM counters WHERE name = {$name}")?->int("value") ?? 0;
+}
+
+// Records that time step `$step` of a TOTP secret was used. False when that step
+// (or a later one) was used before. It is one statement, so two requests sending
+// the same code at the same moment cannot both pass. Steps are kept for a day.
+export function use_totp_step(Database $db, string $secret, int $step): bool {
+    $key = hash("sha256", $secret);
+    $now = time();
+    $old = $now - KEEP_SECONDS;
+    $db->execute(sql"DELETE FROM totp_steps WHERE used_at < {$old}");
+    $n = $db->execute(sql"INSERT INTO totp_steps (secret, step, used_at) VALUES ({$key}, {$step}, {$now})
+        ON CONFLICT(secret) DO UPDATE SET step = excluded.step, used_at = excluded.used_at
+        WHERE excluded.step > totp_steps.step");
+    return $n == 1;
 }

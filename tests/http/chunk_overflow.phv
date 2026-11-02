@@ -1,0 +1,7 @@
+import std.net.HttpClient;
+
+try {
+    HttpClient::connect("api")->get("/chunk-overflow");
+} catch (NetworkError $e) {
+    echo "NetworkError: ", $e->getMessage(), "\n";
+}

@@ -119,6 +119,12 @@ pub enum EchoContext {
     ScriptUrl,
     /// `<iframe srcdoc="...">`: its value is parsed as an HTML document.
     Srcdoc,
+    /// The URL of a `<script>` (`src`, or `href` in SVG): the tag gets the CSP
+    /// nonce, so any URL inserted there would run as a trusted script.
+    ScriptSrc,
+    /// `content` of a `<meta>` that is not a `name`/`property`/`itemprop`
+    /// meta, such as `http-equiv="refresh"` (`content="0;url=..."` redirects).
+    MetaContent,
 }
 
 #[derive(Debug, Clone)]

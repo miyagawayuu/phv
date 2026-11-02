@@ -22,10 +22,12 @@ percent-encoding.workspace = true
 bytes.workspace = true
 postgres.workspace = true
 tokio-postgres-rustls.workspace = true
+tokio-postgres.workspace = true
+futures-util.workspace = true
 rustls.workspace = true
 webpki-roots.workspace = true
 mysql.workspace = true
-redis.workspace = true
+tokio.workspace = true
 tungstenite.workspace = true
 httparse.workspace = true
 

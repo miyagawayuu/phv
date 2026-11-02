@@ -1,0 +1,6 @@
+// More rows than the memory limit allows (run with a 16 MB limit).
+import std.db.Database;
+
+$db = Database::connect("main");
+$rows = $db->query(sql"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 50) SELECT REPEAT('x', 4000000) AS v FROM n");
+echo "not reached: ", count($rows), "\n";

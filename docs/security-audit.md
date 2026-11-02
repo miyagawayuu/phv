@@ -2,8 +2,8 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates three audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-and §8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache).
+This report consolidates four audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), and §9 covers what was added up to v0.4.0.
 
 Date: 2026-11-02
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
@@ -220,3 +220,102 @@ the interpreter stops with a bounds-check panic (caught by `catch_unwind`), and 
 
 All reviewer PoCs were rerun against the fixed build and verified to no longer reproduce. Regression tests were added for cache forgery, reuse,
 same-length rewrites, junctions, constructor visibility, `lsp` URIs, and config validation.
+
+## 9. Fourth Assessment (v0.4: network clients, database servers, web additions, editor, CI)
+
+Date: 2026-11-03. Scope: everything added after §8, which shipped in v0.2.5–v0.4.0: the HTTP and WebSocket clients
+(`std.net`), PostgreSQL / MySQL / Redis (`std.db`), `response()->file()`, `formAll()` / `queryAll()`, TOTP and QR codes,
+project-root discovery, LSP completion and go to definition (and the editor analysis behind them), the release and
+publishing workflows, the VS Code extension, and the example sites (`examples/demo`, `company`, `wardogs`).
+
+### Method
+
+Four new reviewers, each given only the source and one area, confirmed every finding with a working attack. They ran
+hostile HTTP, WebSocket and TLS servers, real PostgreSQL 17, MySQL 8.4 and Redis 7 servers in Docker, the example sites
+over HTTP (in production and development mode), and an LSP client with mutation fuzzing (about 400,000 requests). All
+PoCs were rerun against the fixed build, and regression tests were added. Dependencies: the shipped dependencies of
+the extension have no known vulnerabilities; CI's `cargo audit` passes.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| High | 2 | All fixed |
+| Medium | 9 | All fixed |
+| Low / Info | 14 | 13 fixed, 1 documented |
+| Found while verifying | 1 | Fixed (R4-24) |
+
+Repository and account settings that only the owner can change, and the remaining risks, are listed at the end.
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R4-1 | Query results bypassed `memory_limit_mb` (PostgreSQL, MySQL, Redis): memory was checked every 256 rows (PostgreSQL, MySQL) or after the whole reply (Redis). With a 16 MB limit, one query grew the process to 1.9 GB; a few such requests (or one hostile server reply) could make the whole server run out of memory | Memory is checked after every row. PostgreSQL connections are read through a metered socket with a byte budget of about half the memory left to the script; MySQL gets a client-side `max_allowed_packet`; Redis uses a new client (`redisclient.rs`) with the same budget. A connection that hits the limit is closed, not drained. Peak: 1.9 GB → 23–46 MB |
+| R4-2 | PostgreSQL `LISTEN` notifications piled up in the pooled connection's buffer and were never freed: the server's memory grew 26 → 1192 MB over three requests and stayed there | PostgreSQL connections are now driven by PHV (`pgmeter.rs`, over `tokio-postgres`), and notifications are dropped as they arrive. Three floods: the server stays at 23 MB |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R4-3 | A hostile HTTP or WebSocket server could hold a request past the script's time limit, forever: the socket timeout limits each read, not the total (one byte of headers or body every 1.5 s, endless `100 Continue`, a WebSocket handshake or ping flood one byte at a time). Through `phv serve` this pins a worker per request | Every socket read and write stops at the deadline (`netio::Socket`, also under TLS). At most 10 interim responses. `receive()` also ends when control frames keep arriving. Every attack now ends at the time limit |
+| R4-4 | Database time limits could be bypassed by the script (`SET statement_timeout = 0`, `set_config`, MySQL `MAX_EXECUTION_TIME` hints, `DO SLEEP()`, which `max_execution_time` does not cover), and PostgreSQL had no client-side timeout, so a hostile server could hang a request forever and a few such requests used up `pool_size` | PostgreSQL stops reading at the deadline on the client side (R4-2's metered socket); MySQL statements are stopped with `KILL QUERY` from a second connection at the deadline, and the socket timeout is the time limit + 10 s. All four PoCs end at the limit |
+| R4-5 | The MySQL pool reset (`COM_RESET_CONNECTION`) kept the active role (`SET ROLE`) and the current database (`USE`) for the next request (privileges or another tenant's data) | After the reset: `SET ROLE DEFAULT` and the URL's database again; without a database in the URL, a connection that chose one is not reused |
+| R4-6 | `<script src="<?= safe_url($u) ?>">` compiled, and the tag got the CSP nonce: any URL there ran as a trusted script (also `/js/<?= $s ?>` and SVG `<script href>`) | Inserting into the URL of a `<script>` is a compile error |
+| R4-7 | Static files (up to 64 MB) and `response()->file()` were read whole into memory for every request, and connections had no write timeout: 30 parallel downloads of a 60 MB file took 1.8 GB | Both are streamed from the open file. A connection whose client accepts no data for 30 s is closed (`StallGuard`). 20 parallel 40 MB downloads: peak 30 MB |
+| R4-8 | Since v0.2.1, project-root discovery walked every ancestor directory, so a `phv.toml` planted by another local user (e.g. `D:\phv.toml`, writable by all users on Windows) became the project file, with its permissions, environment variables and services | A `phv.toml` is skipped at a filesystem root, in the shared temporary directory, and on Unix when it is not owned by the current user or root |
+| R4-9 | Each subclass copies what it inherits, so 127 KB of source (3,000 classes extending one with 3,000 methods) took 13.7 s and 2.3 GB in `phv lsp`, repeated on every keystroke; 560 KB took 7.9 GB | All classes together may inherit at most 200,000 members (compile error beyond). The same file: 1.2 s and 69 MB. Sources larger than 8 MB are refused |
+| R4-10 | The Marketplace publish job ran `npx @vscode/vsce@4.1.0` with its whole dependency tree unpinned (and install scripts) while holding the OIDC permission that can publish the extension | vsce 4.1.0 is pinned in `editors/vscode/package-lock.json`; the job checks out the tag, installs with `npm ci --ignore-scripts`, and checks the `.vsix` against the release's `SHA256SUMS` |
+| R4-11 | The example sites rate-limited by the full address (an IPv6 /64 gives 2^64 keys) and the demo trusted `Fly-Client-IP` when not on Fly.io: the board, contact form, TOTP and click limits could be bypassed | New `ip_group($ip)` (an IPv6 address stands for its /64); the examples and the spec use it. The demo reads `Fly-Client-IP` only when `FLY_APP_NAME` is set |
+
+### Low / Info
+
+| # | Finding | Fix |
+|---|---|---|
+| R4-12 | A chunk size of `ffffffffffffffff` after a first chunk overflowed (`attempt to add with overflow`): any service a site calls could turn a request into an internal error | Checked arithmetic; chunk sizes are hex digits only (at most 16), the CRLF after each chunk is checked; `Content-Length` must be digits only and repeated values must agree |
+| R4-13 | A script could shadow a `headers_env` credential with `X_Api_Key` (CGI servers read `_` and `-` the same) and add a second value for a query key of the base URL | `_` counts as `-` when comparing header names; query keys of the base URL cannot be given again |
+| R4-14 | Paths with `..;` (path parameters) and `%252e%252e` (decoded twice by some proxies) were sent | Refused, as are `%` without two hex digits and characters outside RFC 3986 (non-ASCII is percent-encoded) |
+| R4-15 | Error messages named the host of a service (`cannot resolve <host>`, rustls certificate errors, MySQL driver errors with `host:port`) | Network, TLS and connection errors are described in fixed words |
+| R4-16 | `DISCARD ALL` also removed the PostgreSQL client's own prepared statements, so the first query using an unseen custom type (enum, domain) failed on that pooled connection for good | The reset runs the parts of `DISCARD ALL` except `DEALLOCATE ALL`, and deallocates the statements scripts prepared by name |
+| R4-17 | `<meta http-equiv="refresh" content="0;url=<?= $s ?>">` accepted any string (open redirect) | Inserting into `<meta content>` takes only numbers unless `name`, `property` or `itemprop` comes first |
+| R4-18 | 52,000 cookieless requests to a page that creates a session evicted every visitor's session (the store holds 50,000) | When full, sessions whose visitor never came back are evicted first |
+| R4-19 | The TOTP replay check the spec and the demo used (last step in the session) was racy: 2 of 8 parallel requests with the same code were accepted | The demo stores the step with one SQLite statement that only succeeds for a newer step; the spec recommends this. 1 of 8 accepted |
+| R4-20 | Pages with a CSRF token had no `Cache-Control` when the visitor already had the CSRF cookie: a shared cache could hand one visitor's token to another | `csrf_token()` / `csrf_field()` mark the response `private, no-store` |
+| R4-21 | The website deploy step (with the Cloudflare token) ran in the same job as `npm run build`, which could plant a `wrangler` in `node_modules` that `npx` would run | Build and deploy are separate jobs; the deploy job only downloads the built site |
+| R4-22 | The loader read a file when its path could not be resolved (device names), read sources of any size, and could block on a FIFO | An unresolvable path is not read; sources are read only from regular files up to 8 MB (also `phv.toml`) |
+| R4-23 | The WARDOGS example returned 500 on huge numbers from the game server (`(int)round(1e308)`) | Out-of-range numbers count as missing |
+| Info | `safe_url()` let `\/host` through (browsers read it as `//host`); `phv lsp` had no `catch_unwind`, checked unopened documents on save and kept diagnostics state after close; definition URIs could contain `..`; `sslmode=require` / `require_ssl` in a URL was ignored when `phv.toml` allowed plain connections; two `[databases]` entries with the same URL shared a pool; header values could hold control characters other than CR/LF | Fixed |
+| Info (documented) | Development mode is the default on `127.0.0.1`, which is also where a reverse proxy connects | The spec says to use `--prod` behind a proxy, and the server prints a note at startup |
+
+### Found while verifying
+
+| # | Finding | Fix |
+|---|---|---|
+| R4-24 | On Windows, requests opening a new SQLite file at the same moment failed with "not a safe file name" (5 of 8): a journal deleted by another connection gets a final path under `\$Extend\$Deleted`, which the real-name check (R2-4) took for an alias | A file in that location counts as gone. Three runs of the same race: no failures |
+
+### Settings for the owner (not changed)
+
+These are repository and account settings; they were not changed in this assessment.
+
+- The `marketplace` environment has no protection rules: allow deployments only from tags `v*`, add a required reviewer,
+  and add a ruleset that restricts who can create `v*` tags.
+- Turn on Dependabot security updates and secret scanning, and consider a `.github/dependabot.yml` for GitHub Actions.
+
+### Residual Risks
+
+| Item | Description |
+|---|---|
+| Deploy tooling | `wrangler` is pinned, but its own dependencies are resolved when the deploy job runs, with install scripts (the deploy job holds the Cloudflare token). `cargo install cargo-audit` takes the latest version |
+| Actions pinned by tag | Only GitHub's own actions are used, referenced by tag rather than commit |
+| Editor | Every change triggers a full analysis (no debouncing or cancellation); the caps above bound its cost. Dependencies listed with a `path` outside the project are read by the editor (only `.phv` files) |
+| DNS | Name lookups of the network clients have no timeout of their own |
+| Response bodies | A page's output is held in memory up to the memory limit of its request, for each of up to 1024 connections |
+| File-backed sessions | The eviction order of R4-18 applies to the memory store |
+
+### Verification
+
+All PoCs were rerun against the fixed build. Regression tests were added for the slow-drip and chunk-overflow servers
+(`tests/http`), memory and time limits on real servers, notifications, custom types after a reset, and the MySQL role
+and database reset (`tests/db`, run in CI against PostgreSQL, MySQL and Redis), the template contexts (`tests/cases`),
+the session flood, the deadline socket, URL, path, header and chunk parsing, and the fuzzer (1,500 mutations per
+program, also through the editor analysis).

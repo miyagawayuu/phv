@@ -1,0 +1,8 @@
+// Notifications cannot pile up (run with a 16 MB limit): the script stops at the
+// memory limit instead, and the server keeps its memory.
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->execute(sql"LISTEN phv_flood");
+$db->execute(sql"SELECT count(pg_notify('phv_flood', g::text || repeat('x', 7900))) FROM generate_series(1, 20000) g");
+echo "not reached\n";

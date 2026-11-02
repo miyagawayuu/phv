@@ -1,6 +1,6 @@
 <?phv
 import std.http.{request, response, session};
-import lib.client.client_ip;
+import lib.client.client_key;
 import lib.source.sources;
 import lib.store.{demo_db, recent_messages, add_message, validate_message};
 
@@ -16,7 +16,7 @@ if ($req->isPost()) {
     $name = ($req->form("name") ?? "")->trim();
     $text = ($req->form("text") ?? "")->trim();
     $errors = validate_message($name, $text);
-    $ip = client_ip();
+    $ip = client_key();
     if ($errors->isEmpty() && (!rate_limit("board:" . $ip, 3, 60) || !rate_limit("board:" . $ip, 20, 86400))) {
         $errors[] = "Too many messages from your address; please wait a little.";
     }

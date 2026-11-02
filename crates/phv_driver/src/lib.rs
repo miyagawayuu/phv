@@ -154,7 +154,7 @@ fn find_root_in(cwd: &Path, entry: &Path) -> PathBuf {
     };
     let mut dir = start.clone();
     loop {
-        if cwd.join(&dir).join("phv.toml").is_file() {
+        if trusted_config(&cwd.join(&dir)) {
             return dir;
         }
         match dir.parent() {
@@ -166,12 +166,79 @@ fn find_root_in(cwd: &Path, entry: &Path) -> PathBuf {
     // it (`public/index.phv` stops at `public`), so go on along the absolute path.
     if entry.is_relative() {
         if let Ok(abs) = cwd.join(&start).canonicalize() {
-            if let Some(dir) = abs.ancestors().find(|d| d.join("phv.toml").is_file()) {
+            if let Some(dir) = abs.ancestors().find(|d| trusted_config(d)) {
                 return dir.to_path_buf();
             }
         }
     }
     start
+}
+
+/// Largest source file (module, template or entry script) that is read.
+const MAX_SOURCE: u64 = 8 << 20;
+
+/// Reads a source file: only a regular file (not a pipe or a device, which could
+/// block forever), of at most `MAX_SOURCE` bytes.
+pub(crate) fn read_source(path: &Path) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read};
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+    }
+    if meta.len() > MAX_SOURCE {
+        return Err(Error::new(ErrorKind::InvalidData, format!("larger than {} MB", MAX_SOURCE >> 20)));
+    }
+    let mut text = String::new();
+    file.take(MAX_SOURCE + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_SOURCE {
+        return Err(Error::new(ErrorKind::InvalidData, format!("larger than {} MB", MAX_SOURCE >> 20)));
+    }
+    Ok(text)
+}
+
+/// Whether `dir` holds a `phv.toml` that may be used when it is found by
+/// walking up from a script. A project file decides what scripts may read,
+/// write and connect to, so one that another user could have put there is
+/// skipped: at the root of a filesystem (on Windows any user may create files
+/// at the root of a drive), in the shared temporary directory, and on Unix one
+/// not owned by the current user or root.
+fn trusted_config(dir: &Path) -> bool {
+    let file = dir.join("phv.toml");
+    let Ok(meta) = std::fs::symlink_metadata(&file) else { return false };
+    if !meta.is_file() {
+        return false;
+    }
+    let abs = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if abs.parent().is_none() {
+        return false;
+    }
+    if std::env::temp_dir().canonicalize().is_ok_and(|t| t == abs) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let me = current_uid();
+        if meta.uid() != me && meta.uid() != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// The current user's id, taken from the owner of the home directory.
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    static UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *UID.get_or_init(|| {
+        // The home directory belongs to the user; fall back to the current directory.
+        std::env::var_os("HOME")
+            .and_then(|h| std::fs::metadata(h).ok())
+            .or_else(|| std::fs::metadata(".").ok())
+            .map_or(u32::MAX, |m| m.uid())
+    })
 }
 
 fn display_name(root: &Path, path: &Path) -> String {
@@ -223,17 +290,28 @@ impl Loader {
         if let Some(&i) = self.by_path.get(&path) {
             return Some(i);
         }
-        // Symlinks and junctions must not pull in files from outside the project.
-        if let Ok(c) = path.canonicalize() {
-            if !self.allowed.iter().any(|a| c.starts_with(a)) {
+        // Symlinks and junctions must not pull in files from outside the project. A path
+        // that cannot be resolved (missing, or a device name such as `CON`) is not read.
+        let canonical = match path.canonicalize() {
+            Ok(c) => c,
+            Err(e) => {
                 let shown = display_name(&self.root, &path);
-                self.diags
-                    .push(Diagnostic::error(format!("{what} {shown} resolves to a file outside the project"), span));
+                let msg = if e.kind() == std::io::ErrorKind::NotFound {
+                    format!("{what} not found (looked for {shown})")
+                } else {
+                    format!("cannot read {what} at {shown}")
+                };
+                self.diags.push(Diagnostic::error(msg, span));
                 return None;
             }
+        };
+        if !self.allowed.iter().any(|a| canonical.starts_with(a)) {
+            let shown = display_name(&self.root, &path);
+            self.diags.push(Diagnostic::error(format!("{what} {shown} resolves to a file outside the project"), span));
+            return None;
         }
-        let overlaid = path.canonicalize().ok().and_then(|c| self.overlay.get(&c).cloned());
-        match overlaid.map(Ok).unwrap_or_else(|| std::fs::read_to_string(&path)) {
+        let overlaid = self.overlay.get(&canonical).cloned();
+        match overlaid.map(Ok).unwrap_or_else(|| read_source(&path)) {
             Ok(text) => {
                 let name = display_name(&self.root, &path);
                 Some(self.add(name, Some(path), text, kind))
@@ -416,7 +494,7 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
     loader.deps.push(Dep::new(&toml, std::fs::read(&toml).ok().as_deref()));
     loader.add("<std>/prelude.phv".into(), None, phv_std::PRELUDE.to_string(), ModuleKind::Prelude);
     let overlaid = entry.canonicalize().ok().and_then(|c| loader.overlay.get(&c).cloned());
-    let text = match overlaid.map(Ok).unwrap_or_else(|| std::fs::read_to_string(entry)) {
+    let text = match overlaid.map(Ok).unwrap_or_else(|| read_source(entry)) {
         Ok(t) => t,
         Err(e) => {
             messages.push(format!("cannot read {}: {e}", entry.display()));

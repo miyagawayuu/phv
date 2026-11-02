@@ -21,3 +21,8 @@ $h = escape($q);
 <a href="javascript:go('<?= $q ?>')">a javascript: URL</a>
 <textarea><a title="</textarea><script>var h = <?= $q ?>;</script>
 <svg><title><script>var i = <?= $q ?>;</script></title></svg>
+<script src="<?= safe_url($q) ?>"></script>
+<script src="/js/<?= $q ?>.js"></script>
+<svg><script href="<?= safe_url($q) ?>"></script></svg>
+<meta http-equiv="refresh" content="0;url=<?= $q ?>">
+<meta content="0;url=<?= $q ?>" http-equiv="refresh">

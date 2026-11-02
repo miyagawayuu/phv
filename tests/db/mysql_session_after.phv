@@ -1,0 +1,7 @@
+// After the pool reset: the database of the URL and no role.
+import std.db.Database;
+
+$db = Database::connect("main");
+echo "db: ", $db->first(sql"SELECT DATABASE() AS d")?->string("d") ?? "", " role: ", $db->first(sql"SELECT CURRENT_ROLE() AS r")?->string("r") ?? "", "\n";
+$db->execute(sql"DROP DATABASE phv_other");
+$db->execute(sql"DROP ROLE phv_role");

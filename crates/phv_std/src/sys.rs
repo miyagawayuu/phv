@@ -437,13 +437,13 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             };
             crate::check_header(vm, "Content-Type", &ct)?;
             let (dir, name) = resolve_path(vm, &rel, false)?;
-            let mut f = dir.open(&name, false).map_err(|e| fs_error(vm, &rel, "", e))?;
-            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-            vm.reserve(size as usize)?;
-            let mut bytes = Vec::with_capacity(size as usize);
-            f.read_to_end(&mut bytes).map_err(|e| io_error(vm, "cannot read", &rel, e))?;
+            let f = dir.open(&name, false).map_err(|e| fs_error(vm, &rel, "", e))?;
+            if !f.metadata().is_ok_and(|m| m.is_file()) {
+                return Err(vm.throw("ValueError", format!("\"{rel}\" is not a file")));
+            }
             crate::set_type(vm, &ct)?;
-            vm.http.body_file = Some(bytes);
+            // Sent from this open handle, so the file is not read into memory.
+            vm.http.body_file = Some(std::sync::Arc::new(f));
             Ok(Value::Null)
         },
         "file_put_contents" => |vm, a| {

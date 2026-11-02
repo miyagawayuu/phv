@@ -2,10 +2,20 @@ import std.http.request;
 
 // The visitor's address. Behind Fly.io's proxy, request()->ip is the proxy's
 // address; the proxy puts the real one in Fly-Client-IP (replacing any value
-// the client sent).
+// the client sent). Anywhere else that header is the client's own text, so it
+// is only used when the site runs on Fly.io.
 export function client_ip(): string {
     $req = request();
+    if (getenv("FLY_APP_NAME") == null) {
+        return $req->ip;
+    }
     return $req->header("Fly-Client-IP") ?? $req->ip;
+}
+
+// The key to rate-limit a visitor by: their address, or for IPv6 its /64
+// (one visitor can use any address of their network).
+export function client_key(): string {
+    return ip_group(client_ip());
 }
 
 // The region serving this request ("nrt" for Tokyo), or "local".

@@ -166,9 +166,7 @@ fn http_spec(name: &str, h: HttpSection) -> Result<HttpSpec, String> {
     let mut headers = Vec::new();
     for (header, value) in h.headers {
         phv_std::check_header_name(&header).map_err(|e| format!("[http.{name}] headers: {e}"))?;
-        if value.contains(['\r', '\n', '\0']) {
-            return Err(format!("[http.{name}] headers: the value of {header} contains a line break"));
-        }
+        phv_std::check_header_value(&header, &value).map_err(|e| format!("[http.{name}] headers: {e}"))?;
         headers.push((header, Some(value)));
     }
     let mut headers_env = Vec::new();
@@ -178,7 +176,8 @@ fn http_spec(name: &str, h: HttpSection) -> Result<HttpSpec, String> {
             return Err(format!("[http.{name}]: {header} is in both headers and headers_env"));
         }
         // Like `url_env`, an unset variable is reported when a request is sent.
-        let value = std::env::var(&var).ok().filter(|v| !v.is_empty() && !v.contains(['\r', '\n', '\0']));
+        let value =
+            std::env::var(&var).ok().filter(|v| !v.is_empty() && phv_std::check_header_value(&header, v).is_ok());
         headers.push((header.clone(), value));
         headers_env.push((header, var));
     }
@@ -389,7 +388,7 @@ fn overlaps(a: &[String], b: &[String]) -> bool {
 /// Reads `<root>/phv.toml` (all settings are optional).
 pub fn load_config(root: &Path) -> Result<Config, String> {
     let path = root.join("phv.toml");
-    let text = match std::fs::read_to_string(&path) {
+    let text = match crate::read_source(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default_for(root)),
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),

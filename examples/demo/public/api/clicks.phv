@@ -1,6 +1,6 @@
 <?phv
 import std.http.{request, response, session};
-import lib.client.client_ip;
+import lib.client.client_key;
 import lib.store.{demo_db, bump_counter, counter};
 
 // GET  /api/clicks -> {"total": 12}
@@ -12,7 +12,7 @@ if (!request()->isPost()) {
     return;
 }
 
-if (!rate_limit("clicks:" . client_ip(), 60, 60)) {
+if (!rate_limit("clicks:" . client_key(), 60, 60)) {
     response()->status(429)->json(["error" => "Slow down: at most 60 clicks a minute."]);
     return;
 }

@@ -477,6 +477,8 @@ and text such as `</scripts>` that looks like an end tag but is not one.
 | `<style>`, `style="..."` | | Error (numbers are allowed) |
 | Event attribute | `onclick="go(<?= $v ?>)"` | Error. Put the value in a `data-*` attribute and read it from JavaScript |
 | `<iframe srcdoc="...">` | | Error (the value is parsed as a separate HTML document) |
+| URL of a `<script>` | `<script src="<?= $u ?>">` (and `href` in SVG) | Error, also for `SafeUrl`: the tag gets the CSP nonce, so any URL there would run as a trusted script. Write the URL in the template |
+| `content` of a `<meta>` | `<meta http-equiv="refresh" content="0;url=<?= $u ?>">` | Only numbers, unless a `name`, `property` or `itemprop` attribute comes before `content` (`<meta property="og:title" content="<?= $t ?>">` is text) |
 
 - The bodies of functions and closures, and `if` and loop blocks, must end in the same HTML state they started in
   (leaving a `<script>` or an attribute open at the end of a block is an error). This prevents the context from drifting with call order or repetition.
@@ -497,15 +499,19 @@ phv serve examples/site --port 8080
 - Each request runs in a new VM (a new heap). Only the compiled bytecode is shared.
 - When a file is saved, it is recompiled on the next request (the modification times of all the files it depends on are checked).
 - Limits: execution time 30 seconds (`--time-limit`), memory 128 MB (`[security] memory_limit_mb`), body 8 MB, receiving headers 10 seconds,
-  receiving the body 30 seconds, 1024 concurrent connections, 1000 query and form fields.
+  receiving the body 30 seconds, 1024 concurrent connections, 1000 query and form fields. A connection is closed when the
+  client accepts no data for 30 seconds. Static files (and `response()->file()`) are sent from disk as they are read,
+  so they do not take memory.
 - If `[security] requests_per_minute` is set, the number of requests accepted per minute from a single client address is limited to that number
   (beyond it, the response is `429 Too Many Requests` with `Retry-After`). The default is unlimited.
 - Headers sent by default: `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`,
   `Referrer-Policy: strict-origin-when-cross-origin`, and Content-Security-Policy (see "Content-Security-Policy" below).
-  HSTS if `secure_cookies = true`. `Cache-Control: private, no-store` on responses that use sessions or cookies.
+  HSTS if `secure_cookies = true`. `Cache-Control: private, no-store` on responses that use sessions or cookies, or
+  that carry a CSRF token (`csrf_field()`, `csrf_token()`).
   Version information such as `Server` / `X-Powered-By` is not sent. Scripts cannot set transport headers such as `Content-Length`.
 - In development mode, the details of compile errors and runtime errors are shown in the browser. Development mode is the default only
-  when listening on `127.0.0.1` / `localhost` (it can be set explicitly with `--dev` / `--prod`).
+  when listening on `127.0.0.1` / `localhost` (it can be set explicitly with `--dev` / `--prod`). **Behind a reverse proxy, which
+  reaches the server on `127.0.0.1`, use `--prod`**: otherwise visitors see the details (the server prints a note at startup).
 
 ### std.http
 
@@ -557,6 +563,9 @@ session()->destroy();                 // log out
   as in `[security] session_store = "sessions/"`, each session is stored in its own file. Sessions then survive restarts and can be shared by
   multiple server processes that use the same directory. File names are hashes of the IDs, so the IDs cannot be learned from a directory listing.
   A directory inside `public/` cannot be specified.
+- The store holds at most 50,000 sessions. When it is full, sessions whose visitor never came back are removed first,
+  then the least recently used: a flood of requests without a cookie (each creating a session) removes its own sessions,
+  not those of returning visitors.
 
 ### CSRF protection
 
@@ -676,11 +685,16 @@ The methods are the same as for SQLite (`query`, `first`, `execute`, `transactio
   production credentials. The URL is never shown to scripts or in error messages.
 - Connections are pooled per server process. When a script ends (or calls `close()`), its connection goes back
   to the pool after the session is reset: an open transaction is rolled back, and temporary tables and session
-  settings are cleared (PostgreSQL `DISCARD ALL`, MySQL `COM_RESET_CONNECTION`). Connecting to the same name
+  settings are cleared (PostgreSQL: cursors, `SET`s, roles, `LISTEN`, advisory locks, temporary tables and prepared
+  statements; MySQL `COM_RESET_CONNECTION`, the active role and the database of the URL). Connecting to the same name
   twice in one script gives the same connection. When every connection is in use, `connect()` waits up to the
   script's time limit (30 seconds at most) and then raises `DatabaseError`.
-- A statement running past the script's time limit is stopped by the server (PostgreSQL `statement_timeout`,
-  MySQL `max_execution_time`, which applies to `SELECT`).
+- A statement running past the script's time limit is stopped: by the server (PostgreSQL `statement_timeout`,
+  MySQL `max_execution_time`, which applies to `SELECT`) and, also when a script changes those settings, on the client
+  side (PostgreSQL connections stop reading at the deadline; MySQL statements are stopped with `KILL QUERY`). A result
+  larger than the memory left to the script is refused while it is read (the connection is then closed, not reused), so
+  a large result or a misbehaving server cannot grow the process past the memory limit. PostgreSQL notifications
+  (`LISTEN`) are dropped as they arrive; scripts cannot read them.
 - Each call runs a single statement (MySQL multi-statements are off), and `LOAD DATA LOCAL INFILE` is refused.
 - Value types: PostgreSQL `bool` → `bool`; integer types → `int`; `real`/`double precision` → `float`;
   `numeric`, `json`/`jsonb`, `uuid`, dates and times (`YYYY-MM-DD HH:MM:SS[.ffffff]`, `timestamptz` in UTC),
@@ -709,7 +723,8 @@ $redis->rpush("jobs", "a");  $redis->lpop("jobs");  $redis->lrange("jobs", 0, -1
 ```
 
 Methods: `get`, `set`, `delete`, `exists`, `incr`, `expire`, `ttl`, `hget`, `hset`, `hdel`, `hgetAll`, `rpush`,
-`lpop`, `lrange`, `close`. Only these commands can be sent: commands such as `KEYS`, `FLUSHALL`, `CONFIG` or
+`lpop`, `lrange`, `close`. Each command waits at most until the script's time limit, and a reply larger than the
+memory left to the script is refused. Only these commands can be sent: commands such as `KEYS`, `FLUSHALL`, `CONFIG` or
 `EVAL` are not available. A remote server needs a `rediss://` URL (or `tls = false`). Errors raise `DatabaseError`.
 
 ### WebSocket (std.net)
@@ -737,7 +752,8 @@ $ws->close();
   between requests.
 - Only text messages are sent and received. A binary message from the server raises `NetworkError`. Pings are
   answered while reading.
-- `receive()` waits at most until the script's time limit. A message is at most 16 MB, and a script can hold
+- `receive()` waits at most until the script's time limit, also when the server keeps sending pings or a message one
+  byte at a time (every read and write stops at the deadline). A message is at most 16 MB, and a script can hold
   16 connections at once.
 - **TLS (`wss://`) is required for every host except `localhost`**, with the server certificate checked against the
   public CAs. `tls = false` allows `ws://` to such a host.
@@ -782,18 +798,22 @@ joined with `, `), `body` (string), `ok()` (2xx), `header($name)` (`?string`, an
 when the body is not JSON).
 
 - The path must start with `/` and is added to the base URL's path. Paths that could leave it are refused with
-  `ValueError` before anything is sent: `//host`, `.` and `..` segments (also percent-encoded), encoded slashes, and
-  `?` or `#` (give the query as `$query`).
+  `ValueError` before anything is sent: `//host`, `.` and `..` segments (also percent-encoded, encoded twice as
+  `%252e`, or followed by `;` as in `..;`), encoded slashes, `%` not followed by two hex digits, and `?` or `#` (give
+  the query as `$query`). Characters outside ASCII are percent-encoded.
 - Header names and values are checked (no line breaks). `Host`, `Content-Length`, `Transfer-Encoding`,
   `Connection` and the other headers that frame the message are set by PHV. Scripts can replace the `headers` of
-  `phv.toml`, but not those of `headers_env`.
+  `phv.toml`, but not those of `headers_env` (also not under another spelling: `_` counts as `-`, as CGI servers read
+  both the same way). A query parameter of the base URL cannot be given again in `$query`.
 - Errors come back as responses: a 4xx or 5xx status does not throw. **Redirects are not followed**: a 3xx response
   is returned with its `Location` header.
 - **TLS (`https://`) is required for every host except `localhost`**, with the server certificate checked against the
   public CAs. `tls = false` allows `http://` to such a host.
-- Each request uses its own connection and waits at most until the script's time limit (30 seconds when it has none).
-  Request and response bodies are at most 16 MB. The body is read as UTF-8 text.
-- Connection failures and network errors raise `NetworkError`, naming the service but never its URL or headers. An
+- Each request uses its own connection and waits at most until the script's time limit (30 seconds when it has none),
+  whatever the server sends: every read and write stops at that deadline, and at most 10 interim (`1xx`) responses
+  are skipped. Request and response bodies are at most 16 MB. The body is read as UTF-8 text.
+- Connection failures and network errors raise `NetworkError`, naming the service but never its URL, host or headers
+  (errors are described in fixed words, such as "the server's TLS certificate is not valid"). An
   unset `url_env` or `headers_env` variable is reported when a request is sent, so `phv check` works without the
   production keys.
 
@@ -806,7 +826,7 @@ when the body is not JSON).
 | `random_int($min, $max)`, `random_token($bytes = 32)` | The OS's cryptographic random number generator (do not use `rand()` for cryptography) |
 | `password_hash($pw)`, `password_verify($pw, $hash)` | Argon2id |
 | `hash("sha256" \| "sha384" \| "sha512", $data)`, `hash_hmac($algo, $data, $key)`, `hash_equals($a, $b)` | `hash_equals` takes a comparison time that does not depend on the contents |
-| `totp_secret()`, `totp_code($secret, ?$time)`, `totp_verify($secret, $code): ?int` | Two-factor codes of authenticator apps (TOTP, RFC 6238: HMAC-SHA1, 6 digits, 30 seconds). The secret is 160 random bits as Base32. `totp_verify` accepts one step of clock drift either way, compares in constant time, and returns the time step it matched (or `null`): store it and refuse a step that is not newer, so a code cannot be used twice |
+| `totp_secret()`, `totp_code($secret, ?$time)`, `totp_verify($secret, $code): ?int` | Two-factor codes of authenticator apps (TOTP, RFC 6238: HMAC-SHA1, 6 digits, 30 seconds). The secret is 160 random bits as Base32. `totp_verify` accepts one step of clock drift either way, compares in constant time, and returns the time step it matched (or `null`): store it and refuse a step that is not newer, so a code cannot be used twice. Store it in the database with one statement that only succeeds for a newer step (`UPDATE ... SET step = {$step} WHERE id = {$id} AND step < {$step}`, then check the affected rows): with the session, two requests sending the same code at the same time could both pass |
 | `qr_svg($text): Html` | A QR code as an `<svg>` element (for example of an `otpauth://` URI). The markup holds only the modules, not the text, so it is safe to output |
 | `base64_encode`, `base64_decode: ?string`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | |
 | `json_decode($s): any` | Depth up to 128 |
@@ -835,20 +855,24 @@ form-action 'self'; frame-ancestors 'self'
 ### Rate limiting
 
 ```phv
-if (!rate_limit("login:" . request()->ip, 5, 60)) {     // up to 5 times per 60 seconds
+if (!rate_limit("login:" . ip_group(request()->ip), 5, 60)) {     // up to 5 times per 60 seconds
     response()->status(429);
     echo "Please wait a moment and try again.";
     return;
 }
 // after a successful login
-rate_limit_reset("login:" . request()->ip);
+rate_limit_reset("login:" . ip_group(request()->ip));
 ```
 
 - `rate_limit($key, $max, $seconds)` counts one use and returns `true` if the key has not yet reached `$max` in the current window,
   and returns `false` if it has. Counters are shared within the server process and are lost on restart.
 - The same key is counted separately for each window length (you can apply both 5 per minute and 50 per day). When there are more than 100,000 keys,
   keys that have not reached their limit are discarded first, so using a large number of keys does not release keys that are currently limited.
-- `requests_per_minute` counts IPv6 addresses grouped by /64.
+- `requests_per_minute` counts IPv6 addresses grouped by /64. Do the same in keys: `ip_group($ip)` returns the /64 of
+  an IPv6 address (and an IPv4 address as it is), as in `rate_limit("login:" . ip_group(request()->ip), 5, 60)`, since one
+  visitor can use any address of their network.
+- Behind a proxy, `request()->ip` is the proxy's address. Read the visitor's address from the proxy's header (such as
+  `Fly-Client-IP` on Fly.io) only when the site runs behind that proxy: anywhere else the header is the client's own text.
 - The site-wide limit is `[security] requests_per_minute` (§14).
 
 ### Permissions (phv.toml)
@@ -899,6 +923,11 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 The directory that contains `phv.toml` is the project root. Unknown keys are errors (so typos are caught).
 `phv serve` reads the file at startup, so restart the server after changing it.
 
+`phv run`, `check`, `test` and the editor look for `phv.toml` in the script's directory and the ones above it. A
+`phv.toml` that another user could have put there is skipped: at the root of a filesystem (on Windows any user may
+create files at the root of a drive), in the shared temporary directory, and on Unix one not owned by the current user
+(or root). The project file decides what scripts may read, write and connect to.
+
 ## 15. Builtin functions
 
 ### Global functions
@@ -921,7 +950,7 @@ The directory that contains `phv.toml` is the project root. Unknown keys are err
 | `json_decode(string): any`, `json_html(any): SafeJs`, `safe_url(string): SafeUrl` | §13, §14 |
 | `csrf_token(): string`, `csrf_field(): Html` | §14 |
 | `csp_nonce(): string` | The CSP nonce for this response (§14) |
-| `rate_limit(string, int, int): bool`, `rate_limit_reset(string)` | §14 |
+| `rate_limit(string, int, int): bool`, `rate_limit_reset(string)`, `ip_group(string): string` | §14 |
 | `date`, `gmdate`, `mktime`, `strtotime`, `checkdate` | Dates (table in §14) |
 | `random_int`, `random_token`, `password_hash`, `password_verify`, `hash`, `hash_hmac`, `hash_equals`, `totp_secret`, `totp_code`, `totp_verify`, `qr_svg` | Cryptography and two-factor authentication (table in §14) |
 | `base64_encode`, `base64_decode`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | Encoding |
@@ -1038,6 +1067,8 @@ It then runs the type checker and shows the places that need manual work, such a
 | Memory | 128 MB (`[security] memory_limit_mb`) | Fatal error |
 | Call depth | 10,000 | Fatal error |
 | Request body | 8 MB | 413 |
+| Source file (module, template, script) | 8 MB | Compile error |
+| Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits) |
 
 `unsafe` is used only in the allocator that counts memory usage (`phv_vm/src/alloc.rs`) and in the JIT
 (`phv_jit`, for calling generated code).

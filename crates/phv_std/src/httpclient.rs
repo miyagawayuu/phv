@@ -7,7 +7,7 @@
 //! Each request uses its own HTTP/1.1 connection (`Connection: close`).
 //! Redirects are not followed: a 3xx response is returned to the script.
 
-use crate::netio::{check_plain, dial, until};
+use crate::netio::{check_plain, describe, dial, until};
 use crate::{map, s};
 use indexmap::IndexMap;
 use phv_vm::{Key, Value, Vm, VmError};
@@ -24,6 +24,8 @@ const MAX_BODY: usize = 16 << 20;
 /// Largest response head (status line and headers).
 const MAX_HEAD: usize = 64 << 10;
 const MAX_HEADERS: usize = 100;
+/// Interim (1xx) responses skipped before the final one.
+const MAX_INTERIM: usize = 10;
 
 const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 
@@ -114,33 +116,72 @@ pub fn check_header_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn check_header_value(name: &str, value: &str) -> Result<(), String> {
-    if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
-        return Err(format!("the value of the {name} header contains a line break"));
+/// Checks a header value: no line breaks or other control characters (tab is allowed).
+pub fn check_header_value(name: &str, value: &str) -> Result<(), String> {
+    if value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+        return Err(format!("the value of the {name} header contains a line break or a control character"));
     }
     Ok(())
 }
 
-/// Checks the path a script asks for: it is added to the base URL's path, so
-/// it must start with `/` and cannot leave that path (`..`) or name another
-/// host (`//host`).
-fn check_path(path: &str) -> Result<(), String> {
+/// Whether two header names are the same header. `_` counts as `-`: servers
+/// that pass headers on as variables (CGI: `HTTP_X_API_KEY`) cannot tell them apart.
+fn same_header(a: &str, b: &str) -> bool {
+    let norm = |c: u8| if c == b'_' { b'-' } else { c.to_ascii_lowercase() };
+    a.len() == b.len() && a.bytes().zip(b.bytes()).all(|(x, y)| norm(x) == norm(y))
+}
+
+/// The keys of a query string (`a=1&b=2`), decoded.
+fn query_keys(query: &str) -> Vec<String> {
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let key = p.split('=').next().unwrap_or("").replace('+', " ");
+            percent_encoding::percent_decode_str(&key).decode_utf8_lossy().into_owned()
+        })
+        .collect()
+}
+
+/// Checks the path a script asks for and returns it ready to send (characters
+/// outside ASCII percent-encoded). It is added to the base URL's path, so it
+/// must start with `/` and cannot leave that path (`..`) or name another host
+/// (`//host`). Servers differ in how they read paths, so the spellings that
+/// some of them take as `..` are refused too: `..;` (path parameters) and
+/// `%252e%252e` (decoded twice).
+fn check_path(path: &str) -> Result<String, String> {
     if !path.starts_with('/') || path.starts_with("//") {
         return Err("the path must start with a single `/`".into());
     }
     if path.contains(['?', '#']) {
         return Err("put the query in the `query` argument, not in the path".into());
     }
-    if path.chars().any(|c| c.is_control() || c == ' ' || c == '\\') {
+    if path.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\') {
         return Err("the path contains spaces, backslashes or control characters".into());
     }
-    for segment in path.split('/') {
-        let decoded = percent_encoding::percent_decode_str(segment).decode_utf8_lossy();
-        if decoded == "." || decoded == ".." || decoded.contains(['/', '\\']) {
-            return Err("the path cannot contain `.` or `..` segments or encoded slashes".into());
+    let bytes = path.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        let hex = |j: usize| bytes.get(j).is_some_and(u8::is_ascii_hexdigit);
+        if *b == b'%' && !(hex(i + 1) && hex(i + 2)) {
+            return Err("the path has a `%` that is not followed by two hex digits".into());
+        }
+        let allowed = b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/%".contains(b) || *b >= 0x80;
+        if !allowed {
+            return Err(format!("the path cannot contain `{}`; percent-encode it", *b as char));
         }
     }
-    Ok(())
+    for segment in path.split('/') {
+        let once = percent_encoding::percent_decode_str(segment).decode_utf8_lossy().into_owned();
+        let twice = percent_encoding::percent_decode_str(&once).decode_utf8_lossy().into_owned();
+        for decoded in [&once, &twice] {
+            let name = decoded.split(';').next().unwrap_or("").trim_end();
+            if name == "." || name == ".." || decoded.contains(['/', '\\']) {
+                return Err("the path cannot contain `.` or `..` segments or encoded slashes".into());
+            }
+        }
+    }
+    const NON_ASCII: &percent_encoding::AsciiSet = percent_encoding::CONTROLS;
+    Ok(percent_encoding::utf8_percent_encode(path, NON_ASCII).to_string())
 }
 
 /// A request a script asked for, checked against its service.
@@ -151,6 +192,7 @@ struct Request {
     body: Vec<u8>,
 }
 
+#[derive(Debug)]
 struct Response {
     status: u16,
     headers: Vec<(String, String)>,
@@ -186,9 +228,18 @@ fn str_pairs(v: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A decimal Content-Length (digits only: `+3` and ` 3` are refused).
+fn parse_length(v: &str) -> Option<usize> {
+    if v.is_empty() || v.len() > 20 || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    v.parse().ok()
+}
+
 fn read_response(stream: &mut impl Read, head_only: bool) -> Result<Response, String> {
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 16 << 10];
+    let mut interim = 0;
     loop {
         // Interim (1xx) responses are skipped.
         let (status, headers, used) = loop {
@@ -220,6 +271,10 @@ fn read_response(stream: &mut impl Read, head_only: bool) -> Result<Response, St
         };
         buf.drain(..used);
         if (100..200).contains(&status) {
+            interim += 1;
+            if interim > MAX_INTERIM {
+                return Err("the server sent too many interim (1xx) responses".into());
+            }
             continue;
         }
         let header = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
@@ -229,7 +284,14 @@ fn read_response(stream: &mut impl Read, head_only: bool) -> Result<Response, St
         } else if header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
             read_chunked(stream, buf, &mut chunk)?
         } else if let Some(len) = header("content-length") {
-            let len: usize = len.parse().map_err(|_| "the response has an invalid Content-Length")?;
+            // Repeated Content-Length headers must agree.
+            let lengths: Vec<&str> =
+                headers.iter().filter(|(n, _)| n == "content-length").map(|(_, v)| v.as_str()).collect();
+            let invalid = "the response has an invalid Content-Length";
+            let len = parse_length(len).ok_or(invalid)?;
+            if lengths.iter().any(|l| parse_length(l) != Some(len)) {
+                return Err(invalid.into());
+            }
             if len > MAX_BODY {
                 return Err(too_large());
             }
@@ -267,10 +329,9 @@ fn read_some(stream: &mut impl Read, chunk: &mut [u8]) -> Result<usize, String> 
         match stream.read(chunk) {
             Ok(n) => return Ok(n),
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => return Err("timed out".into()),
             // Servers that close a TLS connection without close_notify: the data so far counts.
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(0),
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(describe(&e)),
         }
     }
 }
@@ -295,19 +356,27 @@ fn read_chunked(stream: &mut impl Read, mut buf: Vec<u8>, chunk: &mut [u8]) -> R
             }
             fill(&mut buf)?;
         };
+        let invalid = "the server sent an invalid chunk";
         let line = String::from_utf8_lossy(&buf[..line_end]).to_string();
         let size_text = line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_text, 16).map_err(|_| "the server sent an invalid chunk")?;
+        // Hex digits only (no sign), at most 16 of them.
+        if size_text.is_empty() || size_text.len() > 16 || !size_text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(invalid.into());
+        }
+        let size = usize::from_str_radix(size_text, 16).map_err(|_| invalid)?;
         buf.drain(..line_end + 2);
         if size == 0 {
             // Trailers are ignored.
             return Ok(body);
         }
-        if body.len() + size > MAX_BODY {
+        if size > MAX_BODY - body.len() {
             return Err(too_large());
         }
         while buf.len() < size + 2 {
             fill(&mut buf)?;
+        }
+        if &buf[size..size + 2] != b"\r\n" {
+            return Err(invalid.into());
         }
         body.extend_from_slice(&buf[..size]);
         buf.drain(..size + 2);
@@ -326,13 +395,7 @@ fn exchange(base: &Base, req: &Request, until: std::time::Instant) -> Result<Res
         head.push_str(&format!("Content-Length: {}\r\n", req.body.len()));
     }
     head.push_str("Connection: close\r\n\r\n");
-    let io = |e: std::io::Error| {
-        if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
-            "timed out".to_string()
-        } else {
-            e.to_string()
-        }
-    };
+    let io = |e: std::io::Error| describe(&e);
     stream.write_all(head.as_bytes()).map_err(io)?;
     stream.write_all(&req.body).map_err(io)?;
     stream.flush().map_err(io)?;
@@ -355,10 +418,10 @@ pub fn request(vm: &mut Vm, a: &[Value]) -> R {
     if !METHODS.contains(&method.as_str()) {
         return Err(vm.throw("ValueError", format!("unsupported HTTP method \"{}\"", method.escape_debug())));
     }
-    let path = s(&a[2]).to_string();
-    if let Err(e) = check_path(&path) {
-        return Err(vm.throw("ValueError", e));
-    }
+    let path = match check_path(s(&a[2])) {
+        Ok(p) => p,
+        Err(e) => return Err(vm.throw("ValueError", e)),
+    };
     let body = s(&a[5]).as_bytes().to_vec();
     if body.len() > MAX_BODY {
         return Err(vm.throw("ValueError", format!("the request body is larger than {} MB", MAX_BODY >> 20)));
@@ -378,10 +441,10 @@ pub fn request(vm: &mut Vm, a: &[Value]) -> R {
         if let Err(e) = checked {
             return Err(vm.throw("ValueError", e));
         }
-        if spec.headers_env.iter().any(|(n, _)| n.eq_ignore_ascii_case(&h)) {
+        if spec.headers_env.iter().any(|(n, _)| same_header(n, &h)) {
             return Err(vm.throw("ValueError", format!("the {h} header comes from phv.toml and cannot be replaced")));
         }
-        headers.retain(|(n, _)| !n.eq_ignore_ascii_case(&h));
+        headers.retain(|(n, _)| !same_header(n, &h));
         headers.push((h, value));
     }
     let has = |headers: &[(String, String)], n: &str| headers.iter().any(|(h, _)| h.eq_ignore_ascii_case(n));
@@ -398,7 +461,14 @@ pub fn request(vm: &mut Vm, a: &[Value]) -> R {
     if let Err(e) = check_plain(&base.host, base.tls, spec.tls, "https://") {
         return Err(fail(vm, e));
     }
-    let query = encode_query(&str_pairs(&a[3]));
+    let pairs = str_pairs(&a[3]);
+    // The base URL's query may hold a key; the script cannot add a second value for it.
+    let fixed = query_keys(&base.query);
+    if let Some((k, _)) = pairs.iter().find(|(k, _)| fixed.contains(k)) {
+        let msg = format!("the query parameter \"{}\" comes from phv.toml and cannot be replaced", k.escape_debug());
+        return Err(vm.throw("ValueError", msg));
+    }
+    let query = encode_query(&pairs);
     let mut target = format!("{}{path}", base.path);
     match (base.query.is_empty(), query.is_empty()) {
         (true, true) => {}
@@ -457,19 +527,30 @@ mod tests {
 
     #[test]
     fn paths_stay_under_the_base() {
-        assert!(check_path("/v1/items/42").is_ok());
-        assert!(check_path("/search%20results").is_ok());
+        assert_eq!(check_path("/v1/items/42").unwrap(), "/v1/items/42");
+        assert_eq!(check_path("/search%20results;v=1").unwrap(), "/search%20results;v=1");
+        assert_eq!(check_path("/café").unwrap(), "/caf%C3%A9");
         for bad in [
             "items",
             "//evil.example/x",
             "/a/../b",
             "/a/%2e%2E/b",
             "/a/%2F/b",
+            "/a/..;/b",
+            "/a/%2e%2e;x/b",
+            "/a/%252e%252e/b",
+            "/a/%252F/b",
+            "/a/.;/b",
             "/a?x=1",
             "/a#b",
             "/a b",
             "/a\\b",
             "/a\r\nX: y",
+            "/a%",
+            "/a%zz",
+            "/a<b>",
+            "/a\"b",
+            "/a\u{3000}b",
         ] {
             assert!(check_path(bad).is_err(), "{bad:?}");
         }
@@ -482,6 +563,10 @@ mod tests {
             assert!(check_header_name(bad).is_err(), "{bad:?}");
         }
         assert!(check_header_value("X", "a\r\nInjected: 1").is_err());
+        assert!(check_header_value("X", "a\x0bb").is_err());
+        assert!(check_header_value("X", "a\tb").is_ok());
+        assert!(same_header("X-Api-Key", "x_api_KEY") && !same_header("X-Api-Key", "X-Api-Keys"));
+        assert_eq!(query_keys("key=x&a+b=1&c"), ["key", "a b", "c"]);
     }
 
     #[test]
@@ -499,5 +584,19 @@ mod tests {
         assert!(read_response(&mut &raw[..], false).is_err());
         let raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1);
         assert!(read_response(&mut raw.as_bytes(), false).is_err());
+        // A chunk size near usize::MAX after a first chunk must not overflow.
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\nffffffffffffffff\r\n";
+        assert!(read_response(&mut &raw[..], false).unwrap_err().contains("larger than"));
+        for bad in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n+5\r\nhello\r\n0\r\n\r\n"[..],
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10000000000000000\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: +3\r\n\r\nabc",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabcd",
+        ] {
+            assert!(read_response(&mut &bad[..], false).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+        let endless = b"HTTP/1.1 100 Continue\r\n\r\n".repeat(MAX_INTERIM + 1);
+        assert!(read_response(&mut &endless[..], false).unwrap_err().contains("interim"));
     }
 }

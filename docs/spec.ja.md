@@ -477,6 +477,8 @@ HTML エスケープが守れるのは、要素の中身と**引用符で囲ん�
 | `<style>`・`style="..."` | | エラー(数値は可) |
 | イベント属性 | `onclick="go(<?= $v ?>)"` | エラー。`data-*` 属性に入れて JavaScript から読む |
 | `<iframe srcdoc="...">` | | エラー(値が別の HTML 文書として解析される) |
+| `<script>` の URL | `<script src="<?= $u ?>">`(SVG では `href`) | `SafeUrl` でもエラー。このタグには CSP の nonce が付くので、そこに入った URL は信頼されたスクリプトとして実行される。URL はテンプレートに書く |
+| `<meta>` の `content` | `<meta http-equiv="refresh" content="0;url=<?= $u ?>">` | 数値だけ。ただし `content` より前に `name`、`property`、`itemprop` 属性があればテキスト(`<meta property="og:title" content="<?= $t ?>">`) |
 
 - 関数・クロージャの本体、`if`・ループのブロックは、始まったときと同じ HTML の状態で終わらなければならない
   (`<script>` や属性をブロックの中で開いたまま終えるとエラー)。呼び出し順や繰り返しで文脈がずれるのを防ぐ。
@@ -497,15 +499,18 @@ phv serve examples/site --port 8080
 - リクエストごとに新しい VM(新しいヒープ)で実行する。コンパイル済みのバイトコードだけが共有される。
 - ファイルを保存すると次のリクエストで再コンパイルされる(依存する全ファイルの更新時刻を見る)。
 - 上限: 実行時間 30 秒(`--time-limit`)、メモリ 128 MB(`[security] memory_limit_mb`)、本文 8 MB、ヘッダーの受信 10 秒、
-  本文の受信 30 秒、同時接続 1024、クエリ・フォームの項目 1000 個。
+  本文の受信 30 秒、同時接続 1024、クエリ・フォームの項目 1000 個。クライアントが 30 秒データを受け取らなければ
+  接続を閉じる。静的ファイル(と `response()->file()`)はディスクから読みながら送るので、メモリを使わない。
 - `[security] requests_per_minute` を書くと、1 つの接続元アドレスから 1 分間に受け付けるリクエストをその数までにする
   (超えると `429 Too Many Requests` と `Retry-After`)。既定は無制限。
 - 既定で付けるヘッダー: `X-Content-Type-Options: nosniff`、`X-Frame-Options: SAMEORIGIN`、
   `Referrer-Policy: strict-origin-when-cross-origin`、Content-Security-Policy(下の「Content-Security-Policy」)。
-  `secure_cookies = true` なら HSTS。セッションや Cookie を使うレスポンスには `Cache-Control: private, no-store`。
+  `secure_cookies = true` なら HSTS。セッションや Cookie を使うレスポンスと、CSRF トークンを含むレスポンス
+  (`csrf_field()`、`csrf_token()`)には `Cache-Control: private, no-store`。
   `Server` / `X-Powered-By` のようなバージョン情報は出さない。スクリプトは `Content-Length` などの通信用ヘッダーを設定できない。
 - 開発モードではコンパイルエラーと実行時エラーの詳細をブラウザに表示する。開発モードが既定になるのは
-  `127.0.0.1` / `localhost` で待ち受けるときだけ(`--dev` / `--prod` で明示できる)。
+  `127.0.0.1` / `localhost` で待ち受けるときだけ(`--dev` / `--prod` で明示できる)。**`127.0.0.1` に接続してくる
+  リバースプロキシの後ろでは `--prod` を付ける**こと。付けないと訪問者に詳細が見える(起動時に注意を表示する)。
 
 ### std.http
 
@@ -557,6 +562,9 @@ session()->destroy();                 // ログアウト
   プロジェクト内のディレクトリを書くと、1 セッション 1 ファイルで保存する。再起動しても残り、同じディレクトリを使う
   複数のサーバープロセスで共有できる。ファイル名は ID のハッシュなので、ディレクトリの一覧から ID は分からない。
   `public/` の中は指定できない。
+- 保存できるセッションは最大 50,000。いっぱいになると、訪問者が一度も戻ってこなかったセッションから先に消し、
+  その次に最も長く使われていないものを消す。Cookie なしのリクエストを大量に送られても(それぞれがセッションを作る)、
+  消えるのはそのセッションで、戻ってくる訪問者のセッションは残る。
 
 ### CSRF 対策
 
@@ -675,11 +683,15 @@ $id = $db->lastInsertId();                                                      
   認証情報がなくても `phv check` は通ります。URL はスクリプトにもエラーメッセージにも出ません。
 - 接続はサーバープロセスごとにプールします。スクリプトが終わる(または `close()` する)と、セッションを
   リセットしてからプールに戻します。開いたままのトランザクションはロールバックし、一時テーブルとセッション設定も
-  消します(PostgreSQL は `DISCARD ALL`、MySQL は `COM_RESET_CONNECTION`)。1 つのスクリプトで同じ名前に
+  消します(PostgreSQL はカーソル、`SET`、ロール、`LISTEN`、アドバイザリロック、一時テーブル、プリペアド文、
+  MySQL は `COM_RESET_CONNECTION` と有効なロール、URL のデータベース)。1 つのスクリプトで同じ名前に
   2 回接続すると同じ接続になります。接続がすべて使用中のときは、スクリプトの制限時間(最大 30 秒)まで待ってから
   `DatabaseError` になります。
-- スクリプトの制限時間を超えた文はサーバー側で止まります(PostgreSQL は `statement_timeout`、MySQL は
-  `SELECT` に効く `max_execution_time`)。
+- スクリプトの制限時間を超えた文は止まります。サーバー側(PostgreSQL は `statement_timeout`、MySQL は
+  `SELECT` に効く `max_execution_time`)に加えて、スクリプトがその設定を変えてもクライアント側で止めます
+  (PostgreSQL の接続は期限で読み取りをやめ、MySQL の文は `KILL QUERY` で止める)。スクリプトに残っているメモリより
+  大きい結果は、読んでいる途中で拒否します(その接続は閉じて再利用しない)。大きな結果やおかしなサーバーでプロセスが
+  メモリ制限を超えて膨らむことはありません。PostgreSQL の通知(`LISTEN`)は届いたときに捨てます(スクリプトは読めない)。
 - 1 回の呼び出しで実行できる文は 1 つだけです(MySQL の複数文は無効)。`LOAD DATA LOCAL INFILE` も拒否します。
 - 値の型: PostgreSQL の `bool` → `bool`、整数型 → `int`、`real`/`double precision` → `float`。
   `numeric`、`json`/`jsonb`、`uuid`、日付と時刻(`YYYY-MM-DD HH:MM:SS[.ffffff]`。`timestamptz` は UTC)、
@@ -710,6 +722,7 @@ $redis->rpush("jobs", "a");  $redis->lpop("jobs");  $redis->lrange("jobs", 0, -1
 メソッド: `get`、`set`、`delete`、`exists`、`incr`、`expire`、`ttl`、`hget`、`hset`、`hdel`、`hgetAll`、
 `rpush`、`lpop`、`lrange`、`close`。送れるのはこれらのコマンドだけで、`KEYS`、`FLUSHALL`、`CONFIG`、`EVAL`
 などは使えません。リモートのサーバーには `rediss://` の URL が必要です(または `tls = false`)。エラーは `DatabaseError`。
+各コマンドが待つのはスクリプトの制限時間までで、スクリプトに残っているメモリより大きい応答は拒否します。
 
 ### WebSocket (std.net)
 
@@ -734,7 +747,8 @@ $ws->close();
 
 - `connect()` のたびに新しい接続を開き、`close()` かスクリプトの終了で閉じる。リクエストの間で共有されるものはない。
 - 送受信できるのはテキストメッセージだけ。サーバーからのバイナリメッセージは `NetworkError`。ping には受信中に応答する。
-- `receive()` が待つのはスクリプトの時間制限まで。メッセージは最大 16 MB、1 つのスクリプトが同時に持てる接続は 16 まで。
+- `receive()` が待つのはスクリプトの時間制限まで。サーバーが ping を送り続けたり、メッセージを 1 バイトずつ送ったりしても
+  同じ(読み書きはすべて期限で止まる)。メッセージは最大 16 MB、1 つのスクリプトが同時に持てる接続は 16 まで。
 - **`localhost` 以外のホストには TLS(`wss://`)が必要**で、サーバー証明書は公開 CA で検証する。`tls = false` でそのホストへの
   `ws://` を許す。
 - 接続の失敗、サーバーによる切断、ネットワークのエラーは `NetworkError`。メッセージに URL は出ない。
@@ -777,17 +791,22 @@ echo $res->status, " ", $res->header("content-type") ?? "", "\n", $res->body;
 なければ `ValueError`)を持ちます。
 
 - パスは `/` で始め、ベース URL のパスの後ろに付く。そこから出られるパスは、何も送る前に `ValueError` にする:`//host`、
-  `.` と `..` のセグメント(パーセントエンコードしたものも)、エンコードしたスラッシュ、`?` と `#`(クエリは `$query` で渡す)。
+  `.` と `..` のセグメント(パーセントエンコードしたもの、`%252e` のように二重にエンコードしたもの、`..;` のように `;` が
+  続くものも)、エンコードしたスラッシュ、16 進 2 桁が続かない `%`、`?` と `#`(クエリは `$query` で渡す)。ASCII 以外の文字は
+  パーセントエンコードして送る。
 - ヘッダーの名前と値を検査する(改行は不可)。`Host`、`Content-Length`、`Transfer-Encoding`、`Connection` など
   メッセージの区切りに関わるヘッダーは PHV が付ける。`phv.toml` の `headers` はスクリプトで置き換えられるが、`headers_env` の
-  ものは置き換えられない。
+  ものは置き換えられない(別の書き方でも不可。CGI のサーバーは `_` と `-` を同じに読むので、`_` は `-` とみなす)。
+  ベース URL のクエリにあるパラメーターは、`$query` でもう一度渡せない。
 - エラーもレスポンスとして返る(4xx や 5xx で例外にはならない)。**リダイレクトはたどらない**:3xx はその `Location`
   ヘッダーとともにそのまま返す。
 - **`localhost` 以外のホストには TLS(`https://`)が必要**で、サーバー証明書は公開 CA で検証する。`tls = false` でそのホストへの
   `http://` を許す。
-- リクエストごとに新しい接続を使い、待つのはスクリプトの時間制限まで(制限がなければ 30 秒)。リクエストとレスポンスの本文は
-  最大 16 MB。本文は UTF-8 のテキストとして読む。
-- 接続の失敗やネットワークのエラーは `NetworkError`。メッセージにはサービスの名前が出るが、URL やヘッダーは出ない。
+- リクエストごとに新しい接続を使い、待つのはスクリプトの時間制限まで(制限がなければ 30 秒)。サーバーが何を送っても
+  同じで、読み書きはすべてその期限で止まり、途中の応答(`1xx`)は 10 個までしか読み飛ばさない。リクエストとレスポンスの
+  本文は最大 16 MB。本文は UTF-8 のテキストとして読む。
+- 接続の失敗やネットワークのエラーは `NetworkError`。メッセージにはサービスの名前が出るが、URL、ホスト名、ヘッダーは出ない
+  (エラーは「the server's TLS certificate is not valid」のような決まった言葉で表す)。
   `url_env` や `headers_env` の環境変数が設定されていないことはリクエストを送るときに報告するので、`phv check` は本番の
   キーなしで使える。
 
@@ -800,7 +819,7 @@ echo $res->status, " ", $res->header("content-type") ?? "", "\n", $res->body;
 | `random_int($min, $max)`, `random_token($bytes = 32)` | OS の暗号論的乱数(`rand()` は暗号用途に使わない) |
 | `password_hash($pw)`, `password_verify($pw, $hash)` | Argon2id |
 | `hash("sha256" \| "sha384" \| "sha512", $data)`, `hash_hmac($algo, $data, $key)`, `hash_equals($a, $b)` | `hash_equals` は比較時間が内容に依存しない |
-| `totp_secret()`, `totp_code($secret, ?$time)`, `totp_verify($secret, $code): ?int` | 認証アプリの 2 段階認証コード(TOTP、RFC 6238: HMAC-SHA1、6 桁、30 秒)。秘密鍵は 160 ビットの乱数を Base32 にしたもの。`totp_verify` は前後 1 ステップの時刻のずれを許し、比較時間は内容に依存せず、一致した時刻ステップ(なければ `null`)を返す。これを保存して、それより新しくないステップを拒めば、同じコードを二度使えない |
+| `totp_secret()`, `totp_code($secret, ?$time)`, `totp_verify($secret, $code): ?int` | 認証アプリの 2 段階認証コード(TOTP、RFC 6238: HMAC-SHA1、6 桁、30 秒)。秘密鍵は 160 ビットの乱数を Base32 にしたもの。`totp_verify` は前後 1 ステップの時刻のずれを許し、比較時間は内容に依存せず、一致した時刻ステップ(なければ `null`)を返す。これを保存して、それより新しくないステップを拒めば、同じコードを二度使えない。保存は、新しいステップのときだけ成功する 1 つの文でデータベースに行う(`UPDATE ... SET step = {$step} WHERE id = {$id} AND step < {$step}` のあと影響を受けた行数を見る)。セッションに保存すると、同じコードを同時に送った 2 つのリクエストがどちらも通ることがある |
 | `qr_svg($text): Html` | QR コードを `<svg>` 要素で返す(`otpauth://` の URI など)。中身は模様だけで文字列そのものは含まないので、そのまま出力してよい |
 | `base64_encode`, `base64_decode: ?string`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | |
 | `json_decode($s): any` | 深さ 128 まで |
@@ -829,20 +848,24 @@ form-action 'self'; frame-ancestors 'self'
 ### レート制限
 
 ```phv
-if (!rate_limit("login:" . request()->ip, 5, 60)) {     // 60 秒に 5 回まで
+if (!rate_limit("login:" . ip_group(request()->ip), 5, 60)) {     // 60 秒に 5 回まで
     response()->status(429);
     echo "しばらく待ってからやり直してください。";
     return;
 }
 // ログインに成功したら
-rate_limit_reset("login:" . request()->ip);
+rate_limit_reset("login:" . ip_group(request()->ip));
 ```
 
 - `rate_limit($key, $max, $seconds)` は、そのキーの今の時間枠でまだ `$max` 回に達していなければ 1 回数えて `true`、
   達していれば `false` を返す。カウンターはサーバープロセスの中で共有され、再起動で消える。
 - 同じキーでも時間枠の長さごとに別に数える(1 分 5 回と 1 日 50 回を両方かけられる)。キーが 10 万個を超えると、
   上限に達していないものから捨てるので、大量のキーを使っても制限中のキーは外れない。
-- `requests_per_minute` は IPv6 のアドレスを /64 ごとにまとめて数える。
+- `requests_per_minute` は IPv6 のアドレスを /64 ごとにまとめて数える。キーも同じようにする。`ip_group($ip)` は IPv6 の
+  アドレスなら /64 を、IPv4 ならそのアドレスを返す(`rate_limit("login:" . ip_group(request()->ip), 5, 60)`)。1 人の訪問者が
+  自分のネットワークのどのアドレスでも使えるため。
+- プロキシの後ろでは `request()->ip` はプロキシのアドレス。訪問者のアドレスをプロキシのヘッダー(Fly.io の `Fly-Client-IP`
+  など)から読むのは、そのプロキシの後ろで動くときだけにする。それ以外では、そのヘッダーはクライアントが書いた文字列。
 - サイト全体の制限は `[security] requests_per_minute`(§14)。
 
 ### 権限(phv.toml)
@@ -893,6 +916,11 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 `phv.toml` のあるディレクトリがプロジェクトのルートになる。知らないキーはエラー(書き間違いに気づける)。
 `phv serve` は起動時に読み込むので、変更したらサーバーを再起動する。
 
+`phv run`、`check`、`test` とエディタは、スクリプトのディレクトリとその上のディレクトリで `phv.toml` を探す。ほかのユーザーが
+置けた可能性のある `phv.toml` は使わない: ファイルシステムのルート(Windows ではドライブのルートに誰でもファイルを作れる)、
+共有の一時ディレクトリ、Unix では今のユーザー(または root)の持ち物でないもの。プロジェクトファイルは、スクリプトが何を
+読み書きし、どこに接続できるかを決めるため。
+
 ## 15. 組み込み関数
 
 ### グローバル関数
@@ -915,7 +943,7 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 | `json_decode(string): any`, `json_html(any): SafeJs`, `safe_url(string): SafeUrl` | §13、§14 |
 | `csrf_token(): string`, `csrf_field(): Html` | §14 |
 | `csp_nonce(): string` | このレスポンスの CSP の nonce(§14) |
-| `rate_limit(string, int, int): bool`, `rate_limit_reset(string)` | §14 |
+| `rate_limit(string, int, int): bool`, `rate_limit_reset(string)`, `ip_group(string): string` | §14 |
 | `date`, `gmdate`, `mktime`, `strtotime`, `checkdate` | 日付(§14 の表) |
 | `random_int`, `random_token`, `password_hash`, `password_verify`, `hash`, `hash_hmac`, `hash_equals`, `totp_secret`, `totp_code`, `totp_verify`, `qr_svg` | 暗号と 2 段階認証(§14 の表) |
 | `base64_encode`, `base64_decode`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | エンコード |
@@ -1032,6 +1060,8 @@ phv migrate legacy/page.php      # page.phv を書き出す
 | メモリ | 128 MB(`[security] memory_limit_mb`) | 致命的エラー |
 | 呼び出しの深さ | 10,000 | 致命的エラー |
 | リクエスト本文 | 8 MB | 413 |
+| ソースファイル(モジュール、テンプレート、スクリプト) | 8 MB | コンパイルエラー |
+| 全クラスが継承するメンバーの合計 | 200,000 | コンパイルエラー(各クラスは継承したものの写しを持つ) |
 
 `unsafe` を使っているのは、メモリ使用量を数えるアロケータ(`phv_vm/src/alloc.rs`)と JIT
 (`phv_jit`、生成したコードの呼び出し)だけ。

@@ -1,0 +1,6 @@
+// More rows than the memory limit allows (run with a 16 MB limit).
+import std.db.Database;
+
+$db = Database::connect("main");
+$rows = $db->query(sql"SELECT repeat('x', 4000000) AS v FROM generate_series(1, 50)");
+echo "not reached: ", count($rows), "\n";
