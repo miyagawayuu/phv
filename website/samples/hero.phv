@@ -1,0 +1,14 @@
+<?phv
+import std.http.request;
+import std.db.Database;
+
+$name = request()->query("author") ?? "ann";   // ?string, narrowed by ??
+$db = Database::open("data/blog.db");
+$posts = $db->query(sql"SELECT title FROM posts WHERE author = {$name}");
+?>
+<h1>Posts by <?= $name ?></h1>
+<ul>
+<?phv foreach ($posts as $post): ?>
+  <li><?= $post->string("title") ?? "untitled" ?></li>
+<?phv endforeach; ?>
+</ul>

@@ -1,18 +1,18 @@
-error: `===` is not needed in PHX
- --> err_syntax.phx:4:11
+error: `===` is not needed in PHV
+ --> err_syntax.phv:4:11
   |
 4 | if ($name === "x") {
   |           ^^^ use `==`
   = note: `==` and `!=` are always strict: values of different types are never equal
 
 error: variable variables (`$$name`) are not supported
- --> err_syntax.phx:7:1
+ --> err_syntax.phv:7:1
   |
 7 | $$name = 1;
   | ^^
 
 error: unterminated string
- --> err_syntax.phx:8:6
+ --> err_syntax.phv:8:6
   |
 8 | echo "unterminated;
   |      ^

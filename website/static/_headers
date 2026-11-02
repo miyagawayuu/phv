@@ -1,4 +1,4 @@
-# HTTP headers for Cloudflare Pages: the same safe defaults PHX gives its own pages.
+# HTTP headers for Cloudflare Pages: the same safe defaults PHV gives its own pages.
 /*
   Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
   X-Content-Type-Options: nosniff

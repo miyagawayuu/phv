@@ -1,0 +1,24 @@
+[package]
+name = "phv_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[[bin]]
+name = "phv"
+path = "src/main.rs"
+
+[dependencies]
+phv_std.workspace = true
+phv_syntax.workspace = true
+phv_driver.workspace = true
+phv_server.workspace = true
+phv_vm.workspace = true
+clap.workspace = true
+phv_types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+percent-encoding.workspace = true

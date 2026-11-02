@@ -1,0 +1,16 @@
+<?phv
+// Insertions the HTML context check accepts.
+$u = safe_url("https://example.com/a?b=1");
+$js = json_html(["a" => 1, "s" => "</script>"]);
+$sel = true;
+function item(string $label): void { ?><li class="item"><?= $label ?></li><?phv }
+?>
+<a href="<?= $u ?>">safe URL in a variable</a>
+<script>var data = <?= $js ?>; var n = <?= 3 ?>;</script>
+<a href="/post?id=<?= 5 ?>&q=<?= "x y" ?>">query string</a>
+<option value="1" <?phv if ($sel): ?>selected<?phv endif; ?>>one</option>
+<ul><?phv foreach (["a", "<b>"] as $l) { item($l); } ?></ul>
+<a href="<?= $u ?>&page=<?= "2" ?>">after a safe URL</a>
+<textarea><?= "</textarea><b>" ?></textarea>
+<svg><a href="<?= $u ?>">svg link</a></svg>
+<p title="<?= escape("\"q\"") ?>"><?= nl2br("a\nb") ?></p>

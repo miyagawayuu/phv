@@ -1,0 +1,94 @@
+<?phv
+// finally
+function work(int $mode): string {
+    $log = "";
+    try {
+        if ($mode == 1) {
+            return "returned";
+        }
+        if ($mode == 2) {
+            throw new RuntimeException("boom");
+        }
+        $log .= "body ";
+    } catch (RuntimeException $e) {
+        $log .= "caught ";
+    } finally {
+        echo "[finally $mode] ";
+    }
+    return $log . "end";
+}
+echo work(0), "\n", work(1), "\n", work(2), "\n";
+
+foreach ([1, 2, 3] as $i) {
+    try {
+        if ($i == 2) {
+            continue;
+        }
+        if ($i == 3) {
+            break;
+        }
+        echo "i=$i ";
+    } finally {
+        echo "(f$i) ";
+    }
+}
+echo "\n";
+
+try {
+    try {
+        throw new LogicException("inner");
+    } finally {
+        echo "inner finally\n";
+    }
+} catch (LogicException $e) {
+    echo "outer caught ", $e->getMessage(), "\n";
+}
+
+// generic functions
+function first_or<T>(list<T> $xs, T $fallback): T {
+    if ($xs->isEmpty()) {
+        return $fallback;
+    }
+    return $xs[0];
+}
+
+function pair<A, B>(A $a, B $b): map<string, any> {
+    return ["first" => $a, "second" => $b];
+}
+
+$n = first_or([5, 6], 0);
+$w = first_or([], "none");
+echo $n + 1, " ", $w->upper(), " ", json_encode(pair(1, "x")), "\n";
+
+// property narrowing
+class Node {
+    public function __construct(public string $label, public ?Node $next = null) {}
+
+    public function describe(): string {
+        if ($this->next != null) {
+            return $this->label . " -> " . $this->next->label;
+        }
+        return $this->label;
+    }
+}
+echo (new Node("a", new Node("b")))->describe(), " / ", (new Node("z"))->describe(), "\n";
+
+// nested map entries are created on assignment
+map<string, map<string, int>> $scores = [];
+$scores["alice"]["math"] = 90;
+$scores["alice"]["art"] = 75;
+$scores["bob"]["math"] = 60;
+echo json_encode($scores), "\n";
+
+map<string, list<string>> $tags = [];
+$tags["php"][] = "web";
+$tags["php"][] = "classic";
+echo json_encode($tags), "\n";
+
+// parentheses stop a ?-> chain, as in PHP
+function maybe(bool $yes): ?Node {
+    return $yes ? new Node("found") : null;
+}
+echo maybe(false)?->label->upper() ?? "(none)", "\n";
+$q = sql"SELECT * FROM users WHERE id = {$n} AND name = {$w}";
+echo $q is list ? "sql value" : "?", "\n";

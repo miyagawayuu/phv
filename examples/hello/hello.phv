@@ -1,0 +1,21 @@
+<?phv
+// Hello, PHV!
+
+function greet(string $name, int $times = 1): string {
+    $out = "";
+    foreach (0..$times as $i) {
+        $out .= "Hello, {$name}! ({$i})\n";
+    }
+    return $out;
+}
+
+echo greet("PHV", 3);
+
+foreach (1..=15 as $n) {
+    echo match (true) {
+        $n % 15 == 0 => "FizzBuzz",
+        $n % 3 == 0 => "Fizz",
+        $n % 5 == 0 => "Buzz",
+        default => (string)$n,
+    }, "\n";
+}

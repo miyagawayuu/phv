@@ -1,8 +1,0 @@
-<?phx
-// Syntax errors are reported before type checking.
-$name = "x";
-if ($name === "x") {
-    echo "strict";
-}
-$$name = 1;
-echo "unterminated;

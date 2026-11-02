@@ -1,6 +1,6 @@
-# Fly.io settings for https://demo.phx-lang.org (deploy with `fly deploy` from this directory).
+# Fly.io settings for https://demo.phv-lang.org (deploy with `fly deploy` from this directory).
 
-app = "phx-demo"
+app = "phv-demo"
 primary_region = "nrt"
 
 [build]
@@ -29,7 +29,7 @@ primary_region = "nrt"
 # SQLite (message board and click counter). A volume belongs to one machine,
 # so the demo runs on a single machine.
 [mounts]
-  source = "phx_demo_data"
+  source = "phv_demo_data"
   destination = "/app/data"
 
 [[vm]]

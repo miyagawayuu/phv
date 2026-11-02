@@ -1,19 +1,19 @@
 error: the constructor of `Token` is private
-  --> err_ctor.phx:16:10
+  --> err_ctor.phv:16:10
    |
 16 | $t = new Token("forged");
    |          ^^^^^
    = note: create it with one of its static methods, e.g. `Token::open(...)`
 
 error: the constructor of `Database` is private
-  --> err_ctor.phx:17:11
+  --> err_ctor.phv:17:11
    |
 17 | $db = new Database(0);
    |           ^^^^^^^^
    = note: create it with one of its static methods, e.g. `Database::open(...)`
 
 error: the constructor of `MyDb` is private
-  --> err_ctor.phx:18:10
+  --> err_ctor.phv:18:10
    |
 18 | $d = new MyDb(1);
    |          ^^^^

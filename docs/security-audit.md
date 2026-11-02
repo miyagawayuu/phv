@@ -1,12 +1,12 @@
-# PHX Security Audit Report (v0.2)
+# PHV Security Audit Report (v0.2)
 
 English | [日本語](security-audit.ja.md)
 
 This report consolidates three audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-and §8 covers the parts excluded from the second assessment (`phx lsp`, `phx migrate`, bytecode cache).
+and §8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache).
 
 Date: 2026-11-02
-Scope: All crates of the PHX implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
+Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
 
@@ -14,9 +14,9 @@ Scope: All crates of the PHX implementation (parser, type checker, compiler, VM,
    and confirmed each issue by running actual attack code (PoC).
    - A: HTTP layer (routing, static files, sessions, CSRF, multipart, headers)
    - B: Runtime (VM, JIT, memory and time limits, standard library, file permissions, SQLite)
-   - C: Language guarantees and tools (escaping, type-system soundness, `Html`/`Sql` types, module loading, `phx install`/`migrate`/`lsp`)
+   - C: Language guarantees and tools (escaping, type-system soundness, `Html`/`Sql` types, module loading, `phv install`/`migrate`/`lsp`)
 2. **Fixes and re-verification.** All findings were fixed, and the reviewers' PoCs were rerun against the fixed build.
-3. **Automated tests.** Regression tests (`tests/cases/err_security.phx`, `security.phx`) were added to the golden tests.
+3. **Automated tests.** Regression tests (`tests/cases/err_security.phv`, `security.phv`) were added to the golden tests.
    In addition, HTTP integration tests against a real server and fuzzing with mutated programs (about 22,000 cases locally)
    run on every CI build.
 
@@ -39,7 +39,7 @@ were also resolved in the follow-up in §4, except those accepted by design (§5
 
 | # | Finding | Fix | Verified |
 |---|---|---|---|
-| C1 | On Windows, `.phx` sources, templates, and dotfiles were served verbatim via aliases such as `/INDEX.PHX`, `/index.phx::$DATA`, and 8.3 short names (`/DASHBO~1.PHX`, `/ENV~1`) | Serve only when every component of the normalized path has **exactly the same spelling** as the requested path. Reject paths containing `:`. Never treat `.phx` / `.phx.html` / files starting with `.` as static files | All patterns return 404 on a real server; added to unit tests |
+| C1 | On Windows, `.phv` sources, templates, and dotfiles were served verbatim via aliases such as `/INDEX.PHV`, `/index.phv::$DATA`, and 8.3 short names (`/DASHBO~1.PHV`, `/ENV~1`) | Serve only when every component of the normalized path has **exactly the same spelling** as the requested path. Reject paths containing `:`. Never treat `.phv` / `.phv.html` / files starting with `.` as static files | All patterns return 404 on a real server; added to unit tests |
 | C2 | Dropping a list nested 300,000 levels deep overflowed the stack during recursive deallocation and crashed the whole server process (`catch_unwind` cannot stop it) | Made `Value` deallocation and `==` comparison iterative | Completes normally at 1,000,000 levels (test `deep_values_do_not_overflow_the_stack`) |
 | C3 | A failed huge allocation, such as `"a"->padStart(10^13, "b")`, aborted the process | Built-ins whose output can exceed their input check the limit with `reserve()` before allocating (pad, repeat, replace, chars, split, join, concat, range, file reads, string concatenation) | Raises an uncatchable fatal error (memory limit); the process stays alive |
 
@@ -63,14 +63,14 @@ were also resolved in the follow-up in §4, except those accepted by design (§5
 |---|---|---|
 | M1 | Escaping ignored context (unquoted attributes, `href="javascript:..."`, `<script>`, `<style>`, event attributes) | Determine the HTML context of each `<?= ?>` at parse time, and make inserting a string into an unsafe location a compile error. Added `safe_url()` and `json_html()` |
 | M2 | `response()->type("image/svg+xml")` or `"text/plain, text/html"` disabled escaping | Escaping is disabled only for allowlisted types (`text/plain`, `application/json`, `text/csv`, etc.). Reject Content-Type values containing commas |
-| M3 | `render()` could read any file in the project, such as `.env`. Junctions also allowed reading outside the project | Templates must be `.phx.html`. Verify that the normalized path is inside the project or a package |
-| M4 | `phx install` ran git inside an existing `vendor/<name>/.git`, executing bundled hooks | Always clone fresh into a temporary directory, disable hooks and fsmonitor, and restrict protocols with an allowlist. Lock-file commits accept only 40-digit hex |
-| M5 | `phx migrate` commented out `require 'auth.php'` and reported "passes type check" (auth checks silently disappear) | Emit an uncompilable `TODO_migrate(...)` call instead. Overwriting existing files requires `--force` |
+| M3 | `render()` could read any file in the project, such as `.env`. Junctions also allowed reading outside the project | Templates must be `.phv.html`. Verify that the normalized path is inside the project or a package |
+| M4 | `phv install` ran git inside an existing `vendor/<name>/.git`, executing bundled hooks | Always clone fresh into a temporary directory, disable hooks and fsmonitor, and restrict protocols with an allowlist. Lock-file commits accept only 40-digit hex |
+| M5 | `phv migrate` commented out `require 'auth.php'` and reported "passes type check" (auth checks silently disappear) | Emit an uncompilable `TODO_migrate(...)` call instead. Overwriting existing files requires `--force` |
 | M6 | Scripts could set `Content-Length` and similar headers, desynchronizing keep-alive responses (response splitting) | Reject framing-related headers in both built-ins and the server |
 | M7 | Development mode (detailed error display) was the default | Development mode is the default only when listening on loopback. Can be set explicitly with `--dev` / `--prod` |
 | M8 | SQLite `PRAGMA temp_store_directory` and similar could change process-wide settings or write to other directories | Reject `ATTACH`/`DETACH` and dangerous pragmas via an authorizer |
 | M9 | Out-of-range `slice()` caused an internal panic | Use saturating arithmetic. Check integer overflow in release builds too |
-| M10 | Uploads could be saved as `.phx`, and `write = ["."]` allowed rewriting source | `.phx` cannot be written. Paths under `public/` and the project root cannot be listed in `[permissions].write` |
+| M10 | Uploads could be saved as `.phv`, and `write = ["."]` allowed rewriting source | `.phv` cannot be written. Paths under `public/` and the project root cannot be listed in `[permissions].write` |
 
 ### Low / Info (main items)
 
@@ -94,7 +94,7 @@ Items accepted in the initial report were revisited and fixed.
 | R1 | A hard link to an external file placed in a writable directory allowed reading and writing that file | Check the link count on the opened file handle, and reject unless it is 1 (for both reads and writes). Also reject non-regular files (directories, FIFOs, devices) | Reads and writes via a hard link to a real file raise `PermissionError`; the outside file is unchanged |
 | R2 | A directory could be swapped for a link between the path check and the open (TOCTOU) | New `safefs` module. Opens one component at a time from the allowed directory's handle, rejecting links. Unix uses `openat` + `O_NOFOLLOW`; Windows opens with `FILE_FLAG_OPEN_REPARSE_POINT` and keeps each directory open without `FILE_SHARE_DELETE`, preventing rename, deletion, or swapping while in use. Writes open without truncation, check, then truncate | Windows: all access via junctions and symbolic links rejected; a unit test confirms a directory cannot be renamed while its handle is held. Linux (Docker): tests reject symbolic links, FIFOs, and `o+w` directories |
 | R2' | SQLite opens files by name, so the R2 approach cannot be used as is | Pin the directory by keeping it open, and before and after opening verify that the database and `-journal` / `-wal` / `-shm` are "absent, or regular files without links". Pass `SQLITE_OPEN_NOFOLLOW`. On Unix, reject directories writable by other users (`o+w`) | `Database::open` via a junction is rejected |
-| N1 | (Found in this round, Medium) `file_put_contents("data/a.phx::$DATA", ...)` and `"data/b.phx."` bypassed the `.phx` write ban and created `a.phx`. Device names such as `CON` were also usable | For each path component, reject `:`, trailing dots and spaces, device names such as `CON` `NUL` `COM1` `LPT1`, and control characters (same rules on all OSes) | All 3 PoCs raise `PermissionError` |
+| N1 | (Found in this round, Medium) `file_put_contents("data/a.phv::$DATA", ...)` and `"data/b.phv."` bypassed the `.phv` write ban and created `a.phv`. Device names such as `CON` were also usable | For each path component, reject `:`, trailing dots and spaces, device names such as `CON` `NUL` `COM1` `LPT1`, and control characters (same rules on all OSes) | All 3 PoCs raise `PermissionError` |
 | R3 | CSP was off by default | Enabled by default. The parser records the position of each `<script>` tag written in a template, and a per-response nonce is added automatically. A `<script>` injected via `raw()` or similar gets no nonce, so it does not run | HTTP integration test confirms the header nonce matches the template's two `<script>` tags and is absent from the `raw()` `<script>`. Sample site works in a browser |
 | R4 | No rate limiting | Added `rate_limit($key, $max, $seconds)` / `rate_limit_reset($key)` and `request()->ip`. Site-wide limit `[security] requests_per_minute` (429 with `Retry-After` when exceeded). The counter table holds up to 100,000 keys and discards the oldest windows first. Used in the sample guestbook | Unit tests and HTTP integration tests |
 | R5 | Sessions were memory-only | `[security] session_store = "dir/"` stores them in files. Filenames are the SHA-256 of the ID (IDs cannot be learned from a listing); writes are atomic via rename from a temp file; reads and writes go through `safefs`. Count and size limits, plus cleanup of expired sessions | HTTP integration test confirms another server process can read the same session |
@@ -113,9 +113,9 @@ Items accepted in the initial report were revisited and fixed.
   HTTP integration tests against a real server (aliases, traversal, CSRF, cookie attributes, time limits), and fuzzing.
 - CI: Linux / Windows / macOS, `clippy -D warnings`, long-running fuzzing, `cargo audit` (known vulnerabilities in dependency crates).
 - Unix-specific code (the `openat` path in `safefs`) was also verified by running all tests and clippy in a Linux Docker container.
-- `unsafe` is used in only three places: the memory-accounting allocator (`phx_vm/src/alloc.rs`),
-  calls into JIT-generated code (`phx_jit`, `Vm::call_jit`), and calls to OS file APIs
-  (`phx_std/src/safefs.rs`).
+- `unsafe` is used in only three places: the memory-accounting allocator (`phv_vm/src/alloc.rs`),
+  calls into JIT-generated code (`phv_jit`, `Vm::call_jit`), and calls to OS file APIs
+  (`phv_std/src/safefs.rs`).
 
 ## 7. Second Vulnerability Assessment
 
@@ -147,9 +147,9 @@ the reviewers' PoCs were rerun against the fixed build and added to the regressi
 | # | Finding | Fix |
 |---|---|---|
 | R2-1 | Results of `escape()`, `htmlspecialchars()`, and `nl2br()` (`Html`) could be placed at the start of `href` or inside `<script>`. HTML escaping stops neither `javascript:alert(1)` nor script code, and template `<script>` tags get a nonce, so CSP did not block it either | Added context-verified types `SafeUrl` (`safe_url()`) and `SafeJs` (`json_html()`). URL starts accept only `SafeUrl` and numbers; `<script>` contents accept only `SafeJs` and numbers. `json_html()` values are rejected inside attribute values (a `"` would end the attribute) |
-| R2-2 | `echo` written between template HTML (`<?phx echo $x; ?>`) was not context-checked | `echo` gets the same checks as `<?= ?>` |
-| R2-3 | `file_put_contents("views/page.phx.html/", ...)` (trailing `/`, `/.`, `\`) bypassed the `.phx` write ban, allowing templates to be rewritten for code execution. `unlink` and `Database::open` did not check the ban | Check the final filename after path normalization, and apply it to all writes, deletes, saves, and databases. Reject paths ending in `/` `\` `/.` |
-| R2-4 | Windows 8.3 short names (`views/GREETI~1.HTM`) allowed rewriting `.phx.html` templates | Retrieve the real name from the opened handle, and reject if it differs from the requested name (8.3 short names and other aliases). Also applied to directories |
+| R2-2 | `echo` written between template HTML (`<?phv echo $x; ?>`) was not context-checked | `echo` gets the same checks as `<?= ?>` |
+| R2-3 | `file_put_contents("views/page.phv.html/", ...)` (trailing `/`, `/.`, `\`) bypassed the `.phv` write ban, allowing templates to be rewritten for code execution. `unlink` and `Database::open` did not check the ban | Check the final filename after path normalization, and apply it to all writes, deletes, saves, and databases. Reject paths ending in `/` `\` `/.` |
+| R2-4 | Windows 8.3 short names (`views/GREETI~1.HTM`) allowed rewriting `.phv.html` templates | Retrieve the real name from the opened handle, and reject if it differs from the requested name (8.3 short names and other aliases). Also applied to directories |
 | R2-5 | `join()`, `json_encode()`, `json_html()`, `dump()`, `echo`, and string concatenation did not check the memory limit before allocating; a single call could allocate several GB and crash the process (`serve` also stopped) | Compute the result size first and `reserve()` (`join`); once output exceeds 64 KB, proceed while checking the memory and time limits (JSON, dump); `echo` and concatenation check before allocating, including the up-to-6x growth from escaping |
 | R2-6 | `==` on shared structures (`$a = [$a, $a]` 60 times) took exponential time, ignored the time limit, and tied up a worker | Remember already-compared list and map pairs, and compare each pair once (linear time). Quadratic operations such as `unique()` check the time limit as they run |
 
@@ -175,7 +175,7 @@ the reviewers' PoCs were rerun against the fixed build and added to the regressi
 - **`mktime` / `checkdate`** (fixed): Out-of-range values silently wrapped around → `ValueError`.
 - **`password_verify`** (fixed): Lowered the cost limits for stored hashes to 64 MiB, 8 iterations, and parallelism 4.
 - **Session files** (fixed): Readable by other users on Unix → created with 0600. Mass writes between the 30-second cleanups → clean up early based on write volume.
-- **`phx fmt` / `phx test`** (fixed): Directory traversal followed symbolic links and junctions, which could loop forever or rewrite outside files → links are not followed.
+- **`phv fmt` / `phv test`** (fixed): Directory traversal followed symbolic links and junctions, which could loop forever or rewrite outside files → links are not followed.
 - **CI** (fixed): Third-party GitHub Actions were pinned by tag → use only GitHub's own actions plus rustup and `cargo audit`; checkout credentials are not persisted.
 - **CSP nonce** (fixed): `<script` strings inside `<textarea>` also got a nonce → RCDATA element contents are excluded. The documented `'nonce-{nonce}'` syntax now works too.
 - **Content-Type values that disable escaping** (documented): Some types (e.g. `text/markdown`) were missing from the spec. Browsers render none of them as HTML, so the spec was updated to match the implementation.
@@ -186,11 +186,11 @@ the reviewers' PoCs were rerun against the fixed build and added to the regressi
 Path traversal and source exposure (encoding, case, 8.3 short names, ADS, trailing dots), response splitting, CSRF bypasses,
 cookie attributes, uploads, production-mode error display, slowloris, huge multipart, deep JSON, `sql"..."`
 parameterization (no way to construct an `Sql` value through the type system was found), the SQLite authorizer, JIT/interpreter result parity and
-limits, and the `phx install` git invocation (`--` separator, revision character set, protocol allowlist).
+limits, and the `phv install` git invocation (`--` separator, revision character set, protocol allowlist).
 
 ### Not Covered in This Round
 
-`phx lsp`, `phx migrate`, and the bytecode cache were out of scope (assessed in §8).
+`phv lsp`, `phv migrate`, and the bytecode cache were out of scope (assessed in §8).
 
 ## 8. Third Assessment (lsp, migrate, cache)
 
@@ -199,20 +199,20 @@ assessment, forging connection handles via `new Database(<integer>)`, was also c
 
 | # | Severity | Finding | Fix |
 |---|---|---|---|
-| R3-1 | High | The premise that the cache has the same trust level as source did not hold. Entries were not checked against the script they belong to (always valid when the dependency list was empty), and the `stamp` (version, executable size and mtime) is public information, so a `.phx-cache/` in a project received from someone else could hold bytecode that differs from the source (code other than the source you read runs) | Sign with an HMAC using a per-user secret key (outside the project; 0600 on Unix), and refuse entries whose signature does not match. Record the canonical paths of the script and the root in each entry and check them, and verify that the script itself is among the dependencies |
+| R3-1 | High | The premise that the cache has the same trust level as source did not hold. Entries were not checked against the script they belong to (always valid when the dependency list was empty), and the `stamp` (version, executable size and mtime) is public information, so a `.phv-cache/` in a project received from someone else could hold bytecode that differs from the source (code other than the source you read runs) | Sign with an HMAC using a per-user secret key (outside the project; 0600 on Unix), and refuse entries whose signature does not match. Record the canonical paths of the script and the root in each entry and check them, and verify that the script itself is among the dependencies |
 | R3-2 | Medium | Dependencies were compared by mtime only, so mtime-preserving copies (`cp -p`, `rsync -t`, archive extraction) or same-length rewrites kept stale bytecode running (deployed security fixes would not take effect). There was also a race where a file changed between reading it and fetching its mtime | Record the SHA-256 of the compiled contents, the size, and the mtime of each dependency. Always verify contents when loading the cache; the server's in-memory check also verifies the contents of files modified just before recording (within the timestamp resolution) |
-| R3-3 | Medium | Cache writes followed links; a project with `.phx-cache` as a junction, or a symbolic-linked `.gitignore`, allowed overwriting files outside the project. Temp file names were also predictable | Read and write via `safefs`, rejecting links and hard links. Do not use `.phx-cache` if it is itself a link. Temp files get random names; `.gitignore` is created only if absent |
-| R3-4 | Low | `[permissions].write` could list `.phx-cache/` or `vendor/`, letting scripts write files that are later loaded as code | Directories starting with `.`, `vendor/`, and package directories cannot be listed in `write` |
-| R3-5 | Medium | `phx migrate` did not convert `<?PHP` / `<?Php` (uppercase), so PHP containing the auth `require` and `exit` remained as a plain string, and it reported "passes type check" (auth checks silently disappear) | Convert open tags case-insensitively. Keep any `<?` that cannot be converted, with an uncompilable `TODO_migrate(...)` attached |
-| R3-6 | Medium | `phx migrate` output followed dangling symbolic links and was written to arbitrary locations. Varying the spelling, as in `self.PHX`, allowed overwriting the input file itself | Write via `safefs`, never to links or hard links. Compare input and output by normalized path |
-| R3-7 | Low | `phx migrate` panicked on non-ASCII characters (e.g. Japanese) near comments or strings | Compare byte-wise |
-| R3-8 | Low | `phx lsp` URI checks could be bypassed with decoded UNC paths (`file:///%5C%5Chost%5Cshare`) or `\\?\` and `\\.\`, allowing reads of unopened files, triggering SMB connections, and hanging when given a named pipe | After decoding, accept only local paths that start with a drive letter; reject device names and `..`. Hover works only on open documents. Up to 1000 open documents. Return an error on malformed JSON and continue |
+| R3-3 | Medium | Cache writes followed links; a project with `.phv-cache` as a junction, or a symbolic-linked `.gitignore`, allowed overwriting files outside the project. Temp file names were also predictable | Read and write via `safefs`, rejecting links and hard links. Do not use `.phv-cache` if it is itself a link. Temp files get random names; `.gitignore` is created only if absent |
+| R3-4 | Low | `[permissions].write` could list `.phv-cache/` or `vendor/`, letting scripts write files that are later loaded as code | Directories starting with `.`, `vendor/`, and package directories cannot be listed in `write` |
+| R3-5 | Medium | `phv migrate` did not convert `<?PHP` / `<?Php` (uppercase), so PHP containing the auth `require` and `exit` remained as a plain string, and it reported "passes type check" (auth checks silently disappear) | Convert open tags case-insensitively. Keep any `<?` that cannot be converted, with an uncompilable `TODO_migrate(...)` attached |
+| R3-6 | Medium | `phv migrate` output followed dangling symbolic links and was written to arbitrary locations. Varying the spelling, as in `self.PHV`, allowed overwriting the input file itself | Write via `safefs`, never to links or hard links. Compare input and output by normalized path |
+| R3-7 | Low | `phv migrate` panicked on non-ASCII characters (e.g. Japanese) near comments or strings | Compare byte-wise |
+| R3-8 | Low | `phv lsp` URI checks could be bypassed with decoded UNC paths (`file:///%5C%5Chost%5Cshare`) or `\\?\` and `\\.\`, allowing reads of unopened files, triggering SMB connections, and hanging when given a named pipe | After decoding, accept only local paths that start with a drive letter; reject device names and `..`. Hover works only on open documents. Up to 1000 open documents. Return an error on malformed JSON and continue |
 | R3-9 | Info | `new Database(0)` could forge a connection handle (within the same request only) | `new` now checks `private` / `protected` constructors (previously unchecked), and the `Database` constructor is now `private` |
 
 ### No Issues Found
 
-`phx lsp` does not write files. It has limits of 64 MiB per body and 8 KiB per header line, and resists deep nesting (the parser's 500-level
-limit). `phx migrate` leaves `require`, `exit`, `eval`, `$$var`, `extract`, superglobals, etc. as
+`phv lsp` does not write files. It has limits of 64 MiB per body and 8 KiB per header line, and resists deep nesting (the parser's 500-level
+limit). `phv migrate` leaves `require`, `exit`, `eval`, `$$var`, `extract`, superglobals, etc. as
 uncompilable code. Decoding the cache format (postcard) is safe; even with adversarial bytecode,
 the interpreter stops with a bounds-check panic (caught by `catch_unwind`), and the JIT rejects it via the `well_formed` check.
 

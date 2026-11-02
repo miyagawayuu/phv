@@ -1,7 +1,7 @@
 {
-  "name": "phx-lang-website",
+  "name": "phv-lang-website",
   "private": true,
-  "description": "The phx-lang.org website: a static site built from docs/ and the landing pages.",
+  "description": "The phv-lang.org website: a static site built from docs/ and the landing pages.",
   "license": "MIT",
   "type": "module",
   "scripts": {

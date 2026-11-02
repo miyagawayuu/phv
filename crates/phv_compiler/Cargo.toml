@@ -1,0 +1,12 @@
+[package]
+name = "phv_compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[dependencies]
+phv_syntax.workspace = true
+phv_types.workspace = true
+phv_vm.workspace = true

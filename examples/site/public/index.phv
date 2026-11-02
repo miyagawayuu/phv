@@ -1,0 +1,7 @@
+<?phv
+import std.http.request;
+import lib.posts.all_posts;
+
+$name = request()->query("name") ?? "world";
+$body = render("views/home.phv.html", name: $name, posts: all_posts());
+echo render("views/layout.phv.html", title: "Posts", body: $body);

@@ -1,0 +1,92 @@
+<?phv
+import std.db.Database;
+import std.http.{request, session};
+
+// JSON
+$data = json_decode('{"name": "Ann", "age": 31, "tags": ["a", "b"], "ok": true}');
+if ($data is map) {
+    $name = $data["name"] ?? null;
+    $age = $data["age"] ?? null;
+    if ($name is string && $age is int) {
+        echo "$name is ", $age + 1, " next year\n";
+    }
+}
+try {
+    json_decode("{bad json}");
+} catch (ValueError $e) {
+    echo "invalid: ", $e->getMessage(), "\n";
+}
+
+// dates (UTC, fixed timestamp)
+$ts = 1772892309;
+echo gmdate("Y-m-d H:i:s", $ts), " | ", gmdate("D, jS F Y", $ts), "\n";
+echo strtotime("2026-03-07 14:05:09") != null ? "parsed" : "failed", " ", strtotime("not a date") ?? -1, "\n";
+echo checkdate(2, 29, 2024) ? "leap" : "no", " ", checkdate(2, 29, 2026) ? "leap" : "no", "\n";
+
+// crypto and encoding
+echo hash("sha256", "abc"), "\n";
+echo hash_hmac("sha256", "message", "key")->slice(0, 16), "\n";
+$hash = password_hash("correct horse");
+echo password_verify("correct horse", $hash) ? "password ok" : "bad", " ", password_verify("wrong", $hash) ? "?!" : "rejected", "\n";
+echo hash_equals("abc", "abc") ? "equal" : "different", " ", random_token()->len(), " ", random_token(8)->len(), "\n";
+$r = random_int(1, 6);
+echo $r >= 1 && $r <= 6 ? "dice ok" : "dice broken", "\n";
+echo base64_encode("PHV ✓"), " ", base64_decode(base64_encode("round trip")) ?? "?", "\n";
+echo urlencode("a b&c"), " ", rawurlencode("a b&c"), " ", urldecode("a+b%26c"), " ", http_build_query(["q" => "x y", "page" => "2"]), "\n";
+
+// SQLite (in memory) with sql"..." parameters
+$db = Database::open(":memory:");
+$db->execute(sql"CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL, score REAL)");
+$evil = "x'); DROP TABLE posts; --";
+foreach (["Hello", "World", $evil] as $i => $title) {
+    $score = $i * 1.5;
+    $db->execute(sql"INSERT INTO posts (title, score) VALUES ({$title}, {$score})");
+}
+echo "last id ", $db->lastInsertId(), "\n";
+$min = 1.0;
+foreach ($db->query(sql"SELECT id, title, score FROM posts WHERE score >= {$min} ORDER BY id") as $row) {
+    echo $row->int("id") ?? 0, ": ", $row->string("title") ?? "", " (", $row->float("score") ?? 0.0, ")\n";
+}
+$order = sql_ident("title");
+echo count($db->query(sql"SELECT * FROM posts ORDER BY " . $order)), " rows\n";
+try {
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"DELETE FROM posts");
+        throw new RuntimeException("rollback please");
+    });
+} catch (RuntimeException $e) {
+    echo "after rollback: ", count($db->query(sql"SELECT id FROM posts")), " rows\n";
+}
+try {
+    $db->query(sql"SELECT * FROM missing_table");
+} catch (DatabaseError $e) {
+    echo "db error: ", $e->getMessage(), "\n";
+}
+try {
+    sql_ident("title; DROP TABLE posts");
+} catch (ValueError $e) {
+    echo $e->getMessage(), "\n";
+}
+
+// permissions: nothing is allowed without phv.toml
+try {
+    echo file_get_contents("secret.txt");
+} catch (PermissionError $e) {
+    echo "denied: ", $e->getMessage(), "\n";
+}
+try {
+    file_put_contents("../outside.txt", "x");
+} catch (PermissionError $e) {
+    echo "denied: ", $e->getMessage(), "\n";
+}
+try {
+    echo getenv("PATH") ?? "";
+} catch (PermissionError $e) {
+    echo "denied: ", $e->getMessage(), "\n";
+}
+
+// sessions (in memory when run from the command line)
+session()->set("user", "ann");
+echo "user=", session()->get("user") ?? "-", " flash=", session()->flash("user") ?? "-", " after=", session()->get("user") ?? "-", "\n";
+echo strlen(csrf_token()), " ", csrf_token() == csrf_token() ? "stable token" : "changed", "\n";
+echo request()->cookie("missing") ?? "no cookie", "\n";

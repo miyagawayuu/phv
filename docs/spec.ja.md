@@ -1,16 +1,16 @@
-# PHX 言語仕様 (v0.2)
+# PHV 言語仕様 (v0.2)
 
 [English](spec.md) | 日本語
 
-公式サイト: <https://phx-lang.org>
+公式サイト: <https://phv-lang.org>
 
-PHX は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋め込める」という良さを引き継ぎながら、
+PHV は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋め込める」という良さを引き継ぎながら、
 型安全性・セキュリティ・実行速度・保守性を言語の側で保証する Web 向けの言語です。
 既存の PHP コードとの互換性はありませんが、PHP を書いてきた人がすぐ読めて書けることを目指しています。
 
 ## 1. 設計方針
 
-| PHP の弱点 | PHX での解決 |
+| PHP の弱点 | PHV での解決 |
 |---|---|
 | 暗黙の型変換 (`"1" + 1`、`"abc" == 0`) | 暗黙の変換はしない。`==` は常に厳密比較。違う型どうしの比較はコンパイルエラー |
 | null による実行時エラー | `?T` 型。null チェック (`!= null`、`is`、`??`、`?->`) をしないと使えない |
@@ -19,7 +19,7 @@ PHX は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋
 | SQL インジェクション | SQL は `sql"..."` リテラル(`Sql` 型)でしか書けず、埋め込んだ値は必ずプレースホルダになる |
 | 文脈を無視したエスケープ | `<?= ?>` の位置(属性・URL・`<script>`・CSS)を判定し、エスケープでは守れない場所への挿入はコンパイルエラー |
 | CSRF・セッション固定 | フォームの POST はサーバーがトークンを自動で検査。セッション ID はサーバーが発行したものだけを受け付ける |
-| 何でもできるスクリプト | ファイル・環境変数へのアクセスは `phx.toml` の `[permissions]` で許可したものだけ |
+| 何でもできるスクリプト | ファイル・環境変数へのアクセスは `phv.toml` の `[permissions]` で許可したものだけ |
 | 注入されたスクリプトの実行 | 既定の Content-Security-Policy で、テンプレートに書いた `<script>` 以外のインラインスクリプトを止める |
 | ヘッダーインジェクション | 改行を含むヘッダー値は `ValueError` |
 | パストラバーサル | サーバーは `public/` の外、ドットファイル、テンプレートを配信しない |
@@ -29,9 +29,9 @@ PHX は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋
 
 ## 2. ファイル
 
-- `.phx` … スクリプトまたはモジュール。**コードモード**で始まる。先頭の `<?phx` は書いても書かなくてもよい。
-- `.phx.html` … テンプレート。**HTML モード**で始まる。
-- コードモードで `?>` を書くと HTML モードに切り替わる。HTML モードでは `<?phx`(または `<? `)でコードに、
+- `.phv` … スクリプトまたはモジュール。**コードモード**で始まる。先頭の `<?phv` は書いても書かなくてもよい。
+- `.phv.html` … テンプレート。**HTML モード**で始まる。
+- コードモードで `?>` を書くと HTML モードに切り替わる。HTML モードでは `<?phv`(または `<? `)でコードに、
   `<?= 式 ?>` で値の出力に戻る。`?>` の直後の改行 1 つは出力されない(PHP と同じ)。
 - 文字コードは UTF-8。
 
@@ -84,14 +84,14 @@ PHP の `array` は `list<T>` と `map<K, V>` に分かれています。`mixed`
 
 - PHP と同じく、**最初の代入で変数が宣言される**。そのとき値の型が変数の型になり、あとから別の型は代入できない。
 
-  ```phx
+  ```phv
   $count = 1;
   $count = "two";   // エラー: expected `int`, found `string`
   ```
 
 - 型を推論できないとき(`null` や空の `[]`)は型を書いて宣言する。
 
-  ```phx
+  ```phv
   ?User $found = null;
   list<string> $names = [];
   map<string, int> $counts = [];
@@ -99,7 +99,7 @@ PHP の `array` は `list<T>` と `map<K, V>` に分かれています。`mixed`
 
 - 変数のスコープは関数全体(PHP と同じ)。ただし **一部の経路でしか代入されない変数は使えない**。
 
-  ```phx
+  ```phv
   if ($ok) { $msg = "hi"; }
   echo $msg;   // エラー: variable `$msg` might not be defined here
   ```
@@ -112,7 +112,7 @@ PHP の `array` は `list<T>` と `map<K, V>` に分かれています。`mixed`
 
 条件によって、ローカル変数の型が狭められる。
 
-```phx
+```phv
 function greet(?User $u): string {
     if ($u == null) {
         return "guest";
@@ -158,7 +158,7 @@ $len = $user?->email?->len();             // ?int
 
 ## 7. 制御構文
 
-```phx
+```phv
 if (...) { } elseif (...) { } else if (...) { } else { }
 while (...) { }
 do { } while (...);
@@ -177,7 +177,7 @@ break; continue; break 2; continue 2;
 
 ### match
 
-```phx
+```phv
 $text = match ($code) {
     200, 201 => "ok",
     404 => "not found",
@@ -193,7 +193,7 @@ $size = match (true) {
 
 ### 例外
 
-```phx
+```phv
 try {
     risky();
 } catch (NotFound | InvalidArgumentException $e) {
@@ -203,7 +203,7 @@ throw new RuntimeException("boom");
 $port = $config["port"] ?? throw new ValueError("port is required");
 ```
 
-```phx
+```phv
 try {
     $db->execute(sql"...");
 } finally {
@@ -215,7 +215,7 @@ try {
 
 ## 8. 関数
 
-```phx
+```phv
 function greet(string $name, int $times = 1): string { ... }
 greet("Ann");
 greet(name: "Bob", times: 3);       // 名前付き引数
@@ -229,7 +229,7 @@ greet(name: "Bob", times: 3);       // 名前付き引数
 
 ### クロージャ
 
-```phx
+```phv
 $double = fn(int $x): int => $x * 2;           // 外側の変数を自動でキャプチャ
 $names->map(fn($n) => $n->upper());            // 引数の型は文脈から推論される
 $counter = function () use ($start): int { return $start + 1; };
@@ -240,7 +240,7 @@ $counter = function () use ($start): int { return $start + 1; };
 
 ## 9. クラス
 
-```phx
+```phv
 class User {
     private int $loginCount = 0;
     public readonly string $email;
@@ -281,7 +281,7 @@ class Admin extends User {
 - オブジェクトは参照、`list` と `map` は値(コピーオンライト)。
 ### interface と abstract
 
-```phx
+```phv
 interface Shape {
     const UNIT = "cm";
     public function area(): float;
@@ -312,7 +312,7 @@ final class Square extends Base {
 
 ### enum
 
-```phx
+```phv
 enum Suit {
     case Hearts;
     case Spades;
@@ -341,7 +341,7 @@ Status::cases();                 // list<Status>
 
 ### 定数
 
-```phx
+```phv
 const MAX_ITEMS = 50;            // ファイルの先頭レベル(export / import もできる)
 class Config {
     const VERSION = "1.0";
@@ -353,7 +353,7 @@ echo MAX_ITEMS, Config::VERSION, self::VERSION;
 
 ### ジェネリック関数
 
-```phx
+```phv
 function first_or<T>(list<T> $xs, T $fallback): T {
     return $xs->isEmpty() ? $fallback : $xs[0];
 }
@@ -381,7 +381,7 @@ Exception                    (getMessage(): string)
 ├── KeyError                 map にないキー
 ├── ValueError               不正な引数(ヘッダーの改行など)
 ├── UnhandledMatchError
-├── PermissionError          phx.toml で許可されていないファイル・環境変数へのアクセス
+├── PermissionError          phv.toml で許可されていないファイル・環境変数へのアクセス
 └── AssertionError           assert() / assert_eq() の失敗
 ```
 
@@ -389,21 +389,21 @@ Exception                    (getMessage(): string)
 
 ## 11. モジュール
 
-```phx
-// lib/posts.phx
+```phv
+// lib/posts.phv
 export class Post { ... }
 export function all_posts(): list<Post> { ... }
 function helper(): int { ... }      // export しないものは外から見えない
 ```
 
-```phx
+```phv
 import lib.posts.{Post, all_posts};
 import lib.posts.Post;
 import std.http.{request, response};
 ```
 
-- `import a.b.{x, y};` は、プロジェクトのルート(`phx.toml` のあるディレクトリ、なければ実行するファイルの
-  ディレクトリ)からの `a/b.phx` を読み込む。
+- `import a.b.{x, y};` は、プロジェクトのルート(`phv.toml` のあるディレクトリ、なければ実行するファイルの
+  ディレクトリ)からの `a/b.phv` を読み込む。
 - import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`const`、`import`)
   しか書けない。モジュールを読み込んでも副作用は起きない。
 - `std.*` は標準モジュール(`std.http`、`std.db`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
@@ -412,23 +412,23 @@ import std.http.{request, response};
 ## 12. テンプレート
 
 ```html
-<?phx
+<?phv
 import lib.posts.Post;
 params(string $title, list<Post> $posts);
 ?>
 <h1><?= $title ?></h1>
-<?phx foreach ($posts as $post): ?>
+<?phv foreach ($posts as $post): ?>
   <li><a href="/post?id=<?= $post->id ?>"><?= $post->title ?></a></li>
-<?phx endforeach; ?>
+<?phv endforeach; ?>
 ```
 
-```phx
-$html = render("views/list.phx.html", title: "Posts", posts: $posts);   // Html
-echo render("views/layout.phx.html", title: "Home", body: $html);
+```phv
+$html = render("views/list.phv.html", title: "Posts", posts: $posts);   // Html
+echo render("views/layout.phv.html", title: "Home", body: $html);
 ```
 
 - テンプレートは `params(...)` で型付きの引数を宣言する。`render()` の呼び出しはコンパイル時に型チェックされる。
-- `render()` のパスは文字列リテラルで、プロジェクトのルートからの相対パス(`..` は使えない)。拡張子は `.phx.html`。
+- `render()` のパスは文字列リテラルで、プロジェクトのルートからの相対パス(`..` は使えない)。拡張子は `.phv.html`。
 - `render()` は `Html` を返すので、別のテンプレートにそのまま渡して埋め込める(レイアウト)。
 
 ## 13. 出力とエスケープ
@@ -437,7 +437,7 @@ echo render("views/layout.phx.html", title: "Home", body: $html);
 
 | 状況 | 出力先 |
 |---|---|
-| `phx run` で実行したスクリプト | テキスト(`--html` を付けると HTML) |
+| `phv run` で実行したスクリプト | テキスト(`--html` を付けると HTML) |
 | Web サーバーが実行するページ | HTML(`response()->type("application/json")` などで HTML 以外にするとテキスト) |
 | テンプレートの中 | 常に HTML |
 
@@ -484,15 +484,15 @@ HTML エスケープが守れるのは、要素の中身と**引用符で囲ん�
 ## 14. Web サーバー
 
 ```
-phx serve examples/site --port 8080
+phv serve examples/site --port 8080
 ```
 
 - サイトのディレクトリには `public/` が必要。URL はファイル名で決まる:
-  `/` → `public/index.phx`、`/about` → `public/about.phx` または `public/about/index.phx`、`/about.phx` も可。
+  `/` → `public/index.phv`、`/about` → `public/about.phv` または `public/about/index.phv`、`/about.phv` も可。
 - 静的ファイルとして配信するのは既知の拡張子(html、css、js、json、txt、画像、フォント、pdf、音声、動画、wasm)だけ。
-- 配信しないもの: `public/` の外、`.` や `_` で始まるファイルとディレクトリ(`_partial.phx` は部品に使える)、
-  `.phx.html`(テンプレート)、知らない拡張子(`.php`、`.bak`、`.sql` など)。URL はファイル名と完全に同じ綴り
-  でなければならない(`INDEX.PHX` や Windows の短縮名、`::$DATA` では開けない)。
+- 配信しないもの: `public/` の外、`.` や `_` で始まるファイルとディレクトリ(`_partial.phv` は部品に使える)、
+  `.phv.html`(テンプレート)、知らない拡張子(`.php`、`.bak`、`.sql` など)。URL はファイル名と完全に同じ綴り
+  でなければならない(`INDEX.PHV` や Windows の短縮名、`::$DATA` では開けない)。
 - リクエストごとに新しい VM(新しいヒープ)で実行する。コンパイル済みのバイトコードだけが共有される。
 - ファイルを保存すると次のリクエストで再コンパイルされる(依存する全ファイルの更新時刻を見る)。
 - 上限: 実行時間 30 秒(`--time-limit`)、メモリ 128 MB(`[security] memory_limit_mb`)、本文 8 MB、ヘッダーの受信 10 秒、
@@ -508,7 +508,7 @@ phx serve examples/site --port 8080
 
 ### std.http
 
-```phx
+```phv
 import std.http.{request, response, session};
 
 $req = request();
@@ -538,7 +538,7 @@ response()->file("data/photos/1.jpg");                // 出力の代わりに�
 
 ### セッション
 
-```phx
+```phv
 import std.http.session;
 
 session()->set("user_id", (string)$user->id);
@@ -549,7 +549,7 @@ session()->destroy();                 // ログアウト
 ```
 
 - 値はサーバー側に保存され、Cookie には 256 ビットの乱数の ID だけが入る
-  (`PHXSESSID`、`HttpOnly`、`SameSite=Lax`、`[security] secure_cookies = true` で `Secure`)。
+  (`PHVSESSID`、`HttpOnly`、`SameSite=Lax`、`[security] secure_cookies = true` で `Secure`)。
 - サーバーが発行していない ID は受け付けない。1 セッションの値は合計 64 KB まで。
 - `[security] session_ttl` 秒アクセスがないと消える。アクセスが続いても 24 時間で消える。
 - 既定の保存先はメモリで、サーバーを再起動すると消える。`[security] session_store = "sessions/"` のように
@@ -573,14 +573,14 @@ session()->destroy();                 // ログアウト
 JavaScript から送るときは `csrf_token()` の値を `X-CSRF-Token` ヘッダーに入れる。
 JSON のリクエストは CORS のプリフライトが必要なので、ほかのサイトからは送れない。
 
-トークンはブラウザごとの Cookie(`PHXCSRF`)の HMAC なので、攻撃者がその Cookie を書き換えられないことが前提になる。
+トークンはブラウザごとの Cookie(`PHVCSRF`)の HMAC なので、攻撃者がその Cookie を書き換えられないことが前提になる。
 本番では HTTPS で配信して `secure_cookies = true` にする(Cookie が `__Host-` 付きになり、平文の通信や
 サブドメインから上書きされなくなる)。
 `[security] csrf = false` で無効にできる。
 
 ### Cookie
 
-```phx
+```phv
 request()->cookie("theme");                                   // ?string
 response()->cookie("theme", "dark", maxAge: 86400 * 30);      // HttpOnly; SameSite=Lax が既定
 response()->deleteCookie("theme");
@@ -590,7 +590,7 @@ response()->deleteCookie("theme");
 
 ### アップロード
 
-```phx
+```phv
 $file = request()->file("avatar");     // ?UploadedFile
 if ($file != null) {
     echo $file->name, $file->type, $file->size;
@@ -609,7 +609,7 @@ if ($file != null) {
 
 ### JSON
 
-```phx
+```phv
 $data = request()->json();             // any(不正な JSON は ValueError)
 if ($data is map) {
     $name = $data["name"] ?? null;
@@ -620,7 +620,7 @@ response()->json(["ok" => true]);
 
 ### データベース(std.db)
 
-```phx
+```phv
 import std.db.Database;
 
 $db = Database::open("data/app.db");      // [permissions].write = ["data/"] が必要。":memory:" も可
@@ -647,7 +647,7 @@ $db->transaction(function () use ($db): void {
 
 #### PostgreSQL と MySQL
 
-データベースサーバーは `phx.toml` に名前を付けて書きます。スクリプトは名前だけを使うので、パスワードがコードに出てきません。
+データベースサーバーは `phv.toml` に名前を付けて書きます。スクリプトは名前だけを使うので、パスワードがコードに出てきません。
 
 ```toml
 [databases.main]
@@ -657,7 +657,7 @@ url_env = "DATABASE_URL"      # postgres://user:pass@host/db、mysql://user:pass
 # pool_size = 8               # サーバープロセスごとに保つ接続数(1〜256)
 ```
 
-```phx
+```phv
 $db = Database::connect("main");
 $row = $db->first(sql"INSERT INTO posts (title) VALUES ({$title}) RETURNING id");   // PostgreSQL
 $db->execute(sql"INSERT INTO posts (title) VALUES ({$title})");
@@ -671,7 +671,7 @@ $id = $db->lastInsertId();                                                      
 - **`localhost` 以外のホストには TLS が必須**で、サーバー証明書は公開 CA(webpki-roots)で検証します。
   プライベート CA の証明書を使うサーバーにはまだ対応していません。そうしたホストでは `tls = false` で TLS を切れます。
 - `url_env` の環境変数が設定されていないことは、スクリプトが接続したときにエラーになります。そのため本番の
-  認証情報がなくても `phx check` は通ります。URL はスクリプトにもエラーメッセージにも出ません。
+  認証情報がなくても `phv check` は通ります。URL はスクリプトにもエラーメッセージにも出ません。
 - 接続はサーバープロセスごとにプールします。スクリプトが終わる(または `close()` する)と、セッションを
   リセットしてからプールに戻します。開いたままのトランザクションはロールバックし、一時テーブルとセッション設定も
   消します(PostgreSQL は `DISCARD ALL`、MySQL は `COM_RESET_CONNECTION`)。1 つのスクリプトで同じ名前に
@@ -695,7 +695,7 @@ $id = $db->lastInsertId();                                                      
 url_env = "REDIS_URL"         # redis://localhost。TLS なら rediss://user:pass@host
 ```
 
-```phx
+```phv
 import std.db.Redis;
 
 $redis = Redis::connect("cache");
@@ -734,7 +734,7 @@ img-src 'self' data: https:; font-src 'self' data:; object-src 'none'; base-uri 
 form-action 'self'; frame-ancestors 'self'
 ```
 
-- テンプレート(`.phx.html` と `.phx` の HTML 部分)に書いた `<script>` タグには、PHX が自動で
+- テンプレート(`.phv.html` と `.phv` の HTML 部分)に書いた `<script>` タグには、PHV が自動で
   `nonce="..."` を付ける。そのため、自分で書いたインラインスクリプトはそのまま動き、エスケープをすり抜けて
   注入されたスクリプト(`raw()` に入った `<script>` など)は動かない。
 - `onclick="..."` のようなイベント属性と `javascript:` の URL は止まる。`addEventListener` を使う。
@@ -747,7 +747,7 @@ form-action 'self'; frame-ancestors 'self'
 
 ### レート制限
 
-```phx
+```phv
 if (!rate_limit("login:" . request()->ip, 5, 60)) {     // 60 秒に 5 回まで
     response()->status(429);
     echo "しばらく待ってからやり直してください。";
@@ -764,9 +764,9 @@ rate_limit_reset("login:" . request()->ip);
 - `requests_per_minute` は IPv6 のアドレスを /64 ごとにまとめて数える。
 - サイト全体の制限は `[security] requests_per_minute`(§14)。
 
-### 権限(phx.toml)
+### 権限(phv.toml)
 
-スクリプトがヒープの外に触れるものは、すべて `phx.toml` で許可したものだけ。**何も書かなければ何も許可されない。**
+スクリプトがヒープの外に触れるものは、すべて `phv.toml` で許可したものだけ。**何も書かなければ何も許可されない。**
 
 ```toml
 [permissions]
@@ -783,10 +783,10 @@ env = ["APP_*"]             # getenv で読める環境変数(末尾 * は前方
 - ファイル名に `:`(Windows の代替データストリーム)、末尾のドットや空白、`CON` `NUL` `COM1` などのデバイス名は使えない。
 - Unix では、ほかのユーザーが書き込めるディレクトリ(`o+w`)は使えない。
 - コードとして読み込まれる場所は `write` に指定できない: `public/`、プロジェクトのルート、`.` で始まるディレクトリ
-  (`.phx-cache/`、`.git/` など)、`vendor/`、`[dependencies]` のパッケージのディレクトリ。
-- 許可されていないときは `PermissionError`(メッセージに `phx.toml` に書くべき内容が出る)。
+  (`.phv-cache/`、`.git/` など)、`vendor/`、`[dependencies]` のパッケージのディレクトリ。
+- 許可されていないときは `PermissionError`(メッセージに `phv.toml` に書くべき内容が出る)。
 
-### phx.toml
+### phv.toml
 
 ```toml
 [project]
@@ -809,8 +809,8 @@ utils = { path = "../utils" }
 markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 ```
 
-`phx.toml` のあるディレクトリがプロジェクトのルートになる。知らないキーはエラー(書き間違いに気づける)。
-`phx serve` は起動時に読み込むので、変更したらサーバーを再起動する。
+`phv.toml` のあるディレクトリがプロジェクトのルートになる。知らないキーはエラー(書き間違いに気づける)。
+`phv serve` は起動時に読み込むので、変更したらサーバーを再起動する。
 
 ## 15. 組み込み関数
 
@@ -871,21 +871,21 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
 
 | コマンド | 説明 |
 |---|---|
-| `phx run file.phx` | 型検査して実行(`--html`、`--time-limit 秒`) |
-| `phx check file.phx` | 型検査だけ(import しているモジュールとテンプレートも) |
-| `phx serve dir` | Web サーバー(`--port`、`--host`、`--prod`、`--time-limit`) |
-| `phx test [paths]` | `*_test.phx` の `test_*` 関数を実行(1 テストごとに新しい VM) |
-| `phx fmt [paths] [--check]` | インデントと空白を整える(文字列・コメント・HTML は変えない) |
-| `phx lsp` | エディタ用の Language Server(入力中のエラー表示、ホバーで型を表示) |
-| `phx install` | `[dependencies]` を取得して `phx.lock` に固定 |
-| `phx migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
-| `phx disasm file.phx` | バイトコードを表示 |
-| `phx parse file.phx` | 構文木を表示 |
+| `phv run file.phv` | 型検査して実行(`--html`、`--time-limit 秒`) |
+| `phv check file.phv` | 型検査だけ(import しているモジュールとテンプレートも) |
+| `phv serve dir` | Web サーバー(`--port`、`--host`、`--prod`、`--time-limit`) |
+| `phv test [paths]` | `*_test.phv` の `test_*` 関数を実行(1 テストごとに新しい VM) |
+| `phv fmt [paths] [--check]` | インデントと空白を整える(文字列・コメント・HTML は変えない) |
+| `phv lsp` | エディタ用の Language Server(入力中のエラー表示、ホバーで型を表示) |
+| `phv install` | `[dependencies]` を取得して `phv.lock` に固定 |
+| `phv migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
+| `phv disasm file.phv` | バイトコードを表示 |
+| `phv parse file.phv` | 構文木を表示 |
 
 ### テスト
 
-```phx
-// tests/posts_test.phx
+```phv
+// tests/posts_test.phv
 import lib.posts.find_post;
 
 function test_find_post(): void {
@@ -904,23 +904,23 @@ textutils = { git = "https://github.com/example/textutils.git", rev = "v1" }
 local = { path = "../shared" }
 ```
 
-```phx
-import textutils.strings.slugify;      // vendor/textutils/strings.phx
+```phv
+import textutils.strings.slugify;      // vendor/textutils/strings.phv
 ```
 
-- `git` のパッケージは `vendor/<名前>` に取得され、正確なコミットが `phx.lock` に記録される。
+- `git` のパッケージは `vendor/<名前>` に取得され、正確なコミットが `phv.lock` に記録される。
   2 回目以降は lock のコミットを取得し、違っていればエラーになる。
 - 使える URL は `https://`、`ssh://`、`git@host:...`、`file://` だけ。
-- パッケージは PHX のソースコードで、インストール時にパッケージのコードが実行されることはない。
-- パッケージの依存はアプリの `phx.toml` に並べて書く(推移的な依存の解決はまだない)。
+- パッケージは PHV のソースコードで、インストール時にパッケージのコードが実行されることはない。
+- パッケージの依存はアプリの `phv.toml` に並べて書く(推移的な依存の解決はまだない)。
 
 ### 移行
 
 ```
-phx migrate legacy/page.php      # page.phx を書き出す
+phv migrate legacy/page.php      # page.phv を書き出す
 ```
 
-`<?php`→`<?phx`、`===`→`==`、`array(...)`→`[...]`、`isset($x)`→`($x != null)`、`$_GET`/`$_POST`/`$_COOKIE`/`$_SESSION`
+`<?php`→`<?phv`、`===`→`==`、`array(...)`→`[...]`、`isset($x)`→`($x != null)`、`$_GET`/`$_POST`/`$_COOKIE`/`$_SESSION`
 → `request()`/`session()`、`var_dump`/`print_r`→`dump`、`print`→`echo` を変換し、`require` や `global` には
 `TODO(migrate)` コメントを付ける。そのあと型検査を実行して、型注釈などの手作業が必要な箇所を表示する。
 
@@ -933,15 +933,15 @@ phx migrate legacy/page.php      # page.phx を書き出す
    - **インタプリタ**: 安全な Rust だけで書かれている。文字列・list・map は参照カウント + コピーオンライト。
    - **JIT**(Cranelift): すべての値が `int`/`bool` の関数(数値計算のループや再帰)はネイティブコードになる。
      オーバーフロー、0 での剰余、負のシフト、再帰の深さ、実行時間・メモリの上限は JIT でも同じように検査される。
-     `PHX_JIT=0` で無効にできる。JIT の中で起きた例外のスタックトレースは呼び出し元までになる。
-5. **バイトコードキャッシュ**: `phx run` と `phx serve` はコンパイル結果を `.phx-cache/` に保存し、
-   ソースファイルと `phx` 本体が変わっていなければ再利用する。
-   - キャッシュはユーザーごとの鍵(`%LOCALAPPDATA%\phx\cache.key`、`~/.cache/phx/cache.key`)の HMAC で
-     署名し、署名が合わないものは読まない。ほかの人から受け取ったプロジェクトに `.phx-cache/` が入っていても、
+     `PHV_JIT=0` で無効にできる。JIT の中で起きた例外のスタックトレースは呼び出し元までになる。
+5. **バイトコードキャッシュ**: `phv run` と `phv serve` はコンパイル結果を `.phv-cache/` に保存し、
+   ソースファイルと `phv` 本体が変わっていなければ再利用する。
+   - キャッシュはユーザーごとの鍵(`%LOCALAPPDATA%\phv\cache.key`、`~/.cache/phv/cache.key`)の HMAC で
+     署名し、署名が合わないものは読まない。ほかの人から受け取ったプロジェクトに `.phv-cache/` が入っていても、
      ソースと違うコードが動くことはない。
    - エントリはスクリプトとプロジェクトごと。依存するすべてのファイルの内容(SHA-256)を記録し、読み込むときに
      確かめる(更新時刻を保つコピーや、同じ長さの書き換えでも古いコードは使われない)。
-   - `.phx-cache/` がリンクなら使わない。中のファイルも、リンクやハードリンクなら読み書きしない。
+   - `.phv-cache/` がリンクなら使わない。中のファイルも、リンクやハードリンクなら読み書きしない。
 
 ### 実行時の上限
 
@@ -952,8 +952,8 @@ phx migrate legacy/page.php      # page.phx を書き出す
 | 呼び出しの深さ | 10,000 | 致命的エラー |
 | リクエスト本文 | 8 MB | 413 |
 
-`unsafe` を使っているのは、メモリ使用量を数えるアロケータ(`phx_vm/src/alloc.rs`)と JIT
-(`phx_jit`、生成したコードの呼び出し)だけ。
+`unsafe` を使っているのは、メモリ使用量を数えるアロケータ(`phv_vm/src/alloc.rs`)と JIT
+(`phv_jit`、生成したコードの呼び出し)だけ。
 
 ## 18. 今後の予定
 
@@ -961,7 +961,7 @@ phx migrate legacy/page.php      # page.phx を書き出す
 - 非同期 I/O、HTTP クライアント(`[permissions].net`)
 - JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
 - 推移的な依存関係の解決、パッケージレジストリ
-- LSP の定義ジャンプ・補完、`phx fmt` の行の折り返し
+- LSP の定義ジャンプ・補完、`phv fmt` の行の折り返し
 - 複数プロセスで共有できるレート制限、データベースに保存するセッション
 
 セキュリティ監査の結果と残っているリスクは [security-audit.ja.md](security-audit.ja.md) を参照。

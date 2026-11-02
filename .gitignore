@@ -1,4 +1,4 @@
 target/
 .claude/
-.phx-cache/
+.phv-cache/
 vendor/

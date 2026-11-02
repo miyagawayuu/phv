@@ -1,0 +1,17 @@
+# Settings for the public demo at https://demo.phv-lang.org.
+
+[project]
+name = "phv-demo"
+
+[security]
+csrf = true
+secure_cookies = true  # served over HTTPS (browsers also accept these cookies on http://localhost)
+session_ttl = 3600
+memory_limit_mb = 32
+# requests_per_minute stays off: behind Fly.io's proxy every request comes from
+# the proxy's address. The pages limit by Fly-Client-IP instead (lib/client.phv).
+
+[permissions]
+read = ["public/", "views/", "lib/"]  # the "Source" panels show the code of each page
+write = ["data/"]
+env = ["FLY_REGION"]

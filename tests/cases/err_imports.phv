@@ -1,0 +1,5 @@
+<?phv
+import lib.shop.{catalog, internal_discount};
+import std.http.Nope;
+
+echo count(catalog());

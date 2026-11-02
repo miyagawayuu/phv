@@ -1,10 +1,10 @@
-// Builds the static phx-lang.org site into dist/:
+// Builds the static phv-lang.org site into dist/:
 //   /                 landing page (English)     /ja/              landing page (Japanese)
 //   /docs/spec/       language specification     /ja/docs/spec/
 //   /docs/security/   security audit report      /ja/docs/security/
 //   /404.html         page for unknown paths
 // The specification and the audit report are rendered from ../docs/*.md, and
-// PHX code is highlighted with the VS Code extension's TextMate grammars.
+// PHV code is highlighted with the VS Code extension's TextMate grammars.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -26,14 +26,14 @@ const highlighter = await createHighlighter({
     "sql",
     "bash",
     "toml",
-    { ...grammar("phx-html.tmLanguage.json"), name: "phx-html", embeddedLangs: ["html", "sql"] },
-    { ...grammar("phx.tmLanguage.json"), name: "phx", embeddedLangs: ["phx-html", "sql"] },
+    { ...grammar("phv-html.tmLanguage.json"), name: "phv-html", embeddedLangs: ["html", "sql"] },
+    { ...grammar("phv.tmLanguage.json"), name: "phv", embeddedLangs: ["phv-html", "sql"] },
   ],
 });
 
 /** Highlighted HTML for a code block; light and dark colors via CSS variables. */
 export function code(text, lang) {
-  const known = ["phx", "phx-html", "html", "sql", "bash", "toml"];
+  const known = ["phv", "phv-html", "html", "sql", "bash", "toml"];
   return highlighter.codeToHtml(text, {
     lang: known.includes(lang) ? lang : "text",
     themes: { light: "github-light", dark: "github-dark" },
@@ -123,7 +123,7 @@ export function layout({ lang, title, description, body, depth, active, otherHre
 <body>
 <header class="site-header">
   <div class="inner">
-    <a class="logo" href="${home}"><img src="${up}logo.svg" alt="" width="30" height="30">PHX</a>
+    <a class="logo" href="${home}"><img src="${up}logo.svg" alt="" width="30" height="30">PHV</a>
     <nav>
       ${nav("spec", `${docs}spec/`, t.spec)}
       ${nav("security", `${docs}security/`, t.security)}
@@ -137,7 +137,7 @@ ${body}
 </main>
 <footer class="site-footer">
   <div class="inner">
-    <p>PHX ${version} · MIT License · <a href="mailto:security@phx-lang.org">security@phx-lang.org</a></p>
+    <p>PHV ${version} · MIT License · <a href="mailto:security@phv-lang.org">security@phv-lang.org</a></p>
   </div>
 </footer>
 </body>
@@ -162,7 +162,7 @@ function docPage(src, lang, out, active, otherHref) {
 ${html}</article>
 </div>`;
   const depth = out.split("/").length - 1;
-  write(out, layout({ lang, title: `${title} · PHX`, description: title, body, depth, active, otherHref, wide: true }));
+  write(out, layout({ lang, title: `${title} · PHV`, description: title, body, depth, active, otherHref, wide: true }));
 }
 
 fs.rmSync(dist, { recursive: true, force: true });
@@ -190,9 +190,9 @@ write(
   "404.html",
   layout({
     lang: "en",
-    title: "Page not found · PHX",
+    title: "Page not found · PHV",
     description: "Page not found",
-    body: `<section class="notfound"><h1>Page not found</h1><p>There is no page at this address. <a href="/">Go to the PHX home page</a> or read the <a href="/docs/spec/">specification</a>.</p><p lang="ja">ページが見つかりません。<a href="/ja/">トップページ</a>へ。</p></section>`,
+    body: `<section class="notfound"><h1>Page not found</h1><p>There is no page at this address. <a href="/">Go to the PHV home page</a> or read the <a href="/docs/spec/">specification</a>.</p><p lang="ja">ページが見つかりません。<a href="/ja/">トップページ</a>へ。</p></section>`,
     depth: 0,
     absolute: true,
     otherHref: "/ja/",

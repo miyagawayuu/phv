@@ -1,0 +1,93 @@
+<?phv
+interface Shape {
+    public function area(): float;
+    public function name(): string;
+}
+
+interface Labeled extends Shape {
+    const PREFIX = "shape:";
+    public function label(): string;
+}
+
+abstract class Base implements Labeled {
+    public function label(): string {
+        return self::PREFIX . $this->name() . " (" . round($this->area(), 1) . ")";
+    }
+}
+
+class Circle extends Base {
+    const PI = 3.14159;
+
+    public function __construct(private float $r) {}
+
+    public function area(): float {
+        return self::PI * $this->r * $this->r;
+    }
+
+    public function name(): string {
+        return "circle";
+    }
+}
+
+final class Square extends Base {
+    public function __construct(private float $side) {}
+
+    public function area(): float {
+        return $this->side * $this->side;
+    }
+
+    public function name(): string {
+        return "square";
+    }
+}
+
+function total_area(list<Shape> $shapes): float {
+    $sum = 0.0;
+    foreach ($shapes as $s) {
+        $sum += $s->area();   // called through the interface
+    }
+    return $sum;
+}
+
+list<Labeled> $shapes = [new Circle(1), new Square(2)];
+foreach ($shapes as $s) {
+    echo $s->label(), "\n";
+}
+echo round(total_area([new Circle(2), new Square(3)]), 2), "\n";
+echo $shapes[0] is Shape ? "is Shape" : "no", " ", $shapes[1] is Circle ? "circle" : "not circle", "\n";
+echo Circle::PI, " ", Labeled::PREFIX, "\n";
+
+enum Suit {
+    case Hearts;
+    case Spades;
+
+    public function color(): string {
+        return match ($this) {
+            Suit::Hearts => "red",
+            Suit::Spades => "black",
+        };
+    }
+}
+
+enum Status: string {
+    case Active = "active";
+    case Banned = "banned";
+
+    public function label(): string {
+        return ucfirst($this->value);
+    }
+}
+
+$suit = Suit::Hearts;
+echo $suit->name, " is ", $suit->color(), "; same case: ", $suit == Suit::Hearts ? "yes" : "no", "\n";
+echo Status::from("banned")->label(), " ", Status::tryFrom("nope")?->label() ?? "unknown", "\n";
+echo implode(",", Status::cases()->map(fn($c) => $c->value)), "\n";
+echo json_encode(["status" => Status::Active->value]), "\n";
+try {
+    Status::from("x");
+} catch (ValueError $e) {
+    echo $e->getMessage(), "\n";
+}
+
+const MAX_ITEMS = 3;
+echo "max ", MAX_ITEMS, "\n";

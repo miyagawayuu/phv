@@ -1,140 +1,140 @@
 error: a URL attribute cannot start with an unchecked value
- --> err_context.phx:6:14
+ --> err_context.phv:6:14
   |
 6 | <a href="<?= htmlspecialchars($q) ?>">escaped is not a safe URL</a>
   |              ^^^^^^^^^^^^^^^^^^^^
   = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
 
 error: only `json_html()` values and numbers can be inserted into `<script>`
- --> err_context.phx:7:21
+ --> err_context.phv:7:21
   |
 7 | <script>var a = <?= escape($q) ?>;</script>
   |                     ^^^^^^^^^^
   = note: use `json_html($value)`, which produces a JavaScript value that is safe inside a script; `escape()` does not make code safe
 
 error: values cannot be inserted into CSS
- --> err_context.phx:8:22
+ --> err_context.phv:8:22
   |
 8 | <p style="color: <?= nl2br($q) ?>">nor safe CSS</p>
   |                      ^^^^^^^^^
   = note: use a class name, or a `data-*` attribute
 
 error: a URL attribute cannot start with an unchecked value
- --> err_context.phx:9:14
+ --> err_context.phv:9:14
   |
 9 | <a href="<?= $h ?>">nor through a variable</a>
   |              ^^
   = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
 
 error: a URL attribute cannot start with an unchecked value
-  --> err_context.phx:10:21
+  --> err_context.phv:10:21
    |
-10 | <a href="<?phx echo $q; ?>">echo is checked like a short tag</a>
+10 | <a href="<?phv echo $q; ?>">echo is checked like a short tag</a>
    |                     ^^
    = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
 
 error: only `json_html()` values and numbers can be inserted into `<script>`
-  --> err_context.phx:11:28
+  --> err_context.phv:11:28
    |
-11 | <script>var b = <?phx echo $q; ?>;</script>
+11 | <script>var b = <?phv echo $q; ?>;</script>
    |                            ^^
    = note: use `json_html($value)`, which produces a JavaScript value that is safe inside a script; `escape()` does not make code safe
 
 error: values in attributes must be quoted
-  --> err_context.phx:12:20
+  --> err_context.phv:12:20
    |
-12 | <a href=<?phx echo $q; ?>>unquoted</a>
+12 | <a href=<?phv echo $q; ?>>unquoted</a>
    |                    ^^
    = note: write `attr="<?= $value ?>"`: escaping does not protect unquoted attribute values
 
 warning: the event handler attribute `onclick` does not run under the default Content-Security-Policy
-  --> err_context.phx:13:9
+  --> err_context.phv:13:9
    |
-13 | <button onclick="go(<?phx echo $q; ?>)">handler</button>
+13 | <button onclick="go(<?phv echo $q; ?>)">handler</button>
    |         ^^^^^^^
    = note: attach the handler from a `<script>` in the template (it gets the CSP nonce), e.g. `el.addEventListener("click", ...)`
-   = note: or allow inline code with `[security] csp` in phx.toml (not recommended)
+   = note: or allow inline code with `[security] csp` in phv.toml (not recommended)
 
 error: values cannot be inserted into event handler attributes
-  --> err_context.phx:13:32
+  --> err_context.phv:13:32
    |
-13 | <button onclick="go(<?phx echo $q; ?>)">handler</button>
+13 | <button onclick="go(<?phv echo $q; ?>)">handler</button>
    |                                ^^
    = note: put the value in a `data-*` attribute and read it with addEventListener
 
 error: only `json_html()` values and numbers can be inserted into `<script>`
-  --> err_context.phx:14:43
+  --> err_context.phv:14:43
    |
 14 | <script>var c = "</scripts>"; var d = <?= $q ?>;</script>
    |                                           ^^
    = note: use `json_html($value)`, which produces a JavaScript value that is safe inside a script; `escape()` does not make code safe
 
 error: only `json_html()` values and numbers can be inserted into `<script>`
-  --> err_context.phx:15:26
+  --> err_context.phv:15:26
    |
 15 | <!--><script>var e = <?= $q ?>;</script>
    |                          ^^
    = note: use `json_html($value)`, which produces a JavaScript value that is safe inside a script; `escape()` does not make code safe
 
 error: only `json_html()` values and numbers can be inserted into `<script>`
-  --> err_context.phx:16:30
+  --> err_context.phv:16:30
    |
 16 | <!-- --!><script>var f = <?= $q ?>;</script>
    |                              ^^
    = note: use `json_html($value)`, which produces a JavaScript value that is safe inside a script; `escape()` does not make code safe
 
 error: only `json_html()` values and numbers can be inserted into `<script>`
-  --> err_context.phx:17:42
+  --> err_context.phv:17:42
    |
 17 | <script><!--<script></script>var g = <?= $q ?>;</script>-->
    |                                          ^^
    = note: use `json_html($value)`, which produces a JavaScript value that is safe inside a script; `escape()` does not make code safe
 
 error: values cannot be inserted into `srcdoc`
-  --> err_context.phx:18:21
+  --> err_context.phv:18:21
    |
 18 | <iframe srcdoc="<?= $q ?>"></iframe>
    |                     ^^
    = note: its value is parsed as a separate HTML document, where escaping does not apply; serve the content as its own page and use `src`
 
 error: a URL attribute cannot start with an unchecked value
-  --> err_context.phx:19:20
+  --> err_context.phv:19:20
    |
 19 | <a href="&#x20;<?= $q ?>">an entity is not the end of the scheme</a>
    |                    ^^
    = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
 
 error: a URL attribute cannot start with an unchecked value
-  --> err_context.phx:20:15
+  --> err_context.phv:20:15
    |
 20 | <a href="j<?= $q ?>">nor is a letter</a>
    |               ^^
    = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
 
 warning: `javascript:` URLs do not run under the default Content-Security-Policy
-  --> err_context.phx:21:9
+  --> err_context.phv:21:9
    |
 21 | <a href="javascript:go('<?= $q ?>')">a javascript: URL</a>
    |         ^
    = note: use a button with an event listener added from a `<script>` in the template
-   = note: or allow inline code with `[security] csp` in phx.toml (not recommended)
+   = note: or allow inline code with `[security] csp` in phv.toml (not recommended)
 
 error: values cannot be inserted into a `javascript:` (or `data:`) URL
-  --> err_context.phx:21:29
+  --> err_context.phv:21:29
    |
 21 | <a href="javascript:go('<?= $q ?>')">a javascript: URL</a>
    |                             ^^
    = note: put the value in a `data-*` attribute and read it from a script
 
 error: only `json_html()` values and numbers can be inserted into `<script>`
-  --> err_context.phx:22:52
+  --> err_context.phv:22:52
    |
 22 | <textarea><a title="</textarea><script>var h = <?= $q ?>;</script>
    |                                                    ^^
    = note: use `json_html($value)`, which produces a JavaScript value that is safe inside a script; `escape()` does not make code safe
 
 error: only `json_html()` values and numbers can be inserted into `<script>`
-  --> err_context.phx:23:33
+  --> err_context.phv:23:33
    |
 23 | <svg><title><script>var i = <?= $q ?>;</script></title></svg>
    |                                 ^^

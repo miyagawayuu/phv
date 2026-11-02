@@ -1,5 +1,0 @@
-<?phx
-import lib.missing.thing;
-
-echo render("views/nope.phx.html");
-echo render("../secret.phx.html");

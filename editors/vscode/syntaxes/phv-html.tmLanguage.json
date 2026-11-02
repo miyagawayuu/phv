@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "PHV Template",
+  "scopeName": "text.html.phv",
+  "comment": "HTML with embedded PHV: `<?phv ... ?>` blocks and `<?= ... ?>` output. The injection lets the blocks appear anywhere, including inside attribute values and <script>.",
+  "injections": {
+    "L:text.html.phv - meta.embedded.block.phv - comment.block.phv - string.quoted.double.phv - string.quoted.single.phv": {
+      "patterns": [{ "include": "#embedded" }]
+    }
+  },
+  "patterns": [
+    { "include": "#embedded" },
+    { "include": "text.html.basic" }
+  ],
+  "repository": {
+    "embedded": {
+      "begin": "<\\?(?:phv|=)",
+      "beginCaptures": { "0": { "name": "punctuation.section.embedded.begin.phv" } },
+      "end": "\\?>",
+      "endCaptures": { "0": { "name": "punctuation.section.embedded.end.phv" } },
+      "name": "meta.embedded.block.phv",
+      "contentName": "source.phv",
+      "patterns": [{ "include": "source.phv#code" }]
+    }
+  }
+}

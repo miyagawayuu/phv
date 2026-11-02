@@ -1,5 +1,0 @@
-<?phx
-import std.http.request;
-$site = request()->query("site") ?? "";
-?>
-<a href="<?= $site ?>">Website</a>

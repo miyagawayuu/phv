@@ -1,20 +1,22 @@
 <h1>
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/phx-lockup-on-dark.svg">
-    <img src="assets/logo/phx-lockup-on-light.svg" alt="PHX" height="64">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/phv-lockup-on-dark.svg">
+    <img src="assets/logo/phv-lockup-on-light.svg" alt="PHV" height="64">
   </picture>
 </h1>
 
 English | [日本語](README.ja.md)
 
-PHX is a programming language for the web that keeps the feel of PHP while
+PHV is a programming language for the web that keeps the feel of PHP while
 the language itself guarantees **type safety, safe defaults and speed**.
 The implementation is written in Rust.
 
-Website: <https://phx-lang.org>
+PHV was called PHX until v0.2.7 ([miyagawayuu/phx](https://github.com/miyagawayuu/phx)).
 
-```phx
-<?phx
+Website: <https://phv-lang.org>
+
+```phv
+<?phv
 import std.http.request;
 import std.db.Database;
 
@@ -50,7 +52,7 @@ echo greet($name);                                 // HTML-escaped automatically
   - **Sessions**: stored on the server, with protection against fixation (in memory, or in files that survive
     restarts).
   - **Rate limiting**: `rate_limit()`, and a per-client limit with `requests_per_minute`.
-  - **Permissions**: scripts can only touch the files and environment variables allowed in `phx.toml`. Links and
+  - **Permissions**: scripts can only touch the files and environment variables allowed in `phv.toml`. Links and
     hard links are not followed, and paths cannot be swapped between the check and the use.
   - **Limits**: memory, time and recursion depth are limited.
   - **No dynamic execution**: there is no `eval` and no variable variables.
@@ -59,7 +61,7 @@ echo greet($name);                                 // HTML-escaped automatically
 - **Speed**: a register-based bytecode VM specialized by type, a Cranelift JIT, and an on-disk bytecode cache.
 - **Tools**: test runner, formatter, Language Server, package manager, and a migration tool from PHP.
   A VS Code extension (highlighting and the language server) is in [editors/vscode](editors/vscode); each release
-  includes it as `phx-<version>.vsix`.
+  includes it as `phv-<version>.vsix`.
 
 The full language specification is in [docs/spec.md](docs/spec.md).
 
@@ -72,20 +74,20 @@ You need a recent stable Rust (tested with 1.97). SQLite is built in, so a C com
 cargo build --release
 ```
 
-The executable is `target/release/phx` (`phx.exe` on Windows).
+The executable is `target/release/phv` (`phv.exe` on Windows).
 
 ## Usage
 
 ```bash
-phx run examples/hello/hello.phx         # type-check and run
-phx check examples/site/public/index.phx # type-check only
-phx serve examples/site                  # serve the site on http://127.0.0.1:8080
-phx test examples                        # run the test_* functions in *_test.phx files
-phx fmt examples                         # fix indentation and spacing (--check only reports)
-phx lsp                                  # Language Server for editors
-phx install                              # fetch the [dependencies] in phx.toml
-phx migrate legacy/page.php              # convert PHP and list what needs manual work
-phx disasm examples/bench/bench.phx      # show the bytecode
+phv run examples/hello/hello.phv         # type-check and run
+phv check examples/site/public/index.phv # type-check only
+phv serve examples/site                  # serve the site on http://127.0.0.1:8080
+phv test examples                        # run the test_* functions in *_test.phv files
+phv fmt examples                         # fix indentation and spacing (--check only reports)
+phv lsp                                  # Language Server for editors
+phv install                              # fetch the [dependencies] in phv.toml
+phv migrate legacy/page.php              # convert PHP and list what needs manual work
+phv disasm examples/bench/bench.phv      # show the bytecode
 ```
 
 ## Example site
@@ -95,11 +97,11 @@ protection and flash messages), a contact form with validation, and a JSON API.
 
 ```
 examples/site/
-├── phx.toml             security settings and permissions ([permissions].write = ["data/"])
-├── public/              pages, one per URL (/ -> index.phx, /guestbook -> guestbook.phx)
-├── lib/                 imported modules (posts.phx, guestbook.phx)
-├── views/*.phx.html     typed templates
-├── tests/posts_test.phx tests run by phx test
+├── phv.toml             security settings and permissions ([permissions].write = ["data/"])
+├── public/              pages, one per URL (/ -> index.phv, /guestbook -> guestbook.phv)
+├── lib/                 imported modules (posts.phv, guestbook.phv)
+├── views/*.phv.html     typed templates
+├── tests/posts_test.phv tests run by phv test
 └── data/                the SQLite database (the only place scripts may write)
 ```
 
@@ -107,14 +109,14 @@ examples/site/
 
 ```
 error: cannot call `->upper()` on `?string` because it might be null
- --> err_null_safety.phx:6:6
+ --> err_null_safety.phv:6:6
   |
 6 | echo $name->upper();
   |      ^^^^^
   = note: check `!= null` first, or use `?->`
 
 error: a URL attribute cannot start with an unchecked value
-  --> err_security.phx:45:14
+  --> err_security.phv:45:14
    |
 45 | <a href="<?= $name ?>">url</a>
    |              ^^^^^
@@ -125,15 +127,15 @@ error: a URL attribute cannot start with an unchecked value
 
 | Crate | Purpose |
 |---|---|
-| `phx_syntax` | Sources, diagnostics, lexer (code / HTML modes), parser, HTML context tracking, formatter |
-| `phx_types` | Name resolution, type checking, narrowing, definite assignment → typed HIR; builtin signatures |
-| `phx_compiler` | HIR → register bytecode |
-| `phx_vm` | Values, bytecode format, interpreter, runtime limits |
-| `phx_jit` | Native code for functions that only use int/bool values (Cranelift) |
-| `phx_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, PostgreSQL, MySQL, Redis, sessions) and the prelude, `std.http` and `std.db` written in PHX |
-| `phx_driver` | Loading modules and templates, `phx.toml`, bytecode cache, running programs |
-| `phx_server` | Web server (hyper + tokio), routing, sessions, CSRF, uploads |
-| `phx_cli` | The `phx` command (run / check / serve / test / fmt / lsp / install / migrate) |
+| `phv_syntax` | Sources, diagnostics, lexer (code / HTML modes), parser, HTML context tracking, formatter |
+| `phv_types` | Name resolution, type checking, narrowing, definite assignment → typed HIR; builtin signatures |
+| `phv_compiler` | HIR → register bytecode |
+| `phv_vm` | Values, bytecode format, interpreter, runtime limits |
+| `phv_jit` | Native code for functions that only use int/bool values (Cranelift) |
+| `phv_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, PostgreSQL, MySQL, Redis, sessions) and the prelude, `std.http` and `std.db` written in PHV |
+| `phv_driver` | Loading modules and templates, `phv.toml`, bytecode cache, running programs |
+| `phv_server` | Web server (hyper + tokio), routing, sessions, CSRF, uploads |
+| `phv_cli` | The `phv` command (run / check / serve / test / fmt / lsp / install / migrate) |
 
 ## Tests
 
@@ -141,21 +143,21 @@ error: a URL attribute cannot start with an unchecked value
 cargo test --workspace
 ```
 
-- Golden tests: each `tests/cases/*.phx` is run and compared with its `.out` file, also with the JIT on and
-  after `phx fmt`, which must not change the behavior.
-- Security regression tests (`err_security.phx`, `err_context.phx`, `security.phx`, and others).
+- Golden tests: each `tests/cases/*.phv` is run and compared with its `.out` file, also with the JIT on and
+  after `phv fmt`, which must not change the behavior.
+- Security regression tests (`err_security.phv`, `err_context.phv`, `security.phv`, and others).
 - Integration tests that start the real server and talk HTTP to it.
-- Fuzzing with mutated programs (set the number of runs with `PHX_FUZZ_ITERATIONS`).
+- Fuzzing with mutated programs (set the number of runs with `PHV_FUZZ_ITERATIONS`).
 
-To update the expected output, run `PHX_BLESS=1 cargo test -p phx_driver --test golden golden` and review the
+To update the expected output, run `PHV_BLESS=1 cargo test -p phv_driver --test golden golden` and review the
 diff. CI (`.github/workflows/ci.yml`) runs all of this plus clippy, rustfmt and `cargo audit` on Linux, Windows
 and macOS.
 
 ## Benchmarks
 
-`examples/bench/bench.phx` compared with the equivalent `bench.py` (Windows 11, release build; indicative only).
+`examples/bench/bench.phv` compared with the equivalent `bench.py` (Windows 11, release build; indicative only).
 
-| Benchmark | PHX (JIT) | PHX (interpreter) | CPython 3.13 |
+| Benchmark | PHV (JIT) | PHV (interpreter) | CPython 3.13 |
 |---|---:|---:|---:|
 | `fib(30)` (recursive calls) | 6.7 ms | 80 ms | 94 ms |
 | 10 million loop iterations | 13 ms | 284 ms | 326 ms |
@@ -164,7 +166,7 @@ and macOS.
 | 200,000 map updates | 44 ms | 46 ms | 34 ms |
 
 The JIT compiles functions whose values are all `int` / `bool`. Code that relies on closures or strings runs in
-the interpreter and, as the table shows, can be slower than CPython (to be improved). Set `PHX_JIT=0` to turn
+the interpreter and, as the table shows, can be slower than CPython (to be improved). Set `PHV_JIT=0` to turn
 the JIT off.
 
 ## License

@@ -1,0 +1,32 @@
+<?phv
+$s = "  Hello, World  ";
+$t = $s->trim();
+echo "[", $t, "] len=", $t->len(), "\n";
+echo $t->upper(), " ", $t->lower(), "\n";
+echo $t->contains("World") ? "contains" : "missing", "\n";
+echo $t->startsWith("Hell") ? "yes" : "no", " ", $t->endsWith("x") ? "yes" : "no", "\n";
+echo $t->replace("World", "PHV"), "\n";
+echo implode("|", $t->split(", ")), "\n";
+echo $t->slice(7), " / ", $t->slice(0, 5), " / ", $t->slice(-5, 3), "\n";
+echo $t->indexOf("o") ?? -1, " ", $t->indexOf("z") ?? -1, "\n";
+echo "7"->padStart(3, "0"), " ", "ab"->padEnd(5, "."), "\n";
+echo "日本語テキスト"->len(), " ", strlen("日本語"), " ", "日本語テキスト"->slice(3, 2), "\n";
+echo implode(",", "abc"->chars()), "\n";
+echo str_repeat("=-", 5), "\n";
+echo ucfirst("phv"), " ", strtoupper("abc"), " ", str_replace("a", "o", "banana"), "\n";
+
+$n = "42"->toInt();
+if ($n != null) {
+    echo "parsed ", $n + 1, "\n";
+}
+echo "abc"->toInt() ?? "not a number", "\n";
+echo "3.5"->toFloat() ?? 0.0, "\n";
+
+$csv = "";
+foreach (["a", "b", "c"] as $i => $letter) {
+    $csv .= ($i > 0 ? "," : "") . $letter;
+}
+echo $csv, "\n";
+$parts = explode("-", "2026-11-01");
+echo count($parts), " ", $parts[0], "\n";
+echo "x" . 1 . "y" . 2.5, "\n";

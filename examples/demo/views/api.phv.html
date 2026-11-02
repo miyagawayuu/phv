@@ -1,0 +1,48 @@
+<?phv params(int $total, int $yours) ?>
+<h1>JSON API</h1>
+<p class="lead">A file under <code>public/api/</code> is an endpoint: <code>response()->json($value)</code> sends any
+value as JSON, and objects contribute their public properties.</p>
+
+<div class="demo">
+  <h2>A shared counter</h2>
+  <p>The button sends <code>POST /api/clicks</code> with <code>fetch()</code>. Everyone who visits shares the
+  total; the server also counts your clicks in your session.</p>
+  <p class="counter"><button id="click">+1</button>
+    <span>Total <strong id="total"><?= $total ?></strong></span>
+    <span>Yours <strong id="mine"><?= $yours ?></strong></span></p>
+  <pre class="term"><code id="response">// the JSON response appears here</code></pre>
+</div>
+
+<script>
+  // This inline script runs because PHV adds a CSP nonce to scripts written in
+  // templates. The token comes from json_html(), the only way to put a value here.
+  const token = <?= json_html(csrf_token()) ?>;
+  const button = document.getElementById("click");
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      const res = await fetch("/api/clicks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+        body: "{}",
+      });
+      const data = await res.json();
+      document.getElementById("response").textContent = JSON.stringify(data, null, 2);
+      if (res.ok) {
+        document.getElementById("total").textContent = data.total;
+        document.getElementById("mine").textContent = data.yours;
+      }
+    } finally {
+      button.disabled = false;
+    }
+  });
+</script>
+
+<div class="demo">
+  <h2>Read-only endpoints</h2>
+  <ul>
+    <li><a href="/api/clicks">GET /api/clicks</a> — the counter</li>
+    <li><a href="/api/messages">GET /api/messages</a> — the message board as JSON</li>
+    <li><a href="/api/messages?limit=3">GET /api/messages?limit=3</a></li>
+  </ul>
+</div>

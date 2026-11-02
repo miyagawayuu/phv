@@ -1,5 +1,5 @@
 data/
-.phx-cache/
+.phv-cache/
 Dockerfile
 fly.toml
 README.md

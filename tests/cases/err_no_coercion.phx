@@ -1,5 +1,0 @@
-<?phx
-// No implicit conversion between strings and numbers.
-$y = "1" + 1;
-$z = 10 . 5;   // allowed: `.` builds strings from numbers
-$n = "5" == 5;

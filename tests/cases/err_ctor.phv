@@ -1,0 +1,18 @@
+<?phv
+// A private constructor can only be used by the class itself.
+import std.db.Database;
+
+class Token {
+    private function __construct(public string $value) {}
+
+    public static function make(): Token {
+        return new Token("issued by the class");
+    }
+}
+
+class MyDb extends Database {}
+
+echo Token::make()->value, "\n";
+$t = new Token("forged");
+$db = new Database(0);
+$d = new MyDb(1);

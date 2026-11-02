@@ -1,0 +1,16 @@
+import lib.store.validate_message;
+
+function test_accepts_a_normal_message(): void {
+    assert(validate_message("Ann", "Hello from PHV")->isEmpty());
+}
+
+function test_rejects_empty_and_long_fields(): void {
+    assert_eq(1, validate_message("", "hi")->len());
+    assert_eq(1, validate_message("Ann", "x"->repeat(281))->len());
+    assert_eq(1, validate_message("n"->repeat(41), "hi")->len());
+}
+
+function test_rejects_links(): void {
+    assert_eq(["Links are not allowed on this board."], validate_message("Ann", "see HTTPS://example.com"));
+    assert_eq(1, validate_message("Ann", "www.example.com")->len());
+}

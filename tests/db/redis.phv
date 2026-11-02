@@ -1,0 +1,54 @@
+// Run by crates/phv_driver/tests/databases.rs against a Redis server.
+import std.db.{Database, Redis};
+
+$r = Redis::connect("main");
+$r->delete("phv:greeting");
+echo "missing: ", $r->get("phv:greeting") ?? "null", "\n";
+$r->set("phv:greeting", "hello ?", 60);
+echo "get: ", $r->get("phv:greeting") ?? "null", "\n";
+echo "exists: ", $r->exists("phv:greeting") ? "yes" : "no", "\n";
+$ttl = $r->ttl("phv:greeting");
+echo "ttl ok: ", $ttl > 0 && $ttl <= 60 ? "yes" : "no", "\n";
+$r->set("phv:greeting", "plain");
+echo "ttl after plain set: ", $r->ttl("phv:greeting"), "\n";
+echo "expire: ", $r->expire("phv:greeting", 30) ? "yes" : "no", "\n";
+echo "delete: ", $r->delete("phv:greeting") ? "yes" : "no", " ", $r->delete("phv:greeting") ? "yes" : "no", "\n";
+
+$r->delete("phv:counter");
+echo "incr: ", $r->incr("phv:counter"), " ", $r->incr("phv:counter", 10), " ", $r->incr("phv:counter", -3), "\n";
+$r->set("phv:text", "abc");
+try {
+    $r->incr("phv:text");
+} catch (DatabaseError $e) {
+    echo "error: ", $e->message, "\n";
+}
+
+$r->delete("phv:user");
+echo "hset: ", $r->hset("phv:user", "name", "Ann") ? "new" : "old", " ", $r->hset("phv:user", "name", "Bo") ? "new" : "old", "\n";
+$r->hset("phv:user", "city", "Kyoto");
+echo "hget: ", $r->hget("phv:user", "name") ?? "null", " ", $r->hget("phv:user", "nope") ?? "null", "\n";
+echo "hgetAll: ", json_encode($r->hgetAll("phv:user")), "\n";
+echo "hdel: ", $r->hdel("phv:user", "city") ? "yes" : "no", "\n";
+
+$r->delete("phv:queue");
+$r->rpush("phv:queue", "a");
+$r->rpush("phv:queue", "b");
+echo "rpush: ", $r->rpush("phv:queue", "c"), "\n";
+echo "lrange: ", json_encode($r->lrange("phv:queue", 0, -1)), "\n";
+echo "lpop: ", $r->lpop("phv:queue") ?? "null", "\n";
+echo "lrange: ", json_encode($r->lrange("phv:queue", 0, -1)), "\n";
+
+try {
+    Database::connect("main");
+} catch (DatabaseError $e) {
+    echo "error: ", $e->message, "\n";
+}
+foreach (["phv:counter", "phv:text", "phv:user", "phv:queue"] as $k) {
+    $r->delete($k);
+}
+$r->close();
+try {
+    $r->get("x");
+} catch (DatabaseError $e) {
+    echo "error: ", $e->message, "\n";
+}

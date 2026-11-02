@@ -1,0 +1,24 @@
+[package]
+name = "phv_driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[dev-dependencies]
+phv_syntax.workspace = true
+
+[dependencies]
+phv_syntax.workspace = true
+phv_types.workspace = true
+phv_compiler.workspace = true
+phv_vm.workspace = true
+phv_std.workspace = true
+phv_jit.workspace = true
+toml.workspace = true
+postcard.workspace = true
+serde.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+getrandom.workspace = true

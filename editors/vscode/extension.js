@@ -1,4 +1,4 @@
-// PHX for VS Code: starts `phx lsp` for diagnostics and hover types.
+// PHV for VS Code: starts `phv lsp` for diagnostics and hover types.
 // Syntax highlighting needs no code; it comes from the grammars in syntaxes/.
 
 const vscode = require("vscode");
@@ -8,27 +8,27 @@ const { LanguageClient } = require("vscode-languageclient/node");
 let client;
 
 function activate(context) {
-  const config = vscode.workspace.getConfiguration("phx");
+  const config = vscode.workspace.getConfiguration("phv");
   if (!config.get("lsp.enabled", true)) {
     return;
   }
-  // `phx.path` is a machine-scoped setting, so a workspace cannot point it at
+  // `phv.path` is a machine-scoped setting, so a workspace cannot point it at
   // a program of its own.
-  const command = config.get("path") || "phx";
+  const command = config.get("path") || "phv";
   client = new LanguageClient(
-    "phx",
-    "PHX Language Server",
+    "phv",
+    "PHV Language Server",
     { command, args: ["lsp"] },
     {
       documentSelector: [
-        { scheme: "file", language: "phx" },
-        { scheme: "file", language: "phx-template" },
+        { scheme: "file", language: "phv" },
+        { scheme: "file", language: "phv-template" },
       ],
     },
   );
   client.start().catch((err) => {
     vscode.window.showWarningMessage(
-      `PHX: could not start "${command} lsp" (${err.message}). Install phx from https://phx-lang.org or set "phx.path".`,
+      `PHV: could not start "${command} lsp" (${err.message}). Install phv from https://phv-lang.org or set "phv.path".`,
     );
   });
   context.subscriptions.push({ dispose: () => client && client.stop() });

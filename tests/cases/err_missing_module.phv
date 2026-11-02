@@ -1,0 +1,5 @@
+<?phv
+import lib.missing.thing;
+
+echo render("views/nope.phv.html");
+echo render("../secret.phv.html");

@@ -1,0 +1,23 @@
+<?phv
+// Values in places where HTML escaping does not protect them (all errors).
+$q = "x";
+$h = escape($q);
+?>
+<a href="<?= htmlspecialchars($q) ?>">escaped is not a safe URL</a>
+<script>var a = <?= escape($q) ?>;</script>
+<p style="color: <?= nl2br($q) ?>">nor safe CSS</p>
+<a href="<?= $h ?>">nor through a variable</a>
+<a href="<?phv echo $q; ?>">echo is checked like a short tag</a>
+<script>var b = <?phv echo $q; ?>;</script>
+<a href=<?phv echo $q; ?>>unquoted</a>
+<button onclick="go(<?phv echo $q; ?>)">handler</button>
+<script>var c = "</scripts>"; var d = <?= $q ?>;</script>
+<!--><script>var e = <?= $q ?>;</script>
+<!-- --!><script>var f = <?= $q ?>;</script>
+<script><!--<script></script>var g = <?= $q ?>;</script>-->
+<iframe srcdoc="<?= $q ?>"></iframe>
+<a href="&#x20;<?= $q ?>">an entity is not the end of the scheme</a>
+<a href="j<?= $q ?>">nor is a letter</a>
+<a href="javascript:go('<?= $q ?>')">a javascript: URL</a>
+<textarea><a title="</textarea><script>var h = <?= $q ?>;</script>
+<svg><title><script>var i = <?= $q ?>;</script></title></svg>

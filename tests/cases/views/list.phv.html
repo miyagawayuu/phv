@@ -1,0 +1,15 @@
+<?phv
+import lib.shop.Product;
+params(string $title, list<Product> $products);
+?>
+<h1><?= $title ?></h1>
+<ul>
+<?phv foreach ($products as $p): ?>
+  <li class="<?= $p->inStock ? "in" : "out" ?>"><?= $p->label() ?></li>
+<?phv endforeach; ?>
+</ul>
+<?phv if ($products->isEmpty()) { ?>
+<p>Nothing here.</p>
+<?phv } else { ?>
+<p><?= count($products) ?> products, <?= raw("<b>bold</b>") ?></p>
+<?phv } ?>

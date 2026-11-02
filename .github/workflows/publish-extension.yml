@@ -1,6 +1,6 @@
 name: Publish VS Code extension
 
-# Publishes the release's phx-X.Y.Z.vsix to the Visual Studio Marketplace when
+# Publishes the release's phv-X.Y.Z.vsix to the Visual Studio Marketplace when
 # a release is published (after the draft has been checked). Authentication is
 # Marketplace Trusted Publishing: GitHub's OIDC token proves this repository,
 # this workflow file and the `marketplace` environment, so no token is stored.
@@ -30,7 +30,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'phx-*.vsix' --dir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'phv-*.vsix' --dir dist
           ls -l dist
           # The release must contain exactly one extension package.
           test "$(ls dist/*.vsix | wc -l)" -eq 1

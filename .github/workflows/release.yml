@@ -1,7 +1,7 @@
 name: Release
 
-# Pushing a tag `vX.Y.Z` builds `phx` for every platform and the VS Code
-# extension (`phx-X.Y.Z.vsix`), and creates a *draft* GitHub release with them
+# Pushing a tag `vX.Y.Z` builds `phv` for every platform and the VS Code
+# extension (`phv-X.Y.Z.vsix`), and creates a *draft* GitHub release with them
 # and their SHA-256 checksums; it is published by hand after checking it. Running the workflow by hand (Actions
 # tab, or `gh workflow run release.yml`) only builds and tests the archives.
 on:
@@ -48,21 +48,21 @@ jobs:
             exit 1
           fi
       - name: Build
-        run: cargo build --release --locked -p phx_cli --target ${{ matrix.target }}
+        run: cargo build --release --locked -p phv_cli --target ${{ matrix.target }}
       - name: Smoke test
         if: matrix.native
         run: |
-          bin=target/${{ matrix.target }}/release/phx
+          bin=target/${{ matrix.target }}/release/phv
           "$bin" --version
-          out=$("$bin" run examples/hello/hello.phx)
+          out=$("$bin" run examples/hello/hello.phv)
           echo "$out"
           test -n "$out"
       - name: Package
         run: |
-          name=phx-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          name=phv-${{ steps.version.outputs.version }}-${{ matrix.target }}
           mkdir -p "dist/$name"
-          exe=phx
-          [[ "${{ matrix.target }}" == *windows* ]] && exe=phx.exe
+          exe=phv
+          [[ "${{ matrix.target }}" == *windows* ]] && exe=phv.exe
           cp "target/${{ matrix.target }}/release/$exe" LICENSE README.md README.ja.md SECURITY.md "dist/$name/"
           cd dist
           if [[ "${{ matrix.target }}" == *windows* ]]; then
@@ -74,7 +74,7 @@ jobs:
           ls -l
       - uses: actions/upload-artifact@v4
         with:
-          name: phx-${{ matrix.target }}
+          name: phv-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
@@ -104,7 +104,7 @@ jobs:
           npm ci --ignore-scripts --no-audit --no-fund
           npm test
           mkdir -p ../../dist
-          npx vsce package --out "../../dist/phx-${{ steps.version.outputs.version }}.vsix"
+          npx vsce package --out "../../dist/phv-${{ steps.version.outputs.version }}.vsix"
       - name: Check the package
         run: |
           # extension.js loads vscode-languageclient at run time, so it must be in the package.
@@ -112,7 +112,7 @@ jobs:
           ls -l dist
       - uses: actions/upload-artifact@v4
         with:
-          name: phx-vscode
+          name: phv-vscode
           path: dist/*.vsix
           if-no-files-found: error
 
@@ -140,5 +140,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --draft \
-            --title "PHX $GITHUB_REF_NAME" \
+            --title "PHV $GITHUB_REF_NAME" \
             --generate-notes

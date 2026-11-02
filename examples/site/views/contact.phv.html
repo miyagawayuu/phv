@@ -1,0 +1,24 @@
+<?phv params(string $name, string $message, list<string> $errors, bool $sent) ?>
+<h1>Contact</h1>
+<?phv if ($sent): ?>
+<div class="notice ok">
+  <p>Thanks, <?= $name ?>! We received your message:</p>
+  <blockquote><?= nl2br($message) ?></blockquote>
+</div>
+<?phv else: ?>
+<?phv if (!$errors->isEmpty()): ?>
+<ul class="notice error">
+<?phv foreach ($errors as $error): ?>
+  <li><?= $error ?></li>
+<?phv endforeach; ?>
+</ul>
+<?phv endif; ?>
+<form method="post" action="/contact" class="stack">
+  <?= csrf_field() ?>
+  <label for="name">Name</label>
+  <input id="name" name="name" value="<?= $name ?>">
+  <label for="message">Message</label>
+  <textarea id="message" name="message" rows="5"><?= $message ?></textarea>
+  <button>Send</button>
+</form>
+<?phv endif; ?>

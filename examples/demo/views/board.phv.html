@@ -1,0 +1,39 @@
+<?phv
+import lib.store.Message;
+params(list<Message> $messages, string $name, string $text, list<string> $errors, ?string $notice);
+?>
+<h1>Message board</h1>
+<p class="lead">Messages are stored in SQLite. SQL can only be written as <code>sql"..."</code> literals, and every
+<code>{$value}</code> inside one becomes a placeholder, so quotes and <code>'); DROP TABLE</code> are just text.
+The form carries a CSRF token that the server checks before the script runs.</p>
+
+<?phv if ($notice != null): ?>
+<div class="notice ok"><?= $notice ?></div>
+<?phv endif; ?>
+<?phv if (!$errors->isEmpty()): ?>
+<ul class="notice error">
+<?phv foreach ($errors as $error): ?>
+  <li><?= $error ?></li>
+<?phv endforeach; ?>
+</ul>
+<?phv endif; ?>
+
+<form method="post" action="/board" class="stack">
+  <?= csrf_field() ?>
+  <label for="name">Name</label>
+  <input id="name" name="name" value="<?= $name ?>" maxlength="40" required>
+  <label for="text">Message</label>
+  <textarea id="text" name="text" rows="3" maxlength="280" required><?= $text ?></textarea>
+  <button>Post</button>
+  <p class="muted small">Public. Kept for 24 hours, no links, 3 posts a minute.</p>
+</form>
+
+<?phv foreach ($messages as $message): ?>
+<article class="message">
+  <p class="meta"><strong><?= $message->name ?></strong> <span><?= $message->time() ?></span></p>
+  <p><?= nl2br($message->text) ?></p>
+</article>
+<?phv endforeach; ?>
+<?phv if ($messages->isEmpty()): ?>
+<p class="muted">No messages in the last 24 hours. Be the first!</p>
+<?phv endif; ?>

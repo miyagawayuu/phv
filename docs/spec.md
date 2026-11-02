@@ -1,16 +1,16 @@
-# PHX Language Specification (v0.2)
+# PHV Language Specification (v0.2)
 
 English | [日本語](spec.ja.md)
 
-Website: <https://phx-lang.org>
+Website: <https://phv-lang.org>
 
-PHX is a language for the web. It keeps what is good about PHP: you save a file and it runs, it is built for the web, and it embeds in HTML.
+PHV is a language for the web. It keeps what is good about PHP: you save a file and it runs, it is built for the web, and it embeds in HTML.
 On top of that, the language itself guarantees type safety, security, execution speed, and maintainability.
 It is not compatible with existing PHP code, but it aims to be something PHP programmers can read and write right away.
 
 ## 1. Design Principles
 
-| PHP weakness | How PHX solves it |
+| PHP weakness | How PHV solves it |
 |---|---|
 | Implicit conversion (`"1" + 1`, `"abc" == 0`) | No implicit conversion. `==` is always a strict comparison. Comparing values of different types is a compile error |
 | Runtime errors caused by null | The `?T` type. A value cannot be used until it is null-checked (`!= null`, `is`, `??`, `?->`) |
@@ -19,7 +19,7 @@ It is not compatible with existing PHP code, but it aims to be something PHP pro
 | SQL injection | SQL can only be written as an `sql"..."` literal (type `Sql`), and embedded values always become placeholders |
 | Escaping that ignores context | The position of `<?= ?>` (attribute, URL, `<script>`, CSS) is analyzed, and inserting into a place that escaping cannot protect is a compile error |
 | CSRF and session fixation | The server checks the token on form POSTs automatically. Only session IDs issued by the server are accepted |
-| Scripts that can do anything | Access to files and environment variables is limited to what `[permissions]` in `phx.toml` allows |
+| Scripts that can do anything | Access to files and environment variables is limited to what `[permissions]` in `phv.toml` allows |
 | Execution of injected scripts | The default Content-Security-Policy blocks inline scripts other than the `<script>` elements written in templates |
 | Header injection | A header value that contains a newline raises `ValueError` |
 | Path traversal | The server does not serve files outside `public/`, dotfiles, or templates |
@@ -29,9 +29,9 @@ It is not compatible with existing PHP code, but it aims to be something PHP pro
 
 ## 2. Files
 
-- `.phx` … A script or module. Starts in **code mode**. The leading `<?phx` is optional.
-- `.phx.html` … A template. Starts in **HTML mode**.
-- Writing `?>` in code mode switches to HTML mode. In HTML mode, `<?phx` (or `<? `) switches back to code,
+- `.phv` … A script or module. Starts in **code mode**. The leading `<?phv` is optional.
+- `.phv.html` … A template. Starts in **HTML mode**.
+- Writing `?>` in code mode switches to HTML mode. In HTML mode, `<?phv` (or `<? `) switches back to code,
   and `<?= expr ?>` outputs a value. A single newline right after `?>` is not output (same as PHP).
 - The character encoding is UTF-8.
 
@@ -84,14 +84,14 @@ PHP's `array` is split into `list<T>` and `map<K, V>`. `mixed` is `any`.
 
 - As in PHP, **a variable is declared by its first assignment**. The type of the value becomes the type of the variable, and a value of a different type cannot be assigned later.
 
-  ```phx
+  ```phv
   $count = 1;
   $count = "two";   // error: expected `int`, found `string`
   ```
 
 - When the type cannot be inferred (`null` or an empty `[]`), declare the variable with a type.
 
-  ```phx
+  ```phv
   ?User $found = null;
   list<string> $names = [];
   map<string, int> $counts = [];
@@ -99,7 +99,7 @@ PHP's `array` is split into `list<T>` and `map<K, V>`. `mixed` is `any`.
 
 - A variable's scope is the whole function (same as PHP). However, **a variable that is assigned only on some paths cannot be used**.
 
-  ```phx
+  ```phv
   if ($ok) { $msg = "hi"; }
   echo $msg;   // error: variable `$msg` might not be defined here
   ```
@@ -112,7 +112,7 @@ PHP's `array` is split into `list<T>` and `map<K, V>`. `mixed` is `any`.
 
 Conditions narrow the types of local variables.
 
-```phx
+```phv
 function greet(?User $u): string {
     if ($u == null) {
         return "guest";
@@ -158,7 +158,7 @@ From highest to lowest precedence:
 
 ## 7. Control Flow
 
-```phx
+```phv
 if (...) { } elseif (...) { } else if (...) { } else { }
 while (...) { }
 do { } while (...);
@@ -177,7 +177,7 @@ The template-oriented syntax is also available: `if (...): ... elseif (...): ...
 
 ### match
 
-```phx
+```phv
 $text = match ($code) {
     200, 201 => "ok",
     404 => "not found",
@@ -193,7 +193,7 @@ Comparison uses `==` (strict). If no arm matches and there is no `default`, `Unh
 
 ### Exceptions
 
-```phx
+```phv
 try {
     risky();
 } catch (NotFound | InvalidArgumentException $e) {
@@ -203,7 +203,7 @@ throw new RuntimeException("boom");
 $port = $config["port"] ?? throw new ValueError("port is required");
 ```
 
-```phx
+```phv
 try {
     $db->execute(sql"...");
 } finally {
@@ -215,7 +215,7 @@ Only `Exception` and its subclasses can be thrown.
 
 ## 8. Functions
 
-```phx
+```phv
 function greet(string $name, int $times = 1): string { ... }
 greet("Ann");
 greet(name: "Bob", times: 3);       // named arguments
@@ -229,7 +229,7 @@ greet(name: "Bob", times: 3);       // named arguments
 
 ### Closures
 
-```phx
+```phv
 $double = fn(int $x): int => $x * 2;           // captures outer variables automatically
 $names->map(fn($n) => $n->upper());            // parameter types are inferred from context
 $counter = function () use ($start): int { return $start + 1; };
@@ -240,7 +240,7 @@ $counter = function () use ($start): int { return $start + 1; };
 
 ## 9. Classes
 
-```phx
+```phv
 class User {
     private int $loginCount = 0;
     public readonly string $email;
@@ -281,7 +281,7 @@ class Admin extends User {
 - Objects are references; `list` and `map` are values (copy-on-write).
 ### interface and abstract
 
-```phx
+```phv
 interface Shape {
     const UNIT = "cm";
     public function area(): float;
@@ -312,7 +312,7 @@ final class Square extends Base {
 
 ### enum
 
-```phx
+```phv
 enum Suit {
     case Hearts;
     case Spades;
@@ -341,7 +341,7 @@ Each case is a single object within one execution (one request), so cases can be
 
 ### Constants
 
-```phx
+```phv
 const MAX_ITEMS = 50;            // at the top level of a file (can also be exported / imported)
 class Config {
     const VERSION = "1.0";
@@ -353,7 +353,7 @@ Constant values must be literals (int, float, string, bool, null).
 
 ### Generic Functions
 
-```phx
+```phv
 function first_or<T>(list<T> $xs, T $fallback): T {
     return $xs->isEmpty() ? $fallback : $xs[0];
 }
@@ -381,7 +381,7 @@ Exception                    (getMessage(): string)
 ├── KeyError                 key not in a map
 ├── ValueError               invalid argument (a newline in a header, etc.)
 ├── UnhandledMatchError
-├── PermissionError          access to a file or environment variable not allowed in phx.toml
+├── PermissionError          access to a file or environment variable not allowed in phv.toml
 └── AssertionError           failure of assert() / assert_eq()
 ```
 
@@ -389,20 +389,20 @@ Fatal errors, such as exceeding the execution time limit, cannot be caught.
 
 ## 11. Modules
 
-```phx
-// lib/posts.phx
+```phv
+// lib/posts.phv
 export class Post { ... }
 export function all_posts(): list<Post> { ... }
 function helper(): int { ... }      // anything not exported is not visible from outside
 ```
 
-```phx
+```phv
 import lib.posts.{Post, all_posts};
 import lib.posts.Post;
 import std.http.{request, response};
 ```
 
-- `import a.b.{x, y};` loads `a/b.phx` relative to the project root (the directory that contains `phx.toml`, or, if there is none,
+- `import a.b.{x, y};` loads `a/b.phv` relative to the project root (the directory that contains `phv.toml`, or, if there is none,
   the directory of the file being run).
 - The top level of an imported module can contain only declarations (`function`, `class`, `interface`, `enum`, `const`, `import`).
   Loading a module has no side effects.
@@ -412,23 +412,23 @@ import std.http.{request, response};
 ## 12. Templates
 
 ```html
-<?phx
+<?phv
 import lib.posts.Post;
 params(string $title, list<Post> $posts);
 ?>
 <h1><?= $title ?></h1>
-<?phx foreach ($posts as $post): ?>
+<?phv foreach ($posts as $post): ?>
   <li><a href="/post?id=<?= $post->id ?>"><?= $post->title ?></a></li>
-<?phx endforeach; ?>
+<?phv endforeach; ?>
 ```
 
-```phx
-$html = render("views/list.phx.html", title: "Posts", posts: $posts);   // Html
-echo render("views/layout.phx.html", title: "Home", body: $html);
+```phv
+$html = render("views/list.phv.html", title: "Posts", posts: $posts);   // Html
+echo render("views/layout.phv.html", title: "Home", body: $html);
 ```
 
 - A template declares typed parameters with `params(...)`. Calls to `render()` are type-checked at compile time.
-- The path given to `render()` is a string literal, relative to the project root (`..` is not allowed). The extension is `.phx.html`.
+- The path given to `render()` is a string literal, relative to the project root (`..` is not allowed). The extension is `.phv.html`.
 - `render()` returns `Html`, so the result can be passed directly to another template and embedded there (layouts).
 
 ## 13. Output and escaping
@@ -437,7 +437,7 @@ There are two kinds of output destination: text and HTML.
 
 | Situation | Output destination |
 |---|---|
-| A script run with `phx run` | Text (HTML with `--html`) |
+| A script run with `phv run` | Text (HTML with `--html`) |
 | A page run by the web server | HTML (text if set to a non-HTML type, for example with `response()->type("application/json")`) |
 | Inside a template | Always HTML |
 
@@ -484,15 +484,15 @@ and text such as `</scripts>` that looks like an end tag but is not one.
 ## 14. Web server
 
 ```
-phx serve examples/site --port 8080
+phv serve examples/site --port 8080
 ```
 
 - The site directory must contain `public/`. URLs are determined by file names:
-  `/` → `public/index.phx`, `/about` → `public/about.phx` or `public/about/index.phx`. `/about.phx` also works.
+  `/` → `public/index.phv`, `/about` → `public/about.phv` or `public/about/index.phv`. `/about.phv` also works.
 - Only files with known extensions (html, css, js, json, txt, images, fonts, pdf, audio, video, wasm) are served as static files.
-- Not served: anything outside `public/`, files and directories whose names start with `.` or `_` (`_partial.phx` can be used as a partial),
-  `.phx.html` (templates), and unknown extensions (`.php`, `.bak`, `.sql`, etc.). The URL must match the file name's spelling
-  exactly (`INDEX.PHX`, Windows short names, and `::$DATA` do not open the file).
+- Not served: anything outside `public/`, files and directories whose names start with `.` or `_` (`_partial.phv` can be used as a partial),
+  `.phv.html` (templates), and unknown extensions (`.php`, `.bak`, `.sql`, etc.). The URL must match the file name's spelling
+  exactly (`INDEX.PHV`, Windows short names, and `::$DATA` do not open the file).
 - Each request runs in a new VM (a new heap). Only the compiled bytecode is shared.
 - When a file is saved, it is recompiled on the next request (the modification times of all the files it depends on are checked).
 - Limits: execution time 30 seconds (`--time-limit`), memory 128 MB (`[security] memory_limit_mb`), body 8 MB, receiving headers 10 seconds,
@@ -508,7 +508,7 @@ phx serve examples/site --port 8080
 
 ### std.http
 
-```phx
+```phv
 import std.http.{request, response, session};
 
 $req = request();
@@ -538,7 +538,7 @@ response()->file("data/photos/1.jpg");                // sends a file instead of
 
 ### Sessions
 
-```phx
+```phv
 import std.http.session;
 
 session()->set("user_id", (string)$user->id);
@@ -549,7 +549,7 @@ session()->destroy();                 // log out
 ```
 
 - Values are stored on the server. The cookie holds only a 256-bit random ID
-  (`PHXSESSID`, `HttpOnly`, `SameSite=Lax`, and `Secure` with `[security] secure_cookies = true`).
+  (`PHVSESSID`, `HttpOnly`, `SameSite=Lax`, and `Secure` with `[security] secure_cookies = true`).
 - IDs that the server did not issue are rejected. The values in one session can total at most 64 KB.
 - A session is removed after `[security] session_ttl` seconds without access. Even with continued access, it is removed after 24 hours.
 - By default, sessions are stored in memory and are lost when the server restarts. If you set a directory in the project,
@@ -573,14 +573,14 @@ the server checks a token before running the script. If the token is missing or 
 When sending from JavaScript, put the value of `csrf_token()` in the `X-CSRF-Token` header.
 JSON requests require a CORS preflight, so other sites cannot send them.
 
-The token is an HMAC of a per-browser cookie (`PHXCSRF`), so this relies on attackers being unable to overwrite that cookie.
+The token is an HMAC of a per-browser cookie (`PHVCSRF`), so this relies on attackers being unable to overwrite that cookie.
 In production, serve over HTTPS and set `secure_cookies = true` (the cookie gets the `__Host-` prefix and can no longer be overwritten
 over plaintext connections or from subdomains).
 It can be disabled with `[security] csrf = false`.
 
 ### Cookie
 
-```phx
+```phv
 request()->cookie("theme");                                   // ?string
 response()->cookie("theme", "dark", maxAge: 86400 * 30);      // HttpOnly; SameSite=Lax by default
 response()->deleteCookie("theme");
@@ -590,7 +590,7 @@ Characters not allowed in names, line breaks, and `SameSite=None` without `Secur
 
 ### Uploads
 
-```phx
+```phv
 $file = request()->file("avatar");     // ?UploadedFile
 if ($file != null) {
     echo $file->name, $file->type, $file->size;
@@ -609,7 +609,7 @@ so that an uploaded file cannot run as a page on the site.
 
 ### JSON
 
-```phx
+```phv
 $data = request()->json();             // any (invalid JSON raises ValueError)
 if ($data is map) {
     $name = $data["name"] ?? null;
@@ -620,7 +620,7 @@ response()->json(["ok" => true]);
 
 ### Database (std.db)
 
-```phx
+```phv
 import std.db.Database;
 
 $db = Database::open("data/app.db");      // requires [permissions].write = ["data/"]. ":memory:" is also allowed
@@ -647,7 +647,7 @@ $db->transaction(function () use ($db): void {
 
 #### PostgreSQL and MySQL
 
-Database servers are named in `phx.toml`; scripts only use the name, so passwords never appear in the code.
+Database servers are named in `phv.toml`; scripts only use the name, so passwords never appear in the code.
 
 ```toml
 [databases.main]
@@ -657,7 +657,7 @@ url_env = "DATABASE_URL"      # postgres://user:pass@host/db, mysql://user:pass@
 # pool_size = 8               # connections kept per server process (1 to 256)
 ```
 
-```phx
+```phv
 $db = Database::connect("main");
 $row = $db->first(sql"INSERT INTO posts (title) VALUES ({$title}) RETURNING id");   // PostgreSQL
 $db->execute(sql"INSERT INTO posts (title) VALUES ({$title})");
@@ -671,7 +671,7 @@ The methods are the same as for SQLite (`query`, `first`, `execute`, `transactio
 - **TLS is required for every host except `localhost`**, and the server certificate is checked against the
   public CAs (webpki-roots). Servers with a certificate from a private CA are not supported yet; `tls = false`
   turns TLS off for such hosts.
-- With `url_env`, an unset variable is reported when a script connects, so `phx check` works without the
+- With `url_env`, an unset variable is reported when a script connects, so `phv check` works without the
   production credentials. The URL is never shown to scripts or in error messages.
 - Connections are pooled per server process. When a script ends (or calls `close()`), its connection goes back
   to the pool after the session is reset: an open transaction is rolled back, and temporary tables and session
@@ -696,7 +696,7 @@ The methods are the same as for SQLite (`query`, `first`, `execute`, `transactio
 url_env = "REDIS_URL"         # redis://localhost, or rediss://user:pass@host for TLS
 ```
 
-```phx
+```phv
 import std.db.Redis;
 
 $redis = Redis::connect("cache");
@@ -735,7 +735,7 @@ img-src 'self' data: https:; font-src 'self' data:; object-src 'none'; base-uri 
 form-action 'self'; frame-ancestors 'self'
 ```
 
-- PHX automatically adds `nonce="..."` to `<script>` tags written in templates (`.phx.html` and the HTML parts of `.phx`).
+- PHV automatically adds `nonce="..."` to `<script>` tags written in templates (`.phv.html` and the HTML parts of `.phv`).
   As a result, inline scripts you write yourself work as is, while scripts injected by getting
   past escaping (such as a `<script>` passed to `raw()`) do not run.
 - Event attributes such as `onclick="..."` and `javascript:` URLs are blocked. Use `addEventListener`.
@@ -748,7 +748,7 @@ form-action 'self'; frame-ancestors 'self'
 
 ### Rate limiting
 
-```phx
+```phv
 if (!rate_limit("login:" . request()->ip, 5, 60)) {     // up to 5 times per 60 seconds
     response()->status(429);
     echo "Please wait a moment and try again.";
@@ -765,9 +765,9 @@ rate_limit_reset("login:" . request()->ip);
 - `requests_per_minute` counts IPv6 addresses grouped by /64.
 - The site-wide limit is `[security] requests_per_minute` (§14).
 
-### Permissions (phx.toml)
+### Permissions (phv.toml)
 
-A script can touch nothing outside the heap unless it is permitted in `phx.toml`. **If nothing is written, nothing is permitted.**
+A script can touch nothing outside the heap unless it is permitted in `phv.toml`. **If nothing is written, nothing is permitted.**
 
 ```toml
 [permissions]
@@ -784,10 +784,10 @@ env = ["APP_*"]             # environment variables readable with getenv (a trai
 - File names cannot contain `:` (Windows alternate data streams), trailing dots or spaces, or device names such as `CON` `NUL` `COM1`.
 - On Unix, directories that other users can write to (`o+w`) cannot be used.
 - Locations that are loaded as code cannot be specified in `write`: `public/`, the project root, directories whose names start with `.`
-  (`.phx-cache/`, `.git/`, etc.), `vendor/`, and the directories of packages in `[dependencies]`.
-- Anything not permitted raises `PermissionError` (the message shows what to write in `phx.toml`).
+  (`.phv-cache/`, `.git/`, etc.), `vendor/`, and the directories of packages in `[dependencies]`.
+- Anything not permitted raises `PermissionError` (the message shows what to write in `phv.toml`).
 
-### phx.toml
+### phv.toml
 
 ```toml
 [project]
@@ -810,8 +810,8 @@ utils = { path = "../utils" }
 markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 ```
 
-The directory that contains `phx.toml` is the project root. Unknown keys are errors (so typos are caught).
-`phx serve` reads the file at startup, so restart the server after changing it.
+The directory that contains `phv.toml` is the project root. Unknown keys are errors (so typos are caught).
+`phv serve` reads the file at startup, so restart the server after changing it.
 
 ## 15. Builtin functions
 
@@ -872,21 +872,21 @@ When code uses a PHP function name, the error message suggests the alternative
 
 | Command | Description |
 |---|---|
-| `phx run file.phx` | Type-check and run (`--html`, `--time-limit seconds`) |
-| `phx check file.phx` | Type-check only (including imported modules and templates) |
-| `phx serve dir` | Web server (`--port`, `--host`, `--prod`, `--time-limit`) |
-| `phx test [paths]` | Run the `test_*` functions in `*_test.phx` files (a new VM for each test) |
-| `phx fmt [paths] [--check]` | Normalize indentation and whitespace (strings, comments, and HTML are not changed) |
-| `phx lsp` | Language Server for editors (errors as you type, types on hover) |
-| `phx install` | Fetch `[dependencies]` and pin them in `phx.lock` |
-| `phx migrate file.php` | Convert PHP mechanically and list the places that need manual work |
-| `phx disasm file.phx` | Show the bytecode |
-| `phx parse file.phx` | Show the syntax tree |
+| `phv run file.phv` | Type-check and run (`--html`, `--time-limit seconds`) |
+| `phv check file.phv` | Type-check only (including imported modules and templates) |
+| `phv serve dir` | Web server (`--port`, `--host`, `--prod`, `--time-limit`) |
+| `phv test [paths]` | Run the `test_*` functions in `*_test.phv` files (a new VM for each test) |
+| `phv fmt [paths] [--check]` | Normalize indentation and whitespace (strings, comments, and HTML are not changed) |
+| `phv lsp` | Language Server for editors (errors as you type, types on hover) |
+| `phv install` | Fetch `[dependencies]` and pin them in `phv.lock` |
+| `phv migrate file.php` | Convert PHP mechanically and list the places that need manual work |
+| `phv disasm file.phv` | Show the bytecode |
+| `phv parse file.phv` | Show the syntax tree |
 
 ### Testing
 
-```phx
-// tests/posts_test.phx
+```phv
+// tests/posts_test.phv
 import lib.posts.find_post;
 
 function test_find_post(): void {
@@ -905,23 +905,23 @@ textutils = { git = "https://github.com/example/textutils.git", rev = "v1" }
 local = { path = "../shared" }
 ```
 
-```phx
-import textutils.strings.slugify;      // vendor/textutils/strings.phx
+```phv
+import textutils.strings.slugify;      // vendor/textutils/strings.phv
 ```
 
-- `git` packages are fetched into `vendor/<name>`, and the exact commit is recorded in `phx.lock`.
+- `git` packages are fetched into `vendor/<name>`, and the exact commit is recorded in `phv.lock`.
   From the second install on, the commit in the lock file is fetched, and a mismatch is an error.
 - Only `https://`, `ssh://`, `git@host:...`, and `file://` URLs are allowed.
-- Packages are PHX source code. No package code runs at install time.
-- List a package's dependencies alongside it in the app's `phx.toml` (transitive dependency resolution is not yet supported).
+- Packages are PHV source code. No package code runs at install time.
+- List a package's dependencies alongside it in the app's `phv.toml` (transitive dependency resolution is not yet supported).
 
 ### Migration
 
 ```
-phx migrate legacy/page.php      # writes page.phx
+phv migrate legacy/page.php      # writes page.phv
 ```
 
-Converts `<?php`→`<?phx`, `===`→`==`, `array(...)`→`[...]`, `isset($x)`→`($x != null)`, `$_GET`/`$_POST`/`$_COOKIE`/`$_SESSION`
+Converts `<?php`→`<?phv`, `===`→`==`, `array(...)`→`[...]`, `isset($x)`→`($x != null)`, `$_GET`/`$_POST`/`$_COOKIE`/`$_SESSION`
 → `request()`/`session()`, `var_dump`/`print_r`→`dump`, and `print`→`echo`, and adds `TODO(migrate)` comments to `require` and `global`.
 It then runs the type checker and shows the places that need manual work, such as type annotations.
 
@@ -934,15 +934,15 @@ It then runs the type checker and shows the places that need manual work, such a
    - **Interpreter**: written entirely in safe Rust. Strings, lists, and maps use reference counting + copy-on-write.
    - **JIT** (Cranelift): functions in which every value is an `int`/`bool` (numeric loops and recursion) are compiled to native code.
      Overflow, modulo by zero, negative shifts, recursion depth, and the execution time and memory limits are checked in the JIT just as in the interpreter.
-     It can be disabled with `PHX_JIT=0`. The stack trace of an exception raised inside the JIT goes back only as far as the caller.
-5. **Bytecode cache**: `phx run` and `phx serve` save compiled output in `.phx-cache/` and reuse it
-   if neither the source files nor the `phx` binary have changed.
-   - The cache is signed with an HMAC using a per-user key (`%LOCALAPPDATA%\phx\cache.key`, `~/.cache/phx/cache.key`), and entries whose
-     signature does not match are not read. Even if a project received from someone else contains `.phx-cache/`,
+     It can be disabled with `PHV_JIT=0`. The stack trace of an exception raised inside the JIT goes back only as far as the caller.
+5. **Bytecode cache**: `phv run` and `phv serve` save compiled output in `.phv-cache/` and reuse it
+   if neither the source files nor the `phv` binary have changed.
+   - The cache is signed with an HMAC using a per-user key (`%LOCALAPPDATA%\phv\cache.key`, `~/.cache/phv/cache.key`), and entries whose
+     signature does not match are not read. Even if a project received from someone else contains `.phv-cache/`,
      code that differs from the source never runs.
    - Entries are per script and per project. Each records the contents (SHA-256) of all the files it depends on, and these are verified on load
      (old code is not used even after a copy that preserves modification times or a rewrite that keeps the same length).
-   - If `.phx-cache/` is a link, it is not used. Files inside it are neither read nor written if they are links or hard links.
+   - If `.phv-cache/` is a link, it is not used. Files inside it are neither read nor written if they are links or hard links.
 
 ### Runtime limits
 
@@ -953,8 +953,8 @@ It then runs the type checker and shows the places that need manual work, such a
 | Call depth | 10,000 | Fatal error |
 | Request body | 8 MB | 413 |
 
-`unsafe` is used only in the allocator that counts memory usage (`phx_vm/src/alloc.rs`) and in the JIT
-(`phx_jit`, for calling generated code).
+`unsafe` is used only in the allocator that counts memory usage (`phv_vm/src/alloc.rs`) and in the JIT
+(`phv_jit`, for calling generated code).
 
 ## 18. Roadmap
 
@@ -962,7 +962,7 @@ It then runs the type checker and shows the places that need manual work, such a
 - Asynchronous I/O, HTTP client (`[permissions].net`)
 - Wider JIT coverage (functions that handle floats and strings), AOT compilation
 - Transitive dependency resolution, a package registry
-- Go-to-definition and completion in the LSP, line wrapping in `phx fmt`
+- Go-to-definition and completion in the LSP, line wrapping in `phv fmt`
 - Rate limiting shared across multiple processes, sessions stored in a database
 
 See [security-audit.md](security-audit.md) for the results of the security audit and the remaining risks.

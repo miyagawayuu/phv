@@ -1,0 +1,61 @@
+<?phv
+import std.http.{request, response, session};
+import lib.client.client_ip;
+import lib.source.sources;
+
+$req = request();
+$s = session();
+
+if ($req->isPost() && $req->form("action") == "reset") {
+    $s->remove("totp_secret");
+    $s->remove("totp_step");
+    response()->redirect("/totp");
+    return;
+}
+
+// A secret per visitor, kept in the server-side session.
+$secret = $s->get("totp_secret") ?? "";
+if ($secret->isEmpty()) {
+    $secret = totp_secret();
+    $s->set("totp_secret", $secret);
+}
+
+?string $result = null;
+$ok = false;
+if ($req->isPost()) {
+    $code = ($req->form("code") ?? "")->replace(" ", "");
+    if (!rate_limit("totp:" . client_ip(), 10, 60)) {
+        $result = "Too many attempts; please wait a minute.";
+    } else {
+        $step = totp_verify($secret, $code);   // ?int: the time step it matched
+        $last = ($s->get("totp_step") ?? "")->toInt() ?? 0;
+        if ($step == null) {
+            $result = "That code is not valid for this secret.";
+        } elseif ($step <= $last) {
+            $result = "That code was already used. Wait for the next one.";
+        } else {
+            $s->set("totp_step", (string)$step);   // so the same code cannot be used twice
+            $result = "Correct! The code matched time step {$step}.";
+            $ok = true;
+        }
+    }
+}
+
+$uri = "otpauth://totp/" . rawurlencode("PHV demo:visitor")
+    . "?" . http_build_query(["secret" => $secret, "issuer" => "PHV demo"]);
+
+$body = render(
+    "views/totp.phv.html",
+    secret: $secret,
+    qr: qr_svg($uri),
+    current: totp_code($secret),
+    result: $result,
+    ok: $ok,
+);
+echo render(
+    "views/layout.phv.html",
+    title: "Two-factor codes",
+    path: "/totp",
+    body: $body,
+    files: sources(["public/totp.phv", "views/totp.phv.html"]),
+);

@@ -1,0 +1,41 @@
+<?phv
+import std.http.{request, response, session};
+import lib.guestbook.{guestbook_db, recent_entries, add_entry};
+
+$req = request();
+$db = guestbook_db();
+list<string> $errors = [];
+$name = session()->get("name") ?? "";
+$message = "";
+
+if ($req->isPost()) {
+    $name = ($req->form("name") ?? "")->trim();
+    $message = ($req->form("message") ?? "")->trim();
+    if ($name->isEmpty() || $name->len() > 40) {
+        $errors[] = "Please enter a name (up to 40 characters).";
+    }
+    if ($message->isEmpty() || $message->len() > 500) {
+        $errors[] = "Please write a message (up to 500 characters).";
+    }
+    // At most 5 entries per minute from one address (counted only when valid).
+    if ($errors->isEmpty() && !rate_limit("guestbook:" . $req->ip, 5, 60)) {
+        $errors[] = "Too many messages; please wait a minute.";
+    }
+    if ($errors->isEmpty()) {
+        add_entry($db, $name, $message);
+        session()->set("name", $name);       // remembered for next time
+        session()->set("notice", "Thanks for signing the guestbook!");
+        response()->redirect("/guestbook");   // post/redirect/get
+        return;
+    }
+}
+
+$body = render(
+    "views/guestbook.phv.html",
+    entries: recent_entries($db),
+    name: $name,
+    message: $message,
+    errors: $errors,
+    notice: session()->flash("notice"),
+);
+echo render("views/layout.phv.html", title: "Guestbook", body: $body);

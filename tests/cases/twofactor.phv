@@ -1,0 +1,33 @@
+// TOTP (RFC 6238) and QR codes for two-factor authentication.
+$secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";   // the RFC's key "12345678901234567890"
+echo totp_code($secret, 59), "\n";
+echo totp_code($secret, 1111111109), "\n";
+echo totp_code("gezd gnbv gy3t qojq gezd gnbv gy3t qojq", 1234567890), "\n";
+
+// A code for now is accepted, and returns its time step so it can be refused next time.
+$now = totp_code($secret);
+$step = totp_verify($secret, $now);
+echo $step != null ? "verified" : "rejected", "\n";
+echo totp_verify($secret, "12345") == null ? "short code rejected" : "accepted", "\n";
+echo totp_verify($secret, "abcdef") == null ? "non-digits rejected" : "accepted", "\n";
+
+// New secrets are 160 bits of Base32.
+$fresh = totp_secret();
+echo $fresh->len(), " ", $fresh == totp_secret() ? "same" : "different", "\n";
+echo totp_code($fresh)->len(), "\n";
+
+try {
+    totp_code("not base32!");
+} catch (ValueError $e) {
+    echo $e->getMessage(), "\n";
+}
+
+// qr_svg() returns Html: an <svg> element, without the XML declaration.
+$qr = (string)qr_svg("otpauth://totp/PHV:ann?secret=" . $secret . "&issuer=PHV");
+echo $qr->startsWith("<svg") ? "svg" : "other", " ", $qr->contains("<?xml") ? "with declaration" : "no declaration", "\n";
+echo $qr->contains("otpauth") ? "text leaked" : "text not in markup", "\n";
+try {
+    qr_svg("x"->repeat(5000));
+} catch (ValueError $e) {
+    echo $e->getMessage(), "\n";
+}

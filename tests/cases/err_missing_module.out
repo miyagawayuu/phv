@@ -1,19 +1,19 @@
-error: module `lib.missing` not found (looked for lib/missing.phx)
- --> err_missing_module.phx:2:1
+error: module `lib.missing` not found (looked for lib/missing.phv)
+ --> err_missing_module.phv:2:1
   |
 2 | import lib.missing.thing;
   | ^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: template not found (looked for views/nope.phx.html)
- --> err_missing_module.phx:4:13
+error: template not found (looked for views/nope.phv.html)
+ --> err_missing_module.phv:4:13
   |
-4 | echo render("views/nope.phx.html");
+4 | echo render("views/nope.phv.html");
   |             ^^^^^^^^^^^^^^^^^^^^^
 
 error: template paths must be relative to the project and stay inside it
- --> err_missing_module.phx:5:13
+ --> err_missing_module.phv:5:13
   |
-5 | echo render("../secret.phx.html");
+5 | echo render("../secret.phv.html");
   |             ^^^^^^^^^^^^^^^^^^^^
   = note: `..` and absolute paths are not allowed
 

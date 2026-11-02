@@ -1,4 +1,4 @@
-// Tokenizes sample PHX sources with the extension's grammars (the same
+// Tokenizes sample PHV sources with the extension's grammars (the same
 // TextMate engine VS Code uses) and checks the scopes of key tokens.
 // Run: npm test
 
@@ -11,8 +11,8 @@ const root = path.join(__dirname, "..");
 const wasm = fs.readFileSync(require.resolve("vscode-oniguruma/release/onig.wasm")).buffer;
 
 const grammars = {
-  "source.phx": "syntaxes/phx.tmLanguage.json",
-  "text.html.phx": "syntaxes/phx-html.tmLanguage.json",
+  "source.phv": "syntaxes/phv.tmLanguage.json",
+  "text.html.phv": "syntaxes/phv-html.tmLanguage.json",
 };
 
 const registry = new vsctm.Registry({
@@ -56,9 +56,9 @@ function expect(tokens, text, scope) {
 
 (async () => {
   const code = await tokenize(
-    "source.phx",
+    "source.phv",
     [
-      "<?phx",
+      "<?phv",
       "import std.http.request;",
       "/** Greets someone. */",
       "function greet(string $name, int $times = 1): string {",
@@ -70,31 +70,31 @@ function expect(tokens, text, scope) {
       '<p class="x"><?= greet($n) ?></p>',
     ].join("\n"),
   );
-  expect(code, "<?phx", "punctuation.section.embedded.begin.phx");
-  expect(code, "import", "keyword.control.import.phx");
-  expect(code, " Greets someone. ", "comment.block.documentation.phx");
-  expect(code, "greet", "entity.name.function.phx");
-  expect(code, "string", "support.type.phx");
-  expect(code, "$name", "variable.other.phx");
-  expect(code, "{", "punctuation.definition.template-expression.begin.phx");
-  expect(code, "\\n", "constant.character.escape.phx");
-  expect(code, "sql", "storage.type.string.sql.phx");
-  expect(code, "?->", "punctuation.accessor.phx");
-  expect(code, "??", "keyword.operator.null-coalescing.phx");
-  expect(code, "null", "constant.language.null.phx");
-  expect(code, "// fallback", "comment.line.double-slash.phx");
-  expect(code, "?>", "punctuation.section.embedded.end.phx");
-  expect(code, "<?=", "punctuation.section.embedded.begin.phx");
+  expect(code, "<?phv", "punctuation.section.embedded.begin.phv");
+  expect(code, "import", "keyword.control.import.phv");
+  expect(code, " Greets someone. ", "comment.block.documentation.phv");
+  expect(code, "greet", "entity.name.function.phv");
+  expect(code, "string", "support.type.phv");
+  expect(code, "$name", "variable.other.phv");
+  expect(code, "{", "punctuation.definition.template-expression.begin.phv");
+  expect(code, "\\n", "constant.character.escape.phv");
+  expect(code, "sql", "storage.type.string.sql.phv");
+  expect(code, "?->", "punctuation.accessor.phv");
+  expect(code, "??", "keyword.operator.null-coalescing.phv");
+  expect(code, "null", "constant.language.null.phv");
+  expect(code, "// fallback", "comment.line.double-slash.phv");
+  expect(code, "?>", "punctuation.section.embedded.end.phv");
+  expect(code, "<?=", "punctuation.section.embedded.begin.phv");
 
   const template = await tokenize(
-    "text.html.phx",
-    ['<a href="<?= safe_url($u) ?>">link</a>', "<?phx foreach ($items as $i): ?>", "<li><?= $i ?></li>", "<?phx endforeach; ?>"].join("\n"),
+    "text.html.phv",
+    ['<a href="<?= safe_url($u) ?>">link</a>', "<?phv foreach ($items as $i): ?>", "<li><?= $i ?></li>", "<?phv endforeach; ?>"].join("\n"),
   );
-  expect(template, "safe_url", "entity.name.function.phx");
-  expect(template, "$u", "variable.other.phx");
-  expect(template, "foreach", "keyword.control.phx");
-  expect(template, "endforeach", "keyword.control.phx");
-  expect(template, "$i", "variable.other.phx");
+  expect(template, "safe_url", "entity.name.function.phv");
+  expect(template, "$u", "variable.other.phv");
+  expect(template, "foreach", "keyword.control.phv");
+  expect(template, "endforeach", "keyword.control.phv");
+  expect(template, "$i", "variable.other.phv");
 
   if (failures > 0) {
     console.error(`${failures} grammar check(s) failed`);

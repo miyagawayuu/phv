@@ -1,0 +1,8 @@
+<?phv
+// HTML opened in a function or loop body must be closed in it.
+?>
+<?phv
+function head(): void { ?><script>var x = <?phv }
+foreach ([1] as $n): ?><script>var y = <?phv endforeach;
+?>
+<p>after</p>

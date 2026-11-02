@@ -1,73 +1,73 @@
 error: expected `Html`, found `string`
-  --> err_security.phx:18:16
+  --> err_security.phv:18:16
    |
 18 |         return $x;
    |                ^^
    = note: use `escape($s)` to make safe HTML, or `raw($s)` if it is trusted markup
 
 error: expected `Sql`, found `list<any>`
-  --> err_security.phx:25:16
+  --> err_security.phv:25:16
    |
 25 |         return $x;
    |                ^^
 
 error: expected `Html`, found `string|Html`
-  --> err_security.phx:33:16
+  --> err_security.phv:33:16
    |
 33 |         return $b->v;
    |                ^^^^^
 
 error: map keys must be `int` or `string`, found `float`
-  --> err_security.phx:40:8
+  --> err_security.phv:40:8
    |
 40 |     $m[1.5] = 2;
    |        ^^^
 
 error: values in attributes must be quoted
-  --> err_security.phx:44:13
+  --> err_security.phv:44:13
    |
 44 | <a href=<?= $name ?>>unquoted</a>
    |             ^^^^^
    = note: write `attr="<?= $value ?>"`: escaping does not protect unquoted attribute values
 
 error: a URL attribute cannot start with an unchecked value
-  --> err_security.phx:45:14
+  --> err_security.phv:45:14
    |
 45 | <a href="<?= $name ?>">url</a>
    |              ^^^^^
    = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
 
 warning: the event handler attribute `onclick` does not run under the default Content-Security-Policy
-  --> err_security.phx:47:9
+  --> err_security.phv:47:9
    |
 47 | <button onclick="go(<?= $name ?>)">handler</button>
    |         ^^^^^^^
    = note: attach the handler from a `<script>` in the template (it gets the CSP nonce), e.g. `el.addEventListener("click", ...)`
-   = note: or allow inline code with `[security] csp` in phx.toml (not recommended)
+   = note: or allow inline code with `[security] csp` in phv.toml (not recommended)
 
 error: values cannot be inserted into event handler attributes
-  --> err_security.phx:47:25
+  --> err_security.phv:47:25
    |
 47 | <button onclick="go(<?= $name ?>)">handler</button>
    |                         ^^^^^
    = note: put the value in a `data-*` attribute and read it with addEventListener
 
 error: values cannot be inserted between the attributes of a tag
-  --> err_security.phx:48:10
+  --> err_security.phv:48:10
    |
 48 | <div <?= $name ?>>inside a tag</div>
    |          ^^^^^
    = note: write each attribute as `name="<?= $value ?>"`
 
 error: only `json_html()` values and numbers can be inserted into `<script>`
-  --> err_security.phx:49:21
+  --> err_security.phv:49:21
    |
 49 | <script>var n = <?= $name ?>;</script>
    |                     ^^^^^
    = note: use `json_html($value)`, which produces a JavaScript value that is safe inside a script; `escape()` does not make code safe
 
 error: values cannot be inserted into CSS
-  --> err_security.phx:51:23
+  --> err_security.phv:51:23
    |
 51 | <style>p { color: <?= $name ?>; }</style>
    |                       ^^^^^

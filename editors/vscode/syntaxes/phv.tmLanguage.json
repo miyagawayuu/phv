@@ -1,0 +1,207 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "PHV",
+  "scopeName": "source.phv",
+  "comment": "A .phv file is code from the start; after `?>` the rest is HTML with embedded `<?phv ... ?>` / `<?= ... ?>` blocks (text.html.phv).",
+  "patterns": [
+    { "include": "#open-tag" },
+    {
+      "begin": "\\?>",
+      "beginCaptures": { "0": { "name": "punctuation.section.embedded.end.phv" } },
+      "end": "(?!\\G)(?=x)\\G",
+      "contentName": "text.html.phv",
+      "patterns": [{ "include": "text.html.phv" }]
+    },
+    { "include": "#code" }
+  ],
+  "repository": {
+    "open-tag": {
+      "match": "<\\?(?:phv|=)",
+      "name": "punctuation.section.embedded.begin.phv"
+    },
+    "code": {
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#sql-string" },
+        { "include": "#double-string" },
+        { "include": "#single-string" },
+        { "include": "#numbers" },
+        { "include": "#variables" },
+        { "include": "#declarations" },
+        { "include": "#keywords" },
+        { "include": "#types" },
+        { "include": "#constants" },
+        { "include": "#calls" },
+        { "include": "#class-names" },
+        { "include": "#operators" }
+      ]
+    },
+    "comments": {
+      "patterns": [
+        {
+          "begin": "/\\*\\*(?!/)",
+          "end": "\\*/",
+          "name": "comment.block.documentation.phv"
+        },
+        {
+          "begin": "/\\*",
+          "end": "\\*/",
+          "name": "comment.block.phv"
+        },
+        {
+          "match": "//.*?(?=\\?>|$)",
+          "name": "comment.line.double-slash.phv"
+        }
+      ]
+    },
+    "escapes": {
+      "match": "\\\\(?:[nrt0\\\\\"'${]|u\\{[0-9A-Fa-f]+\\}|x[0-9A-Fa-f]{2})",
+      "name": "constant.character.escape.phv"
+    },
+    "interpolation": {
+      "patterns": [
+        {
+          "begin": "\\{(?=\\$)",
+          "end": "\\}",
+          "beginCaptures": { "0": { "name": "punctuation.definition.template-expression.begin.phv" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.template-expression.end.phv" } },
+          "name": "meta.interpolation.phv",
+          "patterns": [{ "include": "#code" }]
+        },
+        {
+          "match": "\\$[A-Za-z_][A-Za-z0-9_]*",
+          "name": "variable.other.interpolated.phv"
+        }
+      ]
+    },
+    "double-string": {
+      "begin": "\"",
+      "end": "\"",
+      "name": "string.quoted.double.phv",
+      "patterns": [{ "include": "#escapes" }, { "include": "#interpolation" }]
+    },
+    "single-string": {
+      "begin": "'",
+      "end": "'",
+      "name": "string.quoted.single.phv",
+      "patterns": [{ "match": "\\\\[\\\\']", "name": "constant.character.escape.phv" }]
+    },
+    "sql-string": {
+      "comment": "sql\"...\": SQL text; interpolated values become bound parameters.",
+      "begin": "\\b(sql)(\")",
+      "beginCaptures": {
+        "1": { "name": "storage.type.string.sql.phv" },
+        "2": { "name": "punctuation.definition.string.begin.phv" }
+      },
+      "end": "\"",
+      "endCaptures": { "0": { "name": "punctuation.definition.string.end.phv" } },
+      "name": "string.quoted.double.sql.phv",
+      "contentName": "meta.embedded.sql.phv",
+      "patterns": [{ "include": "#escapes" }, { "include": "#interpolation" }, { "include": "source.sql" }]
+    },
+    "numbers": {
+      "patterns": [
+        { "match": "\\b0x[0-9A-Fa-f_]+\\b", "name": "constant.numeric.hex.phv" },
+        { "match": "\\b0b[01_]+\\b", "name": "constant.numeric.binary.phv" },
+        { "match": "\\b\\d[\\d_]*(?:\\.\\d[\\d_]*)?(?:[eE][+-]?\\d+)?\\b", "name": "constant.numeric.decimal.phv" }
+      ]
+    },
+    "variables": {
+      "patterns": [
+        { "match": "\\$this\\b", "name": "variable.language.this.phv" },
+        { "match": "\\$[A-Za-z_][A-Za-z0-9_]*", "name": "variable.other.phv" }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(function)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.function.phv" },
+            "2": { "name": "entity.name.function.phv" }
+          }
+        },
+        {
+          "match": "\\b(class|interface|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.class.phv" },
+            "2": { "name": "entity.name.type.class.phv" }
+          }
+        },
+        {
+          "match": "\\b(extends|implements|new)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.modifier.phv" },
+            "2": { "name": "entity.name.type.class.phv" }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "match": "\\b(if|elseif|else|endif|while|endwhile|do|for|endfor|foreach|endforeach|as|break|continue|return|match|default|try|catch|finally|throw|echo|is|instanceof|case)\\b",
+          "name": "keyword.control.phv"
+        },
+        {
+          "match": "\\b(import|export|use)\\b",
+          "name": "keyword.control.import.phv"
+        },
+        {
+          "match": "\\b(function|fn)\\b",
+          "name": "storage.type.function.phv"
+        },
+        {
+          "match": "\\b(class|interface|enum|const)\\b",
+          "name": "storage.type.phv"
+        },
+        {
+          "match": "\\b(extends|implements|abstract|final|static|readonly|public|private|protected|new)\\b",
+          "name": "storage.modifier.phv"
+        }
+      ]
+    },
+    "types": {
+      "match": "\\b(int|float|string|bool|void|never|any|list|map|Html|SafeUrl|SafeJs|Sql)\\b",
+      "name": "support.type.phv"
+    },
+    "constants": {
+      "patterns": [
+        { "match": "\\b(true|false)\\b", "name": "constant.language.boolean.phv" },
+        { "match": "\\bnull\\b", "name": "constant.language.null.phv" }
+      ]
+    },
+    "calls": {
+      "patterns": [
+        {
+          "match": "(?<=->|\\?->|::)\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": { "1": { "name": "entity.name.function.member.phv" } }
+        },
+        {
+          "match": "(?<=->|\\?->)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": { "1": { "name": "variable.other.property.phv" } }
+        },
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": { "1": { "name": "entity.name.function.phv" } }
+        }
+      ]
+    },
+    "class-names": {
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b",
+      "name": "entity.name.type.phv"
+    },
+    "operators": {
+      "patterns": [
+        { "match": "\\?->|->|::|=>", "name": "punctuation.accessor.phv" },
+        { "match": "\\?\\?=?", "name": "keyword.operator.null-coalescing.phv" },
+        { "match": "\\.\\.=?", "name": "keyword.operator.range.phv" },
+        { "match": "==|!=|<=>|<=|>=|<|>", "name": "keyword.operator.comparison.phv" },
+        { "match": "&&|\\|\\||!", "name": "keyword.operator.logical.phv" },
+        { "match": "\\.=|\\+=|-=|\\*=|/=|%=|=", "name": "keyword.operator.assignment.phv" },
+        { "match": "\\*\\*|[-+*/%.]", "name": "keyword.operator.arithmetic.phv" },
+        { "match": "\\?|:", "name": "keyword.operator.ternary.phv" }
+      ]
+    }
+  }
+}

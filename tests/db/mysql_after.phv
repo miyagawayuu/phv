@@ -1,0 +1,13 @@
+// Runs after mysql.phv on the same pooled connection.
+import std.db.Database;
+
+$db = Database::connect("main");
+try {
+    $db->query(sql"SELECT * FROM phv_temp");
+    echo "temp table: still there\n";
+} catch (DatabaseError $e) {
+    echo "temp table: gone\n";
+}
+echo "variable: ", $db->first(sql"SELECT @leaked AS v")?->string("v") ?? "unset", "\n";
+echo "uncommitted rows: ", count($db->query(sql"SELECT id FROM phv_items WHERE name = 'uncommitted'")), "\n";
+$db->execute(sql"DROP TABLE phv_items");

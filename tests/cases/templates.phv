@@ -1,0 +1,6 @@
+<?phv
+import lib.shop.{Product, catalog};
+
+$products = catalog();
+$page = render("views/list.phv.html", title: "Tools & <Toys>", products: $products);
+echo render("views/layout.phv.html", title: "Shop", body: $page);

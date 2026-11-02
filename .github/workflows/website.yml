@@ -1,6 +1,6 @@
 name: Website
 
-# Builds phx-lang.org and deploys it to Cloudflare Pages (project `phx-lang`).
+# Builds phv-lang.org and deploys it to Cloudflare Pages (project `phv-lang`).
 # Needs two repository secrets: CLOUDFLARE_API_TOKEN (a token with the
 # "Cloudflare Pages: Edit" permission) and CLOUDFLARE_ACCOUNT_ID. Without them
 # the site is still built, and the deploy step is skipped.
@@ -55,7 +55,7 @@ jobs:
 
           wrangler="npx --yes wrangler@4.151.1"
           # The first deploy creates the project; later runs find it.
-          if ! jq -e '.result[]? | select(.name == "phx-lang")' /tmp/cf.json > /dev/null; then
-            $wrangler pages project create phx-lang --production-branch main
+          if ! jq -e '.result[]? | select(.name == "phv-lang")' /tmp/cf.json > /dev/null; then
+            $wrangler pages project create phv-lang --production-branch main
           fi
-          $wrangler pages deploy dist --project-name phx-lang --branch main --commit-dirty=true
+          $wrangler pages deploy dist --project-name phv-lang --branch main --commit-dirty=true

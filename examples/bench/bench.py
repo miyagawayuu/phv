@@ -1,4 +1,4 @@
-# Same benchmarks as bench.phx, for comparison: python examples/bench/bench.py
+# Same benchmarks as bench.phv, for comparison: python examples/bench/bench.py
 import time
 
 

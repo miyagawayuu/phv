@@ -1,0 +1,52 @@
+<?phv
+// Regression tests from the security audit: each of these used to compile.
+import std.db.Database;
+
+class Box {
+    public function __construct(public Html|string $v) {}
+
+    public function swap(string $s): bool {
+        $this->v = $s;
+        return true;
+    }
+}
+
+// A type parameter narrowed with `is` must not become `never` (which would
+// turn any value into Html or Sql).
+function launder<T>(T $x): Html {
+    if ($x is string) {
+        return $x;
+    }
+    return raw("");
+}
+
+function asSql<T>(T $x): Sql {
+    if ($x is list) {
+        return $x;
+    }
+    return sql"SELECT 1";
+}
+
+// Property narrowing must not survive a call in the same condition.
+function stale(Box $b, string $input): Html {
+    if ($b->v is Html && $b->swap($input)) {
+        return $b->v;
+    }
+    return raw("");
+}
+
+$m = json_decode("{}");
+if ($m is map) {
+    $m[1.5] = 2;
+}
+$name = "x";
+?>
+<a href=<?= $name ?>>unquoted</a>
+<a href="<?= $name ?>">url</a>
+<a href="/search?q=<?= $name ?>">fine: not the start of the URL</a>
+<button onclick="go(<?= $name ?>)">handler</button>
+<div <?= $name ?>>inside a tag</div>
+<script>var n = <?= $name ?>;</script>
+<script>var ok = <?= json_html(["name" => $name]) ?>;</script>
+<style>p { color: <?= $name ?>; }</style>
+<a href="<?= safe_url($name) ?>">fine</a>

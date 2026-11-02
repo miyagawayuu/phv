@@ -1,0 +1,14 @@
+<?phv
+import std.http.session;
+import lib.source.sources;
+import lib.store.{demo_db, counter};
+
+$yours = session()->get("clicks")?->toInt() ?? 0;
+$body = render("views/api.phv.html", total: counter(demo_db(), "clicks"), yours: $yours);
+echo render(
+    "views/layout.phv.html",
+    title: "JSON API",
+    path: "/api",
+    body: $body,
+    files: sources(["views/api.phv.html", "public/api/clicks.phv", "public/api/messages.phv"]),
+);

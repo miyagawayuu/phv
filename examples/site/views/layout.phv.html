@@ -1,0 +1,25 @@
+<?phv params(string $title, Html $body) ?>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title><?= $title ?> · PHV</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="site">
+    <a class="brand" href="/">PHV</a>
+    <nav>
+      <a href="/">Posts</a>
+      <a href="/guestbook">Guestbook</a>
+      <a href="/contact">Contact</a>
+      <a href="/api/posts">JSON API</a>
+    </nav>
+  </header>
+  <main>
+<?= $body ?>
+  </main>
+  <footer>Rendered by PHV: typed, escaped, compiled to bytecode.</footer>
+</body>
+</html>

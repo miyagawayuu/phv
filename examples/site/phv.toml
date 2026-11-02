@@ -1,0 +1,15 @@
+# PHV project settings. Everything is optional; the defaults are safe.
+
+[project]
+name = "phv-blog"
+
+[security]
+csrf = true            # form POSTs must include csrf_field()
+secure_cookies = false # set to true when the site is served over HTTPS
+session_ttl = 7200
+memory_limit_mb = 128
+
+[permissions]
+# Scripts can only touch the files and variables listed here.
+write = ["data/"]
+env = []

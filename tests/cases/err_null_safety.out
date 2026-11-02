@@ -1,12 +1,12 @@
 error: cannot call `->upper()` on `?string` because it might be null
- --> err_null_safety.phx:6:6
+ --> err_null_safety.phv:6:6
   |
 6 | echo $name->upper();
   |      ^^^^^
   = note: check `!= null` first, or use `?->`
 
 error: expected `string`, found `?string`
- --> err_null_safety.phx:7:13
+ --> err_null_safety.phv:7:13
   |
 7 | echo strlen($name);
   |             ^^^^^

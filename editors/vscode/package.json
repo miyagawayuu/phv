@@ -1,15 +1,15 @@
 {
-  "name": "phx-language",
-  "displayName": "PHX Language",
-  "description": "PHX language support: syntax highlighting for .phx and .phx.html, and diagnostics and hover types from `phx lsp`.",
+  "name": "phv-language",
+  "displayName": "PHV Language",
+  "description": "PHV language support: syntax highlighting for .phv and .phv.html, and diagnostics and hover types from `phv lsp`.",
   "version": "0.2.7",
-  "publisher": "phx-lang",
+  "publisher": "phv-lang",
   "license": "MIT",
   "icon": "images/icon.png",
-  "homepage": "https://phx-lang.org",
+  "homepage": "https://phv-lang.org",
   "repository": {
     "type": "git",
-    "url": "https://github.com/miyagawayuu/phx"
+    "url": "https://github.com/miyagawayuu/phv"
   },
   "engines": {
     "vscode": "^1.82.0"
@@ -27,38 +27,38 @@
   "contributes": {
     "languages": [
       {
-        "id": "phx",
-        "aliases": ["PHX", "phx"],
-        "extensions": [".phx"],
+        "id": "phv",
+        "aliases": ["PHV", "phv"],
+        "extensions": [".phv"],
         "configuration": "./language-configuration.json",
-        "icon": { "light": "./images/phx-file.svg", "dark": "./images/phx-file.svg" }
+        "icon": { "light": "./images/phv-file.svg", "dark": "./images/phv-file.svg" }
       },
       {
-        "id": "phx-template",
-        "aliases": ["PHX Template"],
-        "filenamePatterns": ["*.phx.html"],
+        "id": "phv-template",
+        "aliases": ["PHV Template"],
+        "filenamePatterns": ["*.phv.html"],
         "configuration": "./language-configuration.json",
-        "icon": { "light": "./images/phx-file.svg", "dark": "./images/phx-file.svg" }
+        "icon": { "light": "./images/phv-file.svg", "dark": "./images/phv-file.svg" }
       }
     ],
     "grammars": [
       {
-        "language": "phx",
-        "scopeName": "source.phx",
-        "path": "./syntaxes/phx.tmLanguage.json",
+        "language": "phv",
+        "scopeName": "source.phv",
+        "path": "./syntaxes/phv.tmLanguage.json",
         "embeddedLanguages": {
-          "text.html.phx": "html",
+          "text.html.phv": "html",
           "source.sql": "sql",
           "source.js": "javascript",
           "source.css": "css"
         }
       },
       {
-        "language": "phx-template",
-        "scopeName": "text.html.phx",
-        "path": "./syntaxes/phx-html.tmLanguage.json",
+        "language": "phv-template",
+        "scopeName": "text.html.phv",
+        "path": "./syntaxes/phv-html.tmLanguage.json",
         "embeddedLanguages": {
-          "meta.embedded.block.phx": "phx",
+          "meta.embedded.block.phv": "phv",
           "source.sql": "sql",
           "source.js": "javascript",
           "source.css": "css"
@@ -66,18 +66,18 @@
       }
     ],
     "configuration": {
-      "title": "PHX",
+      "title": "PHV",
       "properties": {
-        "phx.path": {
+        "phv.path": {
           "type": "string",
-          "default": "phx",
+          "default": "phv",
           "scope": "machine",
-          "description": "The phx executable used for the language server. A user setting only: a workspace cannot change which program runs."
+          "description": "The phv executable used for the language server. A user setting only: a workspace cannot change which program runs."
         },
-        "phx.lsp.enabled": {
+        "phv.lsp.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Start `phx lsp` for diagnostics and hover types."
+          "description": "Start `phv lsp` for diagnostics and hover types."
         }
       }
     }

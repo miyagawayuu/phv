@@ -1499,43 +1499,43 @@ dependencies = [
 ]
 
 [[package]]
-name = "phx_cli"
+name = "phv_cli"
 version = "0.2.7"
 dependencies = [
  "clap",
  "percent-encoding",
- "phx_driver",
- "phx_server",
- "phx_std",
- "phx_syntax",
- "phx_types",
- "phx_vm",
+ "phv_driver",
+ "phv_server",
+ "phv_std",
+ "phv_syntax",
+ "phv_types",
+ "phv_vm",
  "serde",
  "serde_json",
  "toml",
 ]
 
 [[package]]
-name = "phx_compiler"
+name = "phv_compiler"
 version = "0.2.7"
 dependencies = [
- "phx_syntax",
- "phx_types",
- "phx_vm",
+ "phv_syntax",
+ "phv_types",
+ "phv_vm",
 ]
 
 [[package]]
-name = "phx_driver"
+name = "phv_driver"
 version = "0.2.7"
 dependencies = [
  "getrandom 0.3.4",
  "hmac 0.12.1",
- "phx_compiler",
- "phx_jit",
- "phx_std",
- "phx_syntax",
- "phx_types",
- "phx_vm",
+ "phv_compiler",
+ "phv_jit",
+ "phv_std",
+ "phv_syntax",
+ "phv_types",
+ "phv_vm",
  "postcard",
  "serde",
  "sha2 0.10.9",
@@ -1543,7 +1543,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "phx_jit"
+name = "phv_jit"
 version = "0.2.7"
 dependencies = [
  "cranelift-codegen",
@@ -1551,11 +1551,11 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
- "phx_vm",
+ "phv_vm",
 ]
 
 [[package]]
-name = "phx_server"
+name = "phv_server"
 version = "0.2.7"
 dependencies = [
  "bytes",
@@ -1566,16 +1566,16 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "percent-encoding",
- "phx_driver",
- "phx_std",
- "phx_syntax",
- "phx_vm",
+ "phv_driver",
+ "phv_std",
+ "phv_syntax",
+ "phv_vm",
  "serde_json",
  "tokio",
 ]
 
 [[package]]
-name = "phx_std"
+name = "phv_std"
 version = "0.2.7"
 dependencies = [
  "argon2",
@@ -1588,8 +1588,8 @@ dependencies = [
  "libc",
  "mysql",
  "percent-encoding",
- "phx_types",
- "phx_vm",
+ "phv_types",
+ "phv_vm",
  "postgres",
  "qrcode",
  "redis",
@@ -1603,18 +1603,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "phx_syntax"
+name = "phv_syntax"
 version = "0.2.7"
 
 [[package]]
-name = "phx_types"
+name = "phv_types"
 version = "0.2.7"
 dependencies = [
- "phx_syntax",
+ "phv_syntax",
 ]
 
 [[package]]
-name = "phx_vm"
+name = "phv_vm"
 version = "0.2.7"
 dependencies = [
  "indexmap",

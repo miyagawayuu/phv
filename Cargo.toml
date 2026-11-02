@@ -6,18 +6,18 @@ members = ["crates/*"]
 version = "0.2.7"
 edition = "2021"
 license = "MIT"
-homepage = "https://phx-lang.org"
-documentation = "https://phx-lang.org"
+homepage = "https://phv-lang.org"
+documentation = "https://phv-lang.org"
 
 [workspace.dependencies]
-phx_syntax = { path = "crates/phx_syntax" }
-phx_types = { path = "crates/phx_types" }
-phx_compiler = { path = "crates/phx_compiler" }
-phx_vm = { path = "crates/phx_vm" }
-phx_std = { path = "crates/phx_std" }
-phx_driver = { path = "crates/phx_driver" }
-phx_server = { path = "crates/phx_server" }
-phx_jit = { path = "crates/phx_jit" }
+phv_syntax = { path = "crates/phv_syntax" }
+phv_types = { path = "crates/phv_types" }
+phv_compiler = { path = "crates/phv_compiler" }
+phv_vm = { path = "crates/phv_vm" }
+phv_std = { path = "crates/phv_std" }
+phv_driver = { path = "crates/phv_driver" }
+phv_server = { path = "crates/phv_server" }
+phv_jit = { path = "crates/phv_jit" }
 
 indexmap = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }

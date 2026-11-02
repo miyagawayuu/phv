@@ -1,0 +1,10 @@
+<?phv
+import lib.posts.Post;
+params(Post $post);
+?>
+<article class="post">
+  <h1><?= $post->title ?></h1>
+  <p><?= nl2br($post->body) ?></p>
+  <p class="tags"><?phv foreach ($post->tags as $tag): ?><span>#<?= $tag ?></span><?phv endforeach; ?></p>
+  <p><a href="/">← All posts</a></p>
+</article>

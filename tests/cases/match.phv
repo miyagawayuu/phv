@@ -1,0 +1,35 @@
+<?phv
+function describe(int $code): string {
+    return match ($code) {
+        200, 201 => "ok",
+        404 => "not found",
+        500 => "server error",
+        default => "other",
+    };
+}
+echo describe(200), " ", describe(201), " ", describe(404), " ", describe(999), "\n";
+
+function size(int $n): string {
+    return match (true) {
+        $n < 10 => "small",
+        $n < 100 => "medium",
+        default => "large",
+    };
+}
+echo size(5), " ", size(50), " ", size(500), "\n";
+
+$label = match ("b") {
+    "a" => 1,
+    "b" => 2.5,
+};
+echo $label, "\n";
+
+try {
+    $x = match (3) {
+        1 => "one",
+        2 => "two",
+    };
+    echo $x;
+} catch (UnhandledMatchError $e) {
+    echo "caught: ", $e->getMessage(), "\n";
+}
