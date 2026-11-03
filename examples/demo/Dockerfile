@@ -3,7 +3,7 @@
 
 # The release binary is built on Ubuntu 24.04, so it needs its glibc.
 FROM ubuntu:24.04 AS fetch
-ARG PHV_VERSION=0.4.1
+ARG PHV_VERSION=0.5.0
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
