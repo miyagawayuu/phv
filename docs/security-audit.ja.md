@@ -445,3 +445,7 @@ PostgreSQL・MySQL・Redis に対しても)、Redis の件数とバイト数の�
 URL・名前(`install`)、パッケージの境界(`tests/packages`)。すべてのテストが、Windows と Linux(Docker)で clippy
 (`-D warnings`)・rustfmt とあわせて通った。`tests/db` は PostgreSQL 17・MySQL 8.4・Redis 7 に対して通り、ファズテストは
 1 プログラムあたり 1,500 回の変異を実行した。
+
+依存関係: サイトのデプロイ用ツール(`.github/deploy`。wrangler が使い、デプロイのジョブでだけ動く)の `undici` 7.29.1 に、
+Dependabot が 8 件の勧告(うち高 4 件)を報告した。修正済みの 7.30.1 に上書きし、`npm ci --ignore-scripts` からの
+インストールで wrangler が動くことを確かめた。拡張機能とサイトの `npm audit --omit=dev` は 0 件。`cargo audit` は CI で実行する。

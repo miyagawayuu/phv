@@ -447,3 +447,8 @@ cases, template jumps and `json_html()` (`tests/cases`), deep JIT recursion (`ji
 formatter (`format`), links, URLs and names in `phv install` (`install`), and the package boundary
 (`tests/packages`). All tests pass on Windows and on Linux (Docker) with clippy (`-D warnings`) and rustfmt;
 `tests/db` passed against PostgreSQL 17, MySQL 8.4 and Redis 7, and the fuzzer ran 1,500 mutations per program.
+
+Dependencies: Dependabot reported eight advisories (four high) for `undici` 7.29.1 in the website's deploy tooling
+(`.github/deploy`, pulled in by wrangler, which runs only in the deploy job); it is overridden to the fixed 7.30.1, and
+a clean `npm ci --ignore-scripts` gives a working wrangler. `npm audit --omit=dev` finds nothing in the extension and
+the website; `cargo audit` runs in CI.
