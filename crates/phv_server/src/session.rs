@@ -13,6 +13,10 @@
 //! shared by every server process using the directory. A new session's file
 //! is `n-<hash>.json` until its cookie comes back, then `<hash>.json`, so the
 //! sweep can tell the two kinds apart from the listing alone.
+//!
+//! With `session_store = "db:<name>"` sessions live in that database of
+//! `[databases]` instead (Redis, PostgreSQL or MySQL), keyed by the same hash,
+//! with the same rules; see `DbStore`.
 
 use indexmap::IndexMap;
 use phv_std::safefs;
@@ -50,7 +54,99 @@ pub struct Store {
     pub cookie: &'static str,
     secure: bool,
     inner: Mutex<Inner>,
-    files: Option<FileStore>,
+    files: Option<Box<dyn Backend>>,
+}
+
+/// Where sessions are kept when not in memory: files, or a database.
+trait Backend: Send + Sync {
+    /// The session and whether its visitor came back.
+    fn read(&self, id: &str) -> Option<(Record, bool)>;
+    fn write(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<()>;
+    fn remove(&self, id: &str);
+    /// Marks the session as one whose visitor came back; false if that failed.
+    fn promote(&self, id: &str) -> bool;
+    /// Removes expired sessions, and the excess when there are too many.
+    fn sweep(&self, ttl: Duration);
+    /// The file store, for tests that lower its limits.
+    #[cfg(test)]
+    fn file_store(&mut self) -> Option<&mut FileStore> {
+        None
+    }
+}
+
+/// The key a session is stored under: a hash of its id, so a listing of the
+/// store reveals no ids.
+fn session_key(id: &str) -> String {
+    phv_std::sha256_hex(format!("phv-session:{id}").as_bytes())
+}
+
+fn values_json(values: &IndexMap<String, String>) -> String {
+    serde_json::json!(values).to_string()
+}
+
+fn values_from_json(text: &str) -> Option<IndexMap<String, String>> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    v.as_object()?.iter().map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()
+}
+
+/// Sessions in a database of `[databases]`: Redis keeps them under
+/// `phv:session:<hash>` and expires them itself (a session whose visitor has
+/// not come back after an hour); PostgreSQL and MySQL in a `phv_sessions`
+/// table, which the sweep keeps within `MAX_SESSIONS`, dropping those whose
+/// visitor never came back first. A database that cannot be reached loses the
+/// session (a warning is logged) instead of failing the request.
+struct DbStore {
+    spec: phv_vm::DatabaseSpec,
+    ttl: Duration,
+    /// Unix time of the last sweep.
+    swept: AtomicU64,
+}
+
+impl DbStore {
+    fn warn(what: &str, e: String) {
+        eprintln!("warning: cannot {what} the session in the database: {e}");
+    }
+}
+
+impl Backend for DbStore {
+    fn read(&self, id: &str) -> Option<(Record, bool)> {
+        let row = match phv_std::session_read(&self.spec, &session_key(id)) {
+            Ok(r) => r?,
+            Err(e) => {
+                Self::warn("read", e);
+                return None;
+            }
+        };
+        let values = values_from_json(&row.data)?;
+        Some((Record { created: row.created, last: row.last, values }, row.returned))
+    }
+
+    fn write(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<()> {
+        let row = phv_std::SessionRow { data: values_json(&r.values), created: r.created, last: r.last, returned };
+        phv_std::session_write(&self.spec, &session_key(id), &row, self.ttl).map_err(std::io::Error::other)
+    }
+
+    fn remove(&self, id: &str) {
+        if let Err(e) = phv_std::session_remove(&self.spec, &session_key(id)) {
+            Self::warn("remove", e);
+        }
+    }
+
+    fn promote(&self, id: &str) -> bool {
+        let Some((r, _)) = self.read(id) else { return false };
+        self.write(id, &r, true).is_ok()
+    }
+
+    fn sweep(&self, ttl: Duration) {
+        let now = now_secs();
+        let last = self.swept.load(Ordering::Relaxed);
+        if now < last + 30 || self.swept.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        if let Err(e) = phv_std::session_sweep(&self.spec, ttl, MAX_LIFETIME, MAX_SESSIONS) {
+            Self::warn("clean up", e);
+        }
+    }
 }
 
 fn valid_id(id: &str) -> bool {
@@ -102,11 +198,38 @@ fn is_session_file(name: &str) -> bool {
     name.strip_suffix(".json").is_some_and(hash)
 }
 
+impl Backend for FileStore {
+    fn read(&self, id: &str) -> Option<(Record, bool)> {
+        FileStore::read(self, id)
+    }
+
+    fn write(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<()> {
+        FileStore::write(self, id, r, returned)
+    }
+
+    fn remove(&self, id: &str) {
+        FileStore::remove(self, id)
+    }
+
+    fn promote(&self, id: &str) -> bool {
+        FileStore::promote(self, id)
+    }
+
+    fn sweep(&self, ttl: Duration) {
+        FileStore::sweep(self, ttl)
+    }
+
+    #[cfg(test)]
+    fn file_store(&mut self) -> Option<&mut FileStore> {
+        Some(self)
+    }
+}
+
 impl FileStore {
     /// `<hash>.json` once the visitor came back (and for files from older
     /// versions), `n-<hash>.json` before.
     fn name(id: &str, returned: bool) -> String {
-        let hash = phv_std::sha256_hex(format!("phv-session:{id}").as_bytes());
+        let hash = session_key(id);
         if returned {
             format!("{hash}.json")
         } else {
@@ -242,13 +365,13 @@ impl Store {
             if !dir.join(".gitignore").exists() {
                 let _ = std::fs::write(dir.join(".gitignore"), "*\n");
             }
-            FileStore {
+            Box::new(FileStore {
                 dir,
                 swept: AtomicU64::new(0),
                 written: AtomicU64::new(0),
                 max_sessions: MAX_SESSIONS,
                 max_bytes: MAX_BYTES as u64,
-            }
+            }) as Box<dyn Backend>
         });
         Store {
             ttl,
@@ -257,6 +380,13 @@ impl Store {
             inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, requests: 0 }),
             files,
         }
+    }
+
+    /// A store that keeps sessions in a database of `[databases]` (see `DbStore`).
+    pub fn with_database(ttl: Duration, secure: bool, spec: phv_vm::DatabaseSpec) -> Store {
+        let mut store = Store::new(ttl, secure, None);
+        store.files = Some(Box::new(DbStore { spec, ttl, swept: AtomicU64::new(0) }));
+        store
     }
 
     fn alive(&self, e: &Entry) -> bool {
@@ -340,7 +470,7 @@ impl Store {
     /// Stores the session after a request. Returns the `Set-Cookie` value to send, if any.
     pub fn save(&self, s: SessionData) -> Option<String> {
         if let Some(files) = &self.files {
-            return self.save_file(files, s);
+            return self.save_file(files.as_ref(), s);
         }
         let mut inner = self.inner.lock().unwrap();
         inner.requests += 1;
@@ -382,7 +512,7 @@ impl Store {
         issue_cookie.then(|| self.cookie_for(Some(&new_id)))
     }
 
-    fn save_file(&self, files: &FileStore, s: SessionData) -> Option<String> {
+    fn save_file(&self, files: &dyn Backend, s: SessionData) -> Option<String> {
         files.sweep(self.ttl);
         if s.destroyed {
             if let Some(id) = &s.id {
@@ -474,6 +604,66 @@ mod tests {
         }
     }
 
+    /// The database stores keep the rules of the others: values come back,
+    /// a logged-out session stays gone, and the sweep removes expired
+    /// sessions and then the excess, those whose visitor never came back first.
+    /// Runs against the servers named by `PHV_TEST_REDIS_URL`,
+    /// `PHV_TEST_POSTGRES_URL` and `PHV_TEST_MYSQL_URL` (skipped without them).
+    #[test]
+    fn database_stores_keep_the_same_rules() {
+        for var in ["PHV_TEST_REDIS_URL", "PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
+            let Some(url) = std::env::var(var).ok().filter(|u| !u.is_empty()) else {
+                eprintln!("skipped: {var} is not set");
+                continue;
+            };
+            let spec = phv_vm::DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 2 };
+            let store = Store::with_database(Duration::from_secs(60), false, spec.clone());
+            let mut s = SessionData::default();
+            s.values.insert("user".into(), "alice".into());
+            s.changed = true;
+            let cookie = store.save(s).unwrap();
+            let header = format!("PHVSESSID={}", cookie.split(['=', ';']).nth(1).unwrap());
+            assert_eq!(store.load(Some(&header)).values.get("user").map(String::as_str), Some("alice"), "{var}");
+            // Logged out while a slow request still holds it: it stays gone.
+            let mut slow = store.load(Some(&header));
+            let mut logout = store.load(Some(&header));
+            logout.destroyed = true;
+            store.save(logout);
+            slow.values.insert("seen".into(), "1".into());
+            slow.changed = true;
+            assert!(store.save(slow).is_none(), "{var}");
+            assert!(store.load(Some(&header)).id.is_none(), "{var}");
+
+            if var == "PHV_TEST_REDIS_URL" {
+                continue;
+            }
+            // The sweep: one expired session, two returning and two new ones, room for three.
+            let now = now_secs();
+            let row =
+                |last: u64, returned: bool| phv_std::SessionRow { data: "{}".into(), created: last, last, returned };
+            let ttl = Duration::from_secs(60);
+            let keys = ["sweep-expired", "sweep-back-1", "sweep-back-2", "sweep-new-1", "sweep-new-2"];
+            let rows = [
+                row(now - 3600, true),
+                row(now - 5, true),
+                row(now - 4, true),
+                row(now - 3, false),
+                row(now - 2, false),
+            ];
+            for (k, r) in keys.iter().zip(&rows) {
+                phv_std::session_write(&spec, k, r, ttl).unwrap();
+            }
+            phv_std::session_sweep(&spec, ttl, MAX_LIFETIME, 3).unwrap();
+            let left: Vec<&str> =
+                keys.iter().copied().filter(|k| phv_std::session_read(&spec, k).unwrap().is_some()).collect();
+            // 90% of 3 is 2: the new ones go first.
+            assert_eq!(left, ["sweep-back-1", "sweep-back-2"], "{var}");
+            for k in keys {
+                phv_std::session_remove(&spec, k).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn the_sweep_only_touches_session_files() {
         assert!(is_session_file(&format!("{}.json", "a".repeat(64))));
@@ -524,7 +714,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("phv-sess-flood-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut store = Store::new(Duration::from_secs(600), false, Some(dir.clone()));
-        let files = store.files.as_mut().unwrap();
+        let files = store.files.as_mut().unwrap().file_store().unwrap();
         files.max_sessions = 20;
         files.max_bytes = 20 * 200;
         let mut s = SessionData::default();
@@ -544,9 +734,10 @@ mod tests {
             s.changed = true;
             assert!(store.save(s).is_some());
         }
-        let files = store.files.as_ref().unwrap();
+        let ttl = store.ttl;
+        let files = store.files.as_mut().unwrap().file_store().unwrap();
         files.swept.store(0, Ordering::Relaxed);
-        files.sweep(store.ttl);
+        files.sweep(ttl);
         let names = file_names(&dir);
         assert!(names.iter().filter(|n| is_session_file(n)).count() <= 20);
         assert!(names.iter().any(|n| n.starts_with("n-")), "only the excess is swept");

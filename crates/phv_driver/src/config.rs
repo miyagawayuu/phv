@@ -378,6 +378,8 @@ pub struct Config {
     pub requests_per_minute: u32,
     /// Directory for session files; None keeps sessions in memory.
     pub session_dir: Option<PathBuf>,
+    /// The database of `[databases]` sessions are kept in (`session_store = "db:<name>"`).
+    pub session_db: Option<String>,
     pub dependencies: BTreeMap<String, Dependency>,
     pub fmt: FmtSection,
 }
@@ -395,6 +397,7 @@ impl Config {
             csp: Csp::Policy(DEFAULT_CSP.into()),
             requests_per_minute: 0,
             session_dir: None,
+            session_db: None,
             dependencies: BTreeMap::new(),
             fmt: FmtSection::default(),
         }
@@ -508,8 +511,17 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
     };
     // Session files hold logins: the directory must belong to the server alone
     // (its sweep deletes old files), not to the project or to scripts.
+    let mut session_db = None;
     let session_dir = match file.security.session_store.as_deref() {
         None | Some("memory") => None,
+        Some(d) if d.starts_with("db:") => {
+            let name = &d[3..];
+            if !file.databases.contains_key(name) {
+                return Err(format!("[security].session_store: no database named \"{name}\" in [databases]"));
+            }
+            session_db = Some(name.to_string());
+            None
+        }
         Some(d) => {
             check_dir("session_store", d).map_err(|e| e.replace("[permissions].", "[security]."))?;
             let names = dir_names(d);
@@ -576,6 +588,7 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
         csp,
         requests_per_minute: file.security.requests_per_minute,
         session_dir,
+        session_db,
         dependencies: file.dependencies,
         fmt: file.fmt,
     })

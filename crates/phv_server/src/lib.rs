@@ -79,11 +79,18 @@ impl State {
         getrandom::fill(&mut secret).expect("operating system random number generator failed");
         State {
             public: root.join("public"),
-            sessions: session::Store::new(
-                Duration::from_secs(config.session_ttl),
-                config.secure_cookies,
-                config.session_dir.clone(),
-            ),
+            sessions: match config.session_db.as_ref().and_then(|n| config.host.databases.get(n)) {
+                Some(spec) => session::Store::with_database(
+                    Duration::from_secs(config.session_ttl),
+                    config.secure_cookies,
+                    spec.clone(),
+                ),
+                None => session::Store::new(
+                    Duration::from_secs(config.session_ttl),
+                    config.secure_cookies,
+                    config.session_dir.clone(),
+                ),
+            },
             csrf_cookie: if config.secure_cookies { "__Host-PHVCSRF" } else { "PHVCSRF" },
             csrf_secret: secret,
             workers: Arc::new(tokio::sync::Semaphore::new(config.workers)),

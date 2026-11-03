@@ -633,6 +633,12 @@ session()->destroy();                 // log out
   multiple server processes that use the same directory. File names are hashes of the IDs, so the IDs cannot be learned from a directory listing.
   A directory inside `public/` cannot be specified. A new session's file is named `n-<hash>.json` until its visitor
   sends the cookie back, and is then renamed to `<hash>.json`.
+- With `[security] session_store = "db:<name>"`, sessions are kept in that database of `[databases]` (Redis, PostgreSQL
+  or MySQL), shared by every server process and machine that uses it. Redis keeps each under `phv:session:<hash>` and
+  expires it itself; a session whose visitor has not sent the cookie back expires after an hour at most. PostgreSQL and
+  MySQL keep them in a table `phv_sessions`, created when first needed; every 30 seconds a server removes expired
+  sessions and keeps the table within the limit below. If the database cannot be reached, the request goes on without
+  its session and a warning is logged.
 - The store holds at most 50,000 sessions (the file store also at most 256 MB). When it is full, sessions whose visitor
   never came back are removed first, then the least recently used: a flood of requests without a cookie (each creating
   a session) removes its own sessions, not those of returning visitors.
@@ -1018,7 +1024,7 @@ session_ttl = 7200      # seconds
 memory_limit_mb = 128   # per request (one execution)
 csp = "default"         # "off" or a custom policy that may contain {nonce}
 requests_per_minute = 0 # limit per client address (0 means unlimited)
-session_store = "memory"  # or a directory ("sessions/")
+session_store = "memory"  # or a directory ("sessions/"), or a database ("db:cache")
 rate_limit_store = "cache"  # count rate limits on this Redis database (default: in the process)
 
 [server]
@@ -1231,6 +1237,5 @@ that checks journal files (`phv_std/src/db/vfs.rs`).
 
 - Wider JIT coverage (functions that handle floats and strings), AOT compilation
 - Transitive dependency resolution, a package registry
-- Sessions stored in a database
 
 See [security-audit.md](security-audit.md) for the results of the security audit and the remaining risks.

@@ -628,6 +628,11 @@ session()->destroy();                 // ログアウト
   複数のサーバープロセスで共有できる。ファイル名は ID のハッシュなので、ディレクトリの一覧から ID は分からない。
   `public/` の中は指定できない。新しいセッションのファイル名は、訪問者が Cookie を送り返すまでは `n-<hash>.json` で、
   送り返したときに `<hash>.json` に変わる。
+- `[security] session_store = "db:<名前>"` と書くと、`[databases]` のそのデータベース(Redis、PostgreSQL、MySQL)に保存し、
+  それを使うすべてのサーバープロセスとマシンで共有する。Redis は `phv:session:<hash>` に保存し、期限切れは Redis に任せる。
+  訪問者が Cookie を送り返していないセッションは、長くても 1 時間で消える。PostgreSQL と MySQL は `phv_sessions` テーブル
+  (必要になったときに作る)に保存し、30 秒ごとに期限切れを消して、下の上限に収める。データベースに届かないときは、
+  セッションなしでリクエストを続け、警告をログに出す。
 - 保存できるセッションは最大 50,000(ファイルの保存先は 256 MB まで)。いっぱいになると、訪問者が一度も戻ってこなかったセッションから先に消し、
   その次に最も長く使われていないものを消す。Cookie なしのリクエストを大量に送られても(それぞれがセッションを作る)、
   消えるのはそのセッションで、戻ってくる訪問者のセッションは残る。
@@ -1007,7 +1012,7 @@ session_ttl = 7200      # 秒
 memory_limit_mb = 128   # 1 リクエスト(1 回の実行)あたり
 csp = "default"         # "off" か、{nonce} を含められる独自のポリシー
 requests_per_minute = 0 # 接続元アドレスごとの上限(0 は無制限)
-session_store = "memory"  # またはディレクトリ("sessions/")
+session_store = "memory"  # またはディレクトリ("sessions/")、データベース("db:cache")
 rate_limit_store = "cache"  # この Redis のデータベースでレート制限を数える(既定: プロセスの中)
 
 [server]
@@ -1218,6 +1223,5 @@ phv migrate legacy/page.php      # page.phv を書き出す
 
 - JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
 - 推移的な依存関係の解決、パッケージレジストリ
-- データベースに保存するセッション
 
 セキュリティ監査の結果と残っているリスクは [security-audit.ja.md](security-audit.ja.md) を参照。
