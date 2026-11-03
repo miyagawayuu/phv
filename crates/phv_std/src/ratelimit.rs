@@ -4,6 +4,9 @@
 //! expired windows go first, then windows that are not at their limit, and
 //! only then the oldest limited ones, so flooding the table with new keys
 //! does not lift an active limit.
+//!
+//! With `[security] rate_limit_store`, the counters live on a Redis server
+//! instead, shared by every server process (`hit_shared`, `reset_shared`).
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -92,6 +95,39 @@ pub fn reset(key: &str) {
     let mut t = TABLE.lock().unwrap_or_else(|e| e.into_inner());
     let base = base_of(key);
     t.retain(|k, _| !k.starts_with(&base));
+}
+
+/// Counts a hit in the store phv.toml names: the Redis database of
+/// `[security] rate_limit_store`, or this process. Returns whether the hit is
+/// allowed and the seconds until the window ends. When the Redis server cannot
+/// be reached, the error says why.
+pub fn hit_shared(
+    host: &phv_vm::Host,
+    key: &str,
+    max: u32,
+    window: Duration,
+    until: Instant,
+) -> Result<(bool, u64), String> {
+    match store(host)? {
+        Some(spec) => crate::netdb::redis_hit(spec, key, max, window, until),
+        None => Ok((hit(key, max, window), retry_after(key, window))),
+    }
+}
+
+/// Forgets the hits of `key` in the store phv.toml names (see `hit_shared`).
+pub fn reset_shared(host: &phv_vm::Host, key: &str, until: Instant) -> Result<(), String> {
+    match store(host)? {
+        Some(spec) => crate::netdb::redis_reset(spec, key, until),
+        None => {
+            reset(key);
+            Ok(())
+        }
+    }
+}
+
+fn store(host: &phv_vm::Host) -> Result<Option<&phv_vm::DatabaseSpec>, String> {
+    let Some(name) = &host.rate_limit_store else { return Ok(None) };
+    host.databases.get(name).map(Some).ok_or_else(|| format!("no database named \"{name}\""))
 }
 
 /// The address a client is limited by: IPv6 clients usually control a whole

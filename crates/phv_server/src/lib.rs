@@ -165,9 +165,29 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
     let limit = state.config.requests_per_minute;
     let client = format!("ip:{}", phv_std::ratelimit::client_key(peer.ip()));
     let minute = Duration::from_secs(60);
-    let mut resp = if limit > 0 && !phv_std::ratelimit::hit(&client, limit, minute) {
+    let limited = if limit == 0 {
+        None
+    } else if state.config.host.rate_limit_store.is_none() {
+        (!phv_std::ratelimit::hit(&client, limit, minute)).then(|| phv_std::ratelimit::retry_after(&client, minute))
+    } else {
+        // Counted on the shared Redis server; if it cannot be reached, in this process.
+        let (host, key) = (state.config.host.clone(), client.clone());
+        let until = Instant::now() + Duration::from_secs(2);
+        let shared =
+            tokio::task::spawn_blocking(move || phv_std::ratelimit::hit_shared(&host, &key, limit, minute, until))
+                .await;
+        match shared {
+            Ok(Ok((allowed, wait))) => (!allowed).then_some(wait),
+            Ok(Err(e)) => {
+                eprintln!("warning: the shared rate limit store cannot be used ({e}); counting in this process");
+                (!phv_std::ratelimit::hit(&client, limit, minute))
+                    .then(|| phv_std::ratelimit::retry_after(&client, minute))
+            }
+            Err(_) => None,
+        }
+    };
+    let mut resp = if let Some(wait) = limited {
         let mut r = simple(StatusCode::TOO_MANY_REQUESTS, "text/plain", "too many requests".into());
-        let wait = phv_std::ratelimit::retry_after(&client, minute);
         r.headers_mut().insert("retry-after", HeaderValue::from(wait));
         r
     } else {

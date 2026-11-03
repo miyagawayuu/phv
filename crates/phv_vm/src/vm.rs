@@ -149,6 +149,9 @@ pub struct Host {
     pub websockets: std::collections::BTreeMap<String, WebSocketSpec>,
     /// HTTP services scripts may send requests to, by name (`[http]` in phv.toml).
     pub http: std::collections::BTreeMap<String, HttpSpec>,
+    /// The Redis database (a name in `databases`) that rate limits are counted
+    /// in, so every server process shares them; None counts in this process.
+    pub rate_limit_store: Option<String>,
 }
 
 /// A database server named in phv.toml. Scripts only ever see the name: the

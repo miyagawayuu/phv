@@ -59,6 +59,13 @@ fn int(v: &Value) -> i64 {
     }
 }
 
+/// How long a shared rate limit waits for its store: at most 2 seconds, and
+/// never past the script's deadline.
+fn shared_until(vm: &Vm) -> std::time::Instant {
+    let cap = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    vm.deadline().map_or(cap, |d| d.min(cap))
+}
+
 fn float(v: &Value) -> f64 {
     match v {
         Value::Float(f) => *f,
@@ -824,10 +831,21 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
                 ));
             }
             let key = format!("app:{}", s(&a[0]));
-            Ok(Value::Bool(ratelimit::hit(&key, max as u32, std::time::Duration::from_secs(secs as u64))))
+            let window = std::time::Duration::from_secs(secs as u64);
+            match ratelimit::hit_shared(&vm.host, &key, max as u32, window, shared_until(vm)) {
+                Ok((allowed, _)) => Ok(Value::Bool(allowed)),
+                // A limit that cannot be counted refuses: it usually guards logins and the like.
+                Err(e) => {
+                    eprintln!("rate_limit(): the shared rate limit store cannot be used: {e}");
+                    Ok(Value::Bool(false))
+                }
+            }
         },
-        "rate_limit_reset" => |_, a| {
-            ratelimit::reset(&format!("app:{}", s(&a[0])));
+        "rate_limit_reset" => |vm, a| {
+            let key = format!("app:{}", s(&a[0]));
+            if let Err(e) = ratelimit::reset_shared(&vm.host, &key, shared_until(vm)) {
+                return Err(vm.throw("DatabaseError", format!("rate_limit_reset(): {e}")));
+            }
             Ok(Value::Null)
         },
         "__req_path" => |vm, _| Ok(Value::str(vm.http.path.as_str())),

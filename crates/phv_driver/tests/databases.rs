@@ -120,6 +120,32 @@ fn redis() {
     let host = host(&url);
     check(&host, "redis");
     check_memory_limit(&host, "redis_big");
+
+    // Rate limits counted on the server: a second process (here, the counters
+    // of this process) does not see them, the server does.
+    let shared = Arc::new(Host { rate_limit_store: Some("main".into()), ..(*host).clone() });
+    check(&shared, "redis_ratelimit");
+    let until = std::time::Instant::now() + Duration::from_secs(2);
+    let minute = Duration::from_secs(60);
+    for _ in 0..3 {
+        assert!(phv_std::ratelimit::hit_shared(&shared, "app:other", 3, minute, until).unwrap().0);
+    }
+    assert!(!phv_std::ratelimit::hit_shared(&shared, "app:other", 3, minute, until).unwrap().0);
+    assert!(phv_std::ratelimit::hit("app:other", 3, minute), "the process's own counters were used");
+    phv_std::ratelimit::reset_shared(&shared, "app:other", until).unwrap();
+}
+
+/// A shared rate limit whose store cannot be reached refuses.
+#[test]
+fn unreachable_rate_limit_store_refuses() {
+    let mut host = (*host("redis://127.0.0.1:1")).clone();
+    host.rate_limit_store = Some("main".into());
+    let out = run_script(&Arc::new(host), "ratelimit_down", Some(Duration::from_secs(5)));
+    assert_eq!(
+        out,
+        "limited
+"
+    );
 }
 
 /// Remote servers need TLS unless the configuration says otherwise.

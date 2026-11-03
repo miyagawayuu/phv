@@ -1210,6 +1210,107 @@ fn redis_connect(url: &str, spec: &DatabaseSpec, timeout: Duration) -> Result<Re
     RedisConn::connect(url, spec.tls, Instant::now() + timeout)
 }
 
+// ----- Shared rate limits ------------------------------------------------------
+
+/// Counts a hit in a fixed window on the Redis server `spec` (see
+/// `ratelimit::hit_shared`). Every server process using the same server shares
+/// the counters. Returns whether the hit is allowed and the seconds until the
+/// window ends.
+pub(crate) fn redis_hit(
+    spec: &DatabaseSpec,
+    key: &str,
+    max: u32,
+    window: Duration,
+    until: Instant,
+) -> Result<(bool, u64), String> {
+    let ms = window.as_millis().max(1) as u64;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let slot = now / ms;
+    let rkey = format!("{}{ms}:{slot}", redis_prefix(key));
+    let mut conn = redis_conn(spec, until)?;
+    let n = match conn.get().command(&[b"INCR", rkey.as_bytes()], until, 1024) {
+        Ok(Reply::Int(n)) => n,
+        other => {
+            conn.broken = true;
+            return Err(redis_failure(other.err()));
+        }
+    };
+    if n == 1 {
+        // The counter lives as long as its window (plus a margin for clock skew).
+        let ttl = (ms + 1000).to_string();
+        if conn.get().command(&[b"PEXPIRE", rkey.as_bytes(), ttl.as_bytes()], until, 1024).is_err() {
+            conn.broken = true;
+        }
+    }
+    Ok((n <= i64::from(max), ((slot + 1) * ms - now) / 1000 + 1))
+}
+
+/// Forgets every window of `key` on the Redis server `spec`.
+pub(crate) fn redis_reset(spec: &DatabaseSpec, key: &str, until: Instant) -> Result<(), String> {
+    let pattern = format!("{}*", redis_prefix(key));
+    let mut conn = redis_conn(spec, until)?;
+    let mut cursor = b"0".to_vec();
+    loop {
+        let reply =
+            conn.get().command(&[b"SCAN", &cursor, b"MATCH", pattern.as_bytes(), b"COUNT", b"1000"], until, 1 << 20);
+        let mut parts = match reply {
+            Ok(Reply::Array(parts)) => parts,
+            other => {
+                conn.broken = true;
+                return Err(redis_failure(other.err()));
+            }
+        };
+        let (Some(Reply::Array(keys)), Some(Reply::Bulk(next))) = (parts.pop(), parts.pop()) else {
+            conn.broken = true;
+            return Err("the server sent an invalid reply".into());
+        };
+        for k in keys {
+            if let Reply::Bulk(k) = k {
+                if conn.get().command(&[b"DEL", &k], until, 1024).is_err() {
+                    conn.broken = true;
+                    return Err("the server did not answer".into());
+                }
+            }
+        }
+        if next == b"0" {
+            return Ok(());
+        }
+        cursor = next;
+    }
+}
+
+/// Counter keys of `key`: hashed, so they hold no glob characters for `SCAN`
+/// and their length is bounded.
+fn redis_prefix(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("phv:ratelimit:{:x}:", Sha256::digest(key.as_bytes()))
+}
+
+fn redis_conn(spec: &DatabaseSpec, until: Instant) -> Result<Pooled<RedisConn>, String> {
+    let Some(url) = spec.url.clone() else {
+        return Err(format!("the environment variable {} is not set", spec.url_env.as_deref().unwrap_or("?")));
+    };
+    if kind_of(&url) != Kind::Redis {
+        return Err("it is not a Redis server".into());
+    }
+    tls_init();
+    let key = format!("{:?}|{}|{}", spec.tls, spec.pool_size, url);
+    let timeout = until.saturating_duration_since(Instant::now()).clamp(Duration::from_millis(100), CONNECT_TIMEOUT);
+    match pool_for(&REDIS_POOLS, &key, spec.pool_size).acquire(until, || redis_connect(&url, spec, timeout)) {
+        Ok(c) => Ok(c),
+        Err(AcquireError::Busy) => Err("all its connections are in use".into()),
+        Err(AcquireError::Connect(e)) => Err(e),
+    }
+}
+
+fn redis_failure(e: Option<crate::redisclient::RedisError>) -> String {
+    match e {
+        Some(crate::redisclient::RedisError::Server(m)) => m,
+        Some(_) => "the server did not answer".into(),
+        None => "the server sent an invalid reply".into(),
+    }
+}
+
 /// Commands scripts may run, with their argument counts.
 const REDIS_COMMANDS: &[(&str, usize, usize)] = &[
     ("GET", 1, 1),

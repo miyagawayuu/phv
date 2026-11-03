@@ -1,0 +1,10 @@
+// Run by crates/phv_driver/tests/databases.rs with `rate_limit_store = "main"`:
+// the counters live on the Redis server, shared by every server process.
+rate_limit_reset("shared");
+for ($i = 1; $i <= 4; $i++) {
+    echo "hit ", $i, ": ", rate_limit("shared", 3, 60) ? "allowed" : "limited", "\n";
+}
+echo "per hour: ", rate_limit("shared", 3, 3600) ? "allowed" : "limited", "\n";
+rate_limit_reset("shared");
+echo "after reset: ", rate_limit("shared", 3, 60) ? "allowed" : "limited", "\n";
+rate_limit_reset("shared");

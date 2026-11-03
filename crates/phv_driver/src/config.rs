@@ -9,6 +9,7 @@
 //! secure_cookies = false  # mark the session cookie `Secure` (use behind HTTPS)
 //! session_ttl = 7200      # seconds of inactivity before a session expires
 //! memory_limit_mb = 128   # per request
+//! rate_limit_store = "cache"  # count rate limits in this Redis database (default: in the process)
 //!
 //! [server]
 //! workers = 16            # scripts running at once (default: 2 per CPU, at least 8)
@@ -229,6 +230,10 @@ struct Security {
     /// so sessions survive restarts and are shared by several server processes.
     #[serde(default)]
     session_store: Option<String>,
+    /// A Redis database in `[databases]` to count rate limits in, so that
+    /// several server processes share them.
+    #[serde(default)]
+    rate_limit_store: Option<String>,
 }
 
 impl Default for Security {
@@ -241,6 +246,7 @@ impl Default for Security {
             csp: None,
             requests_per_minute: 0,
             session_store: None,
+            rate_limit_store: None,
         }
     }
 }
@@ -505,6 +511,17 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
     if !(1..=1_048_576).contains(&file.security.memory_limit_mb) {
         return Err("[security].memory_limit_mb must be between 1 and 1048576".into());
     }
+    let rate_limit_store = file.security.rate_limit_store.clone();
+    if let Some(name) = &rate_limit_store {
+        let redis = |u: &str| u.starts_with("redis://") || u.starts_with("rediss://");
+        match file.databases.get(name) {
+            None => return Err(format!("[security].rate_limit_store: no database named \"{name}\" in [databases]")),
+            Some(d) if d.url.as_deref().is_some_and(|u| !redis(u)) => {
+                return Err(format!("[security].rate_limit_store: database \"{name}\" is not a Redis server"))
+            }
+            Some(_) => {}
+        }
+    }
     if file.server.workers.is_some_and(|w| !(1..=1024).contains(&w)) {
         return Err("[server].workers must be between 1 and 1024".into());
     }
@@ -527,7 +544,7 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
     }
     Ok(Config {
         name: file.project.name,
-        host: Arc::new(Host { root: root.to_path_buf(), permissions, databases, websockets, http }),
+        host: Arc::new(Host { root: root.to_path_buf(), permissions, databases, websockets, http, rate_limit_store }),
         csrf: file.security.csrf,
         secure_cookies: file.security.secure_cookies,
         session_ttl: file.security.session_ttl,

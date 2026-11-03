@@ -1,0 +1,2 @@
+// Run by crates/phv_driver/tests/databases.rs with a rate limit store that is down.
+echo rate_limit("down", 3, 60) ? "allowed" : "limited", "\n";
