@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates seven audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, and §14 what was added for v0.6.0.
+This report consolidates eight audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, and §15 what was added for v0.7.0.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14: 2026-11-04)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§15: 2026-11-04)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -615,3 +615,73 @@ on Linux and macOS in CI, with clippy (`-D warnings`) and rustfmt, and the fuzze
 
 Dependencies: `cargo audit` (CI) and `npm audit --omit=dev` in the extension and the website find nothing; Dependabot
 has no open alerts.
+
+## 15. Eighth Assessment (v0.7.0: routes, middleware, error pages, static files, mail, migrations, test client)
+
+Date: 2026-11-04. Scope: everything changed after v0.6.0 (`git diff v0.6.0..main`): routes with parameters
+(`[id]`, `[...rest]`) and the route table, `_middleware.phv`, `_404.phv` and `_500.phv`, conditional and range
+requests for static files, gzip, `[cors]`, the access log, graceful shutdown, `layout()`, `std.validate`, `std.mail`
+(an SMTP client with STARTTLS), `phv db migrate`, `std.testing` and the in-process site of `phv test`, and the new
+`phv.toml` settings. The only other change is the demo's Dockerfile.
+
+### Method
+
+A new reviewer, given the source and the change, attacked a release build as an untrusted client: `phv serve --prod`,
+a site built with `phv build`, and a fake SMTP server. Requests tried every spelling of a path that could reach a
+private file or skip a middleware (percent-encoding, case, Windows 8.3 names and `::$DATA`, trailing dots and spaces,
+double slashes, `[id]` written literally, route parameters, the 404 page, the built site), compression with session
+and CSRF secrets (BREACH), ranges and validators at their edges, CORS origins, stalled readers holding responses, and
+injection through every argument of the mail API. Every finding was confirmed with a working PoC, and rerun against
+the fixed build.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| High | 0 | – |
+| Medium | 1 | Fixed |
+| Low | 3 | Fixed |
+| Info | 3 | Fixed / documented |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R8-1 | gzip skipped responses for one visitor by looking at their headers (`Set-Cookie`, `Cache-Control: private` / `no-store`), and the server adds `private, no-store` only when the page set no `Cache-Control` of its own. A page that used the session or printed a CSRF token and set `Cache-Control: no-cache` was compressed with the secret next to reflected input, and pages that read other cookies or `Authorization` were always compressed (BREACH) | Whether a response is personal is decided once, from what the page did, and carried with the response; and no page answering a request that carries cookies or `Authorization` is compressed (static files still are) |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R8-2 | `replyTo()` accepted a display name, so a value from a form could list more addresses (`a@evil.example, "x" <b@evil.example>`); line breaks were already refused | The reply-to address is a bare address, like the recipients |
+| R8-3 | Static text files of up to 1 MB were read whole on every request, even for clients that do not accept gzip, compressed again each time, and not counted in the server's limit on output waiting to be sent: 900 connections that stopped reading a 1 MB `.js` held 945 MB | Read whole only when the response will be compressed, counted in that limit; each compressed version is kept (up to 32 MB in all) instead of compressed again |
+| R8-4 | `is_email()` accepted line breaks, tabs and quotes (`x@e.com\r\nBcc:...`), and `url()` accepted `"` and `<>` | Both refuse control characters, quotes and angle brackets (and `is_email` also `(),;:[]\`) |
+
+### Info
+
+| Item | Result |
+|---|---|
+| A `"` in a path was written unescaped into the text access log | Fixed: `"` and `\` are escaped |
+| `_middleware.phv` runs before pages, not before static files under its directory | Documented in spec §14, with the way to serve protected files |
+| Each connection could buffer about 700 KB for a client that stopped reading (hyper's default buffer), so 900 stalled connections held 640 MB even for streamed files (since earlier releases) | Fixed: a connection's buffers are capped at 64 KB; 900 stalled readers of a 1 MB file now leave the server at 8 MB |
+
+### Residual Risks
+
+None.
+
+### Verification
+
+All PoCs were rerun against the fixed build: the session and CSRF pages with their own `Cache-Control` are sent
+uncompressed while static files still are compressed, the reply-to list is refused, 900 stalled readers of a 1 MB
+`.js` or `.png` leave the server at about 8 MB, and the loose addresses and URLs are refused. Regression tests:
+`caching_ranges_gzip_cors_and_shutdown` and `routes_middleware_and_error_pages` in `crates/phv_server/tests/http.rs`,
+`test_client_runs_pages_in_process`, `mail_reaches_a_local_server` and the unit tests of `mail.rs`, `routes.rs`,
+`static_files.rs` and `migrate.rs`, `tests/cases/validate.phv` and `layout.phv`, and the server migrations in the CI
+database job. What held up: routing and middleware for every spelling tried (also on a built site), private `_` files,
+the route scan (links are not followed; depth and page limits), production error pages, ranges and validators, CORS,
+STARTTLS stripping (refused for other machines), `layout()` with exceptions and nesting, `std.testing` (its builtin
+cannot be called from user code), `phv db` path checks, and shutdown. All tests pass on Windows, and on Linux and macOS
+in CI, with clippy (`-D warnings`) and rustfmt.
+
+Dependencies: `cargo audit` (CI) and `npm audit --omit=dev` in the extension and the website find nothing; Dependabot
+has no open alerts. New crates: `signal-hook-registry` and `errno` (Unix only, for tokio's signal handling).

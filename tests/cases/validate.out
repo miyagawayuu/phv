@@ -10,4 +10,6 @@ confirm: the passwords differ
 terms: accept the terms
 must be an email address / -
 name,email,terms
-a@b.co=y a@b=n @b.co=n a@@b.co=n a b@c.d=n a@.b.c=n a@b..c=n 
+a@b.co=y a@b=n @b.co=n a@@b.co=n a b@c.d=n a@.b.c=n a@b..c=n x@e.com
+Bcc:v@e.com=n x@e.com	f=n "x",y@a.b=n 
+a

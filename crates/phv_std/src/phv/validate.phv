@@ -71,7 +71,7 @@ export class Validator {
     public function url(string $field, string $message = ""): Validator {
         $v = $this->value($field);
         $ok = $v == null || (($v->lower()->startsWith("https://") || $v->lower()->startsWith("http://"))
-            && $v->len() > 8 && !$v->contains(" "));
+            && $v->len() > 8 && !has_unsafe($v, " \"'<>`"));
         return $this->check($field, $ok, $this->say($message, "must be a URL starting with http:// or https://"));
     }
 
@@ -149,9 +149,18 @@ export class Validator {
     }
 }
 
+// Control characters: line breaks, tabs, NUL and DEL.
+const CONTROL = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f";
+
+/** Whether `$s` has a control character or one of `$chars`. */
+function has_unsafe(string $s, string $chars): bool {
+    $bad = $chars . CONTROL;
+    return $s->chars()->any(fn($c) => $bad->contains($c));
+}
+
 /** Whether `$s` looks like an email address (a practical check, not RFC 5322). */
 export function is_email(string $s): bool {
-    if ($s->len() > 254 || $s->contains(" ")) {
+    if ($s->len() > 254 || has_unsafe($s, " \"'<>(),;:[]\\")) {
         return false;
     }
     $parts = $s->split("@");

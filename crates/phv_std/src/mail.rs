@@ -135,7 +135,10 @@ pub fn build(from: &str, m: &Message) -> Result<String, String> {
     no_breaks("the subject", m.subject)?;
     if !m.reply_to.is_empty() {
         no_breaks("the reply-to address", m.reply_to)?;
-        address_of(m.reply_to).ok_or_else(|| format!("`{}` is not an email address", m.reply_to))?;
+        // A bare address: a display name from a form could list more addresses.
+        if address_of(m.reply_to).is_none_or(|a| a != m.reply_to) {
+            return Err(format!("`{}` is not an email address", m.reply_to));
+        }
     }
     let from_addr = address_of(from).ok_or("[mail] from is not an email address")?;
     let domain = from_addr.rsplit('@').next().unwrap_or("localhost");
@@ -320,6 +323,8 @@ mod tests {
             assert!(build("app@example.com", &Message { to: &to, ..m }).is_err(), "{bad}");
         }
         assert!(build("app@example.com", &Message { subject: "a\r\nBcc: x@y.z", ..m }).is_err());
+        let list = "attacker@evil.example, \"x\" <me@example.com>";
+        assert!(build("app@example.com", &Message { reply_to: list, ..m }).is_err());
         let html = build("app@example.com", &Message { html: "<b>x</b>", ..m }).unwrap();
         assert!(html.contains("multipart/alternative") && html.contains("text/html"));
     }

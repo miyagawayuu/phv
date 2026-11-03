@@ -168,6 +168,15 @@ pub fn accepts_gzip(req: &HeaderMap) -> bool {
     })
 }
 
+/// Marks a response for one visitor (it uses the session, sets a cookie or
+/// carries a CSRF token), whatever its headers say.
+#[derive(Clone, Copy)]
+pub struct Personal;
+
+/// Marks a static file's response (its bytes come from the site, not the request).
+#[derive(Clone, Copy)]
+pub struct StaticFile;
+
 /// Whether a response may be compressed. Responses for one visitor (they set
 /// cookies, use the session or carry a CSRF token) are not: compressing a
 /// secret next to text an attacker chooses would leak it through the size

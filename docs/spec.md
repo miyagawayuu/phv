@@ -747,8 +747,8 @@ phv serve examples/site --port 8080
 - At most `[server] workers` scripts run at once (default: two per CPU, at least 8); a request waits up to 10 seconds
   for one. A request that cannot get one in time, or that arrives while the output waiting to be sent to clients is
   more than the workers could produce (`workers` × `memory_limit_mb`), gets `503 Service Unavailable` with
-  `Retry-After: 5`. Static files do not need a worker. So the memory a server uses stays around twice
-  `workers` × `memory_limit_mb`, however many clients connect.
+  `Retry-After: 5`. Static files do not need a worker. A connection buffers at most 64 KB for a client that reads
+  slowly. So the memory a server uses stays around twice `workers` × `memory_limit_mb`, however many clients connect.
 - If `[security] requests_per_minute` is set, the number of requests accepted per minute from a single client address is limited to that number
   (beyond it, the response is `429 Too Many Requests` with `Retry-After`). The default is unlimited. With
   `[security] rate_limit_store`, all server processes share the count (see "Rate limiting").
@@ -800,6 +800,8 @@ new route files are picked up within a second.
   }
   ```
 
+- Middleware runs before pages, not before static files: a file under `public/admin/` is served to anyone. Keep
+  files that need protection outside `public/` and send them from a page with `response()->file()`.
 - Files starting with `_` are never served as pages, so `_404.phv`, `_500.phv` and `_middleware.phv` cannot be opened by URL.
   `phv build` includes them in the executable.
 
@@ -810,7 +812,9 @@ new route files are picked up within a second.
   (`Range: bytes=a-b`) is served with `206 Partial Content` for media players and resumed downloads.
 - Text responses (HTML, CSS, JavaScript, JSON, SVG, ...) of 1 KB or more are compressed with gzip when the client
   accepts it (`[server] compress = false` turns this off). Responses for one visitor (they set a cookie, use the session
-  or carry a CSRF token) are never compressed, so a secret in them cannot be guessed from the compressed size (BREACH).
+  or carry a CSRF token, whatever `Cache-Control` the page sets) and pages answering a request that carries cookies or
+  an `Authorization` header are never compressed, so a secret in them cannot be guessed from the compressed size
+  (BREACH). Static files are compressed once per version and kept (up to 32 MB).
 - `[cors]` lets pages of other origins call the site from a browser:
 
   ```toml
@@ -1167,7 +1171,8 @@ $name = $v->value("name");           // ?string, trimmed (null when empty)
 
 Rules: `required`, `minLength`, `maxLength` (characters), `email`, `url` (http and https), `int` and `number` (with
 `min` / `max`), `in`, `same`, and `check` for checks of your own. Every rule takes a last `$message` argument to
-replace the English default. A rule other than `required` passes when the field is missing or empty. `is_email($s)`
+replace the English default. A rule other than `required` passes when the field is missing or empty. Rules check
+the value with spaces trimmed, so store `$v->value("name")`, which is what was checked. `is_email($s)`
 is the email check on its own.
 
 ### Mail (std.mail)

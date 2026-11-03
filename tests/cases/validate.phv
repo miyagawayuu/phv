@@ -44,7 +44,11 @@ foreach ($bad->errors() as $field => $messages) {
 echo $bad->first("email") ?? "-", " / ", $bad->first("missing") ?? "-", "\n";
 $empty = check(["name" => " ", "email" => ""]);
 echo $empty->errors()->keys()->join(","), "\n";
-foreach (["a@b.co", "a@b", "@b.co", "a@@b.co", "a b@c.d", "a@.b.c", "a@b..c"] as $e) {
+foreach (["a@b.co", "a@b", "@b.co", "a@@b.co", "a b@c.d", "a@.b.c", "a@b..c", "x@e.com\r\nBcc:v@e.com", "x@e.com\tf", "\"x\",y@a.b"] as $e) {
     echo $e, "=", is_email($e) ? "y" : "n", " ";
 }
 echo "\n";
+$u = new Validator(["a" => "https://x\"><script>", "b" => "https://ok.example/p?q=1"]);
+$u->url("a")->url("b");
+echo $u->errors()->keys()->join(","), "
+";

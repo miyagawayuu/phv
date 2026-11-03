@@ -417,6 +417,16 @@ fn caching_ranges_gzip_cors_and_shutdown() {
     write(&dir, "public/site.css", &css);
     write(&dir, "public/index.phv", &format!("<?phv\necho \"{}\";\n", "hello ".repeat(400)));
     write(&dir, "public/form.phv", &format!("<?phv\necho csrf_field(), \"{}\";\n", "x".repeat(2000)));
+    // Uses the session but sets its own Cache-Control: still personal.
+    write(
+        &dir,
+        "public/personal.phv",
+        &format!(
+            "<?phv\nimport std.http.{{session, response}};\nsession()->set(\"k\", \"v\");\n\
+             response()->header(\"Cache-Control\", \"no-cache\");\necho \"{}\";\n",
+            "s".repeat(2000)
+        ),
+    );
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let opts = ServeOptions {
@@ -466,6 +476,20 @@ fn caching_ranges_gzip_cors_and_shutdown() {
         assert!(head.contains("Accept-Encoding"), "{path} must vary: {head}");
         assert_eq!(gunzip(&body), want);
     }
+    // Personal pages, and pages answering a request with cookies, are never
+    // compressed (BREACH); static files still are.
+    for (path, cookie) in [("/personal", ""), ("/", "Cookie: a=b\r\n")] {
+        let (head, _) = raw_bytes(
+            addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n{cookie}Connection: close\r\n\r\n"),
+        );
+        assert!(!head.to_ascii_lowercase().contains("content-encoding"), "{path}: {head}");
+    }
+    let (head, _) = raw_bytes(
+        addr,
+        "GET /site.css HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nCookie: a=b\r\nConnection: close\r\n\r\n",
+    );
+    assert!(head.to_ascii_lowercase().contains("content-encoding: gzip"), "{head}");
     // A page with a CSRF token is personal: never compressed (BREACH).
     let (head, _) =
         raw_bytes(addr, "GET /form HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n");

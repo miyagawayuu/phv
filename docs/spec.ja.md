@@ -738,7 +738,8 @@ phv serve examples/site --port 8080
 - 同時に実行するスクリプトは `[server] workers` 個まで(既定は CPU 数の 2 倍、最小 8)。空きを最大 10 秒待つ。
   時間内に空かなかったリクエストと、クライアントへの送信待ちの出力が workers で作れる量(`workers` × `memory_limit_mb`)を
   超えているときに来たリクエストには、`503 Service Unavailable` と `Retry-After: 5` を返す。静的ファイルには空きは要らない。
-  そのため、何人が接続しても、サーバーのメモリはおよそ `workers` × `memory_limit_mb` の 2 倍に収まる。
+  読むのが遅いクライアントのために 1 つの接続がためるのは 64 KB まで。そのため、何人が接続しても、サーバーのメモリは
+  およそ `workers` × `memory_limit_mb` の 2 倍に収まる。
 - `[security] requests_per_minute` を書くと、1 つの接続元アドレスから 1 分間に受け付けるリクエストをその数までにする
   (超えると `429 Too Many Requests` と `Retry-After`)。既定は無制限。`[security] rate_limit_store` を書くと、
   すべてのサーバープロセスで数を共有する(「レート制限」を参照)。
@@ -790,6 +791,8 @@ public/docs/[...path].phv      /docs/guide/intro  request()->param("path") == "g
   }
   ```
 
+- ミドルウェアはページの前に実行され、静的ファイルの前には実行されない: `public/admin/` の下のファイルは誰にでも
+  配信される。保護が必要なファイルは `public/` の外に置き、ページから `response()->file()` で送る。
 - `_` で始まるファイルはページとして配信されないので、`_404.phv`、`_500.phv`、`_middleware.phv` を URL で開くことは
   できない。`phv build` はこれらを実行ファイルに含める。
 
@@ -800,7 +803,9 @@ public/docs/[...path].phv      /docs/guide/intro  request()->param("path") == "g
   ダウンロードの再開のため、1 つのバイト範囲(`Range: bytes=a-b`)を `206 Partial Content` で送る。
 - 1 KB 以上のテキストのレスポンス(HTML、CSS、JavaScript、JSON、SVG など)は、クライアントが受け付けるなら gzip で
   圧縮する(`[server] compress = false` で止められる)。訪問者ごとのレスポンス(Cookie を設定する、セッションを使う、
-  CSRF トークンを含む)は決して圧縮しないので、圧縮後の大きさから中の秘密を推測されることはない(BREACH)。
+  CSRF トークンを含む。ページが設定した `Cache-Control` によらない)と、Cookie か `Authorization` ヘッダー付きの
+  リクエストに答えるページは決して圧縮しないので、圧縮後の大きさから中の秘密を推測されることはない(BREACH)。
+  静的ファイルは版ごとに 1 回だけ圧縮して保持する(32 MB まで)。
 - `[cors]` を書くと、ほかのオリジンのページからブラウザでこのサイトを呼べる:
 
   ```toml
@@ -1150,7 +1155,8 @@ $name = $v->value("name");           // ?string。前後の空白を除く(空�
 
 規則: `required`、`minLength`、`maxLength`(文字数)、`email`、`url`(http と https)、`int` と `number`(`min` / `max`
 付き)、`in`、`same`、独自の検査には `check`。どの規則も最後の引数 `$message` で英語の既定のメッセージを置き換えられる。
-`required` 以外の規則は、フィールドがないか空なら通る。`is_email($s)` はメールアドレスの検査だけを行う。
+`required` 以外の規則は、フィールドがないか空なら通る。規則は前後の空白を除いた値を検査するので、保存するのは検査した
+値である `$v->value("name")` にする。`is_email($s)` はメールアドレスの検査だけを行う。
 
 ### メール(std.mail)
 

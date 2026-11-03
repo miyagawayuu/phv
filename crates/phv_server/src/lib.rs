@@ -49,9 +49,13 @@ const MAX_FIELDS: usize = 1000;
 const WRITE_STALL: Duration = Duration::from_secs(30);
 /// Time a request waits for a free worker before it gets 503.
 const QUEUE_WAIT: Duration = Duration::from_secs(10);
-/// Static files larger than this are sent uncompressed (compressing takes time
-/// on every request).
+/// Static files larger than this are sent uncompressed.
 const MAX_STATIC_COMPRESS: u64 = 1 << 20;
+/// Bytes of compressed static files kept, so each version is compressed once.
+const GZ_CACHE: usize = 32 << 20;
+/// A connection's read and write buffers (hyper's default is about 400 KB):
+/// a client that stops reading holds at most this much (and a file's 64 KB).
+const CONN_BUFFER: usize = 64 * 1024;
 
 /// A site built with `phv build`: its pages and static files, by their paths
 /// under `public/`, and its phv.toml. Directories the project reads and writes
@@ -97,6 +101,8 @@ struct State {
     access_log: Option<Mutex<std::fs::File>>,
     /// Tags of the static files of a built site, by path.
     embedded_tags: HashMap<String, String>,
+    /// Compressed static files by `ETag`, and their total size.
+    gz_cache: Mutex<(HashMap<String, Bytes>, usize)>,
 }
 
 impl State {
@@ -132,6 +138,7 @@ impl State {
             routes: Mutex::new((Instant::now(), Arc::new(routes::Table::default()))),
             access_log: None,
             embedded_tags: HashMap::new(),
+            gz_cache: Mutex::new((HashMap::new(), 0)),
         }
     }
 
@@ -316,6 +323,7 @@ fn serve_with(
                 let conn = http1::Builder::new()
                     .timer(TokioTimer::new())
                     .header_read_timeout(HEADER_TIMEOUT)
+                    .max_buf_size(CONN_BUFFER)
                     .serve_connection(TokioIo::new(StallGuard::new(stream, WRITE_STALL)), service);
                 tokio::pin!(conn);
                 tokio::select! {
@@ -354,6 +362,9 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
     let path = req.uri().path().to_string();
     let ip = peer.ip().to_canonical().to_string();
     let gzip_ok = state.config.compress && static_files::accepts_gzip(req.headers());
+    // A page answering a request that carries credentials may hold the visitor's
+    // secrets next to text from the request: it is never compressed (BREACH).
+    let credentialed = req.headers().contains_key("cookie") || req.headers().contains_key("authorization");
     let origin = req.headers().get("origin").and_then(|v| v.to_str().ok()).map(str::to_string);
     let cors = state.config.cors.as_ref().zip(origin.as_deref()).filter(|(c, o)| c.allows(o)).map(|(c, _)| c);
     // A CORS preflight is answered here, before rate limits and pages.
@@ -429,24 +440,34 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
         static_files::vary(resp.headers_mut(), "Origin");
     }
     if state.config.compress {
-        resp = compress(resp, gzip_ok).await;
+        resp = compress(&state, resp, gzip_ok, credentialed).await;
     }
     add_security_headers(&state, &mut resp);
     log_request(&state, &ip, &method, &path, resp.status().as_u16(), start);
     Ok(resp)
 }
 
-/// gzip for a text response in memory, when the client accepts it.
-async fn compress(mut resp: Resp, gzip_ok: bool) -> Resp {
+/// gzip for a text response in memory, when the client accepts it. Static
+/// files are compressed once per version (`ETag`) and kept.
+async fn compress(state: &State, mut resp: Resp, gzip_ok: bool, credentialed: bool) -> Resp {
     let text = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(static_files::compressible);
     if text {
         static_files::vary(resp.headers_mut(), "Accept-Encoding");
     }
-    if !gzip_ok || !static_files::may_compress(&resp) {
+    let is_static = resp.extensions().get::<static_files::StaticFile>().is_some();
+    let personal = resp.extensions().get::<static_files::Personal>().is_some() || (credentialed && !is_static);
+    if !gzip_ok || personal || !static_files::may_compress(&resp) {
+        return resp;
+    }
+    let tag = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_string).filter(|_| is_static);
+    if let Some(gz) = tag.as_ref().and_then(|t| state.gz_cache.lock().unwrap().0.get(t).cloned()) {
+        *resp.body_mut() = RespBody::full(gz);
+        static_files::mark_gzip(resp.headers_mut());
         return resp;
     }
     let Some(bytes) = resp.body_mut().take_bytes() else { return resp };
-    let packed = if (1024..=static_files::MAX_COMPRESS).contains(&bytes.len()) {
+    let max = if is_static { MAX_STATIC_COMPRESS as usize } else { static_files::MAX_COMPRESS };
+    let packed = if (1024..=max).contains(&bytes.len()) {
         let data = bytes.clone();
         tokio::task::spawn_blocking(move || static_files::gzip(&data)).await.ok().flatten()
     } else {
@@ -454,6 +475,16 @@ async fn compress(mut resp: Resp, gzip_ok: bool) -> Resp {
     };
     match packed {
         Some(gz) => {
+            let gz = Bytes::from(gz);
+            if let Some(t) = tag {
+                let mut cache = state.gz_cache.lock().unwrap();
+                // A bounded cache: emptied when full (files change rarely).
+                if cache.1 + gz.len() > GZ_CACHE {
+                    *cache = (HashMap::new(), 0);
+                }
+                cache.1 += gz.len();
+                cache.0.insert(t, gz.clone());
+            }
             *resp.body_mut() = RespBody::full(gz);
             static_files::mark_gzip(resp.headers_mut());
         }
@@ -469,7 +500,10 @@ fn log_request(state: &State, ip: &str, method: &Method, path: &str, status: u16
     let (Some(file), Some((_, format))) = (&state.access_log, &state.config.access_log) else { return };
     let time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let line = match format {
-        LogFormat::Text => format!("{time} {ip} \"{method} {path}\" {status} {ms:.1}ms\n"),
+        LogFormat::Text => {
+            let path = path.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("{time} {ip} \"{method} {path}\" {status} {ms:.1}ms\n")
+        }
         LogFormat::Json => {
             let v = serde_json::json!({
                 "time": time,
@@ -635,6 +669,7 @@ fn content_type(path: &Path) -> Option<&'static str> {
 }
 
 async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
+    let gzip_ok = state.config.compress && static_files::accepts_gzip(req.headers());
     if let Err(e) = state.routes() {
         eprintln!("error in the routes of public/: {e}");
         return state.error_page("Route error", &e);
@@ -695,15 +730,16 @@ async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
                         }
                         partial(RespBody::file(file, b - a + 1), a, b, len)
                     }
-                    // Small text files are read whole, so `compress` can gzip them;
-                    // others are streamed: memory does not grow with the file or the downloads.
-                    None if len <= MAX_STATIC_COMPRESS && static_files::compressible(ct) => {
+                    // Small text files a client takes gzipped are read whole, so `compress`
+                    // can gzip them (once per version); others are streamed: memory does
+                    // not grow with the file or the downloads.
+                    None if gzip_ok && len <= MAX_STATIC_COMPRESS && static_files::compressible(ct) => {
                         use tokio::io::AsyncReadExt;
                         let mut data = Vec::with_capacity(len as usize);
                         if file.read_to_end(&mut data).await.is_err() {
                             return not_found();
                         }
-                        Response::new(RespBody::full(data))
+                        Response::new(RespBody::counted(data, &state.buffered))
                     }
                     None => Response::new(RespBody::file(file, len)),
                 }
@@ -726,6 +762,7 @@ fn partial(body: RespBody, a: u64, b: u64, len: u64) -> Resp {
 }
 
 fn static_headers(state: &State, r: &mut Resp, ct: &'static str, v: &Validators) {
+    r.extensions_mut().insert(static_files::StaticFile);
     let h = r.headers_mut();
     h.insert(CONTENT_TYPE, HeaderValue::from_static(ct));
     h.insert("accept-ranges", HeaderValue::from_static("bytes"));
@@ -1040,8 +1077,12 @@ impl State {
         }
         // Personalized responses must not be stored by shared caches: those that use the
         // session or cookies, or carry a CSRF token (it is tied to the visitor's cookie).
-        if (touched_session || sets_cookie || http.personalized) && !h.contains_key("cache-control") {
+        let personal = touched_session || sets_cookie || http.personalized;
+        if personal && !h.contains_key("cache-control") {
             h.insert("cache-control", HeaderValue::from_static("private, no-store"));
+        }
+        if personal {
+            r.extensions_mut().insert(static_files::Personal);
         }
         r
     }
