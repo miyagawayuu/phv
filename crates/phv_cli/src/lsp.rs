@@ -8,14 +8,15 @@ use phv_syntax::token::Tok;
 use phv_syntax::{Severity, SourceFile};
 use phv_types::index::{Item, ItemKind};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
 
-/// Messages on the stream: `None` means the stream ended or its framing is
-/// broken (nothing more can be read); `Some(None)` is a well-framed message
-/// that is not valid JSON, answered with a parse error.
-fn read_message(input: &mut impl BufRead) -> Option<Option<Value>> {
+/// Messages on the stream, with the length of their body: `None` means the
+/// stream ended or its framing is broken (nothing more can be read); a message
+/// of `None` is well framed but not valid JSON, answered with a parse error.
+fn read_message(input: &mut impl BufRead) -> Option<(Option<Value>, usize)> {
     let mut length = None;
     loop {
         let mut line = String::new();
@@ -38,11 +39,66 @@ fn read_message(input: &mut impl BufRead) -> Option<Option<Value>> {
     }
     let mut buf = vec![0u8; n];
     input.read_exact(&mut buf).ok()?;
-    Some(serde_json::from_slice(&buf).ok())
+    Some((serde_json::from_slice(&buf).ok(), n))
+}
+
+/// A message from the reader thread (`None` if it is not JSON) and what it costs
+/// to hold: its body and the bookkeeping of a small message.
+type Incoming = (Option<Value>, usize);
+
+/// What the reader thread holds ahead of the server at most, beyond one message.
+const MAX_QUEUED: usize = 64 * 1024 * 1024;
+
+/// Reads messages into `tx` until the stream ends or the server stops listening.
+/// The server hands back the cost of each message it takes on `taken`, so that a
+/// client writing faster than the server checks waits instead of filling memory.
+fn read_messages(input: &mut impl BufRead, tx: &Sender<Incoming>, taken: &Receiver<usize>) {
+    let mut queued = 0;
+    loop {
+        while let Ok(n) = taken.try_recv() {
+            queued -= n;
+        }
+        while queued >= MAX_QUEUED {
+            let Ok(n) = taken.recv() else { return };
+            queued -= n;
+        }
+        let Some((msg, n)) = read_message(input) else { return };
+        let cost = n + 256;
+        queued += cost;
+        if tx.send((msg, cost)).is_err() {
+            return;
+        }
+    }
+}
+
+/// The server's end of the reader thread.
+struct Inbox {
+    rx: Receiver<Incoming>,
+    taken: Sender<usize>,
+}
+
+impl Inbox {
+    /// Waits for a message, then takes every one already waiting with it.
+    /// Empty once the stream has ended.
+    fn batch(&self) -> Vec<Option<Value>> {
+        let Ok(first) = self.rx.recv() else { return Vec::new() };
+        let mut batch = vec![first];
+        batch.extend(self.rx.try_iter());
+        batch
+            .into_iter()
+            .map(|(msg, cost)| {
+                let _ = self.taken.send(cost);
+                msg
+            })
+            .collect()
+    }
 }
 
 /// Open documents at most; more are ignored (each holds a copy of its text).
 const MAX_OPEN: usize = 1000;
+
+/// Cancelled request ids remembered at most (the oldest are forgotten first).
+const MAX_CANCELLED: usize = 100;
 
 fn send(out: &mut impl Write, msg: &Value) {
     let body = msg.to_string();
@@ -461,122 +517,191 @@ impl Server {
 }
 
 pub fn run() {
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
+    let (tx, rx) = mpsc::channel();
+    let (taken, taken_rx) = mpsc::channel();
+    std::thread::spawn(move || read_messages(&mut std::io::stdin().lock(), &tx, &taken_rx));
     let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let mut server = Server { open: HashMap::new(), reported: HashMap::new() };
-    let mut shutting_down = false;
-    while let Some(msg) = read_message(&mut input) {
-        let Some(msg) = msg else {
-            send(
-                &mut out,
-                &json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "parse error" } }),
-            );
-            continue;
-        };
-        let method = msg["method"].as_str().unwrap_or("").to_string();
-        let id = msg.get("id").cloned();
-        let params = &msg["params"];
-        let doc_path = || params["textDocument"]["uri"].as_str().and_then(uri_to_path);
-        // A bug in the checker must not take the editor's language server down.
-        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match method.as_str() {
-            "initialize" => Some(json!({
-                "capabilities": {
-                    "textDocumentSync": { "openClose": true, "change": 1, "save": { "includeText": false } },
-                    "hoverProvider": true,
-                    "completionProvider": { "triggerCharacters": ["$", ">", ":"] },
-                    "definitionProvider": true,
-                },
-                "serverInfo": { "name": "phv", "version": env!("CARGO_PKG_VERSION") },
-            })),
-            "shutdown" => {
-                shutting_down = true;
-                Some(Value::Null)
-            }
-            "exit" => std::process::exit(if shutting_down { 0 } else { 1 }),
-            "textDocument/didOpen" => {
-                if let Some(p) = doc_path().filter(|p| server.open.contains_key(p) || server.open.len() < MAX_OPEN) {
-                    let text = params["textDocument"]["text"].as_str().unwrap_or("").to_string();
-                    server.open.insert(p.clone(), text);
-                    server.check(&p, &mut out);
-                }
-                None
-            }
-            "textDocument/didChange" => {
-                if let Some(p) = doc_path().filter(|p| server.open.contains_key(p)) {
-                    if let Some(text) =
-                        params["contentChanges"].as_array().and_then(|c| c.last()).and_then(|c| c["text"].as_str())
-                    {
-                        server.open.insert(p.clone(), text.to_string());
-                    }
-                    server.check(&p, &mut out);
-                }
-                None
-            }
-            "textDocument/didSave" => {
-                // Only documents the editor opened are checked.
-                if let Some(p) = doc_path().filter(|p| server.open.contains_key(p)) {
-                    server.check(&p, &mut out);
-                }
-                None
-            }
-            "textDocument/didClose" => {
-                if let Some(p) = doc_path() {
-                    server.open.remove(&p);
-                    server.reported.remove(&p);
-                }
-                None
-            }
-            "textDocument/completion" => match doc_path() {
-                Some(p) => Some(server.completion(
-                    &p,
-                    params["position"]["line"].as_u64().unwrap_or(0),
-                    params["position"]["character"].as_u64().unwrap_or(0),
-                    params["context"]["triggerKind"].as_u64() == Some(1),
-                )),
-                None => Some(Value::Null),
-            },
-            "textDocument/definition" => match doc_path() {
-                Some(p) => Some(server.definition(
-                    &p,
-                    params["position"]["line"].as_u64().unwrap_or(0),
-                    params["position"]["character"].as_u64().unwrap_or(0),
-                )),
-                None => Some(Value::Null),
-            },
-            "textDocument/hover" => match doc_path() {
-                Some(p) => Some(server.hover(
-                    &p,
-                    params["position"]["line"].as_u64().unwrap_or(0),
-                    params["position"]["character"].as_u64().unwrap_or(0),
-                )),
-                None => Some(Value::Null),
-            },
-            _ => {
-                if id.is_some() {
-                    send(
-                        &mut out,
-                        &json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "error": { "code": -32601, "message": format!("method not found: {method}") },
-                        }),
-                    );
-                }
-                None
-            }
-        }));
-        let Ok(result) = handled else {
-            if id.is_some() {
+    if let Some(code) = serve(&Inbox { rx, taken }, &mut stdout.lock()) {
+        std::process::exit(code);
+    }
+}
+
+/// Runs `f`, answering `id` with an internal error if it panics: a bug in the
+/// checker must not take the editor's language server down.
+fn guarded<W: Write, T>(out: &mut W, id: Option<&Value>, f: impl FnOnce(&mut W) -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut *out))) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            if let Some(id) = id {
                 send(
-                    &mut out,
+                    out,
                     &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": "internal error" } }),
                 );
             }
-            continue;
-        };
-        if let (Some(id), Some(result)) = (id, result) {
-            send(&mut out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+            None
+        }
+    }
+}
+
+fn doc_path(params: &Value) -> Option<PathBuf> {
+    params["textDocument"]["uri"].as_str().and_then(uri_to_path)
+}
+
+/// Answers messages until the stream ends (`None`) or `exit` arrives (its exit code).
+/// Every message already waiting is taken at once: text changes first, then the
+/// rest in the order they came (so requests see the newest text), then one check
+/// per document that changed, however many edits arrived during the last check.
+fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
+    let mut server = Server { open: HashMap::new(), reported: HashMap::new() };
+    let mut shutting_down = false;
+    let mut cancelled: VecDeque<Value> = VecDeque::new();
+    loop {
+        let batch = inbox.batch();
+        if batch.is_empty() {
+            return None;
+        }
+        // Documents to check once the batch is answered, in the order they changed.
+        let mut changed: Vec<PathBuf> = Vec::new();
+        for msg in batch.iter().flatten() {
+            let params = &msg["params"];
+            guarded(out, None, |_| match msg["method"].as_str().unwrap_or("") {
+                "textDocument/didOpen" => {
+                    if let Some(p) =
+                        doc_path(params).filter(|p| server.open.contains_key(p) || server.open.len() < MAX_OPEN)
+                    {
+                        let text = params["textDocument"]["text"].as_str().unwrap_or("").to_string();
+                        server.open.insert(p.clone(), text);
+                        if !changed.contains(&p) {
+                            changed.push(p);
+                        }
+                    }
+                }
+                "textDocument/didChange" => {
+                    if let Some(p) = doc_path(params).filter(|p| server.open.contains_key(p)) {
+                        if let Some(text) =
+                            params["contentChanges"].as_array().and_then(|c| c.last()).and_then(|c| c["text"].as_str())
+                        {
+                            server.open.insert(p.clone(), text.to_string());
+                        }
+                        if !changed.contains(&p) {
+                            changed.push(p);
+                        }
+                    }
+                }
+                "textDocument/didClose" => {
+                    if let Some(p) = doc_path(params) {
+                        server.open.remove(&p);
+                        server.reported.remove(&p);
+                        changed.retain(|c| *c != p);
+                    }
+                }
+                "$/cancelRequest" => {
+                    let id = &params["id"];
+                    if (id.is_number() || id.is_string()) && !cancelled.contains(id) {
+                        if cancelled.len() == MAX_CANCELLED {
+                            cancelled.pop_front();
+                        }
+                        cancelled.push_back(id.clone());
+                    }
+                }
+                _ => {}
+            });
+        }
+        for msg in &batch {
+            let Some(msg) = msg else {
+                send(
+                    out,
+                    &json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "parse error" } }),
+                );
+                continue;
+            };
+            let method = msg["method"].as_str().unwrap_or("");
+            let id = msg.get("id");
+            let params = &msg["params"];
+            match method {
+                "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didClose" | "$/cancelRequest" => {
+                    continue
+                }
+                "exit" => return Some(if shutting_down { 0 } else { 1 }),
+                _ => {}
+            }
+            if let Some(i) = id.and_then(|id| cancelled.iter().position(|c| c == id)) {
+                cancelled.remove(i);
+                send(
+                    out,
+                    &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32800, "message": "request cancelled" } }),
+                );
+                continue;
+            }
+            let position = || {
+                (
+                    params["position"]["line"].as_u64().unwrap_or(0),
+                    params["position"]["character"].as_u64().unwrap_or(0),
+                )
+            };
+            let result = guarded(out, id, |out| match method {
+                "initialize" => Some(json!({
+                    "capabilities": {
+                        "textDocumentSync": { "openClose": true, "change": 1, "save": { "includeText": false } },
+                        "hoverProvider": true,
+                        "completionProvider": { "triggerCharacters": ["$", ">", ":"] },
+                        "definitionProvider": true,
+                    },
+                    "serverInfo": { "name": "phv", "version": env!("CARGO_PKG_VERSION") },
+                })),
+                "shutdown" => {
+                    shutting_down = true;
+                    Some(Value::Null)
+                }
+                "textDocument/didSave" => {
+                    // Only documents the editor opened are checked.
+                    if let Some(p) = doc_path(params).filter(|p| server.open.contains_key(p)) {
+                        if !changed.contains(&p) {
+                            changed.push(p);
+                        }
+                    }
+                    None
+                }
+                "textDocument/completion" => Some(match doc_path(params) {
+                    Some(p) => {
+                        let (line, character) = position();
+                        server.completion(&p, line, character, params["context"]["triggerKind"].as_u64() == Some(1))
+                    }
+                    None => Value::Null,
+                }),
+                "textDocument/definition" => Some(match doc_path(params) {
+                    Some(p) => {
+                        let (line, character) = position();
+                        server.definition(&p, line, character)
+                    }
+                    None => Value::Null,
+                }),
+                "textDocument/hover" => Some(match doc_path(params) {
+                    Some(p) => {
+                        let (line, character) = position();
+                        server.hover(&p, line, character)
+                    }
+                    None => Value::Null,
+                }),
+                _ => {
+                    if id.is_some() {
+                        send(
+                            out,
+                            &json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "error": { "code": -32601, "message": format!("method not found: {method}") },
+                            }),
+                        );
+                    }
+                    None
+                }
+            });
+            if let (Some(id), Some(Some(result))) = (id, result) {
+                send(out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+            }
+        }
+        for p in changed {
+            guarded(out, None, |out| server.check(&p, out));
         }
     }
 }
@@ -643,6 +768,101 @@ mod tests {
             let name = target.file_name()?.to_string_lossy().into_owned();
             Some((name, content[start as usize..end as usize].to_string()))
         }
+    }
+
+    /// What the server writes when `msgs` all arrive before it reads the first.
+    fn serve_batch(msgs: Vec<Value>) -> Vec<Value> {
+        let (tx, rx) = mpsc::channel();
+        for msg in msgs {
+            tx.send((Some(msg), 0)).unwrap();
+        }
+        drop(tx);
+        let (taken, _) = mpsc::channel();
+        let mut out = Vec::new();
+        assert_eq!(serve(&Inbox { rx, taken }, &mut out), None);
+        let mut input = &out[..];
+        std::iter::from_fn(|| read_message(&mut input).map(|(msg, _)| msg.unwrap())).collect()
+    }
+
+    fn notification(method: &str, params: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "method": method, "params": params })
+    }
+
+    #[test]
+    fn checks_a_burst_of_edits_once() {
+        let p = Project::new("burst");
+        let uri = path_to_uri(&p.dir.join("page.phv"));
+        let mut msgs = vec![notification(
+            "textDocument/didOpen",
+            json!({ "textDocument": { "uri": uri, "languageId": "phv", "version": 0, "text": "" } }),
+        )];
+        for i in 1..=100 {
+            msgs.push(notification(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": { "uri": uri, "version": i },
+                    "contentChanges": [{ "text": format!("<?phv\necho $missing{i};\n") }],
+                }),
+            ));
+        }
+        let got = serve_batch(msgs);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0]["method"], "textDocument/publishDiagnostics");
+        assert_eq!(got[0]["params"]["uri"], uri);
+        let diags = got[0]["params"]["diagnostics"].as_array().unwrap();
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0]["message"].as_str().unwrap().contains("$missing100"), "{diags:?}");
+    }
+
+    #[test]
+    fn answers_cancelled_requests_with_an_error() {
+        let p = Project::new("cancel");
+        let uri = path_to_uri(&p.dir.join("page.phv"));
+        let complete = |id: u64| {
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "textDocument/completion",
+                "params": { "textDocument": { "uri": uri }, "position": { "line": 1, "character": 2 },
+                            "context": { "triggerKind": 1 } },
+            })
+        };
+        let got = serve_batch(vec![
+            notification(
+                "textDocument/didOpen",
+                json!({ "textDocument": { "uri": uri, "languageId": "phv", "version": 0, "text": "<?phv\nma\n" } }),
+            ),
+            complete(1),
+            complete(2),
+            notification("$/cancelRequest", json!({ "id": 1 })),
+        ]);
+        let reply = |id: u64| got.iter().find(|m| m["id"] == id).unwrap();
+        assert_eq!(reply(1)["error"]["code"], -32800);
+        let labels = reply(2)["result"].as_array().unwrap();
+        assert!(labels.iter().any(|i| i["label"] == "match"), "{labels:?}");
+        // The two answers come first, then the diagnostics of the opened document.
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[2]["method"], "textDocument/publishDiagnostics");
+    }
+
+    #[test]
+    fn reads_on_its_own_thread_until_exit() {
+        let mut stream = Vec::new();
+        for msg in [
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "shutdown" }),
+            json!({ "jsonrpc": "2.0", "method": "exit" }),
+        ] {
+            send(&mut stream, &msg);
+        }
+        stream.extend_from_slice(b"Content-Length: 3\r\n\r\n{\"x");
+        let (tx, rx) = mpsc::channel();
+        let (taken, taken_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || read_messages(&mut &stream[..], &tx, &taken_rx));
+        let mut out = Vec::new();
+        assert_eq!(serve(&Inbox { rx, taken }, &mut out), Some(0));
+        reader.join().unwrap();
+        let mut output = &out[..];
+        let got: Vec<Value> = std::iter::from_fn(|| read_message(&mut output).map(|(m, _)| m.unwrap())).collect();
+        assert_eq!(got.iter().map(|m| m["id"].clone()).collect::<Vec<_>>(), [json!(1), json!(2)]);
     }
 
     impl Drop for Project {
