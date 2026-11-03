@@ -206,7 +206,7 @@ pub fn compile_cached(root: &Path, entry: &Path) -> Result<Compiled, CompileErro
     Ok(c)
 }
 
-fn clone_program(p: &Program) -> Program {
+pub(crate) fn clone_program(p: &Program) -> Program {
     // Program is serializable but not Clone; round-trip through the encoder.
     postcard::from_bytes(&postcard::to_allocvec(p).expect("encode")).expect("decode")
 }

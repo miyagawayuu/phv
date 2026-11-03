@@ -1,6 +1,7 @@
 //! Loads a script with its imports and templates, type-checks it, compiles it
 //! to bytecode and runs it.
 
+pub mod bundle;
 mod cache;
 pub mod config;
 

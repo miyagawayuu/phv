@@ -44,6 +44,15 @@ const WRITE_STALL: Duration = Duration::from_secs(30);
 /// Time a request waits for a free worker before it gets 503.
 const QUEUE_WAIT: Duration = Duration::from_secs(10);
 
+/// A site built with `phv build`: its pages and static files, by their paths
+/// under `public/`, and its phv.toml. Directories the project reads and writes
+/// stay on disk, under the root given to the server.
+pub struct Embedded {
+    pub pages: HashMap<String, Arc<Compiled>>,
+    pub statics: HashMap<String, Bytes>,
+    pub config: Option<String>,
+}
+
 pub struct ServeOptions {
     /// Site directory; pages live in `<root>/public`.
     pub root: PathBuf,
@@ -65,6 +74,7 @@ struct State {
     csrf_secret: Vec<u8>,
     csrf_cookie: &'static str,
     cache: Mutex<HashMap<PathBuf, Arc<Compiled>>>,
+    embedded: Option<Embedded>,
     /// Scripts running at once (`[server] workers`).
     workers: Arc<tokio::sync::Semaphore>,
     /// Bytes of script output waiting to be sent, over all connections.
@@ -102,6 +112,7 @@ impl State {
             dev,
             time_limit,
             cache: Mutex::new(HashMap::new()),
+            embedded: None,
         }
     }
 }
@@ -116,14 +127,34 @@ pub fn serve(opts: ServeOptions) -> Result<(), String> {
 
 /// Serves on an already bound listener (tests bind port 0).
 pub fn serve_on(listener: std::net::TcpListener, opts: ServeOptions) -> Result<(), String> {
+    serve_with(listener, opts, None)
+}
+
+/// Serves a site built with `phv build` (see `Embedded`).
+pub fn serve_embedded(opts: ServeOptions, embedded: Embedded) -> Result<(), String> {
+    let addr: SocketAddr = format!("{}:{}", opts.host, opts.port)
+        .parse()
+        .map_err(|e| format!("invalid address {}:{}: {e}", opts.host, opts.port))?;
+    let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
+    serve_with(listener, opts, Some(embedded))
+}
+
+fn serve_with(listener: std::net::TcpListener, opts: ServeOptions, embedded: Option<Embedded>) -> Result<(), String> {
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let root = opts.root.canonicalize().map_err(|e| format!("cannot open {}: {e}", opts.root.display()))?;
-    if !root.join("public").is_dir() {
-        return Err(format!("{} has no `public/` directory", root.display()));
-    }
-    let config = load_config(&root)?;
-    let state = Arc::new(State::new(root, opts.dev, opts.time_limit, config));
+    let config = match &embedded {
+        Some(e) => phv_driver::config::parse_config(&root, e.config.as_deref().unwrap_or(""))?,
+        None => {
+            if !root.join("public").is_dir() {
+                return Err(format!("{} has no `public/` directory", root.display()));
+            }
+            load_config(&root)?
+        }
+    };
+    let mut state = State::new(root, opts.dev, opts.time_limit, config);
+    state.embedded = embedded;
+    let state = Arc::new(state);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // Scripts run on blocking threads; give them room for deep recursion.
@@ -137,7 +168,10 @@ pub fn serve_on(listener: std::net::TcpListener, opts: ServeOptions) -> Result<(
         if state.dev && !addr.ip().is_loopback() {
             eprintln!("warning: development mode shows error details to every visitor; use --prod");
         }
-        eprintln!("Serving {}", state.public.display());
+        match &state.embedded {
+            Some(e) => eprintln!("Serving the built site ({} pages, {} files)", e.pages.len(), e.statics.len()),
+            None => eprintln!("Serving {}", state.public.display()),
+        }
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         loop {
             let permit = slots.clone().acquire_owned().await.expect("semaphore is never closed");
@@ -251,6 +285,8 @@ fn add_security_headers(state: &State, resp: &mut Resp) {
 enum Target {
     Script(PathBuf),
     Static(PathBuf),
+    /// A static file of a built site, with its content type.
+    Embedded(Bytes, &'static str),
 }
 
 /// Maps a URL path to a file under `public/`, refusing anything that could
@@ -269,6 +305,9 @@ fn resolve(state: &State, url_path: &str) -> Option<Target> {
         return None;
     }
     let rel = segments.join("/");
+    if let Some(e) = &state.embedded {
+        return resolve_embedded(state, e, rel);
+    }
     let mut candidates = Vec::new();
     if rel.is_empty() {
         candidates.push("index.phv".to_string());
@@ -336,6 +375,14 @@ async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
     let target = resolve(state, req.uri().path());
     match target {
         None => not_found(),
+        Some(Target::Embedded(bytes, ct)) => {
+            if req.method() != Method::GET && req.method() != Method::HEAD {
+                return simple(StatusCode::METHOD_NOT_ALLOWED, "text/plain", "method not allowed".into());
+            }
+            let mut r = Response::new(RespBody::full(bytes));
+            r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+            r
+        }
         Some(Target::Static(p)) => {
             if req.method() != Method::GET && req.method() != Method::HEAD {
                 return simple(StatusCode::METHOD_NOT_ALLOWED, "text/plain", "method not allowed".into());
@@ -358,9 +405,36 @@ async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
     }
 }
 
+/// `resolve` for a built site: its pages are known by their paths under
+/// `public/`, which `State::compiled` looks up again.
+fn resolve_embedded(state: &State, e: &Embedded, rel: String) -> Option<Target> {
+    let candidates = if rel.is_empty() {
+        vec!["index.phv".to_string()]
+    } else if rel.ends_with(".phv") {
+        vec![rel.clone()]
+    } else {
+        vec![format!("{rel}.phv"), format!("{rel}/index.phv")]
+    };
+    if let Some(page) = candidates.into_iter().find(|c| e.pages.contains_key(c)) {
+        return Some(Target::Script(state.public.join(page)));
+    }
+    let bytes = e.statics.get(&rel)?;
+    let lower = rel.to_ascii_lowercase();
+    if lower.ends_with(".phv") || lower.ends_with(".phv.html") {
+        return None;
+    }
+    Some(Target::Embedded(bytes.clone(), content_type(Path::new(&rel))?))
+}
+
 impl State {
     /// Compiles a page, reusing the cached bytecode until a source file changes.
+    /// Pages of a built site are compiled already.
     fn compiled(&self, script: &Path) -> Result<Arc<Compiled>, String> {
+        if let Some(e) = &self.embedded {
+            let rel = script.strip_prefix(&self.public).map_err(|_| "not a page of this site".to_string())?;
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            return e.pages.get(&rel).cloned().ok_or_else(|| format!("no page {rel} in this site"));
+        }
         if let Some(c) = self.cache.lock().unwrap().get(script) {
             if !c.is_stale() {
                 return Ok(c.clone());

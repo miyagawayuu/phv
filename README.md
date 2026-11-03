@@ -82,6 +82,7 @@ The executable is `target/release/phv` (`phv.exe` on Windows).
 phv run examples/hello/hello.phv         # type-check and run
 phv check examples/site/public/index.phv # type-check only
 phv serve examples/site                  # serve the site on http://127.0.0.1:8080
+phv build examples/site -o site-server   # one executable that serves the site, without the sources
 phv test examples                        # run the test_* functions in *_test.phv files
 phv fmt examples                         # fix indentation and spacing (--check only reports)
 phv lsp                                  # Language Server for editors

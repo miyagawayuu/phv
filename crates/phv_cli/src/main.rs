@@ -1,3 +1,4 @@
+mod build;
 mod lsp;
 mod migrate;
 mod pkg;
@@ -62,6 +63,16 @@ enum Command {
         /// Install exactly what phv.lock records; fail if it is out of date.
         #[arg(long)]
         locked: bool,
+    },
+    /// Compile a site (a directory with public/) or a script into one executable
+    /// that runs it without the sources.
+    Build {
+        /// The site's directory, or a script.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// The executable to write.
+        #[arg(short, long)]
+        output: PathBuf,
     },
     /// Convert a PHP file to PHV, marking what needs manual work.
     Migrate {
@@ -136,6 +147,21 @@ fn write_migrated(input: &Path, out: &Path, text: &str, force: bool) -> Result<(
 }
 
 fn main() -> ExitCode {
+    // An executable made by `phv build` runs what it carries instead.
+    if let Some(bundle) = phv_driver::bundle::read_own() {
+        let bundle = match bundle {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || build::run_bundle(bundle))
+            .expect("failed to start main thread");
+        return handle.join().unwrap_or(ExitCode::FAILURE);
+    }
     let cli = Cli::parse();
     // Scripts run on a thread with a large stack so deep recursion through
     // builtins (e.g. nested `map` callbacks) has room.
@@ -205,6 +231,7 @@ fn exec(cmd: Command) -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Install { dir, locked } => pkg::install(&dir, locked),
+        Command::Build { path, output } => build::build(&path, &output),
         Command::Migrate { file, output, force } => {
             let src = match std::fs::read_to_string(&file) {
                 Ok(t) => t,

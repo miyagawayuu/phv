@@ -515,7 +515,12 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default_for(root)),
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    let file: File = toml::from_str(&text).map_err(|e| format!("phv.toml: {e}"))?;
+    parse_config(root, &text)
+}
+
+/// The configuration in `text` (a phv.toml) for the project at `root`.
+pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
+    let file: File = toml::from_str(text).map_err(|e| format!("phv.toml: {e}"))?;
     for d in &file.permissions.read {
         check_dir("read", d)?;
     }

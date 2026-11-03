@@ -1099,6 +1099,7 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
 | `phv run file.phv` | 型検査して実行(`--html`、`--time-limit 秒`) |
 | `phv check file.phv` | 型検査だけ(import しているモジュールとテンプレートも) |
 | `phv serve dir` | Web サーバー(`--port`、`--host`、`--prod`、`--time-limit`) |
+| `phv build path -o file` | サイトかスクリプトを 1 つの実行ファイルにする(下を参照) |
 | `phv test [paths]` | `*_test.phv` の `test_*` 関数を実行(1 テストごとに新しい VM) |
 | `phv fmt [paths] [--check] [--width N]` | インデントと空白を整え、長い行を折り返す(文字列・コメント・HTML は変えない) |
 | `phv lsp` | エディタ用の Language Server(入力中のエラー表示、ホバーで型を表示、補完、定義へのジャンプ) |
@@ -1106,6 +1107,23 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
 | `phv migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
 | `phv disasm file.phv` | バイトコードを表示 |
 | `phv parse file.phv` | 構文木を表示 |
+
+### 実行ファイルを作る
+
+```bash
+phv build mysite -o mysite-server      # サイト: 配信する(オプションは `phv serve` と同じ)
+./mysite-server --port 8080 --prod
+phv build tools/report.phv -o report    # スクリプト: 実行する
+```
+
+`phv build` は、サイトのすべてのページ(`public/**/*.phv`。使うテンプレートとモジュールを含む)か 1 つのスクリプトを前もって
+コンパイルし、サイトの静的ファイルと phv.toml とともに、phv の実行ファイルの写しの末尾に付ける。できたものはソースなしで
+動き、起動時のコンパイルもない。必要なのは、プロジェクトが読み書きするディレクトリ(`[permissions]`、セッションの
+ディレクトリ)だけで、`--root`(既定はカレントディレクトリ)の下で探す。名前が `.` か `_` で始まるファイルとディレクトリは
+入れない(サーバーが配信しないため)。
+
+バンドルには SHA-256 と、作った phv のバージョンが入っている。壊れたバンドルや、別のバージョンで作ったものは起動時に
+拒否する。実行ファイルは、動かすプラットフォームで作る(そのプラットフォームの phv の写しなので)。
 
 ### 整形
 
@@ -1236,6 +1254,6 @@ phv migrate legacy/page.php      # page.phv を書き出す
 
 ## 18. 今後の予定
 
-- JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
+- JIT の対象拡大(float・文字列を扱う関数)
 
 セキュリティ監査の結果と残っているリスクは [security-audit.ja.md](security-audit.ja.md) を参照。

@@ -1111,6 +1111,7 @@ When code uses a PHP function name, the error message suggests the alternative
 | `phv run file.phv` | Type-check and run (`--html`, `--time-limit seconds`) |
 | `phv check file.phv` | Type-check only (including imported modules and templates) |
 | `phv serve dir` | Web server (`--port`, `--host`, `--prod`, `--time-limit`) |
+| `phv build path -o file` | Compile a site or a script into one executable (see below) |
 | `phv test [paths]` | Run the `test_*` functions in `*_test.phv` files (a new VM for each test) |
 | `phv fmt [paths] [--check] [--width N]` | Normalize indentation and whitespace and wrap long lines (strings, comments, and HTML are not changed) |
 | `phv lsp` | Language Server for editors (errors as you type, types on hover, completion, go to definition) |
@@ -1118,6 +1119,23 @@ When code uses a PHP function name, the error message suggests the alternative
 | `phv migrate file.php` | Convert PHP mechanically and list the places that need manual work |
 | `phv disasm file.phv` | Show the bytecode |
 | `phv parse file.phv` | Show the syntax tree |
+
+### Building an executable
+
+```bash
+phv build mysite -o mysite-server      # a site: serves it, with the options of `phv serve`
+./mysite-server --port 8080 --prod
+phv build tools/report.phv -o report    # a script: runs it
+```
+
+`phv build` compiles every page of a site (`public/**/*.phv`, with the templates and modules they use) or one script
+ahead of time and appends them, with the site's static files and phv.toml, to a copy of the phv executable. The result
+runs without the sources and without compiling at startup. It needs no other files except the directories the project
+reads and writes (`[permissions]`, a session directory), which are looked up under `--root` (default: the current
+directory). Files and directories whose names start with `.` or `_` are not included, as the server never serves them.
+
+The bundle carries its SHA-256 and the version of phv that built it; a damaged bundle, or one from another version,
+is refused at startup. Build the executable on the platform it runs on (it is a copy of that platform's phv).
 
 ### Formatting
 
@@ -1251,6 +1269,6 @@ that checks journal files (`phv_std/src/db/vfs.rs`).
 
 ## 18. Roadmap
 
-- Wider JIT coverage (functions that handle floats and strings), AOT compilation
+- Wider JIT coverage (functions that handle floats and strings)
 
 See [security-audit.md](security-audit.md) for the results of the security audit and the remaining risks.

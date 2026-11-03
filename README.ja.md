@@ -78,6 +78,7 @@ cargo build --release
 phv run examples/hello/hello.phv         # 型検査して実行
 phv check examples/site/public/index.phv # 型検査だけ
 phv serve examples/site                  # http://127.0.0.1:8080 でサイトを配信
+phv build examples/site -o site-server   # ソースなしでサイトを配信する 1 つの実行ファイルを作る
 phv test examples                        # *_test.phv の test_* 関数を実行
 phv fmt examples                         # インデントと空白を整える(--check で確認だけ)
 phv lsp                                  # エディタ用の Language Server
