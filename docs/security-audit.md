@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates five audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, and §12 the follow-up on its residual risks.
+This report consolidates six audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, and §13 what was added for v0.5.2.
 
-Date: 2026-11-02 (§9–§11: 2026-11-03)
+Date: 2026-11-02 (§9–§13: 2026-11-03)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -470,3 +470,68 @@ problems of the same kind (compile memory of very large functions, and the time 
 
 All tests pass on Windows and on Linux (Docker) with clippy (`-D warnings`) and rustfmt, and the fuzzer ran 1,500
 mutations per program.
+
+## 13. Sixth Assessment (v0.5.2: `final`, warnings for unused code, errors of several files at once)
+
+Date: 2026-11-03. Scope: everything changed after v0.5.1: the compiler's check for functions too large for the
+register file, `final` classes and methods, the warnings for unused variables and imports and unreachable code, and
+type checking the files that loaded cleanly while another file has a syntax error. The other changes since v0.5.1 are
+a test that now runs alone and the demo's Dockerfile.
+
+### Method
+
+A new reviewer, given only the source and the change, looked at the front end as `phv lsp` sees it (hostile source in
+an untrusted workspace, within the 8 MB per file) and at what the compiler hands the VM. Every finding was confirmed
+with a working PoC against a release build, and timed: generated sources with 65,537 properties, 80,000 parameters or
+captures, and import chains of 2,000 modules behind an entry file of 200,000 imports. A separate fuzz run cut and
+spliced the 50 test programs at 12 points each (1,800 programs through `phv check`). All PoCs were rerun against the
+fixed build, and regression tests were added.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| High | 1 | Fixed |
+| Medium | 1 | Fixed |
+| Low | 2 | Fixed |
+| Info | 1 | Fixed |
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R6-1 | A property's slot is a 16-bit operand of the bytecode, and the compiler cut the checker's 32-bit slot to it: in a class with more than 65,536 properties, property 65,536 was property 0. `$o->f65536 = 7` stored an int in the `string` property `f0` (a panic of the VM when read as a string), and it wrote `readonly` and private properties of the class from outside. Found while auditing the register check; present since the first release | A class may have at most 65,535 properties, inherited ones included (a compile error names the class). The compiler reports a slot that does not fit instead of cutting it |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R6-2 | Finding the files whose type errors are held back (those using a file with a syntax error) went over every module and every `import` statement again for each step of a chain: 2,000 modules in a chain behind an entry file of 200,000 imports took 60 s in `phv check` (1.7 s without the syntax error). New in this release | One walk over the files that use each file (each import counted once): 1.5 s |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R6-3 | The check for a repeated parameter name compared each parameter with all before it: a method of 80,000 parameters took 8.5 s to check, also in `phv lsp`. Present before this release | The names are kept in a set: 0.2 s (the method is then too large to compile) |
+| R6-4 | Properties were found by name with a linear search when declared and when used: checking a class of 65,537 properties took 5 s, also in `phv lsp`. Present before this release | Each class keeps its slots by name: a class of 65,000 properties is checked and run in 0.7 s |
+
+### Info
+
+| Item | Result |
+|---|---|
+| The new warnings looked through the parameters and the captured variables for each unused variable (quadratic in principle; 1.2 s for 80,000 captures, which the compiler then refuses) | Fixed: sets |
+
+### Residual Risks
+
+None.
+
+### Verification
+
+All PoCs were rerun against the fixed build: the three property PoCs are compile errors, the import chain takes 1.5 s
+and the 80,000 parameters 0.2 s. Regression tests: `oversized_functions_are_errors` (65,536 properties, 70,000
+locals, a literal of 40,000 pairs) and `tests/cases/err_mixed.phv` (a chain through `lib/chain.phv`), with
+`err_final`, `err_final_syntax` and `lints` for the features themselves. All tests pass on Windows, and on Linux and
+macOS in CI, with clippy (`-D warnings`) and rustfmt, and the fuzzer ran 1,500 mutations per program.
+
+Dependencies: `cargo audit` (CI) and `npm audit --omit=dev` in the extension and the website find nothing; Dependabot
+has no open alerts.

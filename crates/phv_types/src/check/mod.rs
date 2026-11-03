@@ -120,6 +120,8 @@ struct ClassInfo<'a> {
     /// Itself, ancestors and all interfaces; filled when the class is resolved.
     supers: HashSet<ClassId>,
     fields: Vec<FieldInfo>,
+    /// The slot of each field in `fields`, by name.
+    field_slots: HashMap<String, u32>,
     methods: HashMap<String, MethodInfo>,
     vtable: Vec<FuncId>,
     ctor: Option<FuncId>,
@@ -226,6 +228,10 @@ const ANNOTATIONS: &str = "Deprecated, Override, Test, Skip";
 
 /// Members (fields, methods, constants) all classes may inherit together.
 const MAX_INHERITED_MEMBERS: usize = 200_000;
+
+/// Properties of one class, its inherited ones included: a property's slot is a
+/// 16-bit operand of the bytecode.
+const MAX_FIELDS: usize = u16::MAX as usize;
 
 fn sig_type(t: &TypeExpr) -> Type {
     match &t.kind {
@@ -402,12 +408,13 @@ impl<'a> Checker<'a> {
         if matches!(self.module_kind(), ModuleKind::Std | ModuleKind::Prelude) {
             return;
         }
+        let captured: HashSet<LocalId> = ctx.captures.iter().map(|(inner, _)| *inner).collect();
         for id in ctx.unused_locals(skip) {
             let name = &ctx.locals[id as usize].name;
             let span = ctx.spans[id as usize];
             let note = if ctx.catch_vars.contains(&id) {
                 "leave the variable out: `catch (SomeException)`".to_string()
-            } else if ctx.captures.iter().any(|(inner, _)| *inner == id) {
+            } else if captured.contains(&id) {
                 "remove it from `use (...)`".to_string()
             } else {
                 format!("remove it, or start its name with `_` (`$_{name}`) if it is meant to be unused")
@@ -1043,6 +1050,7 @@ impl<'a> Checker<'a> {
 
     fn resolve_params(&mut self, params: &[ast::Param], self_class: Option<ClassId>) -> Vec<ParamInfo> {
         let mut out: Vec<ParamInfo> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
         for p in params {
             let ty = match &p.ty {
                 Some(t) => self.resolve_type(t, self_class),
@@ -1056,7 +1064,7 @@ impl<'a> Checker<'a> {
                 self.error("parameters cannot be `void`", p.span);
             }
             let default = p.default.as_ref().and_then(|d| self.const_default(d, &ty));
-            if out.iter().any(|o| o.name == p.name) {
+            if !seen.insert(p.name.as_str()) {
                 self.error(format!("duplicate parameter `${}`", p.name), p.span);
             }
             out.push(ParamInfo { name: p.name.clone(), ty, default, promote: p.promote, span: p.span });
@@ -1173,6 +1181,7 @@ impl<'a> Checker<'a> {
                             ifaces: Vec::new(),
                             supers: HashSet::new(),
                             fields: Vec::new(),
+                            field_slots: HashMap::new(),
                             methods: HashMap::new(),
                             vtable: Vec::new(),
                             ctor: None,
@@ -1381,8 +1390,9 @@ impl<'a> Checker<'a> {
     /// Copies what class `ci` inherits from its parent `p` (already resolved).
     fn inherit_from(&mut self, ci: usize, p: ClassId) {
         let parent = &self.classes[p as usize];
-        let (fields, methods, vtable, ctor, ctor_access, consts) = (
+        let (fields, field_slots, methods, vtable, ctor, ctor_access, consts) = (
             parent.fields.clone(),
+            parent.field_slots.clone(),
             parent.methods.clone(),
             parent.vtable.clone(),
             parent.ctor,
@@ -1391,6 +1401,7 @@ impl<'a> Checker<'a> {
         );
         let c = &mut self.classes[ci];
         c.fields = fields;
+        c.field_slots = field_slots;
         c.methods = methods;
         c.vtable = vtable;
         c.ctor = ctor;
@@ -1564,7 +1575,7 @@ impl<'a> Checker<'a> {
                     required: false,
                     span: decl.name_span,
                 };
-                self.classes[ci].fields.push(name_field);
+                self.add_field(cid, name_field);
                 if let Some(b) = &backing {
                     let value_field = FieldInfo {
                         name: "value".into(),
@@ -1576,7 +1587,7 @@ impl<'a> Checker<'a> {
                         required: false,
                         span: decl.name_span,
                     };
-                    self.classes[ci].fields.push(value_field);
+                    self.add_field(cid, value_field);
                 }
                 for case in &decl.cases {
                     let value = match (&backing, &case.value) {
@@ -1876,8 +1887,8 @@ impl<'a> Checker<'a> {
     fn add_field(&mut self, cid: ClassId, field: FieldInfo) {
         let span = field.span;
         let c = &mut self.classes[cid as usize];
-        if let Some(existing) = c.fields.iter().find(|f| f.name == field.name) {
-            let inherited = existing.owner != cid;
+        if let Some(&slot) = c.field_slots.get(&field.name) {
+            let inherited = c.fields[slot as usize].owner != cid;
             let msg = if inherited {
                 format!("property `${}` is already declared in a parent class", field.name)
             } else {
@@ -1886,6 +1897,19 @@ impl<'a> Checker<'a> {
             self.error(msg, span);
             return;
         }
+        if c.fields.len() >= MAX_FIELDS {
+            if c.fields.len() == MAX_FIELDS {
+                // Reported once; the class is not given more fields.
+                let name = c.name.clone();
+                c.fields.push(field);
+                self.error(
+                    format!("class `{name}` has too many properties (at most {MAX_FIELDS}, inherited ones included)"),
+                    span,
+                );
+            }
+            return;
+        }
+        c.field_slots.insert(field.name.clone(), c.fields.len() as u32);
         c.fields.push(field);
     }
 
@@ -2097,7 +2121,8 @@ impl<'a> Checker<'a> {
     }
 
     pub(crate) fn field_slot(&self, cid: ClassId, name: &str) -> Option<u32> {
-        self.classes[cid as usize].fields.iter().position(|f| f.name == name).map(|i| i as u32)
+        let c = &self.classes[cid as usize];
+        c.field_slots.get(name).copied()
     }
 
     fn finish(mut self) -> (HProgram, Vec<Diagnostic>) {

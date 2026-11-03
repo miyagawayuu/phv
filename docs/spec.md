@@ -1316,6 +1316,7 @@ It then runs the type checker and shows the places that need manual work, such a
 | Source file (module, template, script) | 8 MB | Compile error |
 | Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits) |
 | Variables and temporary values of one function | 65,534 | Compile error (split the function) |
+| Properties of one class (inherited ones included) | 65,535 | Compile error |
 
 `unsafe` is used only in the allocator that counts memory usage (`phv_vm/src/alloc.rs`), in the JIT
 (`phv_jit`, for calling generated code, and the helpers it calls in `phv_vm/src/jit.rs`), in calls to OS file APIs (`phv_std/src/safefs.rs`) and in the SQLite VFS

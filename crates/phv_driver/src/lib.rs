@@ -706,27 +706,42 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
 /// them (directly or through other files).
 fn tainted_files(loader: &Loader) -> HashSet<u32> {
     let mut tainted: HashSet<u32> = loader.diags.iter().filter(|d| d.is_error()).map(|d| d.span.file).collect();
-    let file_of = |i: Option<&usize>| i.filter(|i| **i != usize::MAX).map(|i| loader.modules[*i].0.file);
-    loop {
-        let mut changed = false;
-        for (module, _, _) in &loader.modules {
-            if tainted.contains(&module.file) {
-                continue;
-            }
-            let imports = module.stmts.iter().filter_map(|s| match &s.kind {
-                StmtKind::Import(d) => Some(file_of(loader.imports.get(&d.module.join(".")))),
+    // The files that use each file. A use that did not load taints the user,
+    // which then also has an error of its own.
+    let mut users: HashMap<u32, HashSet<u32>> = HashMap::new();
+    for (module, _, _) in &loader.modules {
+        let imports: HashSet<String> = module
+            .stmts
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StmtKind::Import(d) => Some(d.module.join(".")),
                 _ => None,
-            });
-            let templates = module.template_refs.iter().map(|(rel, _)| file_of(loader.templates.get(rel)));
-            if imports.chain(templates).any(|f| f.is_none_or(|f| tainted.contains(&f))) {
-                tainted.insert(module.file);
-                changed = true;
+            })
+            .collect();
+        let used = imports
+            .iter()
+            .map(|name| loader.imports.get(name))
+            .chain(module.template_refs.iter().map(|(rel, _)| loader.templates.get(rel)));
+        for target in used {
+            match target.filter(|i| **i != usize::MAX) {
+                Some(i) => {
+                    users.entry(loader.modules[*i].0.file).or_default().insert(module.file);
+                }
+                None => {
+                    tainted.insert(module.file);
+                }
             }
-        }
-        if !changed {
-            return tainted;
         }
     }
+    let mut work: Vec<u32> = tainted.iter().copied().collect();
+    while let Some(file) = work.pop() {
+        for user in users.get(&file).into_iter().flatten() {
+            if tainted.insert(*user) {
+                work.push(*user);
+            }
+        }
+    }
+    tainted
 }
 
 /// Loads, checks and compiles `entry` (and everything it uses).

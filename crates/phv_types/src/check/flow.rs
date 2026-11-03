@@ -128,6 +128,7 @@ impl FnCtx {
     /// Locals that are never read, except `$this`, names starting with `_`
     /// and those in `skip` (parameters whose signature is fixed elsewhere).
     pub fn unused_locals(&self, skip: &[LocalId]) -> Vec<LocalId> {
+        let skip: HashSet<LocalId> = skip.iter().copied().collect();
         (0..self.locals.len() as LocalId)
             .filter(|id| {
                 let name = &self.locals[*id as usize].name;

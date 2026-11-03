@@ -1481,7 +1481,7 @@ impl<'a> Checker<'a> {
             Type::Class(c, cargs) => {
                 let Some(m) = self.classes[c as usize].methods.get(name).cloned() else {
                     let cname = self.class_names[c as usize].clone();
-                    let has_prop = self.classes[c as usize].fields.iter().any(|f| f.name == name);
+                    let has_prop = self.field_slot(c, name).is_some();
                     let e = self.error(format!("class `{cname}` has no method `{name}`"), name_span);
                     if has_prop {
                         e.add_note(format!("`{name}` is a property; read it with `->{name}` (no parentheses)"));

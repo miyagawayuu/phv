@@ -303,7 +303,14 @@ fn oversized_functions_are_errors() {
     std::fs::create_dir_all(&dir).unwrap();
     let locals: String = (0..70_000).map(|i| format!("$v{i} = {i};\n")).collect();
     let pairs: Vec<String> = (0..40_000).map(|i| format!("\"k{i}\" => {i}")).collect();
+    // A property's slot is a 16-bit operand: property 65,536 used to alias property 0.
+    let props: String = (0..65_536).map(|i| format!("    public int $f{i} = {i};\n")).collect();
     let cases = [
+        (
+            "props.phv",
+            format!("<?phv\nclass C {{\n{props}}}\n$o = new C();\n$o->f65535 = 7;\necho $o->f0;\n"),
+            "class `C` has too many properties (at most 65535, inherited ones included)",
+        ),
         ("locals.phv", format!("<?phv\n{locals}"), "this script is too large to compile"),
         (
             "literal.phv",

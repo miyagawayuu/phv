@@ -1,0 +1,7 @@
+// Used by err_mixed.phv: a module that uses the broken one. Its own type error
+// is not reported while lib/broken.phv has a syntax error.
+import lib.broken.broken;
+
+export function chained(): int {
+    return broken() . "x";
+}

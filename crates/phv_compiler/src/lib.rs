@@ -253,6 +253,15 @@ impl<'a> FnC<'a> {
         }
     }
 
+    /// A property slot as a bytecode operand. The checker limits classes to
+    /// `u16::MAX` properties; a larger slot is reported, never truncated.
+    fn prop_slot(&mut self, slot: u32) -> u16 {
+        u16::try_from(slot).unwrap_or_else(|_| {
+            self.too_big = true;
+            0
+        })
+    }
+
     fn is_local(&self, r: Reg) -> bool {
         r < self.num_locals
     }
@@ -477,7 +486,8 @@ impl<'a> FnC<'a> {
             HExprKind::Prop(o, slot) => {
                 let ro = self.operand(o);
                 self.off = off;
-                self.emit(Instr::GetProp(dst, ro, *slot as u16));
+                let slot = self.prop_slot(*slot);
+                self.emit(Instr::GetProp(dst, ro, slot));
             }
             HExprKind::NullSafe { tmp, obj, body } => {
                 let t = self.reg(*tmp);
@@ -724,7 +734,10 @@ impl<'a> FnC<'a> {
     fn place_regs(&mut self, p: &HPlace) -> (PathBase, Vec<Reg>, Vec<Option<Const>>, bool) {
         let base = match &p.base {
             HPlaceBase::Local(id) => PathBase::Local(self.reg(*id)),
-            HPlaceBase::Prop(obj, slot) => PathBase::Prop(self.operand(obj), *slot as u16),
+            HPlaceBase::Prop(obj, slot) => {
+                let slot = self.prop_slot(*slot);
+                PathBase::Prop(self.operand(obj), slot)
+            }
         };
         let mut keys = Vec::new();
         let mut create = Vec::new();

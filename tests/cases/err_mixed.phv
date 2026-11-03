@@ -1,8 +1,8 @@
 <?phv
 // A syntax error in one module does not hide the type errors of the others.
-// This file uses the broken module, so its own type errors are not reported
-// (they might come from what the parser left out).
-import lib.broken.broken;
+// This file uses the broken module (also through lib/chain.phv), so its own type
+// errors are not reported: they might come from what the parser left out.
+import lib.chain.chained;
 import lib.typed.typed;
 
-echo broken() + typed() + "x";
+echo chained() + typed() + "x";
