@@ -116,7 +116,7 @@ pub fn test(paths: Vec<PathBuf>, color: bool) -> ExitCode {
     }
 }
 
-pub fn fmt(paths: Vec<PathBuf>, check: bool) -> ExitCode {
+pub fn fmt(paths: Vec<PathBuf>, check: bool, width: Option<usize>) -> ExitCode {
     let paths = if paths.is_empty() { vec![PathBuf::from(".")] } else { paths };
     let files = collect(&paths, &|p| {
         let n = name_of(p);
@@ -124,13 +124,27 @@ pub fn fmt(paths: Vec<PathBuf>, check: bool) -> ExitCode {
     });
     let mut changed = 0;
     let mut errors = 0;
+    // `--width`, else `[fmt] width` of each file's project.
+    let mut widths: std::collections::HashMap<PathBuf, Result<usize, String>> = std::collections::HashMap::new();
     for f in &files {
+        let width = match width {
+            Some(w) => Ok(w),
+            None => widths.entry(find_root(f)).or_insert_with_key(|r| load_config(r).map(|c| c.fmt.width)).clone(),
+        };
+        let width = match width {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("error: {}: {e}", f.display());
+                errors += 1;
+                continue;
+            }
+        };
         let Ok(src) = std::fs::read_to_string(f) else {
             eprintln!("error: cannot read {}", f.display());
             errors += 1;
             continue;
         };
-        match phv_syntax::format::format_source(&src) {
+        match phv_syntax::format::format_source_width(&src, width) {
             Ok(out) if out != src => {
                 changed += 1;
                 if check {

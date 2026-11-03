@@ -19,5 +19,11 @@ if ($req->isPost()) {
     $sent = $errors->isEmpty();
 }
 
-$body = render("views/contact.phv.html", name: $name, message: $message, errors: $errors, sent: $sent);
+$body = render(
+    "views/contact.phv.html",
+    name: $name,
+    message: $message,
+    errors: $errors,
+    sent: $sent,
+);
 echo render("views/layout.phv.html", title: "Contact", body: $body);

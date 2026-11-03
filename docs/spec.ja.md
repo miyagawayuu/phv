@@ -1013,6 +1013,9 @@ rate_limit_store = "cache"  # この Redis のデータベースでレート制�
 [server]
 workers = 16            # 同時に実行するスクリプトの数(既定: CPU 数の 2 倍、最小 8)
 
+[fmt]
+width = 100             # phv fmt はこれより長い行を折り返す
+
 [permissions]
 write = ["data/"]
 
@@ -1092,12 +1095,35 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
 | `phv check file.phv` | 型検査だけ(import しているモジュールとテンプレートも) |
 | `phv serve dir` | Web サーバー(`--port`、`--host`、`--prod`、`--time-limit`) |
 | `phv test [paths]` | `*_test.phv` の `test_*` 関数を実行(1 テストごとに新しい VM) |
-| `phv fmt [paths] [--check]` | インデントと空白を整える(文字列・コメント・HTML は変えない) |
+| `phv fmt [paths] [--check] [--width N]` | インデントと空白を整え、長い行を折り返す(文字列・コメント・HTML は変えない) |
 | `phv lsp` | エディタ用の Language Server(入力中のエラー表示、ホバーで型を表示、補完、定義へのジャンプ) |
 | `phv install` | `[dependencies]` を取得して `phv.lock` に固定 |
 | `phv migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
 | `phv disasm file.phv` | バイトコードを表示 |
 | `phv parse file.phv` | 構文木を表示 |
+
+### 整形
+
+`phv fmt` は 1 段を空白 4 つでインデントし、100 文字(インデントを含む)を超える行を折り返す。幅は `--width N` で、
+プロジェクトごとには phv.toml で変えられる(`[fmt] width = 120`)。
+
+長い行はいちばん外側で分ける。括弧の外のカンマ(`echo a, b, c;`)では入るだけ並べ、残りを 1 段深い次の行に続ける。
+そうでなければ、その行で開いて閉じるいちばん長い `(...)` か `[...]` の要素を 1 行に 1 つずつ 1 段深く置き、閉じ括弧を
+独立した行にする。呼び出し・引数リスト・リストとマップのリテラルでは最後の要素のあとにもカンマを付ける。そうした括弧が
+ない行は `??`・`||`・`&&`・`.`(または `->` と `?->`)の前で分け、続きの行を 1 段深くする。まだ長い要素も同じように分ける。
+
+```phv
+$body = render(
+    "views/contact.phv.html",
+    name: $name,
+    message: $message,
+    errors: $errors,
+    sent: $sent,
+);
+```
+
+`phv fmt` は行をつなげず、コメント・複数行の文字列・インライン HTML・`<?phv` / `?>` を含む行は変えないので、整形で
+プログラムの動作は変わらない。整形済みのファイルを整形しても何も変わらない。
 
 ### テスト
 
@@ -1192,7 +1218,6 @@ phv migrate legacy/page.php      # page.phv を書き出す
 
 - JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
 - 推移的な依存関係の解決、パッケージレジストリ
-- `phv fmt` の行の折り返し
 - データベースに保存するセッション
 
 セキュリティ監査の結果と残っているリスクは [security-audit.ja.md](security-audit.ja.md) を参照。

@@ -6,7 +6,11 @@ import std.net.HttpClient;
 import lib.wardogs.{fetch_snapshot, format_clock, Player, RconError, Snapshot};
 
 function row(string $name, string $k, string $d, string $kd, string $cash, string $ping): string {
-    return "  " . $name->padEnd(24, " ") . $k->padStart(5, " ") . $d->padStart(5, " ") . $kd->padStart(6, " ")
+    return "  "
+        . $name->padEnd(24, " ")
+        . $k->padStart(5, " ")
+        . $d->padStart(5, " ")
+        . $kd->padStart(6, " ")
         . $cash->padStart(9, " ") . $ping->padStart(6, " ") . "\n";
 }
 
@@ -27,7 +31,9 @@ function players_table(string $title, list<Player> $players): string {
 function report(Snapshot $snap): string {
     $st = $snap->status;
     $out = "{$st->serverName}\n";
-    $out .= "  Map      {$st->mapName()} ({$st->map})" . ($st->lighting->isEmpty() ? "" : " · {$st->lighting}") . "\n";
+    $out .= "  Map      {$st->mapName()} ({$st->map})"
+        . ($st->lighting->isEmpty() ? "" : " · {$st->lighting}")
+        . "\n";
     if (!$st->experiences->isEmpty()) {
         $out .= "  Mode     " . $st->experiences->join(", ") . "\n";
     }

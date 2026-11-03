@@ -17,7 +17,10 @@ if ($req->isPost()) {
     $text = ($req->form("text") ?? "")->trim();
     $errors = validate_message($name, $text);
     $ip = client_key();
-    if ($errors->isEmpty() && (!rate_limit("board:" . $ip, 3, 60) || !rate_limit("board:" . $ip, 20, 86400))) {
+    if (
+        $errors->isEmpty()
+            && (!rate_limit("board:" . $ip, 3, 60) || !rate_limit("board:" . $ip, 20, 86400))
+    ) {
         $errors[] = "Too many messages from your address; please wait a little.";
     }
     if ($errors->isEmpty()) {

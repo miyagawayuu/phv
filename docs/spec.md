@@ -1024,6 +1024,9 @@ rate_limit_store = "cache"  # count rate limits on this Redis database (default:
 [server]
 workers = 16            # scripts running at once (default: two per CPU, at least 8)
 
+[fmt]
+width = 100             # phv fmt wraps longer lines
+
 [permissions]
 write = ["data/"]
 
@@ -1103,12 +1106,37 @@ When code uses a PHP function name, the error message suggests the alternative
 | `phv check file.phv` | Type-check only (including imported modules and templates) |
 | `phv serve dir` | Web server (`--port`, `--host`, `--prod`, `--time-limit`) |
 | `phv test [paths]` | Run the `test_*` functions in `*_test.phv` files (a new VM for each test) |
-| `phv fmt [paths] [--check]` | Normalize indentation and whitespace (strings, comments, and HTML are not changed) |
+| `phv fmt [paths] [--check] [--width N]` | Normalize indentation and whitespace and wrap long lines (strings, comments, and HTML are not changed) |
 | `phv lsp` | Language Server for editors (errors as you type, types on hover, completion, go to definition) |
 | `phv install` | Fetch `[dependencies]` and pin them in `phv.lock` |
 | `phv migrate file.php` | Convert PHP mechanically and list the places that need manual work |
 | `phv disasm file.phv` | Show the bytecode |
 | `phv parse file.phv` | Show the syntax tree |
+
+### Formatting
+
+`phv fmt` indents with 4 spaces per level and wraps lines longer than 100 characters (indentation included). Choose
+another width with `--width N`, or for a project in phv.toml (`[fmt] width = 120`).
+
+A long line is split at its outermost level. Commas outside any bracket (`echo a, b, c;`) keep as many items on the
+line as fit, and the rest continues on the next line, one level deeper. Otherwise the longest `(...)` or `[...]` that
+opens and closes on the line puts each element on its own line, one level deeper, and the closing bracket on its own
+line; calls, parameter lists and list and map literals also get a comma after the last element. A line without such a
+bracket is split before `??`, `||`, `&&` or `.` (or `->` and `?->`), and the continuation lines are indented one more
+level. Elements that are still too long are split the same way.
+
+```phv
+$body = render(
+    "views/contact.phv.html",
+    name: $name,
+    message: $message,
+    errors: $errors,
+    sent: $sent,
+);
+```
+
+`phv fmt` never joins lines, and never changes a line that holds a comment, a multi-line string, inline HTML or
+`<?phv` / `?>` tags, so formatting cannot change what a program does; formatting a formatted file changes nothing.
 
 ### Testing
 
@@ -1203,7 +1231,6 @@ that checks journal files (`phv_std/src/db/vfs.rs`).
 
 - Wider JIT coverage (functions that handle floats and strings), AOT compilation
 - Transitive dependency resolution, a package registry
-- Line wrapping in `phv fmt`
 - Sessions stored in a database
 
 See [security-audit.md](security-audit.md) for the results of the security audit and the remaining risks.

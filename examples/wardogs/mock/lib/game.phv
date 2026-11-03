@@ -10,7 +10,8 @@ function factions(): list<string> {
 }
 
 function names(): list<string> {
-    return ["Ash", "Birch", "Cedar", "Dune", "Ember", "Flint", "Gale", "Haze", "Iron", "Jade", "Kite",
+    return ["Ash", "Birch", "Cedar", "Dune", "Ember", "Flint", "Gale", "Haze", "Iron", "Jade",
+        "Kite",
         "Lynx", "Moss", "Nova", "Onyx", "Pike", "Quill", "Rook", "Slate", "Thorn", "Umber", "Vale"];
 }
 
@@ -21,7 +22,9 @@ export function authorized(): bool {
         return true;
     }
     response()->status(401);
-    response()->json(["error" => ["code" => "unauthorized", "message" => "Missing or invalid bearer token."]]);
+    response()->json(
+        ["error" => ["code" => "unauthorized", "message" => "Missing or invalid bearer token."]],
+    );
     return false;
 }
 

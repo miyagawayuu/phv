@@ -12,4 +12,8 @@ if ($post == null) {
     return;
 }
 
-echo render("views/layout.phv.html", title: $post->title, body: render("views/post.phv.html", post: $post));
+echo render(
+    "views/layout.phv.html",
+    title: $post->title,
+    body: render("views/post.phv.html", post: $post),
+);

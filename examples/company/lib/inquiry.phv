@@ -48,7 +48,10 @@ function looks_like_email(string $email): bool {
         return false;
     }
     $domain = $parts[1];
-    return !$parts[0]->isEmpty() && $domain->contains(".") && !$domain->startsWith(".") && !$domain->endsWith(".");
+    return !$parts[0]->isEmpty()
+        && $domain->contains(".")
+        && !$domain->startsWith(".")
+        && !$domain->endsWith(".");
 }
 
 export function inquiry_db(): Database {

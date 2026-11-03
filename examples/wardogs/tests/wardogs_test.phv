@@ -43,7 +43,11 @@ function test_optional_fields_when_present(): void {
 }
 
 function test_teams_are_sorted_and_split(): void {
-    $snap = new Snapshot(parse_status(json_decode(LIVE_STATUS)), parse_players(json_decode(PLAYERS)), 0);
+    $snap = new Snapshot(
+        parse_status(json_decode(LIVE_STATUS)),
+        parse_players(json_decode(PLAYERS)),
+        0,
+    );
     assert_eq(["Birch", "Ash"], $snap->team("Valkyra")->map(fn($p) => $p->name));
     assert_eq(["Cedar"], $snap->team("Lonestar")->map(fn($p) => $p->name));
     assert_eq(["Dune"], $snap->unassigned()->map(fn($p) => $p->name));

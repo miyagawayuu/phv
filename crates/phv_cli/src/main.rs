@@ -43,12 +43,15 @@ enum Command {
         /// Files or directories (default: the current directory).
         paths: Vec<PathBuf>,
     },
-    /// Format `.phv` files (indentation and whitespace).
+    /// Format `.phv` files (indentation, whitespace and long lines).
     Fmt {
         paths: Vec<PathBuf>,
         /// Only report files that would change.
         #[arg(long)]
         check: bool,
+        /// Wrap lines longer than this (default: `[fmt] width` in phv.toml, or 100).
+        #[arg(long)]
+        width: Option<usize>,
     },
     /// Start the language server (for editors) on stdin/stdout.
     Lsp,
@@ -193,7 +196,7 @@ fn exec(cmd: Command) -> ExitCode {
             }
         }
         Command::Test { paths } => tools::test(paths, color),
-        Command::Fmt { paths, check } => tools::fmt(paths, check),
+        Command::Fmt { paths, check, width } => tools::fmt(paths, check, width),
         Command::Lsp => {
             lsp::run();
             ExitCode::SUCCESS

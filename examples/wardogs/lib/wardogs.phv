@@ -79,7 +79,11 @@ export class Snapshot {
     public function team(string $faction): list<Player> {
         return $this->players
             ->filter(fn($p) => $p->faction == $faction)
-            ->sortBy(fn($a, $b) => ($a->kills == $b->kills ? $a->deaths <=> $b->deaths : $b->kills <=> $a->kills));
+            ->sortBy(
+                fn($a, $b) => (
+                    $a->kills == $b->kills ? $a->deaths <=> $b->deaths : $b->kills <=> $a->kills
+                ),
+            );
     }
 
     /** Players whose faction is not on the scoreboard (still choosing a side, for example). */
@@ -121,7 +125,9 @@ function describe_error(string $path, HttpResponse $res): string {
     $text = match ($res->status) {
         401, 403 => "the RCON password was refused",
         404 => "this server does not serve the route",
-        429 => "too many requests; retry after " . ($res->header("retry-after") ?? "a few") . " seconds",
+        429 => "too many requests; retry after "
+            . ($res->header("retry-after") ?? "a few")
+            . " seconds",
         default => "HTTP {$res->status}",
     };
     try {

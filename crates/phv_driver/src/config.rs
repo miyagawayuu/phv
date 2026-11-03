@@ -59,6 +59,27 @@ struct File {
     websockets: BTreeMap<String, WebSocketSection>,
     #[serde(default)]
     http: BTreeMap<String, HttpSection>,
+    #[serde(default)]
+    fmt: FmtSection,
+}
+
+/// `[fmt]`: settings for `phv fmt`.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FmtSection {
+    /// Lines longer than this many characters are wrapped (default 100).
+    #[serde(default = "default_fmt_width")]
+    pub width: usize,
+}
+
+impl Default for FmtSection {
+    fn default() -> Self {
+        FmtSection { width: default_fmt_width() }
+    }
+}
+
+fn default_fmt_width() -> usize {
+    phv_syntax::format::DEFAULT_WIDTH
 }
 
 /// `[databases.<name>]`: a server scripts reach with `Database::connect("<name>")`
@@ -358,6 +379,7 @@ pub struct Config {
     /// Directory for session files; None keeps sessions in memory.
     pub session_dir: Option<PathBuf>,
     pub dependencies: BTreeMap<String, Dependency>,
+    pub fmt: FmtSection,
 }
 
 impl Config {
@@ -374,6 +396,7 @@ impl Config {
             requests_per_minute: 0,
             session_dir: None,
             dependencies: BTreeMap::new(),
+            fmt: FmtSection::default(),
         }
     }
 }
@@ -554,6 +577,7 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
         requests_per_minute: file.security.requests_per_minute,
         session_dir,
         dependencies: file.dependencies,
+        fmt: file.fmt,
     })
 }
 
