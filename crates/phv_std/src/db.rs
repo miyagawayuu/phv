@@ -10,6 +10,8 @@ use rusqlite::{Connection, OpenFlags};
 use std::rc::Rc;
 use std::time::Duration;
 
+mod vfs;
+
 type R = Result<Value, VmError>;
 
 /// Marks a bound parameter in `Sql` text (see the type checker).
@@ -159,7 +161,8 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
         let (dir, name) = crate::sys::resolve_path(vm, &rel, true)?;
         // SQLite opens the database and its journal files by name, so each must
         // be missing or a plain file (no link, no second hard link) before and
-        // after opening. The directory itself cannot change meanwhile.
+        // after opening. The directory itself cannot change meanwhile. Files
+        // SQLite opens later (a journal per transaction) are checked by `vfs`.
         let check = |vm: &Vm| -> Result<(), VmError> {
             for suffix in ["", "-journal", "-wal", "-shm"] {
                 let mut n = name.clone();
@@ -173,7 +176,11 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let c = Connection::open_with_flags(dir.path().join(&name), flags).map_err(|e| db_error(vm, e))?;
+        if !vfs::register() {
+            return Err(vm.throw("DatabaseError", "SQLite has no file system support"));
+        }
+        let c = Connection::open_with_flags_and_vfs(dir.path().join(&name), flags, vfs::NAME)
+            .map_err(|e| db_error(vm, e))?;
         check(vm)?;
         (c, Some(dir))
     };

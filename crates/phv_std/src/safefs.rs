@@ -159,6 +159,43 @@ fn check_plain(f: &File) -> Result<(), FsError> {
     Ok(())
 }
 
+// Files that SQLite opens by their full name beneath a `DirGuard` (see `db::vfs`).
+
+/// Checks a file SQLite opened as `path`: a plain file reached by its own name,
+/// not through a link.
+#[cfg(windows)]
+pub fn check_opened(f: &File, path: &Path) -> Result<(), FsError> {
+    imp::check_path(f, path)?;
+    check_plain(f)
+}
+
+/// Opens `path` (created if missing), checked like `check_opened`, and holds
+/// it: while the handle is open the name cannot be replaced by a link.
+#[cfg(windows)]
+pub fn hold(path: &Path) -> Result<File, FsError> {
+    let f = imp::hold(path)?;
+    check_opened(&f, path)?;
+    Ok(f)
+}
+
+/// Checks the entry at `path` without following it. SQLite's descriptor is
+/// not reachable on Unix; SQLite itself refuses symlinks there (`O_NOFOLLOW`).
+#[cfg(unix)]
+pub fn check_path(path: &Path) -> Result<(), FsError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(FsError::Link);
+    }
+    if !meta.is_file() {
+        return Err(FsError::NotFile);
+    }
+    if meta.nlink() != 1 {
+        return Err(FsError::HardLink);
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 mod imp {
     use super::{DirGuard, FsError};
@@ -360,6 +397,34 @@ mod imp {
         } else {
             Err(FsError::BadName)
         }
+    }
+
+    /// `f` must be the entry at `path` itself. A handle opened through a link
+    /// has its target's path; one opened with FILE_FLAG_OPEN_REPARSE_POINT is
+    /// the link.
+    pub fn check_path(f: &File, path: &Path) -> Result<(), FsError> {
+        if f.metadata()?.file_attributes() & ATTR_REPARSE_POINT != 0 {
+            return Err(FsError::Link);
+        }
+        check_real_name(f, path.file_name().ok_or(FsError::BadName)?)?;
+        let plain = |p: &Path| p.to_string_lossy().trim_start_matches(r"\\?\").to_lowercase();
+        if plain(&final_path(f)?) == plain(path) {
+            Ok(())
+        } else {
+            Err(FsError::BadName)
+        }
+    }
+
+    /// Without FILE_SHARE_DELETE the file cannot be renamed or deleted (and
+    /// its name reused) while the handle is open.
+    pub fn hold(path: &Path) -> Result<File, FsError> {
+        Ok(OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?)
     }
 
     /// Opens an entry only to read its attributes and real name.
