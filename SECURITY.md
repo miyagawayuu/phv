@@ -12,8 +12,8 @@ PHV is pre-1.0. Security fixes are made on the latest release only.
 
 | Version | Supported |
 |---|---|
-| 0.5.x | Yes |
-| < 0.5 | No |
+| 0.6.x | Yes |
+| < 0.6 | No |
 
 ## Reporting a vulnerability
 
