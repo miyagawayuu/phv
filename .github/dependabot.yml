@@ -1,6 +1,7 @@
-# Keeps the GitHub Actions used by the workflows up to date. Security updates
-# for the Cargo and npm dependencies are turned on in the repository settings
-# and need no entry here.
+# Keeps the GitHub Actions used by the workflows (pinned to commit SHAs, with
+# the version in a comment) and the website's deploy tooling up to date.
+# Security updates for the Cargo and npm dependencies are turned on in the
+# repository settings and need no entry here.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -9,4 +10,12 @@ updates:
       interval: weekly
     groups:
       actions:
+        patterns: ["*"]
+  # wrangler, installed by the website workflow's deploy job from this lockfile.
+  - package-ecosystem: npm
+    directory: /.github/deploy
+    schedule:
+      interval: weekly
+    groups:
+      deploy:
         patterns: ["*"]

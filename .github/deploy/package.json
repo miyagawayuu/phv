@@ -1,0 +1,9 @@
+{
+  "name": "phv-lang-deploy",
+  "private": true,
+  "description": "Pinned deploy tooling for the website workflow: wrangler, installed with npm ci --ignore-scripts.",
+  "license": "MIT",
+  "dependencies": {
+    "wrangler": "4.151.1"
+  }
+}

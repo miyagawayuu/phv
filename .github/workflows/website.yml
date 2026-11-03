@@ -13,6 +13,7 @@ on:
       - "editors/vscode/syntaxes/**"
       - "Cargo.toml"
       - ".github/workflows/website.yml"
+      - ".github/deploy/**"
   workflow_dispatch:
 
 permissions:
@@ -25,11 +26,13 @@ concurrency:
 jobs:
   # The build and the deploy are separate jobs: the build runs the site's npm
   # packages without the Cloudflare token, and the deploy job (which has the
-  # token) has no checkout or node_modules the build could have changed.
+  # token) has no checkout or node_modules the build could have changed. It
+  # checks out only .github/deploy and installs wrangler from that lockfile,
+  # with install scripts off and before the token is in the environment.
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Build
@@ -37,7 +40,7 @@ jobs:
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
           npm run build
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: site
           path: website/dist
@@ -47,11 +50,20 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: /.github/deploy/
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: site
           path: dist
+      - name: Install wrangler
+        working-directory: .github/deploy
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Deploy to Cloudflare Pages
+        working-directory: .github/deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -69,9 +81,10 @@ jobs:
           echo "token verify: HTTP $(api user/tokens/verify), $(jq -c '{success, status: .result.status, errors: [.errors[]?.code]}' /tmp/cf.json)"
           echo "pages projects: HTTP $(api accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects), $(jq -c '{success, errors: [.errors[]? | {code, message}], projects: [.result[]?.name]}' /tmp/cf.json)"
 
-          wrangler="npx --yes wrangler@4.151.1"
+          # Only the wrangler that npm ci installed from the lockfile.
+          wrangler="npx --no-install wrangler"
           # The first deploy creates the project; later runs find it.
           if ! jq -e '.result[]? | select(.name == "phv-lang")' /tmp/cf.json > /dev/null; then
             $wrangler pages project create phv-lang --production-branch main
           fi
-          $wrangler pages deploy dist --project-name phv-lang --branch main --commit-dirty=true
+          $wrangler pages deploy "$GITHUB_WORKSPACE/dist" --project-name phv-lang --branch main --commit-dirty=true
