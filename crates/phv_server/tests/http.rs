@@ -294,3 +294,38 @@ fn repeated_fields_are_all_read() {
     assert!(r.body.starts_with("|7,8|"), "{}", r.body);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn busy_servers_answer_503() {
+    let dir = std::env::temp_dir().join(format!("phv-http-busy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phv.toml", "[server]\nworkers = 1\n");
+    write(&dir, "public/loop.phv", "<?phv\nwhile (true) {\n}\n");
+    write(&dir, "public/index.phv", "<?phv echo \"ok\";");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let opts = ServeOptions {
+        root: dir.clone(),
+        host: "127.0.0.1".into(),
+        port: 0,
+        dev: true,
+        time_limit: Duration::from_secs(14),
+    };
+    std::thread::spawn(move || serve_on(listener, opts).unwrap());
+    assert_eq!(get(addr, "/", "").status, 200);
+
+    // The only worker is busy for longer than a request waits for one.
+    let slow = std::thread::spawn(move || get(addr, "/loop", "").status);
+    std::thread::sleep(Duration::from_millis(500));
+    let start = std::time::Instant::now();
+    let r = get(addr, "/", "");
+    assert_eq!(r.status, 503, "{}", r.body);
+    assert_eq!(r.header("retry-after"), Some("5"));
+    assert!(start.elapsed() >= Duration::from_secs(9), "{:?}", start.elapsed());
+    // Static files do not need a worker.
+    write(&dir, "public/a.txt", "a");
+    assert_eq!(get(addr, "/a.txt", "").status, 200);
+    assert_eq!(slow.join().unwrap(), 500);
+    assert_eq!(get(addr, "/", "").status, 200);
+    let _ = std::fs::remove_dir_all(&dir);
+}

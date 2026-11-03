@@ -5,6 +5,8 @@ use hyper::body::{Body, Frame, SizeHint};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -16,9 +18,34 @@ pub enum RespBody {
     File { file: tokio::fs::File, left: u64, buf: Box<[u8]> },
 }
 
+/// Output counted in a server-wide total until the last copy of its bytes is
+/// dropped, that is, once the connection has written them (or is gone).
+struct Counted {
+    data: Vec<u8>,
+    total: Arc<AtomicUsize>,
+}
+
+impl AsRef<[u8]> for Counted {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.data.len(), Ordering::Relaxed);
+    }
+}
+
 impl RespBody {
     pub fn full(bytes: impl Into<Bytes>) -> RespBody {
         RespBody::Full(Some(bytes.into()))
+    }
+
+    /// A body whose size counts in `total` until it has been sent.
+    pub fn counted(data: Vec<u8>, total: &Arc<AtomicUsize>) -> RespBody {
+        total.fetch_add(data.len(), Ordering::Relaxed);
+        RespBody::full(Bytes::from_owner(Counted { data, total: total.clone() }))
     }
 
     pub fn file(file: tokio::fs::File, len: u64) -> RespBody {
@@ -132,5 +159,27 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StallGuard<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counted_output_is_released_with_its_last_copy() {
+        let total = Arc::new(AtomicUsize::new(0));
+        let mut body = RespBody::counted(vec![b'x'; 1000], &total);
+        assert_eq!(total.load(Ordering::Relaxed), 1000);
+        let RespBody::Full(bytes) = &mut body else { panic!("not in memory") };
+        let sent = bytes.take().unwrap();
+        drop(body);
+        // The connection still holds the bytes it has not written yet.
+        assert_eq!(total.load(Ordering::Relaxed), 1000);
+        let part = sent.slice(500..);
+        drop(sent);
+        assert_eq!(total.load(Ordering::Relaxed), 1000);
+        drop(part);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
     }
 }

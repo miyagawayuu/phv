@@ -10,6 +10,9 @@
 //! session_ttl = 7200      # seconds of inactivity before a session expires
 //! memory_limit_mb = 128   # per request
 //!
+//! [server]
+//! workers = 16            # scripts running at once (default: 2 per CPU, at least 8)
+//!
 //! [permissions]
 //! read = ["content/"]
 //! write = ["data/", "storage/"]
@@ -43,6 +46,8 @@ struct File {
     project: Project,
     #[serde(default)]
     security: Security,
+    #[serde(default)]
+    server: ServerSection,
     #[serde(default)]
     permissions: PermissionsSection,
     #[serde(default)]
@@ -190,6 +195,18 @@ struct Project {
     name: Option<String>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ServerSection {
+    /// Scripts that `phv serve` runs at once; further requests wait for one.
+    workers: Option<usize>,
+}
+
+/// Two workers per CPU, at least 8.
+fn default_workers() -> usize {
+    std::thread::available_parallelism().map_or(8, |n| n.get() * 2).max(8)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Security {
@@ -328,6 +345,8 @@ pub struct Config {
     pub secure_cookies: bool,
     pub session_ttl: u64,
     pub memory_limit_mb: u64,
+    /// Scripts that `phv serve` runs at once.
+    pub workers: usize,
     pub csp: Csp,
     pub requests_per_minute: u32,
     /// Directory for session files; None keeps sessions in memory.
@@ -344,6 +363,7 @@ impl Config {
             secure_cookies: false,
             session_ttl: default_ttl(),
             memory_limit_mb: default_memory(),
+            workers: default_workers(),
             csp: Csp::Policy(DEFAULT_CSP.into()),
             requests_per_minute: 0,
             session_dir: None,
@@ -485,6 +505,9 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
     if !(1..=1_048_576).contains(&file.security.memory_limit_mb) {
         return Err("[security].memory_limit_mb must be between 1 and 1048576".into());
     }
+    if file.server.workers.is_some_and(|w| !(1..=1024).contains(&w)) {
+        return Err("[server].workers must be between 1 and 1024".into());
+    }
     let permissions =
         Permissions { read: file.permissions.read, write: file.permissions.write, env: file.permissions.env };
     let mut databases = BTreeMap::new();
@@ -509,6 +532,7 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
         secure_cookies: file.security.secure_cookies,
         session_ttl: file.security.session_ttl,
         memory_limit_mb: file.security.memory_limit_mb,
+        workers: file.server.workers.unwrap_or_else(default_workers),
         csp,
         requests_per_minute: file.security.requests_per_minute,
         session_dir,

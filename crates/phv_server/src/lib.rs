@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -40,6 +41,8 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FIELDS: usize = 1000;
 /// A connection is closed when the client accepts no data for this long.
 const WRITE_STALL: Duration = Duration::from_secs(30);
+/// Time a request waits for a free worker before it gets 503.
+const QUEUE_WAIT: Duration = Duration::from_secs(10);
 
 pub struct ServeOptions {
     /// Site directory; pages live in `<root>/public`.
@@ -62,6 +65,12 @@ struct State {
     csrf_secret: Vec<u8>,
     csrf_cookie: &'static str,
     cache: Mutex<HashMap<PathBuf, Arc<Compiled>>>,
+    /// Scripts running at once (`[server] workers`).
+    workers: Arc<tokio::sync::Semaphore>,
+    /// Bytes of script output waiting to be sent, over all connections.
+    buffered: Arc<AtomicUsize>,
+    /// No new script runs while `buffered` is above this.
+    buffered_cap: usize,
 }
 
 impl State {
@@ -77,6 +86,10 @@ impl State {
             ),
             csrf_cookie: if config.secure_cookies { "__Host-PHVCSRF" } else { "PHVCSRF" },
             csrf_secret: secret,
+            workers: Arc::new(tokio::sync::Semaphore::new(config.workers)),
+            buffered: Arc::new(AtomicUsize::new(0)),
+            // As much output as the workers could make at once.
+            buffered_cap: config.workers * (config.memory_limit_mb as usize) * 1024 * 1024,
             config,
             root,
             dev,
@@ -481,7 +494,7 @@ impl State {
                 Err(Err(_)) => RespBody::full(Bytes::new()),
             }
         } else {
-            RespBody::full(outcome.output)
+            RespBody::counted(outcome.output.into_bytes(), &self.buffered)
         };
         let mut r = Response::new(body);
         *r.status_mut() = status;
@@ -525,8 +538,26 @@ async fn run_script(state: &Arc<State>, script: PathBuf, ip: String, req: Reques
         Ok(Err(_)) => return simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "request body too large".into()),
         Err(_) => return simple(StatusCode::REQUEST_TIMEOUT, "text/plain", "request body timed out".into()),
     };
+    // Memory is bounded by the scripts running at once and the output waiting
+    // to be sent; past either limit, new requests are turned away for now.
+    let busy = || {
+        let mut r = simple(StatusCode::SERVICE_UNAVAILABLE, "text/plain", "the server is busy; try again soon".into());
+        r.headers_mut().insert("retry-after", HeaderValue::from_static("5"));
+        r
+    };
+    if state.buffered.load(Ordering::Relaxed) > state.buffered_cap {
+        return busy();
+    }
+    let Ok(Ok(permit)) = tokio::time::timeout(QUEUE_WAIT, state.workers.clone().acquire_owned()).await else {
+        return busy();
+    };
     let st = state.clone();
-    match tokio::task::spawn_blocking(move || st.execute(&script, ip, parts, body)).await {
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        st.execute(&script, ip, parts, body)
+    })
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("internal error: {e}");
