@@ -1,0 +1,23 @@
+<?phv
+import lib.shop.{catalog as f};
+
+const A = 1;
+const B = A + C;
+const C = 2;
+const D = 9223372036854775807 + 1;
+const E = 1 % 0;
+const F = 1.5 . "x";
+const G = "a" + 1;
+const H = strlen("x");
+const I = -"a";
+const J = 2 ** -1;
+const K = 1 << -1;
+
+class K2 {
+    const X = self::Y;
+    const Y = 1;
+}
+
+function f(int $n = UNKNOWN, float $r = 1 / 0): int {
+    return $n;
+}

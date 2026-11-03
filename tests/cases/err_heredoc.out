@@ -1,0 +1,37 @@
+error: this line is indented less than the closing marker of its heredoc
+ --> err_heredoc.phv:4:1
+  |
+4 |  b
+  | ^^
+
+error: `\x` above `\x7f` is not a whole UTF-8 character; use `\u{...}`
+ --> err_heredoc.phv:6:7
+  |
+6 | echo "\xff \xg";
+  |       ^^^^
+
+error: expected one or two hex digits after `\x`
+ --> err_heredoc.phv:6:12
+  |
+6 | echo "\xff \xg";
+  |            ^^
+
+error: the text of a heredoc starts on the next line
+ --> err_heredoc.phv:7:6
+  |
+7 | echo <<<E x
+  |      ^^^^
+
+error: expected `;`, found `x`
+ --> err_heredoc.phv:7:10
+  |
+7 | echo <<<E x
+  |          ^
+
+error: expected a label after `<<<`, like `<<<EOT`
+ --> err_heredoc.phv:8:6
+  |
+8 | echo <<<
+  |      ^^^
+
+6 errors found

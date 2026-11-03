@@ -1,0 +1,69 @@
+error: `T` has no methods
+  --> err_bounds.phv:16:16
+   |
+16 |     return $x->name();
+   |                ^^^^
+   = note: give `T` a bound to use its methods, e.g. `<T: SomeInterface>`
+
+error: `Rock` does not satisfy the bound `T: Named` of `greet`
+  --> err_bounds.phv:23:6
+   |
+23 | echo greet(new Rock());
+   |      ^^^^^^^^^^^^^^^^^
+
+error: `int` does not satisfy the bound `T: Named` of `greet`
+  --> err_bounds.phv:24:6
+   |
+24 | echo greet(5);
+   |      ^^^^^^^^
+
+error: `Rock` does not satisfy the bound `T: Named` of `Box::__construct`
+  --> err_bounds.phv:25:6
+   |
+25 | $b = new Box(new Rock());
+   |      ^^^^^^^^^^^^^^^^^^^
+
+error: `int` does not satisfy the bound `T: Named` of `Box`
+  --> err_bounds.phv:26:1
+   |
+26 | Box<int> $c = new Box(new Dog());
+   | ^^^^^^^^
+
+error: expected `int`, found `Dog`
+  --> err_bounds.phv:26:23
+   |
+26 | Box<int> $c = new Box(new Dog());
+   |                       ^^^^^^^^^
+
+error: `T` does not satisfy the bound `U: Named` of `g`
+  --> err_bounds.phv:33:12
+   |
+33 |     return g($x);
+   |            ^^^^^
+
+error: `T` does not satisfy the bound `T: Named` of `Box`
+  --> err_bounds.phv:37:30
+   |
+37 |     public function boxed(): Box<T> {
+   |                              ^^^^^^
+
+error: `Child::m` overrides `Base::m` with an incompatible signature
+  --> err_bounds.phv:52:21
+   |
+52 |     public function m<T: Named>(T $x): string {
+   |                     ^
+   = note: overriding methods must keep the same parameter types and a compatible return type
+
+error: `int` does not satisfy the bound `T: float` of `half`
+  --> err_bounds.phv:61:6
+   |
+61 | echo half(5);
+   |      ^^^^^^^
+
+error: at most 4 type parameters are supported
+  --> err_bounds.phv:64:10
+   |
+64 | function many<A, B, C, D, E, F, G, H, I: int>(int $x): void {}
+   |          ^^^^
+
+11 errors found

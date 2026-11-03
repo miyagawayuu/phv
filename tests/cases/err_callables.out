@@ -1,0 +1,153 @@
+error: a variadic parameter must be the last parameter
+ --> err_callables.phv:2:12
+  |
+2 | function a(int ...$xs, int $y): int {
+  |            ^^^^^^^^^^
+
+error: a variadic parameter cannot have a default value
+ --> err_callables.phv:5:12
+  |
+5 | function b(int ...$xs = []): int {
+  |            ^^^^^^^^^^^^^^^
+  = note: it is an empty list when no arguments are given for it
+
+error: a variadic parameter cannot be promoted to a property
+ --> err_callables.phv:9:33
+  |
+9 |     public function __construct(public int ...$xs) {}
+  |                                 ^^^^^^^^^^^^^^^^^
+
+error: `Q::m` overrides `P::m` with an incompatible signature
+  --> err_callables.phv:14:21
+   |
+14 |     public function m(int $x): void {}
+   |                     ^
+   = note: overriding methods must keep the same parameter types and a compatible return type
+
+error: closure parameters cannot be variadic
+  --> err_callables.phv:23:9
+   |
+23 | $f = fn(int ...$xs) => 1;
+   |         ^^^^^^^^^^
+   = note: take a list instead, e.g. `fn(list<int> $xs) => ...`
+
+error: expected `int`, found `string`
+  --> err_callables.phv:24:13
+   |
+24 | echo c("a", "b");
+   |             ^^^
+   = note: strings are never converted to numbers implicitly; use `->toInt()` or `->toFloat()`
+
+error: missing argument `$s` for `c`
+  --> err_callables.phv:25:6
+   |
+25 | echo c(...["a"]);
+   |      ^^^^^^^^^^^
+
+error: `...` can only pass arguments to a variadic parameter
+  --> err_callables.phv:25:8
+   |
+25 | echo c(...["a"]);
+   |        ^^^^^^^^
+   = note: a variadic parameter is declared like `int ...$numbers`
+
+error: `xs` is variadic: pass its values as positional arguments
+  --> err_callables.phv:26:13
+   |
+26 | echo c("a", xs: 1);
+   |             ^^
+
+error: expected `int`, found `float`
+  --> err_callables.phv:27:17
+   |
+27 | echo c("a", ...[1.5]);
+   |                 ^^^
+   = note: use `(int)$value` to truncate, or `round()` first
+
+error: `...` can only be used in a list literal or for a variadic parameter
+  --> err_callables.phv:28:13
+   |
+28 | echo strlen(...["a"]);
+   |             ^^^^^^^^
+
+error: `...` needs a list, found `int`
+  --> err_callables.phv:29:14
+   |
+29 | $xs = [1, ...2];
+   |              ^
+
+error: `c` is variadic and cannot be used as a value
+  --> err_callables.phv:30:6
+   |
+30 | echo c(...);
+   |      ^^^^^^
+   = note: write a closure instead, e.g. `fn(string $s): string => ...`
+
+error: generic function `gen` cannot be used as a value
+  --> err_callables.phv:31:6
+   |
+31 | echo gen(...);
+   |      ^^^^^^^^
+   = note: write a closure instead, e.g. `fn(string $s): string => ...`
+
+error: `count` has several signatures, so it cannot be used as a value here
+  --> err_callables.phv:32:6
+   |
+32 | echo count(...);
+   |      ^^^^^^^^^^
+   = note: write a closure instead, e.g. `fn(string $s): string => ...`
+
+error: undefined function `nope`
+  --> err_callables.phv:33:6
+   |
+33 | echo nope(...);
+   |      ^^^^
+
+error: class `P` has no method `nope`
+  --> err_callables.phv:35:10
+   |
+35 | echo $p->nope(...);
+   |          ^^^^
+
+error: `P::m` is not static
+  --> err_callables.phv:36:9
+   |
+36 | echo P::m(...);
+   |         ^
+   = note: use `$object->m(...)`
+
+error: `P::s` is static; use `P::s(...)`
+  --> err_callables.phv:37:10
+   |
+37 | echo $p->s(...);
+   |          ^
+
+error: methods of `string` cannot be used with `(...)`
+  --> err_callables.phv:38:6
+   |
+38 | echo "abc"->upper(...);
+   |      ^^^^^^^^^^^^^^^^^
+   = note: write a closure instead, e.g. `fn(string $s): string => ...`
+
+error: `?->` cannot be used with `(...)`
+  --> err_callables.phv:40:6
+   |
+40 | echo $q?->m(...);
+   |      ^^^^^^^^^^^
+   = note: check the value for null first
+
+error: only functions, methods and static methods can be used with `(...)`
+  --> err_callables.phv:41:6
+   |
+41 | echo ($f)(...);
+   |      ^^^^^^^^^
+   = note: a closure is already a value
+
+error: `...` needs a list, found `null`
+  --> err_callables.phv:43:11
+   |
+43 | $ys = [...$maybe];
+   |           ^^^^^^
+   = note: the value might be null; use `...($xs ?? [])`
+
+23 errors found

@@ -92,6 +92,8 @@ pub enum StmtKind {
     Class(ClassDecl),
     Import(ImportDecl),
     Const(ConstDecl),
+    /// `type UserId = int;`
+    TypeAlias(TypeAliasDecl),
     /// `params(string $title, list<Item> $items);` at the top of a template.
     Params(Vec<Param>),
 }
@@ -149,6 +151,8 @@ pub struct Param {
     pub default: Option<Expr>,
     /// Constructor property promotion: `public readonly int $id`.
     pub promote: Option<(Visibility, bool)>,
+    /// `int ...$xs`: takes the remaining arguments as a list.
+    pub variadic: bool,
     pub span: Span,
 }
 
@@ -168,6 +172,8 @@ pub struct FunctionDecl {
     pub name_span: Span,
     /// `function first<T>(list<T> $xs): ?T`
     pub type_params: Vec<(String, Span)>,
+    /// `<T: Shape>`: the bound of each type parameter.
+    pub type_bounds: Vec<Option<TypeExpr>>,
     /// Declared without a body (`abstract` methods and interface methods).
     pub is_abstract: bool,
     /// `final public function ...`: subclasses cannot override it.
@@ -199,6 +205,8 @@ pub struct ClassDecl {
     pub is_final: bool,
     /// `class Box<T>`
     pub type_params: Vec<(String, Span)>,
+    /// `class Repo<T: Model>`: the bound of each type parameter.
+    pub type_bounds: Vec<Option<TypeExpr>>,
     pub parent: Option<(String, Span)>,
     /// Type arguments of the parent: `extends Base<int>`.
     pub parent_args: Vec<TypeExpr>,
@@ -227,6 +235,17 @@ pub struct ConstDecl {
     pub span: Span,
 }
 
+/// `type Pair<T> = map<string, T>;`
+#[derive(Debug, Clone)]
+pub struct TypeAliasDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub type_params: Vec<(String, Span)>,
+    pub ty: TypeExpr,
+    pub exported: bool,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct EnumCase {
     pub name: String,
@@ -249,8 +268,26 @@ pub struct PropDecl {
 pub struct ImportDecl {
     /// `std.http` in `import std.http.{request, Request};`
     pub module: Vec<String>,
-    pub names: Vec<(String, Span)>,
+    pub names: Vec<ImportName>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportName {
+    pub name: String,
+    pub span: Span,
+    /// `import lib.a.{render as renderA};`
+    pub alias: Option<(String, Span)>,
+}
+
+impl ImportName {
+    /// The name the importing file uses, and where it is written.
+    pub fn local(&self) -> (&str, Span) {
+        match &self.alias {
+            Some((a, s)) => (a, *s),
+            None => (&self.name, self.span),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -454,4 +491,9 @@ pub enum ExprKind {
         inclusive: bool,
     },
     Throw(Box<Expr>),
+    /// `strlen(...)`, `$obj->method(...)`, `Cls::method(...)`: the function as
+    /// a value. Holds the call, written without arguments.
+    FuncRef(Box<Expr>),
+    /// `...$xs` in an argument list or a list literal.
+    Spread(Box<Expr>),
 }

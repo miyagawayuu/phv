@@ -69,6 +69,20 @@ impl<'a> Lexer<'a> {
         self.diags.push(Diagnostic::error(msg, span));
     }
 
+    /// Skips at most `n` spaces or tabs (the indentation of a heredoc line).
+    fn skip_indent(&mut self, n: usize, limit: usize) {
+        for _ in 0..n {
+            if self.pos >= limit || !matches!(self.peek(0), b' ' | b'\t') {
+                break;
+            }
+            self.pos += 1;
+        }
+    }
+
+    fn peek_at(&self, pos: usize) -> u8 {
+        self.bytes.get(pos).copied().unwrap_or(0)
+    }
+
     fn peek(&self, off: usize) -> u8 {
         *self.bytes.get(self.pos + off).unwrap_or(&0)
     }
@@ -240,6 +254,10 @@ impl<'a> Lexer<'a> {
             self.single_quoted();
             return;
         }
+        if self.starts_with("<<<") {
+            self.heredoc();
+            return;
+        }
 
         const PUNCT: &[(&str, Tok)] = &[
             ("<=>", Tok::Spaceship),
@@ -248,6 +266,7 @@ impl<'a> Lexer<'a> {
             ("??=", Tok::QQEq),
             ("?->", Tok::NullsafeArrow),
             ("**=", Tok::StarStarEq),
+            ("...", Tok::Ellipsis),
             ("..=", Tok::DotDotEq),
             ("::", Tok::DoubleColon),
             ("->", Tok::Arrow),
@@ -399,18 +418,43 @@ impl<'a> Lexer<'a> {
     fn double_quoted(&mut self) {
         let start = self.pos;
         self.pos += 1;
+        let parts = self.string_body(start, None, 0);
+        self.push_string(parts, start);
+    }
+
+    fn push_string(&mut self, mut parts: Vec<StrPart>, start: usize) {
+        if let [StrPart::Lit(_)] = parts.as_slice() {
+            let Some(StrPart::Lit(s)) = parts.pop() else { unreachable!() };
+            self.push(Tok::Str(s), start);
+        } else {
+            self.push(Tok::Interp(parts), start);
+        }
+    }
+
+    /// The body of a double-quoted string (`end` is `None`: up to the closing
+    /// `"`) or of a heredoc (up to `end`, with `indent` bytes removed from the
+    /// start of each line).
+    fn string_body(&mut self, start: usize, end: Option<usize>, indent: usize) -> Vec<StrPart> {
         let mut parts = Vec::new();
         let mut lit = String::new();
+        let limit = end.unwrap_or(self.bytes.len());
         loop {
-            if self.pos >= self.bytes.len() {
-                self.error("unterminated string", start, start + 1);
+            if self.pos >= limit {
+                if end.is_none() {
+                    self.error("unterminated string", start, start + 1);
+                }
                 break;
             }
             let b = self.peek(0);
             match b {
-                b'"' => {
+                b'"' if end.is_none() => {
                     self.pos += 1;
                     break;
+                }
+                b'\n' if end.is_some() => {
+                    lit.push('\n');
+                    self.pos += 1;
+                    self.skip_indent(indent, limit);
                 }
                 b'\\' => self.escape(&mut lit),
                 b'$' if is_ident_start(self.peek(1)) => {
@@ -430,7 +474,7 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                     let expr_start = self.pos;
                     let mut depth = 1;
-                    while self.pos < self.bytes.len() {
+                    while self.pos < limit {
                         match self.peek(0) {
                             b'{' => depth += 1,
                             b'}' => {
@@ -439,7 +483,8 @@ impl<'a> Lexer<'a> {
                                     break;
                                 }
                             }
-                            b'"' => break,
+                            b'"' if end.is_none() => break,
+                            b'\n' if end.is_some() => break,
                             _ => {}
                         }
                         self.pos += 1;
@@ -459,14 +504,100 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
-        if parts.is_empty() {
-            self.push(Tok::Str(lit), start);
-        } else {
-            if !lit.is_empty() {
-                parts.push(StrPart::Lit(lit));
-            }
-            self.push(Tok::Interp(parts), start);
+        if !lit.is_empty() || parts.is_empty() {
+            parts.push(StrPart::Lit(lit));
         }
+        parts
+    }
+
+    /// `<<<EOT` (like a double-quoted string), `<<<"EOT"` (the same) or
+    /// `<<<'EOT'` (nowdoc: no escapes or interpolation). The closing marker is on
+    /// a line of its own and may be indented; that indentation is removed from
+    /// every line of the text.
+    fn heredoc(&mut self) {
+        let start = self.pos;
+        self.pos += 3;
+        while matches!(self.peek(0), b' ' | b'\t') {
+            self.pos += 1;
+        }
+        let quote = self.peek(0);
+        let quoted = matches!(quote, b'\'' | b'"');
+        if quoted {
+            self.pos += 1;
+        }
+        if !is_ident_start(self.peek(0)) {
+            self.error("expected a label after `<<<`, like `<<<EOT`", start, self.pos);
+            self.push(Tok::Str(String::new()), start);
+            return;
+        }
+        let label = self.ident().to_string();
+        if quoted {
+            if self.peek(0) == quote {
+                self.pos += 1;
+            } else {
+                self.error(format!("expected `{}` after the label", quote as char), start, self.pos);
+            }
+        }
+        if self.peek(0) == b'\r' {
+            self.pos += 1;
+        }
+        if self.peek(0) != b'\n' {
+            self.error("the text of a heredoc starts on the next line", start, self.pos);
+            self.push(Tok::Str(String::new()), start);
+            return;
+        }
+        self.pos += 1;
+        let body_start = self.pos;
+        // The closing line: optional spaces or tabs, the label, then no identifier character.
+        let mut line = body_start;
+        let close = loop {
+            let mut p = line;
+            while matches!(self.bytes.get(p), Some(b' ' | b'\t')) {
+                p += 1;
+            }
+            if self.src[p..].starts_with(label.as_str()) && !is_ident_char(self.peek_at(p + label.len())) {
+                break Some((line, p));
+            }
+            match self.src[line..].find('\n') {
+                Some(rel) => line += rel + 1,
+                None => break None,
+            }
+        };
+        let Some((close_line, marker)) = close else {
+            self.error(format!("missing the closing `{label}` of this heredoc"), start, body_start);
+            self.pos = self.bytes.len();
+            self.push(Tok::Str(String::new()), start);
+            return;
+        };
+        let indent = &self.src[close_line..marker];
+        // The text ends before the line break of the closing line.
+        let mut body_end = close_line.saturating_sub(1).max(body_start);
+        if body_end > body_start && self.bytes[body_end - 1] == b'\r' {
+            body_end -= 1;
+        }
+        let mut at = body_start;
+        let mut bad = Vec::new();
+        for l in self.src[body_start..body_end].split('\n') {
+            if !l.trim_end_matches('\r').is_empty() && !l.starts_with(indent) {
+                bad.push((at, at + l.len()));
+            }
+            at += l.len() + 1;
+        }
+        for (from, to) in bad {
+            self.error("this line is indented less than the closing marker of its heredoc", from, to);
+        }
+        let indent = indent.len();
+        let parts = if quote == b'\'' {
+            let text: Vec<&str> =
+                self.src[body_start..body_end].split('\n').map(|l| l.get(indent..).unwrap_or("")).collect();
+            vec![StrPart::Lit(text.join("\n"))]
+        } else {
+            self.pos = body_start;
+            self.skip_indent(indent, body_end);
+            self.string_body(start, Some(body_end), indent)
+        };
+        self.pos = marker + label.len();
+        self.push_string(parts, start);
     }
 
     fn escape(&mut self, out: &mut String) {
@@ -483,9 +614,25 @@ impl<'a> Lexer<'a> {
             b'"' => out.push('"'),
             b'$' => out.push('$'),
             b'{' => out.push('{'),
+            b'x' => {
+                let digits = (0..2).take_while(|&i| self.peek(i).is_ascii_hexdigit()).count();
+                let hex = &self.src[self.pos..self.pos + digits];
+                self.pos += digits;
+                match u8::from_str_radix(hex, 16) {
+                    Ok(v) if v < 0x80 => out.push(v as char),
+                    Ok(_) => self.error(
+                        "`\\x` above `\\x7f` is not a whole UTF-8 character; use `\\u{...}`",
+                        start,
+                        self.pos,
+                    ),
+                    Err(_) => self.error("expected one or two hex digits after `\\x`", start, self.pos),
+                }
+            }
             b'u' if self.peek(0) == b'{' => {
                 let hex_start = self.pos + 1;
-                match self.src[hex_start..].find('}') {
+                // At most 8 digits: an unclosed `\u{` must not scan the rest of the file.
+                let window = &self.bytes[hex_start.min(self.bytes.len())..(hex_start + 9).min(self.bytes.len())];
+                match window.iter().position(|&b| b == b'}') {
                     Some(rel) => {
                         let hex = &self.src[hex_start..hex_start + rel];
                         self.pos = hex_start + rel + 1;

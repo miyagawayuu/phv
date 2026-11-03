@@ -1,0 +1,43 @@
+<?phv
+// Exception codes, causes (`previous:`) and traces.
+
+class ConfigError extends RuntimeException {}
+
+function parse_port(string $s): int {
+    $n = $s->toInt();
+    if ($n == null) {
+        throw new ValueError("not a number: {$s}", 22);
+    }
+    return $n;
+}
+
+function load(string $raw): int {
+    try {
+        return parse_port($raw);
+    } catch (ValueError $e) {
+        throw new ConfigError("bad port", previous: $e);
+    }
+}
+
+try {
+    load("http");
+} catch (ConfigError $e) {
+    echo $e->getMessage(), " (code ", $e->getCode(), ")\n";
+    $cause = $e->getPrevious();
+    if ($cause != null) {
+        echo "caused by ", $cause->getMessage(), " (code ", $cause->getCode(), ")\n";
+    }
+    echo $e->getTraceAsString(), "\n";
+    echo "--\n";
+    echo $cause?->getTraceAsString() ?? "", "\n";
+}
+
+try {
+    echo intdiv(1, 0);
+} catch (DivisionByZeroError $e) {
+    echo $e->getMessage(), " ", $e->getCode(), " ", $e->getPrevious() == null ? "no cause" : "cause", "\n";
+    echo $e->getTraceAsString(), "\n";
+}
+
+$kept = new RuntimeException("never thrown");
+echo "[", $kept->getTraceAsString(), "]\n";

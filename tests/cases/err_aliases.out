@@ -1,0 +1,92 @@
+error: module `lib.types` has no exported `Hidden`
+ --> err_aliases.phv:2:18
+  |
+2 | import lib.types.Hidden;
+  |                  ^^^^^^
+  = note: `Hidden` exists but is not exported; add `export` to its declaration
+
+error: type alias `Loop` refers to itself
+ --> err_aliases.phv:4:6
+  |
+4 | type Loop = list<Loop>;
+  |      ^^^^
+  = note: an alias is replaced by its type, so it cannot contain itself; use a class for recursive data
+
+error: type alias `A` refers to itself
+ --> err_aliases.phv:5:6
+  |
+5 | type A = B;
+  |      ^
+  = note: an alias is replaced by its type, so it cannot contain itself; use a class for recursive data
+
+error: `int` is a built-in type
+ --> err_aliases.phv:7:6
+  |
+7 | type int = string;
+  |      ^^^
+
+error: type `Twice` is defined more than once
+ --> err_aliases.phv:9:6
+  |
+9 | type Twice = string;
+  |      ^^^^^
+
+error: `list` takes one type argument, e.g. `list<string>`
+  --> err_aliases.phv:10:12
+   |
+10 | type Box = list;
+   |            ^^^^
+
+error: unknown type `Nope`
+  --> err_aliases.phv:11:14
+   |
+11 | type Thing = Nope;
+   |              ^^^^
+
+error: `Shape` is defined more than once
+  --> err_aliases.phv:13:6
+   |
+13 | type Shape = int;
+   |      ^^^^^
+   = note: a type alias and a class cannot have the same name
+
+error: `Gen` takes 1 type argument
+  --> err_aliases.phv:16:1
+   |
+16 | Gen $g = [];
+   | ^^^
+
+error: cannot infer the element type of `[]`
+  --> err_aliases.phv:16:10
+   |
+16 | Gen $g = [];
+   |          ^^
+   = note: declare the variable with a type, e.g. `list<string> $names = [];`
+
+error: `Gen` takes 1 type argument
+  --> err_aliases.phv:17:1
+   |
+17 | Gen<int, int> $h = [];
+   | ^^^^^^^^^^^^^
+
+error: cannot infer the element type of `[]`
+  --> err_aliases.phv:17:20
+   |
+17 | Gen<int, int> $h = [];
+   |                    ^^
+   = note: declare the variable with a type, e.g. `list<string> $names = [];`
+
+error: expected `int`, found `string`
+  --> err_aliases.phv:19:12
+   |
+19 | Score $s = "x";
+   |            ^^^
+   = note: strings are never converted to numbers implicitly; use `->toInt()` or `->toFloat()`
+
+error: types must be declared at the top level of a file
+  --> err_aliases.phv:22:10
+   |
+22 |     type Inner = int;
+   |          ^^^^^
+
+14 errors found

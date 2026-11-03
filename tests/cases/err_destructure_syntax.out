@@ -1,0 +1,13 @@
+error: a key cannot be destructured
+ --> err_destructure_syntax.phv:2:22
+  |
+2 | foreach ([[1, 2]] as [$m] => $n) {
+  |                      ^^^^
+
+error: type parameters of a type alias cannot have bounds
+ --> err_destructure_syntax.phv:5:15
+  |
+5 | type Alias<T: Named> = list<T>;
+  |               ^^^^^
+
+2 errors found

@@ -1,0 +1,36 @@
+<?phv
+// Type aliases.
+import lib.types.{UserId, Row, lookup};
+import lib.types.Row as Record;
+
+type Score = int|float;
+type Pair<A, B> = map<string, A|B>;
+type Handler = fn(string): ?string;
+type Names = list<string>;
+
+function total(list<Score> $scores): float {
+    $sum = 0.0;
+    foreach ($scores as $s) {
+        $sum += $s is int ? (float) $s : $s;
+    }
+    return $sum;
+}
+
+function shout(): Handler {
+    return fn(string $s): ?string => ($s == "" ? null : $s->upper());
+}
+
+UserId $id = 1;
+?Row<string> $row = lookup($id);
+if ($row != null) {
+    echo $row["name"], "\n";
+}
+Record<int> $counts = ["a" => 1];
+echo $counts["a"], "\n";
+echo total([1, 2.5]), "\n";
+Pair<int, string> $p = ["n" => 1, "s" => "x"];
+echo $p->len(), "\n";
+$h = shout();
+echo $h("hi") ?? "-", " ", $h("") ?? "-", "\n";
+Names $names = ["a", "b"];
+echo $names->join(","), "\n";

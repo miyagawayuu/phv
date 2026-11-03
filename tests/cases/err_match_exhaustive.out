@@ -1,0 +1,22 @@
+error: `match` does not handle `Suit::Spades` and `Suit::Clubs`
+ --> err_match_exhaustive.phv:9:12
+  |
+9 |     return match ($s) {
+  |            ^^^^^^^^^^^^
+  = note: add an arm for each, or a `default` arm
+
+error: `match` does not handle `null`
+  --> err_match_exhaustive.phv:15:12
+   |
+15 |     return match ($s) {
+   |            ^^^^^^^^^^^^
+   = note: add an arm for each, or a `default` arm
+
+error: `match` does not handle `false`
+  --> err_match_exhaustive.phv:21:12
+   |
+21 |     return match ($b) {
+   |            ^^^^^^^^^^^^
+   = note: add an arm for each, or a `default` arm
+
+3 errors found

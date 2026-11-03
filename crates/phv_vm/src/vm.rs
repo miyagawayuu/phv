@@ -553,26 +553,43 @@ impl Vm {
         VmError::Exception(Box::new(Exc { value: obj, trace: Vec::new() }))
     }
 
-    /// `ClassName: message` for an exception value.
+    /// `ClassName: message` for an exception value, then `(caused by ...)` for
+    /// each exception it was thrown because of.
     pub fn describe_exception(&self, e: &Exc) -> String {
-        match &e.value {
-            Value::Object(o) => {
+        let mut out = String::new();
+        let mut cur = e.value.clone();
+        // A bounded walk: a class could make an exception its own cause.
+        for depth in 0..16 {
+            let Value::Object(o) = &cur else {
+                out.push_str(cur.type_name());
+                break;
+            };
+            let next = {
                 let o = o.borrow();
                 let cls = &self.prog.classes[o.class as usize];
-                let msg = cls
-                    .fields
-                    .iter()
-                    .position(|f| f.name == "message")
-                    .map(|i| o.fields[i].to_display_string())
-                    .unwrap_or_default();
-                if msg.is_empty() {
-                    cls.name.clone()
-                } else {
-                    format!("{}: {}", cls.name, msg)
+                let field = |name: &str| cls.fields.iter().position(|f| f.name == name).map(|i| o.fields[i].clone());
+                let msg = field("message").map(|v| v.to_display_string()).unwrap_or_default();
+                if depth > 0 {
+                    out.push_str(" (caused by ");
+                }
+                out.push_str(&cls.name);
+                if !msg.is_empty() {
+                    out.push_str(": ");
+                    out.push_str(&msg);
+                }
+                field("previous")
+            };
+            match next {
+                Some(v @ Value::Object(_)) => cur = v,
+                _ => {
+                    out.push_str(&")".repeat(depth));
+                    return out;
                 }
             }
-            v => v.type_name().to_string(),
         }
+        out.push_str(" ...");
+        out.push_str(&")".repeat(15));
+        out
     }
 
     pub fn class_name(&self, class: u32) -> &str {
@@ -646,6 +663,19 @@ impl Vm {
                 TraceLine { func: func.name.clone(), file: file.name.clone(), line }
             })
             .collect()
+    }
+
+    /// Stores where an exception was first thrown in its `trace` field, which
+    /// `getTraceAsString()` returns. A rethrown exception keeps the first one.
+    fn record_trace(&self, e: &Exc) {
+        let Value::Object(o) = &e.value else { return };
+        let mut o = o.borrow_mut();
+        let cls = &self.prog.classes[o.class as usize];
+        let Some(i) = cls.fields.iter().position(|f| f.name == "trace") else { return };
+        if matches!(&o.fields[i], Value::Str(s) if s.is_empty()) {
+            let lines: Vec<String> = e.trace.iter().map(|t| format!("at {} ({}:{})", t.func, t.file, t.line)).collect();
+            o.fields[i] = Value::str(lines.join("\n"));
+        }
     }
 
     /// After an instruction that went over `bytes` of a string: a long one
@@ -855,6 +885,7 @@ impl Vm {
                 Err(VmError::Exception(mut e)) => {
                     if e.trace.is_empty() {
                         e.trace = self.trace();
+                        self.record_trace(&e);
                     }
                     match self.handlers.last() {
                         Some(h) if h.frame >= stop_at => {

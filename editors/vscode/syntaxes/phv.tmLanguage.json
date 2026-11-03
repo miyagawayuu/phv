@@ -24,6 +24,7 @@
         { "include": "#attributes" },
         { "include": "#comments" },
         { "include": "#sql-string" },
+        { "include": "#heredoc" },
         { "include": "#double-string" },
         { "include": "#single-string" },
         { "include": "#numbers" },
@@ -73,7 +74,7 @@
       ]
     },
     "escapes": {
-      "match": "\\\\(?:[nrt0\\\\\"'${]|u\\{[0-9A-Fa-f]+\\}|x[0-9A-Fa-f]{2})",
+      "match": "\\\\(?:[nrt0\\\\\"'${]|u\\{[0-9A-Fa-f]+\\}|x[0-9A-Fa-f]{1,2})",
       "name": "constant.character.escape.phv"
     },
     "interpolation": {
@@ -97,6 +98,27 @@
       "end": "\"",
       "name": "string.quoted.double.phv",
       "patterns": [{ "include": "#escapes" }, { "include": "#interpolation" }]
+    },
+    "heredoc": {
+      "patterns": [
+        {
+          "comment": "<<<'NAME' (nowdoc): no escapes or interpolation.",
+          "begin": "<<<\\s*'([A-Za-z_][A-Za-z0-9_]*)'\\s*$",
+          "end": "^\\s*(\\1)\\b",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.phv" } },
+          "endCaptures": { "1": { "name": "punctuation.definition.string.end.phv" } },
+          "name": "string.unquoted.nowdoc.phv"
+        },
+        {
+          "comment": "<<<NAME or <<<\"NAME\" (heredoc): like a double-quoted string.",
+          "begin": "<<<\\s*\"?([A-Za-z_][A-Za-z0-9_]*)\"?\\s*$",
+          "end": "^\\s*(\\1)\\b",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.phv" } },
+          "endCaptures": { "1": { "name": "punctuation.definition.string.end.phv" } },
+          "name": "string.unquoted.heredoc.phv",
+          "patterns": [{ "include": "#escapes" }, { "include": "#interpolation" }]
+        }
+      ]
     },
     "single-string": {
       "begin": "'",
@@ -170,7 +192,7 @@
           "name": "storage.type.function.phv"
         },
         {
-          "match": "\\b(class|interface|enum|const)\\b",
+          "match": "\\b(class|interface|enum|const)\\b|\\btype\\b(?=\\s+[A-Za-z_][A-Za-z0-9_]*\\s*[=<])",
           "name": "storage.type.phv"
         },
         {

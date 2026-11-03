@@ -43,10 +43,27 @@ It is not compatible with existing PHP code, but it aims to be something PHP pro
 - Floating-point numbers: `1.5`, `1e-3`.
 - Strings:
   - `'...'` … No interpolation. The only escapes are `\'` and `\\`.
-  - `"..."` … Interpolates `$name` and `{$expr}`. Escapes are `\n \t \r \0 \e \\ \" \$ \{ \u{1F600}`.
+  - `"..."` … Interpolates `$name` and `{$expr}`. Escapes are `\n \t \r \0 \e \\ \" \$ \{ \x41 \u{1F600}`
+    (`\x` takes one or two hex digits up to `\x7f`; other characters are written with `\u{...}`).
+  - Heredoc and nowdoc, for text over several lines:
+
+    ```phv
+    $page = <<<HTML
+        <h1>{$title}</h1>
+        <p>Hello, $name</p>
+        HTML;
+    $raw = <<<'TEXT'
+        No $interpolation or \escapes here.
+        TEXT;
+    ```
+
+    `<<<NAME` (or `<<<"NAME"`) works like `"..."`; `<<<'NAME'` (nowdoc) like `'...'` without escapes. The text starts
+    on the next line and ends before the line holding `NAME`. The indentation of that closing line is removed from
+    every line, and a line indented less than it is an error.
 - Reserved words: `function fn return if elseif else endif while endwhile do for endfor foreach endforeach as break continue
   echo class extends new public private protected readonly static true false null match default try catch finally
-  throw import export use is instanceof interface implements abstract final enum case const`
+  throw import export use is instanceof interface implements abstract final enum case const`. `type` is a keyword only
+  where it starts a type alias (§4).
 
 ## 4. Types
 
@@ -70,6 +87,20 @@ It is not compatible with existing PHP code, but it aims to be something PHP pro
 | Class name | The type of an object. `self` is the class itself |
 
 PHP's `array` is split into `list<T>` and `map<K, V>`. `mixed` is `any`.
+
+### Type aliases
+
+```phv
+type UserId = int;
+type Row<T> = map<string, T>;
+export type Handler = fn(Request): Html;
+
+function find(UserId $id): ?Row<string> { ... }
+```
+
+A type alias is another name for a type: `UserId` and `int` are the same type. Aliases are declared at the top level
+of a file, can take type parameters, can be exported and imported like classes, and cannot refer to themselves
+(use a class for recursive data).
 
 ### Assignability
 
@@ -107,6 +138,23 @@ PHP's `array` is split into `list<T>` and `map<K, V>`. `mixed` is `any`.
 - A `foreach` or `catch` variable whose type differs from an existing variable with the same name is a new variable that shadows it
   (so `catch (A $e)` and `catch (B $e)` can be written one after another).
 - `$this` can be used only inside non-static methods. It cannot be assigned.
+
+### Destructuring
+
+```phv
+[$a, $b] = [1, 2];
+[$a, $b] = [$b, $a];                       // swap
+[$first, ...$rest] = $names;               // $rest = $names->slice(1)
+["id" => $id, "name" => $name] = $row;     // a map, by key
+[[$x, $y], $z] = [[1, 2], 3];
+[$this->x, $list[0]] = $pair;              // any assignable place
+foreach ($pairs as [$key, $value]) { ... }
+foreach ($rows as $i => ["id" => $id]) { ... }
+```
+
+The value is evaluated once, then each target is assigned its element: `$v[0]`, `$v[1]`, ... for a list, `$v["key"]`
+for a map. A missing element throws `IndexError` or `KeyError`, as indexing does. Each target follows the usual rules of
+assignment, so an element of a `list<int|string>` is `int|string`. Only `=` can assign to a pattern.
 
 ### Type Narrowing
 
@@ -191,6 +239,27 @@ $size = match (true) {
 
 Comparison uses `==` (strict). If no arm matches and there is no `default`, `UnhandledMatchError` is thrown.
 
+A `match` on an enum or a `bool` without `default` must have an arm for every case (and for `null` when the subject
+may be null); a missing one is a compile error, so adding a case to an enum shows every `match` to update.
+
+```phv
+$color = match ($suit) {
+    Suit::Hearts, Suit::Diamonds => "red",
+    Suit::Spades, Suit::Clubs => "black",
+};
+```
+
+In `match (true)`, an arm sees what its condition proves, and the later arms what the earlier conditions disprove,
+as in `if` / `elseif`:
+
+```phv
+$area = match (true) {
+    $shape is Circle => 3.14 * $shape->r ** 2,
+    $shape is Square => $shape->side ** 2,
+    default => 0.0,
+};
+```
+
 ### Exceptions
 
 ```phv
@@ -214,6 +283,21 @@ try {
 Only `Exception` and its subclasses can be thrown. A `catch` that does not need the exception leaves the variable
 out: `catch (ValueError) { ... }`.
 
+An exception can carry a code and the exception it was thrown because of:
+
+```phv
+try {
+    $port = parse_port($raw);
+} catch (ValueError $e) {
+    throw new ConfigError("bad port", previous: $e);    // or new ConfigError("bad port", 2, $e)
+}
+// $e->getCode(): int, $e->getPrevious(): ?Exception
+// $e->getTraceAsString(): "at parse_port (lib/config.phv:12)\nat load (lib/config.phv:20)\n..."
+```
+
+`getTraceAsString()` gives the calls where the exception was first thrown, innermost first (empty for an exception that
+was never thrown). An uncaught exception shows its causes too: `Uncaught ConfigError: bad port (caused by ValueError: ...)`.
+
 ## 8. Functions
 
 ```phv
@@ -224,9 +308,36 @@ greet(name: "Bob", times: 3);       // named arguments
 
 - Parameter types are required. If the return type is omitted, it is `void`.
 - A function that returns a value must `return` on every path, or it is an error.
-- Default values must be constants (literals, `null`, `[]`).
-- Functions are not values. To pass a function, wrap it in a closure.
+- Default values must be constant expressions (see "Constants" in §9), `null` or `[]`.
 - Generic functions with type parameters can be written (see "Generic Functions" in §9).
+
+### Variadic parameters and spreading
+
+```phv
+function sum(int ...$xs): int { ... }    // $xs is a list<int>
+sum();                     // $xs = []
+sum(1, 2, 3);
+sum(...$numbers);          // a list<int> spread into $xs
+sum(1, ...$more, 4);
+$all = [0, ...$a, ...$b];  // lists joined in a list literal
+```
+
+A variadic parameter is the last one, takes the remaining positional arguments as a list, and has no default value.
+`...` passes a list's elements to a variadic parameter only (the number of a list's elements is not known when the
+program is checked, so it cannot fill fixed parameters).
+
+### Functions as values
+
+```phv
+$len = strlen(...);                    // fn(string): int
+$names->map(strtoupper(...));
+$greet = $greeter->greet(...);         // the method, bound to $greeter (evaluated now)
+$items->map(Item::fromRow(...));       // a static method
+```
+
+`name(...)` makes a closure that calls the function, method or static method with its own arguments. Generic and
+variadic functions, built-in functions with several signatures (unless the expected function type picks one),
+and the methods of `string`, `list` and `map` cannot be used this way; write a closure instead.
 
 ### Closures
 
@@ -238,6 +349,8 @@ $counter = function () use ($start): int { return $start + 1; };
 
 - All captures are **by value** (a copy taken when the closure is created). There is no capture by reference (`&$x`).
 - A closure created inside a method can use `$this`.
+- The body of `fn() =>` extends as far as possible: `fn($n) => $n > 0 ? "+" : "-"` returns the whole conditional.
+- Closure parameters cannot have default values or be variadic, because a function type (`fn(int): int`) has neither.
 
 ## 9. Classes
 
@@ -353,7 +466,20 @@ class Config {
 echo MAX_ITEMS, Config::VERSION, self::VERSION;
 ```
 
-Constant values must be literals (int, float, string, bool, null).
+Constant values are constant expressions: literals (int, float, string, bool, null), the constants declared before
+them in the same file (and class constants: `self::X`, `Other::Y`), and operators on them, computed when the program is
+checked. The same expressions are allowed as default values.
+
+```phv
+const MINUTE = 60;
+const DAY = 24 * 60 * MINUTE;
+const MASK = (1 << 8) - 1;
+const PREFIX = "v" . 2 . "/";
+function wait(int $seconds = 5 * MINUTE): void { ... }
+```
+
+An overflow, a division by zero or an operator on the wrong types is a compile error. Floats are not joined to strings
+in a constant.
 
 ### Generic Functions
 
@@ -366,7 +492,27 @@ $s = first_or([], "none");       // string
 ```
 
 Type arguments are inferred from the call's arguments (up to 4). Inside the function, `T` is treated as an opaque type,
-and operators and methods cannot be used on values of type `T`.
+and operators and methods cannot be used on values of type `T`, unless it has a bound:
+
+```phv
+interface Shape {
+    public function area(): float;
+}
+function largest<T: Shape>(list<T> $shapes): ?T {
+    ?T $best = null;
+    foreach ($shapes as $s) {
+        if ($best == null || $s->area() > $best->area()) {   // methods of Shape
+            $best = $s;
+        }
+    }
+    return $best;
+}
+class Registry<T: Shape> { ... }
+```
+
+With `T: Bound`, a value of type `T` has the methods and properties of `Bound` and can be passed where a `Bound` is
+expected, and every type argument must be a `Bound`: `largest([new Circle()])` gives a `?Circle`, while
+`largest([1, 2])` is a compile error.
 
 ### Generic Classes
 
@@ -440,7 +586,7 @@ Annotations are checked at compile time and are not available at run time.
 Available from every file.
 
 ```
-Exception                    (getMessage(): string)
+Exception                    getMessage(), getCode(), getPrevious(), getTraceAsString()
 ├── RuntimeException
 │   ├── DatabaseError        SQL error
 │   └── NetworkError         WebSocket connection failure
@@ -471,11 +617,13 @@ function helper(): int { ... }      // anything not exported is not visible from
 import lib.posts.{Post, all_posts};
 import lib.posts.Post;
 import std.http.{request, response};
+import lib.admin.posts.{Post as AdminPost};     // under another name
+import lib.legacy.render as render_legacy;
 ```
 
 - `import a.b.{x, y};` loads `a/b.phv` relative to the project root (the directory that contains `phv.toml`, or, if there is none,
   the directory of the file being run).
-- The top level of an imported module can contain only declarations (`function`, `class`, `interface`, `enum`, `const`, `import`).
+- The top level of an imported module can contain only declarations (`function`, `class`, `interface`, `enum`, `const`, `type`, `import`).
   Loading a module has no side effects.
 - `std.*` are the standard modules (`std.http`, `std.db`, `std.net`, `std.async`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
 - Only files inside the project and package directories can be loaded (symbolic links cannot be used to escape them).
@@ -1317,6 +1465,9 @@ It then runs the type checker and shows the places that need manual work, such a
 | Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits) |
 | Variables and temporary values of one function | 65,534 | Compile error (split the function) |
 | Properties of one class (inherited ones included) | 65,535 | Compile error |
+| A string built by a constant expression | 1 MiB (16 MiB for all of a program's) | Compile error |
+| Type aliases resolved inside each other | 64 | Compile error |
+| Size of the type an alias stands for | 10,000 type nodes (2,000,000 for all uses together) | Compile error |
 
 `unsafe` is used only in the allocator that counts memory usage (`phv_vm/src/alloc.rs`), in the JIT
 (`phv_jit`, for calling generated code, and the helpers it calls in `phv_vm/src/jit.rs`), in calls to OS file APIs (`phv_std/src/safefs.rs`) and in the SQLite VFS
@@ -1326,9 +1477,9 @@ that checks journal files (`phv_std/src/db/vfs.rs`).
 
 Planned, in this order. Each release is audited before it is published, as before.
 
-- **0.6, the language**: destructuring (`[$a, $b] = ...`), variadic parameters and `...` spread, functions as values
-  (`strlen(...)`), type aliases, `match` that must cover every case of an enum, bounds on type parameters
-  (`<T: Comparable>`), heredoc strings, and exceptions that carry the exception that caused them.
+- **0.6, the language** (done): destructuring, variadic parameters and `...` spread, functions as values
+  (`strlen(...)`), type aliases, `match` that must cover every case of an enum, bounds on type parameters,
+  constant expressions, `import ... as`, heredoc strings, and exceptions that carry their cause and trace.
 - **0.7, web applications**: routes with parameters (`public/posts/[id].phv`), middleware, custom error pages, form
   validation, layouts with slots, CORS, compression and caching headers for static files, graceful shutdown, access
   logs, database migrations, an HTTP client for `phv test`, and sending mail.

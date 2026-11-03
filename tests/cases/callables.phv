@@ -1,0 +1,68 @@
+<?phv
+// Variadic parameters, `...` spreading, and functions as values (`f(...)`).
+
+function sum(int ...$xs): int {
+    $total = 0;
+    foreach ($xs as $x) {
+        $total += $x;
+    }
+    return $total;
+}
+
+function tag(string $name, string ...$classes): string {
+    return "<{$name} class=\"" . $classes->join(" ") . "\">";
+}
+
+function first<T>(T $_a, T ...$rest): int {
+    return 1 + $rest->len();
+}
+
+$nums = [3, 4];
+echo sum(), " ", sum(1), " ", sum(1, 2), " ", sum(...$nums), " ", sum(1, ...$nums, 10, ...$nums), "\n";
+echo tag("p"), " ", tag("div", "a", "b"), "\n";
+echo first("x", "y", "z"), "\n";
+
+$all = [0, ...$nums, 5, ...[6, 7]];
+echo $all->join(","), "\n";
+list<float> $fs = [1, ...[2.5]];
+echo $fs->join(","), "\n";
+
+class Greeter {
+    public function __construct(private string $greeting) {}
+
+    public function greet(string $name): string {
+        return "{$this->greeting}, {$name}";
+    }
+
+    public static function shout(string $s): string {
+        return $s->upper() . "!";
+    }
+
+    private function secret(): string {
+        return "secret";
+    }
+
+    public function reveal(): fn(): string {
+        return $this->secret(...);
+    }
+}
+
+function double(int $n): int {
+    return $n * 2;
+}
+
+$d = double(...);
+echo $d(21), " ", [1, 2, 3]->map(double(...))->join(","), "\n";
+
+$g = new Greeter("Hello");
+$hi = $g->greet(...);
+$g = new Greeter("Bye");
+echo $hi("Ada"), " ", $g->greet(...)("Bob"), "\n";
+echo ["a", "b"]->map(Greeter::shout(...))->join(" "), "\n";
+echo ["a", "b"]->map(strtoupper(...))->join(" "), " ", (strlen(...))("four"), "\n";
+echo ($g->reveal())(), "\n";
+
+function apply(fn(int): int $f, int $x): int {
+    return $f($x);
+}
+echo apply(double(...), 5), "\n";

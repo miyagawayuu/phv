@@ -1,0 +1,12 @@
+Hello, PHV!
+  Indented by two.
+
+Count: 2
+Tab:	end, quote: "q", escaped $name
+---
+No $name and no \t here.
+---
+<h1>Hi</h1>
+---
+[AB~]
+1

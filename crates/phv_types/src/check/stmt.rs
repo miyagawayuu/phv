@@ -2,7 +2,7 @@ use super::flow::{assigned_vars, Flow};
 use super::Checker;
 use crate::hir::*;
 use crate::types::*;
-use phv_syntax::ast::{AssignOp, BinOp, Expr, ExprKind, Stmt, StmtKind};
+use phv_syntax::ast::{Arg, AssignOp, BinOp, Expr, ExprKind, Stmt, StmtKind};
 use phv_syntax::Span;
 use std::collections::HashSet;
 
@@ -275,9 +275,86 @@ impl Checker<'_> {
             StmtKind::Const(d) => {
                 self.error("constants must be declared at the top level of a file", d.name_span);
             }
+            StmtKind::TypeAlias(d) => {
+                self.error("types must be declared at the top level of a file", d.name_span);
+            }
             StmtKind::Params(_) => {
                 self.error("`params(...)` must be at the top level of a template", s.span);
             }
+        }
+    }
+
+    /// `[$a, $b] = $list;`, `[$first, ...$rest] = $list;` and
+    /// `["id" => $id] = $map;` (nested patterns too): the value is kept in a
+    /// hidden variable, and each target is assigned its element.
+    fn destructure(&mut self, pattern: &Expr, value: &Expr, out: &mut Vec<HStmt>) {
+        let h = self.expr(value, None);
+        let is_list = matches!(pattern.kind, ExprKind::List(_));
+        let ok = match &h.ty {
+            Type::List(_) => is_list,
+            Type::Map(..) => !is_list,
+            Type::Error => true,
+            _ => false,
+        };
+        if !ok {
+            let msg = format!("cannot destructure `{}` with this pattern", self.tn(&h.ty));
+            let e = self.error(msg, value.span);
+            match &h.ty {
+                Type::List(_) => {
+                    e.add_note("a list is destructured with `[$a, $b]`");
+                }
+                Type::Map(..) => {
+                    e.add_note("a map is destructured with `[\"key\" => $var]`");
+                }
+                t if t.is_nullable() => {
+                    e.add_note("the value might be null; check it first");
+                }
+                _ => {}
+            }
+        }
+        let name = format!("%d{}", self.cx().locals.len());
+        // After an error, the targets get `Type::Error` instead of more errors.
+        let ty = if ok { h.ty.clone() } else { Type::Error };
+        let id = self.cx().declare(&name, ty, pattern.span);
+        self.cx().flow.mark(id);
+        out.push(HStmt::Assign(HPlace { base: HPlaceBase::Local(id), path: Vec::new() }, h));
+        let tmp = || Box::new(Expr { kind: ExprKind::Var(name.clone()), span: pattern.span });
+        let index = |k: Expr| ExprKind::Index { base: tmp(), index: Some(Box::new(k)) };
+        let mut items: Vec<(&Expr, ExprKind)> = Vec::new();
+        match &pattern.kind {
+            ExprKind::List(xs) => {
+                for (i, x) in xs.iter().enumerate() {
+                    if let ExprKind::Spread(rest) = &x.kind {
+                        if i + 1 != xs.len() {
+                            self.error("`...` must come last in a pattern", x.span);
+                        }
+                        let from = Arg { name: None, value: Expr { kind: ExprKind::Int(i as i64), span: x.span } };
+                        let slice = ExprKind::MethodCall {
+                            obj: tmp(),
+                            name: "slice".into(),
+                            name_span: x.span,
+                            args: vec![from],
+                            nullsafe: false,
+                        };
+                        items.push((rest, slice));
+                        continue;
+                    }
+                    items.push((x, index(Expr { kind: ExprKind::Int(i as i64), span: x.span })));
+                }
+            }
+            ExprKind::Map(pairs) => {
+                for (k, x) in pairs {
+                    items.push((x, index(k.clone())));
+                }
+            }
+            _ => unreachable!(),
+        }
+        if items.is_empty() {
+            self.error("this pattern assigns nothing", pattern.span);
+        }
+        for (target, kind) in items {
+            let value = Expr { kind, span: target.span };
+            self.assign(target, AssignOp::Set, &value, out);
         }
     }
 
@@ -393,6 +470,15 @@ impl Checker<'_> {
     }
 
     fn assign(&mut self, target: &Expr, op: AssignOp, value: &Expr, out: &mut Vec<HStmt>) {
+        if matches!(target.kind, ExprKind::List(_) | ExprKind::Map(_)) {
+            if op != AssignOp::Set {
+                self.error("only `=` can assign to `[...]`", target.span);
+                self.expr(value, None);
+                return;
+            }
+            self.destructure(target, value, out);
+            return;
+        }
         if let ExprKind::Var(name) = &target.kind {
             if name == "this" {
                 self.error("cannot assign to `$this`", target.span);

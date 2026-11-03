@@ -1,0 +1,59 @@
+error: cannot destructure `map<string, int>` with this pattern
+ --> err_destructure.phv:2:12
+  |
+2 | [$a, $b] = ["k" => 1];
+  |            ^^^^^^^^^^
+  = note: a map is destructured with `["key" => $var]`
+
+error: cannot destructure `list<int>` with this pattern
+ --> err_destructure.phv:3:15
+  |
+3 | ["k" => $c] = [1, 2];
+  |               ^^^^^^
+  = note: a list is destructured with `[$a, $b]`
+
+error: cannot destructure `int` with this pattern
+ --> err_destructure.phv:4:8
+  |
+4 | [$d] = 5;
+  |        ^
+
+error: only `=` can assign to `[...]`
+ --> err_destructure.phv:5:1
+  |
+5 | [$e, $f] += [1, 2];
+  | ^^^^^^^^
+
+error: this pattern assigns nothing
+ --> err_destructure.phv:6:1
+  |
+6 | [] = [1];
+  | ^^
+
+error: `...` must come last in a pattern
+ --> err_destructure.phv:7:2
+  |
+7 | [...$g, $h] = [1, 2];
+  |  ^^^^^
+
+error: cannot assign to this expression
+ --> err_destructure.phv:8:6
+  |
+8 | [$i, 1] = [1, 2];
+  |      ^
+
+error: cannot destructure `null` with this pattern
+  --> err_destructure.phv:10:8
+   |
+10 | [$j] = $maybe;
+   |        ^^^^^^
+   = note: the value might be null; check it first
+
+error: expected `string`, found `int`
+  --> err_destructure.phv:12:2
+   |
+12 | [$k] = [1];
+   |  ^^
+   = note: use `(string)$value` or string interpolation
+
+9 errors found

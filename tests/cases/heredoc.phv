@@ -1,0 +1,31 @@
+<?phv
+// Heredoc, nowdoc and `\x` escapes.
+
+$name = "PHV";
+$items = ["a", "b"];
+
+$text = <<<EOT
+    Hello, $name!
+      Indented by two.
+
+    Count: {$items->len()}
+    Tab:\tend, quote: "q", escaped \$name
+    EOT;
+echo $text, "\n---\n";
+
+$raw = <<<'RAW'
+  No $name and no \t here.
+  RAW;
+echo $raw, "\n---\n";
+
+function page(string $title): string {
+    return <<<"HTML"
+        <h1>{$title}</h1>
+        HTML;
+}
+echo page("Hi"), "\n---\n";
+
+echo <<<EMPTY
+EMPTY;
+echo "[\x41\x42\x7e]\n";
+echo strlen("\x0a"), "\n";

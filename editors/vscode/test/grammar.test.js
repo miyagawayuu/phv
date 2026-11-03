@@ -91,6 +91,29 @@ function expect(tokens, text, scope) {
   expect(code, "?>", "punctuation.section.embedded.end.phv");
   expect(code, "<?=", "punctuation.section.embedded.begin.phv");
 
+  const newer = await tokenize(
+    "source.phv",
+    [
+      "<?phv",
+      "type UserId = int;",
+      "$html = <<<HTML",
+      "    <p>{$name}\\x41</p>",
+      "    HTML;",
+      "$raw = <<<'RAW'",
+      "    no $interpolation",
+      "    RAW;",
+      "$f = strlen(...);",
+    ].join("\n"),
+  );
+  expect(newer, "type", "storage.type.phv");
+  expect(newer, "    <p>", "string.unquoted.heredoc.phv");
+  expect(newer, "{", "punctuation.definition.template-expression.begin.phv");
+  expect(newer, "\\x41", "constant.character.escape.phv");
+  expect(newer, "HTML", "punctuation.definition.string.end.phv");
+  expect(newer, "    no $interpolation", "string.unquoted.nowdoc.phv");
+  expect(newer, "RAW", "punctuation.definition.string.end.phv");
+  expect(newer, "strlen", "entity.name.function.phv");
+
   const template = await tokenize(
     "text.html.phv",
     ['<a href="<?= safe_url($u) ?>">link</a>', "<?phv foreach ($items as $i): ?>", "<li><?= $i ?></li>", "<?phv endforeach; ?>"].join("\n"),

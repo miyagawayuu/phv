@@ -572,6 +572,9 @@ impl Parser {
                 StmtKind::Class(self.class_decl(false)?)
             }
             Tok::Const => StmtKind::Const(self.const_decl(false)?),
+            Tok::Ident(ref name) if name == "type" && self.at_type_alias(0) => {
+                StmtKind::TypeAlias(self.type_alias(false)?)
+            }
             Tok::Export => {
                 self.advance();
                 match self.peek() {
@@ -580,6 +583,9 @@ impl Parser {
                         StmtKind::Class(self.class_decl(true)?)
                     }
                     Tok::Const => StmtKind::Const(self.const_decl(true)?),
+                    Tok::Ident(name) if name == "type" && self.at_type_alias(0) => {
+                        StmtKind::TypeAlias(self.type_alias(true)?)
+                    }
                     _ => return Err(self.error_here("expected a declaration after `export`")),
                 }
             }
@@ -750,10 +756,18 @@ impl Parser {
         self.expect(Tok::LParen)?;
         let subject = self.expr()?;
         self.expect(Tok::As)?;
-        let first = self.expect_var()?;
-        let (key, value) = if self.eat(&Tok::FatArrow) { (Some(first), self.expect_var()?) } else { (None, first) };
+        let mut pattern = None;
+        let first = self.foreach_var(&mut pattern)?;
+        let (key, value) = if self.eat(&Tok::FatArrow) {
+            if pattern.is_some() {
+                self.diags.push(Diagnostic::error("a key cannot be destructured", first.1));
+            }
+            (Some(first), self.foreach_var(&mut pattern)?)
+        } else {
+            (None, first)
+        };
         self.expect(Tok::RParen)?;
-        let body = self.exit_target(Exit::Loop, |p| {
+        let mut body = self.exit_target(Exit::Loop, |p| {
             if p.eat(&Tok::Colon) {
                 let b = p.block_until(&[Tok::Endforeach]);
                 p.expect(Tok::Endforeach)?;
@@ -763,8 +777,27 @@ impl Parser {
                 p.stmt_or_block()
             }
         })?;
+        if let Some(p) = pattern {
+            body.insert(0, p);
+        }
         let kind = StmtKind::Foreach { subject, key, value, body };
         Ok(Stmt { kind, span: start.to(self.prev_span()) })
+    }
+
+    /// The variable after `as`. `as [$a, $b]` takes the value into a hidden
+    /// variable, and the body starts by destructuring it (`pattern`).
+    fn foreach_var(&mut self, pattern: &mut Option<Stmt>) -> PResult<(String, Span)> {
+        if !self.at(&Tok::LBracket) {
+            return self.expect_var();
+        }
+        let start = self.span();
+        let kind = self.array_literal()?;
+        let span = start.to(self.prev_span());
+        let name = format!("%v{}", span.start);
+        let value = Expr { kind: ExprKind::Var(name.clone()), span };
+        *pattern =
+            Some(Stmt { kind: StmtKind::Assign { target: Expr { kind, span }, op: AssignOp::Set, value }, span });
+        Ok((name, span))
     }
 
     fn try_stmt(&mut self) -> PResult<Stmt> {
@@ -813,10 +846,11 @@ impl Parser {
             }
             let promote =
                 if vis.is_some() || readonly { Some((vis.unwrap_or(Visibility::Public), readonly)) } else { None };
-            let ty = if matches!(self.peek(), Tok::Var(_)) { None } else { Some(self.ty()?) };
+            let ty = if matches!(self.peek(), Tok::Var(_) | Tok::Ellipsis) { None } else { Some(self.ty()?) };
+            let variadic = self.eat(&Tok::Ellipsis);
             let (name, _) = self.expect_var()?;
             let default = if self.eat(&Tok::Eq) { Some(self.expr()?) } else { None };
-            params.push(Param { name, ty, default, promote, span: start.to(self.prev_span()) });
+            params.push(Param { name, ty, default, promote, variadic, span: start.to(self.prev_span()) });
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -828,7 +862,7 @@ impl Parser {
     fn function_decl(&mut self, exported: bool, visibility: Visibility, is_static: bool) -> PResult<FunctionDecl> {
         let start = self.expect(Tok::Function)?;
         let (name, name_span) = self.expect_ident("a function name")?;
-        let type_params = self.type_params()?;
+        let (type_params, type_bounds) = self.bounded_type_params()?;
         let params = self.params()?;
         let ret = if self.eat(&Tok::Colon) { Some(self.ty()?) } else { None };
         let (body, is_abstract) = if self.eat(&Tok::Semi) { (Vec::new(), true) } else { (self.body_block()?, false) };
@@ -838,6 +872,7 @@ impl Parser {
             name_span,
             is_final: false,
             type_params,
+            type_bounds,
             is_abstract,
             params,
             ret,
@@ -885,7 +920,7 @@ impl Parser {
         }
         self.advance();
         let (name, name_span) = self.expect_ident("a type name")?;
-        let type_params = self.type_params()?;
+        let (type_params, type_bounds) = self.bounded_type_params()?;
         let mut backing = None;
         if kind == ClassKind::Enum && self.eat(&Tok::Colon) {
             backing = Some(self.ty()?);
@@ -1038,6 +1073,7 @@ impl Parser {
             kind,
             is_final,
             type_params,
+            type_bounds,
             parent,
             parent_args,
             interfaces,
@@ -1050,6 +1086,22 @@ impl Parser {
             exported,
             span: start.to(self.prev_span()),
         })
+    }
+
+    /// `type Name =` or `type Name<`: `type` is only a keyword here.
+    fn at_type_alias(&self, at: usize) -> bool {
+        matches!(self.peek_at(at + 1), Tok::Ident(_)) && matches!(self.peek_at(at + 2), Tok::Eq | Tok::Lt)
+    }
+
+    fn type_alias(&mut self, exported: bool) -> PResult<TypeAliasDecl> {
+        let start = self.span();
+        self.advance();
+        let (name, name_span) = self.expect_ident("a type name")?;
+        let type_params = self.type_params()?;
+        self.expect(Tok::Eq)?;
+        let ty = self.ty()?;
+        self.semi()?;
+        Ok(TypeAliasDecl { name, name_span, type_params, ty, exported, span: start.to(self.prev_span()) })
     }
 
     fn const_decl(&mut self, exported: bool) -> PResult<ConstDecl> {
@@ -1073,7 +1125,9 @@ impl Parser {
         while self.eat(&Tok::Dot) {
             if self.eat(&Tok::LBrace) {
                 while !self.at(&Tok::RBrace) {
-                    names.push(self.expect_ident("a name to import")?);
+                    let (name, span) = self.expect_ident("a name to import")?;
+                    let alias = self.import_alias()?;
+                    names.push(ImportName { name, span, alias });
                     if !self.eat(&Tok::Comma) {
                         break;
                     }
@@ -1087,11 +1141,22 @@ impl Parser {
             if segments.len() < 2 {
                 return Err(self.error_here("expected `import module.name;` or `import module.{a, b};`"));
             }
-            names.push(segments.pop().unwrap());
+            let (name, span) = segments.pop().unwrap();
+            let alias = self.import_alias()?;
+            names.push(ImportName { name, span, alias });
         }
         self.semi()?;
         let module = segments.into_iter().map(|(s, _)| s).collect();
         Ok(ImportDecl { module, names, span: start.to(self.prev_span()) })
+    }
+
+    /// `as Other` after an imported name.
+    fn import_alias(&mut self) -> PResult<Option<(String, Span)>> {
+        if self.eat(&Tok::As) {
+            Ok(Some(self.expect_ident("a name after `as`")?))
+        } else {
+            Ok(None)
+        }
     }
 
     // ----- types ---------------------------------------------------------
@@ -1183,17 +1248,29 @@ impl Parser {
 
     /// `<T, U>` after a function or class name (empty when there is none).
     fn type_params(&mut self) -> PResult<Vec<(String, Span)>> {
-        let mut type_params = Vec::new();
+        let (names, bounds) = self.bounded_type_params()?;
+        if let Some(b) = bounds.iter().flatten().next() {
+            self.diags.push(Diagnostic::error("type parameters of a type alias cannot have bounds", b.span));
+        }
+        Ok(names)
+    }
+
+    /// `<T, U: Shape>` (empty when there is none).
+    #[allow(clippy::type_complexity)]
+    fn bounded_type_params(&mut self) -> PResult<(Vec<(String, Span)>, Vec<Option<TypeExpr>>)> {
+        let mut names = Vec::new();
+        let mut bounds = Vec::new();
         if self.eat(&Tok::Lt) {
             loop {
-                type_params.push(self.expect_ident("a type parameter")?);
+                names.push(self.expect_ident("a type parameter")?);
+                bounds.push(if self.eat(&Tok::Colon) { Some(self.ty()?) } else { None });
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
             }
             self.expect_gt()?;
         }
-        Ok(type_params)
+        Ok((names, bounds))
     }
 
     /// `<int, string>` after a class name (empty when there is none).
@@ -1368,6 +1445,10 @@ impl Parser {
             self.enter(chain)?;
             chain += 1;
             match self.peek().clone() {
+                Tok::LParen if self.at_func_ref() => {
+                    let span = e.span;
+                    e = self.func_ref(Expr { kind: ExprKind::Call { callee: Box::new(e), args: Vec::new() }, span });
+                }
                 Tok::LParen => {
                     let args = self.args()?;
                     if let ExprKind::Name(n) = &e.kind {
@@ -1393,7 +1474,12 @@ impl Parser {
                     let nullsafe = self.at(&Tok::NullsafeArrow);
                     self.advance();
                     let (name, name_span) = self.member_name()?;
-                    if self.at(&Tok::LParen) {
+                    if self.at_func_ref() {
+                        let span = e.span.to(name_span);
+                        let kind =
+                            ExprKind::MethodCall { obj: Box::new(e), name, name_span, args: Vec::new(), nullsafe };
+                        e = self.func_ref(Expr { kind, span });
+                    } else if self.at(&Tok::LParen) {
                         let args = self.args()?;
                         let span = e.span.to(self.prev_span());
                         e = Expr {
@@ -1416,6 +1502,12 @@ impl Parser {
                     if !self.at(&Tok::LParen) {
                         let span = e.span.to(self.prev_span());
                         e = Expr { kind: ExprKind::ClassConst { class, class_span, name, name_span }, span };
+                        continue;
+                    }
+                    if self.at_func_ref() {
+                        let span = e.span.to(name_span);
+                        let kind = ExprKind::StaticCall { class, class_span, name, name_span, args: Vec::new() };
+                        e = self.func_ref(Expr { kind, span });
                         continue;
                     }
                     let args = self.args()?;
@@ -1475,7 +1567,7 @@ impl Parser {
                 }
                 _ => None,
             };
-            let value = self.expr()?;
+            let value = self.spreadable()?;
             args.push(Arg { name, value });
             if !self.eat(&Tok::Comma) {
                 break;
@@ -1483,6 +1575,30 @@ impl Parser {
         }
         self.expect(Tok::RParen)?;
         Ok(args)
+    }
+
+    /// An expression, or `...expr` (an argument or list item to spread).
+    fn spreadable(&mut self) -> PResult<Expr> {
+        if !self.at(&Tok::Ellipsis) {
+            return self.expr();
+        }
+        let start = self.advance().span;
+        let inner = self.expr()?;
+        let span = start.to(inner.span);
+        Ok(Expr { kind: ExprKind::Spread(Box::new(inner)), span })
+    }
+
+    /// `(...)` after a function, method or static method name: the function as a value.
+    fn at_func_ref(&self) -> bool {
+        self.at(&Tok::LParen) && *self.peek_at(1) == Tok::Ellipsis && *self.peek_at(2) == Tok::RParen
+    }
+
+    fn func_ref(&mut self, call: Expr) -> Expr {
+        for _ in 0..3 {
+            self.advance();
+        }
+        let span = call.span.to(self.prev_span());
+        Expr { kind: ExprKind::FuncRef(Box::new(call)), span }
     }
 
     fn primary(&mut self) -> PResult<Expr> {
@@ -1574,7 +1690,7 @@ impl Parser {
                 let params = self.params()?;
                 let ret = if self.eat(&Tok::Colon) { Some(self.ty_atom()?) } else { None };
                 self.expect(Tok::FatArrow)?;
-                let body = self.expr_bp(2)?;
+                let body = self.expr_bp(0)?;
                 ExprKind::Closure(Box::new(Closure {
                     params,
                     ret,
@@ -1629,8 +1745,8 @@ impl Parser {
         if self.eat(&Tok::RBracket) {
             return Ok(ExprKind::List(Vec::new()));
         }
-        let first = self.expr()?;
-        if self.eat(&Tok::FatArrow) {
+        let first = self.spreadable()?;
+        if !matches!(first.kind, ExprKind::Spread(_)) && self.eat(&Tok::FatArrow) {
             let mut pairs = vec![(first, self.expr()?)];
             while self.eat(&Tok::Comma) {
                 if self.at(&Tok::RBracket) {
@@ -1650,7 +1766,7 @@ impl Parser {
                 if self.at(&Tok::RBracket) {
                     break;
                 }
-                items.push(self.expr()?);
+                items.push(self.spreadable()?);
                 if self.at(&Tok::FatArrow) {
                     return Err(self.error_here("a list literal cannot contain `key => value` entries"));
                 }

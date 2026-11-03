@@ -1,0 +1,62 @@
+<?phv
+// `match` on enums and bools must handle every value; `match (true)` narrows.
+
+enum Suit {
+    case Hearts;
+    case Spades;
+}
+
+enum Size: string {
+    case S = "s";
+    case M = "m";
+    case L = "l";
+}
+
+function color(Suit $s): string {
+    return match ($s) {
+        Suit::Hearts => "red",
+        Suit::Spades => "black",
+    };
+}
+
+function label(?Size $s): string {
+    return match ($s) {
+        Size::S, Size::M => "small",
+        Size::L => "large",
+        null => "none",
+    };
+}
+
+function yes(bool $b): string {
+    return match ($b) {
+        true => "yes",
+        false => "no",
+    };
+}
+
+class Circle {
+    public function __construct(public float $r) {}
+}
+class Square {
+    public function __construct(public float $side) {}
+}
+
+function area(Circle|Square|null $shape): float {
+    return match (true) {
+        $shape is Circle => 3.0 * $shape->r * $shape->r,
+        $shape is Square => $shape->side * $shape->side,
+        default => 0.0,
+    };
+}
+
+function describe(?string $s): string {
+    return match (true) {
+        $s == null => "nothing",
+        $s->len() > 3 => "long",
+        default => "short: " . $s,
+    };
+}
+
+echo color(Suit::Spades), " ", label(Size::M), " ", label(null), " ", yes(false), "\n";
+echo area(new Circle(1.0)), " ", area(new Square(2.0)), " ", area(null), "\n";
+echo describe(null), " ", describe("abcdef"), " ", describe("ab"), "\n";

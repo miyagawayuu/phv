@@ -1,10 +1,33 @@
 // Declarations visible in every PHV file.
 
 class Exception {
-    public function __construct(public string $message = "") {}
+    // Filled in by the runtime where the exception is first thrown.
+    private string $trace = "";
+    // Not promoted: exceptions the runtime throws get these defaults.
+    protected int $code = 0;
+    protected ?Exception $previous = null;
+
+    public function __construct(public string $message = "", int $code = 0, ?Exception $previous = null) {
+        $this->code = $code;
+        $this->previous = $previous;
+    }
 
     public function getMessage(): string {
         return $this->message;
+    }
+
+    public function getCode(): int {
+        return $this->code;
+    }
+
+    // The exception this one was thrown because of (`previous:` in the constructor).
+    public function getPrevious(): ?Exception {
+        return $this->previous;
+    }
+
+    // Where it was first thrown: one `at function (file:line)` line per call, innermost first.
+    public function getTraceAsString(): string {
+        return $this->trace;
     }
 }
 

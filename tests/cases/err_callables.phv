@@ -1,0 +1,43 @@
+<?phv
+function a(int ...$xs, int $y): int {
+    return $y;
+}
+function b(int ...$xs = []): int {
+    return 0;
+}
+class P {
+    public function __construct(public int ...$xs) {}
+    public function m(int ...$xs): void {}
+    public static function s(): void {}
+}
+class Q extends P {
+    public function m(int $x): void {}
+}
+function c(string $s, int ...$xs): int {
+    return $xs->len();
+}
+function gen<T>(T $x): T {
+    return $x;
+}
+
+$f = fn(int ...$xs) => 1;
+echo c("a", "b");
+echo c(...["a"]);
+echo c("a", xs: 1);
+echo c("a", ...[1.5]);
+echo strlen(...["a"]);
+$xs = [1, ...2];
+echo c(...);
+echo gen(...);
+echo count(...);
+echo nope(...);
+$p = new P();
+echo $p->nope(...);
+echo P::m(...);
+echo $p->s(...);
+echo "abc"->upper(...);
+?P $q = null;
+echo $q?->m(...);
+echo ($f)(...);
+?list<int> $maybe = null;
+$ys = [...$maybe];

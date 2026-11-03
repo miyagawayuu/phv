@@ -43,10 +43,27 @@ PHV は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋
 - 浮動小数点数: `1.5`、`1e-3`。
 - 文字列:
   - `'...'` … 展開なし。エスケープは `\'` と `\\` だけ。
-  - `"..."` … `$name` と `{$式}` を展開する。エスケープは `\n \t \r \0 \e \\ \" \$ \{ \u{1F600}`。
+  - `"..."` … `$name` と `{$式}` を展開する。エスケープは `\n \t \r \0 \e \\ \" \$ \{ \x41 \u{1F600}`
+    (`\x` は 1〜2 桁の 16 進数で `\x7f` まで。ほかの文字は `\u{...}` で書く)。
+  - 複数行の文字列にはヒアドキュメントと Nowdoc を使う:
+
+    ```phv
+    $page = <<<HTML
+        <h1>{$title}</h1>
+        <p>Hello, $name</p>
+        HTML;
+    $raw = <<<'TEXT'
+        No $interpolation or \escapes here.
+        TEXT;
+    ```
+
+    `<<<NAME`(または `<<<"NAME"`)は `"..."` と同じ、`<<<'NAME'`(Nowdoc)はエスケープもない `'...'` と同じ。
+    文字列は次の行から始まり、`NAME` だけの行の前で終わる。その終わりの行のインデントがすべての行から取り除かれ、
+    それより浅くインデントした行はエラー。
 - 予約語: `function fn return if elseif else endif while endwhile do for endfor foreach endforeach as break continue
   echo class extends new public private protected readonly static true false null match default try catch finally
-  throw import export use is instanceof interface implements abstract final enum case const`
+  throw import export use is instanceof interface implements abstract final enum case const`。`type` は型エイリアスの
+  先頭(§4)でだけキーワードになる。
 
 ## 4. 型
 
@@ -70,6 +87,19 @@ PHV は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋
 | クラス名 | オブジェクトの型。`self` はそのクラス自身 |
 
 PHP の `array` は `list<T>` と `map<K, V>` に分かれています。`mixed` は `any` です。
+
+### 型エイリアス
+
+```phv
+type UserId = int;
+type Row<T> = map<string, T>;
+export type Handler = fn(Request): Html;
+
+function find(UserId $id): ?Row<string> { ... }
+```
+
+型エイリアスは型の別名で、`UserId` と `int` は同じ型。ファイルのトップレベルで宣言し、型パラメータを取れる。
+クラスと同じように export / import でき、自分自身を含むことはできない(再帰的なデータにはクラスを使う)。
 
 ### 代入できる条件
 
@@ -107,6 +137,23 @@ PHP の `array` は `list<T>` と `map<K, V>` に分かれています。`mixed`
 - `foreach` と `catch` の変数は、同じ名前の既存の変数と型が違うとき、新しい変数としてそれを隠す
   (`catch (A $e)` と `catch (B $e)` を続けて書ける)。
 - `$this` は非 static メソッドの中だけで使える。代入はできない。
+
+### 分割代入
+
+```phv
+[$a, $b] = [1, 2];
+[$a, $b] = [$b, $a];                       // 入れ替え
+[$first, ...$rest] = $names;               // $rest = $names->slice(1)
+["id" => $id, "name" => $name] = $row;     // map はキーで取り出す
+[[$x, $y], $z] = [[1, 2], 3];
+[$this->x, $list[0]] = $pair;              // 代入できる場所ならどこでも
+foreach ($pairs as [$key, $value]) { ... }
+foreach ($rows as $i => ["id" => $id]) { ... }
+```
+
+右辺を 1 回だけ評価し、各要素を代入する。list は `$v[0]`、`$v[1]`…、map は `$v["key"]`。要素がなければ、
+添字と同じく `IndexError` / `KeyError` が投げられる。それぞれの代入は通常の代入の規則に従うので、`list<int|string>`
+の要素は `int|string` になる。パターンに代入できるのは `=` だけ。
 
 ### 型の絞り込み (narrowing)
 
@@ -191,6 +238,27 @@ $size = match (true) {
 
 比較は `==`(厳密)。どの腕にも当てはまらず `default` もないときは `UnhandledMatchError`。
 
+enum か `bool` に対する `match` で `default` がなければ、すべての値の腕が必要(対象が null になりうるときは `null`
+の腕も)。足りなければコンパイルエラーになるので、enum にケースを加えると直すべき `match` がすべて分かる。
+
+```phv
+$color = match ($suit) {
+    Suit::Hearts, Suit::Diamonds => "red",
+    Suit::Spades, Suit::Clubs => "black",
+};
+```
+
+`match (true)` では、`if` / `elseif` と同じく、各腕はその条件で分かったことを使え、後の腕は前の条件が偽だったことを
+使える:
+
+```phv
+$area = match (true) {
+    $shape is Circle => 3.14 * $shape->r ** 2,
+    $shape is Square => $shape->side ** 2,
+    default => 0.0,
+};
+```
+
 ### 例外
 
 ```phv
@@ -214,6 +282,21 @@ try {
 投げられるのは `Exception` かそのサブクラスだけ。例外を使わない `catch` は変数を省略できる:
 `catch (ValueError) { ... }`。
 
+例外はコードと、原因になった例外を持てる:
+
+```phv
+try {
+    $port = parse_port($raw);
+} catch (ValueError $e) {
+    throw new ConfigError("bad port", previous: $e);    // または new ConfigError("bad port", 2, $e)
+}
+// $e->getCode(): int、$e->getPrevious(): ?Exception
+// $e->getTraceAsString(): "at parse_port (lib/config.phv:12)\nat load (lib/config.phv:20)\n..."
+```
+
+`getTraceAsString()` は、例外が最初に投げられたときの呼び出しを内側から順に返す(投げられていない例外では空)。
+捕まえられなかった例外は原因も表示する: `Uncaught ConfigError: bad port (caused by ValueError: ...)`。
+
 ## 8. 関数
 
 ```phv
@@ -224,9 +307,35 @@ greet(name: "Bob", times: 3);       // 名前付き引数
 
 - 引数の型は必須。戻り値の型を省略すると `void`。
 - 値を返す関数は、すべての経路で `return` しないとエラー。
-- デフォルト値は定数(リテラル、`null`、`[]`)だけ。
-- 関数は値ではない。関数を渡すときはクロージャで包む。
+- デフォルト値は定数式(§9 の「定数」)、`null`、`[]` だけ。
 - 型パラメータを持つジェネリック関数を書ける(§9 の「ジェネリック関数」)。
+
+### 可変長引数と展開
+
+```phv
+function sum(int ...$xs): int { ... }    // $xs は list<int>
+sum();                     // $xs = []
+sum(1, 2, 3);
+sum(...$numbers);          // list<int> を $xs に展開する
+sum(1, ...$more, 4);
+$all = [0, ...$a, ...$b];  // list リテラルの中でつなぐ
+```
+
+可変長引数は最後の引数で、残りの位置引数を list として受け取り、デフォルト値は持てない。`...` で list の要素を
+渡せるのは可変長引数だけ(list の要素数は検査のときには分からないので、決まった数の引数は埋められない)。
+
+### 関数を値として使う
+
+```phv
+$len = strlen(...);                    // fn(string): int
+$names->map(strtoupper(...));
+$greet = $greeter->greet(...);         // メソッド。$greeter はこの時点で評価される
+$items->map(Item::fromRow(...));       // static メソッド
+```
+
+`name(...)` は、その関数・メソッド・static メソッドを自分の引数で呼ぶクロージャを作る。ジェネリック関数、可変長引数を
+持つ関数、シグネチャが複数ある組み込み関数(期待される関数型で 1 つに決まる場合を除く)、`string`・`list`・`map`
+のメソッドはこの形では使えないので、クロージャを書く。
 
 ### クロージャ
 
@@ -238,6 +347,8 @@ $counter = function () use ($start): int { return $start + 1; };
 
 - キャプチャはすべて**値渡し**(作られた時点のコピー)。参照キャプチャ(`&$x`)はない。
 - メソッドの中で作ったクロージャは `$this` を使える。
+- `fn() =>` の本体はできるだけ長く続く: `fn($n) => $n > 0 ? "+" : "-"` は条件式全体を返す。
+- 関数型(`fn(int): int`)にはデフォルト値も可変長引数もないので、クロージャの引数はどちらも持てない。
 
 ## 9. クラス
 
@@ -353,7 +464,18 @@ class Config {
 echo MAX_ITEMS, Config::VERSION, self::VERSION;
 ```
 
-定数の値はリテラル(int、float、string、bool、null)だけ。
+定数の値は定数式: リテラル(int、float、string、bool、null)、同じファイルでそれより前に宣言した定数
+(とクラス定数 `self::X`、`Other::Y`)、それらへの演算子で、検査のときに計算される。デフォルト値にも同じ式を書ける。
+
+```phv
+const MINUTE = 60;
+const DAY = 24 * 60 * MINUTE;
+const MASK = (1 << 8) - 1;
+const PREFIX = "v" . 2 . "/";
+function wait(int $seconds = 5 * MINUTE): void { ... }
+```
+
+オーバーフロー、0 での除算、型の合わない演算子はコンパイルエラー。定数の中では float を文字列につなげない。
 
 ### ジェネリック関数
 
@@ -366,7 +488,26 @@ $s = first_or([], "none");       // string
 ```
 
 型引数は呼び出しの引数から推論される(最大 4 個)。関数の中では `T` は中身の分からない型として扱われ、
-`T` の値に演算子やメソッドは使えない。
+`T` の値に演算子やメソッドは使えない。ただし制約を付けると使える:
+
+```phv
+interface Shape {
+    public function area(): float;
+}
+function largest<T: Shape>(list<T> $shapes): ?T {
+    ?T $best = null;
+    foreach ($shapes as $s) {
+        if ($best == null || $s->area() > $best->area()) {   // Shape のメソッド
+            $best = $s;
+        }
+    }
+    return $best;
+}
+class Registry<T: Shape> { ... }
+```
+
+`T: Bound` と書くと、`T` の値は `Bound` のメソッドとプロパティを持ち、`Bound` を受け取る場所に渡せる。型引数は
+すべて `Bound` でなければならない: `largest([new Circle()])` は `?Circle` になり、`largest([1, 2])` はコンパイルエラー。
 
 ### ジェネリッククラス
 
@@ -437,7 +578,7 @@ class Square extends Shape {
 すべてのファイルから使える。
 
 ```
-Exception                    (getMessage(): string)
+Exception                    getMessage()、getCode()、getPrevious()、getTraceAsString()
 ├── RuntimeException
 │   ├── DatabaseError        SQL のエラー
 │   └── NetworkError         WebSocket の接続エラー
@@ -468,11 +609,13 @@ function helper(): int { ... }      // export しないものは外から見え�
 import lib.posts.{Post, all_posts};
 import lib.posts.Post;
 import std.http.{request, response};
+import lib.admin.posts.{Post as AdminPost};     // 別の名前で
+import lib.legacy.render as render_legacy;
 ```
 
 - `import a.b.{x, y};` は、プロジェクトのルート(`phv.toml` のあるディレクトリ、なければ実行するファイルの
   ディレクトリ)からの `a/b.phv` を読み込む。
-- import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`const`、`import`)
+- import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`const`、`type`、`import`)
   しか書けない。モジュールを読み込んでも副作用は起きない。
 - `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`、`std.async`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
 - 読み込めるのはプロジェクトとパッケージのディレクトリの中のファイルだけ(シンボリックリンクで外に出ることはできない)。
@@ -1299,6 +1442,9 @@ phv migrate legacy/page.php      # page.phv を書き出す
 | 全クラスが継承するメンバーの合計 | 200,000 | コンパイルエラー(各クラスは継承したものの写しを持つ) |
 | 1 つの関数の変数と一時的な値 | 65,534 | コンパイルエラー(関数を分ける) |
 | 1 つのクラスのプロパティ(継承したものを含む) | 65,535 | コンパイルエラー |
+| 定数式で作る文字列 | 1 MiB(プログラム全体で 16 MiB) | コンパイルエラー |
+| 入れ子になった型エイリアス | 64 | コンパイルエラー |
+| 型エイリアスが表す型の大きさ | 10,000 個の型の要素(すべての使用の合計で 2,000,000) | コンパイルエラー |
 
 `unsafe` を使っているのは、メモリ使用量を数えるアロケータ(`phv_vm/src/alloc.rs`)、JIT
 (`phv_jit`、生成したコードの呼び出し、およびそれが呼ぶ `phv_vm/src/jit.rs` のヘルパー)、OS のファイル API の呼び出し(`phv_std/src/safefs.rs`)、ジャーナルファイルを
@@ -1308,9 +1454,9 @@ phv migrate legacy/page.php      # page.phv を書き出す
 
 次の順に予定している。これまでどおり、各リリースは監査してから公開する。
 
-- **0.6 言語**: 分割代入(`[$a, $b] = ...`)、可変長引数と `...` による展開、関数を値として渡す(`strlen(...)`)、
-  型エイリアス、enum のすべてのケースを書く必要がある `match`、型パラメータの制約(`<T: Comparable>`)、
-  ヒアドキュメント、原因の例外を持つ例外。
+- **0.6 言語**(実装済み): 分割代入、可変長引数と `...` による展開、関数を値として使う(`strlen(...)`)、
+  型エイリアス、enum のすべてのケースを書く必要がある `match`、型パラメータの制約、定数式、`import ... as`、
+  ヒアドキュメント、原因とトレースを持つ例外。
 - **0.7 Web アプリケーション**: パラメータ付きのルート(`public/posts/[id].phv`)、ミドルウェア、独自のエラーページ、
   フォームの検証、スロット付きのレイアウト、CORS、静的ファイルの圧縮とキャッシュのヘッダー、グレースフル
   シャットダウン、アクセスログ、データベースのマイグレーション、`phv test` 用の HTTP クライアント、メール送信。

@@ -8,6 +8,7 @@ use phv_syntax::ast::{
     UnOp, Visibility,
 };
 use phv_syntax::{normalize_template_path, Span};
+use std::collections::HashSet;
 
 /// Inferred type parameters: a generic class's (when it is created) and then
 /// the function's own, at most 4 each.
@@ -110,6 +111,12 @@ impl<'a> Checker<'a> {
     // ----- assignability ---------------------------------------------------
 
     pub(crate) fn assignable(&self, from: &Type, to: &Type) -> bool {
+        // A bounded `T` is its bound, with no conversion (a `T: int` is not widened to `float`).
+        if let Type::Param(n) = from {
+            if self.bounds.get(n).is_some_and(|b| from != to && self.assignable_exact(b, to)) {
+                return true;
+            }
+        }
         self.assignable_inner(from, to, true)
     }
 
@@ -762,6 +769,7 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Prop { obj, name, name_span, nullsafe } => {
                 let ho = self.expr(obj, None);
+                let ho = self.through_bound(ho);
                 let f = |c: &mut Self, recv: HExpr| match c.prop_access(&recv, name, *name_span) {
                     Some((slot, f)) => {
                         let ty = f.ty.resolve_open(true);
@@ -782,6 +790,12 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Index { base, index } => self.index(base, index.as_deref(), span),
             ExprKind::Closure(c) => self.closure(c, expect, span),
+            ExprKind::FuncRef(call) => self.func_ref(call, expect, span),
+            ExprKind::Spread(inner) => {
+                self.error("`...` can only be used in a list literal or for a variadic parameter", span);
+                self.expr(inner, None);
+                err(span)
+            }
             ExprKind::Match { subject, arms } => self.match_expr(subject.as_deref(), arms, expect, span),
             ExprKind::Cast(kind, x) => self.cast(*kind, x, span),
             ExprKind::Range { from, to, inclusive } => {
@@ -835,6 +849,9 @@ impl<'a> Checker<'a> {
     }
 
     fn list_lit(&mut self, items: &[Expr], expect: Option<&Type>, span: Span) -> HExpr {
+        if items.iter().any(|i| matches!(i.kind, ExprKind::Spread(_))) {
+            return self.spread_list(items, expect, span);
+        }
         let expected = expect.map(|t| t.without_null());
         match expected {
             Some(Type::List(t)) if !t.has_unknown() => {
@@ -861,6 +878,54 @@ impl<'a> Checker<'a> {
         }
         let hs = hs.into_iter().map(|h| self.coerce(h, &elem)).collect();
         HExpr { kind: HExprKind::List(hs), ty: Type::list(elem), span }
+    }
+
+    /// `[1, ...$xs, ...$ys]`: the lists are joined.
+    fn spread_list(&mut self, items: &[Expr], expect: Option<&Type>, span: Span) -> HExpr {
+        let known = match expect.map(|t| t.without_null()) {
+            Some(Type::List(t)) if !t.has_unknown() => Some(*t),
+            _ => None,
+        };
+        let mut parts = Vec::new();
+        for (i, item) in items.iter().enumerate() {
+            let ExprKind::Spread(inner) = &item.kind else {
+                let h = match &known {
+                    Some(t) => self.expr_to(item, t),
+                    None => self.expr(item, None),
+                };
+                parts.push((i, h, false));
+                continue;
+            };
+            let want = known.clone().map(Type::list);
+            let h = self.expr(inner, want.as_ref());
+            if !matches!(h.ty, Type::List(_) | Type::Error) {
+                let msg = format!("`...` needs a list, found `{}`", self.tn(&h.ty));
+                let e = self.error(msg, inner.span);
+                if h.ty.is_nullable() {
+                    e.add_note("the value might be null; use `...($xs ?? [])`");
+                }
+                parts.push((i, err(inner.span), true));
+                continue;
+            }
+            parts.push((i, h, true));
+        }
+        let elem = match known {
+            Some(t) => t,
+            None => parts.iter().fold(Type::Never, |acc, (_, h, spread)| {
+                let t = match (&h.ty, spread) {
+                    (Type::List(e), true) => (**e).clone(),
+                    (_, true) => Type::Error,
+                    (t, false) => t.clone(),
+                };
+                self.join(&acc, &t, true)
+            }),
+        };
+        let lt = Type::list(elem.clone());
+        let parts = parts
+            .into_iter()
+            .map(|(i, h, spread)| (i, self.coerce(h, if spread { &lt } else { &elem }), spread))
+            .collect();
+        self.join_rest(parts, &lt, span)
     }
 
     fn map_lit(&mut self, pairs: &[(Expr, Expr)], expect: Option<&Type>, span: Span) -> HExpr {
@@ -1241,6 +1306,24 @@ impl<'a> Checker<'a> {
             ret = super::subst_params(&ret, &names, &tys).resolve_open(true);
         }
         let (hargs, b) = self.call_args_b(&fname, &params, args, span);
+        // Bounds: the class's (for a constructor's inferred arguments), then the function's own.
+        let mut bounds = vec![None; infer.len()];
+        if let Some(cb) = owner.filter(|_| !infer.is_empty()).and_then(|c| self.class_bounds.get(&c)) {
+            bounds = cb.clone();
+        }
+        let own = self.func_bounds.get(&fid).cloned().unwrap_or_else(|| vec![None; tps.len() - infer.len()]);
+        bounds.extend(own);
+        if bounds.iter().any(Option::is_some) {
+            let actual: Vec<Type> =
+                (0..tps.len()).map(|i| b.get(i).cloned().flatten().unwrap_or(Type::Infer)).collect();
+            let bounds: Vec<Option<Type>> = if fixed.is_empty() {
+                bounds
+            } else {
+                let (names, tys): (Vec<String>, Vec<Type>) = fixed.iter().cloned().unzip();
+                bounds.into_iter().map(|t| t.map(|t| super::subst_params(&t, &names, &tys))).collect()
+            };
+            self.check_bounds(&format!("`{fname}`"), &tps, &bounds, &actual, span);
+        }
         let mut ret = subst(&ret, &b).resolve_open(true);
         if ret.has_unknown() {
             self.error(format!("cannot infer the type parameters of `{fname}` from its arguments"), span);
@@ -1295,13 +1378,32 @@ impl<'a> Checker<'a> {
         let mut order: Vec<usize> = (0..args.len()).filter(|i| !deferred(&args[*i])).collect();
         order.extend((0..args.len()).filter(|i| deferred(&args[*i])));
         let positional = args.iter().take_while(|a| a.name.is_none()).count();
+        // `int ...$xs`: the arguments from its position on, as pieces of the list.
+        let rest = params.last().filter(|p| p.variadic).map(|_| params.len() - 1);
+        let mut rest_parts: Vec<(usize, HExpr, bool)> = Vec::new();
         for i in order {
             let a = &args[i];
             let i = if a.name.is_none() && i >= positional { usize::MAX } else { i };
+            if let ExprKind::Spread(inner) = &a.value.kind {
+                if a.name.is_some() || i == usize::MAX || rest.is_none_or(|r| i < r) {
+                    self.error("`...` can only pass arguments to a variadic parameter", a.value.span)
+                        .add_note("a variadic parameter is declared like `int ...$numbers`");
+                    self.expr(inner, None);
+                    continue;
+                }
+                let ty = params[params.len() - 1].ty.clone();
+                rest_parts.push((i, self.arg_to(inner, &ty, &mut b), true));
+                continue;
+            }
             match &a.name {
                 None => {
                     if i == usize::MAX {
                         self.error("positional arguments cannot follow named arguments", a.value.span);
+                        continue;
+                    }
+                    if let Some(r) = rest.filter(|r| i >= *r) {
+                        let Type::List(elem) = params[r].ty.clone() else { unreachable!() };
+                        rest_parts.push((i, self.arg_to(&a.value, &elem, &mut b), false));
                         continue;
                     }
                     if i >= params.len() {
@@ -1318,6 +1420,10 @@ impl<'a> Checker<'a> {
                     slots[i] = Some(self.arg_to(&a.value, &ty, &mut b));
                 }
                 Some((n, nspan)) => match params.iter().position(|p| &p.name == n) {
+                    Some(j) if params[j].variadic => {
+                        self.error(format!("`{n}` is variadic: pass its values as positional arguments"), *nspan);
+                        self.expr(&a.value, None);
+                    }
                     None => {
                         self.error(format!("`{fname}` has no parameter named `{n}`"), *nspan);
                         self.expr(&a.value, None);
@@ -1333,6 +1439,11 @@ impl<'a> Checker<'a> {
             }
         }
         let mut out = Vec::new();
+        if let Some(r) = rest {
+            rest_parts.sort_by_key(|(i, ..)| *i);
+            let ty = subst(&params[r].ty, &b);
+            slots[r] = Some(self.join_rest(rest_parts, &ty, span));
+        }
         for (j, slot) in slots.into_iter().enumerate() {
             match slot {
                 Some(h) => out.push(h),
@@ -1347,6 +1458,42 @@ impl<'a> Checker<'a> {
             }
         }
         (out, b)
+    }
+
+    /// The list a variadic parameter receives: single arguments are gathered
+    /// into list literals and joined with spread lists.
+    fn join_rest(&mut self, parts: Vec<(usize, HExpr, bool)>, ty: &Type, span: Span) -> HExpr {
+        let mut pieces: Vec<HExpr> = Vec::new();
+        let mut single: Vec<HExpr> = Vec::new();
+        let list = |items: Vec<HExpr>| HExpr { kind: HExprKind::List(items), ty: ty.clone(), span };
+        for (_, h, spread) in parts {
+            if spread {
+                if !single.is_empty() {
+                    pieces.push(list(std::mem::take(&mut single)));
+                }
+                pieces.push(h);
+            } else {
+                single.push(h);
+            }
+        }
+        if !single.is_empty() || pieces.is_empty() {
+            pieces.push(list(single));
+        }
+        // Joined in pairs, so many spreads nest only logarithmically deep.
+        while pieces.len() > 1 {
+            let mut next = Vec::with_capacity(pieces.len().div_ceil(2));
+            let mut it = pieces.into_iter();
+            while let Some(a) = it.next() {
+                next.push(match it.next() {
+                    Some(b) => {
+                        HExpr { kind: HExprKind::CallBuiltin("list_concat".into(), vec![a, b]), ty: ty.clone(), span }
+                    }
+                    None => a,
+                });
+            }
+            pieces = next;
+        }
+        pieces.pop().unwrap()
     }
 
     fn call_builtin(
@@ -1457,7 +1604,19 @@ impl<'a> Checker<'a> {
         err(span)
     }
 
+    /// A value of a bounded type parameter (`T: Shape`) is used through its bound.
+    pub(crate) fn through_bound(&self, h: HExpr) -> HExpr {
+        match &h.ty {
+            Type::Param(n) => match self.bounds.get(n) {
+                Some(b) => HExpr { ty: b.clone(), ..h },
+                None => h,
+            },
+            _ => h,
+        }
+    }
+
     fn method_on(&mut self, recv: HExpr, name: &str, name_span: Span, args: &[Arg], span: Span) -> HExpr {
+        let recv = self.through_bound(recv);
         self.note_site(name_span, &recv.ty, false);
         let recv = match self.as_single_class(&recv.ty) {
             Some(t) => HExpr { ty: t, ..recv },
@@ -1516,7 +1675,10 @@ impl<'a> Checker<'a> {
             }
             t => {
                 let msg = format!("`{}` has no methods", self.tn(&t));
-                self.error(msg, name_span);
+                let e = self.error(msg, name_span);
+                if let Type::Param(n) = &t {
+                    e.add_note(format!("give `{n}` a bound to use its methods, e.g. `<{n}: SomeInterface>`"));
+                }
                 err(span)
             }
         }
@@ -1815,8 +1977,8 @@ impl<'a> Checker<'a> {
         if let Some(def) = self.member_const_span(cid, name) {
             self.note_ref(name_span, def);
         }
-        if let Some(idx) = self.classes[cid as usize].cases.iter().position(|(n, _)| n == name) {
-            return HExpr { kind: HExprKind::EnumCase(cid, idx as u32), ty: Type::class(cid), span };
+        if let Some(&idx) = self.classes[cid as usize].case_index.get(name) {
+            return HExpr { kind: HExprKind::EnumCase(cid, idx), ty: Type::class(cid), span };
         }
         if let Some((c, t)) = self.classes[cid as usize].consts.get(name).cloned() {
             return hconst(c, t, span);
@@ -1973,7 +2135,18 @@ impl<'a> Checker<'a> {
             if p.promote.is_some() {
                 self.error("closure parameters cannot be promoted", p.span);
             }
-            param_infos.push(ParamInfo { name: p.name.clone(), ty, default: None, promote: None, span: p.span });
+            if p.variadic {
+                self.error("closure parameters cannot be variadic", p.span)
+                    .add_note("take a list instead, e.g. `fn(list<int> $xs) => ...`");
+            }
+            param_infos.push(ParamInfo {
+                name: p.name.clone(),
+                ty,
+                default: None,
+                promote: None,
+                variadic: false,
+                span: p.span,
+            });
         }
         let declared_ret = c.ret.as_ref().map(|t| self.resolve_type(t, class));
         let ret_known = declared_ret.or_else(|| exp_ret.filter(|r| !r.has_unknown()));
@@ -2064,11 +2237,234 @@ impl<'a> Checker<'a> {
         HExpr { kind: HExprKind::Closure(fid, cap_values), ty: Type::Func(param_tys, Box::new(ret)), span }
     }
 
+    /// `f(...)`, `$obj->method(...)`, `Cls::method(...)`: a closure that calls
+    /// the function with its own arguments (and the receiver, evaluated once).
+    fn func_ref(&mut self, call: &Expr, expect: Option<&Type>, span: Span) -> HExpr {
+        let Some((params, recv)) = self.func_ref_target(call, expect, span) else { return err(span) };
+        let class = self.cx().class;
+        let mut ctx = FnCtx::new(Type::Infer, class, FuncKind::Closure);
+        let mut captures = Vec::new();
+        let mut cap_values = Vec::new();
+        if let Some(h) = recv {
+            let id = ctx.declare("%recv", h.ty.clone(), span);
+            ctx.flow.mark(id);
+            captures.push(id);
+            cap_values.push(h);
+        }
+        let mut param_ids = Vec::new();
+        let mut args = Vec::new();
+        for (i, t) in params.iter().enumerate() {
+            let name = format!("%a{i}");
+            let id = ctx.declare(&name, t.clone(), span);
+            ctx.flow.mark(id);
+            param_ids.push(id);
+            args.push(Arg { name: None, value: Expr { kind: ExprKind::Var(name), span } });
+        }
+        let kind = match &call.kind {
+            ExprKind::Call { callee, .. } => ExprKind::Call { callee: callee.clone(), args },
+            ExprKind::MethodCall { name, name_span, .. } => ExprKind::MethodCall {
+                obj: Box::new(Expr { kind: ExprKind::Var("%recv".into()), span }),
+                name: name.clone(),
+                name_span: *name_span,
+                args,
+                nullsafe: false,
+            },
+            ExprKind::StaticCall { class, class_span, name, name_span, .. } => ExprKind::StaticCall {
+                class: class.clone(),
+                class_span: *class_span,
+                name: name.clone(),
+                name_span: *name_span,
+                args,
+            },
+            _ => unreachable!(),
+        };
+        self.ctx.push(ctx);
+        let h = self.expr(&Expr { kind, span: call.span }, None);
+        let ret = h.ty.clone();
+        let body = if ret == Type::Void { vec![HStmt::Expr(h)] } else { vec![HStmt::Return(Some(h), span)] };
+        let ctx = self.ctx.pop().unwrap();
+        let file = self.input.modules[self.module].ast.file;
+        let param_infos = params
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ParamInfo {
+                name: format!("%a{i}"),
+                ty: t.clone(),
+                default: None,
+                promote: None,
+                variadic: false,
+                span,
+            })
+            .collect();
+        let fid = self.add_func(FuncInfo {
+            name: "{closure}".into(),
+            type_params: Vec::new(),
+            is_abstract: false,
+            params: param_infos,
+            ret: ret.clone(),
+            body: Body::Done,
+            module: self.module,
+            class,
+            is_static: true,
+            kind: FuncKind::Closure,
+            span,
+        });
+        self.hfuncs[fid as usize] = Some(HFunc {
+            name: "{closure}".into(),
+            file,
+            span,
+            kind: FuncKind::Closure,
+            params: param_ids,
+            captures,
+            locals: ctx.locals,
+            body,
+            ret: ret.clone(),
+        });
+        HExpr { kind: HExprKind::Closure(fid, cap_values), ty: Type::Func(params, Box::new(ret)), span }
+    }
+
+    /// The parameter types of the function `call` names, and the receiver of a method.
+    fn func_ref_target(
+        &mut self,
+        call: &Expr,
+        expect: Option<&Type>,
+        span: Span,
+    ) -> Option<(Vec<Type>, Option<HExpr>)> {
+        let wrap = "write a closure instead, e.g. `fn(string $s): string => ...`";
+        let user = |this: &mut Self, fid: FuncId, fixed: &[(String, Type)]| -> Option<Vec<Type>> {
+            let info = &this.funcs[fid as usize];
+            let name = info.name.clone();
+            if !info.type_params.is_empty() {
+                this.error(format!("generic function `{name}` cannot be used as a value"), span).add_note(wrap);
+                return None;
+            }
+            if info.params.iter().any(|p| p.variadic) {
+                this.error(format!("`{name}` is variadic and cannot be used as a value"), span).add_note(wrap);
+                return None;
+            }
+            let (names, tys): (Vec<String>, Vec<Type>) = fixed.iter().cloned().unzip();
+            Some(info.params.iter().map(|p| super::subst_params(&p.ty, &names, &tys).resolve_open(false)).collect())
+        };
+        match &call.kind {
+            ExprKind::Call { callee, .. } => {
+                let ExprKind::Name(n) = &callee.kind else {
+                    self.error("only functions, methods and static methods can be used with `(...)`", span)
+                        .add_note("a closure is already a value");
+                    return None;
+                };
+                if n == "render" {
+                    self.error("`render` cannot be used as a value", span);
+                    return None;
+                }
+                if let Some(fid) = self.lookup_func(n) {
+                    return Some((user(self, fid, &[])?, None));
+                }
+                let Some(overloads) = self.builtin_overloads(n, None) else {
+                    self.error(format!("undefined function `{n}`"), callee.span);
+                    return None;
+                };
+                let all: Vec<Vec<Type>> = overloads.iter().map(|o| o.params.clone()).collect();
+                let fits: Vec<&Vec<Type>> = match expect.map(|t| t.without_null()) {
+                    Some(Type::Func(ps, _)) => all
+                        .iter()
+                        .filter(|o| o.len() == ps.len() && o.iter().zip(&ps).all(|(a, b)| b.has_unknown() || a == b))
+                        .collect(),
+                    _ => all.iter().collect(),
+                };
+                match fits.as_slice() {
+                    [one] if !one.iter().any(|t| t.has_unknown()) => Some(((*one).clone(), None)),
+                    [_] => {
+                        self.error(format!("`{n}` is generic and cannot be used as a value"), span).add_note(wrap);
+                        None
+                    }
+                    _ => {
+                        self.error(format!("`{n}` has several signatures, so it cannot be used as a value here"), span)
+                            .add_note(wrap);
+                        None
+                    }
+                }
+            }
+            ExprKind::MethodCall { obj, name, name_span, nullsafe, .. } => {
+                if *nullsafe {
+                    self.error("`?->` cannot be used with `(...)`", span).add_note("check the value for null first");
+                    return None;
+                }
+                let h = self.expr(obj, None);
+                let h = match self.as_single_class(&h.ty) {
+                    Some(t) => HExpr { ty: t, ..h },
+                    None => h,
+                };
+                match h.ty.clone() {
+                    Type::Class(c, cargs) => {
+                        let Some(m) = self.classes[c as usize].methods.get(name).cloned() else {
+                            let cname = self.class_names[c as usize].clone();
+                            self.error(format!("class `{cname}` has no method `{name}`"), *name_span);
+                            return None;
+                        };
+                        if m.is_static {
+                            let fname = self.funcs[m.func as usize].name.clone();
+                            self.error(format!("`{fname}` is static; use `{fname}(...)`"), *name_span);
+                            return None;
+                        }
+                        let fixed = self.receiver_args(c, &cargs, m.owner);
+                        Some((user(self, m.func, &fixed)?, Some(h)))
+                    }
+                    Type::Error => None,
+                    t @ (Type::Str | Type::List(_) | Type::Map(..)) => {
+                        let msg = format!("methods of `{}` cannot be used with `(...)`", self.tn(&t));
+                        self.error(msg, span).add_note(wrap);
+                        None
+                    }
+                    t => {
+                        let msg = if t.is_nullable() {
+                            format!("cannot use `->{name}(...)` on `{}` because it might be null", self.tn(&t))
+                        } else {
+                            format!("`{}` has no methods", self.tn(&t))
+                        };
+                        self.error(msg, obj.span);
+                        None
+                    }
+                }
+            }
+            ExprKind::StaticCall { class, class_span, name, name_span, .. } => {
+                let cid = match class.as_str() {
+                    "self" => self.cx().class,
+                    "parent" => {
+                        self.error("`parent::` cannot be used with `(...)`", *class_span)
+                            .add_note("write a closure that calls the parent's method");
+                        return None;
+                    }
+                    other => self.class_ref(other, *class_span),
+                };
+                let Some(cid) = cid else {
+                    self.error(format!("unknown class `{class}`"), *class_span);
+                    return None;
+                };
+                match self.classes[cid as usize].methods.get(name).cloned() {
+                    Some(m) if m.is_static => Some((user(self, m.func, &[])?, None)),
+                    Some(_) => {
+                        self.error(format!("`{class}::{name}` is not static"), *name_span)
+                            .add_note(format!("use `$object->{name}(...)`"));
+                        None
+                    }
+                    None => {
+                        self.error(format!("`{class}` has no static method `{name}`"), *name_span);
+                        None
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn match_expr(&mut self, subject: Option<&Expr>, arms: &[MatchArm], expect: Option<&Type>, span: Span) -> HExpr {
         let hs = subject.map(|s| self.expr(s, None));
         let mut harms = Vec::new();
         let mut default: Option<HExpr> = None;
         let mut ty = Type::Never;
+        // `match (true)`: an arm's body sees what its condition proves, and the
+        // later arms (and `default`) what the earlier conditions disprove.
+        let mut disproved = Vec::new();
         for arm in arms {
             if arm.conds.is_empty() {
                 if default.is_some() {
@@ -2080,6 +2476,8 @@ impl<'a> Checker<'a> {
                 continue;
             }
             let mut conds = Vec::new();
+            let mut proved = None;
+            let mut falses = Vec::new();
             for c in &arm.conds {
                 let hc = match &hs {
                     Some(s) => {
@@ -2095,17 +2493,80 @@ impl<'a> Checker<'a> {
                         }
                         h
                     }
-                    None => self.cond(c).0,
+                    None => {
+                        let (h, t, f) = self.cond(c);
+                        if arm.conds.len() == 1 {
+                            proved = Some(t);
+                        }
+                        falses.push(f);
+                        h
+                    }
                 };
                 conds.push(hc);
             }
+            let saved = proved.map(|t| self.cx().apply(&t));
             let hb = self.expr(&arm.body, expect);
+            if let Some(saved) = saved {
+                self.cx().restore(saved);
+            }
+            for f in falses {
+                disproved.push(self.cx().apply(&f));
+            }
             ty = self.join(&ty, &hb.ty, true);
             harms.push((conds, hb));
+        }
+        for saved in disproved.into_iter().rev() {
+            self.cx().restore(saved);
+        }
+        if let (Some(s), None) = (&hs, &default) {
+            self.check_exhaustive(&s.ty, &harms, span);
         }
         let harms = harms.into_iter().map(|(c, b)| (c, self.coerce(b, &ty))).collect();
         let default = default.map(|d| Box::new(self.coerce(d, &ty)));
         let kind = HExprKind::Match { subject: hs.map(Box::new), arms: harms, default };
         HExpr { kind, ty, span }
+    }
+
+    /// A `match` on an enum or a `bool` without `default` must have an arm for
+    /// every value (and for `null` when the subject may be null).
+    fn check_exhaustive(&mut self, sty: &Type, arms: &[(Vec<HExpr>, HExpr)], span: Span) {
+        let conds = || arms.iter().flat_map(|(c, _)| c.iter()).map(|h| &h.kind);
+        let mut missing: Vec<String> = Vec::new();
+        match sty.without_null() {
+            Type::Class(cid, _) if self.class_kind(cid) == ClassKind::Enum => {
+                let covered: HashSet<u32> = conds()
+                    .filter_map(|k| match k {
+                        HExprKind::EnumCase(c, j) if *c == cid => Some(*j),
+                        _ => None,
+                    })
+                    .collect();
+                let cname = &self.class_names[cid as usize];
+                for (i, (case, _)) in self.classes[cid as usize].cases.iter().enumerate() {
+                    if !covered.contains(&(i as u32)) {
+                        missing.push(format!("`{cname}::{case}`"));
+                    }
+                }
+            }
+            Type::Bool => {
+                for b in [true, false] {
+                    if !conds().any(|k| matches!(k, HExprKind::Const(HConst::Bool(x)) if *x == b)) {
+                        missing.push(format!("`{b}`"));
+                    }
+                }
+            }
+            _ => return,
+        }
+        if sty.is_nullable() && !conds().any(|k| matches!(k, HExprKind::Const(HConst::Null))) {
+            missing.push("`null`".into());
+        }
+        if missing.is_empty() {
+            return;
+        }
+        let list = match missing.as_slice() {
+            [one] => one.clone(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+            [] => unreachable!(),
+        };
+        self.error(format!("`match` does not handle {list}"), span).add_note("add an arm for each, or a `default` arm");
     }
 }

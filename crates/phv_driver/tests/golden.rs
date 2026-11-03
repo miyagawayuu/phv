@@ -335,3 +335,76 @@ fn oversized_functions_are_errors() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Constant expressions, type aliases and spreads cannot make checking or
+/// compiling take exponential time or memory, or nest the compiler deeply.
+#[test]
+fn constants_aliases_and_spreads_stay_small() {
+    let dir = std::env::temp_dir().join(format!("phv-v06-limits-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let doubling: String = (1..80).map(|i| format!("const C{i} = C{} . C{};\n", i - 1, i - 1)).collect();
+    let aliases: String = (1..80).map(|i| format!("type T{i} = fn(T{}): T{};\n", i - 1, i - 1)).collect();
+    let generic: String = (1..80).map(|i| format!("type Q{i} = P<Q{}>;\n", i - 1)).collect();
+    let cases = [
+        ("strings.phv", format!("<?phv\nconst C0 = \"xxxxxxxx\";\n{doubling}"), "this constant string is too long"),
+        (
+            "aliases.phv",
+            format!("<?phv\ntype T0 = int;\n{aliases}"),
+            "type alias `T13` stands for a type that is too large",
+        ),
+        (
+            "generic.phv",
+            format!("<?phv\ntype P<A> = fn(A): A;\ntype Q0 = int;\n{generic}"),
+            "`P` here stands for a type that is too large",
+        ),
+        (
+            "chain.phv",
+            format!(
+                "<?phv\n{}type A2000 = int;\nfunction f(A0 $x): void {{}}\n",
+                (0..2000).map(|i| format!("type A{i} = A{};\n", i + 1)).collect::<String>()
+            ),
+            "is nested too deeply (at most 64 aliases inside each other)",
+        ),
+        (
+            "uses.phv",
+            format!(
+                "<?phv\ntype M0 = int;\n{}{}",
+                (1..13).map(|i| format!("type M{i} = fn(M{}): M{};\n", i - 1, i - 1)).collect::<String>(),
+                (0..20_000).map(|i| format!("function g{i}(M12 $x): void {{}}\n")).collect::<String>()
+            ),
+            "the type aliases of this program stand for too much in total",
+        ),
+        (
+            "total.phv",
+            format!(
+                "<?phv\nconst S0 = \"xxxxxxxxxxxxxxxx\";\n{}{}",
+                (1..16).map(|i| format!("const S{i} = S{} . S{};\n", i - 1, i - 1)).collect::<String>(),
+                (0..1000).map(|i| format!("const B{i} = S15 . S15;\n")).collect::<String>()
+            ),
+            "the constant strings of this program are too long in total",
+        ),
+        ("unicode.phv", format!("<?phv\necho \"{}\";\n", "\\u{".repeat(200_000)), "unterminated unicode escape"),
+    ];
+    for (name, src, message) in cases {
+        let file = dir.join(name);
+        std::fs::write(&file, src).unwrap();
+        let rendered = match phv_driver::compile(&dir, &file) {
+            Err(e) => e.render(false),
+            Ok(_) => String::from("compiled"),
+        };
+        assert!(rendered.contains(message), "{name}: {rendered}");
+    }
+    // 100,000 spreads in one literal are joined in pairs, not nested 100,000 deep.
+    let file = dir.join("spreads.phv");
+    std::fs::write(
+        &file,
+        format!("<?phv\n$a = [1];\n$b = [{}];\necho $b->len();\n", vec!["...$a"; 100_000].join(", ")),
+    )
+    .unwrap();
+    let c = phv_driver::compile(&dir, &file).unwrap_or_else(|e| panic!("{}", e.render(false)));
+    assert_eq!(
+        run(&c, RunOptions { html: false, limits: Default::default(), http: None, host: None }).output,
+        "100000"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1,0 +1,32 @@
+<?phv
+// Constant expressions and `import ... as`.
+import lib.shop.{Product as Item, catalog as products};
+import lib.shop.catalog as everything;
+
+const MINUTE = 60;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
+const HALF = 1 / 2;
+const MASK = (1 << 8) - 1;
+const PREFIX = "v" . 2 . ".";
+const DEBUG = !false && HOUR > MINUTE;
+const NEG = -MINUTE;
+const float RATE = 3;
+
+class Cache {
+    const TTL = 5 * MINUTE;
+
+    public function __construct(public int $ttl = Cache::TTL, public int $max = 2 ** 10) {}
+}
+
+function wait(int $seconds = 2 * MINUTE): int {
+    return $seconds;
+}
+
+echo DAY, " ", HALF, " ", MASK, " ", PREFIX, " ", DEBUG ? "debug" : "quiet", " ", NEG, " ", RATE, "\n";
+$c = new Cache();
+echo $c->max, " ", wait(), "\n";
+
+$first = products()[0];
+echo $first->label(), " ", $first is Item ? "item" : "?", "\n";
+echo everything()->len(), "\n";

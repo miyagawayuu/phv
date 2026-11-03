@@ -1,0 +1,66 @@
+<?phv
+// Bounds on type parameters: `<T: Shape>`.
+
+interface Shape {
+    public function area(): float;
+    public function name(): string;
+}
+
+class Circle implements Shape {
+    public function __construct(public float $r) {}
+    public function area(): float {
+        return 3.0 * $this->r * $this->r;
+    }
+    public function name(): string {
+        return "circle";
+    }
+}
+
+class Rect implements Shape {
+    public function __construct(public float $w, public float $h) {}
+    public function area(): float {
+        return $this->w * $this->h;
+    }
+    public function name(): string {
+        return "rect";
+    }
+}
+
+function largest<T: Shape>(list<T> $shapes): ?T {
+    ?T $best = null;
+    foreach ($shapes as $s) {
+        if ($best == null || $s->area() > $best->area()) {
+            $best = $s;
+        }
+    }
+    return $best;
+}
+
+function describe<T: Shape>(T $s): string {
+    Shape $as_shape = $s;
+    return $as_shape->name() . " " . $s->area();
+}
+
+class Registry<T: Shape> {
+    private list<T> $items = [];
+
+    public function add(T $item): void {
+        $this->items[] = $item;
+    }
+
+    public function total(): float {
+        $sum = 0.0;
+        foreach ($this->items as $i) {
+            $sum += $i->area();
+        }
+        return $sum;
+    }
+}
+
+$c = largest([new Circle(1.0), new Circle(2.0)]);
+echo $c?->r ?? 0.0, "\n";
+echo describe(new Rect(2.0, 3.0)), "\n";
+$r = new Registry<Shape>();
+$r->add(new Circle(1.0));
+$r->add(new Rect(1.0, 2.0));
+echo $r->total(), "\n";

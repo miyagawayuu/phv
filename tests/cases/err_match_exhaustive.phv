@@ -1,0 +1,24 @@
+<?phv
+enum Suit {
+    case Hearts;
+    case Spades;
+    case Clubs;
+}
+
+function color(Suit $s): string {
+    return match ($s) {
+        Suit::Hearts => "red",
+    };
+}
+
+function maybe(?Suit $s): string {
+    return match ($s) {
+        Suit::Hearts, Suit::Spades, Suit::Clubs => "card",
+    };
+}
+
+function flag(bool $b): int {
+    return match ($b) {
+        true => 1,
+    };
+}

@@ -1,0 +1,11 @@
+bad port (code 0)
+caused by not a number: http (code 22)
+at load (exceptions2.phv:18)
+at {main} (exceptions2.phv:23)
+--
+at parse_port (exceptions2.phv:9)
+at load (exceptions2.phv:16)
+at {main} (exceptions2.phv:23)
+division by zero 0 no cause
+at {main} (exceptions2.phv:36)
+[]

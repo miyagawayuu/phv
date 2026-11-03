@@ -1,0 +1,65 @@
+<?phv
+interface Named {
+    public function name(): string;
+}
+class Dog implements Named {
+    public function name(): string {
+        return "dog";
+    }
+}
+class Rock {}
+
+function greet<T: Named>(T $x): string {
+    return $x->name();
+}
+function bad<T>(T $x): string {
+    return $x->name();
+}
+class Box<T: Named> {
+    public function __construct(public T $item) {}
+}
+
+echo greet(new Dog());
+echo greet(new Rock());
+echo greet(5);
+$b = new Box(new Rock());
+Box<int> $c = new Box(new Dog());
+
+// A bound cannot be passed by a type parameter that lacks it.
+function g<U: Named>(U $x): string {
+    return $x->name();
+}
+function unbounded<T>(T $x): string {
+    return g($x);
+}
+class Holder<T> {
+    public function __construct(public T $item) {}
+    public function boxed(): Box<T> {
+        return new Box($this->item);
+    }
+}
+function bounded<T: Named>(T $x): string {
+    return g($x);
+}
+
+// An override cannot add a bound.
+class Base {
+    public function m<T>(T $x): string {
+        return "";
+    }
+}
+class Child extends Base {
+    public function m<T: Named>(T $x): string {
+        return $x->name();
+    }
+}
+
+// Bounds are met exactly: an `int` is not a `T: float`.
+function half<T: float>(T $x): float {
+    return $x;
+}
+echo half(5);
+
+// More type parameters than supported is an error, not a crash.
+function many<A, B, C, D, E, F, G, H, I: int>(int $x): void {}
+many(1);

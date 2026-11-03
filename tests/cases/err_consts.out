@@ -1,0 +1,83 @@
+error: `f` is already defined in this module
+ --> err_consts.phv:2:29
+  |
+2 | import lib.shop.{catalog as f};
+  |                             ^
+
+error: unknown constant `C`
+ --> err_consts.phv:5:15
+  |
+5 | const B = A + C;
+  |               ^
+  = note: a constant can use the constants declared before it in the same file
+
+error: integer overflow
+ --> err_consts.phv:7:11
+  |
+7 | const D = 9223372036854775807 + 1;
+  |           ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: modulo by zero
+ --> err_consts.phv:8:11
+  |
+8 | const E = 1 % 0;
+  |           ^^^^^
+
+error: cannot apply `.` to `float` and `string` in a constant
+ --> err_consts.phv:9:11
+  |
+9 | const F = 1.5 . "x";
+  |           ^^^^^^^^^
+
+error: cannot apply `+` to `string` and `int` in a constant
+  --> err_consts.phv:10:11
+   |
+10 | const G = "a" + 1;
+   |           ^^^^^^^
+
+error: this is not a constant expression
+  --> err_consts.phv:11:11
+   |
+11 | const H = strlen("x");
+   |           ^^^^^^^^^^^
+   = note: constants and default values are built from literals, constants and operators
+
+error: cannot apply `-` to `string`
+  --> err_consts.phv:12:11
+   |
+12 | const I = -"a";
+   |           ^^^^
+
+error: negative exponent in int ** int; use a float base, e.g. 2.0 ** -1
+  --> err_consts.phv:13:11
+   |
+13 | const J = 2 ** -1;
+   |           ^^^^^^^
+
+error: bit shift by a negative number
+  --> err_consts.phv:14:11
+   |
+14 | const K = 1 << -1;
+   |           ^^^^^^^
+
+error: `K2` has no constant named `Y` here
+  --> err_consts.phv:17:21
+   |
+17 |     const X = self::Y;
+   |                     ^
+   = note: a constant can use the class constants declared before it
+
+error: unknown constant `UNKNOWN`
+  --> err_consts.phv:21:21
+   |
+21 | function f(int $n = UNKNOWN, float $r = 1 / 0): int {
+   |                     ^^^^^^^
+   = note: a constant can use the constants declared before it in the same file
+
+error: division by zero
+  --> err_consts.phv:21:41
+   |
+21 | function f(int $n = UNKNOWN, float $r = 1 / 0): int {
+   |                                         ^^^^^
+
+13 errors found

@@ -18,7 +18,7 @@ use crate::index::{EditorIndex, Item, ItemKind, Member, MemberSite, VarScope};
 use crate::types::*;
 use flow::FnCtx;
 use phv_syntax::ast::{
-    self, ClassDecl, ClassKind, ExprKind, FunctionDecl, StmtKind, TypeExpr, TypeExprKind, Visibility,
+    self, BinOp, ClassDecl, ClassKind, ExprKind, FunctionDecl, StmtKind, TypeExpr, TypeExprKind, UnOp, Visibility,
 };
 use phv_syntax::{parse_type_str, Diagnostic, Span};
 use std::cell::RefCell;
@@ -79,6 +79,21 @@ struct Scope {
     export_funcs: HashMap<String, FuncId>,
     export_classes: HashMap<String, ClassId>,
     export_consts: HashMap<String, (HConst, Type)>,
+    /// Type aliases, as indexes into `Checker::aliases`.
+    aliases: HashMap<String, usize>,
+    export_aliases: HashMap<String, usize>,
+}
+
+/// `type Name<T> = ...;`, resolved on first use.
+struct AliasInfo<'a> {
+    decl: &'a ast::TypeAliasDecl,
+    module: usize,
+    ty: Option<Type>,
+    resolving: bool,
+    /// The size of `ty` and how often each type parameter occurs in it, so
+    /// each use can be measured before it is copied.
+    size: usize,
+    uses: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -130,6 +145,10 @@ struct ClassInfo<'a> {
     ctor_access: (Visibility, ClassId),
     consts: HashMap<String, (HConst, Type)>,
     cases: Vec<(String, HConst)>,
+    /// The index of each case in `cases`, by name.
+    case_index: HashMap<String, u32>,
+    /// Where each constant the class itself declares is declared.
+    const_spans: HashMap<String, Span>,
     backing: Option<Type>,
     span: Span,
 }
@@ -145,9 +164,11 @@ enum Body<'a> {
 #[derive(Clone)]
 struct ParamInfo {
     name: String,
+    /// For a variadic parameter, the list it receives (`list<int>` for `int ...$xs`).
     ty: Type,
     default: Option<HConst>,
     promote: Option<(Visibility, bool)>,
+    variadic: bool,
     span: Span,
 }
 
@@ -202,6 +223,20 @@ pub(crate) struct Checker<'a> {
     /// Names each module has looked up in its own scope (`(module, name)`),
     /// to tell which imports are used. Lookups take `&self`, hence the cell.
     used_names: RefCell<HashSet<(usize, String)>>,
+    aliases: Vec<AliasInfo<'a>>,
+    /// Bounds of type parameters (`<T: Shape>`) of functions and classes that have any.
+    func_bounds: HashMap<FuncId, Vec<Option<Type>>>,
+    class_bounds: HashMap<ClassId, Vec<Option<Type>>>,
+    /// The bounds of the type parameters in scope, by name.
+    pub(crate) bounds: HashMap<String, Type>,
+    /// Aliases being resolved inside each other right now.
+    alias_depth: usize,
+    /// Resolving the type of an alias (whose class arguments are checked where it is used).
+    in_alias: bool,
+    /// Type nodes produced by using aliases so far (see `MAX_ALIAS_TOTAL`).
+    alias_nodes: usize,
+    /// Bytes of strings built by constant expressions so far (see `MAX_CONST_TOTAL`).
+    const_bytes: usize,
 }
 
 /// What an annotation can be written before.
@@ -228,6 +263,22 @@ const ANNOTATIONS: &str = "Deprecated, Override, Test, Skip";
 
 /// Members (fields, methods, constants) all classes may inherit together.
 const MAX_INHERITED_MEMBERS: usize = 200_000;
+
+/// Bytes of a string built in a constant expression (`A . A` doubles it).
+const MAX_CONST_STR: usize = 1 << 20;
+
+/// Bytes of all strings built by constant expressions in a program.
+const MAX_CONST_TOTAL: usize = 16 << 20;
+
+/// Type aliases resolved inside each other (`type A = B; type B = C; ...`).
+const MAX_ALIAS_DEPTH: usize = 64;
+
+/// Type nodes all uses of type aliases in a program may produce.
+const MAX_ALIAS_TOTAL: usize = 2_000_000;
+
+/// Nodes of a type a type alias stands for (`type P<T> = fn(T): T;` doubles
+/// with each alias that applies the one before).
+const MAX_ALIAS_SIZE: usize = 10_000;
 
 /// Properties of one class, its inherited ones included: a property's slot is a
 /// 16-bit operand of the bytecode.
@@ -290,6 +341,14 @@ impl<'a> Checker<'a> {
             deprecated_fields: HashMap::new(),
             tests: Vec::new(),
             used_names: RefCell::new(HashSet::new()),
+            aliases: Vec::new(),
+            func_bounds: HashMap::new(),
+            class_bounds: HashMap::new(),
+            bounds: HashMap::new(),
+            alias_depth: 0,
+            in_alias: false,
+            alias_nodes: 0,
+            const_bytes: 0,
         }
     }
 
@@ -371,6 +430,8 @@ impl<'a> Checker<'a> {
         self.collect();
         self.resolve_imports();
         let order = self.order_classes();
+        self.resolve_class_bounds();
+        self.check_aliases();
         self.resolve_classes(&order);
         self.resolve_functions();
         self.check_bodies();
@@ -387,13 +448,15 @@ impl<'a> Checker<'a> {
             }
             for s in &m.ast.stmts {
                 let StmtKind::Import(d) = &s.kind else { continue };
-                for (name, span) in &d.names {
+                for n in &d.names {
+                    let (name, span) = n.local();
                     let known = self.scopes[mi].funcs.contains_key(name)
                         || self.scopes[mi].classes.contains_key(name)
-                        || self.scopes[mi].consts.contains_key(name);
-                    if known && !used.contains(&(mi, name.clone())) {
+                        || self.scopes[mi].consts.contains_key(name)
+                        || self.scopes[mi].aliases.contains_key(name);
+                    if known && !used.contains(&(mi, name.to_string())) {
                         self.diags.push(
-                            Diagnostic::warning(format!("`{name}` is imported but never used"), *span)
+                            Diagnostic::warning(format!("`{name}` is imported but never used"), span)
                                 .note("remove it from the `import`")
                                 .code(phv_syntax::diag::UNUSED),
                         );
@@ -524,11 +587,11 @@ impl<'a> Checker<'a> {
         while let Some(id) = c {
             let info = &self.classes[id as usize];
             if let Some(d) = info.decl {
-                if let Some(case) = d.cases.iter().find(|k| k.name == name) {
-                    return Some(case.span);
+                if let Some(&i) = info.case_index.get(name) {
+                    return d.cases.get(i as usize).map(|k| k.span);
                 }
-                if let Some(k) = d.consts.iter().find(|k| k.name == name) {
-                    return Some(k.name_span);
+                if let Some(s) = info.const_spans.get(name) {
+                    return Some(*s);
                 }
             }
             c = info.parent;
@@ -538,7 +601,7 @@ impl<'a> Checker<'a> {
 
     fn signature(&self, f: FuncId) -> String {
         let info = &self.funcs[f as usize];
-        let params: Vec<String> = info.params.iter().map(|p| format!("{} ${}", self.tn(&p.ty), p.name)).collect();
+        let params: Vec<String> = info.params.iter().map(|p| param_text(p, |t| self.tn(t))).collect();
         if info.kind == FuncKind::Ctor {
             return format!("({})", params.join(", "));
         }
@@ -552,7 +615,7 @@ impl<'a> Checker<'a> {
         let Some(owner) = info.class else { return self.signature(f) };
         let Type::Class(_, own) = self.own_type(c) else { return self.signature(f) };
         let view = |t: &Type| self.tn(&self.member_type(t, c, &own, owner));
-        let params: Vec<String> = info.params.iter().map(|p| format!("{} ${}", view(&p.ty), p.name)).collect();
+        let params: Vec<String> = info.params.iter().map(|p| param_text(p, view)).collect();
         if info.kind == FuncKind::Ctor {
             return format!("({})", params.join(", "));
         }
@@ -722,6 +785,182 @@ impl<'a> Checker<'a> {
         self.prelude().and_then(|p| self.scopes[p].classes.get(name).copied())
     }
 
+    fn lookup_alias(&self, name: &str) -> Option<usize> {
+        if let Some(a) = self.scopes[self.module].aliases.get(name) {
+            self.note_used(name);
+            return Some(*a);
+        }
+        self.prelude().and_then(|p| self.scopes[p].aliases.get(name).copied())
+    }
+
+    /// Reports aliases that clash with a class, and the errors in every alias
+    /// (also the unused ones).
+    fn check_aliases(&mut self) {
+        for a in 0..self.aliases.len() {
+            let (decl, module) = (self.aliases[a].decl, self.aliases[a].module);
+            if self.scopes[module].classes.contains_key(&decl.name) {
+                self.error(format!("`{}` is defined more than once", decl.name), decl.name_span)
+                    .add_note("a type alias and a class cannot have the same name");
+            }
+            self.resolve_alias(a);
+        }
+    }
+
+    /// `<T: Shape>`: the bound of each type parameter (with the parameters in scope).
+    fn resolve_bounds(&mut self, bounds: &[Option<TypeExpr>], self_class: Option<ClassId>) -> Vec<Option<Type>> {
+        bounds.iter().map(|b| b.as_ref().map(|t| self.resolve_type(t, self_class))).collect()
+    }
+
+    fn resolve_class_bounds(&mut self) {
+        for cid in 0..self.classes.len() {
+            let Some(decl) = self.classes[cid].decl else { continue };
+            if decl.type_bounds.iter().all(Option::is_none) {
+                continue;
+            }
+            self.module = self.classes[cid].module;
+            self.type_params = self.classes[cid].type_params.clone();
+            self.bounds.clear();
+            let bounds = self.resolve_bounds(&decl.type_bounds, None);
+            self.type_params.clear();
+            self.class_bounds.insert(cid as ClassId, bounds);
+        }
+    }
+
+    /// Reports type arguments that do not satisfy their bounds. `names` are the
+    /// parameters the bounds may mention, `args` what they stand for.
+    pub(crate) fn check_bounds(
+        &mut self,
+        what: &str,
+        names: &[String],
+        bounds: &[Option<Type>],
+        args: &[Type],
+        span: Span,
+    ) {
+        for (i, b) in bounds.iter().enumerate() {
+            let (Some(b), Some(actual)) = (b, args.get(i)) else { continue };
+            if actual.has_unknown() || *actual == Type::Error {
+                continue;
+            }
+            let want = subst_params(b, names, args);
+            // Exactly: inside the function `T` is used as its bound with no
+            // conversion, so an `int` cannot stand for `T: float`.
+            if want.has_unknown() || self.satisfies(actual, &want) {
+                continue;
+            }
+            let msg = format!(
+                "`{}` does not satisfy the bound `{}: {}` of {what}",
+                self.tn(actual),
+                names.get(i).map_or("?", |n| n.as_str()),
+                self.tn(&want)
+            );
+            self.error(msg, span);
+        }
+    }
+
+    /// Whether `actual` can stand for a type parameter bounded by `bound`.
+    fn satisfies(&self, actual: &Type, bound: &Type) -> bool {
+        match actual {
+            Type::Param(n) if actual != bound => self.bounds.get(n).is_some_and(|b| self.satisfies(b, bound)),
+            _ => self.assignable_exact(actual, bound),
+        }
+    }
+
+    /// Checks the bounds of every generic class `t` mentions (for a type an
+    /// alias stands for, whose class arguments were checked before substitution).
+    fn check_type_bounds(&mut self, t: &Type, span: Span) {
+        let mut stack = vec![t.clone()];
+        while let Some(t) = stack.pop() {
+            match t {
+                Type::List(e) => stack.push(*e),
+                Type::Map(k, v) => stack.extend([*k, *v]),
+                Type::Func(ps, r) => {
+                    stack.extend(ps);
+                    stack.push(*r);
+                }
+                Type::Union(ms) => stack.extend(ms),
+                Type::Class(c, args) => {
+                    if let Some(bounds) = self.class_bounds.get(&c).cloned() {
+                        let names = self.classes[c as usize].type_params.clone();
+                        let what = format!("`{}`", self.class_names[c as usize]);
+                        self.check_bounds(&what, &names, &bounds, &args, span);
+                    }
+                    stack.extend(args);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Puts the bounds of a class's type parameters (when `class` is given) and
+    /// of a function's own in scope.
+    fn set_bounds(&mut self, class: Option<ClassId>, func: &[String], func_bounds: &[Option<Type>]) {
+        self.bounds.clear();
+        if let Some(c) = class {
+            if let Some(bs) = self.class_bounds.get(&c) {
+                for (n, b) in self.classes[c as usize].type_params.iter().zip(bs) {
+                    if let Some(b) = b {
+                        self.bounds.insert(n.clone(), b.clone());
+                    }
+                }
+            }
+        }
+        for (n, b) in func.iter().zip(func_bounds) {
+            if let Some(b) = b {
+                self.bounds.insert(n.clone(), b.clone());
+            }
+        }
+    }
+
+    fn resolve_alias(&mut self, a: usize) -> Type {
+        if let Some(t) = &self.aliases[a].ty {
+            return t.clone();
+        }
+        let decl = self.aliases[a].decl;
+        if self.aliases[a].resolving {
+            self.error(format!("type alias `{}` refers to itself", decl.name), decl.name_span).add_note(
+                "an alias is replaced by its type, so it cannot contain itself; use a class for recursive data",
+            );
+            self.aliases[a].ty = Some(Type::Error);
+            return Type::Error;
+        }
+        if self.alias_depth >= MAX_ALIAS_DEPTH {
+            self.error(
+                format!(
+                    "type alias `{}` is nested too deeply (at most {MAX_ALIAS_DEPTH} aliases inside each other)",
+                    decl.name
+                ),
+                decl.name_span,
+            );
+            self.aliases[a].ty = Some(Type::Error);
+            return Type::Error;
+        }
+        self.aliases[a].resolving = true;
+        self.alias_depth += 1;
+        let params = decl.type_params.iter().map(|(n, _)| n.clone()).collect();
+        let module = std::mem::replace(&mut self.module, self.aliases[a].module);
+        let outer = std::mem::replace(&mut self.type_params, params);
+        // An alias's parameters have no bounds: classes it applies to them are
+        // checked where the alias is used, once the arguments are known.
+        let bounds = std::mem::take(&mut self.bounds);
+        let in_alias = std::mem::replace(&mut self.in_alias, true);
+        let mut t = self.resolve_type(&decl.ty, None);
+        self.in_alias = in_alias;
+        self.bounds = bounds;
+        self.type_params = outer;
+        self.module = module;
+        self.alias_depth -= 1;
+        self.aliases[a].resolving = false;
+        if type_size(&t, MAX_ALIAS_SIZE) > MAX_ALIAS_SIZE {
+            self.error(format!("type alias `{}` stands for a type that is too large", decl.name), decl.name_span);
+            t = Type::Error;
+        }
+        let t = self.aliases[a].ty.clone().unwrap_or(t);
+        self.aliases[a].size = type_size(&t, MAX_ALIAS_SIZE);
+        self.aliases[a].uses = decl.type_params.iter().map(|(n, _)| param_uses(&t, n)).collect();
+        self.aliases[a].ty = Some(t.clone());
+        t
+    }
+
     pub(crate) fn lookup_func(&self, name: &str) -> Option<FuncId> {
         if let Some(f) = self.scopes[self.module].funcs.get(name) {
             self.note_used(name);
@@ -780,27 +1019,18 @@ impl<'a> Checker<'a> {
         self.funcs[f as usize].is_abstract
     }
 
-    /// The value of a `const` declaration: a scalar literal.
+    /// The value of a `const` declaration: a constant expression.
     fn literal_const(
         &mut self,
         e: &ast::Expr,
         ty: Option<&TypeExpr>,
         self_class: Option<ClassId>,
     ) -> Option<(HConst, Type)> {
-        let (c, t) = match &e.kind {
-            ExprKind::Int(i) => (HConst::Int(*i), Type::Int),
-            ExprKind::Float(f) => (HConst::Float(*f), Type::Float),
-            ExprKind::Str(s) => (HConst::Str(s.clone()), Type::Str),
-            ExprKind::Bool(b) => (HConst::Bool(*b), Type::Bool),
-            ExprKind::Null => (HConst::Null, Type::Null),
-            _ => {
-                self.error("constants must be literals (int, float, string, bool or null)", e.span);
-                return None;
-            }
-        };
+        let c = self.fold_const(e, self_class)?;
+        let t = const_type(&c);
         let Some(ty) = ty else { return Some((c, t)) };
         let declared = self.resolve_type(ty, self_class);
-        let c = self.const_default(e, &declared)?;
+        let c = self.const_default(e, &declared, self_class)?;
         Some((c, declared))
     }
 
@@ -886,6 +1116,13 @@ impl<'a> Checker<'a> {
     fn class_args(&mut self, c: ClassId, args: &[TypeExpr], self_class: Option<ClassId>, span: Span) -> Vec<Type> {
         let want = self.classes[c as usize].type_params.len();
         let resolved: Vec<Type> = args.iter().map(|a| self.resolve_type(a, self_class)).collect();
+        if resolved.len() == want && !self.in_alias {
+            if let Some(bounds) = self.class_bounds.get(&c).cloned() {
+                let names = self.classes[c as usize].type_params.clone();
+                let what = format!("`{}`", self.class_names[c as usize]);
+                self.check_bounds(&what, &names, &bounds, &resolved, span);
+            }
+        }
         if resolved.len() != want {
             let name = self.class_names[c as usize].clone();
             let msg = match want {
@@ -973,6 +1210,48 @@ impl<'a> Checker<'a> {
                             let args = self.class_args(c, args, self_class, t.span);
                             return Type::Class(c, args);
                         }
+                        None if let Some(a) = self.lookup_alias(other) => {
+                            let decl = self.aliases[a].decl;
+                            self.note_ref(t.span, decl.name_span);
+                            if self.aliases[a].ty.is_none() {
+                                self.resolve_alias(a);
+                            }
+                            let params: Vec<String> = decl.type_params.iter().map(|(n, _)| n.clone()).collect();
+                            if args.len() != params.len() {
+                                let msg = match params.len() {
+                                    0 => format!("`{other}` does not take type arguments"),
+                                    1 => format!("`{other}` takes 1 type argument"),
+                                    n => format!("`{other}` takes {n} type arguments"),
+                                };
+                                self.error(msg, t.span);
+                                return Type::Error;
+                            }
+                            let args: Vec<Type> = args.iter().map(|a| self.resolve_type(a, self_class)).collect();
+                            // The size of the result, before building it.
+                            let mut size = self.aliases[a].size;
+                            for (uses, arg) in self.aliases[a].uses.iter().zip(&args) {
+                                size = size.saturating_add(uses.saturating_mul(type_size(arg, MAX_ALIAS_SIZE)));
+                            }
+                            if size > MAX_ALIAS_SIZE {
+                                self.error(format!("`{other}` here stands for a type that is too large"), t.span);
+                                return Type::Error;
+                            }
+                            let before = self.alias_nodes;
+                            self.alias_nodes = self.alias_nodes.saturating_add(size);
+                            if self.alias_nodes > MAX_ALIAS_TOTAL {
+                                if before <= MAX_ALIAS_TOTAL {
+                                    self.error("the type aliases of this program stand for too much in total", t.span)
+                                        .add_note("use classes for large data types");
+                                }
+                                return Type::Error;
+                            }
+                            let body = self.aliases[a].ty.as_ref().unwrap_or(&Type::Error);
+                            let ty = subst_params(body, &params, &args);
+                            if !params.is_empty() && !self.in_alias {
+                                self.check_type_bounds(&ty, t.span);
+                            }
+                            return ty;
+                        }
                         None => {
                             self.error(format!("unknown type `{other}`"), t.span);
                             return Type::Error;
@@ -1007,28 +1286,22 @@ impl<'a> Checker<'a> {
     }
 
     /// Default values for parameters and properties must be constants.
-    fn const_default(&mut self, e: &ast::Expr, ty: &Type) -> Option<HConst> {
+    fn const_default(&mut self, e: &ast::Expr, ty: &Type, self_class: Option<ClassId>) -> Option<HConst> {
         let (c, cty) = match &e.kind {
-            ExprKind::Int(i) => {
-                if ty.contains(&Type::Float) && !ty.contains(&Type::Int) {
-                    (HConst::Float(*i as f64), Type::Float)
-                } else {
-                    (HConst::Int(*i), Type::Int)
-                }
-            }
-            ExprKind::Float(f) => (HConst::Float(*f), Type::Float),
-            ExprKind::Str(s) => (HConst::Str(s.clone()), Type::Str),
-            ExprKind::Bool(b) => (HConst::Bool(*b), Type::Bool),
-            ExprKind::Null => (HConst::Null, Type::Null),
             ExprKind::List(items) if items.is_empty() => match ty.without_null() {
                 t @ Type::List(_) => (HConst::EmptyList, t),
                 _ => (HConst::EmptyList, Type::list(Type::Error)),
             },
             ExprKind::Map(items) if items.is_empty() => (HConst::EmptyMap, Type::map(Type::Error, Type::Error)),
-            _ => {
-                self.error("default values must be constants (a literal, `null` or `[]`)", e.span);
-                return None;
-            }
+            _ => match self.fold_const(e, self_class)? {
+                HConst::Int(i) if ty.contains(&Type::Float) && !ty.contains(&Type::Int) => {
+                    (HConst::Float(i as f64), Type::Float)
+                }
+                c => {
+                    let t = const_type(&c);
+                    (c, t)
+                }
+            },
         };
         let ok = match (&c, ty.without_null()) {
             (HConst::EmptyList, Type::List(_)) => true,
@@ -1048,6 +1321,109 @@ impl<'a> Checker<'a> {
         Some(c)
     }
 
+    /// Evaluates a constant expression: literals, constants declared before it,
+    /// and operators on them. Reports an error and returns `None` otherwise.
+    fn fold_const(&mut self, e: &ast::Expr, self_class: Option<ClassId>) -> Option<HConst> {
+        use HConst::{Bool, Float, Int, Str};
+        let v = match &e.kind {
+            ExprKind::Int(i) => Int(*i),
+            ExprKind::Float(f) => Float(*f),
+            ExprKind::Str(s) => Str(s.clone()),
+            ExprKind::Bool(b) => Bool(*b),
+            ExprKind::Null => HConst::Null,
+            ExprKind::Paren(inner) => return self.fold_const(inner, self_class),
+            ExprKind::Name(n) => match self.lookup_const(n) {
+                Some((c, _)) => c,
+                None => {
+                    self.error(format!("unknown constant `{n}`"), e.span)
+                        .add_note("a constant can use the constants declared before it in the same file");
+                    return None;
+                }
+            },
+            ExprKind::ClassConst { class, class_span, name, name_span } => {
+                let cid = match class.as_str() {
+                    "self" | "static" => self_class,
+                    other => self.class_ref(other, *class_span),
+                };
+                let Some(cid) = cid else {
+                    self.error(format!("unknown class `{class}`"), *class_span);
+                    return None;
+                };
+                if let Some(def) = self.member_const_span(cid, name) {
+                    self.note_ref(*name_span, def);
+                }
+                match self.classes[cid as usize].consts.get(name) {
+                    Some((c, _)) => c.clone(),
+                    None => {
+                        let cname = self.class_names[cid as usize].clone();
+                        self.error(format!("`{cname}` has no constant named `{name}` here"), *name_span)
+                            .add_note("a constant can use the class constants declared before it");
+                        return None;
+                    }
+                }
+            }
+            ExprKind::Unary(op, a) => {
+                let a = self.fold_const(a, self_class)?;
+                match (op, a) {
+                    (UnOp::Neg, Int(i)) => match i.checked_neg() {
+                        Some(v) => Int(v),
+                        None => return self.const_error("integer overflow", e.span),
+                    },
+                    (UnOp::Neg, Float(f)) => Float(-f),
+                    (UnOp::Not, Bool(b)) => Bool(!b),
+                    (UnOp::BitNot, Int(i)) => Int(!i),
+                    (_, a) => {
+                        let sym = match op {
+                            UnOp::Neg => "-",
+                            UnOp::Not => "!",
+                            UnOp::BitNot => "~",
+                        };
+                        let msg = format!("cannot apply `{sym}` to `{}`", self.tn(&const_type(&a)));
+                        return self.const_error(&msg, e.span);
+                    }
+                }
+            }
+            ExprKind::Binary(op, l, r) => {
+                let l = self.fold_const(l, self_class)?;
+                let r = self.fold_const(r, self_class)?;
+                match fold_binary(*op, &l, &r) {
+                    Ok(Str(s)) => {
+                        self.const_bytes = self.const_bytes.saturating_add(s.len());
+                        if self.const_bytes > MAX_CONST_TOTAL {
+                            return self.const_error(
+                                "the constant strings of this program are too long in total (at most 16 MiB)",
+                                e.span,
+                            );
+                        }
+                        Str(s)
+                    }
+                    Ok(v) => v,
+                    Err(Some(msg)) => return self.const_error(msg, e.span),
+                    Err(None) => {
+                        let msg = format!(
+                            "cannot apply `{}` to `{}` and `{}` in a constant",
+                            op.symbol(),
+                            self.tn(&const_type(&l)),
+                            self.tn(&const_type(&r))
+                        );
+                        return self.const_error(&msg, e.span);
+                    }
+                }
+            }
+            _ => {
+                self.error("this is not a constant expression", e.span)
+                    .add_note("constants and default values are built from literals, constants and operators");
+                return None;
+            }
+        };
+        Some(v)
+    }
+
+    fn const_error(&mut self, msg: &str, span: Span) -> Option<HConst> {
+        self.error(msg.to_string(), span);
+        None
+    }
+
     fn resolve_params(&mut self, params: &[ast::Param], self_class: Option<ClassId>) -> Vec<ParamInfo> {
         let mut out: Vec<ParamInfo> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
@@ -1063,11 +1439,34 @@ impl<'a> Checker<'a> {
             if ty == Type::Void {
                 self.error("parameters cannot be `void`", p.span);
             }
-            let default = p.default.as_ref().and_then(|d| self.const_default(d, &ty));
+            let default =
+                p.default.as_ref().filter(|_| !p.variadic).and_then(|d| self.const_default(d, &ty, self_class));
             if !seen.insert(p.name.as_str()) {
                 self.error(format!("duplicate parameter `${}`", p.name), p.span);
             }
-            out.push(ParamInfo { name: p.name.clone(), ty, default, promote: p.promote, span: p.span });
+            let ty = if p.variadic {
+                if out.len() + 1 != params.len() {
+                    self.error("a variadic parameter must be the last parameter", p.span);
+                }
+                if p.default.is_some() {
+                    self.error("a variadic parameter cannot have a default value", p.span)
+                        .add_note("it is an empty list when no arguments are given for it");
+                }
+                if p.promote.is_some() {
+                    self.error("a variadic parameter cannot be promoted to a property", p.span);
+                }
+                Type::list(ty)
+            } else {
+                ty
+            };
+            out.push(ParamInfo {
+                name: p.name.clone(),
+                ty,
+                default,
+                promote: p.promote,
+                variadic: p.variadic,
+                span: p.span,
+            });
         }
         out
     }
@@ -1188,6 +1587,8 @@ impl<'a> Checker<'a> {
                             ctor_access: (Visibility::Public, 0),
                             consts: HashMap::new(),
                             cases: Vec::new(),
+                            case_index: HashMap::new(),
+                            const_spans: HashMap::new(),
                             backing: None,
                             span: d.name_span,
                         });
@@ -1215,6 +1616,42 @@ impl<'a> Checker<'a> {
                         }
                         if d.exported {
                             self.scopes[mi].export_consts.insert(d.name.clone(), value);
+                        }
+                    }
+                    StmtKind::TypeAlias(d) => {
+                        let a = self.aliases.len();
+                        self.aliases.push(AliasInfo {
+                            decl: d,
+                            module: mi,
+                            ty: None,
+                            resolving: false,
+                            size: 1,
+                            uses: Vec::new(),
+                        });
+                        let builtin = matches!(
+                            d.name.as_str(),
+                            "int"
+                                | "float"
+                                | "string"
+                                | "bool"
+                                | "void"
+                                | "null"
+                                | "any"
+                                | "list"
+                                | "map"
+                                | "self"
+                                | "Html"
+                                | "Sql"
+                                | "SafeUrl"
+                                | "SafeJs"
+                        );
+                        if builtin {
+                            self.error(format!("`{}` is a built-in type", d.name), d.name_span);
+                        } else if self.scopes[mi].aliases.insert(d.name.clone(), a).is_some() {
+                            self.error(format!("type `{}` is defined more than once", d.name), d.name_span);
+                        }
+                        if d.exported {
+                            self.scopes[mi].export_aliases.insert(d.name.clone(), a);
                         }
                     }
                     StmtKind::Import(_) | StmtKind::Params(_) => {}
@@ -1247,7 +1684,10 @@ impl<'a> Checker<'a> {
                     continue;
                 };
                 self.note_ref(d.span, Span::new(self.input.modules[target].ast.file, 0, 0));
-                for (name, span) in &d.names {
+                for n in &d.names {
+                    let (name, span) = (&n.name, &n.span);
+                    let (local, local_span) = n.local();
+                    let local = local.to_string();
                     let f = self.scopes[target].export_funcs.get(name).copied();
                     let c = self.scopes[target].export_classes.get(name).copied();
                     let def = match (f, c) {
@@ -1257,20 +1697,32 @@ impl<'a> Checker<'a> {
                     };
                     if let Some(def) = def {
                         self.note_ref(*span, def);
+                        if n.alias.is_some() {
+                            self.note_ref(local_span, def);
+                        }
+                    }
+                    if let Some(&a) = self.scopes[target].export_aliases.get(name) {
+                        let def = self.aliases[a].decl.name_span;
+                        self.note_ref(*span, def);
+                        if self.scopes[mi].aliases.insert(local.clone(), a).is_some_and(|old| old != a) {
+                            self.error(format!("`{local}` is already defined in this module"), local_span);
+                        }
+                        continue;
                     }
                     if let Some(k) = self.scopes[target].export_consts.get(name).cloned() {
                         if let Some(def) = def {
-                            self.scopes[mi].const_spans.insert(name.clone(), def);
+                            self.scopes[mi].const_spans.insert(local.clone(), def);
                         }
-                        if self.scopes[mi].consts.insert(name.clone(), k).is_some() {
-                            self.error(format!("`{name}` is already defined in this module"), *span);
+                        if self.scopes[mi].consts.insert(local.clone(), k).is_some() {
+                            self.error(format!("`{local}` is already defined in this module"), local_span);
                         }
                         continue;
                     }
                     if f.is_none() && c.is_none() {
                         let declared = self.scopes[target].funcs.contains_key(name)
                             || self.scopes[target].classes.contains_key(name)
-                            || self.scopes[target].consts.contains_key(name);
+                            || self.scopes[target].consts.contains_key(name)
+                            || self.scopes[target].aliases.contains_key(name);
                         let e = self.error(format!("module `{key}` has no exported `{name}`"), *span);
                         if declared {
                             e.add_note(format!("`{name}` exists but is not exported; add `export` to its declaration"));
@@ -1279,12 +1731,15 @@ impl<'a> Checker<'a> {
                     }
                     let scope = &mut self.scopes[mi];
                     let clash = match (f, c) {
-                        (Some(f), _) => scope.funcs.insert(name.clone(), f).is_some_and(|old| old != f),
-                        (_, Some(c)) => scope.classes.insert(name.clone(), c).is_some_and(|old| old != c),
+                        (Some(f), _) => scope.funcs.insert(local.clone(), f).is_some_and(|old| old != f),
+                        (_, Some(c)) => scope.classes.insert(local.clone(), c).is_some_and(|old| old != c),
                         _ => false,
                     };
                     if clash {
-                        self.error(format!("`{name}` is already defined in this module"), *span);
+                        let e = self.error(format!("`{local}` is already defined in this module"), local_span);
+                        if n.alias.is_none() {
+                            e.add_note(format!("import it under another name: `{name} as Other{name}`"));
+                        }
                     }
                 }
             }
@@ -1363,9 +1818,17 @@ impl<'a> Checker<'a> {
                 None => t,
             }
         };
+        // An override may drop a bound of a type parameter, not add or change one.
+        let bound = |f: FuncId, i: usize| self.func_bounds.get(&f).and_then(|v| v.get(i).cloned().flatten());
+        let bounds_ok = (0..a.type_params.len()).all(|i| match (bound(sub, i), bound(base, i)) {
+            (None, _) => true,
+            (Some(x), Some(y)) => view(&x, a) == view(&y, b),
+            (Some(_), None) => false,
+        });
         a.type_params.len() == b.type_params.len()
+            && bounds_ok
             && a.params.len() == b.params.len()
-            && a.params.iter().zip(&b.params).all(|(x, y)| view(&x.ty, a) == view(&y.ty, b))
+            && a.params.iter().zip(&b.params).all(|(x, y)| x.variadic == y.variadic && view(&x.ty, a) == view(&y.ty, b))
             && self.assignable(&view(&a.ret, a), &view(&b.ret, b))
     }
 
@@ -1430,6 +1893,7 @@ impl<'a> Checker<'a> {
             }
             // Type arguments of the parent and interfaces, in terms of this class's parameters.
             self.type_params = class_tps.clone();
+            self.set_bounds(Some(cid), &[], &[]);
             let mut super_args: HashMap<ClassId, Vec<Type>> = HashMap::new();
             let mut supers_written: Vec<(ClassId, &[TypeExpr], Span)> = Vec::new();
             if let (Some(p), Some((_, pspan))) = (self.classes[ci].parent, &decl.parent) {
@@ -1589,9 +2053,11 @@ impl<'a> Checker<'a> {
                     };
                     self.add_field(cid, value_field);
                 }
+                // Backing values seen so far (an enum's values are all ints or all strings).
+                let mut values: HashSet<String> = HashSet::new();
                 for case in &decl.cases {
                     let value = match (&backing, &case.value) {
-                        (Some(b), Some(v)) => self.const_default(v, &b.clone()).unwrap_or(HConst::Null),
+                        (Some(b), Some(v)) => self.const_default(v, &b.clone(), Some(cid)).unwrap_or(HConst::Null),
                         (Some(_), None) => {
                             self.error(format!("case `{}` of a backed enum needs a value", case.name), case.span);
                             HConst::Null
@@ -1605,8 +2071,13 @@ impl<'a> Checker<'a> {
                         }
                         (None, None) => HConst::Null,
                     };
-                    let dup_name = self.classes[ci].cases.iter().any(|(n, _)| *n == case.name);
-                    let dup_value = value != HConst::Null && self.classes[ci].cases.iter().any(|(_, v)| *v == value);
+                    let idx = self.classes[ci].cases.len() as u32;
+                    let dup_name = self.classes[ci].case_index.insert(case.name.clone(), idx).is_some();
+                    let dup_value = match &value {
+                        HConst::Int(i) => !values.insert(i.to_string()),
+                        HConst::Str(s) => !values.insert(s.clone()),
+                        _ => false,
+                    };
                     if dup_name {
                         self.error(format!("case `{}` is declared more than once", case.name), case.span);
                     } else if dup_value {
@@ -1621,9 +2092,8 @@ impl<'a> Checker<'a> {
             for c in &decl.consts {
                 self.annotations(&c.attrs, AnnTarget::Const);
                 let Some(value) = self.literal_const(&c.value, c.ty.as_ref(), Some(cid)) else { continue };
-                let own_dup = self.classes[ci].consts.contains_key(&c.name)
-                    && decl.consts.iter().filter(|o| o.name == c.name).count() > 1;
-                if own_dup {
+                // `const_spans` holds only the class's own constants, not inherited ones.
+                if self.classes[ci].const_spans.insert(c.name.clone(), c.name_span).is_some() {
                     self.error(format!("constant `{}` is declared more than once", c.name), c.name_span);
                 }
                 self.classes[ci].consts.insert(c.name.clone(), value);
@@ -1635,7 +2105,7 @@ impl<'a> Checker<'a> {
                     self.deprecated_fields.insert((cid, prop.name.clone()), r);
                 }
                 let ty = self.resolve_type(&prop.ty, Some(cid));
-                let default = prop.default.as_ref().and_then(|d| self.const_default(d, &ty));
+                let default = prop.default.as_ref().and_then(|d| self.const_default(d, &ty, Some(cid)));
                 let required = !ty.is_nullable() && default.is_none() && ty != Type::Error;
                 self.add_field(
                     cid,
@@ -1660,8 +2130,12 @@ impl<'a> Checker<'a> {
                     }
                 }
                 // Static methods do not belong to an instance, so the class's parameters are not in scope.
-                self.type_params = if m.is_static && m.name != "__construct" { Vec::new() } else { class_tps.clone() };
+                let instance = !m.is_static || m.name == "__construct";
+                self.type_params = if instance { class_tps.clone() } else { Vec::new() };
                 self.type_params.extend(type_params.iter().cloned());
+                self.set_bounds(instance.then_some(cid), &[], &[]);
+                let bounds = self.resolve_bounds(&m.type_bounds, Some(cid));
+                self.set_bounds(instance.then_some(cid), &type_params, &bounds);
                 let params = self.resolve_params(&m.params, Some(cid));
                 let is_ctor = m.name == "__construct";
                 let ret = match &m.ret {
@@ -1669,6 +2143,7 @@ impl<'a> Checker<'a> {
                     None => Type::Void,
                 };
                 self.type_params.clear();
+                self.bounds.clear();
                 if type_params.len() > 4 {
                     self.error("at most 4 type parameters are supported", m.name_span);
                 }
@@ -1704,6 +2179,9 @@ impl<'a> Checker<'a> {
                     kind: if is_ctor { FuncKind::Ctor } else { FuncKind::Method },
                     span: m.name_span,
                 });
+                if bounds.iter().any(Option::is_some) {
+                    self.func_bounds.insert(fid, bounds);
+                }
                 let ann = self.annotations(&m.attrs, AnnTarget::Method);
                 if let Some(r) = ann.deprecated {
                     self.deprecated_funcs.insert(fid, r);
@@ -1925,15 +2403,23 @@ impl<'a> Checker<'a> {
                     if self.type_params.len() > 4 {
                         self.error("at most 4 type parameters are supported", d.name_span);
                     }
+                    self.bounds.clear();
+                    let bounds = self.resolve_bounds(&d.type_bounds, None);
+                    let tps = self.type_params.clone();
+                    self.set_bounds(None, &tps, &bounds);
                     let params = self.resolve_params(&d.params, None);
                     let ret = match &d.ret {
                         Some(t) => self.resolve_type(t, None),
                         None => Type::Void,
                     };
                     self.type_params.clear();
+                    self.bounds.clear();
                     let f = &mut self.funcs[fid];
                     f.params = params;
                     f.ret = ret;
+                    if bounds.iter().any(Option::is_some) {
+                        self.func_bounds.insert(fid as FuncId, bounds);
+                    }
                 }
                 (FuncKind::Template, Body::Template(m)) => {
                     let decls: Vec<&Vec<ast::Param>> = m
@@ -1975,6 +2461,24 @@ impl<'a> Checker<'a> {
         let info = &self.funcs[fid as usize];
         self.module = info.module;
         let (body, kind, class, is_static, ret) = (info.body, info.kind, info.class, info.is_static, info.ret.clone());
+        self.bounds.clear();
+        if let Some(bs) = self.func_bounds.get(&fid) {
+            for (n, b) in info.type_params.iter().zip(bs) {
+                if let Some(b) = b {
+                    self.bounds.insert(n.clone(), b.clone());
+                }
+            }
+        }
+        if let (Some(c), false) = (class, is_static) {
+            if let Some(bs) = self.class_bounds.get(&c) {
+                for (n, b) in self.classes[c as usize].type_params.iter().zip(bs) {
+                    if let Some(b) = b {
+                        self.bounds.insert(n.clone(), b.clone());
+                    }
+                }
+            }
+        }
+        let info = &self.funcs[fid as usize];
         let params = info.params.clone();
         let file = self.input.modules[info.module].ast.file;
         let span = info.span;
@@ -2036,6 +2540,7 @@ impl<'a> Checker<'a> {
                         | StmtKind::Class(_)
                         | StmtKind::Import(_)
                         | StmtKind::Params(_)
+                        | StmtKind::TypeAlias(_)
                         | StmtKind::Const(_) => {}
                         _ => {
                             self.note_unreachable(s, &mut warned);
@@ -2205,4 +2710,164 @@ pub(crate) fn subst_params(t: &Type, names: &[String], args: &[Type]) -> Type {
         Type::Class(c, xs) => Type::Class(*c, xs.iter().map(|x| subst_params(x, names, args)).collect()),
         other => other.clone(),
     }
+}
+
+/// `int $x`, or `int ...$xs` for a variadic parameter (whose type is the list it receives).
+fn param_text(p: &ParamInfo, show: impl Fn(&Type) -> String) -> String {
+    match (&p.ty, p.variadic) {
+        (Type::List(elem), true) => format!("{} ...${}", show(elem), p.name),
+        (t, _) => format!("{} ${}", show(t), p.name),
+    }
+}
+
+/// The number of nodes in `t`, counting stopped past `limit`.
+fn type_size(t: &Type, limit: usize) -> usize {
+    let mut n = 0;
+    let mut stack = vec![t];
+    while let Some(t) = stack.pop() {
+        n += 1;
+        if n > limit {
+            break;
+        }
+        match t {
+            Type::List(e) => stack.push(e),
+            Type::Map(k, v) => stack.extend([&**k, &**v]),
+            Type::Func(ps, r) => {
+                stack.extend(ps.iter());
+                stack.push(r);
+            }
+            Type::Union(ms) => stack.extend(ms.iter()),
+            Type::Class(_, args) => stack.extend(args.iter()),
+            _ => {}
+        }
+    }
+    n
+}
+
+/// How many times the type parameter `name` occurs in `t`.
+fn param_uses(t: &Type, name: &str) -> usize {
+    let mut n = 0usize;
+    let mut stack = vec![t];
+    while let Some(t) = stack.pop() {
+        match t {
+            Type::Param(p) if p == name => n += 1,
+            Type::List(e) => stack.push(e),
+            Type::Map(k, v) => stack.extend([&**k, &**v]),
+            Type::Func(ps, r) => {
+                stack.extend(ps.iter());
+                stack.push(r);
+            }
+            Type::Union(ms) => stack.extend(ms.iter()),
+            Type::Class(_, args) => stack.extend(args.iter()),
+            _ => {}
+        }
+    }
+    n
+}
+
+fn const_type(c: &HConst) -> Type {
+    match c {
+        HConst::Null => Type::Null,
+        HConst::Bool(_) => Type::Bool,
+        HConst::Int(_) => Type::Int,
+        HConst::Float(_) => Type::Float,
+        HConst::Str(_) => Type::Str,
+        HConst::EmptyList => Type::list(Type::Error),
+        HConst::EmptyMap => Type::map(Type::Error, Type::Error),
+    }
+}
+
+/// `l op r` on two constants, with the same results as at run time.
+/// `Err(None)` when the operator does not apply to these types.
+fn fold_binary(op: BinOp, l: &HConst, r: &HConst) -> Result<HConst, Option<&'static str>> {
+    use HConst::{Bool, Float, Int, Str};
+    let float = |c: &HConst| match c {
+        Int(i) => Some(*i as f64),
+        Float(f) => Some(*f),
+        _ => None,
+    };
+    let overflow = Some("integer overflow");
+    Ok(match (op, l, r) {
+        (BinOp::Add, Int(a), Int(b)) => Int(a.checked_add(*b).ok_or(overflow)?),
+        (BinOp::Sub, Int(a), Int(b)) => Int(a.checked_sub(*b).ok_or(overflow)?),
+        (BinOp::Mul, Int(a), Int(b)) => Int(a.checked_mul(*b).ok_or(overflow)?),
+        (BinOp::Mod, Int(_), Int(0)) => return Err(Some("modulo by zero")),
+        (BinOp::Mod, Int(a), Int(b)) => Int(a.wrapping_rem(*b)),
+        (BinOp::Pow, Int(_), Int(b)) if *b < 0 => {
+            return Err(Some("negative exponent in int ** int; use a float base, e.g. 2.0 ** -1"))
+        }
+        (BinOp::Pow, Int(a), Int(b)) => Int(u32::try_from(*b).ok().and_then(|b| a.checked_pow(b)).ok_or(overflow)?),
+        (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow, _, _) => {
+            let (Some(a), Some(b)) = (float(l), float(r)) else { return Err(None) };
+            if matches!(op, BinOp::Div | BinOp::Mod) && b == 0.0 {
+                return Err(Some(if op == BinOp::Div { "division by zero" } else { "modulo by zero" }));
+            }
+            Float(match op {
+                BinOp::Add => a + b,
+                BinOp::Sub => a - b,
+                BinOp::Mul => a * b,
+                BinOp::Div => a / b,
+                BinOp::Mod => a % b,
+                _ => a.powf(b),
+            })
+        }
+        // Floats are left out: their text is the runtime's to decide.
+        (BinOp::Concat, Str(_) | Int(_), Str(_) | Int(_)) if matches!((l, r), (Str(_), _) | (_, Str(_))) => {
+            let text = |c: &HConst| match c {
+                Str(s) => s.clone(),
+                Int(i) => i.to_string(),
+                _ => unreachable!(),
+            };
+            let (a, b) = (text(l), text(r));
+            if a.len() + b.len() > MAX_CONST_STR {
+                return Err(Some("this constant string is too long (at most 1 MiB)"));
+            }
+            Str(a + &b)
+        }
+        (BinOp::BitAnd, Int(a), Int(b)) => Int(a & b),
+        (BinOp::BitOr, Int(a), Int(b)) => Int(a | b),
+        (BinOp::BitXor, Int(a), Int(b)) => Int(a ^ b),
+        (BinOp::Shl | BinOp::Shr, Int(_), Int(b)) if *b < 0 => return Err(Some("bit shift by a negative number")),
+        (BinOp::Shl, Int(a), Int(b)) => Int(if *b >= 64 { 0 } else { a << b }),
+        (BinOp::Shr, Int(a), Int(b)) => Int(if *b >= 64 {
+            if *a >= 0 {
+                0
+            } else {
+                -1
+            }
+        } else {
+            a >> b
+        }),
+        (BinOp::And, Bool(a), Bool(b)) => Bool(*a && *b),
+        (BinOp::Or, Bool(a), Bool(b)) => Bool(*a || *b),
+        (BinOp::Eq | BinOp::Ne, _, _) => {
+            let eq = match (l, r) {
+                (Int(a), Int(b)) => a == b,
+                (Str(a), Str(b)) => a == b,
+                (Bool(a), Bool(b)) => a == b,
+                (Float(a), Float(b)) => a == b,
+                (HConst::Null, HConst::Null) => true,
+                _ => return Err(None),
+            };
+            Bool(eq == (op == BinOp::Eq))
+        }
+        (BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge, _, _) => {
+            let ord = match (l, r) {
+                (Int(a), Int(b)) => a.partial_cmp(b),
+                (Str(a), Str(b)) => a.partial_cmp(b),
+                _ => match (float(l), float(r)) {
+                    (Some(a), Some(b)) => a.partial_cmp(&b),
+                    _ => return Err(None),
+                },
+            };
+            use std::cmp::Ordering::*;
+            Bool(match op {
+                BinOp::Lt => ord == Some(Less),
+                BinOp::Le => matches!(ord, Some(Less | Equal)),
+                BinOp::Gt => ord == Some(Greater),
+                _ => matches!(ord, Some(Greater | Equal)),
+            })
+        }
+        _ => return Err(None),
+    })
 }

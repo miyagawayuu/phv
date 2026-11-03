@@ -1,0 +1,23 @@
+<?phv
+import lib.types.Hidden;
+
+type Loop = list<Loop>;
+type A = B;
+type B = ?A;
+type int = string;
+type Twice = int;
+type Twice = string;
+type Box = list;
+type Thing = Nope;
+class Shape {}
+type Shape = int;
+type Gen<T> = list<T>;
+
+Gen $g = [];
+Gen<int, int> $h = [];
+type Score = int;
+Score $s = "x";
+
+function f() {
+    type Inner = int;
+}

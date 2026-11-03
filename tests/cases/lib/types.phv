@@ -1,0 +1,10 @@
+export type UserId = int;
+export type Row<T> = map<string, T>;
+type Hidden = string;
+
+export function lookup(UserId $id): ?Row<string> {
+    if ($id == 1) {
+        return ["name" => "Ada"];
+    }
+    return null;
+}
