@@ -1,4 +1,4 @@
-import std.db.{Database, Row};
+import std.db.Database;
 
 export class Entry {
     public function __construct(

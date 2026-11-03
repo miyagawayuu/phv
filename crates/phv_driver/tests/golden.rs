@@ -295,3 +295,36 @@ fn inline_code_warnings_follow_the_policy() {
     assert!(quiet.warnings.is_empty(), "{}", quiet.warnings);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A function needing more registers than a frame has is a compile error, not a crash.
+#[test]
+fn oversized_functions_are_errors() {
+    let dir = std::env::temp_dir().join(format!("phv-oversized-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let locals: String = (0..70_000).map(|i| format!("$v{i} = {i};\n")).collect();
+    let pairs: Vec<String> = (0..40_000).map(|i| format!("\"k{i}\" => {i}")).collect();
+    let cases = [
+        ("locals.phv", format!("<?phv\n{locals}"), "this script is too large to compile"),
+        (
+            "literal.phv",
+            format!("<?phv\nfunction f(): int {{\n    return count([{}]);\n}}\necho f();\n", pairs.join(", ")),
+            "`f` is too large to compile",
+        ),
+    ];
+    for (name, src, message) in cases {
+        let file = dir.join(name);
+        std::fs::write(&file, src).unwrap();
+        let worker = std::thread::Builder::new().stack_size(64 * 1024 * 1024);
+        let (d, f) = (dir.clone(), file.clone());
+        let rendered = worker
+            .spawn(move || match phv_driver::compile(&d, &f) {
+                Err(e) => e.render(false),
+                Ok(_) => String::from("compiled"),
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(rendered.contains(message), "{name}: {rendered}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

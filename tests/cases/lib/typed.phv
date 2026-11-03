@@ -1,0 +1,4 @@
+// Used by err_mixed.phv: a module that parses but has a type error.
+export function typed(): int {
+    return "one";
+}

@@ -1,0 +1,44 @@
+<?phv
+// Code that is never used gives a warning; the program still runs.
+import lib.shop.{Product, catalog};
+
+function total(list<int> $xs, int $unused, int $_ignored): int {
+    $sum = 0;
+    $temp = 5;
+    foreach ($xs as $x) {
+        $sum += $x;
+    }
+    return $sum;
+    echo "never";
+}
+
+function first(list<int> $xs): int {
+    foreach ($xs as $x) {
+        return $x;
+        $x++;
+    }
+    throw new ValueError("empty");
+}
+
+class Greeter {
+    // Parameters of methods and closures are not reported: overrides and callers fix them.
+    public function greet(string $name, int $times): string {
+        return "hi {$name}";
+    }
+}
+
+$label = "total";
+$double = function (int $n) use ($label): int {
+    return $n * 2;
+};
+$pick = fn(int $a, int $b): int => $a;
+try {
+    echo total([1, 2, 3], 0, 0), "\n";
+} catch (ValueError $e) {
+    echo "not thrown\n";
+}
+foreach (0..2 as $_) {
+    echo first([7, 8]), "\n";
+}
+echo count(catalog()), " ", $double(2), " ", $pick(1, 2), "\n";
+echo (new Greeter())->greet("Ann", 1), "\n";

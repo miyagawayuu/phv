@@ -1,0 +1,14 @@
+error: expected an expression, found `;`
+ --> lib/broken.phv:3:15
+  |
+3 |     return 1 +;
+  |               ^
+
+error: expected `int`, found `string`
+ --> lib/typed.phv:3:12
+  |
+3 |     return "one";
+  |            ^^^^^
+  = note: strings are never converted to numbers implicitly; use `->toInt()` or `->toFloat()`
+
+2 errors found

@@ -11,7 +11,7 @@ use phv_syntax::ast::{Module, StmtKind};
 use phv_syntax::{diag, parse_module, Diagnostic, SourceMap, Span};
 use phv_types::{CheckInput, ModuleInput, ModuleKind};
 use phv_vm::{BuiltinFn, Host, HttpCtx, Limits, Program, TraceLine, Vm, VmError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -657,17 +657,9 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
     let kind = if template { ModuleKind::Template } else { ModuleKind::Entry };
     let entry_module = loader.add(name, Some(entry.to_path_buf()), text, kind);
     let entry_file = Some(loader.modules[entry_module].0.file);
-    if !editor && loader.diags.iter().any(|d| d.is_error()) {
-        return Analysis {
-            sources: loader.sources,
-            diags: loader.diags,
-            hir: None,
-            entry_file,
-            messages,
-            index: None,
-            deps: loader.deps,
-        };
-    }
+    // With syntax or loading errors the program cannot run, but the files that
+    // loaded cleanly are still checked, so their type errors show up as well.
+    let broken = !editor && loader.diags.iter().any(|d| d.is_error());
     let input = CheckInput {
         modules: loader
             .modules
@@ -685,18 +677,55 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
         (hir, diags, None)
     };
     drop(input);
+    let mut diags = diags;
+    if broken {
+        // A file with a syntax error is checked as the parser recovered it, and a
+        // file using it sees what that left: their errors could be made up.
+        let tainted = tainted_files(&loader);
+        diags.retain(|d| !tainted.contains(&d.span.file));
+    }
     loader.diags.extend(diags);
     if config.csp.allows_inline_code() {
         loader.diags.retain(|d| d.code != Some(phv_syntax::diag::CSP_INLINE));
     }
+    if !editor && loader.diags.iter().any(|d| d.is_error()) {
+        loader.diags.retain(|d| d.code != Some(phv_syntax::diag::UNUSED));
+    }
     Analysis {
         sources: loader.sources,
         diags: loader.diags,
-        hir: Some(hir),
+        hir: if broken { None } else { Some(hir) },
         entry_file,
         messages,
         index,
         deps: loader.deps,
+    }
+}
+
+/// Files with a loading or syntax error, and the files that import or render
+/// them (directly or through other files).
+fn tainted_files(loader: &Loader) -> HashSet<u32> {
+    let mut tainted: HashSet<u32> = loader.diags.iter().filter(|d| d.is_error()).map(|d| d.span.file).collect();
+    let file_of = |i: Option<&usize>| i.filter(|i| **i != usize::MAX).map(|i| loader.modules[*i].0.file);
+    loop {
+        let mut changed = false;
+        for (module, _, _) in &loader.modules {
+            if tainted.contains(&module.file) {
+                continue;
+            }
+            let imports = module.stmts.iter().filter_map(|s| match &s.kind {
+                StmtKind::Import(d) => Some(file_of(loader.imports.get(&d.module.join(".")))),
+                _ => None,
+            });
+            let templates = module.template_refs.iter().map(|(rel, _)| file_of(loader.templates.get(rel)));
+            if imports.chain(templates).any(|f| f.is_none_or(|f| tainted.contains(&f))) {
+                tainted.insert(module.file);
+                changed = true;
+            }
+        }
+        if !changed {
+            return tainted;
+        }
     }
 }
 
@@ -719,7 +748,10 @@ pub fn compile_with_overlay(
     let mut warnings: Vec<Diagnostic> = a.diags.iter().filter(|d| !d.is_error()).cloned().collect();
     warnings.sort_by_key(|d| (d.span.file, d.span.start));
     let warnings = diag::render(&a.sources, &warnings, false);
-    let program = phv_compiler::compile(&hir, &a.sources);
+    let program = match phv_compiler::compile(&hir, &a.sources) {
+        Ok(p) => p,
+        Err(d) => return Err(CompileError { sources: a.sources, diags: vec![d], messages: Vec::new() }),
+    };
     let marked_tests = hir.tests.iter().map(|(f, skip)| (*f, skip.clone())).collect();
     let builtins = phv_std::link(&program.builtin_names).map_err(|m| CompileError {
         sources: SourceMap::default(),

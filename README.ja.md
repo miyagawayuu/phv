@@ -21,7 +21,7 @@ import std.db.Database;
 
 function greet(string $name, int $times = 1): string {
     $out = "";
-    foreach (0..$times as $i) {
+    foreach (0..$times as $_) {
         $out .= "Hello, {$name}!\n";
     }
     return $out;
@@ -38,7 +38,8 @@ echo greet($name);                                 // Web ページでは自動�
 - **PHP から引き継いだもの**: `$変数`、`[1, 2]` / `["k" => v]`、`echo`、`foreach`、`match`、HTML への埋め込み、
   ファイル単位のルーティング、保存したらすぐ反映、リクエストごとに何も共有しない実行モデル
 - **型安全**: 変数の型は最初の代入で固定。暗黙の型変換なし、`==` は常に厳密、truthiness なし、null 安全(`?T`)、
-  interface・abstract・enum・ジェネリック関数とクラス、`finally`
+  interface・abstract・`final`・enum・ジェネリック関数とクラス、`finally`。使われない変数や import、到達しない
+  コードは警告になる
 - **セキュリティ**:
   - **XSS 対策**: 出力は自動でエスケープされる。加えて、エスケープでは守れない場所(引用符なしの属性、URL、
     `<script>`)への挿入はコンパイルエラーになる。URL には `safe_url()`、`<script>` には `json_html()` の値

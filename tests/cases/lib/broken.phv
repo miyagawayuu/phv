@@ -1,0 +1,4 @@
+// Used by err_mixed.phv: a module with a syntax error.
+export function broken(): int {
+    return 1 +;
+}

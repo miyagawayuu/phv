@@ -10,7 +10,7 @@ function work(int $mode): string {
             throw new RuntimeException("boom");
         }
         $log .= "body ";
-    } catch (RuntimeException $e) {
+    } catch (RuntimeException) {
         $log .= "caught ";
     } finally {
         echo "[finally $mode] ";

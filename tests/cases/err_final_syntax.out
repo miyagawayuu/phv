@@ -1,0 +1,44 @@
+error: a class cannot be both `abstract` and `final`
+ --> err_final_syntax.phv:3:1
+  |
+3 | abstract final class Both {}
+  | ^^^^^^^^
+  = note: an abstract class must be extended to be used
+
+error: interfaces cannot be `final`
+ --> err_final_syntax.phv:4:1
+  |
+4 | final interface Shape {}
+  | ^^^^^
+
+error: enums cannot be `final`
+ --> err_final_syntax.phv:5:1
+  |
+5 | final enum Suit { case Hearts; }
+  | ^^^^^
+
+error: interface methods cannot be `final`
+ --> err_final_syntax.phv:8:27
+  |
+8 |     final public function name(): string;
+  |                           ^^^^
+
+error: a method cannot be both `abstract` and `final`
+  --> err_final_syntax.phv:12:36
+   |
+12 |     abstract final public function m(): void;
+   |                                    ^
+
+error: only classes and methods can be `final`
+  --> err_final_syntax.phv:13:5
+   |
+13 |     final public int $x = 1;
+   |     ^^^^^
+
+error: only classes and methods can be `final`
+  --> err_final_syntax.phv:14:5
+   |
+14 |     final const LIMIT = 1;
+   |     ^^^^^
+
+7 errors found

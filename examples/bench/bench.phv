@@ -19,7 +19,7 @@ function loop_sum(int $n): int {
 
 function build_string(int $n): string {
     $s = "";
-    foreach (0..$n as $i) {
+    foreach (0..$n as $_) {
         $s .= "x";
     }
     return $s;

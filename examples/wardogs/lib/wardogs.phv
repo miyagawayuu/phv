@@ -116,7 +116,7 @@ function get_json(HttpClient $rcon, string $path): any {
     }
     try {
         return $res->json();
-    } catch (ValueError $e) {
+    } catch (ValueError) {
         throw new RconError("{$path}: the reply is not JSON");
     }
 }
@@ -141,7 +141,7 @@ function describe_error(string $path, HttpResponse $res): string {
                 }
             }
         }
-    } catch (ValueError $e) {
+    } catch (ValueError) {
         // not JSON: the status says enough
     }
     return "{$path}: {$text}";

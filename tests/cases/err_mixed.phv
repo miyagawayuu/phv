@@ -1,0 +1,8 @@
+<?phv
+// A syntax error in one module does not hide the type errors of the others.
+// This file uses the broken module, so its own type errors are not reported
+// (they might come from what the parser left out).
+import lib.broken.broken;
+import lib.typed.typed;
+
+echo broken() + typed() + "x";

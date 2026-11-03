@@ -170,6 +170,8 @@ pub struct FunctionDecl {
     pub type_params: Vec<(String, Span)>,
     /// Declared without a body (`abstract` methods and interface methods).
     pub is_abstract: bool,
+    /// `final public function ...`: subclasses cannot override it.
+    pub is_final: bool,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
     pub body: Vec<Stmt>,
@@ -193,6 +195,8 @@ pub struct ClassDecl {
     pub name: String,
     pub name_span: Span,
     pub kind: ClassKind,
+    /// `final class`: no class can extend it.
+    pub is_final: bool,
     /// `class Box<T>`
     pub type_params: Vec<(String, Span)>,
     pub parent: Option<(String, Span)>,

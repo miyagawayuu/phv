@@ -1,6 +1,5 @@
 <?phv
 // Regression tests from the security audit: each of these used to compile.
-import std.db.Database;
 
 class Box {
     public function __construct(public Html|string $v) {}

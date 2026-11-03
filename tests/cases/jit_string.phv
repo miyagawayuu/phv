@@ -85,7 +85,7 @@ function fail_inside(string $s, int $n): string {
     for ($i = 0; $i < $n; $i++) {
         $out .= $i;
         if ($i == 5) {
-            $x = $i % ($n - $n);
+            $_x = $i % ($n - $n);
         }
     }
     return $out;

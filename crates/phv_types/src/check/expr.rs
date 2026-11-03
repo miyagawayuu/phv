@@ -2023,6 +2023,7 @@ impl<'a> Checker<'a> {
             }
         };
         let ctx = self.ctx.pop().unwrap();
+        self.warn_unused_locals(&ctx, &param_ids);
         self.note_scope(span, &ctx);
         let file = self.input.modules[self.module].ast.file;
         let param_tys: Vec<Type> = param_infos.iter().map(|p| p.ty.clone()).collect();

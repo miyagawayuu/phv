@@ -3,13 +3,15 @@
 //! Locals live in fixed registers (captures, then parameters, then the rest);
 //! temporaries are allocated above them like a stack.
 
-use phv_syntax::SourceMap;
+use phv_syntax::{Diagnostic, SourceMap};
 use phv_types::hir::*;
 use phv_types::types::Type;
 use phv_vm::bytecode::*;
 use std::collections::HashMap;
 
-pub fn compile(h: &HProgram, sources: &SourceMap) -> Program {
+/// Fails only for a function too large for the register file (each frame has
+/// at most `NO_REG` registers).
+pub fn compile(h: &HProgram, sources: &SourceMap) -> Result<Program, Diagnostic> {
     let mut pc = ProgCtx {
         consts: Vec::new(),
         str_consts: HashMap::new(),
@@ -18,7 +20,7 @@ pub fn compile(h: &HProgram, sources: &SourceMap) -> Program {
         methods: Vec::new(),
         method_ids: HashMap::new(),
     };
-    let funcs = h.funcs.iter().map(|f| FnC::compile(&mut pc, f)).collect();
+    let funcs = h.funcs.iter().map(|f| FnC::compile(&mut pc, f)).collect::<Result<Vec<_>, _>>()?;
     for c in &h.classes {
         for (name, _) in &c.by_name {
             pc.method(name);
@@ -46,7 +48,7 @@ pub fn compile(h: &HProgram, sources: &SourceMap) -> Program {
         .iter()
         .map(|f| FileInfo { name: f.name.clone(), line_starts: f.line_starts().to_vec() })
         .collect();
-    Program {
+    Ok(Program {
         funcs,
         classes,
         consts: pc.consts,
@@ -55,7 +57,19 @@ pub fn compile(h: &HProgram, sources: &SourceMap) -> Program {
         method_names: pc.methods,
         files,
         exc_classes: h.exc_classes.clone(),
-    }
+    })
+}
+
+fn too_large(f: &HFunc) -> Diagnostic {
+    let what = match f.kind {
+        FuncKind::Main => "this script".to_string(),
+        FuncKind::Template => "this template".to_string(),
+        FuncKind::Closure => "this closure".to_string(),
+        _ => format!("`{}`", f.name),
+    };
+    Diagnostic::error(format!("{what} is too large to compile"), f.span)
+        .note(format!("it needs more than {} registers for its variables and temporary values", NO_REG - 1))
+        .note("split it into smaller functions")
 }
 
 fn to_const(c: &HConst) -> Const {
@@ -144,10 +158,15 @@ struct FnC<'a> {
     loops: Vec<LoopCtx>,
     tries: Vec<TryCtx>,
     off: u32,
+    /// Set when a register beyond the register file was asked for; the code is then discarded.
+    too_big: bool,
 }
 
 impl<'a> FnC<'a> {
-    fn compile(pc: &'a mut ProgCtx, f: &HFunc) -> Function {
+    fn compile(pc: &'a mut ProgCtx, f: &HFunc) -> Result<Function, Diagnostic> {
+        if f.locals.len() >= NO_REG as usize {
+            return Err(too_large(f));
+        }
         // Register layout: captures, params, then the remaining locals.
         let mut reg_of = vec![Reg::MAX; f.locals.len()];
         let mut next: u16 = 0;
@@ -172,6 +191,7 @@ impl<'a> FnC<'a> {
             loops: Vec::new(),
             tries: Vec::new(),
             off: f.span.start,
+            too_big: false,
         };
         match f.kind {
             FuncKind::Template => {
@@ -186,7 +206,10 @@ impl<'a> FnC<'a> {
                 c.emit(Instr::RetNull);
             }
         }
-        Function {
+        if c.too_big {
+            return Err(too_large(f));
+        }
+        Ok(Function {
             native: native_sig(f),
             name: f.name.clone(),
             file: f.file,
@@ -194,7 +217,7 @@ impl<'a> FnC<'a> {
             num_regs: c.max,
             code: c.code,
             offsets: c.offsets,
-        }
+        })
     }
 
     // ----- helpers -------------------------------------------------------
@@ -213,11 +236,21 @@ impl<'a> FnC<'a> {
         self.alloc_n(1)
     }
 
+    /// Registers below `NO_REG` only (it marks "no register"). Past that the
+    /// function is reported as too large, and register 0 stands in meanwhile.
     fn alloc_n(&mut self, n: usize) -> Reg {
         let r = self.next;
-        self.next = self.next.checked_add(n as u16).expect("function needs too many registers");
-        self.max = self.max.max(self.next);
-        r
+        match (r as usize).checked_add(n).filter(|&end| end < NO_REG as usize) {
+            Some(end) => {
+                self.next = end as Reg;
+                self.max = self.max.max(self.next);
+                r
+            }
+            None => {
+                self.too_big = true;
+                0
+            }
+        }
     }
 
     fn is_local(&self, r: Reg) -> bool {
@@ -287,6 +320,9 @@ impl<'a> FnC<'a> {
 
     fn args(&mut self, args: &[HExpr]) -> Reg {
         let start = self.alloc_n(args.len());
+        if self.too_big {
+            return start;
+        }
         for (i, a) in args.iter().enumerate() {
             self.expr_into(a, start + i as u16);
         }
@@ -296,6 +332,9 @@ impl<'a> FnC<'a> {
     // ----- expressions ---------------------------------------------------
 
     fn expr_into(&mut self, e: &HExpr, dst: Reg) {
+        if self.too_big {
+            return;
+        }
         let mark = self.next;
         // Expressions that write `dst` before they are done reading their
         // operands go through a temporary when `dst` is a variable.
@@ -409,6 +448,9 @@ impl<'a> FnC<'a> {
             }
             HExprKind::Map(pairs) => {
                 let start = self.alloc_n(pairs.len() * 2);
+                if self.too_big {
+                    return;
+                }
                 for (i, (k, v)) in pairs.iter().enumerate() {
                     self.expr_into(k, start + 2 * i as u16);
                     self.expr_into(v, start + 2 * i as u16 + 1);
@@ -495,6 +537,9 @@ impl<'a> FnC<'a> {
                 self.emit(Instr::NewObject(dst, *cid));
                 if let Some(ctor) = ctor {
                     let start = self.alloc_n(args.len() + 1);
+                    if self.too_big {
+                        return;
+                    }
                     self.emit(Instr::Move(start, dst));
                     for (i, a) in args.iter().enumerate() {
                         self.expr_into(a, start + 1 + i as u16);

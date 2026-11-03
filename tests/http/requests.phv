@@ -1,4 +1,4 @@
-import std.net.{HttpClient, HttpResponse};
+import std.net.HttpClient;
 
 function show(string $label, any $v): void {
     echo $label, ": ", json_encode($v), "\n";
@@ -76,6 +76,6 @@ foreach (["other", "broken"] as $name) {
 }
 try {
     $api->get("/missing")->json();
-} catch (ValueError $e) {
+} catch (ValueError) {
     echo "json(): ValueError\n";
 }

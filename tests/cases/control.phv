@@ -52,7 +52,7 @@ foreach ([1, 2] as $x):
 endforeach;
 
 $found = false;
-foreach (["x" => 1] as $k => $v) {
+foreach (["x" => 1] as $_k => $_v) {
     $found = true;
 }
 echo $found ? "found\n" : "none\n";

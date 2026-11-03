@@ -211,7 +211,8 @@ try {
 }
 ```
 
-Only `Exception` and its subclasses can be thrown.
+Only `Exception` and its subclasses can be thrown. A `catch` that does not need the exception leaves the variable
+out: `catch (ValueError) { ... }`.
 
 ## 8. Functions
 
@@ -308,6 +309,9 @@ final class Square extends Base {
 - An `abstract` method has no body. A class that has an abstract method must be declared `abstract class`.
 - It is a compile error if a concrete class does not implement an interface or abstract method, or if the signature does not match.
 - Interfaces, abstract classes, and enums cannot be instantiated with `new`.
+- A `final class` cannot be extended, and a `final` method or constructor cannot be overridden (a `private` method is
+  not inherited, so a subclass can declare one of the same name). `final` cannot be combined with `abstract`, and
+  interfaces, interface methods, enums, properties and constants cannot be `final` (compile errors).
 - Method calls on a value of an interface type are dispatched by name. Method calls on a value of a class type are dispatched through a vtable.
 
 ### enum
@@ -1136,6 +1140,23 @@ When code uses a PHP function name, the error message suggests the alternative
 | `phv disasm file.phv` | Show the bytecode |
 | `phv parse file.phv` | Show the syntax tree |
 
+### Errors and warnings
+
+All errors of a program are reported together. When a file has a syntax error, the other files are still
+type-checked and their errors are shown with it; the type errors of the broken file itself, and of the files that
+import or render it, appear once it is fixed (they could come from what the parser had to skip).
+
+Code that is never used gives a warning (the program still runs):
+
+| Warning | Not reported for |
+|---|---|
+| A variable that is never read (`$x = 1;` and nothing reads `$x`) | Names starting with `_` (`foreach (0..$n as $_)`); the parameters of methods, constructors, closures and templates, whose names are fixed by what overrides, calls or renders them |
+| A name in an `import` that the module never uses | |
+| Code after `return`, `throw`, `break` or `continue`, or after a loop that never ends | |
+
+A `catch` that does not use the exception leaves the variable out (`catch (ValueError)`). While a program has
+errors, these warnings are not shown, since the errors often leave such code behind. `phv lsp` shows them as you type.
+
 ### Building an executable
 
 ```bash
@@ -1294,6 +1315,7 @@ It then runs the type checker and shows the places that need manual work, such a
 | Output waiting to be sent (`serve`) | `workers` × `memory_limit_mb` | 503 |
 | Source file (module, template, script) | 8 MB | Compile error |
 | Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits) |
+| Variables and temporary values of one function | 65,534 | Compile error (split the function) |
 
 `unsafe` is used only in the allocator that counts memory usage (`phv_vm/src/alloc.rs`), in the JIT
 (`phv_jit`, for calling generated code, and the helpers it calls in `phv_vm/src/jit.rs`), in calls to OS file APIs (`phv_std/src/safefs.rs`) and in the SQLite VFS
@@ -1301,8 +1323,24 @@ that checks journal files (`phv_std/src/db/vfs.rs`).
 
 ## 18. Roadmap
 
-The items planned so far are all implemented: generic classes, annotations, asynchronous I/O, wider JIT coverage,
-`phv build`, packages of packages and a registry, line wrapping in `phv fmt`, rate limits shared between processes,
-and sessions stored in a database.
+Planned, in this order. Each release is audited before it is published, as before.
+
+- **0.6, the language**: destructuring (`[$a, $b] = ...`), variadic parameters and `...` spread, functions as values
+  (`strlen(...)`), type aliases, `match` that must cover every case of an enum, bounds on type parameters
+  (`<T: Comparable>`), heredoc strings, and exceptions that carry the exception that caused them.
+- **0.7, web applications**: routes with parameters (`public/posts/[id].phv`), middleware, custom error pages, form
+  validation, layouts with slots, CORS, compression and caching headers for static files, graceful shutdown, access
+  logs, database migrations, an HTTP client for `phv test`, and sending mail.
+- **0.8, the standard library**: regular expressions, formatted strings, more list and map methods and a `Set`
+  type, mathematics, dates with time zones, JSON decoded into classes, encryption and signed tokens, UUIDs,
+  directories, logging, URLs and CSV.
+- **0.9, tools**: rename, find references, formatting and quick fixes in `phv lsp`; `phv new`, `phv doc`, a debugger
+  and test coverage; more platforms; a tutorial and a reference of the standard library.
+- **1.0, speed and stability**: freeing reference cycles while a script runs, a JIT that covers more code, HTTP/2,
+  TLS and a WebSocket server, and a stable language specification.
+
+Some features are left out on purpose, because they work against the design principles (§1): `eval`, variable
+variables, static properties and global variables, references (`&$x`), truthiness, `===`, `@`, `goto`, magic
+methods such as `__get`, `extract` / `compact`, and `new $className`.
 
 See [security-audit.md](security-audit.md) for the results of the security audit and the remaining risks.

@@ -21,6 +21,7 @@ use phv_syntax::ast::{
     self, ClassDecl, ClassKind, ExprKind, FunctionDecl, StmtKind, TypeExpr, TypeExprKind, Visibility,
 };
 use phv_syntax::{parse_type_str, Diagnostic, Span};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -196,6 +197,9 @@ pub(crate) struct Checker<'a> {
     deprecated_fields: HashMap<(ClassId, String), String>,
     /// `#[Test]` and `#[Skip]` functions.
     tests: Vec<(FuncId, Option<String>)>,
+    /// Names each module has looked up in its own scope (`(module, name)`),
+    /// to tell which imports are used. Lookups take `&self`, hence the cell.
+    used_names: RefCell<HashSet<(usize, String)>>,
 }
 
 /// What an annotation can be written before.
@@ -279,6 +283,7 @@ impl<'a> Checker<'a> {
             deprecated_classes: HashMap::new(),
             deprecated_fields: HashMap::new(),
             tests: Vec::new(),
+            used_names: RefCell::new(HashSet::new()),
         }
     }
 
@@ -363,6 +368,87 @@ impl<'a> Checker<'a> {
         self.resolve_classes(&order);
         self.resolve_functions();
         self.check_bodies();
+        self.warn_unused_imports();
+    }
+
+    /// Warns about imported names that their module never uses. Only the
+    /// project's own code is checked (not `std` or the prelude).
+    fn warn_unused_imports(&mut self) {
+        let used = std::mem::take(&mut *self.used_names.borrow_mut());
+        for (mi, m) in self.input.modules.iter().enumerate() {
+            if matches!(m.kind, ModuleKind::Std | ModuleKind::Prelude) {
+                continue;
+            }
+            for s in &m.ast.stmts {
+                let StmtKind::Import(d) = &s.kind else { continue };
+                for (name, span) in &d.names {
+                    let known = self.scopes[mi].funcs.contains_key(name)
+                        || self.scopes[mi].classes.contains_key(name)
+                        || self.scopes[mi].consts.contains_key(name);
+                    if known && !used.contains(&(mi, name.clone())) {
+                        self.diags.push(
+                            Diagnostic::warning(format!("`{name}` is imported but never used"), *span)
+                                .note("remove it from the `import`")
+                                .code(phv_syntax::diag::UNUSED),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Warns about the locals of a finished function that are never read.
+    pub(crate) fn warn_unused_locals(&mut self, ctx: &FnCtx, skip: &[LocalId]) {
+        if matches!(self.module_kind(), ModuleKind::Std | ModuleKind::Prelude) {
+            return;
+        }
+        for id in ctx.unused_locals(skip) {
+            let name = &ctx.locals[id as usize].name;
+            let span = ctx.spans[id as usize];
+            let note = if ctx.catch_vars.contains(&id) {
+                "leave the variable out: `catch (SomeException)`".to_string()
+            } else if ctx.captures.iter().any(|(inner, _)| *inner == id) {
+                "remove it from `use (...)`".to_string()
+            } else {
+                format!("remove it, or start its name with `_` (`$_{name}`) if it is meant to be unused")
+            };
+            self.diags.push(
+                Diagnostic::warning(format!("variable `${name}` is never used"), span)
+                    .note(note)
+                    .code(phv_syntax::diag::UNUSED),
+            );
+        }
+    }
+
+    /// Warns (once per block) about a statement that runs after control has
+    /// already left the block.
+    pub(crate) fn note_unreachable(&mut self, s: &ast::Stmt, warned: &mut bool) {
+        if *warned || !self.cx().flow.dead {
+            return;
+        }
+        if let StmtKind::InlineHtml(text, _) = &s.kind {
+            if text.trim().is_empty() {
+                return;
+            }
+        }
+        *warned = true;
+        if matches!(self.module_kind(), ModuleKind::Std | ModuleKind::Prelude) {
+            return;
+        }
+        self.diags.push(
+            Diagnostic::warning("unreachable code", s.span)
+                .note("the code before it always leaves here (`return`, `throw`, `break`, `continue` or a loop that never ends)")
+                .code(phv_syntax::diag::UNUSED),
+        );
+    }
+
+    /// Records that the current module used `name` from its own scope.
+    fn note_used(&self, name: &str) {
+        let key = (self.module, name.to_string());
+        let mut used = self.used_names.borrow_mut();
+        if !used.contains(&key) {
+            used.insert(key);
+        }
     }
 
     // ----- editor index ----------------------------------------------------
@@ -623,6 +709,7 @@ impl<'a> Checker<'a> {
 
     pub(crate) fn lookup_class(&self, name: &str) -> Option<ClassId> {
         if let Some(c) = self.scopes[self.module].classes.get(name) {
+            self.note_used(name);
             return Some(*c);
         }
         self.prelude().and_then(|p| self.scopes[p].classes.get(name).copied())
@@ -630,6 +717,7 @@ impl<'a> Checker<'a> {
 
     pub(crate) fn lookup_func(&self, name: &str) -> Option<FuncId> {
         if let Some(f) = self.scopes[self.module].funcs.get(name) {
+            self.note_used(name);
             return Some(*f);
         }
         self.prelude().and_then(|p| self.scopes[p].funcs.get(name).copied())
@@ -667,6 +755,7 @@ impl<'a> Checker<'a> {
 
     pub(crate) fn lookup_const(&self, name: &str) -> Option<(HConst, Type)> {
         if let Some(c) = self.scopes[self.module].consts.get(name) {
+            self.note_used(name);
             return Some(c.clone());
         }
         self.prelude().and_then(|p| self.scopes[p].consts.get(name).cloned())
@@ -674,6 +763,10 @@ impl<'a> Checker<'a> {
 
     pub(crate) fn class_kind(&self, c: ClassId) -> ClassKind {
         self.classes[c as usize].kind
+    }
+
+    fn func_is_final(&self, f: FuncId) -> bool {
+        matches!(self.funcs[f as usize].body, Body::Function(d) if d.is_final)
     }
 
     pub(crate) fn func_is_abstract(&self, f: FuncId) -> bool {
@@ -1382,6 +1475,11 @@ impl<'a> Checker<'a> {
                     }
                     _ => {}
                 }
+                if self.classes[p as usize].decl.is_some_and(|d| d.is_final) {
+                    let span = decl.parent.as_ref().unwrap().1;
+                    let parent_name = self.classes[p as usize].name.clone();
+                    self.error(format!("`{class_name}` cannot extend `{parent_name}`, which is `final`"), span);
+                }
                 let parent = &self.classes[p as usize];
                 // Each class holds a copy of what it inherits; a long chain or a wide fan of
                 // classes would otherwise take memory and time far out of proportion to the source.
@@ -1614,6 +1712,13 @@ impl<'a> Checker<'a> {
                     }
                 }
                 if is_ctor {
+                    if let Some(old) = self.classes[ci].ctor.filter(|f| self.func_is_final(*f)) {
+                        let parent_name = self.funcs[old as usize].name.clone();
+                        self.error(
+                            format!("`{class_name}::__construct` overrides `{parent_name}`, which is `final`"),
+                            m.name_span,
+                        );
+                    }
                     own_ctor = true;
                     for (p, ap) in params.iter().zip(&m.params) {
                         if let Some((vis, readonly)) = p.promote {
@@ -1648,6 +1753,13 @@ impl<'a> Checker<'a> {
                         continue;
                     }
                     Some(old) if old.vis != Visibility::Private => {
+                        if self.func_is_final(old.func) {
+                            let parent_name = self.funcs[old.func as usize].name.clone();
+                            self.error(
+                                format!("`{class_name}::{}` overrides `{parent_name}`, which is `final`", m.name),
+                                m.name_span,
+                            );
+                        }
                         if old.is_static != m.is_static {
                             self.error(
                                 format!("`{}` changes between static and non-static when overriding", m.name),
@@ -1893,6 +2005,7 @@ impl<'a> Checker<'a> {
                 self.block(&d.body, &mut out);
             }
             Body::Template(m) | Body::Main(m) => {
+                let mut warned = false;
                 for s in &m.stmts {
                     match &s.kind {
                         StmtKind::Function(_)
@@ -1900,7 +2013,10 @@ impl<'a> Checker<'a> {
                         | StmtKind::Import(_)
                         | StmtKind::Params(_)
                         | StmtKind::Const(_) => {}
-                        _ => self.stmt(s, &mut out),
+                        _ => {
+                            self.note_unreachable(s, &mut warned);
+                            self.stmt(s, &mut out);
+                        }
                     }
                 }
             }
@@ -1908,6 +2024,10 @@ impl<'a> Checker<'a> {
         }
 
         let ctx = self.ctx.pop().unwrap();
+        // Only plain functions: the parameters of methods, closures and templates
+        // are fixed by what overrides, calls or renders them.
+        let skip = if kind == FuncKind::Normal { &[][..] } else { &param_ids[..] };
+        self.warn_unused_locals(&ctx, skip);
         let code_span = match body {
             Body::Function(d) => d.span,
             _ => Span::new(file, 0, u32::MAX),

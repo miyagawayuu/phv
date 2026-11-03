@@ -1,0 +1,15 @@
+<?phv
+// `final` is only for classes and methods, and never together with `abstract`.
+abstract final class Both {}
+final interface Shape {}
+final enum Suit { case Hearts; }
+
+interface Named {
+    final public function name(): string;
+}
+
+abstract class Base {
+    abstract final public function m(): void;
+    final public int $x = 1;
+    final const LIMIT = 1;
+}

@@ -836,6 +836,7 @@ impl Parser {
             attrs: Vec::new(),
             name,
             name_span,
+            is_final: false,
             type_params,
             is_abstract,
             params,
@@ -851,11 +852,27 @@ impl Parser {
     fn class_decl(&mut self, exported: bool) -> PResult<ClassDecl> {
         let start = self.span();
         let mut kind = ClassKind::Class;
+        let mut is_final = false;
         while matches!(self.peek(), Tok::Abstract | Tok::Final) {
             if self.at(&Tok::Abstract) {
                 kind = ClassKind::Abstract;
+            } else {
+                is_final = true;
             }
             self.advance();
+        }
+        if is_final && kind == ClassKind::Abstract {
+            self.diags.push(
+                Diagnostic::error("a class cannot be both `abstract` and `final`", start)
+                    .note("an abstract class must be extended to be used"),
+            );
+        }
+        match self.peek() {
+            Tok::Interface | Tok::Enum if is_final => {
+                let what = if self.at(&Tok::Interface) { "interfaces" } else { "enums" };
+                self.diags.push(Diagnostic::error(format!("{what} cannot be `final`"), start));
+            }
+            _ => {}
         }
         match self.peek() {
             Tok::Interface => kind = ClassKind::Interface,
@@ -936,6 +953,7 @@ impl Parser {
             let mut is_static = false;
             let mut readonly = false;
             let mut is_abstract = kind == ClassKind::Interface;
+            let mut is_final = false;
             loop {
                 match self.peek() {
                     Tok::Public => vis = Visibility::Public,
@@ -944,14 +962,26 @@ impl Parser {
                     Tok::Static => is_static = true,
                     Tok::Readonly => readonly = true,
                     Tok::Abstract => is_abstract = true,
-                    Tok::Final => {}
+                    Tok::Final => is_final = true,
                     _ => break,
                 }
                 self.advance();
             }
+            if is_final && !self.at(&Tok::Function) {
+                self.diags.push(Diagnostic::error("only classes and methods can be `final`", mstart));
+            }
             let result = if self.at(&Tok::Function) {
                 self.function_decl(false, vis, is_static).map(|mut f| {
                     f.attrs = attrs;
+                    f.is_final = is_final;
+                    if is_final && is_abstract {
+                        let msg = if kind == ClassKind::Interface {
+                            "interface methods cannot be `final`"
+                        } else {
+                            "a method cannot be both `abstract` and `final`"
+                        };
+                        self.diags.push(Diagnostic::error(msg, f.name_span));
+                    }
                     if f.is_abstract != is_abstract {
                         let msg = if is_abstract {
                             "abstract and interface methods cannot have a body"
@@ -1006,6 +1036,7 @@ impl Parser {
             name,
             name_span,
             kind,
+            is_final,
             type_params,
             parent,
             parent_args,

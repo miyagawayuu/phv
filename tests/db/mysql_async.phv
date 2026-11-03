@@ -19,7 +19,7 @@ echo "rows: ", $rows->map(fn($r) => (string)($r->int("n") ?? 0))->join(","), "\n
 $broken = $db->queryAsync(sql"SELECT * FROM phv_no_such_table");
 try {
     await($broken);
-} catch (DatabaseError $e) {
+} catch (DatabaseError) {
     echo "error caught\n";
 }
 $db->execute(sql"DROP TABLE phv_async");

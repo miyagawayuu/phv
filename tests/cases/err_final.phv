@@ -1,0 +1,16 @@
+<?phv
+// `final` classes cannot be extended and `final` methods cannot be overridden.
+final class Leaf {}
+class Branch extends Leaf {}
+
+class Base {
+    final public function __construct() {}
+    final public function id(): int { return 1; }
+    final private function secret(): int { return 2; }   // private: not inherited
+}
+
+class Child extends Base {
+    public function __construct() {}
+    public function id(): int { return 2; }
+    private function secret(): int { return 3; }
+}

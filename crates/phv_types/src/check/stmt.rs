@@ -29,7 +29,9 @@ fn breaks_out(stmts: &[Stmt], nest: u32) -> bool {
 
 impl Checker<'_> {
     pub(crate) fn block(&mut self, stmts: &[Stmt], out: &mut Vec<HStmt>) {
+        let mut warned = false;
         for s in stmts {
+            self.note_unreachable(s, &mut warned);
             self.stmt(s, out);
         }
     }
@@ -228,7 +230,9 @@ impl Checker<'_> {
                             Some(c) => self.any_args(c),
                             None => Type::Error,
                         };
-                        self.loop_var(v, ty, *span)
+                        let id = self.loop_var(v, ty, *span);
+                        self.cx().catch_vars.insert(id);
+                        id
                     });
                     let mut hb = Vec::new();
                     self.block(&c.body, &mut hb);

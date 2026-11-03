@@ -5,7 +5,7 @@ $db = Database::connect("main");
 try {
     $db->query(sql"SELECT * FROM phv_temp");
     echo "temp table: still there\n";
-} catch (DatabaseError $e) {
+} catch (DatabaseError) {
     echo "temp table: gone\n";
 }
 echo "variable: ", $db->first(sql"SELECT @leaked AS v")?->string("v") ?? "unset", "\n";

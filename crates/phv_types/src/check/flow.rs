@@ -77,6 +77,10 @@ pub(crate) struct FnCtx {
     pub locals: Vec<HLocal>,
     /// Where each local is first assigned or declared.
     pub spans: Vec<Span>,
+    /// Whether each local is ever read (see `unused_locals`).
+    pub used: Vec<bool>,
+    /// Locals bound by `catch`, which can be left out instead of renamed.
+    pub catch_vars: HashSet<LocalId>,
     pub names: HashMap<String, LocalId>,
     pub flow: Flow,
     pub ret: Type,
@@ -97,6 +101,8 @@ impl FnCtx {
         FnCtx {
             locals: Vec::new(),
             spans: Vec::new(),
+            used: Vec::new(),
+            catch_vars: HashSet::new(),
             names: HashMap::new(),
             flow: Flow::default(),
             ret,
@@ -114,8 +120,24 @@ impl FnCtx {
         let id = self.locals.len() as LocalId;
         self.locals.push(HLocal { name: name.to_string(), ty });
         self.spans.push(span);
+        self.used.push(false);
         self.names.insert(name.to_string(), id);
         id
+    }
+
+    /// Locals that are never read, except `$this`, names starting with `_`
+    /// and those in `skip` (parameters whose signature is fixed elsewhere).
+    pub fn unused_locals(&self, skip: &[LocalId]) -> Vec<LocalId> {
+        (0..self.locals.len() as LocalId)
+            .filter(|id| {
+                let name = &self.locals[*id as usize].name;
+                !self.used[*id as usize]
+                    && !skip.contains(id)
+                    && name != "this"
+                    && !name.starts_with('_')
+                    && !name.starts_with('%')
+            })
+            .collect()
     }
 
     /// A hidden local used by the compiler (e.g. the subject of `?->`).
@@ -124,6 +146,7 @@ impl FnCtx {
         self.temps += 1;
         self.locals.push(HLocal { name: format!("%t{}", self.temps), ty });
         self.spans.push(Span::default());
+        self.used.push(true);
         self.flow.mark(id);
         id
     }
@@ -263,8 +286,9 @@ impl Checker<'_> {
     }
 
     fn read_var_at(&mut self, level: usize, name: &str, span: Span, report: bool) -> Option<(LocalId, Type)> {
-        let ctx = &self.ctx[level];
+        let ctx = &mut self.ctx[level];
         if let Some(&id) = ctx.names.get(name) {
+            ctx.used[id as usize] = true;
             if !ctx.flow.is_assigned(id) {
                 if report {
                     self.error(format!("variable `${name}` might not be defined here"), span).add_note(
@@ -280,6 +304,7 @@ impl Checker<'_> {
                 let def = self.ctx[level - 1].spans[outer as usize];
                 let ctx = &mut self.ctx[level];
                 let id = ctx.declare(name, ty.clone(), def);
+                ctx.used[id as usize] = true;
                 ctx.flow.mark(id);
                 ctx.captures.push((id, outer));
                 return Some((id, ty));

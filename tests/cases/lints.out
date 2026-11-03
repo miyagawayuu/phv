@@ -1,0 +1,54 @@
+warning: `Product` is imported but never used
+ --> lints.phv:3:18
+  |
+3 | import lib.shop.{Product, catalog};
+  |                  ^^^^^^^
+  = note: remove it from the `import`
+
+warning: variable `$unused` is never used
+ --> lints.phv:5:31
+  |
+5 | function total(list<int> $xs, int $unused, int $_ignored): int {
+  |                               ^^^^^^^^^^^
+  = note: remove it, or start its name with `_` (`$_unused`) if it is meant to be unused
+
+warning: variable `$temp` is never used
+ --> lints.phv:7:5
+  |
+7 |     $temp = 5;
+  |     ^^^^^
+  = note: remove it, or start its name with `_` (`$_temp`) if it is meant to be unused
+
+warning: unreachable code
+  --> lints.phv:12:5
+   |
+12 |     echo "never";
+   |     ^^^^^^^^^^^^^
+   = note: the code before it always leaves here (`return`, `throw`, `break`, `continue` or a loop that never ends)
+
+warning: unreachable code
+  --> lints.phv:18:9
+   |
+18 |         $x++;
+   |         ^^^^^
+   = note: the code before it always leaves here (`return`, `throw`, `break`, `continue` or a loop that never ends)
+
+warning: variable `$label` is never used
+  --> lints.phv:31:34
+   |
+31 | $double = function (int $n) use ($label): int {
+   |                                  ^^^^^^
+   = note: remove it from `use (...)`
+
+warning: variable `$e` is never used
+  --> lints.phv:37:21
+   |
+37 | } catch (ValueError $e) {
+   |                     ^^
+   = note: leave the variable out: `catch (SomeException)`
+
+6
+7
+7
+3 4 1
+hi Ann

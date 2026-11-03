@@ -22,7 +22,7 @@ import std.db.Database;
 
 function greet(string $name, int $times = 1): string {
     $out = "";
-    foreach (0..$times as $i) {
+    foreach (0..$times as $_) {
         $out .= "Hello, {$name}!\n";
     }
     return $out;
@@ -39,7 +39,8 @@ echo greet($name);                                 // HTML-escaped automatically
 - **What comes from PHP**: `$variables`, `[1, 2]` / `["k" => v]`, `echo`, `foreach`, `match`, embedding in HTML,
   routing by file name, changes take effect on save, and a share-nothing model where each request starts fresh.
 - **Type safety**: a variable's type is fixed by its first assignment. No implicit conversions, `==` is always
-  strict, no truthiness, null safety (`?T`), interfaces, abstract classes, enums, generic functions and classes, `finally`.
+  strict, no truthiness, null safety (`?T`), interfaces, abstract and `final` classes, enums, generic functions and
+  classes, `finally`. Unused variables and imports and unreachable code are reported as warnings.
 - **Security**:
   - **XSS**: output is escaped automatically, and inserting a value where escaping cannot protect it (unquoted
     attributes, URLs, `<script>`) is a compile error. Only `safe_url()` values may start a URL and only

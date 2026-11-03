@@ -1,0 +1,19 @@
+error: `Branch` cannot extend `Leaf`, which is `final`
+ --> err_final.phv:4:22
+  |
+4 | class Branch extends Leaf {}
+  |                      ^^^^
+
+error: `Child::__construct` overrides `Base::__construct`, which is `final`
+  --> err_final.phv:13:21
+   |
+13 |     public function __construct() {}
+   |                     ^^^^^^^^^^^
+
+error: `Child::id` overrides `Base::id`, which is `final`
+  --> err_final.phv:14:21
+   |
+14 |     public function id(): int { return 2; }
+   |                     ^^
+
+3 errors found

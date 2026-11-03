@@ -23,6 +23,11 @@ pub struct Diagnostic {
 /// when phv.toml's policy allows inline code.
 pub const CSP_INLINE: &str = "csp-inline";
 
+/// Warning code for code that is never used (variables, imports, unreachable
+/// statements). The driver drops it while the program has errors, which often
+/// leave such code behind.
+pub const UNUSED: &str = "unused";
+
 impl Diagnostic {
     pub fn error(message: impl Into<String>, span: Span) -> Diagnostic {
         Diagnostic {
@@ -41,6 +46,11 @@ impl Diagnostic {
 
     pub fn label(mut self, label: impl Into<String>) -> Diagnostic {
         self.label = Some(label.into());
+        self
+    }
+
+    pub fn code(mut self, code: &'static str) -> Diagnostic {
+        self.code = Some(code);
         self
     }
 
