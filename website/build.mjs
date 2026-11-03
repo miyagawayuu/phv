@@ -2,6 +2,7 @@
 //   /                 landing page (English)     /ja/              landing page (Japanese)
 //   /docs/spec/       language specification     /ja/docs/spec/
 //   /docs/security/   security audit report      /ja/docs/security/
+//   /packages/        packages of the registry   /ja/packages/
 //   /404.html         page for unknown paths
 // The specification and the audit report are rendered from ../docs/*.md, and
 // PHV code is highlighted with the VS Code extension's TextMate grammars.
@@ -94,8 +95,8 @@ function renderDoc(markdown, lang) {
 }
 
 const strings = {
-  en: { docs: "Docs", spec: "Specification", security: "Security", download: "Download", contents: "Contents", other: "日本語", otherLang: "ja" },
-  ja: { docs: "ドキュメント", spec: "言語仕様", security: "セキュリティ", download: "ダウンロード", contents: "目次", other: "English", otherLang: "en" },
+  en: { docs: "Docs", spec: "Specification", security: "Security", packages: "Packages", download: "Download", contents: "Contents", other: "日本語", otherLang: "ja" },
+  ja: { docs: "ドキュメント", spec: "言語仕様", security: "セキュリティ", packages: "パッケージ", download: "ダウンロード", contents: "目次", other: "English", otherLang: "en" },
 };
 
 /** The page frame shared by every page. `depth` is how far the page is below the site root. */
@@ -127,6 +128,7 @@ export function layout({ lang, title, description, body, depth, active, otherHre
     <nav>
       ${nav("spec", `${docs}spec/`, t.spec)}
       ${nav("security", `${docs}security/`, t.security)}
+      ${nav("packages", `${home}packages/`, t.packages)}
       ${nav("download", `${home}#download`, t.download)}
       <a class="lang" href="${otherHref}" hreflang="${t.otherLang}" lang="${t.otherLang}">${t.other}</a>
     </nav>
@@ -178,6 +180,67 @@ for (const lang of ["en", "ja"]) {
   const depth = lang === "en" ? 0 : 1;
   write(out, layout({ lang, ...page, depth, active: "home", otherHref: lang === "en" ? "ja/" : "../" }));
 }
+// The package registry: a git repository of index/<name>.toml files, read
+// when the site is built. If it cannot be read, the page says so.
+const REGISTRY_REPO = "miyagawayuu/phv-packages";
+async function registryPackages() {
+  try {
+    const signal = AbortSignal.timeout(15000);
+    const res = await fetch(`https://api.github.com/repos/${REGISTRY_REPO}/contents/index`, { signal, headers: { "User-Agent": "phv-lang.org" } });
+    if (!res.ok) return null;
+    const files = (await res.json()).filter((f) => /^[A-Za-z0-9_]+\.toml$/.test(f.name));
+    const out = [];
+    for (const f of files) {
+      const text = await (await fetch(f.download_url, { signal })).text();
+      const field = (k) => (new RegExp(`^${k}\\s*=\\s*"([^"\\n]*)"`, "m").exec(text) || [])[1] || "";
+      out.push({ name: f.name.replace(/\.toml$/, ""), git: field("git"), description: field("description") });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+  } catch {
+    return null;
+  }
+}
+
+const packages = await registryPackages();
+const packagesText = {
+  en: {
+    title: "Packages",
+    lead: `Packages of the PHV registry. Add one to <code>[dependencies]</code> in phv.toml with a version, for example <code>slugify = "^1.0"</code>, and run <code>phv install</code>; the packages it needs are installed too.`,
+    none: "The registry has no packages yet.",
+    unavailable: "The registry could not be read when this page was built.",
+    head: ["Package", "Description", "Repository"],
+    publish: `To publish a package, tag its versions as <code>vX.Y.Z</code> in its git repository and send a pull request to <a href="https://github.com/${REGISTRY_REPO}">${REGISTRY_REPO}</a> adding <code>index/&lt;name&gt;.toml</code> with its <code>git</code> URL and a <code>description</code>.`,
+  },
+  ja: {
+    title: "パッケージ",
+    lead: `PHV のレジストリにあるパッケージです。phv.toml の <code>[dependencies]</code> にバージョンを付けて書き(例: <code>slugify = "^1.0"</code>)、<code>phv install</code> を実行します。そのパッケージが使うパッケージも入ります。`,
+    none: "レジストリにはまだパッケージがありません。",
+    unavailable: "このページを作ったときにレジストリを読めませんでした。",
+    head: ["パッケージ", "説明", "リポジトリ"],
+    publish: `パッケージを公開するには、git リポジトリでバージョンに <code>vX.Y.Z</code> のタグを付け、<a href="https://github.com/${REGISTRY_REPO}">${REGISTRY_REPO}</a> に <code>index/&lt;名前&gt;.toml</code>(<code>git</code> の URL と <code>description</code>)を追加するプルリクエストを送ってください。`,
+  },
+};
+for (const lang of ["en", "ja"]) {
+  const t = packagesText[lang];
+  let list;
+  if (packages === null) list = `<p>${t.unavailable}</p>`;
+  else if (packages.length === 0) list = `<p>${t.none}</p>`;
+  else {
+    const rows = packages
+      .map((p) => {
+        const repo = /^https:\/\//.test(p.git) ? `<a href="${escape(p.git)}">${escape(p.git)}</a>` : escape(p.git);
+        return `<tr><td><code>${escape(p.name)}</code></td><td>${escape(p.description)}</td><td>${repo}</td></tr>`;
+      })
+      .join("\n");
+    list = `<table><thead><tr>${t.head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>\n${rows}\n</tbody></table>`;
+  }
+  const body = `<article class="prose"><h1>${t.title}</h1>\n<p>${t.lead}</p>\n${list}\n<p>${t.publish}</p></article>`;
+  const out = lang === "en" ? "packages/index.html" : "ja/packages/index.html";
+  const depth = lang === "en" ? 1 : 2;
+  const otherHref = lang === "en" ? "../ja/packages/" : "../../packages/";
+  write(out, layout({ lang, title: `${t.title} · PHV`, description: t.title, body, depth, active: "packages", otherHref }));
+}
+
 docPage("spec.md", "en", "docs/spec/index.html", "spec", "../../ja/docs/spec/");
 docPage("spec.ja.md", "ja", "ja/docs/spec/index.html", "spec", "../../../docs/spec/");
 docPage("security-audit.md", "en", "docs/security/index.html", "security", "../../ja/docs/security/");

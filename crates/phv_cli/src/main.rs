@@ -59,6 +59,9 @@ enum Command {
     Install {
         #[arg(default_value = ".")]
         dir: PathBuf,
+        /// Install exactly what phv.lock records; fail if it is out of date.
+        #[arg(long)]
+        locked: bool,
     },
     /// Convert a PHP file to PHV, marking what needs manual work.
     Migrate {
@@ -201,7 +204,7 @@ fn exec(cmd: Command) -> ExitCode {
             lsp::run();
             ExitCode::SUCCESS
         }
-        Command::Install { dir } => pkg::install(&dir),
+        Command::Install { dir, locked } => pkg::install(&dir, locked),
         Command::Migrate { file, output, force } => {
             let src = match std::fs::read_to_string(&file) {
                 Ok(t) => t,

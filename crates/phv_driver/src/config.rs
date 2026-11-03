@@ -20,8 +20,10 @@
 //! env = ["APP_*"]
 //!
 //! [dependencies]
+//! slugify = "^1.2"                                          # from the package registry
 //! utils = { path = "../utils" }
 //! markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
+//! charts = { git = "https://example.com/charts.git", version = "~0.3" }
 //!
 //! [databases.main]
 //! url_env = "DATABASE_URL"  # postgres://, mysql://, redis:// or rediss://
@@ -355,13 +357,81 @@ struct PermissionsSection {
     env: Vec<String>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
+/// A package in `[dependencies]`: a directory (`path`), a git repository at
+/// a `rev` or at the newest tag matching `version`, or a package of the
+/// registry (only `version`, written as a plain string: `slugify = "^1.2"`).
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(from = "DependencySpec")]
 pub struct Dependency {
     pub path: Option<String>,
     pub git: Option<String>,
     /// Tag, branch or commit for git dependencies.
     pub rev: Option<String>,
+    /// A semver requirement (`^1.2`, `~0.3.1`, `>=1, <2`) matched against `vX.Y.Z` tags.
+    pub version: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DependencySpec {
+    Version(String),
+    Table(DependencyTable),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DependencyTable {
+    path: Option<String>,
+    git: Option<String>,
+    rev: Option<String>,
+    version: Option<String>,
+}
+
+impl From<DependencySpec> for Dependency {
+    fn from(d: DependencySpec) -> Dependency {
+        match d {
+            DependencySpec::Version(v) => Dependency { version: Some(v), ..Dependency::default() },
+            DependencySpec::Table(t) => Dependency { path: t.path, git: t.git, rev: t.rev, version: t.version },
+        }
+    }
+}
+
+/// Whether `v` can be a semver requirement (checked fully by `phv install`).
+pub fn plausible_version_req(v: &str) -> bool {
+    !v.trim().is_empty() && v.len() <= 100 && v.chars().all(|c| c.is_ascii_alphanumeric() || " .^~*<>=,-+".contains(c))
+}
+
+/// Checks the `[dependencies]` of a project's or a package's phv.toml.
+pub fn check_dependencies(deps: &BTreeMap<String, Dependency>) -> Result<(), String> {
+    for (name, dep) in deps {
+        if !valid_package_name(name) {
+            return Err(format!("[dependencies]: invalid package name \"{name}\""));
+        }
+        let sources = [dep.path.is_some(), dep.git.is_some(), dep.path.is_none() && dep.git.is_none()];
+        if sources.iter().filter(|s| **s).count() != 1
+            || (dep.git.is_none() && dep.path.is_none() && dep.version.is_none())
+        {
+            return Err(format!("[dependencies].{name}: give a version (\"^1.2\"), or one of `path` or `git`"));
+        }
+        if dep.path.is_some() && (dep.rev.is_some() || dep.version.is_some()) {
+            return Err(format!("[dependencies].{name}: a `path` package takes no `rev` or `version`"));
+        }
+        if dep.rev.is_some() && dep.version.is_some() {
+            return Err(format!("[dependencies].{name}: give `rev` or `version`, not both"));
+        }
+        if dep.version.as_deref().is_some_and(|v| !plausible_version_req(v)) {
+            return Err(format!("[dependencies].{name}: invalid version requirement"));
+        }
+    }
+    Ok(())
+}
+
+/// Package names: letters, digits and `_`, not `std` (which is the standard library).
+pub fn valid_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.starts_with("std")
 }
 
 #[derive(Clone)]
@@ -478,13 +548,8 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
             ));
         }
     }
+    check_dependencies(&file.dependencies)?;
     for (name, dep) in &file.dependencies {
-        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || name.starts_with("std") {
-            return Err(format!("[dependencies]: invalid package name \"{name}\""));
-        }
-        if dep.path.is_some() == dep.git.is_some() {
-            return Err(format!("[dependencies].{name}: give exactly one of `path` or `git`"));
-        }
         if let Some(p) = &dep.path {
             // Relative only: an absolute or UNC path (\\\\host\\share) would make
             // opening the project contact another machine.

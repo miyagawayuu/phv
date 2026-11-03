@@ -1102,7 +1102,7 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
 | `phv test [paths]` | `*_test.phv` の `test_*` 関数を実行(1 テストごとに新しい VM) |
 | `phv fmt [paths] [--check] [--width N]` | インデントと空白を整え、長い行を折り返す(文字列・コメント・HTML は変えない) |
 | `phv lsp` | エディタ用の Language Server(入力中のエラー表示、ホバーで型を表示、補完、定義へのジャンプ) |
-| `phv install` | `[dependencies]` を取得して `phv.lock` に固定 |
+| `phv install [--locked]` | `[dependencies]` とそれらが使うパッケージを取得して `phv.lock` に固定 |
 | `phv migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
 | `phv disasm file.phv` | バイトコードを表示 |
 | `phv parse file.phv` | 構文木を表示 |
@@ -1159,7 +1159,9 @@ function test_import(): void { /* ... */ }
 
 ```toml
 [dependencies]
-textutils = { git = "https://github.com/example/textutils.git", rev = "v1" }
+slugify = "^1.2"                                                            # レジストリから
+textutils = { git = "https://github.com/example/textutils.git", version = "~0.3" }
+nightly = { git = "https://github.com/example/nightly.git", rev = "main" }
 local = { path = "../shared" }
 ```
 
@@ -1167,11 +1169,24 @@ local = { path = "../shared" }
 import textutils.strings.slugify;      // vendor/textutils/strings.phv
 ```
 
-- `git` のパッケージは `vendor/<名前>` に取得され、正確なコミットが `phv.lock` に記録される。
-  2 回目以降は lock のコミットを取得し、違っていればエラーになる。
+- パッケージは PHV のモジュールを置いたディレクトリで、自分の依存があれば `phv.toml` を持つ。取得元は次のどれか:
+  - **レジストリ**: `名前 = "<要件>"`。レジストリは `index/<名前>.toml`(パッケージの `git` の URL を書く)を並べた git
+    リポジトリ(`PHV_REGISTRY` で別のレジストリを使える)。パッケージの一覧は phv-lang.org/packages/ にある。
+  - **git** と `version`: 要件に合う最も新しい `vX.Y.Z` タグ。要件は semver の範囲: `^1.2`(1.2 以上 2.0 未満)、
+    `~0.3.1`、`>=1.0, <1.5`、`=2.0.0`、`*`。
+  - **git** と `rev`(タグ、ブランチ、コミット。なければ既定のブランチ)。
+  - **path**: そのまま使うディレクトリ。書けるのはプロジェクト自身の phv.toml だけ。
+- `phv install` は、パッケージが使うパッケージ(その `[dependencies]`。phv.toml のほかの部分は読まない)も入れる。
+  各パッケージは `vendor/<名前>` に 1 回だけ入る。バージョンの要件なら、それを求めるすべてのパッケージが受け入れる
+  最も新しいバージョン。すべてに合うものがなければ、要件とそれを出したものを並べたエラーになる。同じパッケージを
+  違う形で求めた場合(git の URL が 2 つ、rev が 2 つ)もエラー。
+- `phv.lock` には、ほかのパッケージのために入れたものも含め、すべてのパッケージを正確なコミット(とバージョン)で記録する。
+  次からは要件に合う限りそれを使う。`phv install --locked` は記録どおりに入れ、古くなっていれば失敗する(CI 向け)。
+  取得したコミットが lock と違えばエラー。
+- モジュールが import できるのは、自分のパッケージのモジュール(`import pkg.module`)、依存しているパッケージ、`std`。
+  プロジェクトが import できるのは自分の `[dependencies]` のパッケージだけで、それらのために入れたものは使えない。
 - 使える URL は `https://`、`ssh://`、`git@host:...`、`file://` だけ。
 - パッケージは PHV のソースコードで、インストール時にパッケージのコードが実行されることはない。
-- パッケージの依存はアプリの `phv.toml` に並べて書く(推移的な依存の解決はまだない)。
 
 ### 移行
 
@@ -1222,6 +1237,5 @@ phv migrate legacy/page.php      # page.phv を書き出す
 ## 18. 今後の予定
 
 - JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
-- 推移的な依存関係の解決、パッケージレジストリ
 
 セキュリティ監査の結果と残っているリスクは [security-audit.ja.md](security-audit.ja.md) を参照。

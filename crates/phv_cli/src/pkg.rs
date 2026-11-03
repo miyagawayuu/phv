@@ -1,16 +1,29 @@
-//! `phv install`: fetches the `[dependencies]` of phv.toml.
+//! `phv install`: fetches the `[dependencies]` of phv.toml, and theirs.
 //!
-//! - `path` packages are used in place.
-//! - `git` packages are cloned into `vendor/<name>` and pinned to an exact
-//!   commit in `phv.lock`; later installs check out the locked commit.
+//! - `path` packages are used in place. Only the project's own phv.toml may
+//!   name them.
+//! - `git` packages, and packages of the registry (`name = "^1.2"`), are
+//!   cloned into `vendor/<name>` and pinned to an exact commit in `phv.lock`;
+//!   later installs check out the locked commit.
+//! - A package's own `[dependencies]` are installed too, into `vendor/`. Each
+//!   package is installed once: for a `version` requirement, at the newest
+//!   `vX.Y.Z` tag that every package asking for it accepts.
+//! - The registry is a git repository of `index/<name>.toml` files
+//!   (`git = "<url>"`); `PHV_REGISTRY` names another one.
 //! - Packages are plain PHV source. Installing never runs package code.
 
+use phv_driver::config::{check_dependencies, Dependency};
 use phv_driver::load_config;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-#[derive(Serialize, Deserialize, Default)]
+/// The registry used unless `PHV_REGISTRY` names another.
+const REGISTRY: &str = "https://github.com/miyagawayuu/phv-packages.git";
+
+#[derive(Serialize, Deserialize, Default, PartialEq)]
 struct Lock {
     #[serde(default, rename = "package")]
     packages: Vec<Locked>,
@@ -20,8 +33,16 @@ struct Lock {
 struct Locked {
     name: String,
     git: String,
-    rev: String,
+    /// The `rev` asked for (git packages pinned by rev).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rev: Option<String>,
+    /// The version installed (packages chosen by `version`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
     commit: String,
+    /// The packages this one depends on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    dependencies: Vec<String>,
 }
 
 /// Only plain transports; refuses `ext::` and option-looking URLs.
@@ -68,7 +89,253 @@ fn git(args: &[&str], dir: Option<&Path>) -> Result<String, String> {
     }
 }
 
-pub fn install(dir: &Path) -> ExitCode {
+/// What a project or a package asks for under one name.
+#[derive(Clone)]
+enum Want {
+    Path(PathBuf),
+    Rev { git: String, rev: String },
+    Version { git: String, req: VersionReq, text: String },
+}
+
+/// One request, and who made it (`phv.toml`, or a package's name).
+#[derive(Clone)]
+struct Request {
+    want: Want,
+    by: String,
+}
+
+/// The package installed under a name.
+#[derive(Clone, PartialEq)]
+struct Chosen {
+    git: Option<String>,
+    rev: Option<String>,
+    version: Option<Version>,
+    commit: Option<String>,
+}
+
+struct Installer<'a> {
+    root: &'a Path,
+    old: Lock,
+    locked_only: bool,
+    /// The registry, fetched once per install.
+    registry: Option<PathBuf>,
+    tags: HashMap<String, Vec<(Version, String)>>,
+    /// Commits that revs were checked out at during this install, by (git, rev).
+    revs: HashMap<(String, String), String>,
+}
+
+impl Installer<'_> {
+    /// The git URL of a registry package.
+    fn registry_url(&mut self, name: &str) -> Result<String, String> {
+        if self.registry.is_none() {
+            let url = std::env::var("PHV_REGISTRY").unwrap_or_else(|_| REGISTRY.to_string());
+            if !safe_git_url(&url) {
+                return Err(format!("refusing registry URL \"{url}\""));
+            }
+            let dir = cache_dir().join(format!("registry-{}", &phv_std::sha256_hex(url.as_bytes())[..16]));
+            if dir.join("HEAD").is_file() {
+                git(&["fetch", "--quiet", "--force", "origin", "+refs/heads/*:refs/heads/*"], Some(&dir))
+                    .map_err(|e| format!("cannot update the package registry: {e}"))?;
+            } else {
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(dir.parent().unwrap_or(&dir)).map_err(|e| e.to_string())?;
+                git(&["clone", "--quiet", "--bare", "--", &url, &dir.to_string_lossy()], None)
+                    .map_err(|e| format!("cannot fetch the package registry: {e}"))?;
+            }
+            self.registry = Some(dir);
+        }
+        let dir = self.registry.clone().unwrap_or_default();
+        let entry = git(&["show", &format!("HEAD:index/{name}.toml")], Some(&dir))
+            .map_err(|_| format!("there is no package \"{name}\" in the registry"))?;
+        #[derive(Deserialize)]
+        struct Entry {
+            git: String,
+        }
+        let e: Entry = toml::from_str(&entry).map_err(|_| format!("the registry entry of \"{name}\" is invalid"))?;
+        if !safe_git_url(&e.git) {
+            return Err(format!("the registry entry of \"{name}\" has an unsafe git URL"));
+        }
+        Ok(e.git)
+    }
+
+    /// The `vX.Y.Z` tags of a repository with their commits, newest first.
+    fn versions(&mut self, url: &str) -> Result<Vec<(Version, String)>, String> {
+        if let Some(v) = self.tags.get(url) {
+            return Ok(v.clone());
+        }
+        let out = git(&["ls-remote", "--tags", "--", url], None)?;
+        let mut tags: BTreeMap<String, String> = BTreeMap::new();
+        for line in out.lines() {
+            let Some((sha, name)) = line.split_once('\t') else { continue };
+            let Some(tag) = name.strip_prefix("refs/tags/") else { continue };
+            // Annotated tags: the `^{}` line gives the commit itself.
+            match tag.strip_suffix("^{}") {
+                Some(t) => {
+                    tags.insert(t.to_string(), sha.to_string());
+                }
+                None => {
+                    tags.entry(tag.to_string()).or_insert_with(|| sha.to_string());
+                }
+            }
+        }
+        let mut versions: Vec<(Version, String)> = tags
+            .into_iter()
+            .filter_map(|(t, sha)| Some((Version::parse(t.strip_prefix('v')?).ok()?, sha)))
+            .filter(|(_, sha)| is_commit_hash(sha))
+            .collect();
+        versions.sort_by(|a, b| b.0.cmp(&a.0));
+        self.tags.insert(url.to_string(), versions.clone());
+        Ok(versions)
+    }
+
+    /// Decides what to install under `name` from all the requests for it.
+    fn choose(&mut self, name: &str, reqs: &[Request]) -> Result<Chosen, String> {
+        let who = |r: &Request| r.by.clone();
+        match &reqs[0].want {
+            Want::Path(p) => {
+                if reqs.iter().any(|r| !matches!(&r.want, Want::Path(q) if q == p)) {
+                    let by: Vec<String> = reqs.iter().map(who).collect();
+                    return Err(format!("asked for in different ways by {}", by.join(", ")));
+                }
+                Ok(Chosen { git: None, rev: None, version: None, commit: None })
+            }
+            Want::Rev { git: url, rev } => {
+                if reqs.iter().any(|r| !matches!(&r.want, Want::Rev { git: g, rev: v } if g == url && v == rev)) {
+                    let by: Vec<String> = reqs.iter().map(who).collect();
+                    return Err(format!("pinned to different sources or revs by {}", by.join(", ")));
+                }
+                let locked = self
+                    .old
+                    .packages
+                    .iter()
+                    .find(|l| l.name == name && l.git == *url && l.rev.as_deref() == Some(rev.as_str()));
+                let commit =
+                    locked.map(|l| l.commit.clone()).or_else(|| self.revs.get(&(url.clone(), rev.clone())).cloned());
+                if self.locked_only && commit.is_none() {
+                    return Err("not in phv.lock (run `phv install` without --locked)".into());
+                }
+                Ok(Chosen { git: Some(url.clone()), rev: Some(rev.clone()), version: None, commit })
+            }
+            Want::Version { git: url, .. } => {
+                let mut reqs_v: Vec<(&VersionReq, &str, String)> = Vec::new();
+                for r in reqs {
+                    match &r.want {
+                        Want::Version { git: g, req, text } if g == url => reqs_v.push((req, text, r.by.clone())),
+                        _ => {
+                            let by: Vec<String> = reqs.iter().map(who).collect();
+                            return Err(format!("asked for from different sources by {}", by.join(", ")));
+                        }
+                    }
+                }
+                let fits = |v: &Version| reqs_v.iter().all(|(req, ..)| req.matches(v));
+                // The locked version, while it still fits every request.
+                let locked = self.old.packages.iter().find(|l| l.name == name && l.git == *url).and_then(|l| {
+                    let v = Version::parse(l.version.as_deref()?).ok()?;
+                    fits(&v).then(|| (v, l.commit.clone()))
+                });
+                let picked = match locked {
+                    Some(l) => Some(l),
+                    None if self.locked_only => {
+                        return Err("not in phv.lock at a fitting version (run `phv install` without --locked)".into())
+                    }
+                    None => self.versions(url)?.into_iter().find(|(v, _)| fits(v)),
+                };
+                let Some((version, commit)) = picked else {
+                    let asked: Vec<String> = reqs_v.iter().map(|(_, text, by)| format!("{text} ({by})")).collect();
+                    return Err(format!("no version fits every requirement: {}", asked.join(", ")));
+                };
+                Ok(Chosen { git: Some(url.clone()), rev: None, version: Some(version), commit: Some(commit) })
+            }
+        }
+    }
+
+    /// What `dep` (written in the phv.toml of `by`) asks for.
+    fn want(&mut self, name: &str, dep: &Dependency, by: &str) -> Result<Want, String> {
+        if let Some(p) = &dep.path {
+            if by != "phv.toml" {
+                return Err(format!(
+                    "package \"{by}\" names \"{name}\" by `path`; packages can only use git and the registry"
+                ));
+            }
+            return Ok(Want::Path(self.root.join(p)));
+        }
+        let url = match &dep.git {
+            Some(u) => u.clone(),
+            None => self.registry_url(name)?,
+        };
+        if !safe_git_url(&url) {
+            return Err(format!("refusing git URL \"{url}\" (use https://, ssh:// or file://)"));
+        }
+        if let Some(text) = &dep.version {
+            let req = VersionReq::parse(text).map_err(|_| format!("invalid version requirement \"{text}\""))?;
+            return Ok(Want::Version { git: url, req, text: text.clone() });
+        }
+        let rev = dep.rev.clone().unwrap_or_else(|| "HEAD".into());
+        if !safe_rev(&rev) {
+            return Err(format!("invalid rev \"{rev}\""));
+        }
+        Ok(Want::Rev { git: url, rev })
+    }
+
+    /// Clones `c` into `vendor/<name>` and returns the commit checked out.
+    fn fetch(&self, name: &str, c: &Chosen) -> Result<String, String> {
+        let url = c.git.clone().unwrap_or_default();
+        let dest = self.root.join("vendor").join(name);
+        let tmp = self.root.join("vendor").join(format!(".tmp-{name}-{}", std::process::id()));
+        let result = (|| -> Result<String, String> {
+            std::fs::create_dir_all(self.root.join("vendor")).map_err(|e| e.to_string())?;
+            let _ = std::fs::remove_dir_all(&tmp);
+            git(&["clone", "--quiet", "--no-checkout", "--", &url, &tmp.to_string_lossy()], None)?;
+            let target = match (&c.commit, c.rev.as_deref()) {
+                (Some(commit), _) => commit.clone(),
+                (None, Some("HEAD") | None) => "origin/HEAD".into(),
+                (None, Some(rev)) => rev.to_string(),
+            };
+            git(&["checkout", "--quiet", "--detach", &target, "--"], Some(&tmp)).or_else(|_| {
+                git(&["checkout", "--quiet", "--detach", &format!("origin/{target}"), "--"], Some(&tmp))
+            })?;
+            let commit = git(&["rev-parse", "HEAD"], Some(&tmp))?;
+            if let Some(want) = &c.commit {
+                if *want != commit {
+                    return Err(format!("checked out {commit} but expected {want}"));
+                }
+            }
+            // Replace whatever was in vendor/<name> (it is generated by this command).
+            if dest.exists() {
+                std::fs::remove_dir_all(&dest).map_err(|e| format!("cannot replace {}: {e}", dest.display()))?;
+            }
+            std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+            Ok(commit)
+        })();
+        let _ = std::fs::remove_dir_all(&tmp);
+        result
+    }
+}
+
+/// Where the registry is kept between installs.
+fn cache_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("phv")
+}
+
+/// The `[dependencies]` of the package in `dir` (none without a phv.toml).
+fn package_dependencies(dir: &Path) -> Result<BTreeMap<String, Dependency>, String> {
+    let Ok(text) = std::fs::read_to_string(dir.join("phv.toml")) else { return Ok(BTreeMap::new()) };
+    #[derive(Deserialize)]
+    struct Manifest {
+        #[serde(default)]
+        dependencies: BTreeMap<String, Dependency>,
+    }
+    let m: Manifest = toml::from_str(&text).map_err(|e| format!("its phv.toml is invalid: {e}"))?;
+    check_dependencies(&m.dependencies)?;
+    Ok(m.dependencies)
+}
+
+pub fn install(dir: &Path, locked_only: bool) -> ExitCode {
     let config = match load_config(dir) {
         Ok(c) => c,
         Err(e) => {
@@ -82,92 +349,117 @@ pub fn install(dir: &Path) -> ExitCode {
     }
     let lock_path = dir.join("phv.lock");
     let old: Lock = std::fs::read_to_string(&lock_path).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default();
-    let mut new = Lock::default();
-    let mut failed = false;
-    for (name, dep) in &config.dependencies {
-        if let Some(p) = &dep.path {
-            let full = dir.join(p);
-            if full.is_dir() {
-                println!("  {name}: using {}", full.display());
-            } else {
-                eprintln!("error: {name}: directory {} does not exist", full.display());
-                failed = true;
-            }
-            continue;
-        }
-        let url = dep.git.clone().unwrap_or_default();
-        if !safe_git_url(&url) {
-            eprintln!("error: {name}: refusing git URL \"{url}\" (use https://, ssh:// or file://)");
-            failed = true;
-            continue;
-        }
-        let rev = dep.rev.clone().unwrap_or_else(|| "HEAD".into());
-        if !safe_rev(&rev) {
-            eprintln!("error: {name}: invalid rev \"{rev}\"");
-            failed = true;
-            continue;
-        }
-        let locked = old.packages.iter().find(|l| l.name == *name && l.git == url && l.rev == rev).cloned();
-        if let Some(l) = &locked {
-            if !is_commit_hash(&l.commit) {
-                eprintln!("error: {name}: phv.lock has an invalid commit \"{}\"", l.commit);
-                failed = true;
-                continue;
-            }
-        }
-        let dest = dir.join("vendor").join(name);
-        let tmp = dir.join("vendor").join(format!(".tmp-{name}-{}", std::process::id()));
-        let result = (|| -> Result<String, String> {
-            std::fs::create_dir_all(dir.join("vendor")).map_err(|e| e.to_string())?;
-            let _ = std::fs::remove_dir_all(&tmp);
-            git(&["clone", "--quiet", "--no-checkout", "--", &url, &tmp.to_string_lossy()], None)?;
-            let target = match &locked {
-                Some(l) => l.commit.clone(),
-                None if rev == "HEAD" => "origin/HEAD".into(),
-                None => rev.clone(),
-            };
-            git(&["checkout", "--quiet", "--detach", &target, "--"], Some(&tmp)).or_else(|_| {
-                git(&["checkout", "--quiet", "--detach", &format!("origin/{target}"), "--"], Some(&tmp))
-            })?;
-            let commit = git(&["rev-parse", "HEAD"], Some(&tmp))?;
-            if let Some(l) = &locked {
-                if l.commit != commit {
-                    return Err(format!("checked out {commit} but phv.lock pins {}", l.commit));
-                }
-            }
-            // Replace whatever was in vendor/<name> (it is generated by this command).
-            if dest.exists() {
-                std::fs::remove_dir_all(&dest).map_err(|e| format!("cannot replace {}: {e}", dest.display()))?;
-            }
-            std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
-            Ok(commit)
-        })();
-        let _ = std::fs::remove_dir_all(&tmp);
-        match result {
-            Ok(commit) => {
-                let how = if locked.is_some() { "locked" } else { "resolved" };
-                println!("  {name}: {how} at {}", &commit[..commit.len().min(12)]);
-                new.packages.push(Locked { name: name.clone(), git: url, rev, commit });
-            }
-            Err(e) => {
-                eprintln!("error: {name}: {e}");
-                failed = true;
-            }
-        }
-    }
-    if failed {
+    if let Some(bad) = old.packages.iter().find(|l| !is_commit_hash(&l.commit)) {
+        eprintln!("error: {}: phv.lock has an invalid commit \"{}\"", bad.name, bad.commit);
         return ExitCode::FAILURE;
     }
-    if !new.packages.is_empty() {
-        let text =
-            format!("# Generated by `phv install`. Commit this file.\n{}", toml::to_string(&new).unwrap_or_default());
-        if let Err(e) = std::fs::write(&lock_path, text) {
-            eprintln!("error: cannot write phv.lock: {e}");
-            return ExitCode::FAILURE;
+    let mut ins = Installer { root: dir, old, locked_only, registry: None, tags: HashMap::new(), revs: HashMap::new() };
+    match resolve(&mut ins, &config.dependencies) {
+        Ok(new) => {
+            if locked_only && new != ins.old {
+                eprintln!("error: phv.lock is out of date (run `phv install` without --locked)");
+                return ExitCode::FAILURE;
+            }
+            if !new.packages.is_empty() && new != ins.old {
+                let text = format!(
+                    "# Generated by `phv install`. Commit this file.\n{}",
+                    toml::to_string(&new).unwrap_or_default()
+                );
+                if let Err(e) = std::fs::write(&lock_path, text) {
+                    eprintln!("error: cannot write phv.lock: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
         }
     }
-    println!("{} package(s) ready", config.dependencies.len());
-    ExitCode::SUCCESS
+}
+
+/// Resolves and installs every package, and returns the new lock.
+fn resolve(ins: &mut Installer, root_deps: &BTreeMap<String, Dependency>) -> Result<Lock, String> {
+    let mut requests: BTreeMap<String, Vec<Request>> = BTreeMap::new();
+    for (name, dep) in root_deps {
+        let want = ins.want(name, dep, "phv.toml").map_err(|e| format!("{name}: {e}"))?;
+        requests.entry(name.clone()).or_default().push(Request { want, by: "phv.toml".into() });
+    }
+    let mut chosen: BTreeMap<String, (Chosen, Vec<String>)> = BTreeMap::new();
+    // Choosing a package can change what it asks for, so this repeats until
+    // nothing changes (a few rounds at most for real dependency graphs).
+    for _ in 0..50 {
+        let mut changed = false;
+        let names: Vec<String> = requests.keys().cloned().collect();
+        for name in names {
+            let reqs = requests[&name].clone();
+            if reqs.is_empty() {
+                if chosen.remove(&name).is_some() {
+                    changed = true;
+                }
+                continue;
+            }
+            let pick = ins.choose(&name, &reqs).map_err(|e| format!("{name}: {e}"))?;
+            if chosen.get(&name).is_some_and(|(c, ..)| *c == pick) {
+                continue;
+            }
+            changed = true;
+            let (commit, pkg_dir) = match &reqs[0].want {
+                Want::Path(p) => {
+                    if !p.is_dir() {
+                        return Err(format!("{name}: directory {} does not exist", p.display()));
+                    }
+                    println!("  {name}: using {}", p.display());
+                    (String::new(), p.clone())
+                }
+                _ => {
+                    let commit = ins.fetch(&name, &pick).map_err(|e| format!("{name}: {e}"))?;
+                    if let (Some(git), Some(rev)) = (&pick.git, &pick.rev) {
+                        ins.revs.insert((git.clone(), rev.clone()), commit.clone());
+                    }
+                    let at = match &pick.version {
+                        Some(v) => format!("v{v}"),
+                        None => commit[..commit.len().min(12)].to_string(),
+                    };
+                    println!("  {name}: {at}");
+                    (commit, ins.root.join("vendor").join(&name))
+                }
+            };
+            let deps = package_dependencies(&pkg_dir).map_err(|e| format!("{name}: {e}"))?;
+            // What this package asked for before is replaced by what it asks for now.
+            for list in requests.values_mut() {
+                list.retain(|r| r.by != name);
+            }
+            for (dname, dep) in &deps {
+                if dname == &name {
+                    return Err(format!("{name}: a package cannot depend on itself"));
+                }
+                let want = ins.want(dname, dep, &name).map_err(|e| format!("{dname} (for {name}): {e}"))?;
+                requests.entry(dname.clone()).or_default().push(Request { want, by: name.clone() });
+            }
+            let pick = Chosen { commit: (!commit.is_empty()).then_some(commit), ..pick };
+            chosen.insert(name.clone(), (pick, deps.keys().cloned().collect()));
+        }
+        if !changed {
+            let mut lock = Lock::default();
+            for (name, (c, deps)) in chosen {
+                let (Some(git), Some(commit)) = (c.git, c.commit) else { continue };
+                lock.packages.push(Locked {
+                    name,
+                    git,
+                    rev: c.rev,
+                    version: c.version.map(|v| v.to_string()),
+                    commit,
+                    dependencies: deps,
+                });
+            }
+            let total = requests.values().filter(|r| !r.is_empty()).count();
+            println!("{total} package(s) ready");
+            return Ok(lock);
+        }
+    }
+    Err("the dependency requirements do not settle".into())
 }
 
 #[cfg(test)]

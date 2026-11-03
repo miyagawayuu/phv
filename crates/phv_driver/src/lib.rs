@@ -280,8 +280,16 @@ struct Loader {
     root: PathBuf,
     /// Canonical directories sources may be loaded from: the project and packages.
     allowed: Vec<PathBuf>,
-    /// Package name to the directory its modules are loaded from.
+    /// Package name to the directory its modules are loaded from (the
+    /// project's packages and theirs).
     packages: HashMap<String, PathBuf>,
+    /// The packages each package may import, and those the project may.
+    package_deps: HashMap<String, Vec<String>>,
+    root_deps: Vec<String>,
+    /// Canonical package directories, to tell which package a file belongs to.
+    package_roots: Vec<(String, PathBuf)>,
+    /// The package each module belongs to (None: the project itself or std).
+    owners: Vec<Option<String>>,
     /// Unsaved editor buffers (for the language server), by canonical path.
     overlay: HashMap<PathBuf, String>,
     sources: SourceMap,
@@ -303,6 +311,15 @@ impl Loader {
         self.diags.append(&mut diags);
         self.modules.push((module, kind, name));
         let idx = self.modules.len() - 1;
+        let owner = path.as_ref().and_then(|p| {
+            let canonical = p.canonicalize().ok()?;
+            self.package_roots
+                .iter()
+                .filter(|(_, dir)| canonical.starts_with(dir))
+                .max_by_key(|(_, dir)| dir.as_os_str().len())
+                .map(|(name, _)| name.clone())
+        });
+        self.owners.push(owner);
         if let Some(p) = path {
             self.by_path.insert(p, idx);
         }
@@ -381,6 +398,34 @@ impl Loader {
                 continue;
             }
             let segments: Vec<&str> = name.split('.').collect();
+            // A module imports from its own package, from the packages it
+            // depends on, and (the project's own modules) from the project.
+            let owner = self.owners.get(idx).cloned().flatten();
+            let is_package = self.packages.contains_key(segments[0]);
+            let refused = match &owner {
+                None if is_package && !self.root_deps.iter().any(|d| d == segments[0]) => Some(
+                    Diagnostic::error(format!("package `{}` is not a dependency of this project", segments[0]), span)
+                        .note("add it to [dependencies] in phv.toml to use it here"),
+                ),
+                Some(p)
+                    if p != segments[0]
+                        && !self.package_deps.get(p).is_some_and(|d| d.iter().any(|x| x == segments[0])) =>
+                {
+                    Some(Diagnostic::error(
+                        if is_package {
+                            format!("package `{p}` does not depend on `{}`", segments[0])
+                        } else {
+                            format!("modules of package `{p}` import its own modules as `{p}.<module>`, its dependencies and `std`")
+                        },
+                        span,
+                    ))
+                }
+                _ => None,
+            };
+            if let Some(d) = refused {
+                self.diags.push(d);
+                continue;
+            }
             let (base, rest) = match self.packages.get(segments[0]) {
                 Some(dir) if segments.len() > 1 => (dir.clone(), &segments[1..]),
                 Some(dir) => {
@@ -466,17 +511,46 @@ pub struct Analysis {
 
 /// Directory of each package listed in `[dependencies]`.
 pub fn package_dirs(root: &Path, config: &Config) -> HashMap<String, PathBuf> {
-    config
-        .dependencies
-        .iter()
-        .map(|(name, dep)| {
-            let dir = match &dep.path {
-                Some(p) => root.join(p),
-                None => root.join("vendor").join(name),
-            };
-            (name.clone(), dir)
-        })
-        .collect()
+    package_graph(root, config).0
+}
+
+/// Every package the project uses (its own and theirs, which `phv install`
+/// puts in `vendor/`), with the names each package depends on. Only the
+/// `[dependencies]` of a package's phv.toml are read.
+pub fn package_graph(root: &Path, config: &Config) -> (HashMap<String, PathBuf>, HashMap<String, Vec<String>>) {
+    let mut dirs: HashMap<String, PathBuf> = HashMap::new();
+    let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+    let mut queue: Vec<String> = Vec::new();
+    for (name, dep) in &config.dependencies {
+        let dir = match &dep.path {
+            Some(p) => root.join(p),
+            None => root.join("vendor").join(name),
+        };
+        dirs.insert(name.clone(), dir);
+        queue.push(name.clone());
+    }
+    while let Some(name) = queue.pop() {
+        if deps.contains_key(&name) {
+            continue;
+        }
+        let names = package_dependencies(&dirs[&name]);
+        for n in &names {
+            if !dirs.contains_key(n) {
+                dirs.insert(n.clone(), root.join("vendor").join(n));
+                queue.push(n.clone());
+            }
+        }
+        deps.insert(name, names);
+    }
+    (dirs, deps)
+}
+
+/// The names in the `[dependencies]` of the package in `dir` (none if it has no phv.toml).
+fn package_dependencies(dir: &Path) -> Vec<String> {
+    let Ok(text) = read_source(&dir.join("phv.toml")) else { return Vec::new() };
+    let Ok(t) = toml::from_str::<toml::Table>(&text) else { return Vec::new() };
+    let Some(table) = t.get("dependencies").and_then(|d| d.as_table()) else { return Vec::new() };
+    table.keys().filter(|k| config::valid_package_name(k)).cloned().collect()
 }
 
 /// Loads and type-checks `entry`, using `overlay` (canonical path to text)
@@ -498,13 +572,19 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
         messages.push(e);
         Config::default_for(root)
     });
-    let packages = package_dirs(root, &config);
-    let mut allowed: Vec<PathBuf> = packages.values().filter_map(|d| d.canonicalize().ok()).collect();
+    let (packages, package_deps) = package_graph(root, &config);
+    let package_roots: Vec<(String, PathBuf)> =
+        packages.iter().filter_map(|(n, d)| Some((n.clone(), d.canonicalize().ok()?))).collect();
+    let mut allowed: Vec<PathBuf> = package_roots.iter().map(|(_, d)| d.clone()).collect();
     allowed.extend(root.canonicalize().ok());
     let mut loader = Loader {
         root: root.to_path_buf(),
         allowed,
         packages,
+        package_deps,
+        root_deps: config.dependencies.keys().cloned().collect(),
+        package_roots,
+        owners: Vec::new(),
         overlay,
         sources: SourceMap::default(),
         modules: Vec::new(),

@@ -1114,7 +1114,7 @@ When code uses a PHP function name, the error message suggests the alternative
 | `phv test [paths]` | Run the `test_*` functions in `*_test.phv` files (a new VM for each test) |
 | `phv fmt [paths] [--check] [--width N]` | Normalize indentation and whitespace and wrap long lines (strings, comments, and HTML are not changed) |
 | `phv lsp` | Language Server for editors (errors as you type, types on hover, completion, go to definition) |
-| `phv install` | Fetch `[dependencies]` and pin them in `phv.lock` |
+| `phv install [--locked]` | Fetch `[dependencies]` and the packages they need, and pin them in `phv.lock` |
 | `phv migrate file.php` | Convert PHP mechanically and list the places that need manual work |
 | `phv disasm file.phv` | Show the bytecode |
 | `phv parse file.phv` | Show the syntax tree |
@@ -1173,7 +1173,9 @@ function test_import(): void { /* ... */ }
 
 ```toml
 [dependencies]
-textutils = { git = "https://github.com/example/textutils.git", rev = "v1" }
+slugify = "^1.2"                                                            # from the registry
+textutils = { git = "https://github.com/example/textutils.git", version = "~0.3" }
+nightly = { git = "https://github.com/example/nightly.git", rev = "main" }
 local = { path = "../shared" }
 ```
 
@@ -1181,11 +1183,25 @@ local = { path = "../shared" }
 import textutils.strings.slugify;      // vendor/textutils/strings.phv
 ```
 
-- `git` packages are fetched into `vendor/<name>`, and the exact commit is recorded in `phv.lock`.
-  From the second install on, the commit in the lock file is fetched, and a mismatch is an error.
+- A package is a directory of PHV modules, with a `phv.toml` if it has dependencies of its own. It comes from:
+  - **the registry**: `name = "<requirement>"`. The registry is a git repository of `index/<name>.toml` files, each
+    giving the package's `git` URL (`PHV_REGISTRY` names another registry). The packages are listed at
+    phv-lang.org/packages/.
+  - **git** with a `version`: the newest tag `vX.Y.Z` that fits the requirement. Requirements are semver ranges:
+    `^1.2` (1.2 up to 2.0), `~0.3.1`, `>=1.0, <1.5`, `=2.0.0`, `*`.
+  - **git** with a `rev` (a tag, branch or commit; the default branch without one).
+  - **path**: a directory used in place. Only the project's own phv.toml can name one.
+- `phv install` also installs the packages a package needs (its own `[dependencies]`; nothing else of its phv.toml
+  is read). Each package is installed once, into `vendor/<name>`: for version requirements, at the newest version
+  that every package asking for it accepts. If none fits all of them, it is an error that lists each requirement and
+  who made it. A package asked for in different ways (two git URLs, two revs) is an error too.
+- `phv.lock` records every package, also those installed for other packages, with the exact commit (and version).
+  Later installs use it while it still fits the requirements; `phv install --locked` installs exactly what it records
+  and fails if it is out of date (for CI). A checked-out commit that differs from the lock is an error.
+- A module imports the modules of its own package (`import pkg.module`), of the packages it depends on, and `std`.
+  The project imports only the packages in its own `[dependencies]`, not those installed for them.
 - Only `https://`, `ssh://`, `git@host:...`, and `file://` URLs are allowed.
 - Packages are PHV source code. No package code runs at install time.
-- List a package's dependencies alongside it in the app's `phv.toml` (transitive dependency resolution is not yet supported).
 
 ### Migration
 
@@ -1236,6 +1252,5 @@ that checks journal files (`phv_std/src/db/vfs.rs`).
 ## 18. Roadmap
 
 - Wider JIT coverage (functions that handle floats and strings), AOT compilation
-- Transitive dependency resolution, a package registry
 
 See [security-audit.md](security-audit.md) for the results of the security audit and the remaining risks.
