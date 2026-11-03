@@ -108,6 +108,10 @@ struct Checked {
     strings: bool,
 }
 
+/// The largest function the JIT compiles, in registers and instructions.
+const MAX_REGS: usize = 1024;
+const MAX_INSTRUCTIONS: usize = 16_384;
+
 /// Checks `f` for native compilation: every register, jump target, constant
 /// and callee is in range, every instruction is supported, and every operand
 /// has the kind the instruction needs on every path that reaches it (found by
@@ -117,6 +121,12 @@ fn well_formed(prog: &Program, f: &Function, ok: &HashSet<u32>) -> Option<Checke
     let sig = f.native.as_ref()?;
     let regs = f.num_regs as usize;
     let n = f.code.len();
+    // Compiling a function takes memory and time that grow with its size
+    // (not counted against a script's limits): very large ones are left to
+    // the interpreter.
+    if regs > MAX_REGS || n > MAX_INSTRUCTIONS {
+        return None;
+    }
     if sig.params.len() > 16 || sig.params.len() > regs || f.num_params as usize != sig.params.len() {
         return None;
     }
@@ -400,7 +410,7 @@ enum H {
 fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 14] {
     [
         ("phv_jit_tick", phv_jit_tick as *const u8, Some(0), true),
-        ("phv_jit_enter", phv_jit_enter as *const u8, Some(3), false),
+        ("phv_jit_enter", phv_jit_enter as *const u8, Some(3), true),
         ("phv_jit_leave", phv_jit_leave as *const u8, Some(1), false),
         ("phv_jit_take_ret", phv_jit_take_ret as *const u8, Some(1), false),
         ("phv_jit_const", phv_jit_const as *const u8, Some(2), false),
@@ -779,12 +789,13 @@ impl<'a, 'b> Translator<'a, 'b> {
         let sp = self.b.ins().get_stack_pointer(I64);
         let floor = self.b.ins().load(I64, self.mf, self.ctx, CTX_STACK_LIMIT);
         let low = self.b.ins().icmp(IntCC::UnsignedLessThan, sp, floor);
-        self.fail_if(low, JIT_ERR_DEPTH);
+        self.fail_if(low, JIT_ERR_STACK);
         if self.checked.strings {
             let mask =
                 self.sig.params.iter().enumerate().filter(|(_, p)| **p == ValKind::Str).map(|(i, _)| 1 << i).sum();
             let (n, m) = (self.iconst(self.func.num_regs as i64), self.iconst(mask));
-            self.call(H::Enter, &[n, args_base, m]);
+            let e = self.call(H::Enter, &[n, args_base, m]).unwrap();
+            self.check(e);
         }
         self.tick();
         self.jump(0);

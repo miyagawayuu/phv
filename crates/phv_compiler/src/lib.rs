@@ -739,6 +739,10 @@ impl<'a> FnC<'a> {
                 let r = self.operand(e);
                 self.emit(Instr::Echo(r));
             }
+            HStmt::EchoAttr(e) => {
+                let r = self.operand(e);
+                self.emit(Instr::EchoAttr(r));
+            }
             HStmt::Html(text, scripts) => {
                 // `<script` tags get the request's CSP nonce: `<script nonce="...">`.
                 let mut from = 0;

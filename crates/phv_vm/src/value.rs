@@ -269,6 +269,19 @@ pub fn html_escape_into(s: &str, out: &mut String) {
     }
 }
 
+/// `Html` placed in a quoted attribute value: its quotes are encoded (the
+/// browser decodes them back), so it cannot end the attribute. Markup made
+/// by `escape()` has none; a template's output or a `json_html()` value may.
+pub fn attr_quotes_into(s: &str, out: &mut String) {
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#039;"),
+            c => out.push(c),
+        }
+    }
+}
+
 pub fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     html_escape_into(s, &mut out);

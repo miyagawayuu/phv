@@ -10,7 +10,7 @@
 
 use crate::bytecode::Program;
 use crate::value::{compare, Value};
-use crate::vm::{const_value, op_append, op_concat, op_to_str, MemLimit, BUDGET};
+use crate::vm::{const_value, op_append, op_concat, op_to_str, str_len, MemLimit, BUDGET, LONG_OP};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -29,7 +29,7 @@ pub struct JitCtx {
     pub detail: i64,
     pub rt: *mut JitRt,
     /// The lowest stack address native code may use: a function entered below
-    /// it fails as too deep (depth alone does not bound large frames).
+    /// it stops with `JIT_ERR_STACK` (depth alone does not bound large frames).
     pub stack_limit: i64,
 }
 
@@ -47,6 +47,9 @@ pub const JIT_ERR_SHIFT: i64 = 6;
 /// `/` by zero.
 pub const JIT_ERR_FDIV_ZERO: i64 = 7;
 pub const JIT_ERR_FLOAT_TO_INT: i64 = 8;
+/// Native code ran out of its stack (`JitCtx::stack_limit`): the call is run
+/// again by the interpreter, whose frames are not on the native stack.
+pub const JIT_ERR_STACK: i64 = 9;
 
 /// Kinds of the scalar `phv_jit_put` stores in a window slot.
 pub const JIT_PUT_INT: i64 = 1;
@@ -157,17 +160,23 @@ unsafe fn mem(ctx: *mut JitCtx) -> MemLimit {
 
 /// Enters a native function that keeps strings: pushes a window of `nregs`
 /// slots and moves string argument `k` (bit `k` of `mask`) from slot `args + k`
-/// of the caller's window, as the interpreter moves arguments.
+/// of the caller's window, as the interpreter moves arguments. Returns an
+/// error code: the memory limit is checked before a window is allocated.
 ///
 /// # Safety
-/// See `rt`.
-pub unsafe extern "C" fn phv_jit_enter(ctx: *mut JitCtx, nregs: i64, args: i64, mask: i64) {
+/// See `rt` and `mem`.
+pub unsafe extern "C" fn phv_jit_enter(ctx: *mut JitCtx, nregs: i64, args: i64, mask: i64) -> i64 {
+    let mem = mem(ctx);
     let rt = rt(ctx);
     let i = rt.used;
     if rt.windows.len() == i {
         rt.windows.push(Vec::new());
     }
     let mut w = std::mem::take(&mut rt.windows[i]);
+    if w.capacity() < nregs as usize && mem.reserve(nregs as usize * std::mem::size_of::<Value>()).is_err() {
+        rt.windows[i] = w;
+        return JIT_ERR_MEMORY;
+    }
     w.resize(nregs as usize, Value::Null);
     let caller = &mut rt.windows[i - 1];
     for k in 0..16 {
@@ -177,6 +186,7 @@ pub unsafe extern "C" fn phv_jit_enter(ctx: *mut JitCtx, nregs: i64, args: i64, 
     }
     rt.windows[i] = w;
     rt.used = i + 1;
+    0
 }
 
 /// Leaves a native function that keeps strings, returning the string in slot
@@ -258,9 +268,24 @@ pub unsafe extern "C" fn phv_jit_to_str(ctx: *mut JitCtx, d: i64, a: i64) {
 /// See `rt` and `mem`.
 pub unsafe extern "C" fn phv_jit_concat(ctx: *mut JitCtx, d: i64, start: i64, n: i64) -> i64 {
     let mem = mem(ctx);
-    match op_concat(rt(ctx).top(), mem, d as u16, start as u16, n as u16, false) {
-        Ok(()) => 0,
+    let w = rt(ctx).top();
+    match op_concat(w, mem, d as u16, start as u16, n as u16, false) {
+        Ok(()) => {
+            long_op(ctx, str_len(&w[d as usize]));
+            0
+        }
         Err(_) => JIT_ERR_MEMORY,
+    }
+}
+
+/// As `Vm::long_op`: after a long string operation, the next loop step or
+/// call checks the limits.
+///
+/// # Safety
+/// See `rt`.
+unsafe fn long_op(ctx: *mut JitCtx, bytes: usize) {
+    if bytes >= LONG_OP {
+        (*ctx).budget = 1;
     }
 }
 
@@ -270,8 +295,12 @@ pub unsafe extern "C" fn phv_jit_concat(ctx: *mut JitCtx, d: i64, start: i64, n:
 /// See `rt` and `mem`.
 pub unsafe extern "C" fn phv_jit_append(ctx: *mut JitCtx, d: i64, s: i64) -> i64 {
     let mem = mem(ctx);
-    match op_append(rt(ctx).top(), mem, d as u16, s as u16) {
-        Ok(()) => 0,
+    let w = rt(ctx).top();
+    match op_append(w, mem, d as u16, s as u16) {
+        Ok(()) => {
+            long_op(ctx, str_len(&w[s as usize]));
+            0
+        }
         Err(_) => JIT_ERR_MEMORY,
     }
 }
@@ -303,10 +332,12 @@ pub unsafe extern "C" fn phv_jit_strlen(ctx: *mut JitCtx, r: i64, chars: i64) ->
 /// See `rt`.
 pub unsafe extern "C" fn phv_jit_str_cmp(ctx: *mut JitCtx, a: i64, b: i64) -> i64 {
     let w = rt(ctx).top();
-    match (&w[a as usize], &w[b as usize]) {
+    let r = match (&w[a as usize], &w[b as usize]) {
         (Value::Str(x), Value::Str(y)) => x.as_str().cmp(y.as_str()) as i64,
         (x, y) => compare(x, y) as i64,
-    }
+    };
+    long_op(ctx, str_len(&w[a as usize]));
+    r
 }
 
 /// `%` on floats, exactly as the interpreter computes it.

@@ -1,0 +1,12 @@
+<?phv
+// `Html` placed in a quoted attribute cannot end it: its quotes are encoded.
+// Here a `json_html()` value reaches the attribute through `any` and `is Html`,
+// and a template's output (whose markup has quotes) is placed in `data-p`.
+function launder(any $a): Html {
+    if ($a is Html) {
+        return $a;
+    }
+    return escape("");
+}
+$j = launder(json_html("x\" onmouseover=alert(1) y=\""));
+echo render("views/attr_html.phv.html", h: $j, page: render("views/attr_inner.phv.html", n: "a\"b"), s: "q\"'");

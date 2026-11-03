@@ -196,6 +196,8 @@ pub enum Instr {
     },
 
     Echo(Reg),
+    /// `Echo` into a quoted attribute value: `"` and `'` in `Html` are encoded.
+    EchoAttr(Reg),
     EchoHtml(u32),
     /// ` nonce="..."` when the server sent a CSP nonce, else nothing.
     EchoNonce,

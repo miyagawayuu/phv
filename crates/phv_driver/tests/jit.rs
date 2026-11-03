@@ -98,6 +98,43 @@ echo spin("x", 1.5);
     assert_eq!(out, "start\nFatal error: maximum execution time of 0.2 seconds exceeded");
 }
 
+/// Comparing or joining long strings takes long for one instruction: the
+/// time limit is checked soon after, not thousands of instructions later.
+#[test]
+fn time_limit_after_long_string_operations() {
+    let limits = Limits { max_time: Some(Duration::from_millis(300)), ..Limits::default() };
+    let src = r#"<?phv
+function same(string $a, string $b, int $n): int {
+    $c = 0;
+    for ($i = 0; $i < $n; $i++) {
+        if ($a == $b) {
+            $c++;
+        }
+    }
+    return $c;
+}
+function join(string $a, int $n): int {
+    $c = 0;
+    for ($i = 0; $i < $n; $i++) {
+        $t = $a . "";
+        $c += strlen($t) % 7;
+    }
+    return $c;
+}
+$a = "x"->repeat(8000000);
+$b = "x"->repeat(8000000);
+echo same($a, $b, 1000000), join($a, 1000000);
+"#;
+    for f in ["same", "join"] {
+        let src = if f == "join" { src.replace("echo same($a, $b, 1000000), ", "echo ") } else { src.to_string() };
+        let start = std::time::Instant::now();
+        let out = run_both(f, &src, limits, &[f]);
+        assert_eq!(out, "Fatal error: maximum execution time of 0.3 seconds exceeded", "{f}");
+        // Two runs (with and without the JIT), each stopping near the limit.
+        assert!(start.elapsed() < Duration::from_secs(4), "{f} took {:?}", start.elapsed());
+    }
+}
+
 #[test]
 fn golden_jit_cases_are_compiled() {
     for (case, names) in [
@@ -114,8 +151,9 @@ fn golden_jit_cases_are_compiled() {
 }
 
 /// Native recursion is bounded by the stack, not only by the depth: a function
-/// with a large frame that recurses deep fails with a depth error instead of
-/// overflowing the thread's stack (a server worker's 16 MB).
+/// with a large frame that recurses deep does not overflow the thread's stack
+/// (a server worker's 16 MB). When native code runs out of stack, the
+/// interpreter runs the call, so the result is the same as without the JIT.
 #[test]
 fn deep_recursion_of_large_frames_does_not_overflow() {
     let mut src = String::from("<?php\nfunction f(int $n): int {\n    $v0 = $n;\n");
@@ -145,8 +183,5 @@ fn deep_recursion_of_large_frames_does_not_overflow() {
         .join()
         .expect("the run crashed");
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("phv-jit-test-{}-deep", std::process::id())));
-    match out {
-        (o, None) => assert_eq!(o, "ok"),
-        (_, Some(e)) => assert!(e.contains("maximum call stack depth"), "{e}"),
-    }
+    assert_eq!(out, ("ok".to_string(), None));
 }

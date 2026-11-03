@@ -277,6 +277,10 @@ pub struct Vm {
     jit_rt: JitRt,
     /// `JitCtx::stack_limit` of the outermost native call running, or 0.
     jit_stack_limit: usize,
+    /// A native call that ran out of stack is being run by the interpreter:
+    /// while more than this many frames are on the stack, calls are not
+    /// made natively.
+    jit_paused: Option<usize>,
     limits: Limits,
     mem_base: isize,
     deadline: Option<Instant>,
@@ -397,6 +401,17 @@ pub(crate) fn op_concat(
 
 /// `AppendStr`: `$d .= $s`, in place when the string is not shared. The
 /// error is the memory limit.
+/// A string operation over this many bytes counts as long (see `Vm::long_op`).
+pub(crate) const LONG_OP: usize = 64 << 10;
+
+/// The length of a string value (0 for other values).
+pub(crate) fn str_len(v: &Value) -> usize {
+    match v {
+        Value::Str(s) | Value::Html(s) => s.len(),
+        _ => 0,
+    }
+}
+
 pub(crate) fn op_append(regs: &mut [Value], mem: MemLimit, d: Reg, s: Reg) -> Result<(), usize> {
     let src = regs[s as usize].clone();
     let grow = match &src {
@@ -463,6 +478,7 @@ impl Vm {
             jit: None,
             jit_rt: JitRt::default(),
             jit_stack_limit: 0,
+            jit_paused: None,
             limits,
             mem_base: crate::alloc::thread_allocated(),
             deadline: limits.max_time.map(|d| Instant::now() + d),
@@ -512,7 +528,7 @@ impl Vm {
         };
         let nregs = self.prog.funcs[func as usize].num_regs as usize;
         self.regs.truncate(base);
-        self.regs.resize(base + nregs.max(caps.len() + args.len()), Value::Null);
+        self.grow_regs(base + nregs.max(caps.len() + args.len()))?;
         for (i, v) in caps.iter().chain(args.iter()).enumerate() {
             self.regs[base + i] = v.clone();
         }
@@ -632,6 +648,16 @@ impl Vm {
             .collect()
     }
 
+    /// After an instruction that went over `bytes` of a string: a long one
+    /// makes the next loop step or call check the time limit (one instruction
+    /// could otherwise take milliseconds, and thousands run between checks).
+    #[inline]
+    fn long_op(&mut self, bytes: usize) {
+        if bytes >= LONG_OP {
+            self.budget = 1;
+        }
+    }
+
     #[inline]
     fn tick(&mut self) -> Result<(), VmError> {
         self.budget -= 1;
@@ -641,8 +667,12 @@ impl Vm {
         Ok(())
     }
 
-    /// Runs natively compiled function `func` with arguments `args`.
-    fn call_jit(&mut self, entry: JitEntry, func: u32, args: Vec<Value>) -> Result<Value, VmError> {
+    /// Runs natively compiled function `func` with arguments `args`. When the
+    /// native code runs out of stack, gives the arguments back (`Err`) so the
+    /// interpreter runs the call: compiled functions have no side effects (only
+    /// arithmetic, strings and calls to other compiled functions), so running
+    /// it again gives the same result.
+    fn call_jit(&mut self, entry: JitEntry, func: u32, args: Vec<Value>) -> Result<Result<Value, Vec<Value>>, VmError> {
         let prog = Arc::clone(&self.prog);
         let sig =
             prog.funcs[func as usize].native.as_ref().expect("JIT entry for a function without a native signature");
@@ -664,6 +694,8 @@ impl Vm {
         let mut rt = std::mem::take(&mut self.jit_rt);
         rt.prog.get_or_insert_with(|| Arc::clone(&self.prog));
         rt.consts = std::mem::take(&mut self.consts);
+        // Strings are moved into the native call's window: kept for a rerun.
+        let strings = sig.params.contains(&ValKind::Str).then(|| args.clone());
         rt.start(args);
         // Native code nested in this call (through the interpreter) shares the
         // outermost call's stack limit.
@@ -695,6 +727,20 @@ impl Vm {
         self.budget = ctx.budget.clamp(1, BUDGET as i64) as u32;
         match ctx.error {
             0 => {}
+            JIT_ERR_STACK => {
+                let args = strings.unwrap_or_else(|| {
+                    sig.params
+                        .iter()
+                        .zip(raw)
+                        .map(|(k, r)| match k {
+                            ValKind::Bool => Value::Bool(r != 0),
+                            ValKind::Float => Value::Float(f64::from_bits(r as u64)),
+                            _ => Value::Int(r),
+                        })
+                        .collect()
+                });
+                return Ok(Err(args));
+            }
             JIT_ERR_OVERFLOW => return Err(self.throw("ArithmeticError", "integer overflow")),
             JIT_ERR_DIV_ZERO => return Err(self.throw("DivisionByZeroError", "modulo by zero")),
             JIT_ERR_FDIV_ZERO => return Err(self.throw("DivisionByZeroError", "division by zero")),
@@ -710,17 +756,30 @@ impl Vm {
                 return Err(VmError::Fatal(format!("maximum execution time of {secs} seconds exceeded")));
             }
         }
-        Ok(match sig.ret {
+        Ok(Ok(match sig.ret {
             ValKind::Int => Value::Int(r),
             ValKind::Bool => Value::Bool(r != 0),
             ValKind::Float => Value::Float(f64::from_bits(r as u64)),
             ValKind::Str => ret,
             ValKind::Void => Value::Null,
-        })
+        }))
     }
 
     fn mem(&self) -> MemLimit {
         MemLimit { max: self.limits.max_memory, base: self.mem_base }
+    }
+
+    /// Grows the register file to `need` registers, checking the memory limit
+    /// first: a call to a function with many registers, deep in a recursion,
+    /// would otherwise allocate past the limit before the next check.
+    fn grow_regs(&mut self, need: usize) -> Result<(), VmError> {
+        if need > self.regs.capacity() {
+            let cap = need.max(self.regs.capacity().saturating_mul(2));
+            self.reserve(cap.saturating_mul(std::mem::size_of::<Value>()))?;
+            self.regs.reserve_exact(cap - self.regs.len());
+        }
+        self.regs.resize(need, Value::Null);
+        Ok(())
     }
 
     /// Fails before an allocation of `bytes` that would exceed the memory limit
@@ -912,7 +971,7 @@ impl Vm {
                     let need =
                         new_base + (prog.funcs[callee as usize].num_regs as usize).max(caps.len() + $argc as usize);
                     if self.regs.len() < need {
-                        self.regs.resize(need, Value::Null);
+                        tri!(self.grow_regs(need));
                     }
                     for (i, c) in caps.iter().enumerate() {
                         self.regs[new_base + i] = c.clone();
@@ -1068,22 +1127,27 @@ impl Vm {
                     Instr::LeI(d, a, b) => reg!(*d) = Value::Bool(int!(*a) <= int!(*b)),
                     Instr::Eq(d, a, b) => {
                         let v = values_equal(&reg!(*a), &reg!(*b));
+                        self.long_op(str_len(&reg!(*a)));
                         reg!(*d) = Value::Bool(v);
                     }
                     Instr::Ne(d, a, b) => {
                         let v = !values_equal(&reg!(*a), &reg!(*b));
+                        self.long_op(str_len(&reg!(*a)));
                         reg!(*d) = Value::Bool(v);
                     }
                     Instr::Lt(d, a, b) => {
                         let v = compare(&reg!(*a), &reg!(*b)).is_lt();
+                        self.long_op(str_len(&reg!(*a)));
                         reg!(*d) = Value::Bool(v);
                     }
                     Instr::Le(d, a, b) => {
                         let v = compare(&reg!(*a), &reg!(*b)).is_le();
+                        self.long_op(str_len(&reg!(*a)));
                         reg!(*d) = Value::Bool(v);
                     }
                     Instr::Cmp(d, a, b) => {
                         let v = compare(&reg!(*a), &reg!(*b)) as i64;
+                        self.long_op(str_len(&reg!(*a)));
                         reg!(*d) = Value::Int(v);
                     }
                     Instr::EqF(d, a, b) => reg!(*d) = Value::Bool(float!(*a) == float!(*b)),
@@ -1104,10 +1168,12 @@ impl Vm {
                     Instr::Concat(d, start, n, html) => {
                         let mem = self.mem();
                         tri!(op_concat(&mut self.regs[base..], mem, *d, *start, *n, *html).map_err(memory_error));
+                        self.long_op(str_len(&reg!(*d)));
                     }
                     Instr::AppendStr(d, s) => {
                         let mem = self.mem();
                         tri!(op_append(&mut self.regs[base..], mem, *d, *s).map_err(memory_error));
+                        self.long_op(str_len(&reg!(*s)));
                     }
 
                     Instr::Jump(t) => {
@@ -1158,16 +1224,33 @@ impl Vm {
                     }
 
                     Instr::Call { dst, func: callee, args, argc } => {
-                        let entry = self.jit.as_ref().and_then(|j| j.entries.get(*callee as usize).copied().flatten());
+                        let mut entry =
+                            self.jit.as_ref().and_then(|j| j.entries.get(*callee as usize).copied().flatten());
+                        match self.jit_paused {
+                            Some(n) if self.frames.len() > n => entry = None,
+                            Some(_) => self.jit_paused = None,
+                            None => {}
+                        }
                         if let Some(entry) = entry {
                             // Arguments are moved, as into an interpreted call.
                             let start = base + *args as usize;
                             let argv: Vec<Value> =
                                 self.regs[start..start + *argc as usize].iter_mut().map(std::mem::take).collect();
                             self.frames[fi].pc = pc as u32;
-                            let v = tri!(self.call_jit(entry, *callee, argv));
-                            reg!(*dst) = v;
-                            continue;
+                            match tri!(self.call_jit(entry, *callee, argv)) {
+                                Ok(v) => {
+                                    reg!(*dst) = v;
+                                    continue;
+                                }
+                                // Out of native stack: the interpreter runs this call,
+                                // and the calls it makes, with the arguments put back.
+                                Err(argv) => {
+                                    for (i, v) in argv.into_iter().enumerate() {
+                                        self.regs[start + i] = v;
+                                    }
+                                    self.jit_paused = Some(self.frames.len());
+                                }
+                            }
                         }
                         call!(*callee, *dst, *args, *argc, &[])
                     }
@@ -1395,7 +1478,7 @@ impl Vm {
                         reg!(*dst) = Value::Closure(Rc::new(Closure { func: *f, caps }));
                     }
 
-                    Instr::Echo(r) => {
+                    Instr::Echo(r) | Instr::EchoAttr(r) => {
                         let v = reg!(*r).clone();
                         // The output buffer grows with every echo; large pieces
                         // (and escaping, up to 6x) are checked before they are added.
@@ -1408,7 +1491,19 @@ impl Vm {
                         if len > 1 << 12 || before > 1 << 20 && before.next_power_of_two() < before + len + 64 {
                             tri!(self.reserve(len.max(before)));
                         }
-                        self.echo(&v);
+                        match (ins, &v) {
+                            (Instr::EchoAttr(_), Value::Html(s)) if self.out.last().is_some_and(|o| o.html) => {
+                                let buf = &mut self.out.last_mut().unwrap().buf;
+                                if s.contains(['"', '\'']) {
+                                    tri!(self.reserve(s.len().saturating_mul(6)));
+                                    let buf = &mut self.out.last_mut().unwrap().buf;
+                                    attr_quotes_into(s, buf);
+                                } else {
+                                    buf.push_str(s);
+                                }
+                            }
+                            _ => self.echo(&v),
+                        }
                     }
                     Instr::EchoHtml(c) => {
                         if let Const::Str(s) = &prog.consts[*c as usize] {

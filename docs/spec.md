@@ -538,7 +538,7 @@ and text such as `</scripts>` that looks like an end tag but is not one.
 
 | Location | Example | Treatment |
 |---|---|---|
-| Element content, quoted attribute value | `<p><?= $s ?></p>`, `title="<?= $s ?>"` | Escaped and output |
+| Element content, quoted attribute value | `<p><?= $s ?></p>`, `title="<?= $s ?>"` | Escaped and output. `Html` is output as it is, except that in an attribute value its `"` and `'` are written as `&quot;` and `&#039;`, so no `Html` can end the attribute |
 | Unquoted attribute value | `href=<?= $u ?>` | Error (add quotes) |
 | Inside a tag (between attributes) | `<div <?= $attrs ?>>` | Error |
 | Start of a URL attribute | `href="<?= $u ?>"`, `src="<?= $u ?>"` | Only `SafeUrl` (`safe_url($u)`) and numbers. If the preceding text contains `/` `?` `#` `:`, it is not the start (`href="/post?id=<?= $id ?>"` is allowed). `href="j<?= ?>"` or only a character reference such as `&#106;` still counts as the start |
@@ -1266,10 +1266,11 @@ It then runs the type checker and shows the places that need manual work, such a
      `(string)`, `strlen()` and `->len()`). Numbers stay in machine registers; strings live in a register window and
      are handled by the interpreter's own code, so results, error messages and memory checks are identical.
      Integer overflow, division and modulo by zero, negative shifts, out-of-range float to int conversion, recursion
-     depth, and the execution time and memory limits are checked in the JIT just as in the interpreter. Native
-     recursion also stops when it would use more than 8 MB of stack (a function with a large frame can then reach a
-     smaller depth than in the interpreter). Before
-     compiling, the JIT checks every instruction and the kind of every register on every path, so bytecode from the
+     depth, and the execution time and memory limits are checked in the JIT just as in the interpreter. Native code
+     uses at most 8 MB of stack: a call that needs more (deep recursion of a function with a large frame) is run by
+     the interpreter instead, whose frames are not on the stack. Compiled functions have no side effects, so the
+     result is the same. Functions with more than 1,024 registers or 16,384 instructions are left to the interpreter
+     (compiling them would take much memory). Before compiling, the JIT checks every instruction and the kind of every register on every path, so bytecode from the
      cache is never trusted. It can be disabled with `PHV_JIT=0`. The stack trace of an exception raised inside the JIT
      goes back only as far as the caller.
 5. **Bytecode cache**: `phv run` and `phv serve` save compiled output in `.phv-cache/` and reuse it

@@ -155,6 +155,9 @@ pub struct HCatch {
 pub enum HStmt {
     Expr(HExpr),
     Echo(HExpr),
+    /// Echo into a quoted attribute value: an `Html` value's quotes are
+    /// encoded, so no `Html` can end the attribute.
+    EchoAttr(HExpr),
     /// Literal HTML and the offsets of its opening `<script` tags.
     Html(String, Vec<usize>),
     Assign(HPlace, HExpr),

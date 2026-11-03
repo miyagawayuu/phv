@@ -51,11 +51,16 @@ impl Checker<'_> {
                 }
             }
             StmtKind::HtmlEcho(es, ctx) => {
+                use phv_syntax::ast::EchoContext;
                 for e in es {
                     let h = self.expr(e, None);
                     self.check_printable(&h, "echo");
                     self.check_html_context(&h, *ctx);
-                    out.push(HStmt::Echo(h));
+                    if matches!(ctx, EchoContext::Attr | EchoContext::Url | EchoContext::MetaContent) {
+                        out.push(HStmt::EchoAttr(h));
+                    } else {
+                        out.push(HStmt::Echo(h));
+                    }
                 }
             }
             StmtKind::InlineHtml(text, scripts) => out.push(HStmt::Html(text.clone(), scripts.clone())),

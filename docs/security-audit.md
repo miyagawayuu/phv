@@ -3,7 +3,7 @@
 English | [日本語](security-audit.ja.md)
 
 This report consolidates five audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, and §11 what was added for v0.5.0.
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, and §12 the follow-up on its residual risks.
 
 Date: 2026-11-02 (§9–§11: 2026-11-03)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
@@ -452,3 +452,21 @@ Dependencies: Dependabot reported eight advisories (four high) for `undici` 7.29
 (`.github/deploy`, pulled in by wrangler, which runs only in the deploy job); it is overridden to the fixed 7.30.1, and
 a clean `npm ci --ignore-scripts` gives a working wrangler. `npm audit --omit=dev` finds nothing in the extension and
 the website; `cargo audit` runs in CI.
+
+## 12. Follow-up on the Residual Risks (after v0.5.0)
+
+Date: 2026-11-03. The two residual risks of §11 and the item kept there were fixed, and the work turned up two more
+problems of the same kind (compile memory of very large functions, and the time limit after long string operations).
+
+| # | Risk | Fix | Verified |
+|---|---|---|---|
+| R5-24 | (§11 residual risk) A `json_html()` value passed as `any` and narrowed with `is Html` is `Html` at run time, and could be placed in an attribute, whose quotes it ended | An `Html` value placed in a quoted attribute value has its `"` and `'` encoded (`&quot;`, `&#039;`; the browser decodes them back). `escape()` output has none, so it is unchanged; a template's output or JSON in an attribute stays inside it. Element text is unchanged | `tests/cases/html_in_attributes.phv`: the laundered JSON and a template's output stay in their attributes |
+| R5-25 | (§11 residual risk) Under the JIT, a function with a large frame stopped at a smaller recursion depth than in the interpreter (8 MB of native stack) | Native code that runs out of its stack stops with its own code, and the interpreter runs that call (and the calls it makes) instead. Compiled functions have no side effects (arithmetic, strings, calls to other compiled functions), so running the call again gives the same result | The depth-9,900 recursion of a 300-variable function returns its result under the JIT (`jit` test); the PoC page answers 200 instead of 500 |
+| R5-26 | (§11, kept) Registers for a call were allocated before the memory check: a deep recursion of a 2,000-register function reached 517 MB under a 16 MB limit | The interpreter's register file and the JIT's string window check the memory limit before they grow | The same program under 16 MB: 6 MB with the interpreter, 12 MB with the JIT (peak working set) |
+| R5-27 | (New, Low) Compiling a very large function takes memory not counted against any limit: the 2,000-register function took 159 MB to compile | Functions with more than 1,024 registers or 16,384 instructions are left to the interpreter. A 900-register function compiles within 41 MB | Peak working set measured as above |
+| R5-28 | (New, Low) The time limit is checked every 10,000 loop steps or calls, and one comparison or `.` of long strings can take milliseconds: comparing two 20 MB strings 3,000 times ran 4 s under a 2 s limit, in both engines | After a comparison, `.` or `.=` over 64 KB or more, the next loop step or call checks the limits (interpreter and JIT) | The PoC stops at 2.1 s (interpreter) and 2.4 s (JIT, including compilation); `jit` test `time_limit_after_long_string_operations` |
+
+### Verification
+
+All tests pass on Windows and on Linux (Docker) with clippy (`-D warnings`) and rustfmt, and the fuzzer ran 1,500
+mutations per program.
