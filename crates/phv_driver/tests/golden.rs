@@ -427,3 +427,67 @@ fn constants_aliases_and_spreads_stay_small() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `std.mail` sends through `[mail.<name>]` to a local SMTP server.
+#[test]
+fn mail_reaches_a_local_server() {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (s, _) = listener.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        w.write_all(b"220 hi\r\n").unwrap();
+        let (mut rcpt, mut data) = (Vec::new(), String::new());
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let l = line.trim_end().to_string();
+            if l == "DATA" {
+                w.write_all(b"354 go\r\n").unwrap();
+                loop {
+                    let mut d = String::new();
+                    r.read_line(&mut d).unwrap();
+                    if d == ".\r\n" {
+                        break;
+                    }
+                    data.push_str(&d);
+                }
+            } else if let Some(a) = l.strip_prefix("RCPT TO:") {
+                rcpt.push(a.to_string());
+            } else if l == "QUIT" {
+                w.write_all(b"221 bye\r\n").unwrap();
+                break;
+            }
+            w.write_all(b"250 ok\r\n").unwrap();
+        }
+        (rcpt, data)
+    });
+    let dir = std::env::temp_dir().join(format!("phv-mail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("phv.toml"),
+        format!("[mail.default]\nurl = \"smtp://127.0.0.1:{port}\"\nfrom = \"Shop <shop@example.com>\"\n"),
+    )
+    .unwrap();
+    let file = dir.join("send.phv");
+    std::fs::write(
+        &file,
+        "<?phv\nimport std.mail.Mail;\nMail::to(\"ann@example.com\")->also(\"bob@example.com\")->subject(\"Your order\")\n    \
+         ->text(\"Thanks!\")->html(raw(\"<p>Thanks!</p>\"))->send();\ntry {\n    Mail::to(\"x@y.z\r\nBcc: evil@e.x\")->send();\n} \
+         catch (ValueError $e) {\n    echo $e->getMessage();\n}\n",
+    )
+    .unwrap();
+    let c = phv_driver::compile(&dir, &file).unwrap_or_else(|e| panic!("{}", e.render(false)));
+    let host = phv_driver::load_config(&dir).unwrap().host;
+    let out = run(&c, RunOptions { html: false, limits: Default::default(), http: None, host: Some(host) });
+    assert!(out.error.is_none(), "{}", out.error.map(|e| e.render()).unwrap_or_default());
+    assert_eq!(out.output, "mail: an address cannot contain line breaks");
+    let (rcpt, data) = server.join().unwrap();
+    assert_eq!(rcpt, ["<ann@example.com>", "<bob@example.com>"]);
+    assert!(data.contains("Subject: Your order") && data.contains("multipart/alternative"), "{data}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

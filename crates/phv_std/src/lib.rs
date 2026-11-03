@@ -12,6 +12,8 @@ use std::rc::Rc;
 mod asyncio;
 mod db;
 mod httpclient;
+mod mail;
+pub mod migrate;
 mod netdb;
 mod netio;
 mod pgmeter;
@@ -33,12 +35,20 @@ pub use web::{csrf_expected, json_decode, random_hex};
 pub const PRELUDE: &str = include_str!("phv/prelude.phv");
 
 /// Source of a `std.*` module.
+/// Whether `Name <address>` or `address` names a plain email address (for phv.toml).
+pub fn mail_address(s: &str) -> Option<&str> {
+    mail::address_of(s)
+}
+
 pub fn std_module(name: &str) -> Option<&'static str> {
     match name {
         "std.http" => Some(include_str!("phv/http.phv")),
         "std.db" => Some(include_str!("phv/db.phv")),
         "std.net" => Some(include_str!("phv/net.phv")),
         "std.async" => Some(include_str!("phv/async.phv")),
+        "std.validate" => Some(include_str!("phv/validate.phv")),
+        "std.testing" => Some(include_str!("phv/testing.phv")),
+        "std.mail" => Some(include_str!("phv/mail.phv")),
         _ => None,
     }
 }
@@ -856,6 +866,42 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         },
         "__req_path" => |vm, _| Ok(Value::str(vm.http.path.as_str())),
         "__req_params" => |vm, _| Ok(string_map(&vm.http.params)),
+        // `layout()`: what the page writes after it is kept apart, and given to the layout as its body.
+        // std.testing: [status, body, name, value, name, value, ...]
+        "__site_request" => |vm, a| {
+            let Some(site) = vm.host.site.clone() else {
+                return Err(vm.throw(
+                    "RuntimeException",
+                    "there is no site to send requests to: run the test with `phv test` in a project that has public/",
+                ));
+            };
+            let headers: Vec<(String, String)> =
+                map(&a[2]).iter().map(|(k, v)| (k.to_value().to_display_string(), v.to_display_string())).collect();
+            let req = phv_vm::SiteRequest {
+                method: s(&a[0]).to_string(),
+                path: s(&a[1]).to_string(),
+                headers,
+                body: s(&a[3]).as_bytes().to_vec(),
+            };
+            let resp = site.request(req).map_err(|e| vm.throw("RuntimeException", format!("request failed: {e}")))?;
+            let mut out =
+                vec![Value::str(resp.status.to_string()), Value::str(String::from_utf8_lossy(&resp.body).into_owned())];
+            for (k, v) in resp.headers {
+                out.push(Value::str(k));
+                out.push(Value::str(v));
+            }
+            Ok(Value::list(out))
+        },
+        "__mail_send" => mail::send,
+        "__capture_begin" => |vm, _| {
+            let html = vm.out.last().is_none_or(|o| o.html);
+            vm.out.push(phv_vm::OutBuf { buf: String::new(), html });
+            Ok(Value::Null)
+        },
+        "__capture_end" => |vm, _| {
+            let body = if vm.out.len() > 1 { vm.out.pop().map(|o| o.buf).unwrap_or_default() } else { String::new() };
+            Ok(Value::html(body))
+        },
         "__locals_get" => |vm, a| {
             let key = s(&a[0]);
             Ok(vm

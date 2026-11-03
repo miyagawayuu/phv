@@ -1,0 +1,50 @@
+<?phv
+// std.validate: rules on form fields, messages per field.
+import std.validate.{Validator, is_email};
+
+function check(map<string, string> $form): Validator {
+    $v = new Validator($form);
+    $v->required("name")->maxLength("name", 10);
+    $v->required("email")->email("email");
+    $v->int("age", min: 0, max: 150);
+    $v->number("price", min: 0.5);
+    $v->in("color", ["red", "green"]);
+    $v->url("site");
+    $v->minLength("password", 8)->same("confirm", "password", "the passwords differ");
+    $v->check("terms", ($form["terms"] ?? "") == "yes", "accept the terms");
+    return $v;
+}
+
+$ok = check([
+    "name" => "  Ada  ",
+    "email" => "ada@example.com",
+    "age" => "36",
+    "price" => "1.5",
+    "color" => "red",
+    "site" => "https://ada.dev",
+    "password" => "correct horse",
+    "confirm" => "correct horse",
+    "terms" => "yes",
+]);
+echo $ok->passes() ? "passes" : "fails", " ", $ok->value("name") ?? "", "\n";
+
+$bad = check([
+    "name" => "Bartholomew the Great",
+    "email" => "not-an-email",
+    "age" => "two hundred",
+    "price" => "0.1",
+    "color" => "blue",
+    "site" => "ftp://x",
+    "password" => "short",
+    "confirm" => "other",
+]);
+foreach ($bad->errors() as $field => $messages) {
+    echo $field, ": ", $messages->join("; "), "\n";
+}
+echo $bad->first("email") ?? "-", " / ", $bad->first("missing") ?? "-", "\n";
+$empty = check(["name" => " ", "email" => ""]);
+echo $empty->errors()->keys()->join(","), "\n";
+foreach (["a@b.co", "a@b", "@b.co", "a@@b.co", "a b@c.d", "a@.b.c", "a@b..c"] as $e) {
+    echo $e, "=", is_email($e) ? "y" : "n", " ";
+}
+echo "\n";

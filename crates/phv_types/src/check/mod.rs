@@ -2556,7 +2556,22 @@ impl<'a> Checker<'a> {
             }
             Body::Template(m) | Body::Main(m) => {
                 let mut warned = false;
+                // `layout("views/layout.phv.html", ...)`: what the page writes
+                // after it is captured and rendered as the layout's `$body`.
+                let layout = m.stmts.iter().find_map(|s| match &s.kind {
+                    StmtKind::Expr(ast::Expr { kind: ExprKind::Call { callee, args }, span })
+                        if matches!(&callee.kind, ExprKind::Name(n) if n == "layout") =>
+                    {
+                        Some((s, args, *span))
+                    }
+                    _ => None,
+                });
                 for s in &m.stmts {
+                    if layout.is_some_and(|(l, ..)| std::ptr::eq(l, s)) {
+                        let begin = HExprKind::CallBuiltin("__capture_begin".into(), Vec::new());
+                        out.push(HStmt::Expr(HExpr { kind: begin, ty: Type::Void, span: s.span }));
+                        continue;
+                    }
                     match &s.kind {
                         StmtKind::Function(_)
                         | StmtKind::Class(_)
@@ -2569,6 +2584,25 @@ impl<'a> Checker<'a> {
                             self.stmt(s, &mut out);
                         }
                     }
+                }
+                if let Some((_, args, span)) = layout {
+                    let body = self.cx().declare("%body", Type::Html, span);
+                    self.cx().flow.mark(body);
+                    let end = HExpr {
+                        kind: HExprKind::CallBuiltin("__capture_end".into(), Vec::new()),
+                        ty: Type::Html,
+                        span,
+                    };
+                    out.push(HStmt::Assign(HPlace { base: HPlaceBase::Local(body), path: Vec::new() }, end));
+                    let mut args = args.clone();
+                    args.push(ast::Arg {
+                        name: Some(("body".into(), span)),
+                        value: ast::Expr { kind: ExprKind::Var("%body".into()), span },
+                    });
+                    let callee = Box::new(ast::Expr { kind: ExprKind::Name("render".into()), span });
+                    let render = ast::Expr { kind: ExprKind::Call { callee, args }, span };
+                    let echo = ast::Stmt { kind: StmtKind::Echo(vec![render]), span };
+                    self.stmt(&echo, &mut out);
                 }
             }
             Body::Done => {}

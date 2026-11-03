@@ -627,7 +627,8 @@ import lib.legacy.render as render_legacy;
   the directory of the file being run).
 - The top level of an imported module can contain only declarations (`function`, `class`, `interface`, `enum`, `const`, `type`, `import`).
   Loading a module has no side effects.
-- `std.*` are the standard modules (`std.http`, `std.db`, `std.net`, `std.async`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
+- `std.*` are the standard modules (`std.http`, `std.db`, `std.net`, `std.async`, `std.validate`, `std.mail`,
+  `std.testing`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
 - Only files inside the project and package directories can be loaded (symbolic links cannot be used to escape them).
 
 ## 12. Templates
@@ -650,6 +651,20 @@ echo render("views/layout.phv.html", title: "Home", body: $html);
 
 - A template declares typed parameters with `params(...)`. Calls to `render()` are type-checked at compile time.
 - The path given to `render()` is a string literal, relative to the project root (`..` is not allowed). The extension is `.phv.html`.
+- `layout()` wraps a whole page in a layout: what the page writes after it becomes the layout's `$body` (an
+  `Html` parameter it must declare), and the other arguments are passed as they are. They are evaluated when the page
+  has finished, so the page may set them while it runs:
+
+  ```phv
+  <?phv
+  layout("views/layout.phv.html", title: $title);
+  $title = "Posts";
+  ?>
+  <ul>...</ul>
+  ```
+
+  `layout()` is a statement at the top level of a page or template, at most once. A page that ends early (with
+  `return`) or fails is not wrapped.
 - `render()` returns `Html`, so the result can be passed directly to another template and embedded there (layouts).
 - A template must close everything it opens: it cannot end inside a tag, an attribute, a comment, a `<script>` /
   `<style>` / `<textarea>` element or `<svg>` / `<math>` (compile error). `Html` values can be joined with `.`, and a
@@ -1131,6 +1146,57 @@ when the body is not JSON).
   unset `url_env` or `headers_env` variable is reported when a request is sent, so `phv check` works without the
   production keys.
 
+### Validation (std.validate)
+
+```phv
+import std.validate.Validator;
+
+$v = new Validator(request()->formParams);
+$v->required("name")->maxLength("name", 50);
+$v->required("email")->email("email");
+$v->int("age", min: 0, max: 150);
+$v->in("plan", ["free", "pro"]);
+$v->minLength("password", 12)->same("password_again", "password", "the passwords differ");
+$v->check("terms", request()->form("terms") == "yes", "accept the terms");
+if ($v->fails()) {
+    $errors = $v->errors();          // map<string, list<string>>: the messages of each field
+    $first = $v->first("email");     // ?string
+}
+$name = $v->value("name");           // ?string, trimmed (null when empty)
+```
+
+Rules: `required`, `minLength`, `maxLength` (characters), `email`, `url` (http and https), `int` and `number` (with
+`min` / `max`), `in`, `same`, and `check` for checks of your own. Every rule takes a last `$message` argument to
+replace the English default. A rule other than `required` passes when the field is missing or empty. `is_email($s)`
+is the email check on its own.
+
+### Mail (std.mail)
+
+```toml
+[mail.default]
+url_env = "SMTP_URL"     # smtps://user:password@smtp.example.com (TLS), or smtp://...:587 (STARTTLS)
+from = "Example <noreply@example.com>"
+# tls = false            # allow a server on another machine without TLS (not recommended)
+```
+
+```phv
+import std.mail.Mail;
+
+Mail::to($email)
+    ->subject("Welcome")
+    ->text("Thanks for signing up.")
+    ->html(render("views/mail/welcome.phv.html", name: $name))
+    ->send();                        // through [mail.default]; ->send("alerts") for [mail.alerts]
+```
+
+- Scripts can send only through the servers named in `[mail]`. `smtps://` uses TLS from the start; `smtp://` upgrades
+  with `STARTTLS`, which a server on another machine must offer (unless `tls = false`). A user name and password are
+  never sent without TLS to another machine.
+- An address is a plain `name@domain` (no display name, no line breaks), and the subject cannot contain line breaks
+  (`ValueError`), so a value from a form cannot add headers or recipients. A message has 1 to 50 recipients and at most
+  10 MB. The text part is always sent; `html()` adds an HTML alternative.
+- Sending waits for the server, at most the script's time limit or 30 seconds, and throws `NetworkError` if it fails.
+
 ### Asynchronous I/O (std.async)
 
 ```phv
@@ -1270,6 +1336,18 @@ rate_limit_store = "cache"  # count rate limits on this Redis database (default:
 
 [server]
 workers = 16            # scripts running at once (default: two per CPU, at least 8)
+static_max_age = 3600   # Cache-Control max-age of static files (default: revalidate each time)
+compress = true         # gzip text responses (default)
+access_log = "logs/access.log"   # also append the access log to this file
+access_log_format = "json"       # "text" (default) or "json"
+shutdown_timeout = 30   # seconds running requests get when the server stops
+
+[cors]
+origins = ["https://app.example.com"]
+
+[mail.default]
+url_env = "SMTP_URL"
+from = "Example <noreply@example.com>"
 
 [fmt]
 width = 100             # phv fmt wraps longer lines
@@ -1447,6 +1525,49 @@ function posts_have_titles(): void { /* ... */ }
 function test_import(): void { /* ... */ }
 ```
 
+Requests to the project's own site (a project with `public/`) are made with `std.testing`, in-process: no server
+or network is needed. Pages run as under `phv serve` in development mode (routes, middleware, sessions, error pages),
+except that forms need no CSRF token. A `TestClient` keeps the cookies the site sets, like a browser:
+
+```phv
+import std.testing.TestClient;
+
+function test_login(): void {
+    $c = new TestClient();
+    assert_eq($c->get("/account")->status, 302);
+    $r = $c->post("/login", ["email" => "ann@example.com", "password" => "secret"]);
+    assert_eq($r->location(), "/account");
+    assert($c->get("/account")->body->contains("Ann"));
+    $api = $c->postJson("/api/notes", ["text" => "hi"]);
+    assert_eq($api->status, 201);
+    assert_eq($api->header("Content-Type"), "application/json");
+}
+```
+
+`TestResponse` has `status`, `body`, `header()`, `headers()` (every value), `json()` and `location()`.
+
+### Database migrations
+
+```
+migrations/
+├── 0001_create_posts.sql
+└── 0002_add_tags.sql
+```
+
+```bash
+phv db status --sqlite data/app.db      # each file: applied or pending
+phv db migrate --sqlite data/app.db     # apply the pending ones, in order
+phv db migrate --db main                # a PostgreSQL / MySQL server of [databases.main]
+```
+
+- Files are named `<number>_<name>.sql` and applied in the order of their numbers, each once. The table
+  `phv_migrations` records each applied file with a checksum of its text; `migrate` refuses to run when an applied
+  file has changed since (put changes in a new file instead).
+- On SQLite and PostgreSQL a migration runs in a transaction with its record, so a failing one leaves nothing behind.
+  MySQL commits each schema change at once, so a failing migration may be left half applied there.
+- `--dir` names another directory; the database is named with `--db` (from `[databases]`) or `--sqlite` (a file
+  inside the project).
+
 ### Packages
 
 ```toml
@@ -1555,8 +1676,8 @@ Planned, in this order. Each release is audited before it is published, as befor
 - **0.6, the language** (done): destructuring, variadic parameters and `...` spread, functions as values
   (`strlen(...)`), type aliases, `match` that must cover every case of an enum, bounds on type parameters,
   constant expressions, `import ... as`, heredoc strings, and exceptions that carry their cause and trace.
-- **0.7, web applications**: routes with parameters (`public/posts/[id].phv`), middleware, custom error pages, form
-  validation, layouts with slots, CORS, compression and caching headers for static files, graceful shutdown, access
+- **0.7, web applications** (done): routes with parameters (`public/posts/[id].phv`), middleware, custom error pages, form
+  validation, layouts, CORS, compression and caching headers for static files, graceful shutdown, access
   logs, database migrations, an HTTP client for `phv test`, and sending mail.
 - **0.8, the standard library**: regular expressions, formatted strings, more list and map methods and a `Set`
   type, mathematics, dates with time zones, JSON decoded into classes, encryption and signed tokens, UUIDs,

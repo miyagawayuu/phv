@@ -1,0 +1,8 @@
+<!doctype html>
+<html>
+<head><title>Inside &amp; out</title></head>
+<body>
+<p>HELLO <b>escaped</b></p>
+done
+</body>
+</html>

@@ -111,6 +111,7 @@ fn postgres() {
     check(&host, "postgres_types");
     check(&host, "postgres_types_after");
     check_async(&url, "postgres_async");
+    check_migrations(&host, "SELECT nope FROM missing_table");
 }
 
 #[test]
@@ -125,6 +126,26 @@ fn mysql() {
     check(&host, "mysql_session");
     check(&host, "mysql_session_after");
     check_async(&url, "mysql_async");
+    check_migrations(&host, "SELECT nope FROM missing_table");
+}
+
+/// `phv db migrate` on a server: each file runs once and is recorded; a
+/// failing one is reported and stays pending.
+fn check_migrations(host: &Arc<Host>, failing: &str) {
+    use phv_std::migrate::{Conn, Target};
+    let spec = &host.databases["main"];
+    let mut conn = Conn::open(&Target::Server(spec)).unwrap();
+    let tag = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+    );
+    let first = format!("9001_{tag}.sql");
+    conn.apply(&first, "CREATE TABLE phv_mig_check (n integer); DROP TABLE phv_mig_check;").unwrap();
+    assert!(conn.applied().unwrap().iter().any(|(n, _)| *n == first));
+    let bad = format!("9002_{tag}.sql");
+    assert!(conn.apply(&bad, failing).is_err());
+    assert!(!conn.applied().unwrap().iter().any(|(n, _)| *n == bad));
 }
 
 #[test]

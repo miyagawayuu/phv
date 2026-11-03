@@ -1216,6 +1216,11 @@ impl<'a> Checker<'a> {
             if name == "render" {
                 return self.render(args, span);
             }
+            if name == "layout" {
+                self.error("`layout()` must be a statement at the top level of a page or template", span)
+                    .add_note("a page has at most one layout; it wraps what the page writes after it");
+                return err(span);
+            }
             if let Some(fid) = self.lookup_func(name) {
                 self.note_ref(callee.span, self.funcs[fid as usize].span);
                 let (hargs, ret) = self.invoke(fid, args, span);

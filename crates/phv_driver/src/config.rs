@@ -48,7 +48,7 @@
 //! headers_env = { Authorization = "WEATHER_AUTH" }
 //! ```
 
-use phv_vm::{DatabaseSpec, Host, HttpSpec, Permissions, WebSocketSpec};
+use phv_vm::{DatabaseSpec, Host, HttpSpec, MailSpec, Permissions, WebSocketSpec};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -76,7 +76,37 @@ struct File {
     #[serde(default)]
     http: BTreeMap<String, HttpSection>,
     #[serde(default)]
+    mail: BTreeMap<String, MailSection>,
+    #[serde(default)]
     fmt: FmtSection,
+}
+
+/// `[mail.<name>]`: a mail server scripts send through with `std.mail`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailSection {
+    url: Option<String>,
+    url_env: Option<String>,
+    /// `false` allows a server on another machine without TLS.
+    tls: Option<bool>,
+    from: String,
+}
+
+fn mail_spec(name: &str, m: MailSection) -> Result<MailSpec, String> {
+    if !valid_server_name(name) {
+        return Err(format!("[mail]: invalid name \"{name}\" (letters, digits, `_` and `-`)"));
+    }
+    let url = server_url("mail", name, m.url, &m.url_env)?;
+    if let Some(u) = &url {
+        if !u.starts_with("smtp://") && !u.starts_with("smtps://") {
+            let from = m.url_env.as_deref().map(|v| format!(" (from ${v})")).unwrap_or_default();
+            return Err(format!("[mail.{name}]: the URL{from} must start with smtp:// or smtps://"));
+        }
+    }
+    if m.from.contains(['\r', '\n']) || phv_std::mail_address(&m.from).is_none() {
+        return Err(format!("[mail.{name}].from must be an address, or `Name <address>`"));
+    }
+    Ok(MailSpec { url, url_env: m.url_env, tls: m.tls, from: m.from })
 }
 
 /// `[fmt]`: settings for `phv fmt`.
@@ -791,6 +821,11 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
         let spec = websocket_spec(&name, w)?;
         websockets.insert(name, spec);
     }
+    let mut mail = BTreeMap::new();
+    for (name, m) in file.mail {
+        let spec = mail_spec(&name, m)?;
+        mail.insert(name, spec);
+    }
     let mut http = BTreeMap::new();
     for (name, h) in file.http {
         let spec = http_spec(&name, h)?;
@@ -798,7 +833,16 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
     }
     Ok(Config {
         name: file.project.name,
-        host: Arc::new(Host { root: root.to_path_buf(), permissions, databases, websockets, http, rate_limit_store }),
+        host: Arc::new(Host {
+            root: root.to_path_buf(),
+            permissions,
+            databases,
+            websockets,
+            http,
+            rate_limit_store,
+            site: None,
+            mail,
+        }),
         csrf: file.security.csrf,
         secure_cookies: file.security.secure_cookies,
         session_ttl: file.security.session_ttl,

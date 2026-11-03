@@ -57,6 +57,8 @@ pub fn test(paths: Vec<PathBuf>, color: bool) -> ExitCode {
         if color { ("\x1b[32m", "\x1b[31m", "\x1b[33m", "\x1b[0m") } else { ("", "", "", "") };
     let (mut passed, mut failed, mut skipped) = (0, 0, 0);
     let start = Instant::now();
+    let mut sites: std::collections::HashMap<PathBuf, Option<std::sync::Arc<dyn phv_vm::Site>>> =
+        std::collections::HashMap::new();
     for file in files {
         let root = find_root(&file);
         println!("{}", file.display());
@@ -70,6 +72,21 @@ pub fn test(paths: Vec<PathBuf>, color: bool) -> ExitCode {
         };
         compiled.enable_jit();
         let config = load_config(&root).unwrap_or_else(|_| phv_driver::Config::default_for(&root));
+        // A project with public/ gets its site, for `std.testing`.
+        let mut host = (*config.host).clone();
+        if root.join("public").is_dir() {
+            match sites.entry(root.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => host.site = e.get().clone(),
+                std::collections::hash_map::Entry::Vacant(e) => match phv_server::test_site(&root) {
+                    Ok(site) => host.site = e.insert(Some(site)).clone(),
+                    Err(err) => {
+                        println!("  {yellow}warning{reset}: the site cannot be used in tests: {err}");
+                        e.insert(None);
+                    }
+                },
+            }
+        }
+        let host = std::sync::Arc::new(host);
         let tests = compiled.tests();
         if tests.is_empty() {
             println!("  (no test_* or #[Test] functions)");
@@ -82,7 +99,7 @@ pub fn test(paths: Vec<PathBuf>, color: bool) -> ExitCode {
                 continue;
             }
             let limits = Limits { max_time: Some(Duration::from_secs(30)), ..Limits::default() };
-            let opts = RunOptions { html: false, limits, http: None, host: Some(config.host.clone()) };
+            let opts = RunOptions { html: false, limits, http: None, host: Some(host.clone()) };
             let outcome = run_func(&compiled, fid, opts);
             match outcome.error {
                 None => {

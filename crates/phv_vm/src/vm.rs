@@ -160,6 +160,49 @@ pub struct Host {
     /// The Redis database (a name in `databases`) that rate limits are counted
     /// in, so every server process shares them; None counts in this process.
     pub rate_limit_store: Option<String>,
+    /// The site `phv test` sends requests to (`std.testing`), when the project has one.
+    pub site: Option<std::sync::Arc<dyn Site>>,
+    /// Mail servers scripts may send through, by name (`[mail]` in phv.toml).
+    pub mail: std::collections::BTreeMap<String, MailSpec>,
+}
+
+/// A mail server named in phv.toml (`[mail.<name>]`). The URL holds credentials
+/// and is never shown.
+#[derive(Clone)]
+pub struct MailSpec {
+    /// `smtp://` or `smtps://` URL, or None when the environment variable is not set.
+    pub url: Option<String>,
+    pub url_env: Option<String>,
+    /// Some(false) allows a server on another machine without TLS.
+    pub tls: Option<bool>,
+    /// The sender: `Name <address>` or `address`.
+    pub from: String,
+}
+
+impl std::fmt::Debug for MailSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MailSpec").field("url_env", &self.url_env).field("from", &self.from).finish_non_exhaustive()
+    }
+}
+
+/// A request a test sends to the site (`TestClient` in `std.testing`).
+pub struct SiteRequest {
+    pub method: String,
+    /// The path with its query string.
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+pub struct SiteResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Answers requests the way the web server does, without a network.
+pub trait Site: Send + Sync + std::fmt::Debug {
+    fn request(&self, req: SiteRequest) -> Result<SiteResponse, String>;
 }
 
 /// A database server named in phv.toml. Scripts only ever see the name: the

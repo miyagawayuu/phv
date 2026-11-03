@@ -1089,6 +1089,95 @@ async fn run_script(
     }
 }
 
+/// The site of a project for `phv test` (`std.testing`): requests are answered
+/// in-process, the way `phv serve` answers them in development mode, except
+/// that forms need no CSRF token.
+pub fn test_site(root: &Path) -> Result<Arc<dyn phv_vm::Site>, String> {
+    let root = root.canonicalize().map_err(|e| format!("cannot open {}: {e}", root.display()))?;
+    if !root.join("public").is_dir() {
+        return Err(format!("{} has no `public/` directory", root.display()));
+    }
+    let mut config = load_config(&root)?;
+    config.csrf = false;
+    let mut state = State::new(root, true, Duration::from_secs(30), config);
+    let table = state.scan_routes()?;
+    state.routes = Mutex::new((Instant::now(), Arc::new(table)));
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+    Ok(Arc::new(TestSite { state: Arc::new(state), rt }))
+}
+
+struct TestSite {
+    state: Arc<State>,
+    /// Reads the bodies of responses (a file a page sends is read from disk).
+    rt: tokio::runtime::Runtime,
+}
+
+impl std::fmt::Debug for TestSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TestSite({})", self.state.root.display())
+    }
+}
+
+impl phv_vm::Site for TestSite {
+    fn request(&self, req: phv_vm::SiteRequest) -> Result<phv_vm::SiteResponse, String> {
+        let mut b = Request::builder().method(req.method.as_str()).uri(req.path.as_str());
+        for (k, v) in &req.headers {
+            b = b.header(k.as_str(), v.as_str());
+        }
+        let (parts, ()) = b.body(()).map_err(|e| format!("invalid request: {e}"))?.into_parts();
+        let state = self.state.clone();
+        let body = Bytes::from(req.body);
+        // The page runs in a VM of its own, on a thread with the server's stack size.
+        let resp = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(s, move || state.answer(parts, body))
+                .map_err(|e| e.to_string())?
+                .join()
+                .map_err(|_| "the page stopped with an internal error".to_string())
+        })?;
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
+            .collect();
+        let body = self.rt.block_on(resp.into_body().collect()).map_err(|e| e.to_string())?.to_bytes().to_vec();
+        Ok(phv_vm::SiteResponse { status, headers, body })
+    }
+}
+
+impl State {
+    /// What `route` answers, without a network (for `phv test`).
+    fn answer(&self, parts: hyper::http::request::Parts, body: Bytes) -> Resp {
+        let ip = "127.0.0.1".to_string();
+        if let Err(e) = self.routes() {
+            return self.error_page("Route error", &e);
+        }
+        match resolve(self, parts.uri.path()) {
+            None => match self.special("_404.phv") {
+                Some(page) => self.execute(&page, Vec::new(), ip, parts, body, Page::NotFound),
+                None => not_found(),
+            },
+            Some(Target::Script(p, params)) => self.execute(&p, params, ip, parts, body, Page::Normal),
+            Some(Target::Static(p)) => match std::fs::read(&p) {
+                Ok(data) => {
+                    let mut r = Response::new(RespBody::full(data));
+                    let ct = content_type(&p).unwrap_or("application/octet-stream");
+                    r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+                    r
+                }
+                Err(_) => not_found(),
+            },
+            Some(Target::Embedded(bytes, ct, _)) => {
+                let mut r = Response::new(RespBody::full(bytes));
+                r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+                r
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

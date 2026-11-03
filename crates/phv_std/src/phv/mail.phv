@@ -1,0 +1,64 @@
+// std.mail — sends mail through a server named in phv.toml.
+//
+//   [mail.default]
+//   url_env = "SMTP_URL"                 # smtps://user:pass@smtp.example.com
+//   from = "Example <noreply@example.com>"
+//
+//   import std.mail.Mail;
+//   Mail::to($email)
+//       ->subject("Welcome")
+//       ->text("Thanks for signing up.")
+//       ->html(render("views/mail/welcome.phv.html", name: $name))
+//       ->send();
+//
+// Sending waits for the server (up to the script's time limit, at most 30
+// seconds) and throws NetworkError if it fails.
+
+export class Mail {
+    private string $subjectLine = "";
+    private string $textBody = "";
+    private Html $htmlBody;
+    private string $replyAddress = "";
+
+    private function __construct(private list<string> $recipients) {
+        $this->htmlBody = raw("");
+    }
+
+    /** A message to one address; add more with `also()`. */
+    public static function to(string $address): Mail {
+        return new Mail([$address]);
+    }
+
+    /** Another recipient (each sees every address in `To`). */
+    public function also(string $address): Mail {
+        $this->recipients[] = $address;
+        return $this;
+    }
+
+    public function subject(string $subject): Mail {
+        $this->subjectLine = $subject;
+        return $this;
+    }
+
+    /** The plain text version (always sent, for clients that do not show HTML). */
+    public function text(string $body): Mail {
+        $this->textBody = $body;
+        return $this;
+    }
+
+    /** An HTML version, usually from `render()` of a template. */
+    public function html(Html $body): Mail {
+        $this->htmlBody = $body;
+        return $this;
+    }
+
+    public function replyTo(string $address): Mail {
+        $this->replyAddress = $address;
+        return $this;
+    }
+
+    /** Sends through `[mail.<via>]` of phv.toml (`default` when not given). */
+    public function send(string $via = "default"): void {
+        __mail_send($via, $this->recipients, $this->subjectLine, $this->textBody, $this->htmlBody, $this->replyAddress);
+    }
+}

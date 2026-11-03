@@ -42,6 +42,9 @@ echo greet($name);                                 // Web ページでは自動�
   クラス(`<T: Shape>`)・型エイリアス・`finally`。使われない変数や import、到達しないコードは警告になる
 - **書きやすい構文**: 分割代入(`[$a, $b] = ...`)、可変長引数と `...` による展開、関数を値として使う
   (`strlen(...)`)、定数式、`import ... as`、ヒアドキュメント、原因とトレースを持つ例外
+- **Web アプリケーション**: パラメータ付きのルート(`public/posts/[id].phv`)、ミドルウェア(`_middleware.phv`)、
+  独自のエラーページ、レイアウト、入力の検証(`std.validate`)、メール(`std.mail`)、データベースのマイグレーション
+  (`phv db migrate`)、静的ファイルのキャッシュと範囲リクエスト、gzip、CORS、アクセスログ、穏やかな停止
 - **セキュリティ**:
   - **XSS 対策**: 出力は自動でエスケープされる。加えて、エスケープでは守れない場所(引用符なしの属性、URL、
     `<script>`)への挿入はコンパイルエラーになる。URL には `safe_url()`、`<script>` には `json_html()` の値
@@ -58,7 +61,8 @@ echo greet($name);                                 // Web ページでは自動�
   - **動的な実行がない**: `eval` や可変変数はない。
   - 7 回の監査と脆弱性診断の結果は [docs/security-audit.ja.md](docs/security-audit.ja.md) にある。
 - **速度**: 型に特化したレジスタ型バイトコード VM、Cranelift による JIT、バイトコードのディスクキャッシュ
-- **ツール**: テストランナー、フォーマッタ、Language Server、パッケージマネージャ、PHP からの移行ツール。
+- **ツール**: テストランナー(同じプロセスで動く HTTP クライアント `std.testing` 付き)、フォーマッタ、Language Server、
+  パッケージマネージャ、データベースのマイグレーション、PHP からの移行ツール。
   VS Code 拡張(色分けと Language Server)は [editors/vscode](editors/vscode) にあり、各リリースに
   `phv-<version>.vsix` として含まれる。
 
@@ -87,6 +91,7 @@ phv fmt examples                         # インデントと空白を整える(
 phv lsp                                  # エディタ用の Language Server
 phv install                              # phv.toml の [dependencies] を取得
 phv migrate legacy/page.php              # PHP を変換し、手作業が必要な箇所を一覧にする
+phv db migrate --sqlite data/app.db      # migrations/ の SQL ファイルのうち未適用のものを適用
 phv disasm examples/bench/bench.phv      # バイトコードを表示
 ```
 
@@ -132,7 +137,7 @@ error: a URL attribute cannot start with an unchecked value
 | `phv_compiler` | HIR → レジスタ型バイトコード |
 | `phv_vm` | 値、バイトコード形式、インタプリタ、実行時の上限 |
 | `phv_jit` | int/bool/float/string を扱う関数を Cranelift でネイティブコードにする |
-| `phv_std` | 組み込み関数(文字列・JSON・日付・暗号・ファイル・SQLite・PostgreSQL・MySQL・Redis・WebSocket・HTTP クライアント・裏で動く処理・セッション)と、PHV で書かれた prelude・`std.http`・`std.db`・`std.net`・`std.async` |
+| `phv_std` | 組み込み関数(文字列・JSON・日付・暗号・ファイル・SQLite・PostgreSQL・MySQL・Redis・WebSocket・HTTP クライアント・裏で動く処理・セッション)と、PHV で書かれた prelude・`std.http`・`std.db`・`std.net`・`std.async`・`std.validate`・`std.mail`・`std.testing`。マイグレーション |
 | `phv_driver` | モジュールとテンプレートの読み込み、`phv.toml`、バイトコードキャッシュ、実行 |
 | `phv_server` | Web サーバー(hyper + tokio)、ルーティング、セッション、CSRF、アップロード |
 | `phv_cli` | `phv` コマンド(run / check / serve / test / fmt / lsp / install / migrate) |

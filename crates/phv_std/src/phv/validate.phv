@@ -1,0 +1,164 @@
+// std.validate — checks form fields and collects messages for each field.
+//
+//   import std.validate.Validator;
+//   $v = new Validator(request()->formParams);
+//   $v->required("name")->maxLength("name", 50);
+//   $v->required("email")->email("email");
+//   $v->int("age", min: 0, max: 150);
+//   if ($v->fails()) {
+//       $errors = $v->errors();   // map<string, list<string>>
+//   }
+//
+// A rule other than `required` passes when the field is missing or empty, so
+// optional fields only need the rules for their format. Values are trimmed.
+
+export class Validator {
+    private map<string, list<string>> $messages = [];
+
+    public function __construct(private map<string, string> $fields) {}
+
+    /** The field's value with spaces trimmed, or null when it is missing or empty. */
+    public function value(string $field): ?string {
+        $v = $this->fields[$field] ?? null;
+        if ($v == null) {
+            return null;
+        }
+        $t = $v->trim();
+        return $t == "" ? null : $t;
+    }
+
+    /** Adds a message for a field (for checks of your own). */
+    public function add(string $field, string $message): Validator {
+        list<string> $list = $this->messages[$field] ?? [];
+        $list[] = $message;
+        $this->messages[$field] = $list;
+        return $this;
+    }
+
+    /** Adds `$message` for the field unless `$ok` (a check of your own). */
+    public function check(string $field, bool $ok, string $message): Validator {
+        if (!$ok) {
+            $this->add($field, $message);
+        }
+        return $this;
+    }
+
+    public function required(string $field, string $message = ""): Validator {
+        return $this->check($field, $this->value($field) != null, $this->say($message, "is required"));
+    }
+
+    /** At least `$min` characters. */
+    public function minLength(string $field, int $min, string $message = ""): Validator {
+        $v = $this->value($field);
+        $ok = $v == null || $v->len() >= $min;
+        return $this->check($field, $ok, $this->say($message, "must be at least {$min} characters"));
+    }
+
+    /** At most `$max` characters. */
+    public function maxLength(string $field, int $max, string $message = ""): Validator {
+        $v = $this->value($field);
+        $ok = $v == null || $v->len() <= $max;
+        return $this->check($field, $ok, $this->say($message, "must be at most {$max} characters"));
+    }
+
+    /** An email address: one `@`, a name before it and a domain with a dot after it, no spaces. */
+    public function email(string $field, string $message = ""): Validator {
+        $v = $this->value($field);
+        return $this->check($field, $v == null || is_email($v), $this->say($message, "must be an email address"));
+    }
+
+    /** An `http://` or `https://` URL. */
+    public function url(string $field, string $message = ""): Validator {
+        $v = $this->value($field);
+        $ok = $v == null || (($v->lower()->startsWith("https://") || $v->lower()->startsWith("http://"))
+            && $v->len() > 8 && !$v->contains(" "));
+        return $this->check($field, $ok, $this->say($message, "must be a URL starting with http:// or https://"));
+    }
+
+    /** A whole number, optionally between `$min` and `$max`. */
+    public function int(string $field, ?int $min = null, ?int $max = null, string $message = ""): Validator {
+        $v = $this->value($field);
+        if ($v == null) {
+            return $this;
+        }
+        $n = $v->toInt();
+        if ($n == null) {
+            return $this->add($field, $this->say($message, "must be a whole number"));
+        }
+        if ($min != null && $n < $min) {
+            return $this->add($field, $this->say($message, "must be at least {$min}"));
+        }
+        if ($max != null && $n > $max) {
+            return $this->add($field, $this->say($message, "must be at most {$max}"));
+        }
+        return $this;
+    }
+
+    /** A number (whole or decimal), optionally between `$min` and `$max`. */
+    public function number(string $field, ?float $min = null, ?float $max = null, string $message = ""): Validator {
+        $v = $this->value($field);
+        if ($v == null) {
+            return $this;
+        }
+        $n = $v->toFloat();
+        if ($n == null) {
+            return $this->add($field, $this->say($message, "must be a number"));
+        }
+        if ($min != null && $n < $min) {
+            return $this->add($field, $this->say($message, "must be at least {$min}"));
+        }
+        if ($max != null && $n > $max) {
+            return $this->add($field, $this->say($message, "must be at most {$max}"));
+        }
+        return $this;
+    }
+
+    /** One of `$options`. */
+    public function in(string $field, list<string> $options, string $message = ""): Validator {
+        $v = $this->value($field);
+        $ok = $v == null || $options->contains($v);
+        return $this->check($field, $ok, $this->say($message, "must be one of " . $options->join(", ")));
+    }
+
+    /** The same as another field (a repeated password). */
+    public function same(string $field, string $other, string $message = ""): Validator {
+        $ok = ($this->fields[$field] ?? "") == ($this->fields[$other] ?? "");
+        return $this->check($field, $ok, $this->say($message, "must match {$other}"));
+    }
+
+    public function passes(): bool {
+        return $this->messages->isEmpty();
+    }
+
+    public function fails(): bool {
+        return !$this->messages->isEmpty();
+    }
+
+    /** The messages of each field that failed, in the order the rules ran. */
+    public function errors(): map<string, list<string>> {
+        return $this->messages;
+    }
+
+    /** The first message of a field, or null. */
+    public function first(string $field): ?string {
+        return ($this->messages[$field] ?? [])->first();
+    }
+
+    private function say(string $message, string $default): string {
+        return $message != "" ? $message : $default;
+    }
+}
+
+/** Whether `$s` looks like an email address (a practical check, not RFC 5322). */
+export function is_email(string $s): bool {
+    if ($s->len() > 254 || $s->contains(" ")) {
+        return false;
+    }
+    $parts = $s->split("@");
+    if ($parts->len() != 2) {
+        return false;
+    }
+    [$local, $domain] = $parts;
+    return $local != "" && $local->len() <= 64 && $domain->contains(".")
+        && !$domain->startsWith(".") && !$domain->endsWith(".") && !$domain->contains("..");
+}

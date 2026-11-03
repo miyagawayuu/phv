@@ -73,6 +73,16 @@ impl Stream {
         }
     }
 
+    /// Upgrades a plain connection to TLS (SMTP's `STARTTLS`), checking `host`'s certificate.
+    pub(crate) fn start_tls(self, host: &str) -> Result<Stream, String> {
+        let Stream::Plain(socket) = self else { return Ok(self) };
+        tls_init();
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let name = rustls::pki_types::ServerName::try_from(bare.to_string()).map_err(|_| "invalid host name")?;
+        let session = rustls::ClientConnection::new(TLS.clone(), name).map_err(|_| "the TLS connection failed")?;
+        Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(session, socket))))
+    }
+
     /// Reads and writes from now on stop at `until`.
     pub(crate) fn set_deadline(&mut self, until: Instant) {
         self.socket().until = until;

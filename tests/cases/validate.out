@@ -1,0 +1,13 @@
+passes Ada
+name: must be at most 10 characters
+email: must be an email address
+age: must be a whole number
+price: must be at least 0.5
+color: must be one of red, green
+site: must be a URL starting with http:// or https://
+password: must be at least 8 characters
+confirm: the passwords differ
+terms: accept the terms
+must be an email address / -
+name,email,terms
+a@b.co=y a@b=n @b.co=n a@@b.co=n a b@c.d=n a@.b.c=n a@b..c=n 

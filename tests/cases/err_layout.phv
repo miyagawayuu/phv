@@ -1,0 +1,7 @@
+<?phv
+function f(): void {
+    layout("views/layout.phv.html", title: "x");
+}
+layout("views/layout.phv.html", title: "a");
+layout("views/layout.phv.html", title: "b");
+layout("views/list.phv.html");

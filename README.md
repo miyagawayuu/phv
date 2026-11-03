@@ -44,6 +44,9 @@ echo greet($name);                                 // HTML-escaped automatically
   variables and imports and unreachable code are reported as warnings.
 - **Convenient syntax**: destructuring (`[$a, $b] = ...`), variadic parameters and `...` spreading, functions as values
   (`strlen(...)`), constant expressions, `import ... as`, heredoc strings, and exceptions with a cause and a trace.
+- **Web applications**: routes with parameters (`public/posts/[id].phv`), middleware (`_middleware.phv`), custom
+  error pages, layouts, form validation (`std.validate`), mail (`std.mail`), database migrations (`phv db migrate`),
+  caching and range requests for static files, gzip, CORS, access logs and a graceful stop.
 - **Security**:
   - **XSS**: output is escaped automatically, and inserting a value where escaping cannot protect it (unquoted
     attributes, URLs, `<script>`) is a compile error. Only `safe_url()` values may start a URL and only
@@ -63,7 +66,8 @@ echo greet($name);                                 // HTML-escaped automatically
   - The results of seven security audits are in [docs/security-audit.md](docs/security-audit.md).
     To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - **Speed**: a register-based bytecode VM specialized by type, a Cranelift JIT, and an on-disk bytecode cache.
-- **Tools**: test runner, formatter, Language Server, package manager, and a migration tool from PHP.
+- **Tools**: test runner (with an in-process HTTP client, `std.testing`), formatter, Language Server, package
+  manager, database migrations, and a migration tool from PHP.
   A VS Code extension (highlighting and the language server) is in [editors/vscode](editors/vscode); each release
   includes it as `phv-<version>.vsix`.
 
@@ -92,6 +96,7 @@ phv fmt examples                         # fix indentation and spacing (--check 
 phv lsp                                  # Language Server for editors
 phv install                              # fetch the [dependencies] in phv.toml
 phv migrate legacy/page.php              # convert PHP and list what needs manual work
+phv db migrate --sqlite data/app.db      # apply the SQL files of migrations/ that have not run yet
 phv disasm examples/bench/bench.phv      # show the bytecode
 ```
 
@@ -137,7 +142,7 @@ error: a URL attribute cannot start with an unchecked value
 | `phv_compiler` | HIR → register bytecode |
 | `phv_vm` | Values, bytecode format, interpreter, runtime limits |
 | `phv_jit` | Native code for functions that use int/bool/float/string values (Cranelift) |
-| `phv_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, PostgreSQL, MySQL, Redis, WebSocket, HTTP client, background work, sessions) and the prelude, `std.http`, `std.db`, `std.net` and `std.async` written in PHV |
+| `phv_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, PostgreSQL, MySQL, Redis, WebSocket, HTTP client, background work, sessions) and the prelude, `std.http`, `std.db`, `std.net`, `std.async`, `std.validate`, `std.mail` and `std.testing` written in PHV; migrations |
 | `phv_driver` | Loading modules and templates, `phv.toml`, bytecode cache, running programs |
 | `phv_server` | Web server (hyper + tokio), routing, sessions, CSRF, uploads |
 | `phv_cli` | The `phv` command (run / check / serve / test / fmt / lsp / install / migrate) |

@@ -1,0 +1,12 @@
+<?phv
+// layout(): what the page writes after it becomes the layout's $body.
+layout("views/layout.phv.html", title: $title);
+
+$title = "Inside & out";
+function shout(string $s): string {
+    return $s->upper();
+}
+?>
+<p><?= shout("hello") ?> <?= "<b>escaped</b>" ?></p>
+<?phv
+echo "done\n";

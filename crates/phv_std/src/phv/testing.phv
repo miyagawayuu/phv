@@ -1,0 +1,107 @@
+// std.testing — requests to the project's own site from `phv test`, without a
+// network or a running server. Pages run as they do under `phv serve`
+// (routes, middleware, sessions, error pages), except that forms need no CSRF
+// token.
+//
+//   import std.testing.TestClient;
+//
+//   function test_home(): void {
+//       $client = new TestClient();
+//       $r = $client->get("/posts/1");
+//       assert_eq($r->status, 200);
+//       assert($r->body->contains("Hello"));
+//   }
+
+export class TestResponse {
+    public function __construct(
+        public readonly int $status,
+        public readonly string $body,
+        /** Every header as [name, value], in order (names in lowercase). */
+        public readonly list<list<string>> $headerList,
+    ) {}
+
+    /** The first value of a header (case-insensitive), or null. */
+    public function header(string $name): ?string {
+        $lower = $name->lower();
+        $h = $this->headerList->find(fn($p) => $p[0] == $lower);
+        return $h == null ? null : $h[1];
+    }
+
+    /** Every value of a header, such as each `set-cookie`. */
+    public function headers(string $name): list<string> {
+        $lower = $name->lower();
+        return $this->headerList->filter(fn($p) => $p[0] == $lower)->map(fn($p) => $p[1]);
+    }
+
+    /** The body parsed as JSON. */
+    public function json(): any {
+        return json_decode($this->body);
+    }
+
+    /** Where a redirect points (`Location`), or null. */
+    public function location(): ?string {
+        return $this->header("location");
+    }
+}
+
+/**
+ * Sends requests to the site and keeps the cookies it sets, like a browser,
+ * so a test can sign in and then open pages that need it.
+ */
+export class TestClient {
+    private map<string, string> $cookies = [];
+
+    public function get(string $path, map<string, string> $headers = []): TestResponse {
+        return $this->request("GET", $path, "", $headers);
+    }
+
+    /** Submits a form (`application/x-www-form-urlencoded`). */
+    public function post(string $path, map<string, string> $form = [], map<string, string> $headers = []): TestResponse {
+        $headers["content-type"] = "application/x-www-form-urlencoded";
+        return $this->request("POST", $path, http_build_query($form), $headers);
+    }
+
+    /** Sends a value as a JSON body. */
+    public function postJson(string $path, any $data, map<string, string> $headers = []): TestResponse {
+        $headers["content-type"] = "application/json";
+        return $this->request("POST", $path, json_encode($data), $headers);
+    }
+
+    public function request(string $method, string $path, string $body = "", map<string, string> $headers = []): TestResponse {
+        $sent = $this->cookies->keys()->filter(fn($k) => ($this->cookies[$k] ?? "") != "");
+        if (!$sent->isEmpty()) {
+            $headers["cookie"] = $sent->map(fn($k) => $k . "=" . ($this->cookies[$k] ?? ""))->join("; ");
+        }
+        $raw = __site_request($method, $path, $headers, $body);
+        list<list<string>> $pairs = [];
+        $i = 2;
+        while ($i + 1 < $raw->len()) {
+            $pairs[] = [$raw[$i]->lower(), $raw[$i + 1]];
+            $i += 2;
+        }
+        $r = new TestResponse($raw[0]->toInt() ?? 0, $raw[1], $pairs);
+        foreach ($r->headers("set-cookie") as $c) {
+            $this->keep($c);
+        }
+        return $r;
+    }
+
+    /** The value of a cookie the site has set, or null. */
+    public function cookie(string $name): ?string {
+        $v = $this->cookies[$name] ?? "";
+        return $v == "" ? null : $v;
+    }
+
+    private function keep(string $setCookie): void {
+        $first = $setCookie->split(";")[0];
+        $at = $first->indexOf("=");
+        if ($at == null) {
+            return;
+        }
+        $name = $first->slice(0, $at)->trim();
+        $value = $first->slice($at + 1)->trim();
+        $expired = $setCookie->lower()->contains("max-age=0") || $setCookie->lower()->contains("max-age=-");
+        // A deleted cookie is kept as "" and not sent.
+        $this->cookies[$name] = $expired ? "" : $value;
+    }
+}

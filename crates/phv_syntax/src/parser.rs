@@ -1459,7 +1459,7 @@ impl Parser {
                 Tok::LParen => {
                     let args = self.args()?;
                     if let ExprKind::Name(n) = &e.kind {
-                        if n == "render" {
+                        if n == "render" || n == "layout" {
                             if let Some(Arg { name: None, value: Expr { kind: ExprKind::Str(path), span } }) =
                                 args.first()
                             {

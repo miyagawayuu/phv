@@ -1,4 +1,5 @@
 mod build;
+mod db;
 mod lsp;
 mod migrate;
 mod pkg;
@@ -21,6 +22,30 @@ use std::time::Duration;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Subcommand)]
+enum DbAction {
+    /// Apply the migrations that have not run yet, in order.
+    Migrate(DbArgs),
+    /// List the migrations and whether each has been applied.
+    Status(DbArgs),
+}
+
+#[derive(clap::Args)]
+struct DbArgs {
+    /// A database of [databases] in phv.toml (PostgreSQL or MySQL).
+    #[arg(long)]
+    db: Option<String>,
+    /// A SQLite file inside the project.
+    #[arg(long)]
+    sqlite: Option<String>,
+    /// The directory of the migration files.
+    #[arg(long, default_value = "migrations")]
+    dir: String,
+    /// The project's directory.
+    #[arg(default_value = ".")]
+    project: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -73,6 +98,11 @@ enum Command {
         /// The executable to write.
         #[arg(short, long)]
         output: PathBuf,
+    },
+    /// Apply the SQL files of migrations/ to a database, or list them.
+    Db {
+        #[command(subcommand)]
+        action: DbAction,
     },
     /// Convert a PHP file to PHV, marking what needs manual work.
     Migrate {
@@ -232,6 +262,13 @@ fn exec(cmd: Command) -> ExitCode {
         }
         Command::Install { dir, locked } => pkg::install(&dir, locked),
         Command::Build { path, output } => build::build(&path, &output),
+        Command::Db { action } => {
+            let (a, apply) = match &action {
+                DbAction::Migrate(a) => (a, true),
+                DbAction::Status(a) => (a, false),
+            };
+            db::run(&a.project, a.db.as_deref(), a.sqlite.as_deref(), &a.dir, apply)
+        }
         Command::Migrate { file, output, force } => {
             let src = match std::fs::read_to_string(&file) {
                 Ok(t) => t,

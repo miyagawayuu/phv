@@ -620,7 +620,7 @@ import lib.legacy.render as render_legacy;
   ディレクトリ)からの `a/b.phv` を読み込む。
 - import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`const`、`type`、`import`)
   しか書けない。モジュールを読み込んでも副作用は起きない。
-- `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`、`std.async`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
+- `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`、`std.async`、`std.validate`、`std.mail`、`std.testing`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
 - 読み込めるのはプロジェクトとパッケージのディレクトリの中のファイルだけ(シンボリックリンクで外に出ることはできない)。
 
 ## 12. テンプレート
@@ -643,6 +643,20 @@ echo render("views/layout.phv.html", title: "Home", body: $html);
 
 - テンプレートは `params(...)` で型付きの引数を宣言する。`render()` の呼び出しはコンパイル時に型チェックされる。
 - `render()` のパスは文字列リテラルで、プロジェクトのルートからの相対パス(`..` は使えない)。拡張子は `.phv.html`。
+- `layout()` はページ全体をレイアウトで包む: それより後にページが書いたものがレイアウトの `$body`(レイアウトが宣言する
+  `Html` の引数)になり、ほかの引数はそのまま渡される。引数はページが終わったときに評価されるので、ページは実行中に
+  それらを設定できる:
+
+  ```phv
+  <?phv
+  layout("views/layout.phv.html", title: $title);
+  $title = "Posts";
+  ?>
+  <ul>...</ul>
+  ```
+
+  `layout()` はページかテンプレートのトップレベルの文で、1 回だけ書ける。途中で終わった(`return` した)ページや失敗した
+  ページは包まれない。
 - `render()` は `Html` を返すので、別のテンプレートにそのまま渡して埋め込める(レイアウト)。
 - テンプレートは開いたものをすべて閉じる。タグ、属性、コメント、`<script>` / `<style>` / `<textarea>` 要素、
   `<svg>` / `<math>` の途中で終わるテンプレートはコンパイルエラー。`Html` の値は `.` で連結できるので、`<a href="` で
@@ -1115,6 +1129,56 @@ echo $res->status, " ", $res->header("content-type") ?? "", "\n", $res->body;
   `url_env` や `headers_env` の環境変数が設定されていないことはリクエストを送るときに報告するので、`phv check` は本番の
   キーなしで使える。
 
+### 入力の検証(std.validate)
+
+```phv
+import std.validate.Validator;
+
+$v = new Validator(request()->formParams);
+$v->required("name")->maxLength("name", 50);
+$v->required("email")->email("email");
+$v->int("age", min: 0, max: 150);
+$v->in("plan", ["free", "pro"]);
+$v->minLength("password", 12)->same("password_again", "password", "the passwords differ");
+$v->check("terms", request()->form("terms") == "yes", "accept the terms");
+if ($v->fails()) {
+    $errors = $v->errors();          // map<string, list<string>>: フィールドごとのメッセージ
+    $first = $v->first("email");     // ?string
+}
+$name = $v->value("name");           // ?string。前後の空白を除く(空なら null)
+```
+
+規則: `required`、`minLength`、`maxLength`(文字数)、`email`、`url`(http と https)、`int` と `number`(`min` / `max`
+付き)、`in`、`same`、独自の検査には `check`。どの規則も最後の引数 `$message` で英語の既定のメッセージを置き換えられる。
+`required` 以外の規則は、フィールドがないか空なら通る。`is_email($s)` はメールアドレスの検査だけを行う。
+
+### メール(std.mail)
+
+```toml
+[mail.default]
+url_env = "SMTP_URL"     # smtps://user:password@smtp.example.com(TLS)、または smtp://...:587(STARTTLS)
+from = "Example <noreply@example.com>"
+# tls = false            # ほかのマシンのサーバーに TLS なしで送る(推奨しない)
+```
+
+```phv
+import std.mail.Mail;
+
+Mail::to($email)
+    ->subject("Welcome")
+    ->text("Thanks for signing up.")
+    ->html(render("views/mail/welcome.phv.html", name: $name))
+    ->send();                        // [mail.default] で送る。[mail.alerts] なら ->send("alerts")
+```
+
+- スクリプトが送れるのは `[mail]` に書いたサーバーだけ。`smtps://` は最初から TLS、`smtp://` は `STARTTLS` で切り替え、
+  ほかのマシンのサーバーはそれを提供しなければならない(`tls = false` のときを除く)。ユーザー名とパスワードは、
+  ほかのマシンへは TLS なしでは決して送らない。
+- アドレスは単純な `name@domain`(表示名なし、改行なし)で、件名にも改行は入れられない(`ValueError`)ので、フォームの
+  値でヘッダーや宛先を増やすことはできない。宛先は 1〜50 件、メッセージは 10 MB まで。テキストの部分は常に送られ、
+  `html()` で HTML の版を加える。
+- 送信はサーバーを待ち(スクリプトの時間制限か 30 秒まで)、失敗すると `NetworkError` を投げる。
+
 ### 非同期 I/O(std.async)
 
 ```phv
@@ -1254,6 +1318,18 @@ rate_limit_store = "cache"  # この Redis のデータベースでレート制�
 
 [server]
 workers = 16            # 同時に実行するスクリプトの数(既定: CPU 数の 2 倍、最小 8)
+static_max_age = 3600   # 静的ファイルの Cache-Control の max-age(既定: 毎回再検証)
+compress = true         # テキストのレスポンスを gzip で圧縮(既定)
+access_log = "logs/access.log"   # アクセスログをこのファイルにも追記
+access_log_format = "json"       # "text"(既定)か "json"
+shutdown_timeout = 30   # サーバーを止めるとき、実行中のリクエストに与える秒数
+
+[cors]
+origins = ["https://app.example.com"]
+
+[mail.default]
+url_env = "SMTP_URL"
+from = "Example <noreply@example.com>"
 
 [fmt]
 width = 100             # phv fmt はこれより長い行を折り返す
@@ -1428,6 +1504,49 @@ function posts_have_titles(): void { /* ... */ }
 function test_import(): void { /* ... */ }
 ```
 
+プロジェクト自身のサイト(`public/` のあるプロジェクト)へのリクエストは `std.testing` で、同じプロセスの中で送る。
+サーバーもネットワークも要らない。ページは開発モードの `phv serve` と同じように実行される(ルート、ミドルウェア、
+セッション、エラーページ)が、フォームに CSRF トークンは要らない。`TestClient` はブラウザと同じくサイトが設定した
+Cookie を保持する:
+
+```phv
+import std.testing.TestClient;
+
+function test_login(): void {
+    $c = new TestClient();
+    assert_eq($c->get("/account")->status, 302);
+    $r = $c->post("/login", ["email" => "ann@example.com", "password" => "secret"]);
+    assert_eq($r->location(), "/account");
+    assert($c->get("/account")->body->contains("Ann"));
+    $api = $c->postJson("/api/notes", ["text" => "hi"]);
+    assert_eq($api->status, 201);
+    assert_eq($api->header("Content-Type"), "application/json");
+}
+```
+
+`TestResponse` は `status`、`body`、`header()`、`headers()`(すべての値)、`json()`、`location()` を持つ。
+
+### データベースのマイグレーション
+
+```
+migrations/
+├── 0001_create_posts.sql
+└── 0002_add_tags.sql
+```
+
+```bash
+phv db status --sqlite data/app.db      # 各ファイルが適用済みか未適用か
+phv db migrate --sqlite data/app.db     # 未適用のものを順に適用
+phv db migrate --db main                # [databases.main] の PostgreSQL / MySQL サーバー
+```
+
+- ファイル名は `<番号>_<名前>.sql` で、番号の順に 1 回ずつ適用する。表 `phv_migrations` に、適用したファイルを本文の
+  チェックサムとともに記録し、適用済みのファイルが後で変わっていたら `migrate` は実行を拒む(変更は新しいファイルに書く)。
+- SQLite と PostgreSQL では、マイグレーションはその記録とともに 1 つのトランザクションで実行されるので、失敗しても何も
+  残らない。MySQL はスキーマの変更をそのつど確定するので、失敗したマイグレーションが途中まで適用されたままになりうる。
+- `--dir` でほかのディレクトリを指定できる。データベースは `--db`(`[databases]` の名前)か `--sqlite`(プロジェクト内の
+  ファイル)で指定する。
+
 ### パッケージ
 
 ```toml
@@ -1533,8 +1652,8 @@ phv migrate legacy/page.php      # page.phv を書き出す
 - **0.6 言語**(実装済み): 分割代入、可変長引数と `...` による展開、関数を値として使う(`strlen(...)`)、
   型エイリアス、enum のすべてのケースを書く必要がある `match`、型パラメータの制約、定数式、`import ... as`、
   ヒアドキュメント、原因とトレースを持つ例外。
-- **0.7 Web アプリケーション**: パラメータ付きのルート(`public/posts/[id].phv`)、ミドルウェア、独自のエラーページ、
-  フォームの検証、スロット付きのレイアウト、CORS、静的ファイルの圧縮とキャッシュのヘッダー、グレースフル
+- **0.7 Web アプリケーション**(実装済み): パラメータ付きのルート(`public/posts/[id].phv`)、ミドルウェア、独自のエラーページ、
+  フォームの検証、レイアウト、CORS、静的ファイルの圧縮とキャッシュのヘッダー、グレースフル
   シャットダウン、アクセスログ、データベースのマイグレーション、`phv test` 用の HTTP クライアント、メール送信。
 - **0.8 標準ライブラリ**: 正規表現、書式付きの文字列、list と map のメソッドの追加と `Set` 型、数学関数、
   タイムゾーン付きの日時、クラスへの JSON のデコード、暗号化と署名付きトークン、UUID、ディレクトリ、ログ、

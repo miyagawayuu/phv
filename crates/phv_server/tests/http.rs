@@ -491,3 +491,49 @@ fn caching_ranges_gzip_cors_and_shutdown() {
     assert_eq!(first["status"], 200);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `std.testing`: a test script sends requests to the site in-process and
+/// keeps its cookies.
+#[test]
+fn test_client_runs_pages_in_process() {
+    let dir = std::env::temp_dir().join(format!("phv-test-site-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phv.toml", "");
+    write(
+        &dir,
+        "public/items/[id].phv",
+        "<?phv\nimport std.http.request;\necho \"item \", request()->param(\"id\") ?? \"\";\n",
+    );
+    write(
+        &dir,
+        "public/login.phv",
+        "<?phv\nimport std.http.{request, response, session};\nsession()->set(\"user\", request()->form(\"name\") ?? \"\");\nresponse()->redirect(\"/me\");\n",
+    );
+    write(
+        &dir,
+        "public/me.phv",
+        "<?phv\nimport std.http.session;\necho \"hi \", session()->get(\"user\") ?? \"nobody\";\n",
+    );
+    write(
+        &dir,
+        "check.phv",
+        "<?phv\nimport std.testing.TestClient;\n$c = new TestClient();\necho $c->get(\"/items/7\")->body, \"|\";\n\
+         echo $c->get(\"/missing\")->status, \"|\";\n$r = $c->post(\"/login\", [\"name\" => \"ann\"]);\n\
+         echo $r->status, \" \", $r->location() ?? \"\", \"|\", $c->get(\"/me\")->body;\n",
+    );
+    let site = phv_server::test_site(&dir).unwrap();
+    let root = dir.canonicalize().unwrap();
+    let c = phv_driver::compile(&root, &root.join("check.phv")).unwrap_or_else(|e| panic!("{}", e.render(false)));
+    let mut host = (*phv_driver::load_config(&root).unwrap().host).clone();
+    host.site = Some(site);
+    let opts = phv_driver::RunOptions {
+        html: false,
+        limits: Default::default(),
+        http: None,
+        host: Some(std::sync::Arc::new(host)),
+    };
+    let out = phv_driver::run(&c, opts);
+    assert!(out.error.is_none(), "{}", out.error.map(|e| e.render()).unwrap_or_default());
+    assert_eq!(out.output, "item 7|404|302 /me|hi ann");
+    let _ = std::fs::remove_dir_all(&dir);
+}

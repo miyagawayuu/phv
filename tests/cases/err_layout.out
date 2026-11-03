@@ -1,0 +1,22 @@
+error: `layout()` must be a statement at the top level of a page or template
+ --> err_layout.phv:3:5
+  |
+3 |     layout("views/layout.phv.html", title: "x");
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: a page has at most one layout; it wraps what the page writes after it
+
+error: `layout()` must be a statement at the top level of a page or template
+ --> err_layout.phv:6:1
+  |
+6 | layout("views/layout.phv.html", title: "b");
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: a page has at most one layout; it wraps what the page writes after it
+
+error: `layout()` must be a statement at the top level of a page or template
+ --> err_layout.phv:7:1
+  |
+7 | layout("views/list.phv.html");
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: a page has at most one layout; it wraps what the page writes after it
+
+3 errors found
