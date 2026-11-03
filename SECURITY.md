@@ -12,8 +12,8 @@ PHV is pre-1.0. Security fixes are made on the latest release only.
 
 | Version | Supported |
 |---|---|
-| 0.2.x | Yes |
-| < 0.2 | No |
+| 0.4.x | Yes |
+| < 0.4 | No |
 
 ## Reporting a vulnerability
 
@@ -63,5 +63,7 @@ Not vulnerabilities on their own:
 ## Known limitations
 
 The remaining risks that are accepted by design are listed in
-[docs/security-audit.md](docs/security-audit.md) (§5), together with the
-results of the audits done so far.
+[docs/security-audit.md](docs/security-audit.md) (§5 and the residual risks
+at the end of each later assessment), together with the results of the audits
+done so far. Every release is audited before it is published; see
+[docs/releasing.md](docs/releasing.md).

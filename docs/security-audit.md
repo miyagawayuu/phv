@@ -1,11 +1,11 @@
-# PHV Security Audit Report (v0.2)
+# PHV Security Audit Report
 
 English | [日本語](security-audit.ja.md)
 
 This report consolidates four audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
 §8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), and §9 covers what was added up to v0.4.0.
 
-Date: 2026-11-02
+Date: 2026-11-02 (§9: 2026-11-03)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
