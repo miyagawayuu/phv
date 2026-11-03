@@ -132,7 +132,7 @@ error: a URL attribute cannot start with an unchecked value
 | `phv_types` | Name resolution, type checking, narrowing, definite assignment → typed HIR; builtin signatures |
 | `phv_compiler` | HIR → register bytecode |
 | `phv_vm` | Values, bytecode format, interpreter, runtime limits |
-| `phv_jit` | Native code for functions that only use int/bool values (Cranelift) |
+| `phv_jit` | Native code for functions that use int/bool/float/string values (Cranelift) |
 | `phv_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, PostgreSQL, MySQL, Redis, WebSocket, HTTP client, background work, sessions) and the prelude, `std.http`, `std.db`, `std.net` and `std.async` written in PHV |
 | `phv_driver` | Loading modules and templates, `phv.toml`, bytecode cache, running programs |
 | `phv_server` | Web server (hyper + tokio), routing, sessions, CSRF, uploads |
@@ -163,15 +163,17 @@ published.
 
 | Benchmark | PHV (JIT) | PHV (interpreter) | CPython 3.13 |
 |---|---:|---:|---:|
-| `fib(30)` (recursive calls) | 6.7 ms | 80 ms | 94 ms |
-| 10 million loop iterations | 13 ms | 284 ms | 326 ms |
-| Concatenating 1 million characters | 24 ms | 25 ms | 65 ms |
-| map / filter / sum over 1 million elements | 184 ms | 179 ms | 87 ms |
-| 200,000 map updates | 44 ms | 46 ms | 34 ms |
+| `fib(30)` (recursive calls) | 6.7 ms | 80 ms | 100 ms |
+| 10 million loop iterations | 13 ms | 296 ms | 329 ms |
+| Concatenating 1 million characters | 20 ms | 28 ms | 65 ms |
+| Mandelbrot 300×300 (floats) | 4.0 ms | 249 ms | 196 ms |
+| Building 1 million strings from numbers | 633 ms | 677 ms | 342 ms |
+| map / filter / sum over 1 million elements | 179 ms | 179 ms | 87 ms |
+| 200,000 map updates | 45 ms | 72 ms | 34 ms |
 
-The JIT compiles functions whose values are all `int` / `bool`. Code that relies on closures or strings runs in
-the interpreter and, as the table shows, can be slower than CPython (to be improved). Set `PHV_JIT=0` to turn
-the JIT off.
+The JIT compiles functions whose values are all `int`, `bool`, `float` or `string`. Code that relies on closures,
+lists or maps runs in the interpreter and, as the table shows, can be slower than CPython; so is turning many
+numbers into strings, where formatting dominates (to be improved). Set `PHV_JIT=0` to turn the JIT off.
 
 ## License
 

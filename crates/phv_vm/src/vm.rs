@@ -4,6 +4,8 @@
 //! request; the compiled `Program` is shared and immutable.
 
 use crate::bytecode::*;
+use crate::jit::*;
+pub use crate::jit::{JitCtx, JitEntry, JitLimits, JitTable};
 use crate::value::*;
 use indexmap::IndexMap;
 use std::cell::RefCell;
@@ -240,63 +242,7 @@ impl std::fmt::Debug for HttpSpec {
 
 const MAX_NATIVE_DEPTH: u32 = 200;
 
-// ----- JIT interface -------------------------------------------------------
-
-/// Shared state between the VM and natively compiled code (layout is fixed:
-/// the JIT reads and writes these fields by offset).
-#[repr(C)]
-pub struct JitCtx {
-    /// Set by native code: 0 = ok, see `JIT_ERR_*`.
-    pub error: i64,
-    pub depth: i64,
-    pub max_depth: i64,
-    /// Decremented at loop back-edges and calls; at zero `phv_jit_tick` runs.
-    pub budget: i64,
-    pub limits: *const JitLimits,
-}
-
-pub const JIT_ERR_OVERFLOW: i64 = 1;
-pub const JIT_ERR_DIV_ZERO: i64 = 2;
-pub const JIT_ERR_DEPTH: i64 = 3;
-pub const JIT_ERR_TIME: i64 = 4;
-pub const JIT_ERR_MEMORY: i64 = 5;
-pub const JIT_ERR_SHIFT: i64 = 6;
-
-pub struct JitLimits {
-    pub deadline: Option<Instant>,
-    pub max_memory: Option<usize>,
-    pub mem_base: isize,
-}
-
-/// Called by native code when its budget runs out: checks the time and memory limits.
-///
-/// # Safety
-/// `ctx` must point to a live `JitCtx` whose `limits` points to live `JitLimits`.
-pub unsafe extern "C" fn phv_jit_tick(ctx: *mut JitCtx) -> i64 {
-    let ctx = &mut *ctx;
-    ctx.budget = BUDGET as i64;
-    let limits = &*ctx.limits;
-    if limits.deadline.is_some_and(|d| Instant::now() > d) {
-        return JIT_ERR_TIME;
-    }
-    if let Some(max) = limits.max_memory {
-        if crate::alloc::thread_allocated() - limits.mem_base > max as isize {
-            return JIT_ERR_MEMORY;
-        }
-    }
-    0
-}
-
-/// Entry point of a compiled function: `(ctx, pointer to the i64 arguments) -> result`.
-pub type JitEntry = unsafe extern "C" fn(*mut JitCtx, *const i64) -> i64;
-
-/// Native code for the functions the JIT compiled, indexed by function id.
-pub struct JitTable {
-    pub entries: Vec<Option<JitEntry>>,
-    /// Owns the executable memory the entries point into.
-    pub keep_alive: Box<dyn std::any::Any + Send + Sync>,
-}
-const BUDGET: u32 = 10_000;
+pub(crate) const BUDGET: u32 = 10_000;
 
 struct Frame {
     func: u32,
@@ -328,6 +274,7 @@ pub struct Vm {
     /// Native handles owned by this run (e.g. database connections).
     pub resources: Vec<Option<Box<dyn std::any::Any>>>,
     pub jit: Option<Arc<JitTable>>,
+    jit_rt: JitRt,
     limits: Limits,
     mem_base: isize,
     deadline: Option<Instant>,
@@ -358,6 +305,127 @@ impl Drop for Vm {
 #[inline(never)]
 fn bad(expected: &str, v: &Value) -> ! {
     panic!("phv vm: expected {expected}, found {} (compiler bug)", v.type_name())
+}
+
+/// The memory limit of a run, as the interpreter and native code check it.
+#[derive(Clone, Copy)]
+pub(crate) struct MemLimit {
+    pub max: Option<usize>,
+    pub base: isize,
+}
+
+impl MemLimit {
+    fn used(&self) -> isize {
+        crate::alloc::thread_allocated() - self.base
+    }
+
+    /// Fails before an allocation of `bytes` that would exceed the limit (or
+    /// 4 GB without one); the error holds that limit.
+    pub fn reserve(&self, bytes: usize) -> Result<(), usize> {
+        let limit = self.max.unwrap_or(4 << 30);
+        let used = self.used().max(0) as usize;
+        if bytes > limit || used.saturating_add(bytes) > limit {
+            return Err(limit);
+        }
+        Ok(())
+    }
+
+    /// Fails when more than the limit has been allocated; the error holds the limit.
+    pub fn check(&self) -> Result<(), usize> {
+        match self.max {
+            Some(max) if self.used() > max as isize => Err(max),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn memory_error(limit: usize) -> VmError {
+    VmError::Fatal(format!("allowed memory size of {} MB exhausted", limit / (1024 * 1024)))
+}
+
+// String instructions, shared by the interpreter and the JIT's helpers.
+// `regs` is the function's register window.
+
+/// `ToStr`: the string form of a scalar.
+pub(crate) fn op_to_str(regs: &mut [Value], d: Reg, a: Reg) {
+    let v = match &regs[a as usize] {
+        Value::Str(s) => Value::Str(s.clone()),
+        other => Value::str(other.to_display_string()),
+    };
+    regs[d as usize] = v;
+}
+
+/// `Concat`: joins `n` registers from `start`. The error is the memory limit.
+pub(crate) fn op_concat(
+    regs: &mut [Value],
+    mem: MemLimit,
+    d: Reg,
+    start: Reg,
+    n: u16,
+    html: bool,
+) -> Result<(), usize> {
+    let parts = &regs[start as usize..start as usize + n as usize];
+    let mut size = 0usize;
+    for p in parts {
+        size += match p {
+            Value::Str(s) | Value::Html(s) => s.len(),
+            _ => 24,
+        };
+    }
+    // Escaping can make a string up to 6 times longer (`"` -> `&quot;`).
+    let need = if html { size.saturating_mul(6) } else { size };
+    if need > 1 << 12 {
+        mem.reserve(need)?;
+    }
+    let mut s = String::with_capacity(size);
+    for p in parts {
+        match p {
+            // An `Html` result never contains unescaped plain strings.
+            Value::Str(x) if html => html_escape_into(x, &mut s),
+            v => v.append_to(&mut s),
+        }
+    }
+    let big = s.len() > 1 << 20;
+    regs[d as usize] = if html { Value::html(s) } else { Value::str(s) };
+    if big {
+        mem.check()?;
+    }
+    Ok(())
+}
+
+/// `AppendStr`: `$d .= $s`, in place when the string is not shared. The
+/// error is the memory limit.
+pub(crate) fn op_append(regs: &mut [Value], mem: MemLimit, d: Reg, s: Reg) -> Result<(), usize> {
+    let src = regs[s as usize].clone();
+    let grow = match &src {
+        Value::Str(x) | Value::Html(x) => x.len(),
+        _ => 24,
+    };
+    let cur = match &regs[d as usize] {
+        Value::Str(x) => x.capacity(),
+        _ => 0,
+    };
+    if grow > 1 << 20 || (cur > 1 << 20 && cur < grow + cur) {
+        // The string may double its buffer.
+        mem.reserve(grow.max(cur) * 2)?;
+    }
+    let len = match &mut regs[d as usize] {
+        Value::Str(rc) => {
+            let s = Rc::make_mut(rc);
+            src.append_to(s);
+            s.len()
+        }
+        v => bad("string", v),
+    };
+    if len > 1 << 20 && len.is_power_of_two() {
+        mem.check()?;
+    }
+    Ok(())
+}
+
+/// Ordering of two floats for `<`, `<=` and `<=>`, like `compare` (NaN compares equal).
+fn float_order(x: f64, y: f64) -> std::cmp::Ordering {
+    x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
 }
 
 pub fn const_value(c: &Const) -> Value {
@@ -391,6 +459,7 @@ impl Vm {
             host: Arc::new(Host::default()),
             resources: Vec::new(),
             jit: None,
+            jit_rt: JitRt::default(),
             limits,
             mem_base: crate::alloc::thread_allocated(),
             deadline: limits.max_time.map(|d| Instant::now() + d),
@@ -569,62 +638,82 @@ impl Vm {
         Ok(())
     }
 
-    /// Runs natively compiled function `func` with arguments from `args`.
-    fn call_jit(&mut self, entry: JitEntry, func: u32, args: &[Value]) -> Result<Value, VmError> {
-        let mut raw = vec![0i64; args.len().max(16)];
-        for (i, a) in args.iter().enumerate() {
-            raw[i] = match a {
-                Value::Int(n) => *n,
-                Value::Bool(b) => *b as i64,
-                v => bad("int or bool", v),
+    /// Runs natively compiled function `func` with arguments `args`.
+    fn call_jit(&mut self, entry: JitEntry, func: u32, args: Vec<Value>) -> Result<Value, VmError> {
+        let prog = Arc::clone(&self.prog);
+        let sig =
+            prog.funcs[func as usize].native.as_ref().expect("JIT entry for a function without a native signature");
+        // The JIT compiles at most 16 parameters.
+        let mut raw = [0i64; 16];
+        if args.len() != sig.params.len() {
+            panic!("phv vm: native call with {} arguments for {} parameters", args.len(), sig.params.len());
+        }
+        for (i, (a, k)) in args.iter().zip(&sig.params).enumerate() {
+            raw[i] = match (k, a) {
+                (ValKind::Int, Value::Int(n)) => *n,
+                (ValKind::Bool, Value::Bool(b)) => *b as i64,
+                (ValKind::Float, Value::Float(f)) => f.to_bits() as i64,
+                (ValKind::Str, Value::Str(_)) => 0,
+                (_, v) => bad("an argument of the native signature", v),
             };
         }
         let limits = JitLimits { deadline: self.deadline, max_memory: self.limits.max_memory, mem_base: self.mem_base };
+        let mut rt = std::mem::take(&mut self.jit_rt);
+        rt.prog.get_or_insert_with(|| Arc::clone(&self.prog));
+        rt.consts = std::mem::take(&mut self.consts);
+        rt.start(args);
         let mut ctx = JitCtx {
             error: 0,
             depth: self.frames.len() as i64,
             max_depth: self.limits.max_frames as i64,
             budget: self.budget as i64,
             limits: &limits,
+            detail: 0,
+            rt: &mut rt,
         };
-        // SAFETY: the JIT only creates entries for functions whose arguments
-        // are all ints/bools (checked above), and `ctx`/`limits` outlive the call.
+        // SAFETY: the JIT creates entries only for functions it checked
+        // (`phv_jit::well_formed`), the arguments match their native signature
+        // (checked above), and `ctx`, `limits` and `rt` outlive the call.
         let r = unsafe { entry(&mut ctx, raw.as_ptr()) };
+        let ret = rt.finish();
+        self.consts = std::mem::take(&mut rt.consts);
+        self.jit_rt = rt;
         self.budget = ctx.budget.clamp(1, BUDGET as i64) as u32;
         match ctx.error {
             0 => {}
             JIT_ERR_OVERFLOW => return Err(self.throw("ArithmeticError", "integer overflow")),
             JIT_ERR_DIV_ZERO => return Err(self.throw("DivisionByZeroError", "modulo by zero")),
+            JIT_ERR_FDIV_ZERO => return Err(self.throw("DivisionByZeroError", "division by zero")),
             JIT_ERR_SHIFT => return Err(self.throw("ArithmeticError", "bit shift by a negative number")),
-            JIT_ERR_DEPTH => return Err(VmError::Fatal("maximum call stack depth exceeded".into())),
-            JIT_ERR_MEMORY => {
-                return Err(VmError::Fatal(format!(
-                    "allowed memory size of {} MB exhausted",
-                    self.limits.max_memory.unwrap_or(0) / (1024 * 1024)
-                )))
+            JIT_ERR_FLOAT_TO_INT => {
+                let f = f64::from_bits(ctx.detail as u64);
+                return Err(self.throw("ValueError", format!("cannot convert {} to int", format_float(f))));
             }
+            JIT_ERR_DEPTH => return Err(VmError::Fatal("maximum call stack depth exceeded".into())),
+            JIT_ERR_MEMORY => return Err(memory_error(self.limits.max_memory.unwrap_or(4 << 30))),
             _ => {
                 let secs = self.limits.max_time.map(|t| t.as_secs_f64()).unwrap_or(0.0);
                 return Err(VmError::Fatal(format!("maximum execution time of {secs} seconds exceeded")));
             }
         }
-        Ok(match self.prog.funcs[func as usize].native.as_ref().map(|s| s.ret) {
-            Some(ValKind::Int) => Value::Int(r),
-            Some(ValKind::Bool) => Value::Bool(r != 0),
-            _ => Value::Null,
+        Ok(match sig.ret {
+            ValKind::Int => Value::Int(r),
+            ValKind::Bool => Value::Bool(r != 0),
+            ValKind::Float => Value::Float(f64::from_bits(r as u64)),
+            ValKind::Str => ret,
+            ValKind::Void => Value::Null,
         })
+    }
+
+    fn mem(&self) -> MemLimit {
+        MemLimit { max: self.limits.max_memory, base: self.mem_base }
     }
 
     /// Fails before an allocation of `bytes` that would exceed the memory limit
     /// (or 4 GB without one). Builtins call this before building large values,
     /// because a failed allocation would abort the whole process.
     pub fn reserve(&self, bytes: usize) -> Result<(), VmError> {
-        let limit = self.limits.max_memory.unwrap_or(4 << 30);
-        let used = (crate::alloc::thread_allocated() - self.mem_base).max(0) as usize;
-        if bytes > limit || used.saturating_add(bytes) > limit {
-            return Err(VmError::Fatal(format!("allowed memory size of {} MB exhausted", limit / (1024 * 1024))));
-        }
-        Ok(())
+        self.mem().reserve(bytes).map_err(memory_error)
     }
 
     /// The per-run memory limit in bytes, if any.
@@ -666,13 +755,7 @@ impl Vm {
 
     /// Fails when the script has allocated more than its memory limit.
     pub fn check_memory(&self) -> Result<(), VmError> {
-        if let Some(max) = self.limits.max_memory {
-            let used = crate::alloc::thread_allocated() - self.mem_base;
-            if used > max as isize {
-                return Err(VmError::Fatal(format!("allowed memory size of {} MB exhausted", max / (1024 * 1024))));
-            }
-        }
-        Ok(())
+        self.mem().check().map_err(memory_error)
     }
 
     #[cold]
@@ -989,6 +1072,11 @@ impl Vm {
                         let v = compare(&reg!(*a), &reg!(*b)) as i64;
                         reg!(*d) = Value::Int(v);
                     }
+                    Instr::EqF(d, a, b) => reg!(*d) = Value::Bool(float!(*a) == float!(*b)),
+                    Instr::NeF(d, a, b) => reg!(*d) = Value::Bool(float!(*a) != float!(*b)),
+                    Instr::LtF(d, a, b) => reg!(*d) = Value::Bool(float_order(float!(*a), float!(*b)).is_lt()),
+                    Instr::LeF(d, a, b) => reg!(*d) = Value::Bool(float_order(float!(*a), float!(*b)).is_le()),
+                    Instr::CmpF(d, a, b) => reg!(*d) = Value::Int(float_order(float!(*a), float!(*b)) as i64),
 
                     Instr::IntToFloat(d, a) => reg!(*d) = Value::Float(int!(*a) as f64),
                     Instr::FloatToInt(d, a) => {
@@ -998,65 +1086,14 @@ impl Vm {
                         }
                         reg!(*d) = Value::Int(f.trunc() as i64);
                     }
-                    Instr::ToStr(d, a) => {
-                        let v = match &reg!(*a) {
-                            Value::Str(s) => Value::Str(s.clone()),
-                            other => Value::str(other.to_display_string()),
-                        };
-                        reg!(*d) = v;
-                    }
+                    Instr::ToStr(d, a) => op_to_str(&mut self.regs[base..], *d, *a),
                     Instr::Concat(d, start, n, html) => {
-                        let mut size = 0usize;
-                        for i in 0..*n {
-                            size += match &self.regs[base + (*start + i) as usize] {
-                                Value::Str(s) | Value::Html(s) => s.len(),
-                                _ => 24,
-                            };
-                        }
-                        // Escaping can make a string up to 6 times longer (`"` -> `&quot;`).
-                        let need = if *html { size.saturating_mul(6) } else { size };
-                        if need > 1 << 12 {
-                            tri!(self.reserve(need));
-                        }
-                        let mut s = String::with_capacity(size);
-                        for i in 0..*n {
-                            match &self.regs[base + (*start + i) as usize] {
-                                // An `Html` result never contains unescaped plain strings.
-                                Value::Str(x) if *html => html_escape_into(x, &mut s),
-                                v => v.append_to(&mut s),
-                            }
-                        }
-                        let big = s.len() > 1 << 20;
-                        reg!(*d) = if *html { Value::html(s) } else { Value::str(s) };
-                        if big {
-                            tri!(self.check_memory());
-                        }
+                        let mem = self.mem();
+                        tri!(op_concat(&mut self.regs[base..], mem, *d, *start, *n, *html).map_err(memory_error));
                     }
                     Instr::AppendStr(d, s) => {
-                        let src = reg!(*s).clone();
-                        let grow = match &src {
-                            Value::Str(x) | Value::Html(x) => x.len(),
-                            _ => 24,
-                        };
-                        let cur = match &reg!(*d) {
-                            Value::Str(x) => x.capacity(),
-                            _ => 0,
-                        };
-                        if grow > 1 << 20 || (cur > 1 << 20 && cur < grow + cur) {
-                            // The string may double its buffer.
-                            tri!(self.reserve(grow.max(cur) * 2));
-                        }
-                        let len = match &mut reg!(*d) {
-                            Value::Str(rc) => {
-                                let s = Rc::make_mut(rc);
-                                src.append_to(s);
-                                s.len()
-                            }
-                            v => bad("string", v),
-                        };
-                        if len > 1 << 20 && len.is_power_of_two() {
-                            tri!(self.check_memory());
-                        }
+                        let mem = self.mem();
+                        tri!(op_append(&mut self.regs[base..], mem, *d, *s).map_err(memory_error));
                     }
 
                     Instr::Jump(t) => {
@@ -1109,10 +1146,12 @@ impl Vm {
                     Instr::Call { dst, func: callee, args, argc } => {
                         let entry = self.jit.as_ref().and_then(|j| j.entries.get(*callee as usize).copied().flatten());
                         if let Some(entry) = entry {
+                            // Arguments are moved, as into an interpreted call.
                             let start = base + *args as usize;
-                            let argv: Vec<Value> = self.regs[start..start + *argc as usize].to_vec();
+                            let argv: Vec<Value> =
+                                self.regs[start..start + *argc as usize].iter_mut().map(std::mem::take).collect();
                             self.frames[fi].pc = pc as u32;
-                            let v = tri!(self.call_jit(entry, *callee, &argv));
+                            let v = tri!(self.call_jit(entry, *callee, argv));
                             reg!(*dst) = v;
                             continue;
                         }

@@ -2,6 +2,7 @@
 
 pub mod alloc;
 pub mod bytecode;
+pub mod jit;
 pub mod value;
 pub mod vm;
 

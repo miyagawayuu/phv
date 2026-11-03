@@ -25,6 +25,40 @@ function build_string(int $n): string {
     return $s;
 }
 
+function mandelbrot(int $size): int {
+    $inside = 0;
+    for ($y = 0; $y < $size; $y++) {
+        for ($x = 0; $x < $size; $x++) {
+            $cr = 2.5 * $x / $size - 2.0;
+            $ci = 2.0 * $y / $size - 1.0;
+            $zr = 0.0;
+            $zi = 0.0;
+            $k = 0;
+            while ($k < 50 && $zr * $zr + $zi * $zi <= 4.0) {
+                $t = $zr * $zr - $zi * $zi + $cr;
+                $zi = 2.0 * $zr * $zi + $ci;
+                $zr = $t;
+                $k++;
+            }
+            if ($k == 50) {
+                $inside++;
+            }
+        }
+    }
+    return $inside;
+}
+
+function concat_items(int $n): int {
+    $total = 0;
+    for ($i = 0; $i < $n; $i++) {
+        $s = "item-" . $i . ": " . ($i * 0.5);
+        if ($s < "item-5") {
+            $total += strlen($s);
+        }
+    }
+    return $total;
+}
+
 function map_filter(int $n): int {
     return range(1, $n)->map(fn($x) => $x * 2)->filter(fn($x) => $x % 3 == 0)->sum();
 }
@@ -53,6 +87,16 @@ echo "loop 10M: $r: ", ms($t), "\n";
 $t = microtime();
 $r = build_string(1000000)->len();
 echo "append 1M chars ($r): ", ms($t), "\n";
+
+$t = microtime();
+$r = mandelbrot(300);
+echo "mandelbrot 300x300 ($r inside): ", ms($t), "
+";
+
+$t = microtime();
+$r = concat_items(1000000);
+echo "concat 1M ($r): ", ms($t), "
+";
 
 $t = microtime();
 $r = map_filter(1000000);

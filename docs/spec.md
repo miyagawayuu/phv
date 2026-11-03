@@ -1238,9 +1238,15 @@ It then runs the type checker and shows the places that need manual work, such a
 3. Compilation to register-based bytecode (type-specialized instructions such as `AddI`, `LtI`, and `JumpIfNotLtIImm`)
 4. Execution
    - **Interpreter**: written entirely in safe Rust. Strings, lists, and maps use reference counting + copy-on-write.
-   - **JIT** (Cranelift): functions in which every value is an `int`/`bool` (numeric loops and recursion) are compiled to native code.
-     Overflow, modulo by zero, negative shifts, recursion depth, and the execution time and memory limits are checked in the JIT just as in the interpreter.
-     It can be disabled with `PHV_JIT=0`. The stack trace of an exception raised inside the JIT goes back only as far as the caller.
+   - **JIT** (Cranelift): functions whose locals are all `int`, `bool`, `float` or `string` are compiled to native code
+     when every instruction they use is supported (arithmetic, comparisons, conversions, string constants, `.`, `.=`,
+     `(string)`, `strlen()` and `->len()`). Numbers stay in machine registers; strings live in a register window and
+     are handled by the interpreter's own code, so results, error messages and memory checks are identical.
+     Integer overflow, division and modulo by zero, negative shifts, out-of-range float to int conversion, recursion
+     depth, and the execution time and memory limits are checked in the JIT just as in the interpreter. Before
+     compiling, the JIT checks every instruction and the kind of every register on every path, so bytecode from the
+     cache is never trusted. It can be disabled with `PHV_JIT=0`. The stack trace of an exception raised inside the JIT
+     goes back only as far as the caller.
 5. **Bytecode cache**: `phv run` and `phv serve` save compiled output in `.phv-cache/` and reuse it
    if neither the source files nor the `phv` binary have changed.
    - The cache is signed with an HMAC using a per-user key (`%LOCALAPPDATA%\phv\cache.key`, `~/.cache/phv/cache.key`), and entries whose
@@ -1264,11 +1270,13 @@ It then runs the type checker and shows the places that need manual work, such a
 | Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits) |
 
 `unsafe` is used only in the allocator that counts memory usage (`phv_vm/src/alloc.rs`), in the JIT
-(`phv_jit`, for calling generated code), in calls to OS file APIs (`phv_std/src/safefs.rs`) and in the SQLite VFS
+(`phv_jit`, for calling generated code, and the helpers it calls in `phv_vm/src/jit.rs`), in calls to OS file APIs (`phv_std/src/safefs.rs`) and in the SQLite VFS
 that checks journal files (`phv_std/src/db/vfs.rs`).
 
 ## 18. Roadmap
 
-- Wider JIT coverage (functions that handle floats and strings)
+The items planned so far are all implemented: generic classes, annotations, asynchronous I/O, wider JIT coverage,
+`phv build`, packages of packages and a registry, line wrapping in `phv fmt`, rate limits shared between processes,
+and sessions stored in a database.
 
 See [security-audit.md](security-audit.md) for the results of the security audit and the remaining risks.

@@ -274,6 +274,17 @@ impl<'a> FnC<'a> {
         t
     }
 
+    /// Like `operand`, but an int is converted to a float.
+    fn float_operand(&mut self, e: &HExpr) -> Reg {
+        let r = self.operand(e);
+        if e.ty != Type::Int {
+            return r;
+        }
+        let t = self.alloc();
+        self.emit(Instr::IntToFloat(t, r));
+        t
+    }
+
     fn args(&mut self, args: &[HExpr]) -> Reg {
         let start = self.alloc_n(args.len());
         for (i, a) in args.iter().enumerate() {
@@ -336,6 +347,13 @@ impl<'a> FnC<'a> {
                 let n = small_int(b).unwrap();
                 self.off = off;
                 self.emit(if *k == BinKind::AddI { Instr::AddIImm(dst, ra, n) } else { Instr::SubIImm(dst, ra, n) });
+            }
+            HExprKind::Binary(k, a, b, swap) if float_pair(*k, a, b) => {
+                let ra = self.float_operand(a);
+                let rb = self.float_operand(b);
+                let (x, y) = if *swap { (rb, ra) } else { (ra, rb) };
+                self.off = off;
+                self.emit(float_cmp(*k, dst, x, y));
             }
             HExprKind::Binary(k, a, b, swap) => {
                 let ra = self.operand(a);
@@ -506,9 +524,12 @@ impl<'a> FnC<'a> {
                             Some((sr, sty)) => {
                                 let rc = self.operand(c);
                                 let t = self.alloc();
-                                let kind =
-                                    if *sty == Type::Int && c.ty == Type::Int { BinKind::EqI } else { BinKind::Eq };
-                                self.emit(bin_instr(kind, t, *sr, rc));
+                                let ins = match (sty, &c.ty) {
+                                    (Type::Int, Type::Int) => bin_instr(BinKind::EqI, t, *sr, rc),
+                                    (Type::Float, Type::Float) => Instr::EqF(t, *sr, rc),
+                                    _ => bin_instr(BinKind::Eq, t, *sr, rc),
+                                };
+                                self.emit(ins);
                                 jumps.push(self.emit(Instr::JumpIfTrue(t, 0)));
                             }
                             None => {
@@ -990,11 +1011,14 @@ impl<'a> FnC<'a> {
     }
 }
 
-/// A function whose every local is an int or bool may be compiled natively.
+/// A function whose every local is an int, bool, float or string may be
+/// compiled natively.
 fn native_sig(f: &HFunc) -> Option<NativeSig> {
     let kind = |t: &Type| match t {
         Type::Int => Some(ValKind::Int),
         Type::Bool => Some(ValKind::Bool),
+        Type::Float => Some(ValKind::Float),
+        Type::Str => Some(ValKind::Str),
         _ => None,
     };
     if f.kind != FuncKind::Normal || !f.captures.is_empty() || f.params.len() > 16 {
@@ -1009,6 +1033,24 @@ fn native_sig(f: &HFunc) -> Option<NativeSig> {
         t => kind(t)?,
     };
     Some(NativeSig { params, ret })
+}
+
+/// Whether `k` compares two numbers, at least one of them a float.
+fn float_pair(k: BinKind, a: &HExpr, b: &HExpr) -> bool {
+    matches!(k, BinKind::Eq | BinKind::Ne | BinKind::Lt | BinKind::Le | BinKind::Cmp)
+        && matches!((&a.ty, &b.ty), (Type::Float, Type::Float) | (Type::Int, Type::Float) | (Type::Float, Type::Int))
+}
+
+/// The float form of a comparison, which gives the same results as the generic
+/// one once an int operand is converted (`values_equal` and `compare` convert it too).
+fn float_cmp(k: BinKind, d: Reg, a: Reg, b: Reg) -> Instr {
+    match k {
+        BinKind::Eq => Instr::EqF(d, a, b),
+        BinKind::Ne => Instr::NeF(d, a, b),
+        BinKind::Lt => Instr::LtF(d, a, b),
+        BinKind::Le => Instr::LeF(d, a, b),
+        _ => Instr::CmpF(d, a, b),
+    }
 }
 
 /// An int constant that fits an immediate operand.

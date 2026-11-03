@@ -26,7 +26,7 @@ pub struct Compiled {
     pub warnings: String,
     /// Source file id of the entry script.
     pub entry_file: u32,
-    /// Native code for int/bool-only functions (see `enable_jit`).
+    /// Native code for the functions the JIT can compile (see `enable_jit`).
     pub jit: Option<Arc<phv_vm::JitTable>>,
     /// Loaded from the on-disk bytecode cache.
     pub from_cache: bool,

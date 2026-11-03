@@ -91,6 +91,13 @@ pub enum Instr {
     Lt(Reg, Reg, Reg),
     Le(Reg, Reg, Reg),
     Cmp(Reg, Reg, Reg),
+    /// `==`, `!=`, `<`, `<=` and `<=>` on two floats (the compiler converts an
+    /// int operand first), with the same results as the generic forms.
+    EqF(Reg, Reg, Reg),
+    NeF(Reg, Reg, Reg),
+    LtF(Reg, Reg, Reg),
+    LeF(Reg, Reg, Reg),
+    CmpF(Reg, Reg, Reg),
 
     IntToFloat(Reg, Reg),
     FloatToInt(Reg, Reg),
@@ -201,11 +208,14 @@ pub enum Instr {
 pub enum ValKind {
     Int,
     Bool,
+    Float,
+    Str,
     Void,
 }
 
-/// Present when every register of a function holds an `int` or `bool`, so
-/// the JIT may compile it to native code.
+/// Present when every local of a function is an `int`, `bool`, `float` or
+/// `string`, so the JIT may compile it to native code (it still checks every
+/// instruction, see `phv_jit`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NativeSig {
     pub params: Vec<ValKind>,

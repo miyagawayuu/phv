@@ -1,0 +1,109 @@
+<?phv
+// These functions compute with strings (and numbers), so they are compiled
+// to native code when the JIT is on; the results must match the interpreter.
+
+function repeat(string $s, int $n): string {
+    $out = "";
+    for ($i = 0; $i < $n; $i++) {
+        $out .= $s;
+    }
+    return $out;
+}
+
+function numbered(int $n): string {
+    $out = "";
+    foreach (1..=$n as $i) {
+        $out = $out . $i . ($i % 3 == 0 ? "!" : "") . ($i < $n ? "," : "");
+    }
+    return $out;
+}
+
+function describe(int $i, float $f, bool $b): string {
+    $s = "i=$i f=$f b=" . ($b ? "yes" : "no") . " ";
+    $s .= $i;
+    $s .= $f * 2.0;
+    $s .= " " . (string) ($f / 4.0) . " " . (string) $i;
+    return $s;
+}
+
+function order(string $a, string $b): string {
+    $r = "";
+    if ($a == $b) {
+        $r .= "== ";
+    }
+    if ($a != $b) {
+        $r .= "!= ";
+    }
+    if ($a < $b) {
+        $r .= "< ";
+    }
+    if ($a <= $b) {
+        $r .= "<= ";
+    }
+    if ($a > $b) {
+        $r .= "> ";
+    }
+    if ($a >= $b) {
+        $r .= ">= ";
+    }
+    return $r . ($a <=> $b);
+}
+
+function lengths(string $s): string {
+    return strlen($s) . " bytes, " . $s->len() . " chars";
+}
+
+function reverse(string $s, int $n): string {
+    // recursion with string arguments and results
+    if ($n == 0) {
+        return "";
+    }
+    return $s . $n . reverse($s, $n - 1);
+}
+
+function shared(string $s): string {
+    // appending to a copy must not change the original
+    $t = $s;
+    $t .= "!";
+    $t .= $t;
+    return $s . " " . $t;
+}
+
+function longest(int $n): int {
+    $best = "";
+    for ($i = 0; $i < $n; $i++) {
+        $s = "x" . ($i * 7 % 13);
+        if (strlen($s) > strlen($best) || ($s > $best && strlen($s) == strlen($best))) {
+            $best = $s;
+        }
+    }
+    return strlen($best) * 100 + strlen(repeat($best, 3));
+}
+
+function fail_inside(string $s, int $n): string {
+    $out = $s;
+    for ($i = 0; $i < $n; $i++) {
+        $out .= $i;
+        if ($i == 5) {
+            $x = $i % ($n - $n);
+        }
+    }
+    return $out;
+}
+
+function interpolate(string $name, float $price, int $qty): string {
+    return "{$name}: $qty x $price = " . ($price * $qty);
+}
+
+echo repeat("ab", 5), " ", strlen(repeat("xyz", 1000)), " ", numbered(10), "\n";
+echo describe(42, 2.5, true), "\n", describe(-7, -0.1, false), "\n";
+echo order("apple", "banana"), " | ", order("b", "a"), " | ", order("same", "same"), " | ", order("", "a"), "\n";
+echo order("é", "e"), " | ", lengths("héllo"), " | ", lengths(""), "\n";
+echo reverse("r", 5), " ", strlen(reverse("ab", 150)), " ", shared("hi"), " ", longest(50), "\n";
+echo interpolate("Tea", 1.25, 3), "\n";
+
+try {
+    echo fail_inside("n:", 10), "\n";
+} catch (DivisionByZeroError $e) {
+    echo "caught: ", $e->getMessage(), "\n";
+}

@@ -1,0 +1,17 @@
+4.8333333333333 18.895833333333 7.4854708605503 1.4142135623731 173.90852879696
+2.4329020081766E+18 7.257415615308E+306 INF 26 small
+3 -3 -9223372036854775808 10 -10
+!= < <= <=> -1 | != > >= <=> 1 | == <= >= <=> 0
+!= <= >= <=> 0 | != <= >= <=> 0
+== <= >= <=> 0 | -0 0 0 -0
+!= > >= <=> 1 | INF -INF NAN
+eq ge 0 le | ne ge -1 gt | eq ge 0 le
+0.33333333333333 1.5 -1.5 0 1
+caught: division by zero
+caught: division by zero
+caught: modulo by zero
+caught: cannot convert 9.2233720368548E+18 to int
+caught: cannot convert -9.3E+18 to int
+caught: cannot convert INF to int
+caught: cannot convert NAN to int
+NAN NAN NAN

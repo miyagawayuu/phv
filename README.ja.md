@@ -128,7 +128,7 @@ error: a URL attribute cannot start with an unchecked value
 | `phv_types` | 名前解決、型検査、絞り込み、確定代入の解析 → 型付き HIR。組み込み関数のシグネチャ |
 | `phv_compiler` | HIR → レジスタ型バイトコード |
 | `phv_vm` | 値、バイトコード形式、インタプリタ、実行時の上限 |
-| `phv_jit` | int/bool だけを扱う関数を Cranelift でネイティブコードにする |
+| `phv_jit` | int/bool/float/string を扱う関数を Cranelift でネイティブコードにする |
 | `phv_std` | 組み込み関数(文字列・JSON・日付・暗号・ファイル・SQLite・PostgreSQL・MySQL・Redis・WebSocket・HTTP クライアント・裏で動く処理・セッション)と、PHV で書かれた prelude・`std.http`・`std.db`・`std.net`・`std.async` |
 | `phv_driver` | モジュールとテンプレートの読み込み、`phv.toml`、バイトコードキャッシュ、実行 |
 | `phv_server` | Web サーバー(hyper + tokio)、ルーティング、セッション、CSRF、アップロード |
@@ -158,14 +158,17 @@ CI(`.github/workflows/ci.yml`)は Linux / Windows / macOS でこれらと clippy
 
 | 項目 | PHV (JIT) | PHV (インタプリタ) | CPython 3.13 |
 |---|---:|---:|---:|
-| `fib(30)`(再帰呼び出し) | 6.7 ms | 80 ms | 94 ms |
-| 1,000 万回のループ | 13 ms | 284 ms | 326 ms |
-| 100 万文字の連結 | 24 ms | 25 ms | 65 ms |
-| 100 万要素の map / filter / sum | 184 ms | 179 ms | 87 ms |
-| map の更新 20 万回 | 44 ms | 46 ms | 34 ms |
+| `fib(30)`(再帰呼び出し) | 6.7 ms | 80 ms | 100 ms |
+| 1,000 万回のループ | 13 ms | 296 ms | 329 ms |
+| 100 万文字の連結 | 20 ms | 28 ms | 65 ms |
+| マンデルブロ集合 300×300(float) | 4.0 ms | 249 ms | 196 ms |
+| 数値から文字列を 100 万個作る | 633 ms | 677 ms | 342 ms |
+| 100 万要素の map / filter / sum | 179 ms | 179 ms | 87 ms |
+| map の更新 20 万回 | 45 ms | 72 ms | 34 ms |
 
-JIT の対象は、扱う値がすべて `int` / `bool` の関数です。クロージャや文字列を多く使う処理はインタプリタで動き、
-上の表のとおり CPython より遅いものがあります(今後の課題)。`PHV_JIT=0` で JIT を無効にできます。
+JIT の対象は、扱う値がすべて `int`・`bool`・`float`・`string` の関数です。クロージャや list・map を多く使う処理は
+インタプリタで動き、上の表のとおり CPython より遅いものがあります。数値を大量に文字列にする処理も、書式化に
+時間がかかって遅くなります(今後の課題)。`PHV_JIT=0` で JIT を無効にできます。
 
 ## ライセンス
 
