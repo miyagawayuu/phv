@@ -225,6 +225,14 @@ impl HtmlTracker {
         }
     }
 
+    /// True between elements of an HTML document: not inside a tag, comment,
+    /// raw-text element or foreign content. A template must end here, so that
+    /// joining its output with other `Html` values cannot move them into
+    /// another context.
+    pub fn at_top_level(&self) -> bool {
+        self.state == State::Text && self.pending.is_none() && self.foreign == 0
+    }
+
     /// After a block that may run zero or more times: true if it ended in the
     /// same place it started. The state is then merged with `entry`, keeping
     /// whichever URL start is less decided.

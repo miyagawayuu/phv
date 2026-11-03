@@ -1,0 +1,7 @@
+<?phv
+// A template must end outside any tag, comment, raw-text element or foreign
+// content: its output is Html, which can be joined with other Html values.
+$u = "javascript:alert(1)";
+echo render("views/half_link.phv.html") . escape($u) . raw("\">x</a>");
+echo render("views/open_svg.phv.html");
+echo render("views/open_comment.phv.html", note: "n");

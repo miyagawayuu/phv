@@ -1,0 +1,22 @@
+error: the template ends inside a tag, comment, `<script>`/`<style>` or `<svg>`
+ --> views/half_link.phv.html:1:10
+  |
+1 | <a href="
+  |          ^
+  = note: close everything the template opens: its output is `Html`, which can be joined with other `Html` values
+
+error: the template ends inside a tag, comment, `<script>`/`<style>` or `<svg>`
+ --> views/open_svg.phv.html:2:1
+  |
+2 | 
+  | ^
+  = note: close everything the template opens: its output is `Html`, which can be joined with other `Html` values
+
+error: the template ends inside a tag, comment, `<script>`/`<style>` or `<svg>`
+ --> views/open_comment.phv.html:2:1
+  |
+2 | 
+  | ^
+  = note: close everything the template opens: its output is `Html`, which can be joined with other `Html` values
+
+3 errors found

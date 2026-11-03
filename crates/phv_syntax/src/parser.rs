@@ -9,6 +9,14 @@ pub fn parse_module(src: &str, file: u32, is_template: bool) -> (Module, Vec<Dia
     let (toks, mut diags) = lex(src, file, 0, mode);
     let mut p = Parser::new(toks, file, is_template);
     let stmts = p.block_until(&[]);
+    if is_template && !p.halted && !p.html.at_top_level() {
+        let span = p.span();
+        let mut d = Diagnostic::error("the template ends inside a tag, comment, `<script>`/`<style>` or `<svg>`", span);
+        d.add_note(
+            "close everything the template opens: its output is `Html`, which can be joined with other `Html` values",
+        );
+        p.diags.push(d);
+    }
     diags.append(&mut p.diags);
     let module = Module { file, is_template, stmts, template_refs: p.template_refs };
     (module, diags)
