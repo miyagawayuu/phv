@@ -1,0 +1,126 @@
+<?phv
+// Generic classes: type parameters on classes and interfaces, inferred or
+// written type arguments, inheritance with type arguments, and `is`.
+
+class Box<T> {
+    public function __construct(public T $value) {}
+
+    public function get(): T {
+        return $this->value;
+    }
+
+    public function map<U>(fn(T): U $f): Box<U> {
+        return new Box($f($this->value));
+    }
+
+    public function set(T $value): void {
+        $this->value = $value;
+    }
+}
+
+class Stack<T> {
+    private list<T> $items = [];
+
+    public function push(T $x): void {
+        $this->items[] = $x;
+    }
+
+    public function pop(): ?T {
+        if ($this->items->isEmpty()) {
+            return null;
+        }
+        $last = $this->items[count($this->items) - 1];
+        $this->items = $this->items->slice(0, count($this->items) - 1);
+        return $last;
+    }
+
+    public function size(): int {
+        return count($this->items);
+    }
+}
+
+interface Repo<T> {
+    public function find(int $id): ?T;
+    public function all(): list<T>;
+}
+
+class User {
+    public function __construct(public int $id, public string $name) {}
+}
+
+class MemoryRepo<T> implements Repo<T> {
+    private map<int, T> $rows = [];
+
+    public function put(int $id, T $row): void {
+        $this->rows[$id] = $row;
+    }
+
+    public function find(int $id): ?T {
+        return $this->rows[$id] ?? null;
+    }
+
+    public function all(): list<T> {
+        return $this->rows->values();
+    }
+}
+
+class UserRepo extends MemoryRepo<User> {
+    public function names(): list<string> {
+        return $this->all()->map(fn(User $u) => $u->name);
+    }
+}
+
+class Pair<A, B> {
+    public function __construct(public A $first, public B $second) {}
+
+    public function swap(): Pair<B, A> {
+        return new Pair($this->second, $this->first);
+    }
+}
+
+function first_name(Repo<User> $repo): string {
+    $u = $repo->find(1);
+    return $u?->name ?? "nobody";
+}
+
+function unbox<T>(Box<T> $b): T {
+    return $b->get();
+}
+
+// inferred from the constructor
+$b = new Box(41);
+$b->set($b->get() + 1);
+echo "box: ", $b->get(), "\n";
+$s = $b->map(fn(int $x) => "n=" . $x);
+echo "mapped: ", $s->get(), " (", strlen($s->value), " chars)\n";
+echo "unbox: ", unbox(new Box(2.5)), "\n";
+
+// written, and from the expected type
+$stack = new Stack<string>();
+$stack->push("a");
+$stack->push("b");
+echo "pop: ", $stack->pop() ?? "-", ", size: ", $stack->size(), "\n";
+Stack<int> $nums = new Stack();
+$nums->push(3);
+echo "nums: ", $nums->pop() ?? 0, " then ", $nums->pop() ?? 0, "\n";
+
+// interfaces and inheritance with type arguments
+$users = new UserRepo();
+$users->put(1, new User(1, "Ann"));
+$users->put(2, new User(2, "Bo"));
+echo "names: ", implode(", ", $users->names()), "\n";
+echo "first: ", first_name($users), "\n";
+$empty = new MemoryRepo<User>();
+echo "empty: ", first_name($empty), "\n";
+
+$p = (new Pair("x", 1))->swap();
+echo "pair: ", $p->first + 1, " ", $p->second, "\n";
+
+// `is` checks the class (type arguments are not known at run time)
+function describe(any $x): string {
+    if ($x is Box) {
+        return "a box";
+    }
+    return "something else";
+}
+echo describe($b), " / ", describe(3), "\n";

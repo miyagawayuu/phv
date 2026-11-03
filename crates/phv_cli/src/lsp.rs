@@ -894,6 +894,24 @@ mod tests {
         assert_eq!(got, ["x", "f"]);
     }
 
+    /// Members of a generic class show the receiver's type arguments.
+    #[test]
+    fn completes_members_of_generic_classes() {
+        let p = Project::new("generic");
+        let src = "<?phv\nclass Box<T> {\n    public function __construct(public T $value) {}\n    public function get(): T { return $this->value; }\n}\nclass Named extends Box<string> {}\n$b = new Box(1);\n$n = new Named(\"x\");\n";
+        let (server, path, line, character) = p.open("page.phv", &format!("{src}$b->|\necho 1;\n"));
+        let items = server.completion(&path, line, character, true);
+        let detail = |items: &Value, name: &str| {
+            let item = items.as_array().unwrap().iter().find(|i| i["label"] == name).cloned();
+            item.map(|i| i["detail"].as_str().unwrap_or_default().to_string()).unwrap_or_default()
+        };
+        assert_eq!(detail(&items, "get"), "(): int");
+        assert_eq!(detail(&items, "value"), "int");
+        let (server, path, line, character) = p.open("page.phv", &format!("{src}$n->|\necho 1;\n"));
+        let items = server.completion(&path, line, character, true);
+        assert_eq!(detail(&items, "get"), "(): string");
+    }
+
     #[test]
     fn completes_variables_in_scope() {
         let p = Project::new("vars");

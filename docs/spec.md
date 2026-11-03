@@ -362,7 +362,43 @@ $s = first_or([], "none");       // string
 ```
 
 Type arguments are inferred from the call's arguments (up to 4). Inside the function, `T` is treated as an opaque type,
-and operators and methods cannot be used on values of type `T`. There are no generic classes yet.
+and operators and methods cannot be used on values of type `T`.
+
+### Generic Classes
+
+```phv
+class Box<T> {
+    public function __construct(public T $value) {}
+    public function map<U>(fn(T): U $f): Box<U> {
+        return new Box($f($this->value));
+    }
+}
+
+interface Repo<T> {
+    public function find(int $id): ?T;
+}
+
+class UserRepo implements Repo<User> {
+    public function find(int $id): ?User { /* ... */ }
+}
+
+$b = new Box(41);                 // Box<int>, inferred from the constructor
+$s = new Box<string>("x");        // written
+Box<float> $f = new Box(1);       // from the declared type: Box<float>
+```
+
+- Classes and interfaces can take type parameters (up to 4), which can be used in their properties and in the
+  signatures and bodies of their instance methods. Static methods do not see them (they have no instance). Enums
+  cannot be generic.
+- A generic class is always used with its type arguments: `Box<int>`, `Repo<User>`, `extends Base<list<T>>`.
+  `new` infers them from the declared type of the variable it is assigned to or from the constructor's arguments, or
+  they are written (`new Box<int>(1)`). If neither gives them, it is an error.
+- Members read through `Box<int>` have `T` replaced by `int`, also when they are inherited (`class Named extends
+  Box<string>` gives `get(): string`). An overriding method uses the parent's types as seen through the subclass.
+- Type arguments are invariant: `Box<int>` cannot be used where `Box<any>` or `Box<float>` is expected (a `Box<any>`
+  could otherwise be given a string).
+- Type arguments exist only at compile time. `is` checks the class: `$x is Box` (writing `is Box<int>` is an error),
+  and narrows to `Box<any>`.
 
 
 ## 10. Exception Classes
@@ -1097,7 +1133,7 @@ that checks journal files (`phv_std/src/db/vfs.rs`).
 
 ## 18. Roadmap
 
-- Generic classes, annotations (attributes)
+- Annotations (attributes)
 - Asynchronous I/O
 - Wider JIT coverage (functions that handle floats and strings), AOT compilation
 - Transitive dependency resolution, a package registry

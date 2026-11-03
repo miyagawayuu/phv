@@ -362,7 +362,40 @@ $s = first_or([], "none");       // string
 ```
 
 型引数は呼び出しの引数から推論される(最大 4 個)。関数の中では `T` は中身の分からない型として扱われ、
-`T` の値に演算子やメソッドは使えない。ジェネリッククラスはまだない。
+`T` の値に演算子やメソッドは使えない。
+
+### ジェネリッククラス
+
+```phv
+class Box<T> {
+    public function __construct(public T $value) {}
+    public function map<U>(fn(T): U $f): Box<U> {
+        return new Box($f($this->value));
+    }
+}
+
+interface Repo<T> {
+    public function find(int $id): ?T;
+}
+
+class UserRepo implements Repo<User> {
+    public function find(int $id): ?User { /* ... */ }
+}
+
+$b = new Box(41);                 // Box<int>。コンストラクタから推論
+$s = new Box<string>("x");        // 明示
+Box<float> $f = new Box(1);       // 宣言した型から: Box<float>
+```
+
+- クラスとインターフェースは型パラメーター(最大 4 個)を持てる。プロパティと、インスタンスメソッドのシグネチャと本体で
+  使える。静的メソッドからは見えない(インスタンスがないため)。enum はジェネリックにできない。
+- ジェネリッククラスは常に型引数を付けて使う: `Box<int>`、`Repo<User>`、`extends Base<list<T>>`。`new` は、代入先の変数の
+  宣言した型か、コンストラクタの引数から推論する。明示もできる(`new Box<int>(1)`)。どちらからも決まらなければエラー。
+- `Box<int>` から読むメンバーは `T` が `int` に置き換わる。継承したメンバーも同じ(`class Named extends Box<string>` の
+  `get()` は `string` を返す)。オーバーライドするメソッドは、サブクラスから見た親の型に合わせる。
+- 型引数は不変: `Box<int>` は `Box<any>` や `Box<float>` が要る場所には使えない(そうでないと `Box<any>` に文字列を
+  入れられてしまう)。
+- 型引数があるのはコンパイル時だけ。`is` はクラスを確かめる: `$x is Box`(`is Box<int>` はエラー)。`Box<any>` に絞り込む。
 
 
 ## 10. 例外クラス
@@ -1089,7 +1122,7 @@ phv migrate legacy/page.php      # page.phv を書き出す
 
 ## 18. 今後の予定
 
-- ジェネリッククラス、アノテーション(属性)
+- アノテーション(属性)
 - 非同期 I/O
 - JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
 - 推移的な依存関係の解決、パッケージレジストリ

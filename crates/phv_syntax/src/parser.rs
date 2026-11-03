@@ -59,6 +59,9 @@ struct Parser {
     /// Set when the nesting limit was hit: the rest of the file is skipped and
     /// no further errors are reported.
     halted: bool,
+    /// Tokens that `expect_gt` split (`>>` into `>` `>`), with their original
+    /// form, so a parse that backtracks can put them back.
+    splits: Vec<(usize, Token)>,
 }
 
 const BP_IS: u8 = 31;
@@ -122,6 +125,7 @@ impl Parser {
             template_refs: Vec::new(),
             depth: 0,
             halted: false,
+            splits: Vec::new(),
         }
     }
 
@@ -548,6 +552,7 @@ impl Parser {
         }
         let saved_pos = self.pos;
         let saved_diags = self.diags.len();
+        let saved_splits = self.splits.len();
         if let Ok(ty) = self.ty() {
             if let (Tok::Var(name), Tok::Eq) = (self.peek().clone(), self.peek_at(1).clone()) {
                 let name_span = self.advance().span;
@@ -558,6 +563,9 @@ impl Parser {
         }
         self.pos = saved_pos;
         self.diags.truncate(saved_diags);
+        for (i, tok) in self.splits.drain(saved_splits..).rev() {
+            self.toks[i] = tok;
+        }
         Ok(None)
     }
 
@@ -733,16 +741,7 @@ impl Parser {
     fn function_decl(&mut self, exported: bool, visibility: Visibility, is_static: bool) -> PResult<FunctionDecl> {
         let start = self.expect(Tok::Function)?;
         let (name, name_span) = self.expect_ident("a function name")?;
-        let mut type_params = Vec::new();
-        if self.eat(&Tok::Lt) {
-            loop {
-                type_params.push(self.expect_ident("a type parameter")?);
-                if !self.eat(&Tok::Comma) {
-                    break;
-                }
-            }
-            self.expect_gt()?;
-        }
+        let type_params = self.type_params()?;
         let params = self.params()?;
         let ret = if self.eat(&Tok::Colon) { Some(self.ty()?) } else { None };
         let (body, is_abstract) = if self.eat(&Tok::Semi) { (Vec::new(), true) } else { (self.body_block()?, false) };
@@ -781,27 +780,33 @@ impl Parser {
         }
         self.advance();
         let (name, name_span) = self.expect_ident("a type name")?;
+        let type_params = self.type_params()?;
         let mut backing = None;
         if kind == ClassKind::Enum && self.eat(&Tok::Colon) {
             backing = Some(self.ty()?);
         }
         let mut parent = None;
+        let mut parent_args = Vec::new();
         let mut interfaces = Vec::new();
+        let mut interface_args = Vec::new();
         if self.eat(&Tok::Extends) {
             if kind == ClassKind::Interface {
                 loop {
                     interfaces.push(self.expect_ident("an interface")?);
+                    interface_args.push(self.type_args()?);
                     if !self.eat(&Tok::Comma) {
                         break;
                     }
                 }
             } else {
                 parent = Some(self.expect_ident("a parent class")?);
+                parent_args = self.type_args()?;
             }
         }
         if self.eat(&Tok::Implements) {
             loop {
                 interfaces.push(self.expect_ident("an interface")?);
+                interface_args.push(self.type_args()?);
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
@@ -897,8 +902,11 @@ impl Parser {
             name,
             name_span,
             kind,
+            type_params,
             parent,
+            parent_args,
             interfaces,
+            interface_args,
             props,
             methods,
             consts,
@@ -1017,17 +1025,42 @@ impl Parser {
         Ok(TypeExpr { kind, span: start.to(self.prev_span()) })
     }
 
+    /// `<T, U>` after a function or class name (empty when there is none).
+    fn type_params(&mut self) -> PResult<Vec<(String, Span)>> {
+        let mut type_params = Vec::new();
+        if self.eat(&Tok::Lt) {
+            loop {
+                type_params.push(self.expect_ident("a type parameter")?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect_gt()?;
+        }
+        Ok(type_params)
+    }
+
+    /// `<int, string>` after a class name (empty when there is none).
+    fn type_args(&mut self) -> PResult<Vec<TypeExpr>> {
+        let mut args = Vec::new();
+        if self.eat(&Tok::Lt) {
+            loop {
+                args.push(self.ty()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect_gt()?;
+        }
+        Ok(args)
+    }
+
     /// Accepts `>`; splits `>>` so `list<list<int>>` parses.
     fn expect_gt(&mut self) -> PResult<()> {
-        if self.at(&Tok::Shr) {
+        if self.at(&Tok::Shr) || self.at(&Tok::Ge) {
+            self.splits.push((self.pos, self.toks[self.pos].clone()));
             let t = &mut self.toks[self.pos];
-            t.tok = Tok::Gt;
-            t.span.start += 1;
-            return Ok(());
-        }
-        if self.at(&Tok::Ge) {
-            let t = &mut self.toks[self.pos];
-            t.tok = Tok::Eq;
+            t.tok = if t.tok == Tok::Shr { Tok::Gt } else { Tok::Eq };
             t.span.start += 1;
             return Ok(());
         }
@@ -1376,8 +1409,9 @@ impl Parser {
             Tok::New => {
                 self.advance();
                 let (class, class_span) = self.expect_ident("a class name")?;
+                let type_args = self.type_args()?;
                 let args = if self.at(&Tok::LParen) { self.args()? } else { Vec::new() };
-                ExprKind::New { class, class_span, args }
+                ExprKind::New { class, class_span, type_args, args }
             }
             Tok::Fn => {
                 self.advance();

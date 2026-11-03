@@ -1,0 +1,84 @@
+error: unknown type `T`
+  --> err_generic_classes.phv:11:36
+   |
+11 |     public static function make(): T {
+   |                                    ^
+
+error: type parameter `T` is already a type parameter of `Box`
+  --> err_generic_classes.phv:15:28
+   |
+15 |     public function shadow<T>(T $x): void {}
+   |                            ^
+
+error: `IntBox::set` overrides `Box::set` with an incompatible signature
+  --> err_generic_classes.phv:21:21
+   |
+21 |     public function set(string $value): void {}
+   |                     ^^^
+   = note: overriding methods must keep the same parameter types and a compatible return type
+
+error: `Box` takes 1 type argument
+  --> err_generic_classes.phv:24:22
+   |
+24 | class Broken extends Box {}
+   |                      ^^^
+
+error: enums cannot have type parameters
+  --> err_generic_classes.phv:26:6
+   |
+26 | enum Color<T> {
+   |      ^^^^^
+
+error: `Box` takes 1 type argument
+  --> err_generic_classes.phv:30:1
+   |
+30 | Box<int, int> $two = new Box(1);
+   | ^^^^^^^^^^^^^
+
+error: `Box` takes 1 type argument
+  --> err_generic_classes.phv:31:1
+   |
+31 | Box $none = new Box(1);
+   | ^^^
+
+error: cannot infer the type arguments of `Bag`
+  --> err_generic_classes.phv:32:12
+   |
+32 | $bag = new Bag();
+   |            ^^^
+   = note: write them, e.g. `new Bag<int>(...)`
+
+error: expected `int`, found `string`
+  --> err_generic_classes.phv:33:23
+   |
+33 | $typed = new Box<int>("x");
+   |                       ^^^
+   = note: strings are never converted to numbers implicitly; use `->toInt()` or `->toFloat()`
+
+error: expected `Box<any>`, found `Box<int>`
+  --> err_generic_classes.phv:35:18
+   |
+35 | Box<any> $wide = $ints;
+   |                  ^^^^^
+
+error: expected `int`, found `string`
+  --> err_generic_classes.phv:36:12
+   |
+36 | $ints->set("s");
+   |            ^^^
+   = note: strings are never converted to numbers implicitly; use `->toInt()` or `->toFloat()`
+
+error: expected `string`, found `int`
+  --> err_generic_classes.phv:37:13
+   |
+37 | string $s = $ints->value;
+   |             ^^^^^^^^^^^^
+   = note: use `(string)$value` or string interpolation
+
+error: `is` cannot check type arguments; use `is Box`
+  --> err_generic_classes.phv:38:19
+   |
+38 | $check = $ints is Box<int>;
+   |                   ^^^^^^^^
+
+13 errors found

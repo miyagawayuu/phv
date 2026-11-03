@@ -1,0 +1,38 @@
+<?phv
+// Mistakes with generic classes (all errors).
+
+class Box<T> {
+    public function __construct(public T $value) {}
+
+    public function set(T $value): void {
+        $this->value = $value;
+    }
+
+    public static function make(): T {
+        return 0;
+    }
+
+    public function shadow<T>(T $x): void {}
+}
+
+class Bag<T> {}
+
+class IntBox extends Box<int> {
+    public function set(string $value): void {}
+}
+
+class Broken extends Box {}
+
+enum Color<T> {
+    case Red;
+}
+
+Box<int, int> $two = new Box(1);
+Box $none = new Box(1);
+$bag = new Bag();
+$typed = new Box<int>("x");
+$ints = new Box(1);
+Box<any> $wide = $ints;
+$ints->set("s");
+string $s = $ints->value;
+$check = $ints is Box<int>;

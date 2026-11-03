@@ -9,7 +9,9 @@ use phv_syntax::ast::{
 };
 use phv_syntax::{normalize_template_path, Span};
 
-type Bindings = [Option<Type>; 4];
+/// Inferred type parameters: a generic class's (when it is created) and then
+/// the function's own, at most 4 each.
+type Bindings = [Option<Type>; 8];
 
 fn unify(param: &Type, actual: &Type, b: &mut Bindings) {
     match (param, actual) {
@@ -32,6 +34,22 @@ fn unify(param: &Type, actual: &Type, b: &mut Bindings) {
             }
             unify(pr, ar, b);
         }
+        (Type::Class(pc, pa), Type::Class(ac, aa)) if pc == ac => {
+            for (p, a) in pa.iter().zip(aa) {
+                unify(p, a, b);
+            }
+        }
+        // `?T` (or `T|string`) given `?int`: the members that are not known
+        // already decide the one unknown member.
+        (Type::Union(pms), _) => {
+            let unknown: Vec<&Type> = pms.iter().filter(|m| m.has_unknown()).collect();
+            if let [u] = unknown[..] {
+                let rest: Vec<Type> = actual.members().into_iter().filter(|m| !pms.contains(m)).collect();
+                if !rest.is_empty() {
+                    unify(u, &Type::union(rest), b);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -46,6 +64,7 @@ fn subst(t: &Type, b: &Bindings) -> Type {
         Type::Map(k, v) => Type::map(subst(k, b), subst(v, b)),
         Type::Func(ps, r) => Type::Func(ps.iter().map(|p| subst(p, b)).collect(), Box::new(subst(r, b))),
         Type::Union(ms) => Type::union(ms.iter().map(|m| subst(m, b)).collect()),
+        Type::Class(c, args) => Type::Class(*c, args.iter().map(|a| subst(a, b)).collect()),
         other => other.clone(),
     }
 }
@@ -60,7 +79,8 @@ fn in_nullsafe_chain(e: &Expr) -> bool {
     }
 }
 
-/// Replaces a function's own type parameters with inference variables.
+/// Replaces type parameters (a function's own, and a class's while it is
+/// created) with inference variables.
 fn instantiate(t: &Type, tps: &[String]) -> Type {
     match t {
         Type::Param(n) => match tps.iter().position(|p| p == n) {
@@ -73,6 +93,7 @@ fn instantiate(t: &Type, tps: &[String]) -> Type {
             Type::Func(ps.iter().map(|p| instantiate(p, tps)).collect(), Box::new(instantiate(r, tps)))
         }
         Type::Union(ms) => Type::union(ms.iter().map(|m| instantiate(m, tps)).collect()),
+        Type::Class(c, args) => Type::Class(*c, args.iter().map(|a| instantiate(a, tps)).collect()),
         other => other.clone(),
     }
 }
@@ -109,7 +130,13 @@ impl<'a> Checker<'a> {
             (Type::Int, Type::Float) => coerce,
             // Context-checked HTML is still HTML (not the other way round).
             (Type::SafeUrl | Type::SafeJs, Type::Html) => true,
-            (Type::Class(a), Type::Class(b)) => self.is_subclass(*a, *b),
+            // Type arguments are invariant: `Box<int>` is not a `Box<any>`.
+            (Type::Class(a, aa), Type::Class(b, ba)) => {
+                ba.is_empty() && self.is_subclass(*a, *b)
+                    || self
+                        .upcast(*a, aa, *b)
+                        .is_some_and(|up| up.len() == ba.len() && up.iter().zip(ba).all(|(x, y)| self.same(x, y)))
+            }
             (Type::List(a), Type::List(b)) => self.same(a, b),
             (Type::Map(k1, v1), Type::Map(k2, v2)) => self.same(k1, k2) && self.same(v1, v2),
             (Type::Func(p1, r1), Type::Func(p2, r2)) => {
@@ -134,10 +161,12 @@ impl<'a> Checker<'a> {
             (Type::Never, t) | (t, Type::Never) => t.clone(),
             (Type::Error, _) | (_, Type::Error) => Type::Error,
             (Type::Int, Type::Float) | (Type::Float, Type::Int) if widen => Type::Float,
-            (Type::Class(x), Type::Class(y)) => match self.common_ancestor(&[*x, *y]) {
-                Some(c) => Type::Class(c),
-                None => Type::union(vec![a.clone(), b.clone()]),
-            },
+            (Type::Class(..), Type::Class(..)) => {
+                match self.as_single_class(&Type::union(vec![a.clone(), b.clone()])) {
+                    Some(t) => t,
+                    None => Type::union(vec![a.clone(), b.clone()]),
+                }
+            }
             _ if self.assignable_exact(a, b) => b.clone(),
             _ if self.assignable_exact(b, a) => a.clone(),
             _ => Type::union(vec![a.clone(), b.clone()]),
@@ -324,7 +353,7 @@ impl<'a> Checker<'a> {
         let h = self.expr(x, None);
         let exc = self.exception_class();
         match &h.ty {
-            Type::Class(c) if exc.is_some_and(|e| self.is_subclass(*c, e)) => h,
+            Type::Class(c, _) if exc.is_some_and(|e| self.is_subclass(*c, e)) => h,
             Type::Error | Type::Never => h,
             t => {
                 let msg = format!("only exceptions can be thrown, not `{}`", self.tn(t));
@@ -454,11 +483,14 @@ impl<'a> Checker<'a> {
                 }
                 let obj_ty = cx.current_type(id);
                 let obj_ty = self.as_single_class(&obj_ty).unwrap_or(obj_ty);
-                let Type::Class(c) = obj_ty else { return None };
+                let Type::Class(c, args) = obj_ty else { return None };
                 let slot = self.field_slot(c, name)?;
                 let ty = match cx.flow.prop_narrowed.get(&(id, slot)) {
                     Some(t) => t.clone(),
-                    None => self.classes[c as usize].fields[slot as usize].ty.clone(),
+                    None => {
+                        let f = &self.classes[c as usize].fields[slot as usize];
+                        self.member_type(&f.ty, c, &args, f.owner)
+                    }
                 };
                 Some((FactKey::Prop(id, slot), ty))
             }
@@ -495,7 +527,7 @@ impl<'a> Checker<'a> {
             return None;
         };
         if !args.is_empty() {
-            self.error(format!("`is` cannot check element types; use `is {n}`"), ty.span);
+            self.error(format!("`is` cannot check type arguments; use `is {n}`"), ty.span);
         }
         Some(match n.as_str() {
             "int" => TestKind::Int,
@@ -527,14 +559,20 @@ impl<'a> Checker<'a> {
             | (TestKind::List, Type::List(_))
             | (TestKind::Map, Type::Map(..))
             | (TestKind::Func, Type::Func(..)) => true,
-            (TestKind::Class(target), Type::Class(c)) => self.is_subclass(*c, target),
+            (TestKind::Class(target), Type::Class(c, _)) => self.is_subclass(*c, target),
             // `Sql` values are lists at runtime.
             (TestKind::List, Type::Sql) => true,
             _ => false,
         }
     }
 
-    fn test_type(test: TestKind) -> Type {
+    /// Class `c` with `any` for each type argument: what `is C` proves (type
+    /// arguments are not known at run time).
+    pub(crate) fn any_args(&self, c: ClassId) -> Type {
+        Type::Class(c, vec![Type::Any; self.classes[c as usize].type_params.len()])
+    }
+
+    fn test_type(&self, test: TestKind) -> Type {
         match test {
             TestKind::Null => Type::Null,
             TestKind::Bool => Type::Bool,
@@ -545,13 +583,13 @@ impl<'a> Checker<'a> {
             TestKind::List => Type::list(Type::Any),
             TestKind::Map => Type::map(Type::Any, Type::Any),
             TestKind::Func => Type::Any,
-            TestKind::Class(c) => Type::Class(c),
+            TestKind::Class(c) => self.any_args(c),
         }
     }
 
     fn narrow_to(&self, cur: &Type, test: TestKind) -> Type {
         if matches!(cur, Type::Any | Type::Error) {
-            return Self::test_type(test);
+            return self.test_type(test);
         }
         let mut out = Vec::new();
         for m in cur.members() {
@@ -561,13 +599,13 @@ impl<'a> Checker<'a> {
             }
             match (test, &m) {
                 // A type parameter (or `any`) can hold anything: narrow to the tested type.
-                (_, Type::Param(_)) | (_, Type::Any) => out.push(Self::test_type(test)),
-                (TestKind::Class(target), Type::Class(c)) => {
+                (_, Type::Param(_)) | (_, Type::Any) => out.push(self.test_type(test)),
+                (TestKind::Class(target), Type::Class(c, _)) => {
                     // A subclass of `c` may be (or implement) `target`.
                     let either_interface =
                         self.class_kind(target) == ClassKind::Interface || self.class_kind(*c) == ClassKind::Interface;
                     if self.is_subclass(target, *c) || either_interface {
-                        out.push(Type::Class(target));
+                        out.push(self.any_args(target));
                     }
                 }
                 _ => {}
@@ -727,7 +765,9 @@ impl<'a> Checker<'a> {
             ExprKind::StaticCall { class, class_span, name, name_span, args } => {
                 self.static_call(class, *class_span, name, *name_span, args, span)
             }
-            ExprKind::New { class, class_span, args } => self.new_expr(class, *class_span, args, span),
+            ExprKind::New { class, class_span, type_args, args } => {
+                self.new_expr(class, *class_span, type_args, args, expect, span)
+            }
             ExprKind::Index { base, index } => self.index(base, index.as_deref(), span),
             ExprKind::Closure(c) => self.closure(c, expect, span),
             ExprKind::Match { subject, arms } => self.match_expr(subject.as_deref(), arms, expect, span),
@@ -996,7 +1036,7 @@ impl<'a> Checker<'a> {
                 x == y
                     || (x.is_numeric() && y.is_numeric())
                     || match (x, y) {
-                        (Type::Class(p), Type::Class(q)) => self.is_subclass(*p, *q) || self.is_subclass(*q, *p),
+                        (Type::Class(p, _), Type::Class(q, _)) => self.is_subclass(*p, *q) || self.is_subclass(*q, *p),
                         (Type::List(_), Type::List(_)) | (Type::Map(..), Type::Map(..)) => self.assignable_exact(x, y),
                         _ => false,
                     }
@@ -1145,9 +1185,33 @@ impl<'a> Checker<'a> {
     /// Checks the arguments of a call to `fid` (inferring type parameters of
     /// generic functions) and returns them with the call's result type.
     pub(crate) fn invoke(&mut self, fid: FuncId, args: &[Arg], span: Span) -> (Vec<HExpr>, Type) {
+        let (hargs, ret, _) = self.invoke_with(fid, &[], &[], args, span);
+        (hargs, ret)
+    }
+
+    /// `invoke` for a member of a generic class: `fixed` gives the class's type
+    /// parameters that are known (from the receiver's type), `infer` those to
+    /// infer from the arguments (a constructor's class). Returns what was
+    /// inferred for `infer` (`Infer` where nothing was).
+    pub(crate) fn invoke_with(
+        &mut self,
+        fid: FuncId,
+        fixed: &[(String, Type)],
+        infer: &[String],
+        args: &[Arg],
+        span: Span,
+    ) -> (Vec<HExpr>, Type, Vec<Type>) {
         let info = &self.funcs[fid as usize];
-        let (mut params, mut ret, fname, tps) =
-            (info.params.clone(), info.ret.clone(), info.name.clone(), info.type_params.clone());
+        let (mut params, mut ret, fname) = (info.params.clone(), info.ret.clone(), info.name.clone());
+        if !fixed.is_empty() {
+            let (names, tys): (Vec<String>, Vec<Type>) = fixed.iter().cloned().unzip();
+            for p in params.iter_mut() {
+                p.ty = super::subst_params(&p.ty, &names, &tys);
+            }
+            ret = super::subst_params(&ret, &names, &tys);
+        }
+        let mut tps = infer.to_vec();
+        tps.extend(info.type_params.iter().cloned());
         if !tps.is_empty() {
             for p in params.iter_mut() {
                 p.ty = instantiate(&p.ty, &tps);
@@ -1161,13 +1225,27 @@ impl<'a> Checker<'a> {
             ret = Type::Error;
         }
         self.clear_prop_facts();
-        (hargs, ret)
+        let inferred = (0..infer.len()).map(|i| b.get(i).cloned().flatten().unwrap_or(Type::Infer)).collect();
+        (hargs, ret, inferred)
+    }
+
+    /// An argument of type `Child<int>` given for a parameter `Base<T>`: seen as
+    /// the `Base` it is, so `T` can be inferred.
+    fn as_param_class(&self, actual: &Type, param: &Type) -> Option<Type> {
+        let (Type::Class(pc, pa), Type::Class(ac, aa)) = (param, actual) else { return None };
+        if pa.is_empty() || pc == ac {
+            return None;
+        }
+        self.upcast(*ac, aa, *pc).map(|up| Type::Class(*pc, up))
     }
 
     fn arg_to(&mut self, e: &Expr, p: &Type, b: &mut Bindings) -> HExpr {
         let expected = subst(p, b);
         let h = self.expr(e, Some(&expected));
-        unify(p, &h.ty, b);
+        match self.as_param_class(&h.ty, p) {
+            Some(seen) => unify(p, &seen, b),
+            None => unify(p, &h.ty, b),
+        }
         let target = subst(p, b);
         if target.has_unknown() {
             h
@@ -1378,7 +1456,7 @@ impl<'a> Checker<'a> {
             return self.call_builtin(name, Some(kind), Some(recv), args, span);
         }
         match recv.ty.clone() {
-            Type::Class(c) => {
+            Type::Class(c, cargs) => {
                 let Some(m) = self.classes[c as usize].methods.get(name).cloned() else {
                     let cname = self.class_names[c as usize].clone();
                     let has_prop = self.classes[c as usize].fields.iter().any(|f| f.name == name);
@@ -1397,7 +1475,8 @@ impl<'a> Checker<'a> {
                     self.error(format!("`{fname}` is static; call it as `{fname}(...)`"), name_span);
                     return err(span);
                 }
-                let (rest, ret) = self.invoke(m.func, args, span);
+                let fixed = self.receiver_args(c, &cargs, m.owner);
+                let (rest, ret, _) = self.invoke_with(m.func, &fixed, &[], args, span);
                 let mut hargs = vec![recv];
                 hargs.extend(rest);
                 let kind = if self.class_kind(c) == ClassKind::Interface {
@@ -1426,7 +1505,7 @@ impl<'a> Checker<'a> {
         self.note_site(name_span, &obj.ty, false);
         let ty = self.as_single_class(&obj.ty).unwrap_or_else(|| obj.ty.clone());
         match ty {
-            Type::Class(c) => {
+            Type::Class(c, cargs) => {
                 let cname = self.class_names[c as usize].clone();
                 let Some(slot) = self.field_slot(c, name) else {
                     let has_method = self.classes[c as usize].methods.contains_key(name);
@@ -1436,7 +1515,8 @@ impl<'a> Checker<'a> {
                     }
                     return None;
                 };
-                let f = self.classes[c as usize].fields[slot as usize].clone();
+                let mut f = self.classes[c as usize].fields[slot as usize].clone();
+                f.ty = self.member_type(&f.ty, c, &cargs, f.owner);
                 self.note_ref(name_span, f.span);
                 if !self.can_access(f.owner, f.vis) {
                     self.error(format!("property `{cname}::${name}` is {}", Self::vis_word(f.vis)), name_span);
@@ -1608,11 +1688,16 @@ impl<'a> Checker<'a> {
                 return err(span);
             }
             let mut hargs = Vec::new();
+            let mut fixed = Vec::new();
             if !is_static {
                 let Some((tid, tty)) = this else { return err(span) };
+                if let Type::Class(c, cargs) = &tty {
+                    let owner = self.funcs[fid as usize].class.unwrap_or(parent);
+                    fixed = self.receiver_args(*c, cargs, owner);
+                }
                 hargs.push(HExpr { kind: HExprKind::Local(tid), ty: tty, span: class_span });
             }
-            let (rest, ret) = self.invoke(fid, args, span);
+            let (rest, ret, _) = self.invoke_with(fid, &fixed, &[], args, span);
             hargs.extend(rest);
             return HExpr { kind: HExprKind::Call(fid, hargs), ty: ret, span };
         }
@@ -1638,7 +1723,7 @@ impl<'a> Checker<'a> {
                 return h;
             }
         }
-        self.note_site(name_span, &Type::Class(cid), true);
+        self.note_site(name_span, &Type::class(cid), true);
         let Some(m) = self.classes[cid as usize].methods.get(name).cloned() else {
             let cname = self.class_names[cid as usize].clone();
             self.error(format!("class `{cname}` has no method `{name}`"), name_span);
@@ -1659,7 +1744,7 @@ impl<'a> Checker<'a> {
 
     /// `E::cases()`, `E::from($v)` and `E::tryFrom($v)`.
     fn enum_static(&mut self, cid: ClassId, name: &str, args: &[Arg], span: Span) -> Option<HExpr> {
-        let cty = Type::Class(cid);
+        let cty = Type::class(cid);
         match name {
             "cases" => {
                 if !args.is_empty() {
@@ -1698,12 +1783,12 @@ impl<'a> Checker<'a> {
             self.error(format!("unknown class `{class}`"), class_span);
             return err(span);
         };
-        self.note_site(name_span, &Type::Class(cid), true);
+        self.note_site(name_span, &Type::class(cid), true);
         if let Some(def) = self.member_const_span(cid, name) {
             self.note_ref(name_span, def);
         }
         if let Some(idx) = self.classes[cid as usize].cases.iter().position(|(n, _)| n == name) {
-            return HExpr { kind: HExprKind::EnumCase(cid, idx as u32), ty: Type::Class(cid), span };
+            return HExpr { kind: HExprKind::EnumCase(cid, idx as u32), ty: Type::class(cid), span };
         }
         if let Some((c, t)) = self.classes[cid as usize].consts.get(name).cloned() {
             return hconst(c, t, span);
@@ -1713,7 +1798,15 @@ impl<'a> Checker<'a> {
         err(span)
     }
 
-    fn new_expr(&mut self, class: &str, class_span: Span, args: &[Arg], span: Span) -> HExpr {
+    fn new_expr(
+        &mut self,
+        class: &str,
+        class_span: Span,
+        type_args: &[TypeExpr],
+        args: &[Arg],
+        expect: Option<&Type>,
+        span: Span,
+    ) -> HExpr {
         let cid = if class == "self" { self.cx().class } else { self.class_ref(class, class_span) };
         let Some(cid) = cid else {
             let e = self.error(format!("unknown class `{class}`"), class_span);
@@ -1725,7 +1818,18 @@ impl<'a> Checker<'a> {
             }
             return err(span);
         };
-        let ty = Type::Class(cid);
+        let tps = self.classes[cid as usize].type_params.clone();
+        // Type arguments: written (`new Box<int>()`), from the expected type
+        // (`$b: Box<int> = new Box()`), or inferred from the constructor's arguments.
+        let written = if type_args.is_empty() && !tps.is_empty() {
+            expect.map(|e| e.members()).unwrap_or_default().into_iter().find_map(|m| match m {
+                Type::Class(c, a) if c == cid && !a.iter().any(|t| t.has_unknown()) => Some(a),
+                _ => None,
+            })
+        } else {
+            let self_class = self.ctx.last().and_then(|c| c.class);
+            Some(self.class_args(cid, type_args, self_class, class_span))
+        };
         let what = match self.class_kind(cid) {
             ClassKind::Abstract => Some("an abstract class"),
             ClassKind::Interface => Some("an interface"),
@@ -1747,17 +1851,43 @@ impl<'a> Checker<'a> {
             self.error(format!("the constructor of `{cname}` is {word}"), class_span)
                 .add_note(format!("create it with one of its static methods, e.g. `{cname}::open(...)`"));
         }
+        let cname = self.class_names[cid as usize].clone();
+        let cannot_infer = |me: &mut Self| {
+            me.error(format!("cannot infer the type arguments of `{cname}`"), class_span)
+                .add_note(format!("write them, e.g. `new {cname}<int>(...)`"));
+            vec![Type::Error; tps.len()]
+        };
         match self.classes[cid as usize].ctor {
             Some(fid) => {
-                let (hargs, _) = self.invoke(fid, args, span);
-                HExpr { kind: HExprKind::New(cid, Some(fid), hargs), ty, span }
+                // The constructor may be inherited: its types are in its own class's terms.
+                let owner = self.funcs[fid as usize].class.unwrap_or(cid);
+                let (hargs, targs) = match written {
+                    Some(targs) => {
+                        let fixed = self.receiver_args(cid, &targs, owner);
+                        let (hargs, _, _) = self.invoke_with(fid, &fixed, &[], args, span);
+                        (hargs, targs)
+                    }
+                    None => {
+                        // Inferred as the class's own parameters, then seen through the owner.
+                        let Type::Class(_, own) = self.own_type(cid) else { unreachable!() };
+                        let fixed = self.receiver_args(cid, &own, owner);
+                        let (hargs, _, inferred) = self.invoke_with(fid, &fixed, &tps, args, span);
+                        let targs =
+                            if inferred.iter().any(|t| t.has_unknown()) { cannot_infer(self) } else { inferred };
+                        (hargs, targs)
+                    }
+                };
+                HExpr { kind: HExprKind::New(cid, Some(fid), hargs), ty: Type::Class(cid, targs), span }
             }
             None => {
                 if !args.is_empty() {
-                    let cname = self.class_names[cid as usize].clone();
                     self.error(format!("`{cname}` has no constructor, so it takes no arguments"), span);
                 }
-                HExpr { kind: HExprKind::New(cid, None, Vec::new()), ty, span }
+                let targs = match written {
+                    Some(t) => t,
+                    None => cannot_infer(self),
+                };
+                HExpr { kind: HExprKind::New(cid, None, Vec::new()), ty: Type::Class(cid, targs), span }
             }
         }
     }

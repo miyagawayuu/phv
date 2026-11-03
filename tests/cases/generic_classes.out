@@ -1,0 +1,10 @@
+box: 42
+mapped: n=42 (4 chars)
+unbox: 2.5
+pop: b, size: 1
+nums: 3 then 0
+names: Ann, Bo
+first: Ann
+empty: nobody
+pair: 2 x
+a box / something else

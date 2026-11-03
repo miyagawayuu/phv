@@ -220,7 +220,7 @@ impl Checker<'_> {
                     }
                     let var = c.var.as_ref().map(|(v, span)| {
                         let ty = match self.common_ancestor(&classes) {
-                            Some(c) => Type::Class(c),
+                            Some(c) => self.any_args(c),
                             None => Type::Error,
                         };
                         self.loop_var(v, ty, *span)

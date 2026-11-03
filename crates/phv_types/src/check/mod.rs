@@ -107,6 +107,12 @@ struct ClassInfo<'a> {
     decl: Option<&'a ClassDecl>,
     kind: ClassKind,
     module: usize,
+    /// `class Box<T>`: the names of its type parameters.
+    type_params: Vec<String>,
+    /// The type arguments each ancestor and interface is used with, in terms of
+    /// this class's own type parameters (`class A<T> extends B<list<T>>` maps
+    /// `B` to `[list<T>]`). Only generic supers are listed.
+    super_args: HashMap<ClassId, Vec<Type>>,
     parent: Option<ClassId>,
     /// Directly implemented (or, for interfaces, extended) interfaces.
     ifaces: Vec<ClassId>,
@@ -339,6 +345,20 @@ impl<'a> Checker<'a> {
         format!("({}): {}", params.join(", "), self.tn(&info.ret))
     }
 
+    /// `signature` of a method of class `c` (perhaps inherited), with its types
+    /// in terms of `c`'s own type parameters.
+    fn signature_in(&self, f: FuncId, c: ClassId) -> String {
+        let info = &self.funcs[f as usize];
+        let Some(owner) = info.class else { return self.signature(f) };
+        let Type::Class(_, own) = self.own_type(c) else { return self.signature(f) };
+        let view = |t: &Type| self.tn(&self.member_type(t, c, &own, owner));
+        let params: Vec<String> = info.params.iter().map(|p| format!("{} ${}", view(&p.ty), p.name)).collect();
+        if info.kind == FuncKind::Ctor {
+            return format!("({})", params.join(", "));
+        }
+        format!("({}): {}", params.join(", "), view(&info.ret))
+    }
+
     fn builtin_items(&self, recv: Option<Recv>) -> Vec<Item> {
         let mut out: Vec<Item> = Vec::new();
         for sig in BUILTINS.iter().filter(|b| b.recv == recv && !b.internal) {
@@ -363,15 +383,18 @@ impl<'a> Checker<'a> {
     /// Fills in the members of every class and the names visible in the entry module.
     fn build_index(&mut self) -> EditorIndex {
         let mut ix = self.index.take().unwrap_or_default();
+        ix.class_names = self.class_names.clone();
+        ix.type_params = self.classes.iter().map(|c| c.type_params.clone()).collect();
         for (cid, c) in self.classes.iter().enumerate() {
             let cid = cid as ClassId;
+            let Type::Class(_, own) = self.own_type(cid) else { continue };
             let mut members = Vec::new();
             for f in &c.fields {
                 members.push(Member {
                     item: Item {
                         name: f.name.clone(),
                         kind: ItemKind::Property,
-                        detail: self.tn(&f.ty),
+                        detail: self.tn(&self.member_type(&f.ty, cid, &own, f.owner)),
                         def: Some(f.span),
                     },
                     is_static: false,
@@ -386,7 +409,7 @@ impl<'a> Checker<'a> {
                     item: Item {
                         name: name.clone(),
                         kind: ItemKind::Method,
-                        detail: self.signature(m.func),
+                        detail: self.signature_in(m.func, cid),
                         def: Some(self.funcs[m.func as usize].span),
                     },
                     is_static: m.is_static,
@@ -587,12 +610,86 @@ impl<'a> Checker<'a> {
         None
     }
 
-    /// For a union made only of classes, their common ancestor as a class type.
+    /// For a union made only of classes, their common ancestor as a class type
+    /// (when they all use it with the same type arguments).
     pub(crate) fn as_single_class(&self, t: &Type) -> Option<Type> {
         let Type::Union(ms) = t else { return None };
-        let ids: Option<Vec<ClassId>> =
-            ms.iter().map(|m| if let Type::Class(c) = m { Some(*c) } else { None }).collect();
-        self.common_ancestor(&ids?).map(Type::Class)
+        let classes: Option<Vec<(ClassId, &Vec<Type>)>> =
+            ms.iter().map(|m| if let Type::Class(c, a) = m { Some((*c, a)) } else { None }).collect();
+        let classes = classes?;
+        let ids: Vec<ClassId> = classes.iter().map(|(c, _)| *c).collect();
+        let anc = self.common_ancestor(&ids)?;
+        let mut args = None;
+        for (c, a) in classes {
+            let up = self.upcast(c, a, anc)?;
+            if args.as_ref().is_some_and(|x| *x != up) {
+                return None;
+            }
+            args = Some(up);
+        }
+        Some(Type::Class(anc, args.unwrap_or_default()))
+    }
+
+    /// The class type `c` as seen inside its own declaration: its type
+    /// parameters as arguments (`Box<T>` inside `class Box<T>`).
+    pub(crate) fn own_type(&self, c: ClassId) -> Type {
+        Type::Class(c, self.classes[c as usize].type_params.iter().map(|n| Type::Param(n.clone())).collect())
+    }
+
+    /// The type arguments of `target` (an ancestor or interface of `c`) when
+    /// `c` is used with `args`. None if `target` is not a super of `c`.
+    pub(crate) fn upcast(&self, c: ClassId, args: &[Type], target: ClassId) -> Option<Vec<Type>> {
+        if c == target {
+            return Some(args.to_vec());
+        }
+        if !self.is_subclass(c, target) {
+            return None;
+        }
+        let ci = &self.classes[c as usize];
+        Some(match ci.super_args.get(&target) {
+            Some(sa) => sa.iter().map(|t| subst_params(t, &ci.type_params, args)).collect(),
+            None => Vec::new(),
+        })
+    }
+
+    /// The type `t` of a member declared in `owner`, read through a value of
+    /// type `c<args>`: the owner's type parameters replaced by its arguments.
+    pub(crate) fn member_type(&self, t: &Type, c: ClassId, args: &[Type], owner: ClassId) -> Type {
+        let tps = &self.classes[owner as usize].type_params;
+        if tps.is_empty() {
+            return t.clone();
+        }
+        let owner_args = self.upcast(c, args, owner).unwrap_or_default();
+        subst_params(t, tps, &owner_args)
+    }
+
+    /// The member types of `owner` substituted for a value of type `c<args>`,
+    /// as `(name, type)` pairs for `invoke_with`.
+    pub(crate) fn receiver_args(&self, c: ClassId, args: &[Type], owner: ClassId) -> Vec<(String, Type)> {
+        let tps = self.classes[owner as usize].type_params.clone();
+        if tps.is_empty() {
+            return Vec::new();
+        }
+        let owner_args = self.upcast(c, args, owner).unwrap_or_default();
+        tps.into_iter().enumerate().map(|(i, n)| (n, owner_args.get(i).cloned().unwrap_or(Type::Error))).collect()
+    }
+
+    /// Resolves the type arguments written after a generic class's name,
+    /// checking their number.
+    fn class_args(&mut self, c: ClassId, args: &[TypeExpr], self_class: Option<ClassId>, span: Span) -> Vec<Type> {
+        let want = self.classes[c as usize].type_params.len();
+        let resolved: Vec<Type> = args.iter().map(|a| self.resolve_type(a, self_class)).collect();
+        if resolved.len() != want {
+            let name = self.class_names[c as usize].clone();
+            let msg = match want {
+                0 => format!("`{name}` does not take type arguments"),
+                1 => format!("`{name}` takes 1 type argument"),
+                n => format!("`{name}` takes {n} type arguments"),
+            };
+            self.error(msg, span);
+            return vec![Type::Error; want];
+        }
+        resolved
     }
 
     pub(crate) fn exception_class(&self) -> Option<ClassId> {
@@ -643,7 +740,7 @@ impl<'a> Checker<'a> {
                         return Type::map(k, v);
                     }
                     "self" => match self_class {
-                        Some(c) => simple(Type::Class(c)),
+                        Some(c) => simple(self.own_type(c)),
                         None => {
                             self.error("`self` can only be used inside a class", t.span);
                             return Type::Error;
@@ -665,7 +762,10 @@ impl<'a> Checker<'a> {
                         return Type::Error;
                     }
                     other => match self.class_ref(other, t.span) {
-                        Some(c) => simple(Type::Class(c)),
+                        Some(c) => {
+                            let args = self.class_args(c, args, self_class, t.span);
+                            return Type::Class(c, args);
+                        }
                         None => {
                             self.error(format!("unknown type `{other}`"), t.span);
                             return Type::Error;
@@ -857,6 +957,8 @@ impl<'a> Checker<'a> {
                             decl: Some(d),
                             kind: d.kind,
                             module: mi,
+                            type_params: d.type_params.iter().map(|(n, _)| n.clone()).collect(),
+                            super_args: HashMap::new(),
                             parent: None,
                             ifaces: Vec::new(),
                             supers: HashSet::new(),
@@ -1021,12 +1123,20 @@ impl<'a> Checker<'a> {
         order.push(cid);
     }
 
-    /// Whether method `sub` can stand in for `base` (same parameters, compatible return).
-    fn compatible_override(&self, sub: FuncId, base: FuncId) -> bool {
+    /// Whether method `sub` can stand in for `base` (same parameters, compatible
+    /// return) in class `through`, both seen through it: `class A extends B<int>`
+    /// overrides `B::f(T $x)` with `f(int $x)`.
+    fn compatible_override(&self, sub: FuncId, base: FuncId, through: ClassId) -> bool {
         let (a, b) = (&self.funcs[sub as usize], &self.funcs[base as usize]);
-        a.params.len() == b.params.len()
-            && a.params.iter().zip(&b.params).all(|(x, y)| x.ty == y.ty)
-            && self.assignable(&a.ret, &b.ret)
+        let Type::Class(_, own) = self.own_type(through) else { return false };
+        let view = |t: &Type, owner: Option<ClassId>| match owner {
+            Some(o) => self.member_type(t, through, &own, o),
+            None => t.clone(),
+        };
+        a.type_params.len() == b.type_params.len()
+            && a.params.len() == b.params.len()
+            && a.params.iter().zip(&b.params).all(|(x, y)| view(&x.ty, a.class) == view(&y.ty, b.class))
+            && self.assignable(&view(&a.ret, a.class), &view(&b.ret, b.class))
     }
 
     /// Counts `n` more inherited members; true (after reporting it once) when
@@ -1074,6 +1184,48 @@ impl<'a> Checker<'a> {
             self.module = self.classes[ci].module;
             let kind = decl.kind;
             let class_name = self.classes[ci].name.clone();
+            let class_tps = self.classes[ci].type_params.clone();
+            if !class_tps.is_empty() && kind == ClassKind::Enum {
+                self.error("enums cannot have type parameters", decl.name_span);
+            }
+            if class_tps.len() > 4 {
+                self.error("at most 4 type parameters are supported", decl.name_span);
+            }
+            for (i, (n, s)) in decl.type_params.iter().enumerate() {
+                if decl.type_params[..i].iter().any(|(m, _)| m == n) {
+                    self.error(format!("type parameter `{n}` is declared more than once"), *s);
+                }
+            }
+            // Type arguments of the parent and interfaces, in terms of this class's parameters.
+            self.type_params = class_tps.clone();
+            let mut super_args: HashMap<ClassId, Vec<Type>> = HashMap::new();
+            let mut supers_written: Vec<(ClassId, &[TypeExpr], Span)> = Vec::new();
+            if let (Some(p), Some((_, pspan))) = (self.classes[ci].parent, &decl.parent) {
+                supers_written.push((p, &decl.parent_args, *pspan));
+            }
+            for ((iname, ispan), iargs) in decl.interfaces.iter().zip(&decl.interface_args) {
+                if let Some(i) = self.lookup_class(iname) {
+                    supers_written.push((i, iargs, *ispan));
+                }
+            }
+            for (s, written, span) in supers_written {
+                let args = self.class_args(s, written, Some(cid), span);
+                if args.is_empty() {
+                    let inherited = self.classes[s as usize].super_args.clone();
+                    super_args.extend(inherited);
+                    continue;
+                }
+                let stps = self.classes[s as usize].type_params.clone();
+                let inherited: Vec<(ClassId, Vec<Type>)> = self.classes[s as usize]
+                    .super_args
+                    .iter()
+                    .map(|(k, v)| (*k, v.iter().map(|t| subst_params(t, &stps, &args)).collect()))
+                    .collect();
+                super_args.extend(inherited);
+                super_args.insert(s, args);
+            }
+            self.classes[ci].super_args = super_args;
+            self.type_params.clear();
             if let Some(p) = self.classes[ci].parent {
                 match self.classes[p as usize].kind {
                     ClassKind::Interface => {
@@ -1222,6 +1374,7 @@ impl<'a> Checker<'a> {
                 }
                 self.classes[ci].consts.insert(c.name.clone(), value);
             }
+            self.type_params = class_tps.clone();
             for prop in &decl.props {
                 let ty = self.resolve_type(&prop.ty, Some(cid));
                 let default = prop.default.as_ref().and_then(|d| self.const_default(d, &ty));
@@ -1242,14 +1395,22 @@ impl<'a> Checker<'a> {
             }
             let mut own_ctor = false;
             for m in &decl.methods {
-                self.type_params = m.type_params.iter().map(|(n, _)| n.clone()).collect();
+                let type_params: Vec<String> = m.type_params.iter().map(|(n, _)| n.clone()).collect();
+                for (n, s) in &m.type_params {
+                    if class_tps.contains(n) {
+                        self.error(format!("type parameter `{n}` is already a type parameter of `{class_name}`"), *s);
+                    }
+                }
+                // Static methods do not belong to an instance, so the class's parameters are not in scope.
+                self.type_params = if m.is_static && m.name != "__construct" { Vec::new() } else { class_tps.clone() };
+                self.type_params.extend(type_params.iter().cloned());
                 let params = self.resolve_params(&m.params, Some(cid));
                 let is_ctor = m.name == "__construct";
                 let ret = match &m.ret {
                     Some(t) => self.resolve_type(t, Some(cid)),
                     None => Type::Void,
                 };
-                let type_params = std::mem::take(&mut self.type_params);
+                self.type_params.clear();
                 if type_params.len() > 4 {
                     self.error("at most 4 type parameters are supported", m.name_span);
                 }
@@ -1326,7 +1487,7 @@ impl<'a> Checker<'a> {
                                 m.name_span,
                             );
                         }
-                        if !self.compatible_override(fid, old.func) {
+                        if !self.compatible_override(fid, old.func, cid) {
                             let parent_name = self.funcs[old.func as usize].name.clone();
                             self.error(
                                 format!(
@@ -1416,7 +1577,7 @@ impl<'a> Checker<'a> {
                     Some(cm) => {
                         if cm.vis != Visibility::Public {
                             self.error(format!("`{name}::{mname}` must be public to implement an interface"), span);
-                        } else if !self.compatible_override(cm.func, im.func) {
+                        } else if !self.compatible_override(cm.func, im.func, cid) {
                             let iname = self.funcs[im.func as usize].name.clone();
                             self.error(format!("`{name}::{mname}` does not match the signature of `{iname}`"), span);
                         }
@@ -1517,12 +1678,17 @@ impl<'a> Checker<'a> {
         let name = info.name.clone();
         let is_abstract = info.is_abstract;
         self.type_params = info.type_params.clone();
+        if let (Some(c), false) = (class, is_static) {
+            let mut tps = self.classes[c as usize].type_params.clone();
+            tps.append(&mut self.type_params);
+            self.type_params = tps;
+        }
 
         let mut ctx = FnCtx::new(ret.clone(), class, kind);
         let mut param_ids = Vec::new();
         let mut this = None;
         if matches!(kind, FuncKind::Method | FuncKind::Ctor) && !is_static {
-            let id = ctx.declare("this", Type::Class(class.unwrap()), span);
+            let id = ctx.declare("this", self.own_type(class.unwrap()), span);
             ctx.flow.mark(id);
             param_ids.push(id);
             this = Some(id);
@@ -1543,7 +1709,7 @@ impl<'a> Checker<'a> {
                     for (i, p) in params.iter().enumerate() {
                         if p.promote.is_some() {
                             let slot = self.field_slot(class.unwrap(), &p.name).unwrap_or(0);
-                            let this_ty = Type::Class(class.unwrap());
+                            let this_ty = self.own_type(class.unwrap());
                             let place = HPlace {
                                 base: HPlaceBase::Prop(
                                     Box::new(HExpr { kind: HExprKind::Local(this), ty: this_ty, span }),
@@ -1703,5 +1869,27 @@ impl<'a> Checker<'a> {
             .collect();
         let program = HProgram { funcs, classes, main: self.main.unwrap_or(0), exc_classes };
         (program, self.diags)
+    }
+}
+
+/// Replaces the type parameters `names` (as `Type::Param`) in `t` by `args`.
+pub(crate) fn subst_params(t: &Type, names: &[String], args: &[Type]) -> Type {
+    if names.is_empty() {
+        return t.clone();
+    }
+    match t {
+        Type::Param(n) => match names.iter().position(|p| p == n) {
+            Some(i) => args.get(i).cloned().unwrap_or(Type::Error),
+            None => t.clone(),
+        },
+        Type::List(x) => Type::list(subst_params(x, names, args)),
+        Type::Map(k, v) => Type::map(subst_params(k, names, args), subst_params(v, names, args)),
+        Type::Func(ps, r) => Type::Func(
+            ps.iter().map(|p| subst_params(p, names, args)).collect(),
+            Box::new(subst_params(r, names, args)),
+        ),
+        Type::Union(ms) => Type::union(ms.iter().map(|m| subst_params(m, names, args)).collect()),
+        Type::Class(c, xs) => Type::Class(*c, xs.iter().map(|x| subst_params(x, names, args)).collect()),
+        other => other.clone(),
     }
 }

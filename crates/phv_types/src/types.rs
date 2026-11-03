@@ -25,7 +25,8 @@ pub enum Type {
     Error,
     List(Box<Type>),
     Map(Box<Type>, Box<Type>),
-    Class(ClassId),
+    /// A class or interface with its type arguments (empty unless it is generic).
+    Class(ClassId, Vec<Type>),
     Func(Vec<Type>, Box<Type>),
     /// Normalized: flat, sorted, deduplicated, at least two members.
     Union(Vec<Type>),
@@ -44,6 +45,11 @@ impl Type {
     /// `Html` or one of its more specific forms.
     pub fn is_html(&self) -> bool {
         matches!(self, Type::Html | Type::SafeUrl | Type::SafeJs)
+    }
+
+    /// A class that takes no type arguments.
+    pub fn class(c: ClassId) -> Type {
+        Type::Class(c, Vec::new())
     }
 
     pub fn list(t: Type) -> Type {
@@ -124,6 +130,7 @@ impl Type {
             Type::Map(k, v) => k.has_unknown() || v.has_unknown(),
             Type::Func(ps, r) => ps.iter().any(|p| p.has_unknown()) || r.has_unknown(),
             Type::Union(ms) => ms.iter().any(|m| m.has_unknown()),
+            Type::Class(_, args) => args.iter().any(|a| a.has_unknown()),
             _ => false,
         }
     }
@@ -155,7 +162,20 @@ impl fmt::Display for TypeDisplay<'_> {
             Type::Error => write!(f, "{{unknown}}"),
             Type::List(t) => write!(f, "list<{}>", t.display(self.names)),
             Type::Map(k, v) => write!(f, "map<{}, {}>", k.display(self.names), v.display(self.names)),
-            Type::Class(c) => write!(f, "{}", self.names.get(*c as usize).map(|s| s.as_str()).unwrap_or("?")),
+            Type::Class(c, args) => {
+                write!(f, "{}", self.names.get(*c as usize).map(|s| s.as_str()).unwrap_or("?"))?;
+                if !args.is_empty() {
+                    write!(f, "<")?;
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", a.display(self.names))?;
+                    }
+                    write!(f, ">")?;
+                }
+                Ok(())
+            }
             Type::Func(ps, r) => {
                 write!(f, "fn(")?;
                 for (i, p) in ps.iter().enumerate() {

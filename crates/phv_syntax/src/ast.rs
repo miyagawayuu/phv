@@ -182,9 +182,15 @@ pub struct ClassDecl {
     pub name: String,
     pub name_span: Span,
     pub kind: ClassKind,
+    /// `class Box<T>`
+    pub type_params: Vec<(String, Span)>,
     pub parent: Option<(String, Span)>,
+    /// Type arguments of the parent: `extends Base<int>`.
+    pub parent_args: Vec<TypeExpr>,
     /// `implements` list (or the `extends` list of an interface).
     pub interfaces: Vec<(String, Span)>,
+    /// Type arguments of each entry of `interfaces`.
+    pub interface_args: Vec<Vec<TypeExpr>>,
     pub props: Vec<PropDecl>,
     pub methods: Vec<FunctionDecl>,
     pub consts: Vec<ConstDecl>,
@@ -409,6 +415,8 @@ pub enum ExprKind {
     New {
         class: String,
         class_span: Span,
+        /// `new Box<int>(...)`; empty when they are inferred.
+        type_args: Vec<TypeExpr>,
         args: Vec<Arg>,
     },
     /// `$a[$k]`, or `$a[]` (push, only valid as an assignment target).
