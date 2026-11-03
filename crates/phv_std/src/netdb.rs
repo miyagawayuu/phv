@@ -984,7 +984,9 @@ fn my_connect(
         .write_timeout(Some(io_timeout))
         .max_allowed_packet(Some(packet));
     let opts = mysql::Opts::from(builder.clone());
-    let conn = mysql::Conn::new(builder).map_err(|e| my_message(&e))?;
+    // The driver looks the host up itself, with no deadline of its own.
+    let conn = crate::netio::with_deadline(Instant::now() + timeout, move || mysql::Conn::new(builder))?
+        .map_err(|e| my_message(&e))?;
     Ok(MyConn { conn, timeout_ms: None, opts })
 }
 

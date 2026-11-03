@@ -171,8 +171,9 @@ impl PgClient {
             .enable_all()
             .build()
             .map_err(|_| "cannot start the database connection".to_string())?;
+        let until = std::time::Instant::now() + timeout;
         let client = rt.block_on(async {
-            match tokio::time::timeout(timeout, open(config, tls, meter)).await {
+            match tokio::time::timeout(timeout, open(config, tls, meter, until)).await {
                 Ok(r) => r,
                 Err(_) => Err("timed out".to_string()),
             }
@@ -233,6 +234,7 @@ async fn open(
     config: &Config,
     tls: Option<tokio_postgres_rustls::MakeRustlsConnect>,
     meter: Meter,
+    until: std::time::Instant,
 ) -> Result<Client, String> {
     use tokio_postgres::config::Host;
     let ports = config.get_ports();
@@ -245,11 +247,19 @@ async fn open(
             continue;
         };
         let port = ports.get(i).or(ports.first()).copied().unwrap_or(5432);
-        let addr = match config.get_hostaddrs().get(i) {
-            Some(ip) => std::net::SocketAddr::new(*ip, port).to_string(),
-            None => format!("{}:{port}", name.trim_start_matches('[').trim_end_matches(']')),
+        // Looked up here, with a deadline: tokio's own lookup runs on a thread
+        // that dropping the runtime would wait for.
+        let addrs = match config.get_hostaddrs().get(i) {
+            Some(ip) => vec![std::net::SocketAddr::new(*ip, port)],
+            None => match crate::netio::resolve(name, port, until) {
+                Ok(a) => a,
+                Err(e) => {
+                    last = e;
+                    continue;
+                }
+            },
         };
-        let tcp = match TcpStream::connect(addr).await {
+        let tcp = match TcpStream::connect(&addrs[..]).await {
             Ok(t) => t,
             Err(e) => {
                 last = crate::netio::describe(&e);

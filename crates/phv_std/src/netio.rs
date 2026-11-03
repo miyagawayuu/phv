@@ -3,12 +3,15 @@
 //!
 //! Every socket read and write waits at most until the stream's deadline, so a
 //! server that sends one byte at a time cannot keep a script past its time
-//! limit (a socket timeout alone limits each read, not the total).
+//! limit (a socket timeout alone limits each read, not the total). Name
+//! lookups, which the OS cannot cancel, are given up on at the deadline too
+//! (`with_deadline`).
 
 use crate::netdb::{is_local_host, tls_init};
 use phv_vm::Vm;
 use std::io::{Error, ErrorKind, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -146,13 +149,57 @@ pub(crate) fn describe(e: &Error) -> String {
     }
 }
 
+/// Blocking work (name lookups, the MySQL driver's connect) that is still
+/// running, including work whose caller gave up at its deadline.
+static PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// At most this much abandoned blocking work at once: a resolver that never
+/// answers then costs that many threads, not one per request.
+const MAX_PENDING: usize = 32;
+
+/// Runs `work` on its own thread and waits for it until `until`. The OS cannot
+/// cancel a name lookup, so on timeout the thread is left to finish on its own
+/// and its result is dropped.
+pub(crate) fn with_deadline<T: Send + 'static>(
+    until: Instant,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    if PENDING.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING {
+        PENDING.fetch_sub(1, Ordering::SeqCst);
+        return Err("too many network connections are being set up".into());
+    }
+    let (send, recv) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new().stack_size(256 << 10).spawn(move || {
+        let _ = send.send(work());
+        PENDING.fetch_sub(1, Ordering::SeqCst);
+    });
+    if spawned.is_err() {
+        PENDING.fetch_sub(1, Ordering::SeqCst);
+        return Err("cannot start the connection".into());
+    }
+    recv.recv_timeout(until.saturating_duration_since(Instant::now())).map_err(|_| "timed out".to_string())
+}
+
+/// The addresses of `host`, looked up before `until`.
+pub(crate) fn resolve(host: &str, port: u16, until: Instant) -> Result<Vec<SocketAddr>, String> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let name = bare.to_string();
+    let addrs = with_deadline(until, move || (name.as_str(), port).to_socket_addrs().map(|a| a.collect::<Vec<_>>()))?;
+    match addrs {
+        Ok(a) if !a.is_empty() => Ok(a),
+        _ => Err("cannot resolve the host name".into()),
+    }
+}
+
 /// Connects to `host:port` before `until`, then starts TLS when `tls` is set.
 /// Reads and writes on the stream also stop at `until` (see `set_deadline`).
 pub(crate) fn dial(host: &str, port: u16, tls: bool, until: Instant) -> Result<Stream, String> {
     let left = || until.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
     let bare = host.trim_start_matches('[').trim_end_matches(']');
-    let addrs: Vec<_> =
-        (bare, port).to_socket_addrs().map_err(|_| "cannot resolve the host name".to_string())?.collect();
+    let addrs = resolve(bare, port, until)?;
     let mut last = "cannot resolve the host name".to_string();
     let mut tcp = None;
     for addr in addrs {
@@ -215,5 +262,27 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(1500), "took {:?}", start.elapsed());
         assert!(!got.is_empty() && got.len() < 10, "{got:?}");
         assert_eq!(describe(&err), "timed out");
+    }
+
+    /// Work that never finishes (a resolver that does not answer) is given up
+    /// on at the deadline, and abandoned work is capped.
+    #[test]
+    fn blocking_work_stops_at_the_deadline() {
+        let start = Instant::now();
+        let r = with_deadline(start + Duration::from_millis(200), || std::thread::sleep(Duration::from_secs(3)));
+        assert_eq!(r, Err("timed out".to_string()));
+        assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
+        assert_eq!(with_deadline(Instant::now() + Duration::from_secs(1), || 7), Ok(7));
+
+        let stuck: Vec<_> = (0..MAX_PENDING + 2)
+            .map(|_| {
+                with_deadline(Instant::now() + Duration::from_millis(10), || std::thread::sleep(Duration::from_secs(2)))
+            })
+            .collect();
+        assert!(stuck.iter().any(|r| r.as_ref().is_err_and(|e| e.starts_with("too many"))), "{stuck:?}");
+        assert_eq!(resolve("[::1]", 80, Instant::now()).unwrap(), vec!["[::1]:80".parse().unwrap()]);
+        std::thread::sleep(Duration::from_secs(2));
+        let local = resolve("localhost", 80, Instant::now() + Duration::from_secs(5)).unwrap();
+        assert!(local.iter().all(|a| a.ip().is_loopback()), "{local:?}");
     }
 }
