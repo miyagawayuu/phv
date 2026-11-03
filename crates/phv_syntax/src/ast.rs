@@ -152,8 +152,18 @@ pub struct Param {
     pub span: Span,
 }
 
+/// `#[Deprecated("use load()")]` before a declaration.
+#[derive(Debug, Clone)]
+pub struct Attribute {
+    pub name: String,
+    pub name_span: Span,
+    pub args: Vec<Arg>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct FunctionDecl {
+    pub attrs: Vec<Attribute>,
     pub name: String,
     pub name_span: Span,
     /// `function first<T>(list<T> $xs): ?T`
@@ -179,6 +189,7 @@ pub enum ClassKind {
 
 #[derive(Debug, Clone)]
 pub struct ClassDecl {
+    pub attrs: Vec<Attribute>,
     pub name: String,
     pub name_span: Span,
     pub kind: ClassKind,
@@ -203,6 +214,7 @@ pub struct ClassDecl {
 
 #[derive(Debug, Clone)]
 pub struct ConstDecl {
+    pub attrs: Vec<Attribute>,
     pub name: String,
     pub name_span: Span,
     pub ty: Option<TypeExpr>,
@@ -220,6 +232,7 @@ pub struct EnumCase {
 
 #[derive(Debug, Clone)]
 pub struct PropDecl {
+    pub attrs: Vec<Attribute>,
     pub name: String,
     pub ty: TypeExpr,
     pub default: Option<Expr>,

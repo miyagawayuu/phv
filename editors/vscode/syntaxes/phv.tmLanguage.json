@@ -21,6 +21,7 @@
     },
     "code": {
       "patterns": [
+        { "include": "#attributes" },
         { "include": "#comments" },
         { "include": "#sql-string" },
         { "include": "#double-string" },
@@ -34,6 +35,19 @@
         { "include": "#calls" },
         { "include": "#class-names" },
         { "include": "#operators" }
+      ]
+    },
+    "attributes": {
+      "begin": "#\\[",
+      "end": "\\]",
+      "name": "meta.attribute.phv",
+      "beginCaptures": { "0": { "name": "punctuation.definition.attribute.begin.phv" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.attribute.end.phv" } },
+      "patterns": [
+        { "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b", "name": "entity.name.type.attribute.phv" },
+        { "include": "#double-string" },
+        { "include": "#single-string" },
+        { "include": "#numbers" }
       ]
     },
     "comments": {
@@ -51,6 +65,10 @@
         {
           "match": "//.*?(?=\\?>|$)",
           "name": "comment.line.double-slash.phv"
+        },
+        {
+          "match": "#(?!\\[).*?(?=\\?>|$)",
+          "name": "comment.line.number-sign.phv"
         }
       ]
     },

@@ -78,6 +78,8 @@ pub enum Tok {
     // Punctuation.
     LParen,
     RParen,
+    /// `#` before `[`: the start of an annotation, `#[Deprecated]`.
+    Hash,
     LBracket,
     RBracket,
     LBrace,
@@ -256,6 +258,7 @@ impl Tok {
             Tok::Final => "final",
             Tok::LParen => "(",
             Tok::RParen => ")",
+            Tok::Hash => "#",
             Tok::LBracket => "[",
             Tok::RBracket => "]",
             Tok::LBrace => "{",

@@ -1,0 +1,4 @@
+<?phv
+// An annotation must come before a declaration (error).
+#[Deprecated]
+echo "not a declaration";

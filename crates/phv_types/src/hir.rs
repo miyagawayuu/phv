@@ -251,4 +251,6 @@ pub struct HProgram {
     pub classes: Vec<HClass>,
     pub main: FuncId,
     pub exc_classes: HashMap<String, ClassId>,
+    /// Functions marked `#[Test]` or `#[Skip("...")]`, with the reason a skipped one is skipped.
+    pub tests: Vec<(FuncId, Option<String>)>,
 }

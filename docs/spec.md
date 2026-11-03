@@ -38,7 +38,7 @@ It is not compatible with existing PHP code, but it aims to be something PHP pro
 ## 3. Lexical Structure
 
 - Variables are written `$name`. There is no `$$name` (variable variables).
-- Comments are `// ...`, `# ...`, and `/* ... */`.
+- Comments are `// ...`, `# ...`, and `/* ... */`. `#[` starts an annotation, not a comment (§9).
 - Integers: `42`, `1_000_000`, `0xFF`, `0b1010`, `0o17`. 64-bit. Overflow raises `ArithmeticError`.
 - Floating-point numbers: `1.5`, `1e-3`.
 - Strings:
@@ -399,6 +399,30 @@ Box<float> $f = new Box(1);       // from the declared type: Box<float>
   could otherwise be given a string).
 - Type arguments exist only at compile time. `is` checks the class: `$x is Box` (writing `is Box<int>` is an error),
   and narrows to `Box<any>`.
+
+### Annotations
+
+```phv
+#[Deprecated("use total()")]
+function sum(list<int> $xs): int { return total($xs); }
+
+class Square extends Shape {
+    #[Override]
+    public function area(): float { return $this->side ** 2; }
+}
+```
+
+Annotations are written before a function, class, method or property, as `#[Name]` or `#[Name("reason")]`; several
+can be given as `#[A, B]` or on separate lines. PHV knows these (any other name is an error, so a typo is not ignored):
+
+| Annotation | On | Effect |
+|---|---|---|
+| `#[Deprecated]`, `#[Deprecated("reason")]` | function, method, class, property | A warning where it is used (calls, `new`, static calls, property reads), except inside its own class |
+| `#[Override]` | method | An error unless a parent class or an interface declares a method of that name (not a private one) |
+| `#[Test]` | function | `phv test` runs it, whatever its name (§16) |
+| `#[Skip]`, `#[Skip("reason")]` | function | `phv test` reports it as skipped instead of running it |
+
+Annotations are checked at compile time and are not available at run time.
 
 
 ## 10. Exception Classes
@@ -1067,6 +1091,17 @@ function test_find_post(): void {
 
 When `assert(bool, ?message)` or `assert_eq(expected, actual, ?message)` fails, it raises `AssertionError`.
 
+A test is a function of the test file that takes no parameters and is named `test_*` or marked `#[Test]`. Tests run in
+the order they are declared. A test marked `#[Skip("reason")]` is reported as skipped and not run.
+
+```phv
+#[Test]
+function posts_have_titles(): void { /* ... */ }
+
+#[Skip("needs the staging database")]
+function test_import(): void { /* ... */ }
+```
+
 ### Packages
 
 ```toml
@@ -1133,7 +1168,6 @@ that checks journal files (`phv_std/src/db/vfs.rs`).
 
 ## 18. Roadmap
 
-- Annotations (attributes)
 - Asynchronous I/O
 - Wider JIT coverage (functions that handle floats and strings), AOT compilation
 - Transitive dependency resolution, a package registry

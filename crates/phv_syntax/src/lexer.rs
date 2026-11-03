@@ -161,8 +161,8 @@ impl<'a> Lexer<'a> {
             let b = self.peek(0);
             if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
                 self.pos += 1;
-            } else if self.starts_with("//") || b == b'#' {
-                // Line comment; like PHP it ends at `?>` too.
+            } else if self.starts_with("//") || (b == b'#' && self.peek(1) != b'[') {
+                // Line comment; like PHP it ends at `?>` too. `#[` starts an annotation.
                 let start = self.pos;
                 while self.pos < self.bytes.len() && self.peek(0) != b'\n' && !self.starts_with("?>") {
                     self.pos += 1;
@@ -274,6 +274,7 @@ impl<'a> Lexer<'a> {
             (">>", Tok::Shr),
             ("(", Tok::LParen),
             (")", Tok::RParen),
+            ("#", Tok::Hash),
             ("[", Tok::LBracket),
             ("]", Tok::RBracket),
             ("{", Tok::LBrace),

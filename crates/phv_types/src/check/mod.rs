@@ -189,7 +189,36 @@ pub(crate) struct Checker<'a> {
     /// Members copied into subclasses so far (see `MAX_INHERITED_MEMBERS`).
     inherited_members: usize,
     reported_hierarchy: bool,
+    /// What `#[Deprecated]` says about functions, classes and properties
+    /// (`(owner, name)`); using them gives a warning.
+    deprecated_funcs: HashMap<FuncId, String>,
+    deprecated_classes: HashMap<ClassId, String>,
+    deprecated_fields: HashMap<(ClassId, String), String>,
+    /// `#[Test]` and `#[Skip]` functions.
+    tests: Vec<(FuncId, Option<String>)>,
 }
+
+/// What an annotation can be written before.
+#[derive(Clone, Copy, PartialEq)]
+enum AnnTarget {
+    Function,
+    Method,
+    Class,
+    Property,
+    Const,
+}
+
+/// The annotations of one declaration, checked.
+#[derive(Default)]
+struct Annotations {
+    deprecated: Option<String>,
+    is_override: bool,
+    test: bool,
+    skip: Option<String>,
+}
+
+/// Annotations PHV knows; any other name is an error (a typo would otherwise be ignored).
+const ANNOTATIONS: &str = "Deprecated, Override, Test, Skip";
 
 /// Members (fields, methods, constants) all classes may inherit together.
 const MAX_INHERITED_MEMBERS: usize = 200_000;
@@ -246,7 +275,85 @@ impl<'a> Checker<'a> {
             index: None,
             inherited_members: 0,
             reported_hierarchy: false,
+            deprecated_funcs: HashMap::new(),
+            deprecated_classes: HashMap::new(),
+            deprecated_fields: HashMap::new(),
+            tests: Vec::new(),
         }
+    }
+
+    /// Checks the annotations written before a declaration of kind `target`.
+    fn annotations(&mut self, attrs: &[ast::Attribute], target: AnnTarget) -> Annotations {
+        let mut out = Annotations::default();
+        let mut seen: Vec<&str> = Vec::new();
+        for a in attrs {
+            if seen.contains(&a.name.as_str()) {
+                self.error(format!("`#[{}]` is written more than once", a.name), a.name_span);
+                continue;
+            }
+            seen.push(&a.name);
+            let allowed: &[AnnTarget] = match a.name.as_str() {
+                "Deprecated" => &[AnnTarget::Function, AnnTarget::Method, AnnTarget::Class, AnnTarget::Property],
+                "Override" => &[AnnTarget::Method],
+                "Test" | "Skip" => &[AnnTarget::Function],
+                _ => {
+                    self.error(format!("unknown annotation `#[{}]`", a.name), a.name_span)
+                        .add_note(format!("PHV knows {ANNOTATIONS}"));
+                    continue;
+                }
+            };
+            if !allowed.contains(&target) {
+                let what = match target {
+                    AnnTarget::Function => "a function",
+                    AnnTarget::Method => "a method",
+                    AnnTarget::Class => "a class",
+                    AnnTarget::Property => "a property",
+                    AnnTarget::Const => "a constant",
+                };
+                self.error(format!("`#[{}]` cannot be written before {what}", a.name), a.name_span);
+                continue;
+            }
+            // `Deprecated` and `Skip` take an optional reason; the others nothing.
+            let takes_text = matches!(a.name.as_str(), "Deprecated" | "Skip");
+            let text = match (a.args.as_slice(), takes_text) {
+                ([], _) => String::new(),
+                ([arg], true) if arg.name.is_none() => match &arg.value.kind {
+                    ExprKind::Str(s) => s.clone(),
+                    _ => {
+                        self.error(format!("`#[{}]` takes a string literal", a.name), arg.value.span);
+                        continue;
+                    }
+                },
+                _ => {
+                    let msg = if takes_text {
+                        format!("`#[{}]` takes one string, the reason", a.name)
+                    } else {
+                        format!("`#[{}]` takes no arguments", a.name)
+                    };
+                    self.error(msg, a.span);
+                    continue;
+                }
+            };
+            match a.name.as_str() {
+                "Deprecated" => out.deprecated = Some(text),
+                "Override" => out.is_override = true,
+                "Test" => out.test = true,
+                _ => out.skip = Some(text),
+            }
+        }
+        out
+    }
+
+    /// The warning for using something marked `#[Deprecated]` that belongs to
+    /// class `owner` (none inside that class itself, which still uses it).
+    fn warn_deprecated(&mut self, what: String, reason: Option<String>, owner: Option<ClassId>, span: Span) {
+        let Some(reason) = reason else { return };
+        if owner.is_some() && self.ctx.last().and_then(|c| c.class) == owner {
+            return;
+        }
+        let msg =
+            if reason.is_empty() { format!("{what} is deprecated") } else { format!("{what} is deprecated: {reason}") };
+        self.warn(msg, span);
     }
 
     fn run(&mut self) {
@@ -935,6 +1042,16 @@ impl<'a> Checker<'a> {
                             kind: FuncKind::Normal,
                             span: d.name_span,
                         });
+                        let ann = self.annotations(&d.attrs, AnnTarget::Function);
+                        if let Some(r) = ann.deprecated {
+                            self.deprecated_funcs.insert(fid, r);
+                        }
+                        if ann.test || ann.skip.is_some() {
+                            if !d.params.is_empty() {
+                                self.error("a test cannot take parameters", d.name_span);
+                            }
+                            self.tests.push((fid, ann.skip));
+                        }
                         let scope = &mut self.scopes[mi];
                         if scope.funcs.insert(d.name.clone(), fid).is_some() {
                             self.error(format!("function `{}` is defined more than once", d.name), d.name_span);
@@ -973,6 +1090,10 @@ impl<'a> Checker<'a> {
                             span: d.name_span,
                         });
                         self.class_names.push(d.name.clone());
+                        let ann = self.annotations(&d.attrs, AnnTarget::Class);
+                        if let Some(r) = ann.deprecated {
+                            self.deprecated_classes.insert(cid, r);
+                        }
                         let exists = self.scopes[mi].classes.insert(d.name.clone(), cid).is_some()
                             || (m.kind != ModuleKind::Prelude
                                 && self.prelude().is_some_and(|p| self.scopes[p].classes.contains_key(&d.name)));
@@ -984,6 +1105,7 @@ impl<'a> Checker<'a> {
                         }
                     }
                     StmtKind::Const(d) => {
+                        self.annotations(&d.attrs, AnnTarget::Const);
                         let Some(value) = self.literal_const(&d.value, d.ty.as_ref(), None) else { continue };
                         self.scopes[mi].const_spans.insert(d.name.clone(), d.name_span);
                         if self.scopes[mi].consts.insert(d.name.clone(), value.clone()).is_some() {
@@ -1366,6 +1488,7 @@ impl<'a> Checker<'a> {
                 self.error("`case` can only be used in an enum", case.span);
             }
             for c in &decl.consts {
+                self.annotations(&c.attrs, AnnTarget::Const);
                 let Some(value) = self.literal_const(&c.value, c.ty.as_ref(), Some(cid)) else { continue };
                 let own_dup = self.classes[ci].consts.contains_key(&c.name)
                     && decl.consts.iter().filter(|o| o.name == c.name).count() > 1;
@@ -1376,6 +1499,10 @@ impl<'a> Checker<'a> {
             }
             self.type_params = class_tps.clone();
             for prop in &decl.props {
+                let ann = self.annotations(&prop.attrs, AnnTarget::Property);
+                if let Some(r) = ann.deprecated {
+                    self.deprecated_fields.insert((cid, prop.name.clone()), r);
+                }
                 let ty = self.resolve_type(&prop.ty, Some(cid));
                 let default = prop.default.as_ref().and_then(|d| self.const_default(d, &ty));
                 let required = !ty.is_nullable() && default.is_none() && ty != Type::Error;
@@ -1446,6 +1573,24 @@ impl<'a> Checker<'a> {
                     kind: if is_ctor { FuncKind::Ctor } else { FuncKind::Method },
                     span: m.name_span,
                 });
+                let ann = self.annotations(&m.attrs, AnnTarget::Method);
+                if let Some(r) = ann.deprecated {
+                    self.deprecated_funcs.insert(fid, r);
+                }
+                if ann.is_override {
+                    let overrides = !is_ctor
+                        && self.classes[ci]
+                            .methods
+                            .get(&m.name)
+                            .is_some_and(|old| old.owner != cid && old.vis != Visibility::Private);
+                    if !overrides {
+                        self.error(
+                            format!("`{class_name}::{}` is marked `#[Override]` but overrides nothing", m.name),
+                            m.name_span,
+                        )
+                        .add_note("no parent class or interface declares a method with this name");
+                    }
+                }
                 if is_ctor {
                     own_ctor = true;
                     for (p, ap) in params.iter().zip(&m.params) {
@@ -1813,7 +1958,7 @@ impl<'a> Checker<'a> {
         self.classes[cid as usize].fields.iter().position(|f| f.name == name).map(|i| i as u32)
     }
 
-    fn finish(self) -> (HProgram, Vec<Diagnostic>) {
+    fn finish(mut self) -> (HProgram, Vec<Diagnostic>) {
         let classes = self
             .classes
             .iter()
@@ -1867,7 +2012,8 @@ impl<'a> Checker<'a> {
                 })
             })
             .collect();
-        let program = HProgram { funcs, classes, main: self.main.unwrap_or(0), exc_classes };
+        let tests = std::mem::take(&mut self.tests);
+        let program = HProgram { funcs, classes, main: self.main.unwrap_or(0), exc_classes, tests };
         (program, self.diags)
     }
 }

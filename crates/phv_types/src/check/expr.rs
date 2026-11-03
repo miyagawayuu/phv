@@ -1201,6 +1201,10 @@ impl<'a> Checker<'a> {
         args: &[Arg],
         span: Span,
     ) -> (Vec<HExpr>, Type, Vec<Type>) {
+        let reason = self.deprecated_funcs.get(&fid).cloned();
+        let what = format!("`{}`", self.funcs[fid as usize].name);
+        let owner = self.funcs[fid as usize].class;
+        self.warn_deprecated(what, reason, owner, span);
         let info = &self.funcs[fid as usize];
         let (mut params, mut ret, fname) = (info.params.clone(), info.ret.clone(), info.name.clone());
         if !fixed.is_empty() {
@@ -1517,6 +1521,8 @@ impl<'a> Checker<'a> {
                 };
                 let mut f = self.classes[c as usize].fields[slot as usize].clone();
                 f.ty = self.member_type(&f.ty, c, &cargs, f.owner);
+                let reason = self.deprecated_fields.get(&(f.owner, f.name.clone())).cloned();
+                self.warn_deprecated(format!("property `{cname}::${name}`"), reason, Some(f.owner), name_span);
                 self.note_ref(name_span, f.span);
                 if !self.can_access(f.owner, f.vis) {
                     self.error(format!("property `{cname}::${name}` is {}", Self::vis_word(f.vis)), name_span);
@@ -1723,6 +1729,8 @@ impl<'a> Checker<'a> {
                 return h;
             }
         }
+        let reason = self.deprecated_classes.get(&cid).cloned();
+        self.warn_deprecated(format!("class `{}`", self.class_names[cid as usize]), reason, Some(cid), class_span);
         self.note_site(name_span, &Type::class(cid), true);
         let Some(m) = self.classes[cid as usize].methods.get(name).cloned() else {
             let cname = self.class_names[cid as usize].clone();
@@ -1818,6 +1826,8 @@ impl<'a> Checker<'a> {
             }
             return err(span);
         };
+        let reason = self.deprecated_classes.get(&cid).cloned();
+        self.warn_deprecated(format!("class `{}`", self.class_names[cid as usize]), reason, Some(cid), class_span);
         let tps = self.classes[cid as usize].type_params.clone();
         // Type arguments: written (`new Box<int>()`), from the expected type
         // (`$b: Box<int> = new Box()`), or inferred from the constructor's arguments.

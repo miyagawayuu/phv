@@ -1,0 +1,44 @@
+<?phv
+// Annotations: #[Deprecated] warns where the thing is used, #[Override]
+// checks that a method overrides one.
+
+#[Deprecated("use total()")]
+function sum(list<int> $xs): int {
+    return total($xs);
+}
+
+function total(list<int> $xs): int {
+    $t = 0;
+    foreach ($xs as $x) {
+        $t += $x;
+    }
+    return $t;
+}
+
+interface Shape {
+    public function area(): float;
+}
+
+#[Deprecated]
+class OldSquare implements Shape {
+    #[Deprecated("read side() instead")]
+    public float $width = 2.0;
+
+    #[Override]
+    public function area(): float {
+        return $this->width * $this->width;
+    }
+}
+
+class Square extends OldSquare {
+    #[Override, Deprecated("squares are squares")]
+    public function area(): float {
+        return parent::area();
+    }
+}
+
+# A comment that starts with `#` is still a comment.
+echo sum([1, 2, 3]), " ", total([4]), "\n";
+$s = new OldSquare();
+echo $s->area(), " ", $s->width, "\n";
+echo (new Square())->area(), "\n";

@@ -1,0 +1,7 @@
+error: annotations can only be written before a declaration
+ --> err_annotation_place.phv:3:3
+  |
+3 | #[Deprecated]
+  |   ^^^^^^^^^^
+
+1 error found

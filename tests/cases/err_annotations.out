@@ -1,0 +1,71 @@
+error: unknown annotation `#[Deprecatd]`
+ --> err_annotations.phv:4:3
+  |
+4 | #[Deprecatd]
+  |   ^^^^^^^^^
+  = note: PHV knows Deprecated, Override, Test, Skip
+
+error: `#[Override]` cannot be written before a function
+ --> err_annotations.phv:7:3
+  |
+7 | #[Override]
+  |   ^^^^^^^^
+
+error: `#[Test]` takes no arguments
+  --> err_annotations.phv:10:3
+   |
+10 | #[Test("x")]
+   |   ^^^^^^^^^
+
+error: `#[Deprecated]` takes a string literal
+  --> err_annotations.phv:13:14
+   |
+13 | #[Deprecated(42)]
+   |              ^^
+
+error: a test cannot take parameters
+  --> err_annotations.phv:17:10
+   |
+17 | function e(int $x): void {}
+   |          ^
+
+error: `#[Deprecated]` is written more than once
+  --> err_annotations.phv:19:15
+   |
+19 | #[Deprecated, Deprecated]
+   |               ^^^^^^^^^^
+
+error: `Child::hidden` is marked `#[Override]` but overrides nothing
+  --> err_annotations.phv:28:21
+   |
+28 |     public function hidden(): void {}
+   |                     ^^^^^^
+   = note: no parent class or interface declares a method with this name
+
+error: `Child::fresh` is marked `#[Override]` but overrides nothing
+  --> err_annotations.phv:31:21
+   |
+31 |     public function fresh(): void {}
+   |                     ^^^^^
+   = note: no parent class or interface declares a method with this name
+
+error: `Child::__construct` is marked `#[Override]` but overrides nothing
+  --> err_annotations.phv:34:21
+   |
+34 |     public function __construct() {}
+   |                     ^^^^^^^^^^^
+   = note: no parent class or interface declares a method with this name
+
+error: `#[Deprecated]` cannot be written before a constant
+  --> err_annotations.phv:36:7
+   |
+36 |     #[Deprecated]
+   |       ^^^^^^^^^^
+
+error: `#[Deprecated]` cannot be written before a constant
+  --> err_annotations.phv:40:3
+   |
+40 | #[Deprecated]
+   |   ^^^^^^^^^^
+
+11 errors found

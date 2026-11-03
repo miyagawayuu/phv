@@ -1,0 +1,41 @@
+<?phv
+// Mistakes with annotations (all errors).
+
+#[Deprecatd]
+function a(): void {}
+
+#[Override]
+function b(): void {}
+
+#[Test("x")]
+function c(): void {}
+
+#[Deprecated(42)]
+function d(): void {}
+
+#[Test]
+function e(int $x): void {}
+
+#[Deprecated, Deprecated]
+function f(): void {}
+
+class Base {
+    private function hidden(): void {}
+}
+
+class Child extends Base {
+    #[Override]
+    public function hidden(): void {}
+
+    #[Override]
+    public function fresh(): void {}
+
+    #[Override]
+    public function __construct() {}
+
+    #[Deprecated]
+    const LIMIT = 3;
+}
+
+#[Deprecated]
+const OLD = 1;

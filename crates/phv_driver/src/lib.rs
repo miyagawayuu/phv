@@ -29,6 +29,8 @@ pub struct Compiled {
     pub jit: Option<Arc<phv_vm::JitTable>>,
     /// Loaded from the on-disk bytecode cache.
     pub from_cache: bool,
+    /// Functions marked `#[Test]` or `#[Skip("...")]` (with the reason), by index.
+    pub marked_tests: Vec<(u32, Option<String>)>,
 }
 
 impl Compiled {
@@ -43,6 +45,28 @@ impl Compiled {
     /// Number of functions compiled to native code.
     pub fn jit_count(&self) -> usize {
         self.jit.as_ref().map(|j| j.entries.iter().filter(|e| e.is_some()).count()).unwrap_or(0)
+    }
+
+    /// The tests of the entry file, in the order they are declared: functions
+    /// marked `#[Test]` or `#[Skip]`, and those named `test_*` that take no
+    /// parameters. Each comes with the reason it is skipped, if it is.
+    pub fn tests(&self) -> Vec<(u32, String, Option<String>)> {
+        let mut out: Vec<(u32, String, Option<String>)> = self
+            .entry_functions("test_")
+            .into_iter()
+            .map(|(i, name)| {
+                let skip = self.marked_tests.iter().find(|(t, _)| *t == i).and_then(|(_, s)| s.clone());
+                (i, name, skip)
+            })
+            .collect();
+        for (i, skip) in &self.marked_tests {
+            let Some(f) = self.program.funcs.get(*i as usize) else { continue };
+            if f.file == self.entry_file && !out.iter().any(|(j, ..)| j == i) {
+                out.push((*i, f.name.clone(), skip.clone()));
+            }
+        }
+        out.sort_by_key(|(i, ..)| *i);
+        out
     }
 
     /// Top-level functions of the entry file whose names start with `prefix`
@@ -578,6 +602,7 @@ pub fn compile_with_overlay(
     warnings.sort_by_key(|d| (d.span.file, d.span.start));
     let warnings = diag::render(&a.sources, &warnings, false);
     let program = phv_compiler::compile(&hir, &a.sources);
+    let marked_tests = hir.tests.iter().map(|(f, skip)| (*f, skip.clone())).collect();
     let builtins = phv_std::link(&program.builtin_names).map_err(|m| CompileError {
         sources: SourceMap::default(),
         diags: Vec::new(),
@@ -591,6 +616,7 @@ pub fn compile_with_overlay(
         entry_file: a.entry_file.unwrap_or(0),
         jit: None,
         from_cache: false,
+        marked_tests,
     })
 }
 

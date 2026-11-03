@@ -38,7 +38,7 @@ PHV は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋
 ## 3. 字句
 
 - 変数は `$name`。`$$name`(可変変数)はない。
-- コメントは `// ...`、`# ...`、`/* ... */`。
+- コメントは `// ...`、`# ...`、`/* ... */`。`#[` はコメントではなくアノテーションの始まり(§9)。
 - 整数: `42`、`1_000_000`、`0xFF`、`0b1010`、`0o17`。64 ビット。オーバーフローは `ArithmeticError`。
 - 浮動小数点数: `1.5`、`1e-3`。
 - 文字列:
@@ -396,6 +396,30 @@ Box<float> $f = new Box(1);       // 宣言した型から: Box<float>
 - 型引数は不変: `Box<int>` は `Box<any>` や `Box<float>` が要る場所には使えない(そうでないと `Box<any>` に文字列を
   入れられてしまう)。
 - 型引数があるのはコンパイル時だけ。`is` はクラスを確かめる: `$x is Box`(`is Box<int>` はエラー)。`Box<any>` に絞り込む。
+
+### アノテーション
+
+```phv
+#[Deprecated("use total()")]
+function sum(list<int> $xs): int { return total($xs); }
+
+class Square extends Shape {
+    #[Override]
+    public function area(): float { return $this->side ** 2; }
+}
+```
+
+アノテーションは関数・クラス・メソッド・プロパティの前に `#[Name]` や `#[Name("理由")]` の形で書く。`#[A, B]` や
+複数行で、いくつも書ける。PHV が知っているのは次のもの(ほかの名前はエラーにして、打ち間違いを見逃さない):
+
+| アノテーション | 書ける場所 | 効果 |
+|---|---|---|
+| `#[Deprecated]`、`#[Deprecated("理由")]` | 関数・メソッド・クラス・プロパティ | 使った場所で警告(呼び出し、`new`、静的呼び出し、プロパティの読み書き)。そのクラスの中は除く |
+| `#[Override]` | メソッド | 親クラスかインターフェースに同じ名前のメソッド(private を除く)がなければエラー |
+| `#[Test]` | 関数 | 名前に関係なく `phv test` が実行する(§16) |
+| `#[Skip]`、`#[Skip("理由")]` | 関数 | `phv test` は実行せず、スキップしたと報告する |
+
+アノテーションはコンパイル時に検査され、実行時には参照できない。
 
 
 ## 10. 例外クラス
@@ -1056,6 +1080,17 @@ function test_find_post(): void {
 
 `assert(bool, ?message)` と `assert_eq(expected, actual, ?message)` が失敗すると `AssertionError`。
 
+テストは、テストファイルの引数を取らない関数のうち、名前が `test_*` のものか `#[Test]` を付けたもの。宣言した順に実行する。
+`#[Skip("理由")]` を付けたテストは実行せず、スキップしたと報告する。
+
+```phv
+#[Test]
+function posts_have_titles(): void { /* ... */ }
+
+#[Skip("needs the staging database")]
+function test_import(): void { /* ... */ }
+```
+
 ### パッケージ
 
 ```toml
@@ -1122,7 +1157,6 @@ phv migrate legacy/page.php      # page.phv を書き出す
 
 ## 18. 今後の予定
 
-- アノテーション(属性)
 - 非同期 I/O
 - JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
 - 推移的な依存関係の解決、パッケージレジストリ

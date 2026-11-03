@@ -1,0 +1,27 @@
+warning: `sum` is deprecated: use total()
+  --> annotations.phv:41:6
+   |
+41 | echo sum([1, 2, 3]), " ", total([4]), "\n";
+   |      ^^^^^^^^^^^^^^
+
+warning: class `OldSquare` is deprecated
+  --> annotations.phv:42:10
+   |
+42 | $s = new OldSquare();
+   |          ^^^^^^^^^
+
+warning: property `OldSquare::$width` is deprecated: read side() instead
+  --> annotations.phv:43:27
+   |
+43 | echo $s->area(), " ", $s->width, "\n";
+   |                           ^^^^^
+
+warning: `Square::area` is deprecated: squares are squares
+  --> annotations.phv:44:6
+   |
+44 | echo (new Square())->area(), "\n";
+   |      ^^^^^^^^^^^^^^^^^^^^^^
+
+6 4
+4 2
+4

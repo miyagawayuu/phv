@@ -269,7 +269,8 @@ impl Parser {
                 | Tok::Return
                 | Tok::Echo
                 | Tok::Import
-                | Tok::Export => return,
+                | Tok::Export
+                | Tok::Hash => return,
                 _ => {
                     self.advance();
                 }
@@ -481,6 +482,21 @@ impl Parser {
             Tok::Semi => {
                 self.advance();
                 StmtKind::Block(Vec::new())
+            }
+            Tok::Hash => {
+                let attrs = self.attributes()?;
+                let mut s = self.stmt()?;
+                match &mut s.kind {
+                    StmtKind::Function(d) => d.attrs = attrs,
+                    StmtKind::Class(d) => d.attrs = attrs,
+                    StmtKind::Const(d) => d.attrs = attrs,
+                    _ => {
+                        let span = attrs[0].span;
+                        self.diags
+                            .push(Diagnostic::error("annotations can only be written before a declaration", span));
+                    }
+                }
+                return Ok(s);
             }
             Tok::Function if matches!(self.peek_at(1), Tok::Ident(_)) => {
                 StmtKind::Function(self.function_decl(false, Visibility::Public, false)?)
@@ -746,6 +762,7 @@ impl Parser {
         let ret = if self.eat(&Tok::Colon) { Some(self.ty()?) } else { None };
         let (body, is_abstract) = if self.eat(&Tok::Semi) { (Vec::new(), true) } else { (self.body_block()?, false) };
         Ok(FunctionDecl {
+            attrs: Vec::new(),
             name,
             name_span,
             type_params,
@@ -820,6 +837,16 @@ impl Parser {
         while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
             let member_start = self.pos;
             let mstart = self.span();
+            let attrs = match self.attributes() {
+                Ok(a) => a,
+                Err(_) => {
+                    self.recover(member_start);
+                    continue;
+                }
+            };
+            if let (Some(a), Tok::Case | Tok::RBrace) = (attrs.first(), self.peek()) {
+                self.diags.push(Diagnostic::error("annotations cannot be written before an enum case", a.span));
+            }
             if self.at(&Tok::Case) {
                 let r: PResult<()> = (|| {
                     self.advance();
@@ -852,7 +879,8 @@ impl Parser {
                 self.advance();
             }
             let result = if self.at(&Tok::Function) {
-                self.function_decl(false, vis, is_static).map(|f| {
+                self.function_decl(false, vis, is_static).map(|mut f| {
+                    f.attrs = attrs;
                     if f.is_abstract != is_abstract {
                         let msg = if is_abstract {
                             "abstract and interface methods cannot have a body"
@@ -864,7 +892,10 @@ impl Parser {
                     methods.push(f);
                 })
             } else if self.at(&Tok::Const) {
-                self.const_decl(false).map(|c| consts.push(c))
+                self.const_decl(false).map(|mut c| {
+                    c.attrs = attrs;
+                    consts.push(c)
+                })
             } else if matches!(self.peek(), Tok::Var(_)) {
                 Err(self.error_here("properties must declare a type, e.g. `public string $name;`"))
             } else {
@@ -883,6 +914,7 @@ impl Parser {
                         );
                     }
                     props.push(PropDecl {
+                        attrs,
                         name: pname,
                         ty,
                         default,
@@ -899,6 +931,7 @@ impl Parser {
         }
         self.expect(Tok::RBrace)?;
         Ok(ClassDecl {
+            attrs: Vec::new(),
             name,
             name_span,
             kind,
@@ -928,7 +961,7 @@ impl Parser {
         self.expect(Tok::Eq)?;
         let value = self.expr()?;
         self.semi()?;
-        Ok(ConstDecl { name, name_span, ty, value, exported, span: start.to(self.prev_span()) })
+        Ok(ConstDecl { attrs: Vec::new(), name, name_span, ty, value, exported, span: start.to(self.prev_span()) })
     }
 
     fn import_decl(&mut self) -> PResult<ImportDecl> {
@@ -1023,6 +1056,27 @@ impl Parser {
             other => return Err(self.error_here(format!("expected a type, found {}", other.describe()))),
         };
         Ok(TypeExpr { kind, span: start.to(self.prev_span()) })
+    }
+
+    /// `#[Name]`, `#[Name("text", 1)]`, `#[A, B]`: the annotations before a
+    /// declaration (empty when there are none).
+    fn attributes(&mut self) -> PResult<Vec<Attribute>> {
+        let mut attrs = Vec::new();
+        while self.at(&Tok::Hash) {
+            self.advance();
+            self.expect(Tok::LBracket)?;
+            loop {
+                let start = self.span();
+                let (name, name_span) = self.expect_ident("an annotation name")?;
+                let args = if self.at(&Tok::LParen) { self.args()? } else { Vec::new() };
+                attrs.push(Attribute { name, name_span, args, span: start.to(self.prev_span()) });
+                if !self.eat(&Tok::Comma) || self.at(&Tok::RBracket) {
+                    break;
+                }
+            }
+            self.expect(Tok::RBracket)?;
+        }
+        Ok(attrs)
     }
 
     /// `<T, U>` after a function or class name (empty when there is none).

@@ -66,6 +66,8 @@ function expect(tokens, text, scope) {
       "}",
       '$rows = $db->query(sql"SELECT * FROM users WHERE name = {$name}");',
       "$n = $user?->name ?? null; // fallback",
+      '#[Deprecated("use hello()")]',
+      "function old(): void {} # hash comment",
       "?>",
       '<p class="x"><?= greet($n) ?></p>',
     ].join("\n"),
@@ -83,6 +85,9 @@ function expect(tokens, text, scope) {
   expect(code, "??", "keyword.operator.null-coalescing.phv");
   expect(code, "null", "constant.language.null.phv");
   expect(code, "// fallback", "comment.line.double-slash.phv");
+  expect(code, "Deprecated", "entity.name.type.attribute.phv");
+  expect(code, "#[", "punctuation.definition.attribute.begin.phv");
+  expect(code, "# hash comment", "comment.line.number-sign.phv");
   expect(code, "?>", "punctuation.section.embedded.end.phv");
   expect(code, "<?=", "punctuation.section.embedded.begin.phv");
 

@@ -53,8 +53,9 @@ pub fn test(paths: Vec<PathBuf>, color: bool) -> ExitCode {
         println!("no test files found (test files are named *_test.phv)");
         return ExitCode::SUCCESS;
     }
-    let (green, red, reset) = if color { ("\x1b[32m", "\x1b[31m", "\x1b[0m") } else { ("", "", "") };
-    let (mut passed, mut failed) = (0, 0);
+    let (green, red, yellow, reset) =
+        if color { ("\x1b[32m", "\x1b[31m", "\x1b[33m", "\x1b[0m") } else { ("", "", "", "") };
+    let (mut passed, mut failed, mut skipped) = (0, 0, 0);
     let start = Instant::now();
     for file in files {
         let root = find_root(&file);
@@ -69,11 +70,17 @@ pub fn test(paths: Vec<PathBuf>, color: bool) -> ExitCode {
         };
         compiled.enable_jit();
         let config = load_config(&root).unwrap_or_else(|_| phv_driver::Config::default_for(&root));
-        let tests = compiled.entry_functions("test_");
+        let tests = compiled.tests();
         if tests.is_empty() {
-            println!("  (no test_* functions)");
+            println!("  (no test_* or #[Test] functions)");
         }
-        for (fid, name) in tests {
+        for (fid, name, skip) in tests {
+            if let Some(reason) = skip {
+                skipped += 1;
+                let reason = if reason.is_empty() { String::new() } else { format!(" ({reason})") };
+                println!("  {yellow}skip{reset}  {name}{reason}");
+                continue;
+            }
             let limits = Limits { max_time: Some(Duration::from_secs(30)), ..Limits::default() };
             let opts = RunOptions { html: false, limits, http: None, host: Some(config.host.clone()) };
             let outcome = run_func(&compiled, fid, opts);
@@ -100,7 +107,8 @@ pub fn test(paths: Vec<PathBuf>, color: bool) -> ExitCode {
     }
     let secs = start.elapsed().as_secs_f64();
     let colour = if failed == 0 { green } else { red };
-    println!("\n{colour}{passed} passed, {failed} failed{reset} ({secs:.2}s)");
+    let skipped = if skipped > 0 { format!(", {skipped} skipped") } else { String::new() };
+    println!("\n{colour}{passed} passed, {failed} failed{skipped}{reset} ({secs:.2}s)");
     if failed == 0 {
         ExitCode::SUCCESS
     } else {
