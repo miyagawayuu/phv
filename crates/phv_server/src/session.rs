@@ -10,7 +10,9 @@
 //! Sessions live in memory unless `[security] session_store` names a
 //! directory: then each session is a file (named by a hash of its id, so a
 //! directory listing reveals no ids), and sessions survive restarts and are
-//! shared by every server process using the directory.
+//! shared by every server process using the directory. A new session's file
+//! is `n-<hash>.json` until its cookie comes back, then `<hash>.json`, so the
+//! sweep can tell the two kinds apart from the listing alone.
 
 use indexmap::IndexMap;
 use phv_std::safefs;
@@ -84,25 +86,46 @@ struct FileStore {
     swept: AtomicU64,
     /// Bytes written since the last sweep; a burst triggers an early sweep.
     written: AtomicU64,
+    /// `MAX_SESSIONS` and `MAX_BYTES` (smaller in tests).
+    max_sessions: usize,
+    max_bytes: u64,
 }
 
-/// Session files are `<64 hex>.json`; temporary ones `.<64 hex>.json.<16 hex>`.
-/// The sweep never touches anything else in the directory.
+/// Session files are `<64 hex>.json` (`n-<64 hex>.json` while new); temporary
+/// ones `.<that name>.<16 hex>`. The sweep never touches anything else in the directory.
 fn is_session_file(name: &str) -> bool {
     let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let hash = |s: &str| hex(s.strip_prefix("n-").unwrap_or(s), 64);
     if let Some(rest) = name.strip_prefix('.') {
-        return rest.split_once(".json.").is_some_and(|(id, r)| hex(id, 64) && hex(r, 16));
+        return rest.split_once(".json.").is_some_and(|(id, r)| hash(id) && hex(r, 16));
     }
-    name.strip_suffix(".json").is_some_and(|id| hex(id, 64))
+    name.strip_suffix(".json").is_some_and(hash)
 }
 
 impl FileStore {
-    fn name(id: &str) -> String {
-        format!("{}.json", phv_std::sha256_hex(format!("phv-session:{id}").as_bytes()))
+    /// `<hash>.json` once the visitor came back (and for files from older
+    /// versions), `n-<hash>.json` before.
+    fn name(id: &str, returned: bool) -> String {
+        let hash = phv_std::sha256_hex(format!("phv-session:{id}").as_bytes());
+        if returned {
+            format!("{hash}.json")
+        } else {
+            format!("n-{hash}.json")
+        }
     }
 
-    fn read(&self, id: &str) -> Option<Record> {
-        let (dir, name) = safefs::open_parent(&self.dir, Path::new(&Self::name(id))).ok()?;
+    /// The session and whether its visitor came back. The returned name is
+    /// tried again last: another request may rename the file in between.
+    fn read(&self, id: &str) -> Option<(Record, bool)> {
+        let (back, new) = (Self::name(id, true), Self::name(id, false));
+        self.read_file(&back)
+            .map(|r| (r, true))
+            .or_else(|| self.read_file(&new).map(|r| (r, false)))
+            .or_else(|| self.read_file(&back).map(|r| (r, true)))
+    }
+
+    fn read_file(&self, name: &str) -> Option<Record> {
+        let (dir, name) = safefs::open_parent(&self.dir, Path::new(name)).ok()?;
         let mut text = String::new();
         dir.open(&name, false).ok()?.take(1 << 20).read_to_string(&mut text).ok()?;
         let v: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -115,9 +138,9 @@ impl FileStore {
     }
 
     /// Writes the file atomically: a temporary file renamed over the old one.
-    fn write(&self, id: &str, r: &Record) -> std::io::Result<()> {
+    fn write(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<()> {
         let text = serde_json::json!({"created": r.created, "last": r.last, "values": r.values}).to_string();
-        let name = Self::name(id);
+        let name = Self::name(id, returned);
         let tmp = format!(".{name}.{}", phv_std::random_hex(8));
         let fail = |e: safefs::FsError| std::io::Error::other(format!("{e:?}"));
         let (dir, tmp_name) = safefs::open_parent(&self.dir, Path::new(&tmp)).map_err(fail)?;
@@ -138,18 +161,32 @@ impl FileStore {
     }
 
     fn remove(&self, id: &str) {
-        if let Ok((dir, name)) = safefs::open_parent(&self.dir, Path::new(&Self::name(id))) {
-            let _ = dir.remove(&name);
+        for returned in [false, true] {
+            if let Ok((dir, name)) = safefs::open_parent(&self.dir, Path::new(&Self::name(id, returned))) {
+                let _ = dir.remove(&name);
+            }
         }
     }
 
+    /// Renames `n-<hash>.json` to `<hash>.json` when the visitor comes back.
+    /// A link or hard link is left alone, never followed or moved.
+    fn promote(&self, id: &str) -> bool {
+        let Ok((dir, new)) = safefs::open_parent(&self.dir, Path::new(&Self::name(id, false))) else {
+            return false;
+        };
+        if !dir.exists(&new).unwrap_or(false) || dir.check_plain_or_missing(&new).is_err() {
+            return false;
+        }
+        std::fs::rename(dir.path().join(&new), dir.path().join(Self::name(id, true))).is_ok()
+    }
+
     /// Every 30 seconds, or sooner after many writes: deletes expired session
-    /// files, then the oldest ones while there are too many or they take too
-    /// much space.
+    /// files, then while there are too many or they take too much space, new
+    /// sessions whose visitor never came back, then the oldest of the rest.
     fn sweep(&self, ttl: Duration) {
         let now = now_secs();
         let last = self.swept.load(Ordering::Relaxed);
-        let burst = self.written.load(Ordering::Relaxed) > (MAX_BYTES / 16) as u64;
+        let burst = self.written.load(Ordering::Relaxed) > self.max_bytes / 16;
         if (now < last + 30 && !burst)
             || self.swept.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
         {
@@ -158,7 +195,7 @@ impl FileStore {
         self.written.store(0, Ordering::Relaxed);
         let Ok(rd) = std::fs::read_dir(&self.dir) else { return };
         let limit = SystemTime::now() - ttl.min(MAX_LIFETIME);
-        let mut live: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+        let mut live: Vec<(bool, SystemTime, u64, PathBuf)> = Vec::new();
         for e in rd.flatten() {
             let Ok(meta) = e.metadata() else { continue };
             let name = e.file_name().to_string_lossy().into_owned();
@@ -176,17 +213,17 @@ impl FileStore {
             if modified < limit {
                 let _ = std::fs::remove_file(e.path());
             } else {
-                live.push((modified, meta.len(), e.path()));
+                live.push((!name.starts_with("n-"), modified, meta.len(), e.path()));
             }
         }
-        let mut bytes: u64 = live.iter().map(|l| l.1).sum();
-        if live.len() <= MAX_SESSIONS && bytes <= MAX_BYTES as u64 {
+        let mut bytes: u64 = live.iter().map(|l| l.2).sum();
+        if live.len() <= self.max_sessions && bytes <= self.max_bytes {
             return;
         }
         live.sort();
         let mut count = live.len();
-        for (_, len, path) in live {
-            if count <= MAX_SESSIONS * 9 / 10 && bytes <= MAX_BYTES as u64 * 9 / 10 {
+        for (_, _, len, path) in live {
+            if count <= self.max_sessions * 9 / 10 && bytes <= self.max_bytes * 9 / 10 {
                 break;
             }
             let _ = std::fs::remove_file(path);
@@ -205,7 +242,13 @@ impl Store {
             if !dir.join(".gitignore").exists() {
                 let _ = std::fs::write(dir.join(".gitignore"), "*\n");
             }
-            FileStore { dir, swept: AtomicU64::new(0), written: AtomicU64::new(0) }
+            FileStore {
+                dir,
+                swept: AtomicU64::new(0),
+                written: AtomicU64::new(0),
+                max_sessions: MAX_SESSIONS,
+                max_bytes: MAX_BYTES as u64,
+            }
         });
         Store {
             ttl,
@@ -225,7 +268,7 @@ impl Store {
         let id = cookie_value(cookie_header, self.cookie).filter(|v| valid_id(v)).map(str::to_string);
         if let Some(files) = &self.files {
             let Some(id) = id else { return SessionData::default() };
-            let Some(mut r) = files.read(&id) else { return SessionData::default() };
+            let Some((mut r, mut returned)) = files.read(&id) else { return SessionData::default() };
             let now = now_secs();
             if now >= r.last.saturating_add(self.ttl.as_secs())
                 || now >= r.created.saturating_add(MAX_LIFETIME.as_secs())
@@ -233,10 +276,14 @@ impl Store {
                 files.remove(&id);
                 return SessionData::default();
             }
+            // The cookie came back: the sweep no longer drops this one first.
+            if !returned {
+                returned = files.promote(&id);
+            }
             // Refresh the expiry, at most once a minute per session.
             if now >= r.last + 60 {
                 r.last = now;
-                let _ = files.write(&id, &r);
+                let _ = files.write(&id, &r, returned);
             }
             return SessionData { id: Some(id), values: r.values, ..SessionData::default() };
         }
@@ -352,15 +399,17 @@ impl Store {
         };
         let now = now_secs();
         let mut created = now;
+        let mut returned = false;
         if let Some(old) = &s.id {
             // As in the memory store: a session removed meanwhile stays removed.
-            let r = files.read(old)?;
+            let (r, back) = files.read(old)?;
             created = r.created;
+            returned = back;
             if old != &new_id {
                 files.remove(old);
             }
         }
-        if let Err(e) = files.write(&new_id, &Record { created, last: now, values: s.values }) {
+        if let Err(e) = files.write(&new_id, &Record { created, last: now, values: s.values }, returned) {
             eprintln!("warning: cannot save session: {e}");
             return None;
         }
@@ -429,9 +478,80 @@ mod tests {
     fn the_sweep_only_touches_session_files() {
         assert!(is_session_file(&format!("{}.json", "a".repeat(64))));
         assert!(is_session_file(&format!(".{}.json.{}", "b".repeat(64), "c".repeat(16))));
-        for other in ["phv.toml", "app.db", ".gitignore", "x.json", "index.phv"] {
+        assert!(is_session_file(&format!("n-{}.json", "a".repeat(64))));
+        assert!(is_session_file(&format!(".n-{}.json.{}", "b".repeat(64), "c".repeat(16))));
+        let x = format!("x-{}.json", "a".repeat(64));
+        for other in ["phv.toml", "app.db", ".gitignore", "x.json", "index.phv", "n-x.json", &x] {
             assert!(!is_session_file(other), "{other}");
         }
+    }
+
+    fn file_names(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn a_new_session_file_is_renamed_when_its_cookie_comes_back() {
+        let dir = std::env::temp_dir().join(format!("phv-sess-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(Duration::from_secs(60), false, Some(dir.clone()));
+        let mut s = SessionData::default();
+        s.values.insert("user".into(), "ann".into());
+        s.changed = true;
+        let cookie = store.save(s).unwrap();
+        let id = cookie.split(['=', ';']).nth(1).unwrap().to_string();
+        let header = format!("PHVSESSID={id}");
+        let (back, new) = (FileStore::name(&id, true), FileStore::name(&id, false));
+        assert!(file_names(&dir).contains(&new) && !file_names(&dir).contains(&back));
+        for _ in 0..2 {
+            assert_eq!(store.load(Some(&header)).values.get("user").map(String::as_str), Some("ann"));
+            assert!(file_names(&dir).contains(&back) && !file_names(&dir).contains(&new));
+        }
+        // Saving it again keeps the returned name.
+        let mut s = store.load(Some(&header));
+        s.values.insert("seen".into(), "1".into());
+        s.changed = true;
+        store.save(s);
+        assert!(file_names(&dir).contains(&back) && !file_names(&dir).contains(&new));
+        assert_eq!(store.load(Some(&header)).values.get("seen").map(String::as_str), Some("1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// As with the memory store: a flood of new sessions past the limits does
+    /// not remove the file of a visitor who came back, even when it is the oldest.
+    #[test]
+    fn a_flood_does_not_sweep_returning_visitors_files() {
+        let dir = std::env::temp_dir().join(format!("phv-sess-flood-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::new(Duration::from_secs(600), false, Some(dir.clone()));
+        let files = store.files.as_mut().unwrap();
+        files.max_sessions = 20;
+        files.max_bytes = 20 * 200;
+        let mut s = SessionData::default();
+        s.values.insert("user".into(), "ann".into());
+        s.changed = true;
+        let cookie = store.save(s).unwrap();
+        let id = cookie.split(['=', ';']).nth(1).unwrap().to_string();
+        let header = format!("PHVSESSID={id}");
+        assert!(store.load(Some(&header)).id.is_some());
+        // Ann's file is the oldest of all.
+        let old = SystemTime::now() - Duration::from_secs(300);
+        let path = dir.join(FileStore::name(&id, true));
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        for i in 0..50 {
+            let mut s = SessionData::default();
+            s.values.insert("n".into(), i.to_string());
+            s.changed = true;
+            assert!(store.save(s).is_some());
+        }
+        let files = store.files.as_ref().unwrap();
+        files.swept.store(0, Ordering::Relaxed);
+        files.sweep(store.ttl);
+        let names = file_names(&dir);
+        assert!(names.iter().filter(|n| is_session_file(n)).count() <= 20);
+        assert!(names.iter().any(|n| n.starts_with("n-")), "only the excess is swept");
+        assert_eq!(store.load(Some(&header)).values.get("user").map(String::as_str), Some("ann"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
