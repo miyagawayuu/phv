@@ -244,6 +244,10 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
+    /// Tests that fill the process-wide slots of `with_deadline` run one at a
+    /// time, or one would see the other's stuck work.
+    static SLOTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A server that drips one byte every 200 ms: a read loop must still stop at the deadline.
     #[test]
     fn reads_stop_at_the_deadline() {
@@ -280,6 +284,7 @@ mod tests {
     /// on at the deadline, and abandoned work is capped.
     #[test]
     fn blocking_work_stops_at_the_deadline() {
+        let _slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
         let start = Instant::now();
         let r = with_deadline(start + Duration::from_millis(200), || std::thread::sleep(Duration::from_secs(3)));
         assert_eq!(r, Err("timed out".to_string()));
@@ -302,6 +307,7 @@ mod tests {
     /// answers) cannot use up the slots of name lookups.
     #[test]
     fn hanging_work_of_its_own_kind_leaves_lookups_alone() {
+        let _slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
         static OWN: AtomicUsize = AtomicUsize::new(0);
         let stuck: Vec<_> = (0..MAX_PENDING + 2)
             .map(|_| {
