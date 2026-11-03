@@ -4,7 +4,9 @@
 
 mod body;
 mod multipart;
+mod routes;
 mod session;
+mod static_files;
 
 use body::{RespBody, StallGuard};
 use bytes::Bytes;
@@ -15,13 +17,17 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use phv_driver::config::LogFormat;
 use phv_driver::{compile_cached, load_config, run, Compiled, Config, RunOptions};
 use phv_vm::value::html_escape;
 use phv_vm::{HttpCtx, Limits};
+use static_files::Validators;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -43,6 +49,9 @@ const MAX_FIELDS: usize = 1000;
 const WRITE_STALL: Duration = Duration::from_secs(30);
 /// Time a request waits for a free worker before it gets 503.
 const QUEUE_WAIT: Duration = Duration::from_secs(10);
+/// Static files larger than this are sent uncompressed (compressing takes time
+/// on every request).
+const MAX_STATIC_COMPRESS: u64 = 1 << 20;
 
 /// A site built with `phv build`: its pages and static files, by their paths
 /// under `public/`, and its phv.toml. Directories the project reads and writes
@@ -81,6 +90,13 @@ struct State {
     buffered: Arc<AtomicUsize>,
     /// No new script runs while `buffered` is above this.
     buffered_cap: usize,
+    /// Pages with parameters, and when `public/` was last scanned for them
+    /// (again after a second in development mode, where files change).
+    routes: Mutex<(Instant, Arc<routes::Table>)>,
+    /// `[server] access_log`: the open file.
+    access_log: Option<Mutex<std::fs::File>>,
+    /// Tags of the static files of a built site, by path.
+    embedded_tags: HashMap<String, String>,
 }
 
 impl State {
@@ -113,7 +129,55 @@ impl State {
             time_limit,
             cache: Mutex::new(HashMap::new()),
             embedded: None,
+            routes: Mutex::new((Instant::now(), Arc::new(routes::Table::default()))),
+            access_log: None,
+            embedded_tags: HashMap::new(),
         }
+    }
+
+    fn scan_routes(&self) -> Result<routes::Table, String> {
+        match &self.embedded {
+            Some(e) => routes::Table::from_pages(e.pages.keys().map(String::as_str)),
+            None => routes::Table::scan(&self.public),
+        }
+    }
+
+    /// The table of pages with parameters, scanned again in development mode
+    /// when the last scan is more than a second old.
+    fn routes(&self) -> Result<Arc<routes::Table>, String> {
+        let mut r = self.routes.lock().unwrap();
+        if self.dev && self.embedded.is_none() && r.0.elapsed() > Duration::from_secs(1) {
+            *r = (Instant::now(), Arc::new(self.scan_routes()?));
+        }
+        Ok(r.1.clone())
+    }
+
+    /// A special page under `public/` (`_404.phv`, `_middleware.phv`, ...), if the site has it.
+    fn special(&self, rel: &str) -> Option<PathBuf> {
+        if let Some(e) = &self.embedded {
+            return e.pages.contains_key(rel).then(|| self.public.join(rel));
+        }
+        let c = self.public.join(rel).canonicalize().ok()?;
+        let inner = c.strip_prefix(&self.public).ok()?;
+        let same = inner.components().map(|x| x.as_os_str().to_str()).eq(rel.split('/').map(Some));
+        (same && c.is_file()).then_some(c)
+    }
+
+    /// The `_middleware.phv` files that apply to a page, outermost first.
+    fn middleware_for(&self, script: &Path) -> Vec<PathBuf> {
+        let rel = script.strip_prefix(&self.public).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+        let mut dirs: Vec<&str> = rel.split('/').collect();
+        dirs.pop();
+        let mut out = Vec::new();
+        for i in 0..=dirs.len() {
+            let prefix = dirs[..i].join("/");
+            let file =
+                if prefix.is_empty() { "_middleware.phv".to_string() } else { format!("{prefix}/_middleware.phv") };
+            if let Some(p) = self.special(&file) {
+                out.push(p);
+            }
+        }
+        out
     }
 }
 
@@ -125,9 +189,40 @@ pub fn serve(opts: ServeOptions) -> Result<(), String> {
     serve_on(listener, opts)
 }
 
-/// Serves on an already bound listener (tests bind port 0).
+/// Serves on an already bound listener (tests bind port 0) until Ctrl-C or SIGTERM.
 pub fn serve_on(listener: std::net::TcpListener, opts: ServeOptions) -> Result<(), String> {
-    serve_with(listener, opts, None)
+    serve_with(listener, opts, None, None)
+}
+
+/// Serves until `stop` completes, then lets running requests finish.
+pub fn serve_until(
+    listener: std::net::TcpListener,
+    opts: ServeOptions,
+    stop: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), String> {
+    serve_with(listener, opts, None, Some(Box::pin(stop)))
+}
+
+/// Ctrl-C, or SIGTERM (what `docker stop` and process managers send).
+async fn os_shutdown() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term => {}
+    }
 }
 
 /// Serves a site built with `phv build` (see `Embedded`).
@@ -136,10 +231,17 @@ pub fn serve_embedded(opts: ServeOptions, embedded: Embedded) -> Result<(), Stri
         .parse()
         .map_err(|e| format!("invalid address {}:{}: {e}", opts.host, opts.port))?;
     let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
-    serve_with(listener, opts, Some(embedded))
+    serve_with(listener, opts, Some(embedded), None)
 }
 
-fn serve_with(listener: std::net::TcpListener, opts: ServeOptions, embedded: Option<Embedded>) -> Result<(), String> {
+type Stop = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+fn serve_with(
+    listener: std::net::TcpListener,
+    opts: ServeOptions,
+    embedded: Option<Embedded>,
+    stop: Option<Stop>,
+) -> Result<(), String> {
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let root = opts.root.canonicalize().map_err(|e| format!("cannot open {}: {e}", opts.root.display()))?;
@@ -153,7 +255,23 @@ fn serve_with(listener: std::net::TcpListener, opts: ServeOptions, embedded: Opt
         }
     };
     let mut state = State::new(root, opts.dev, opts.time_limit, config);
+    if let Some((path, _)) = &state.config.access_log {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| format!("cannot open the access log {}: {e}", path.display()))?;
+        state.access_log = Some(Mutex::new(file));
+    }
+    if let Some(e) = &embedded {
+        state.embedded_tags = e.statics.iter().map(|(k, v)| (k.clone(), Validators::of_bytes(v).etag)).collect();
+    }
     state.embedded = embedded;
+    let table = state.scan_routes()?;
+    state.routes = Mutex::new((Instant::now(), Arc::new(table)));
     let state = Arc::new(state);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -161,7 +279,8 @@ fn serve_with(listener: std::net::TcpListener, opts: ServeOptions, embedded: Opt
         .thread_stack_size(16 * 1024 * 1024)
         .build()
         .map_err(|e| e.to_string())?;
-    rt.block_on(async move {
+    let result = rt.block_on(async move {
+        let mut stop: Stop = stop.unwrap_or_else(|| Box::pin(os_shutdown()));
         let listener = TcpListener::from_std(listener).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
         let mode = if state.dev { "development" } else { "production" };
         eprintln!("PHV server ({mode} mode) listening on http://{addr}");
@@ -173,27 +292,58 @@ fn serve_with(listener: std::net::TcpListener, opts: ServeOptions, embedded: Opt
             None => eprintln!("Serving {}", state.public.display()),
         }
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+        // Tells the connections to finish their request and close.
+        let (closing, closed) = tokio::sync::watch::channel(false);
         loop {
-            let permit = slots.clone().acquire_owned().await.expect("semaphore is never closed");
-            let (stream, peer) = match listener.accept().await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("accept failed: {e}");
-                    continue;
-                }
+            let permit = tokio::select! {
+                p = slots.clone().acquire_owned() => p.expect("semaphore is never closed"),
+                _ = &mut stop => break,
+            };
+            let (stream, peer) = tokio::select! {
+                c = listener.accept() => match c {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("accept failed: {e}");
+                        continue;
+                    }
+                },
+                _ = &mut stop => break,
             };
             let state = state.clone();
+            let mut closed = closed.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |req| handle(state.clone(), peer, req));
-                let _ = http1::Builder::new()
+                let conn = http1::Builder::new()
                     .timer(TokioTimer::new())
                     .header_read_timeout(HEADER_TIMEOUT)
-                    .serve_connection(TokioIo::new(StallGuard::new(stream, WRITE_STALL)), service)
-                    .await;
+                    .serve_connection(TokioIo::new(StallGuard::new(stream, WRITE_STALL)), service);
+                tokio::pin!(conn);
+                tokio::select! {
+                    _ = conn.as_mut() => {}
+                    _ = closed.changed() => {
+                        conn.as_mut().graceful_shutdown();
+                        let _ = conn.await;
+                    }
+                }
                 drop(permit);
             });
         }
-    })
+        // New connections are refused; running requests get `shutdown_timeout` to finish.
+        drop(listener);
+        let wait = Duration::from_secs(state.config.shutdown_timeout);
+        eprintln!("Stopping: letting running requests finish (at most {} s)", wait.as_secs());
+        let _ = closing.send(true);
+        let all = slots.acquire_many(MAX_CONNECTIONS as u32);
+        if tokio::time::timeout(wait, all).await.is_err() {
+            eprintln!("Stopped with requests still running");
+        } else {
+            eprintln!("Stopped");
+        }
+        Ok(())
+    });
+    // Scripts still running past the timeout are not waited for.
+    rt.shutdown_timeout(Duration::from_millis(500));
+    result
 }
 
 type Resp = Response<RespBody>;
@@ -203,6 +353,37 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let ip = peer.ip().to_canonical().to_string();
+    let gzip_ok = state.config.compress && static_files::accepts_gzip(req.headers());
+    let origin = req.headers().get("origin").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let cors = state.config.cors.as_ref().zip(origin.as_deref()).filter(|(c, o)| c.allows(o)).map(|(c, _)| c);
+    // A CORS preflight is answered here, before rate limits and pages.
+    if state.config.cors.is_some()
+        && method == Method::OPTIONS
+        && req.headers().contains_key("access-control-request-method")
+    {
+        let mut r = simple(StatusCode::NO_CONTENT, "text/plain", String::new());
+        if let (Some(c), Some(o)) = (cors, &origin) {
+            let h = r.headers_mut();
+            let mut set = |name: &'static str, value: String| {
+                if let Ok(v) = HeaderValue::from_str(&value) {
+                    h.insert(name, v);
+                }
+            };
+            set("access-control-allow-origin", if c.any { "*".into() } else { o.clone() });
+            set("access-control-allow-methods", c.methods.join(", "));
+            if !c.headers.is_empty() {
+                set("access-control-allow-headers", c.headers.join(", "));
+            }
+            set("access-control-max-age", c.max_age.to_string());
+            if c.credentials {
+                set("access-control-allow-credentials", "true".into());
+            }
+        }
+        static_files::vary(r.headers_mut(), "Origin");
+        add_security_headers(&state, &mut r);
+        log_request(&state, &ip, &method, &path, r.status().as_u16(), start);
+        return Ok(r);
+    }
     let limit = state.config.requests_per_minute;
     let client = format!("ip:{}", phv_std::ratelimit::client_key(peer.ip()));
     let minute = Duration::from_secs(60);
@@ -232,11 +413,79 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
         r.headers_mut().insert("retry-after", HeaderValue::from(wait));
         r
     } else {
-        route(&state, ip, req).await
+        route(&state, ip.clone(), req).await
     };
+    if let (Some(c), Some(o)) = (cors, &origin) {
+        let h = resp.headers_mut();
+        let value = if c.any { "*".to_string() } else { o.clone() };
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            h.insert("access-control-allow-origin", v);
+        }
+        if c.credentials {
+            h.insert("access-control-allow-credentials", HeaderValue::from_static("true"));
+        }
+    }
+    if state.config.cors.as_ref().is_some_and(|c| !c.any) {
+        static_files::vary(resp.headers_mut(), "Origin");
+    }
+    if state.config.compress {
+        resp = compress(resp, gzip_ok).await;
+    }
     add_security_headers(&state, &mut resp);
-    eprintln!("{method} {path} {} {:.1}ms", resp.status().as_u16(), start.elapsed().as_secs_f64() * 1000.0);
+    log_request(&state, &ip, &method, &path, resp.status().as_u16(), start);
     Ok(resp)
+}
+
+/// gzip for a text response in memory, when the client accepts it.
+async fn compress(mut resp: Resp, gzip_ok: bool) -> Resp {
+    let text = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(static_files::compressible);
+    if text {
+        static_files::vary(resp.headers_mut(), "Accept-Encoding");
+    }
+    if !gzip_ok || !static_files::may_compress(&resp) {
+        return resp;
+    }
+    let Some(bytes) = resp.body_mut().take_bytes() else { return resp };
+    let packed = if (1024..=static_files::MAX_COMPRESS).contains(&bytes.len()) {
+        let data = bytes.clone();
+        tokio::task::spawn_blocking(move || static_files::gzip(&data)).await.ok().flatten()
+    } else {
+        None
+    };
+    match packed {
+        Some(gz) => {
+            *resp.body_mut() = RespBody::full(gz);
+            static_files::mark_gzip(resp.headers_mut());
+        }
+        None => *resp.body_mut() = RespBody::full(bytes),
+    }
+    resp
+}
+
+/// One line on stderr, and in the access log when phv.toml sets one.
+fn log_request(state: &State, ip: &str, method: &Method, path: &str, status: u16, start: Instant) {
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("{method} {path} {status} {ms:.1}ms");
+    let (Some(file), Some((_, format))) = (&state.access_log, &state.config.access_log) else { return };
+    let time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let line = match format {
+        LogFormat::Text => format!("{time} {ip} \"{method} {path}\" {status} {ms:.1}ms\n"),
+        LogFormat::Json => {
+            let v = serde_json::json!({
+                "time": time,
+                "ip": ip,
+                "method": method.as_str(),
+                "path": path,
+                "status": status,
+                "ms": (ms * 10.0).round() / 10.0,
+            });
+            format!("{v}\n")
+        }
+    };
+    use std::io::Write;
+    if let Ok(mut f) = file.lock() {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 fn simple(status: StatusCode, content_type: &str, body: String) -> Resp {
@@ -283,10 +532,11 @@ fn add_security_headers(state: &State, resp: &mut Resp) {
 }
 
 enum Target {
-    Script(PathBuf),
+    /// A page, with the parameters of its path.
+    Script(PathBuf, Vec<(String, String)>),
     Static(PathBuf),
-    /// A static file of a built site, with its content type.
-    Embedded(Bytes, &'static str),
+    /// A static file of a built site, with its content type and tag.
+    Embedded(Bytes, &'static str, String),
 }
 
 /// Maps a URL path to a file under `public/`, refusing anything that could
@@ -328,7 +578,7 @@ fn resolve(state: &State, url_path: &str) -> Option<Target> {
     for c in candidates {
         if let Some(p) = exact(&c) {
             if !name_of(&p).ends_with(".phv.html") {
-                return Some(Target::Script(p));
+                return Some(Target::Script(p, Vec::new()));
             }
         }
     }
@@ -340,7 +590,15 @@ fn resolve(state: &State, url_path: &str) -> Option<Target> {
             }
         }
     }
-    None
+    let table = state.routes().ok()?;
+    let (file, params) = table.find(&segments)?;
+    exact(file).map(|p| Target::Script(p, params))
+}
+
+/// Checks the pages with parameters under `public/` (`phv build` refuses a
+/// site whose routes conflict, as the server does when it starts).
+pub fn check_routes(public: &Path) -> Result<(), String> {
+    routes::Table::scan(public).map(|_| ())
 }
 
 /// Static files are served only for these extensions, so stray source or
@@ -377,37 +635,109 @@ fn content_type(path: &Path) -> Option<&'static str> {
 }
 
 async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
+    if let Err(e) = state.routes() {
+        eprintln!("error in the routes of public/: {e}");
+        return state.error_page("Route error", &e);
+    }
     let target = resolve(state, req.uri().path());
     match target {
-        None => not_found(),
-        Some(Target::Embedded(bytes, ct)) => {
+        None => match state.special("_404.phv") {
+            Some(page) => run_script(state, page, Vec::new(), ip, req, Page::NotFound).await,
+            None => not_found(),
+        },
+        Some(Target::Embedded(bytes, ct, tag)) => {
             if req.method() != Method::GET && req.method() != Method::HEAD {
                 return simple(StatusCode::METHOD_NOT_ALLOWED, "text/plain", "method not allowed".into());
             }
-            let mut r = Response::new(RespBody::full(bytes));
-            r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+            let v = Validators { etag: tag, modified: None };
+            let len = bytes.len() as u64;
+            let headers = req.headers();
+            let mut r = if v.not_modified(headers) {
+                let mut r = Response::new(RespBody::full(Bytes::new()));
+                *r.status_mut() = StatusCode::NOT_MODIFIED;
+                r
+            } else {
+                match static_files::range(headers, len).filter(|_| v.range_applies(headers)) {
+                    Some(Err(())) => return static_files::unsatisfiable(len),
+                    Some(Ok((a, b))) => partial(RespBody::full(bytes.slice(a as usize..=b as usize)), a, b, len),
+                    None => Response::new(RespBody::full(bytes)),
+                }
+            };
+            static_headers(state, &mut r, ct, &v);
             r
         }
         Some(Target::Static(p)) => {
             if req.method() != Method::GET && req.method() != Method::HEAD {
                 return simple(StatusCode::METHOD_NOT_ALLOWED, "text/plain", "method not allowed".into());
             }
-            let Ok(file) = tokio::fs::File::open(&p).await else { return not_found() };
-            let len = match file.metadata().await {
-                Ok(m) if m.is_file() => m.len(),
+            let Ok(mut file) = tokio::fs::File::open(&p).await else { return not_found() };
+            let (len, modified) = match file.metadata().await {
+                Ok(m) if m.is_file() => (m.len(), m.modified().ok()),
                 _ => return not_found(),
             };
             if len > MAX_STATIC {
                 return simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "file too large to serve".into());
             }
-            // Streamed from the open file: memory does not grow with the file or the number of downloads.
-            let mut r = Response::new(RespBody::file(file, len));
             let ct = content_type(&p).unwrap_or("application/octet-stream");
-            r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+            let v = Validators::of_file(len, modified);
+            let headers = req.headers();
+            let mut r = if v.not_modified(headers) {
+                let mut r = Response::new(RespBody::full(Bytes::new()));
+                *r.status_mut() = StatusCode::NOT_MODIFIED;
+                r
+            } else {
+                match static_files::range(headers, len).filter(|_| v.range_applies(headers)) {
+                    Some(Err(())) => return static_files::unsatisfiable(len),
+                    Some(Ok((a, b))) => {
+                        use tokio::io::AsyncSeekExt;
+                        if file.seek(std::io::SeekFrom::Start(a)).await.is_err() {
+                            return not_found();
+                        }
+                        partial(RespBody::file(file, b - a + 1), a, b, len)
+                    }
+                    // Small text files are read whole, so `compress` can gzip them;
+                    // others are streamed: memory does not grow with the file or the downloads.
+                    None if len <= MAX_STATIC_COMPRESS && static_files::compressible(ct) => {
+                        use tokio::io::AsyncReadExt;
+                        let mut data = Vec::with_capacity(len as usize);
+                        if file.read_to_end(&mut data).await.is_err() {
+                            return not_found();
+                        }
+                        Response::new(RespBody::full(data))
+                    }
+                    None => Response::new(RespBody::file(file, len)),
+                }
+            };
+            static_headers(state, &mut r, ct, &v);
             r
         }
-        Some(Target::Script(p)) => run_script(state, p, ip, req).await,
+        Some(Target::Script(p, params)) => run_script(state, p, params, ip, req, Page::Normal).await,
     }
+}
+
+/// A 206 answer for bytes `a..=b` of `len`.
+fn partial(body: RespBody, a: u64, b: u64, len: u64) -> Resp {
+    let mut r = Response::new(body);
+    *r.status_mut() = StatusCode::PARTIAL_CONTENT;
+    if let Ok(v) = HeaderValue::from_str(&format!("bytes {a}-{b}/{len}")) {
+        r.headers_mut().insert("content-range", v);
+    }
+    r
+}
+
+fn static_headers(state: &State, r: &mut Resp, ct: &'static str, v: &Validators) {
+    let h = r.headers_mut();
+    h.insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+    h.insert("accept-ranges", HeaderValue::from_static("bytes"));
+    v.headers(h, state.config.static_max_age);
+}
+
+/// What a script answers: a page (after its middleware), or a custom error page.
+#[derive(Clone, Copy, PartialEq)]
+enum Page {
+    Normal,
+    NotFound,
+    Error,
 }
 
 /// `resolve` for a built site: its pages are known by their paths under
@@ -421,14 +751,20 @@ fn resolve_embedded(state: &State, e: &Embedded, rel: String) -> Option<Target> 
         vec![format!("{rel}.phv"), format!("{rel}/index.phv")]
     };
     if let Some(page) = candidates.into_iter().find(|c| e.pages.contains_key(c)) {
-        return Some(Target::Script(state.public.join(page)));
+        return Some(Target::Script(state.public.join(page), Vec::new()));
     }
-    let bytes = e.statics.get(&rel)?;
+    let Some(bytes) = e.statics.get(&rel) else {
+        let table = state.routes().ok()?;
+        let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+        let (file, params) = table.find(&segments)?;
+        return Some(Target::Script(state.public.join(file), params));
+    };
     let lower = rel.to_ascii_lowercase();
     if lower.ends_with(".phv") || lower.ends_with(".phv.html") {
         return None;
     }
-    Some(Target::Embedded(bytes.clone(), content_type(Path::new(&rel))?))
+    let tag = state.embedded_tags.get(&rel).cloned().unwrap_or_else(|| Validators::of_bytes(bytes).etag);
+    Some(Target::Embedded(bytes.clone(), content_type(Path::new(&rel))?, tag))
 }
 
 impl State {
@@ -469,7 +805,15 @@ impl State {
 
     /// Parses the request, checks CSRF, runs the page and builds the response.
     /// Runs on a blocking thread: everything here may take CPU time.
-    fn execute(&self, script: &Path, ip: String, parts: hyper::http::request::Parts, body: Bytes) -> Resp {
+    fn execute(
+        &self,
+        script: &Path,
+        params: Vec<(String, String)>,
+        ip: String,
+        parts: hyper::http::request::Parts,
+        body: Bytes,
+        kind: Page,
+    ) -> Resp {
         let headers: Vec<(String, String)> = parts
             .headers
             .iter()
@@ -535,7 +879,7 @@ impl State {
         }
 
         let had_session = session.id.is_some();
-        let ctx = HttpCtx {
+        let mut ctx = HttpCtx {
             method: parts.method.as_str().to_string(),
             path: percent_encoding::percent_decode_str(parts.uri.path()).decode_utf8_lossy().into_owned(),
             query,
@@ -548,16 +892,73 @@ impl State {
             remote_ip: ip,
             csp_nonce: self.config.csp.uses_nonce().then(|| phv_std::random_hex(16)),
             body: if raw_body { String::from_utf8_lossy(&body).into_owned() } else { String::new() },
+            params,
+            status: match kind {
+                Page::Normal => 200,
+                Page::NotFound => 404,
+                Page::Error => 500,
+            },
             ..HttpCtx::default()
         };
         drop(body);
+        // What the error page of this request gets: the request line and headers, nothing sent in it.
+        let error_ctx = || HttpCtx {
+            method: parts.method.as_str().to_string(),
+            path: percent_encoding::percent_decode_str(parts.uri.path()).decode_utf8_lossy().into_owned(),
+            headers: parts
+                .headers
+                .iter()
+                .map(|(k, v)| (k.as_str().to_ascii_lowercase(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
+                .collect(),
+            remote_ip: String::new(),
+            csp_nonce: self.config.csp.uses_nonce().then(|| phv_std::random_hex(16)),
+            status: 500,
+            ..HttpCtx::default()
+        };
+        // In production, a failing page is answered by `_500.phv` when the site has one.
+        let failed = |title: &str, detail: &str| -> Resp {
+            if !self.dev && kind != Page::Error {
+                if let Some(page) = self.special("_500.phv") {
+                    if let Some(r) = self.run_page(&page, error_ctx(), false) {
+                        return r;
+                    }
+                }
+            }
+            self.error_page(title, detail)
+        };
 
+        // Middleware runs first, outermost first; one that answers (writes
+        // output, sets a status, redirects or sends a file) ends the request.
+        if kind == Page::Normal {
+            for mw in self.middleware_for(script) {
+                match self.run_one(&mw, ctx) {
+                    Err((title, detail)) => return failed(&title, &detail),
+                    Ok(outcome) => {
+                        let answered = !outcome.output.is_empty()
+                            || outcome.http.status != 200
+                            || outcome.http.body_file.is_some();
+                        if answered {
+                            return self.respond(outcome, had_session);
+                        }
+                        ctx = outcome.http;
+                    }
+                }
+            }
+        }
+        match self.run_one(script, ctx) {
+            Ok(outcome) => self.respond(outcome, had_session),
+            Err((title, detail)) => failed(&title, &detail),
+        }
+    }
+
+    /// Runs one script for the request; a compile or runtime error gives its title and details.
+    fn run_one(&self, script: &Path, ctx: HttpCtx) -> Result<phv_driver::RunOutcome, (String, String)> {
         let rel = script.strip_prefix(&self.root).unwrap_or(script).to_string_lossy().replace('\\', "/");
         let compiled = match self.compiled(script) {
             Ok(c) => c,
             Err(diagnostics) => {
                 eprintln!("compile error in {rel}:\n{diagnostics}");
-                return self.error_page("Compile error", &format!("{rel} could not be compiled.\n\n{diagnostics}"));
+                return Err(("Compile error".into(), format!("{rel} could not be compiled.\n\n{diagnostics}")));
             }
         };
         let limits = Limits {
@@ -570,9 +971,18 @@ impl State {
         if let Some(err) = &outcome.error {
             let text = err.render();
             eprintln!("runtime error in {rel}:\n{text}");
-            return self.error_page("Runtime error", &text);
+            return Err(("Runtime error".into(), text));
         }
+        Ok(outcome)
+    }
 
+    /// Runs an error page; `None` if it fails too (the built-in page is used then).
+    fn run_page(&self, script: &Path, ctx: HttpCtx, had_session: bool) -> Option<Resp> {
+        self.run_one(script, ctx).ok().map(|o| self.respond(o, had_session))
+    }
+
+    /// The response for what a script did: status, headers, cookies and body.
+    fn respond(&self, outcome: phv_driver::RunOutcome, had_session: bool) -> Resp {
         let mut http = outcome.http;
         let csp = self.config.csp.header(http.csp_nonce.as_deref());
         let flags = if self.config.secure_cookies { "; Secure" } else { "" };
@@ -637,7 +1047,14 @@ impl State {
     }
 }
 
-async fn run_script(state: &Arc<State>, script: PathBuf, ip: String, req: Request<Incoming>) -> Resp {
+async fn run_script(
+    state: &Arc<State>,
+    script: PathBuf,
+    params: Vec<(String, String)>,
+    ip: String,
+    req: Request<Incoming>,
+    kind: Page,
+) -> Resp {
     let (parts, body) = req.into_parts();
     let body = match tokio::time::timeout(BODY_TIMEOUT, Limited::new(body, MAX_BODY).collect()).await {
         Ok(Ok(b)) => b.to_bytes(),
@@ -660,7 +1077,7 @@ async fn run_script(state: &Arc<State>, script: PathBuf, ip: String, req: Reques
     let st = state.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        st.execute(&script, ip, parts, body)
+        st.execute(&script, params, ip, parts, body, kind)
     })
     .await
     {
@@ -695,9 +1112,9 @@ mod tests {
         std::fs::write(dir.join("secret.phv"), "echo 1;").unwrap();
         let root = dir.canonicalize().unwrap();
         let st = State::new(root.clone(), true, Duration::from_secs(5), Config::default_for(&root));
-        assert!(matches!(resolve(&st, "/"), Some(Target::Script(_))));
-        assert!(matches!(resolve(&st, "/blog/post"), Some(Target::Script(_))));
-        assert!(matches!(resolve(&st, "/blog/post.phv"), Some(Target::Script(_))));
+        assert!(matches!(resolve(&st, "/"), Some(Target::Script(..))));
+        assert!(matches!(resolve(&st, "/blog/post"), Some(Target::Script(..))));
+        assert!(matches!(resolve(&st, "/blog/post.phv"), Some(Target::Script(..))));
         assert!(matches!(resolve(&st, "/style.css"), Some(Target::Static(_))));
         for bad in [
             "/.env",

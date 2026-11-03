@@ -126,7 +126,9 @@ fn collect(dir: &Path, prefix: String, out: &mut Vec<(String, PathBuf)>) -> Resu
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || name.starts_with('_') {
+        // Private files are left out, except the pages the server runs itself.
+        let special = matches!(name.as_str(), "_middleware.phv" | "_404.phv" | "_500.phv");
+        if name.starts_with('.') || (name.starts_with('_') && !special) {
             continue;
         }
         let rel = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };

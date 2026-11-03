@@ -745,6 +745,74 @@ phv serve examples/site --port 8080
 - In development mode, the details of compile errors and runtime errors are shown in the browser. Development mode is the default only
   when listening on `127.0.0.1` / `localhost` (it can be set explicitly with `--dev` / `--prod`). **Behind a reverse proxy, which
   reaches the server on `127.0.0.1`, use `--prod`**: otherwise visitors see the details (the server prints a note at startup).
+- Ctrl-C or SIGTERM (`docker stop`) stops the server gracefully: it stops accepting connections and lets running requests
+  finish, for at most `[server] shutdown_timeout` seconds (default 30).
+
+### Routes with parameters
+
+A file or directory name in brackets matches any one part of the path, and `[...name]` the rest of it:
+
+```
+public/posts/[id].phv          /posts/42          request()->param("id") == "42"
+public/users/[id]/edit.phv     /users/7/edit
+public/docs/[...path].phv      /docs/guide/intro  request()->param("path") == "guide/intro"
+```
+
+A file whose exact name matches the path always wins (`public/posts/new.phv` answers `/posts/new`). Otherwise the most
+specific route does: from the left, a fixed name before `[param]` before `[...rest]`. Two routes that would answer the
+same paths (`[id].phv` and `[slug].phv` in one directory) are an error: the server does not start and `phv build`
+refuses the site. Parameter values are decoded, are never empty, and never start with `.` or `_`. In development mode,
+new route files are picked up within a second.
+
+### Error pages and middleware
+
+- `public/_404.phv` answers paths that match no page or file (with status 404), and `public/_500.phv` answers in
+  production when a page fails to compile or throws (status 500; it gets the request's method, path and headers, never
+  the error). In development mode the error's details are shown instead. If an error page fails itself, the built-in
+  page is used.
+- `_middleware.phv` in a directory runs before every page in that directory and below, the outermost first. A middleware
+  that writes output, sets a status or redirects ends the request with that answer (the page does not run). Otherwise
+  the page runs next and sees what the middleware did: the session, the headers and cookies it set, and `locals()`:
+
+  ```phv
+  // public/admin/_middleware.phv
+  import std.http.{session, response, locals};
+  $user = session()->get("user_id");
+  if ($user == null) {
+      response()->redirect("/login");
+  } else {
+      locals()->set("user_id", $user);     // read in the page with locals()->get("user_id")
+  }
+  ```
+
+- Files starting with `_` are never served as pages, so `_404.phv`, `_500.phv` and `_middleware.phv` cannot be opened by URL.
+  `phv build` includes them in the executable.
+
+### Static files, compression and CORS
+
+- Static files carry `ETag` and `Last-Modified`, so browsers revalidate them cheaply (`304 Not Modified`); they are
+  sent with `Cache-Control: no-cache`, or `public, max-age=N` with `[server] static_max_age = N`. One byte range
+  (`Range: bytes=a-b`) is served with `206 Partial Content` for media players and resumed downloads.
+- Text responses (HTML, CSS, JavaScript, JSON, SVG, ...) of 1 KB or more are compressed with gzip when the client
+  accepts it (`[server] compress = false` turns this off). Responses for one visitor (they set a cookie, use the session
+  or carry a CSRF token) are never compressed, so a secret in them cannot be guessed from the compressed size (BREACH).
+- `[cors]` lets pages of other origins call the site from a browser:
+
+  ```toml
+  [cors]
+  origins = ["https://app.example.com"]   # or ["*"]
+  methods = ["GET", "POST"]               # default
+  headers = ["Content-Type"]
+  credentials = false                     # true sends cookies along (not with "*")
+  max_age = 600
+  ```
+
+  Preflight requests (`OPTIONS` with `Access-Control-Request-Method`) are answered by the server; other responses get
+  `Access-Control-Allow-Origin` when the request's `Origin` is allowed. An origin allowed with `credentials = true` can
+  send JSON requests with the visitor's cookies: list only origins you trust.
+- `[server] access_log = "logs/access.log"` also appends one line per request to a file inside the project
+  (`access_log_format = "json"` writes JSON objects with `time`, `ip`, `method`, `path`, `status` and `ms`). The path is
+  logged without the query string.
 
 ### std.http
 
@@ -765,6 +833,9 @@ $req->json();              // any
 $req->body;                // string
 $req->ip;                  // string (the client's IP address; behind a reverse proxy, the proxy's address)
 $req->isPost();            // bool
+$req->param("id");         // ?string: a parameter of the page's path (`public/posts/[id].phv`)
+$req->params;              // map<string, string>
+locals()->get("user_id");  // ?string: a value `_middleware.phv` set with locals()->set()
 
 response()->status(404);
 response()->header("Cache-Control", "no-store");

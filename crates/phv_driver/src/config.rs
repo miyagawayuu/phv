@@ -13,6 +13,18 @@
 //!
 //! [server]
 //! workers = 16            # scripts running at once (default: 2 per CPU, at least 8)
+//! static_max_age = 3600   # Cache-Control max-age of static files (default: revalidate each time)
+//! compress = true         # gzip text responses for clients that accept it (default)
+//! access_log = "logs/access.log"  # also write the access log to this file
+//! access_log_format = "json"      # "text" (default) or "json", one request per line
+//! shutdown_timeout = 30   # seconds to finish running requests on Ctrl-C / SIGTERM
+//!
+//! [cors]
+//! origins = ["https://app.example.com"]  # or ["*"]
+//! methods = ["GET", "POST"]
+//! headers = ["Content-Type"]
+//! credentials = false     # allow cookies (not with "*")
+//! max_age = 600           # seconds browsers may cache a preflight answer
 //!
 //! [permissions]
 //! read = ["content/"]
@@ -51,6 +63,8 @@ struct File {
     security: Security,
     #[serde(default)]
     server: ServerSection,
+    #[serde(default)]
+    cors: Option<CorsSection>,
     #[serde(default)]
     permissions: PermissionsSection,
     #[serde(default)]
@@ -224,6 +238,57 @@ struct Project {
 struct ServerSection {
     /// Scripts that `phv serve` runs at once; further requests wait for one.
     workers: Option<usize>,
+    /// `Cache-Control: public, max-age=N` for static files (default: `no-cache`).
+    static_max_age: Option<u64>,
+    /// Compress text responses with gzip (default: true).
+    compress: Option<bool>,
+    /// A file inside the project the access log is appended to.
+    access_log: Option<String>,
+    /// "text" (default) or "json".
+    access_log_format: Option<String>,
+    /// Seconds running requests get to finish when the server is stopped.
+    shutdown_timeout: Option<u64>,
+}
+
+/// `[cors]`: which other sites may call this one from a browser.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct CorsSection {
+    #[serde(default)]
+    origins: Vec<String>,
+    methods: Option<Vec<String>>,
+    #[serde(default)]
+    headers: Vec<String>,
+    #[serde(default)]
+    credentials: bool,
+    max_age: Option<u64>,
+}
+
+/// Cross-origin requests the server allows (`[cors]`).
+#[derive(Clone, Debug)]
+pub struct Cors {
+    /// Allowed origins (`https://app.example.com`), lowercase; empty with `any`.
+    pub origins: Vec<String>,
+    /// `origins = ["*"]`: any origin (never with credentials).
+    pub any: bool,
+    pub methods: Vec<String>,
+    pub headers: Vec<String>,
+    pub credentials: bool,
+    pub max_age: u64,
+}
+
+impl Cors {
+    /// Whether a request's `Origin` may read the response.
+    pub fn allows(&self, origin: &str) -> bool {
+        self.any || self.origins.iter().any(|o| o.eq_ignore_ascii_case(origin))
+    }
+}
+
+/// The format of the access log file.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LogFormat {
+    Text,
+    Json,
 }
 
 /// Two workers per CPU, at least 8.
@@ -454,6 +519,12 @@ pub struct Config {
     pub session_db: Option<String>,
     pub dependencies: BTreeMap<String, Dependency>,
     pub fmt: FmtSection,
+    pub static_max_age: Option<u64>,
+    pub compress: bool,
+    /// The access log file (inside the project) and its format.
+    pub access_log: Option<(PathBuf, LogFormat)>,
+    pub shutdown_timeout: u64,
+    pub cors: Option<Cors>,
 }
 
 impl Config {
@@ -472,8 +543,58 @@ impl Config {
             session_db: None,
             dependencies: BTreeMap::new(),
             fmt: FmtSection::default(),
+            static_max_age: None,
+            compress: true,
+            access_log: None,
+            shutdown_timeout: 30,
+            cors: None,
         }
     }
+}
+
+/// `[cors]`, checked.
+fn cors_config(c: CorsSection) -> Result<Cors, String> {
+    let any = c.origins.iter().any(|o| o == "*");
+    if any && c.origins.len() > 1 {
+        return Err("[cors].origins: \"*\" cannot be listed with other origins".into());
+    }
+    if any && c.credentials {
+        return Err("[cors]: credentials = true needs a list of origins, not \"*\" (browsers refuse both)".into());
+    }
+    for o in &c.origins {
+        let rest = o.strip_prefix("https://").or_else(|| o.strip_prefix("http://"));
+        let ok = o == "*"
+            || rest.is_some_and(|h| {
+                !h.is_empty()
+                    && h.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':' | '[' | ']'))
+            });
+        if !ok {
+            return Err(format!(
+                "[cors].origins: \"{o}\" must be \"*\" or an origin like \"https://app.example.com\" (no path)"
+            ));
+        }
+    }
+    let token = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b));
+    let methods: Vec<String> =
+        c.methods.unwrap_or_else(|| vec!["GET".into(), "POST".into()]).iter().map(|m| m.to_ascii_uppercase()).collect();
+    if let Some(m) = methods.iter().find(|m| !token(m)) {
+        return Err(format!("[cors].methods: \"{m}\" is not an HTTP method"));
+    }
+    if let Some(h) = c.headers.iter().find(|h| !token(h)) {
+        return Err(format!("[cors].headers: \"{h}\" is not a header name"));
+    }
+    let max_age = c.max_age.unwrap_or(600);
+    if max_age > 86_400 {
+        return Err("[cors].max_age must be at most 86400 seconds".into());
+    }
+    Ok(Cors {
+        origins: if any { Vec::new() } else { c.origins.iter().map(|o| o.to_ascii_lowercase()).collect() },
+        any,
+        methods,
+        headers: c.headers,
+        credentials: c.credentials,
+        max_age,
+    })
 }
 
 fn check_dir(kind: &str, d: &str) -> Result<(), String> {
@@ -632,6 +753,32 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
     if file.server.workers.is_some_and(|w| !(1..=1024).contains(&w)) {
         return Err("[server].workers must be between 1 and 1024".into());
     }
+    if file.server.static_max_age.is_some_and(|a| a > 31_536_000) {
+        return Err("[server].static_max_age must be at most 31536000 seconds (a year)".into());
+    }
+    let shutdown_timeout = file.server.shutdown_timeout.unwrap_or(30);
+    if shutdown_timeout > 3600 {
+        return Err("[server].shutdown_timeout must be at most 3600 seconds".into());
+    }
+    let format = match file.server.access_log_format.as_deref() {
+        None | Some("text") => LogFormat::Text,
+        Some("json") => LogFormat::Json,
+        Some(other) => return Err(format!("[server].access_log_format: \"{other}\" is not \"text\" or \"json\"")),
+    };
+    let access_log = match &file.server.access_log {
+        None => None,
+        Some(f) => {
+            check_dir("access_log", f).map_err(|_| {
+                format!("[server].access_log: \"{f}\" must be a file inside the project (no `..`, not absolute)")
+            })?;
+            let names = dir_names(f);
+            if names.first().is_some_and(|n| n == "public") {
+                return Err(format!("[server].access_log: \"{f}\" is inside public/"));
+            }
+            Some((root.join(f), format))
+        }
+    };
+    let cors = file.cors.map(cors_config).transpose()?;
     let permissions =
         Permissions { read: file.permissions.read, write: file.permissions.write, env: file.permissions.env };
     let mut databases = BTreeMap::new();
@@ -663,6 +810,11 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
         session_db,
         dependencies: file.dependencies,
         fmt: file.fmt,
+        static_max_age: file.server.static_max_age,
+        compress: file.server.compress.unwrap_or(true),
+        access_log,
+        shutdown_timeout,
+        cors,
     })
 }
 
@@ -680,6 +832,54 @@ mod tests {
         let r = load_config(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         r
+    }
+
+    #[test]
+    fn server_and_cors_settings() {
+        for bad in [
+            "[cors]
+origins = [\"*\"]
+credentials = true
+",
+            "[cors]
+origins = [\"*\", \"https://a.example\"]
+",
+            "[cors]
+origins = [\"https://a.example/path\"]
+",
+            "[cors]
+origins = [\"a.example\"]
+",
+            "[cors]
+methods = [\"GET POST\"]
+",
+            "[server]
+access_log = \"public/log.txt\"
+",
+            "[server]
+access_log = \"../log.txt\"
+",
+            "[server]
+access_log_format = \"xml\"
+",
+            "[server]
+shutdown_timeout = 99999
+",
+        ] {
+            assert!(load(bad).is_err(), "{bad}");
+        }
+        let c = load(
+            "[cors]
+origins = [\"https://App.example\"]
+[server]
+access_log = \"logs/a.log\"
+",
+        )
+        .unwrap();
+        let cors = c.cors.unwrap();
+        assert!(cors.allows("https://app.example") && !cors.allows("https://other.example"));
+        assert_eq!(cors.methods, ["GET", "POST"]);
+        assert!(c.access_log.is_some() && c.compress);
     }
 
     #[test]

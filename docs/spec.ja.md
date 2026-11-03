@@ -736,6 +736,74 @@ phv serve examples/site --port 8080
 - 開発モードではコンパイルエラーと実行時エラーの詳細をブラウザに表示する。開発モードが既定になるのは
   `127.0.0.1` / `localhost` で待ち受けるときだけ(`--dev` / `--prod` で明示できる)。**`127.0.0.1` に接続してくる
   リバースプロキシの後ろでは `--prod` を付ける**こと。付けないと訪問者に詳細が見える(起動時に注意を表示する)。
+- Ctrl-C か SIGTERM(`docker stop`)でサーバーは穏やかに止まる: 新しい接続を受け付けるのをやめ、実行中のリクエストが
+  終わるのを最大 `[server] shutdown_timeout` 秒(既定 30)待つ。
+
+### パラメータ付きのルート
+
+角かっこで囲んだファイル名やディレクトリ名は、パスのどれか 1 つの部分に当てはまり、`[...name]` は残り全部に当てはまる:
+
+```
+public/posts/[id].phv          /posts/42          request()->param("id") == "42"
+public/users/[id]/edit.phv     /users/7/edit
+public/docs/[...path].phv      /docs/guide/intro  request()->param("path") == "guide/intro"
+```
+
+パスとちょうど同じ名前のファイルが常に優先する(`/posts/new` には `public/posts/new.phv`)。それ以外は、左から見て
+決まった名前、`[param]`、`[...rest]` の順に具体的なルートが優先する。同じパスに当てはまる 2 つのルート(同じディレクトリの
+`[id].phv` と `[slug].phv`)はエラーで、サーバーは起動せず、`phv build` もそのサイトを拒む。パラメータの値はデコード
+済みで、空になることはなく、`.` や `_` で始まることもない。開発モードでは、新しいルートのファイルは 1 秒以内に反映される。
+
+### エラーページとミドルウェア
+
+- `public/_404.phv` はどのページにもファイルにも当てはまらないパスに(ステータス 404 で)答え、`public/_500.phv` は本番で
+  ページのコンパイルが失敗したり例外が投げられたりしたときに答える(ステータス 500。リクエストのメソッド・パス・ヘッダーは
+  受け取るが、エラーは受け取らない)。開発モードではエラーの詳細を表示する。エラーページ自体が失敗したときは組み込みの
+  ページを使う。
+- ディレクトリの `_middleware.phv` は、そのディレクトリとその下のすべてのページの前に、外側から順に実行される。出力を
+  書いたり、ステータスを設定したり、リダイレクトしたりしたミドルウェアは、その答えでリクエストを終える(ページは実行されない)。
+  そうでなければ次にページが実行され、ミドルウェアがしたこと(セッション、設定したヘッダーと Cookie、`locals()`)が
+  引き継がれる:
+
+  ```phv
+  // public/admin/_middleware.phv
+  import std.http.{session, response, locals};
+  $user = session()->get("user_id");
+  if ($user == null) {
+      response()->redirect("/login");
+  } else {
+      locals()->set("user_id", $user);     // ページでは locals()->get("user_id") で読む
+  }
+  ```
+
+- `_` で始まるファイルはページとして配信されないので、`_404.phv`、`_500.phv`、`_middleware.phv` を URL で開くことは
+  できない。`phv build` はこれらを実行ファイルに含める。
+
+### 静的ファイル、圧縮、CORS
+
+- 静的ファイルには `ETag` と `Last-Modified` が付くので、ブラウザは安く再検証できる(`304 Not Modified`)。
+  `Cache-Control: no-cache` で送り、`[server] static_max_age = N` なら `public, max-age=N` で送る。メディアプレーヤーや
+  ダウンロードの再開のため、1 つのバイト範囲(`Range: bytes=a-b`)を `206 Partial Content` で送る。
+- 1 KB 以上のテキストのレスポンス(HTML、CSS、JavaScript、JSON、SVG など)は、クライアントが受け付けるなら gzip で
+  圧縮する(`[server] compress = false` で止められる)。訪問者ごとのレスポンス(Cookie を設定する、セッションを使う、
+  CSRF トークンを含む)は決して圧縮しないので、圧縮後の大きさから中の秘密を推測されることはない(BREACH)。
+- `[cors]` を書くと、ほかのオリジンのページからブラウザでこのサイトを呼べる:
+
+  ```toml
+  [cors]
+  origins = ["https://app.example.com"]   # または ["*"]
+  methods = ["GET", "POST"]               # 既定
+  headers = ["Content-Type"]
+  credentials = false                     # true なら Cookie も送られる("*" とは併用できない)
+  max_age = 600
+  ```
+
+  プリフライト(`Access-Control-Request-Method` 付きの `OPTIONS`)にはサーバーが答え、ほかのレスポンスには、リクエストの
+  `Origin` が許可されていれば `Access-Control-Allow-Origin` を付ける。`credentials = true` で許可したオリジンは、訪問者の
+  Cookie 付きで JSON のリクエストを送れるので、信頼できるオリジンだけを書くこと。
+- `[server] access_log = "logs/access.log"` を書くと、プロジェクト内のファイルにもリクエストごとに 1 行を追記する
+  (`access_log_format = "json"` なら `time`、`ip`、`method`、`path`、`status`、`ms` を持つ JSON)。パスはクエリ文字列なしで
+  記録する。
 
 ### std.http
 
@@ -756,6 +824,9 @@ $req->json();              // any
 $req->body;                // string
 $req->ip;                  // string(接続元の IP アドレス。リバースプロキシの後ろではプロキシのアドレス)
 $req->isPost();            // bool
+$req->param("id");         // ?string: ページのパスのパラメータ(`public/posts/[id].phv`)
+$req->params;              // map<string, string>
+locals()->get("user_id");  // ?string: `_middleware.phv` が locals()->set() で設定した値
 
 response()->status(404);
 response()->header("Cache-Control", "no-store");

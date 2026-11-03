@@ -36,7 +36,14 @@ export class Request {
         public readonly string $body,
         /** The client's IP address (the proxy's, behind a reverse proxy). */
         public readonly string $ip,
+        /** The parameters of the page's path: `id` for `public/posts/[id].phv`. */
+        public readonly map<string, string> $params = [],
     ) {}
+
+    /** A parameter of the page's path (`[id]` in its file name), or null. */
+    public function param(string $name): ?string {
+        return $this->params[$name] ?? null;
+    }
 
     /** A query string parameter (`?name=value`), or null. */
     public function query(string $name): ?string {
@@ -228,7 +235,34 @@ export function request(): Request {
         $files,
         __req_body(),
         __req_ip(),
+        __req_params(),
     );
+}
+
+/**
+ * Values that `_middleware.phv` passes on to the page of the same request,
+ * such as the signed-in user's id. They last for one request.
+ */
+export class Locals {
+    public function get(string $key): ?string {
+        return __locals_get($key);
+    }
+
+    public function set(string $key, string $value): void {
+        __locals_set($key, $value);
+    }
+
+    public function has(string $key): bool {
+        return __locals_get($key) != null;
+    }
+
+    public function all(): map<string, string> {
+        return __locals_all();
+    }
+}
+
+export function locals(): Locals {
+    return new Locals();
 }
 
 export function response(): Response {

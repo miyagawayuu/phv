@@ -48,6 +48,14 @@ impl RespBody {
         RespBody::full(Bytes::from_owner(Counted { data, total: total.clone() }))
     }
 
+    /// The bytes of a body held in memory (taken out of it), to replace them.
+    pub fn take_bytes(&mut self) -> Option<Bytes> {
+        match self {
+            RespBody::Full(b) => b.take(),
+            RespBody::File { .. } => None,
+        }
+    }
+
     pub fn file(file: tokio::fs::File, len: u64) -> RespBody {
         RespBody::File { file, left: len, buf: vec![0u8; 64 << 10].into_boxed_slice() }
     }

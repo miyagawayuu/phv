@@ -329,3 +329,165 @@ fn busy_servers_answer_503() {
     assert_eq!(get(addr, "/", "").status, 200);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn start_with(dir: &Path, dev: bool) -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let opts = ServeOptions {
+        root: dir.to_path_buf(),
+        host: "127.0.0.1".into(),
+        port: 0,
+        dev,
+        time_limit: Duration::from_secs(5),
+    };
+    std::thread::spawn(move || serve_on(listener, opts).unwrap());
+    addr
+}
+
+/// Routes with parameters, middleware that answers or passes values on, and
+/// the site's own error pages.
+#[test]
+fn routes_middleware_and_error_pages() {
+    let dir = std::env::temp_dir().join(format!("phv-http-routes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let page = |body: &str| format!("<?phv\nimport std.http.{{request, response, locals}};\n{body}\n");
+    write(&dir, "phv.toml", "");
+    write(&dir, "public/index.phv", &page("echo \"home\";"));
+    write(&dir, "public/posts/[id].phv", &page("echo \"post \", request()->param(\"id\") ?? \"?\";"));
+    write(&dir, "public/posts/new.phv", &page("echo \"new post\";"));
+    write(&dir, "public/posts/[id]/edit.phv", &page("echo \"edit \", request()->params[\"id\"];"));
+    write(&dir, "public/docs/[...path].phv", &page("echo \"doc \", request()->param(\"path\") ?? \"\";"));
+    write(&dir, "public/_404.phv", &page("echo \"custom 404 for \", request()->path;"));
+    write(&dir, "public/_500.phv", &page("echo \"custom 500\";"));
+    write(&dir, "public/boom.phv", &page("throw new RuntimeException(\"secret detail\");"));
+    write(
+        &dir,
+        "public/admin/_middleware.phv",
+        &page("if (request()->query(\"key\") != \"ok\") {\n    response()->status(403);\n    echo \"denied\";\n} else {\n    locals()->set(\"user\", \"ann\");\n    response()->header(\"X-Checked\", \"yes\");\n}"),
+    );
+    write(&dir, "public/admin/index.phv", &page("echo \"admin \", locals()->get(\"user\") ?? \"nobody\";"));
+    let addr = start_with(&dir, false);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let r = get(addr, "/posts/42", "");
+    assert_eq!((r.status, r.body.as_str()), (200, "post 42"));
+    assert_eq!(get(addr, "/posts/new", "").body, "new post", "a file named exactly wins");
+    assert_eq!(get(addr, "/posts/7/edit", "").body, "edit 7");
+    assert_eq!(get(addr, "/docs/a/b%20c", "").body, "doc a/b c");
+    let r = get(addr, "/posts/7/nope", "");
+    assert_eq!((r.status, r.body.as_str()), (404, "custom 404 for /posts/7/nope"));
+    assert_eq!(get(addr, "/posts/_hidden", "").status, 404, "private names are never parameters");
+
+    let r = get(addr, "/admin/", "");
+    assert_eq!((r.status, r.body.as_str()), (403, "denied"));
+    let r = get(addr, "/admin/?key=ok", "");
+    assert_eq!((r.status, r.body.as_str()), (200, "admin ann"));
+    assert_eq!(r.header("x-checked"), Some("yes"));
+    assert_eq!(get(addr, "/admin/_middleware", "").status, 404);
+
+    let r = get(addr, "/boom", "");
+    assert_eq!((r.status, r.body.as_str()), (500, "custom 500"));
+    assert!(!r.body.contains("secret detail"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn raw_bytes(addr: SocketAddr, raw: &str) -> (String, Vec<u8>) {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    s.write_all(raw.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).unwrap();
+    let at = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    (String::from_utf8_lossy(&buf[..at]).into_owned(), buf[at + 4..].to_vec())
+}
+
+/// Static files answer conditional and range requests; text is gzipped
+/// unless the response is personal; CORS; the access log; stopping.
+#[test]
+fn caching_ranges_gzip_cors_and_shutdown() {
+    let dir = std::env::temp_dir().join(format!("phv-http-static-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(
+        &dir,
+        "phv.toml",
+        "[server]\nstatic_max_age = 60\naccess_log = \"logs/access.log\"\naccess_log_format = \"json\"\n\
+         [cors]\norigins = [\"https://app.example\"]\nmethods = [\"GET\", \"PUT\"]\nheaders = [\"Content-Type\"]\n",
+    );
+    let css = "body { color: red; }\n".repeat(200);
+    write(&dir, "public/site.css", &css);
+    write(&dir, "public/index.phv", &format!("<?phv\necho \"{}\";\n", "hello ".repeat(400)));
+    write(&dir, "public/form.phv", &format!("<?phv\necho csrf_field(), \"{}\";\n", "x".repeat(2000)));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let opts = ServeOptions {
+        root: dir.clone(),
+        host: "127.0.0.1".into(),
+        port: 0,
+        dev: true,
+        time_limit: Duration::from_secs(5),
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let stop = async move {
+        // Polled until the test asks the server to stop.
+        while rx.try_recv().is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let server = std::thread::spawn(move || phv_server::serve_until(listener, opts, stop).unwrap());
+    std::thread::sleep(Duration::from_millis(300));
+
+    let r = get(addr, "/site.css", "");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("cache-control"), Some("public, max-age=60"));
+    let etag = r.header("etag").unwrap().to_string();
+    assert!(r.header("last-modified").is_some());
+    let r = request(
+        addr,
+        &format!("GET /site.css HTTP/1.1\r\nHost: t\r\nIf-None-Match: {etag}\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!((r.status, r.body.as_str()), (304, ""));
+    let r = request(addr, "GET /site.css HTTP/1.1\r\nHost: t\r\nRange: bytes=0-3\r\nConnection: close\r\n\r\n");
+    assert_eq!((r.status, r.body.as_str()), (206, "body"));
+    assert_eq!(r.header("content-range"), Some(&*format!("bytes 0-3/{}", css.len())));
+    let r = request(addr, "GET /site.css HTTP/1.1\r\nHost: t\r\nRange: bytes=99999-\r\nConnection: close\r\n\r\n");
+    assert_eq!(r.status, 416);
+
+    let gunzip = |b: &[u8]| {
+        let mut s = String::new();
+        flate2::read::GzDecoder::new(b).read_to_string(&mut s).unwrap();
+        s
+    };
+    for (path, want) in [("/site.css", css.clone()), ("/", "hello ".repeat(400))] {
+        let (head, body) = raw_bytes(
+            addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n"),
+        );
+        assert!(head.to_ascii_lowercase().contains("content-encoding: gzip"), "{path}: {head}");
+        assert!(head.contains("Accept-Encoding"), "{path} must vary: {head}");
+        assert_eq!(gunzip(&body), want);
+    }
+    // A page with a CSRF token is personal: never compressed (BREACH).
+    let (head, _) =
+        raw_bytes(addr, "GET /form HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n");
+    assert!(!head.to_ascii_lowercase().contains("content-encoding"), "{head}");
+
+    let pre = "OPTIONS / HTTP/1.1\r\nHost: t\r\nAccess-Control-Request-Method: PUT\r\nConnection: close\r\n";
+    let r = request(addr, &format!("{pre}Origin: https://app.example\r\n\r\n"));
+    assert_eq!(r.status, 204);
+    assert_eq!(r.header("access-control-allow-origin"), Some("https://app.example"));
+    assert_eq!(r.header("access-control-allow-methods"), Some("GET, PUT"));
+    let r = request(addr, &format!("{pre}Origin: https://evil.example\r\n\r\n"));
+    assert_eq!(r.header("access-control-allow-origin"), None);
+    let r = request(addr, "GET / HTTP/1.1\r\nHost: t\r\nOrigin: https://app.example\r\nConnection: close\r\n\r\n");
+    assert_eq!(r.header("access-control-allow-origin"), Some("https://app.example"));
+    assert!(r.header("vary").is_some_and(|v| v.contains("Origin")));
+
+    tx.send(()).unwrap();
+    server.join().unwrap();
+    assert!(TcpStream::connect(addr).is_err(), "the server stopped listening");
+    let log = std::fs::read_to_string(dir.join("logs/access.log")).unwrap();
+    let first: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+    assert_eq!(first["path"], "/site.css");
+    assert_eq!(first["status"], 200);
+    let _ = std::fs::remove_dir_all(&dir);
+}

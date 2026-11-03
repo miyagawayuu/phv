@@ -855,6 +855,26 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::Null)
         },
         "__req_path" => |vm, _| Ok(Value::str(vm.http.path.as_str())),
+        "__req_params" => |vm, _| Ok(string_map(&vm.http.params)),
+        "__locals_get" => |vm, a| {
+            let key = s(&a[0]);
+            Ok(vm
+                .http
+                .locals
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| Value::str(v.as_str()))
+                .unwrap_or(Value::Null))
+        },
+        "__locals_set" => |vm, a| {
+            let (key, value) = (s(&a[0]).to_string(), s(&a[1]).to_string());
+            match vm.http.locals.iter_mut().find(|(k, _)| *k == key) {
+                Some(slot) => slot.1 = value,
+                None => vm.http.locals.push((key, value)),
+            }
+            Ok(Value::Null)
+        },
+        "__locals_all" => |vm, _| Ok(string_map(&vm.http.locals)),
         "__req_query" => |vm, _| Ok(string_map(&vm.http.query)),
         "__req_form" => |vm, _| Ok(string_map(&vm.http.form)),
         "__req_query_all" => |vm, a| Ok(values_named(&vm.http.query, s(&a[0]))),

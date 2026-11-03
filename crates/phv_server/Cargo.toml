@@ -21,3 +21,9 @@ getrandom.workspace = true
 phv_std.workspace = true
 indexmap.workspace = true
 serde_json.workspace = true
+flate2.workspace = true
+httpdate.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true

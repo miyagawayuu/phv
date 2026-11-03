@@ -18,6 +18,10 @@ pub fn build(path: &Path, output: &Path) -> ExitCode {
             eprintln!("error: {} has no `public/` directory (give a site's directory, or a script)", path.display());
             return ExitCode::FAILURE;
         }
+        if let Err(e) = phv_server::check_routes(&path.join("public")) {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
         bundle::build_site(path)
     } else {
         bundle::build_script(&find_root(path), path)

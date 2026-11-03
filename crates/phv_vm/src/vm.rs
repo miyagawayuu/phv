@@ -89,6 +89,10 @@ pub struct HttpCtx {
     /// The response is for this visitor only (it carries a CSRF token), so it
     /// gets `Cache-Control: private, no-store`.
     pub personalized: bool,
+    /// Parameters of the page's path (`public/posts/[id].phv`).
+    pub params: Vec<(String, String)>,
+    /// Values middleware passes on to the page (`locals()`).
+    pub locals: Vec<(String, String)>,
 }
 
 impl Default for HttpCtx {
@@ -112,6 +116,8 @@ impl Default for HttpCtx {
             content_type: None,
             body_file: None,
             personalized: false,
+            params: Vec::new(),
+            locals: Vec::new(),
         }
     }
 }
