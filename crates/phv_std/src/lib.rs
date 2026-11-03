@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::rc::Rc;
 
+mod asyncio;
 mod db;
 mod httpclient;
 mod netdb;
@@ -34,6 +35,7 @@ pub fn std_module(name: &str) -> Option<&'static str> {
         "std.http" => Some(include_str!("phv/http.phv")),
         "std.db" => Some(include_str!("phv/db.phv")),
         "std.net" => Some(include_str!("phv/net.phv")),
+        "std.async" => Some(include_str!("phv/async.phv")),
         _ => None,
     }
 }
@@ -498,6 +500,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         .or_else(|| twofactor::lookup(name))
         .or_else(|| websocket::lookup(name))
         .or_else(|| httpclient::lookup(name))
+        .or_else(|| asyncio::lookup(name))
 }
 
 fn core_lookup(name: &str) -> Option<BuiltinFn> {

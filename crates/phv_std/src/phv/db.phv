@@ -73,6 +73,8 @@ export class Row {
     }
 }
 
+import std.async.Future;
+
 export class Database {
     /** Connections come from `Database::open()`; a handle number cannot be passed in. */
     private function __construct(private int $handle) {}
@@ -100,6 +102,22 @@ export class Database {
     /** Runs INSERT / UPDATE / DELETE / DDL and returns the number of changed rows. */
     public function execute(Sql $query): int {
         return __db_execute($this->handle, $query);
+    }
+
+    /**
+     * `query()` in the background, on a connection of its own (so outside a
+     * transaction of this connection). Wait for the rows with `await()`.
+     * With SQLite the statement runs right away.
+     */
+    public function queryAsync(Sql $query): Future<list<Row>> {
+        $id = __db_start($this->handle, $query, false);
+        return new Future(fn(): list<Row> => __async_rows($id)->map(fn($m) => new Row($m)));
+    }
+
+    /** `execute()` in the background, like `queryAsync()`. */
+    public function executeAsync(Sql $query): Future<int> {
+        $id = __db_start($this->handle, $query, true);
+        return new Future(fn(): int => __async_int($id));
     }
 
     /** The id of the last inserted row (SQLite, MySQL; with PostgreSQL use `RETURNING id`). */
@@ -166,6 +184,19 @@ export class Redis {
     /** The value of `$key`, or null when it does not exist. */
     public function get(string $key): ?string {
         return Redis::text($this->run("GET", [$key]));
+    }
+
+    /** `get()` in the background: wait for the value with `await()` (std.async). */
+    public function getAsync(string $key): Future<?string> {
+        $id = __redis_start($this->handle, "GET", [$key]);
+        return new Future(fn(): ?string => Redis::text(__async_any($id)));
+    }
+
+    /** `set()` in the background. */
+    public function setAsync(string $key, string $value, int $ttl = 0): Future<bool> {
+        $args = $ttl > 0 ? [$key, $value, "EX", (string)$ttl] : [$key, $value];
+        $id = __redis_start($this->handle, "SET", $args);
+        return new Future(fn(): bool => __async_any($id) == true);
     }
 
     /** Sets `$key`; with `$ttl` > 0 it expires after that many seconds. */

@@ -107,6 +107,10 @@ fn server() -> String {
                         "HTTP/1.1 302 Found\r\nLocation: http://elsewhere.invalid/\r\nContent-Length: 0\r\n\r\n".into()
                     }
                     "/v1/missing" => "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found".into(),
+                    "/v1/wait" => {
+                        std::thread::sleep(Duration::from_millis(800));
+                        "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nwaited".into()
+                    }
                     "/v1/slow" => {
                         std::thread::sleep(Duration::from_secs(60));
                         return;
@@ -217,4 +221,28 @@ fn remote_services_need_tls() {
     let out = run_script(&host("http://api.invalid/secret-path", Some(false)), "connect", None);
     assert!(out.contains("HTTP service \"api\""), "{out}");
     assert!(!out.contains("secret-path") && !out.contains("test-key"), "{out}");
+}
+
+/// Requests started with `*Async` run at the same time: three answers that
+/// each take 800 ms arrive in about 800 ms, not 2.4 s.
+#[test]
+fn async_requests_run_at_the_same_time() {
+    let url = server();
+    let start = Instant::now();
+    let out = run_script(&host(&url, None), "async", Some(Duration::from_secs(10)));
+    let took = start.elapsed();
+    golden("async", &out);
+    assert!(took < Duration::from_millis(2000), "took {took:?}");
+}
+
+/// Waiting for a background request stops at the time limit, and a script
+/// cannot start more than 16 at once.
+#[test]
+fn async_requests_are_limited() {
+    let start = Instant::now();
+    let out = run_script(&host(&server(), None), "async_slow", Some(Duration::from_secs(1)));
+    assert!(out.contains("maximum execution time"), "{out}");
+    assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+    let out = run_script(&host(&server(), None), "async_many", Some(Duration::from_secs(10)));
+    assert!(out.contains("started 16") && out.contains("at most 16 operations"), "{out}");
 }

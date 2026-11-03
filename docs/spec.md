@@ -467,7 +467,7 @@ import std.http.{request, response};
   the directory of the file being run).
 - The top level of an imported module can contain only declarations (`function`, `class`, `interface`, `enum`, `const`, `import`).
   Loading a module has no side effects.
-- `std.*` are the standard modules (`std.http`, `std.db`, `std.net`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
+- `std.*` are the standard modules (`std.http`, `std.db`, `std.net`, `std.async`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
 - Only files inside the project and package directories can be loaded (symbolic links cannot be used to escape them).
 
 ## 12. Templates
@@ -887,6 +887,39 @@ when the body is not JSON).
   unset `url_env` or `headers_env` variable is reported when a request is sent, so `phv check` works without the
   production keys.
 
+### Asynchronous I/O (std.async)
+
+```phv
+import std.async.{await, await_all};
+import std.net.HttpClient;
+import std.db.Database;
+
+$api = HttpClient::connect("weather");
+$today = $api->getAsync("/today");          // sent now
+$tomorrow = $api->getAsync("/tomorrow");    // sent at the same time
+$db = Database::connect("main");
+$posts = $db->queryAsync(sql"SELECT id, title FROM posts");
+
+$t = await($today);                         // HttpResponse
+foreach (await($posts) as $row) { /* ... */ }
+$all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpResponse>
+```
+
+- Methods ending in `Async` start their work in the background and return a `Future<T>` at once: `HttpClient`
+  `getAsync`, `postAsync`, `postJsonAsync`, `requestAsync`; `Database` `queryAsync`, `executeAsync`; `Redis`
+  `getAsync`, `setAsync`. The script goes on while the work runs.
+- `await($f)` waits for the result (`T`) or throws the work's error (`NetworkError`, `DatabaseError`); awaiting again
+  gives the same result. `await_all($fs)` waits for a list of them. A mistake in the request itself (an unset
+  environment variable, a path that is not allowed) throws when the work is started.
+- The work stops at the script's time limit (without one: 30 seconds for HTTP and Redis, 300 for SQL), and so does
+  waiting for it. A script can have 16 operations running at once; starting more throws `RuntimeException`.
+- The work's result may take a sixteenth of the memory left to the script when it starts (and at most 16 MB for an
+  HTTP response); a larger result is an error. It is counted against the script's limit when it is awaited.
+- `queryAsync` / `executeAsync` on a database server use a connection of their own from the pool, so they run
+  outside the script's transaction; give `pool_size` room for them. With SQLite the statement runs right away.
+- `new Future(fn(): T => ...)` defers any work: it runs once, when the future is first awaited. Work that is never
+  awaited is dropped when the script ends.
+
 ### Dates, cryptography, and encoding
 
 | Function | Description |
@@ -1168,7 +1201,6 @@ that checks journal files (`phv_std/src/db/vfs.rs`).
 
 ## 18. Roadmap
 
-- Asynchronous I/O
 - Wider JIT coverage (functions that handle floats and strings), AOT compilation
 - Transitive dependency resolution, a package registry
 - Line wrapping in `phv fmt`

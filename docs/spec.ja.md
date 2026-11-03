@@ -464,7 +464,7 @@ import std.http.{request, response};
   ディレクトリ)からの `a/b.phv` を読み込む。
 - import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`const`、`import`)
   しか書けない。モジュールを読み込んでも副作用は起きない。
-- `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
+- `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`、`std.async`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
 - 読み込めるのはプロジェクトとパッケージのディレクトリの中のファイルだけ(シンボリックリンクで外に出ることはできない)。
 
 ## 12. テンプレート
@@ -876,6 +876,39 @@ echo $res->status, " ", $res->header("content-type") ?? "", "\n", $res->body;
   `url_env` や `headers_env` の環境変数が設定されていないことはリクエストを送るときに報告するので、`phv check` は本番の
   キーなしで使える。
 
+### 非同期 I/O(std.async)
+
+```phv
+import std.async.{await, await_all};
+import std.net.HttpClient;
+import std.db.Database;
+
+$api = HttpClient::connect("weather");
+$today = $api->getAsync("/today");          // すぐ送る
+$tomorrow = $api->getAsync("/tomorrow");    // 同時に送る
+$db = Database::connect("main");
+$posts = $db->queryAsync(sql"SELECT id, title FROM posts");
+
+$t = await($today);                         // HttpResponse
+foreach (await($posts) as $row) { /* ... */ }
+$all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpResponse>
+```
+
+- 名前が `Async` で終わるメソッドは処理を裏で始め、すぐに `Future<T>` を返す: `HttpClient` の `getAsync`、`postAsync`、
+  `postJsonAsync`、`requestAsync`、`Database` の `queryAsync`、`executeAsync`、`Redis` の `getAsync`、`setAsync`。
+  処理の間もスクリプトは先へ進む。
+- `await($f)` は結果(`T`)を待つ。処理が失敗していればそのエラー(`NetworkError`、`DatabaseError`)を投げる。もう一度
+  `await` しても同じ結果。`await_all($fs)` はリストのすべてを待つ。リクエスト自体の誤り(設定されていない環境変数、
+  許されないパス)は、処理を始めるときに投げる。
+- 処理と、それを待つのは、スクリプトの時間制限まで(制限がなければ HTTP と Redis は 30 秒、SQL は 300 秒)。1 つの
+  スクリプトが同時に動かせるのは 16 個までで、それを超えて始めると `RuntimeException`。
+- 処理の結果に使えるのは、始めたときにスクリプトに残っているメモリの 16 分の 1(HTTP の応答は最大 16 MB)。それより
+  大きい結果はエラー。`await` したときに、スクリプトのメモリ制限に数える。
+- データベースサーバーの `queryAsync` / `executeAsync` はプールから自分の接続を取るので、スクリプトのトランザクションの
+  外で動く。`pool_size` に余裕を持たせる。SQLite ではその場で実行する。
+- `new Future(fn(): T => ...)` で任意の処理を後回しにできる。最初に `await` したときに 1 回だけ動く。`await` されなかった
+  処理は、スクリプトの終わりに捨てる。
+
 ### 日付・暗号・エンコード
 
 | 関数 | 説明 |
@@ -1157,7 +1190,6 @@ phv migrate legacy/page.php      # page.phv を書き出す
 
 ## 18. 今後の予定
 
-- 非同期 I/O
 - JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
 - 推移的な依存関係の解決、パッケージレジストリ
 - `phv fmt` の行の折り返し

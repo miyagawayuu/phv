@@ -79,6 +79,17 @@ fn check_memory_limit(host: &Arc<Host>, name: &str) {
     assert!(peak < 64 << 20, "{name}: {} MB allocated at the peak", peak >> 20);
 }
 
+/// Statements started with `*Async` take connections of their own, so the
+/// pool has room for them; the two one-second statements run at the same time.
+fn check_async(url: &str, name: &str) {
+    let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 4 };
+    let host =
+        Arc::new(Host { root: root(), databases: BTreeMap::from([("main".to_string(), spec)]), ..Host::default() });
+    let start = std::time::Instant::now();
+    check(&host, name);
+    assert!(start.elapsed() < Duration::from_millis(1800), "{name} took {:?}", start.elapsed());
+}
+
 fn server(var: &str) -> Option<String> {
     let url = std::env::var(var).ok().filter(|u| !u.is_empty());
     if url.is_none() {
@@ -99,6 +110,7 @@ fn postgres() {
     check_memory_limit(&host, "postgres_notify");
     check(&host, "postgres_types");
     check(&host, "postgres_types_after");
+    check_async(&url, "postgres_async");
 }
 
 #[test]
@@ -112,6 +124,7 @@ fn mysql() {
     check_memory_limit(&host, "mysql_big");
     check(&host, "mysql_session");
     check(&host, "mysql_session_after");
+    check_async(&url, "mysql_async");
 }
 
 #[test]
@@ -120,6 +133,7 @@ fn redis() {
     let host = host(&url);
     check(&host, "redis");
     check_memory_limit(&host, "redis_big");
+    check_async(&url, "redis_async");
 
     // Rate limits counted on the server: a second process (here, the counters
     // of this process) does not see them, the server does.

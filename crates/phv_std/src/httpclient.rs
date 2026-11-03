@@ -193,7 +193,7 @@ struct Request {
 }
 
 #[derive(Debug)]
-struct Response {
+pub(crate) struct Response {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
@@ -236,7 +236,8 @@ fn parse_length(v: &str) -> Option<usize> {
     v.parse().ok()
 }
 
-fn read_response(stream: &mut impl Read, head_only: bool) -> Result<Response, String> {
+/// Reads a response whose body is at most `limit` bytes.
+fn read_response(stream: &mut impl Read, head_only: bool, limit: usize) -> Result<Response, String> {
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 16 << 10];
     let mut interim = 0;
@@ -282,7 +283,7 @@ fn read_response(stream: &mut impl Read, head_only: bool) -> Result<Response, St
         let body = if no_body {
             Vec::new()
         } else if header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
-            read_chunked(stream, buf, &mut chunk)?
+            read_chunked(stream, buf, &mut chunk, limit)?
         } else if let Some(len) = header("content-length") {
             // Repeated Content-Length headers must agree.
             let lengths: Vec<&str> =
@@ -292,8 +293,8 @@ fn read_response(stream: &mut impl Read, head_only: bool) -> Result<Response, St
             if lengths.iter().any(|l| parse_length(l) != Some(len)) {
                 return Err(invalid.into());
             }
-            if len > MAX_BODY {
-                return Err(too_large());
+            if len > limit {
+                return Err(too_large(limit));
             }
             while buf.len() < len {
                 let n = read_some(stream, &mut chunk)?;
@@ -306,8 +307,8 @@ fn read_response(stream: &mut impl Read, head_only: bool) -> Result<Response, St
             buf
         } else {
             loop {
-                if buf.len() > MAX_BODY {
-                    return Err(too_large());
+                if buf.len() > limit {
+                    return Err(too_large(limit));
                 }
                 let n = read_some(stream, &mut chunk)?;
                 if n == 0 {
@@ -320,8 +321,12 @@ fn read_response(stream: &mut impl Read, head_only: bool) -> Result<Response, St
     }
 }
 
-fn too_large() -> String {
-    format!("the response is larger than {} MB", MAX_BODY >> 20)
+fn too_large(limit: usize) -> String {
+    if limit >= 1 << 20 {
+        format!("the response is larger than {} MB", limit >> 20)
+    } else {
+        format!("the response is larger than {} KB", limit >> 10)
+    }
 }
 
 fn read_some(stream: &mut impl Read, chunk: &mut [u8]) -> Result<usize, String> {
@@ -336,7 +341,7 @@ fn read_some(stream: &mut impl Read, chunk: &mut [u8]) -> Result<usize, String> 
     }
 }
 
-fn read_chunked(stream: &mut impl Read, mut buf: Vec<u8>, chunk: &mut [u8]) -> Result<Vec<u8>, String> {
+fn read_chunked(stream: &mut impl Read, mut buf: Vec<u8>, chunk: &mut [u8], limit: usize) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     let mut fill = |buf: &mut Vec<u8>| -> Result<(), String> {
         let n = read_some(stream, chunk)?;
@@ -369,8 +374,8 @@ fn read_chunked(stream: &mut impl Read, mut buf: Vec<u8>, chunk: &mut [u8]) -> R
             // Trailers are ignored.
             return Ok(body);
         }
-        if size > MAX_BODY - body.len() {
-            return Err(too_large());
+        if size > limit - body.len() {
+            return Err(too_large(limit));
         }
         while buf.len() < size + 2 {
             fill(&mut buf)?;
@@ -384,7 +389,7 @@ fn read_chunked(stream: &mut impl Read, mut buf: Vec<u8>, chunk: &mut [u8]) -> R
 }
 
 /// Sends `req` to `base` and reads the answer.
-fn exchange(base: &Base, req: &Request, until: std::time::Instant) -> Result<Response, String> {
+fn exchange(base: &Base, req: &Request, until: std::time::Instant, limit: usize) -> Result<Response, String> {
     let mut stream = dial(&base.host, base.port, base.tls, until)?;
     let mut head = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", req.method, req.target, base.authority);
     for (name, value) in &req.headers {
@@ -399,12 +404,54 @@ fn exchange(base: &Base, req: &Request, until: std::time::Instant) -> Result<Res
     stream.write_all(head.as_bytes()).map_err(io)?;
     stream.write_all(&req.body).map_err(io)?;
     stream.flush().map_err(io)?;
-    read_response(&mut stream, req.method == "HEAD")
+    read_response(&mut stream, req.method == "HEAD", limit)
 }
 
 /// `__http_request(name, method, path, query, headers, body)`: sends a request
 /// to `[http.<name>]` and returns `["status" => int, "headers" => map, "body" => string]`.
 pub fn request(vm: &mut Vm, a: &[Value]) -> R {
+    let (base, req, fail) = prepare(vm, a)?;
+    let result = exchange(&base, &req, until(vm, REQUEST_TIMEOUT), MAX_BODY);
+    vm.check_limits()?;
+    match result {
+        Ok(r) => Ok(response_value(r)),
+        Err(e) => Err(vm.throw("NetworkError", format!("{fail}{e}"))),
+    }
+}
+
+/// `__http_start(...)`: `__http_request` in the background; `await()` gives
+/// the same map. The response may take a sixteenth of the memory left to the
+/// script (other work may run at the same time), and at most 16 MB.
+pub fn start(vm: &mut Vm, a: &[Value]) -> R {
+    let (base, req, fail) = prepare(vm, a)?;
+    let limit = (vm.memory_left() / 16).clamp(64 << 10, MAX_BODY);
+    let until = until(vm, REQUEST_TIMEOUT);
+    crate::asyncio::start(vm, until, move || {
+        crate::asyncio::Outcome::Http(exchange(&base, &req, until, limit).map_err(|e| format!("{fail}{e}")))
+    })
+}
+
+/// A response as the map the std.net module turns into an `HttpResponse`.
+pub(crate) fn response_value(resp: Response) -> Value {
+    let mut hs: IndexMap<Key, Value> = IndexMap::new();
+    for (n, v) in resp.headers {
+        let key = Key::Str(Rc::new(n));
+        let joined = match hs.get(&key) {
+            Some(Value::Str(old)) => format!("{old}, {v}"),
+            _ => v,
+        };
+        hs.insert(key, Value::str(joined));
+    }
+    let mut out: IndexMap<Key, Value> = IndexMap::new();
+    out.insert(Key::Str(Rc::new("status".into())), Value::Int(resp.status as i64));
+    out.insert(Key::Str(Rc::new("headers".into())), Value::map(hs));
+    out.insert(Key::Str(Rc::new("body".into())), Value::str(String::from_utf8_lossy(&resp.body).into_owned()));
+    Value::map(out)
+}
+
+/// Checks the arguments of `__http_request` / `__http_start` and builds the
+/// request, with the prefix of its error messages.
+fn prepare(vm: &mut Vm, a: &[Value]) -> Result<(Base, Request, String), VmError> {
     let name = s(&a[0]).to_string();
     let fail = |vm: &Vm, msg: String| vm.throw("NetworkError", format!("HTTP service \"{name}\": {msg}"));
     let Some(spec) = vm.host.http.get(&name).cloned() else {
@@ -476,32 +523,15 @@ pub fn request(vm: &mut Vm, a: &[Value]) -> R {
         (true, false) => target.push_str(&format!("?{query}")),
         (false, false) => target.push_str(&format!("?{}&{query}", base.query)),
     }
+    let fail = format!("HTTP service \"{name}\": {method} {path}: ");
     let req = Request { method, target, headers, body };
-    let result = exchange(&base, &req, until(vm, REQUEST_TIMEOUT));
-    vm.check_limits()?;
-    let resp = match result {
-        Ok(r) => r,
-        Err(e) => return Err(fail(vm, format!("{} {path}: {e}", req.method))),
-    };
-    let mut hs: IndexMap<Key, Value> = IndexMap::new();
-    for (n, v) in resp.headers {
-        let key = Key::Str(Rc::new(n));
-        let joined = match hs.get(&key) {
-            Some(Value::Str(old)) => format!("{old}, {v}"),
-            _ => v,
-        };
-        hs.insert(key, Value::str(joined));
-    }
-    let mut out: IndexMap<Key, Value> = IndexMap::new();
-    out.insert(Key::Str(Rc::new("status".into())), Value::Int(resp.status as i64));
-    out.insert(Key::Str(Rc::new("headers".into())), Value::map(hs));
-    out.insert(Key::Str(Rc::new("body".into())), Value::str(String::from_utf8_lossy(&resp.body).into_owned()));
-    Ok(Value::map(out))
+    Ok((base, req, fail))
 }
 
 pub fn lookup(name: &str) -> Option<phv_vm::BuiltinFn> {
     let f: phv_vm::BuiltinFn = match name {
         "__http_request" => request,
+        "__http_start" => start,
         _ => return None,
     };
     Some(f)
@@ -572,21 +602,21 @@ mod tests {
     #[test]
     fn reads_chunked_and_sized_bodies() {
         let raw = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-A: 1\r\n\r\n5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\n";
-        let r = read_response(&mut &raw[..], false).unwrap();
+        let r = read_response(&mut &raw[..], false, MAX_BODY).unwrap();
         assert_eq!((r.status, r.body.as_slice()), (200, &b"hello world"[..]));
         assert!(r.headers.contains(&("x-a".into(), "1".into())));
         let raw = b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nabcdef";
-        let r = read_response(&mut &raw[..], false).unwrap();
+        let r = read_response(&mut &raw[..], false, MAX_BODY).unwrap();
         assert_eq!((r.status, r.body.as_slice()), (404, &b"abc"[..]));
         let raw = b"HTTP/1.1 200 OK\r\n\r\nuntil the end";
-        assert_eq!(read_response(&mut &raw[..], false).unwrap().body, b"until the end");
+        assert_eq!(read_response(&mut &raw[..], false, MAX_BODY).unwrap().body, b"until the end");
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort";
-        assert!(read_response(&mut &raw[..], false).is_err());
+        assert!(read_response(&mut &raw[..], false, MAX_BODY).is_err());
         let raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1);
-        assert!(read_response(&mut raw.as_bytes(), false).is_err());
+        assert!(read_response(&mut raw.as_bytes(), false, MAX_BODY).is_err());
         // A chunk size near usize::MAX after a first chunk must not overflow.
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\nffffffffffffffff\r\n";
-        assert!(read_response(&mut &raw[..], false).unwrap_err().contains("larger than"));
+        assert!(read_response(&mut &raw[..], false, MAX_BODY).unwrap_err().contains("larger than"));
         for bad in [
             &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n+5\r\nhello\r\n0\r\n\r\n"[..],
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10000000000000000\r\n",
@@ -594,9 +624,9 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: +3\r\n\r\nabc",
             b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabcd",
         ] {
-            assert!(read_response(&mut &bad[..], false).is_err(), "{}", String::from_utf8_lossy(bad));
+            assert!(read_response(&mut &bad[..], false, MAX_BODY).is_err(), "{}", String::from_utf8_lossy(bad));
         }
         let endless = b"HTTP/1.1 100 Continue\r\n\r\n".repeat(MAX_INTERIM + 1);
-        assert!(read_response(&mut &endless[..], false).unwrap_err().contains("interim"));
+        assert!(read_response(&mut &endless[..], false, MAX_BODY).unwrap_err().contains("interim"));
     }
 }

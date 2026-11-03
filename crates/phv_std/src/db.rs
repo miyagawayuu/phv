@@ -251,6 +251,15 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         "__db_connect" => crate::netdb::connect,
         "__redis_connect" => crate::netdb::connect_redis,
         "__redis" => crate::netdb::redis_command,
+        "__redis_start" => crate::netdb::start_redis,
+        "__db_start" => |vm, a| {
+            if !is_sqlite(vm, &a[0]) {
+                return crate::netdb::start_query(vm, a);
+            }
+            // SQLite runs in the script's thread: the statement is done when it returns.
+            let r = if matches!(a[2], Value::Bool(true)) { execute(vm, a) } else { query(vm, a) };
+            crate::asyncio::ready(vm, r)
+        },
         "__db_last_id" => |vm, a| {
             if !is_sqlite(vm, &a[0]) {
                 return crate::netdb::last_insert_id(vm, a);

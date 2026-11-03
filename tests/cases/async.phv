@@ -1,0 +1,24 @@
+<?phv
+// std.async with SQLite (whose statements run right away) and plain deferred work.
+import std.db.Database;
+import std.async.{Future, await, await_all};
+
+$db = Database::open(":memory:");
+$db->execute(sql"CREATE TABLE t (n INTEGER)");
+echo "inserted: ", await($db->executeAsync(sql"INSERT INTO t (n) VALUES (5)")), "\n";
+$rows = await($db->queryAsync(sql"SELECT n FROM t"));
+echo "n: ", $rows[0]->int("n") ?? 0, "\n";
+
+class Counter {
+    public int $calls = 0;
+}
+
+// The work of a Future runs once, when it is first awaited.
+$c = new Counter();
+$f = new Future(function () use ($c): string {
+    $c->calls++;
+    return "lazy";
+});
+echo "before await: ", $c->calls, "\n";
+echo await_all([$f, new Future(fn(): string => "x")])->join(","), "\n";
+echo await($f), " (resolved ", $c->calls, " time)\n";

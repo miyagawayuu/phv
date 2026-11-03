@@ -1,0 +1,40 @@
+// std.async — waiting for work started by the *Async methods of std.net and std.db.
+//
+//   import std.async.{await, await_all};
+//   import std.net.HttpClient;
+//
+//   $api = HttpClient::connect("weather");
+//   $today = $api->getAsync("/today");        // sent now
+//   $tomorrow = $api->getAsync("/tomorrow");  // sent at the same time
+//   echo await($today)->status, " ", await($tomorrow)->status;
+//
+// The work runs while the script goes on, and must finish within the script's
+// time limit. A script can have 16 operations running at once.
+
+/** A result that may not be there yet. */
+export class Future<T> {
+    /** Holds the result once it has been awaited. */
+    private list<T> $result = [];
+
+    /** `$resolve` waits for the result; it is called once, by the first `await()`. */
+    public function __construct(private fn(): T $resolve) {}
+
+    /** The result: waits for it the first time. */
+    public function await(): T {
+        if ($this->result->isEmpty()) {
+            $resolve = $this->resolve;
+            $this->result[] = $resolve();
+        }
+        return $this->result[0];
+    }
+}
+
+/** Waits for `$f` and returns its result (or throws its error). */
+export function await<T>(Future<T> $f): T {
+    return $f->await();
+}
+
+/** Waits for each of `$fs` (they run at the same time) and returns their results in order. */
+export function await_all<T>(list<Future<T>> $fs): list<T> {
+    return $fs->map(fn(Future<T> $f): T => $f->await());
+}

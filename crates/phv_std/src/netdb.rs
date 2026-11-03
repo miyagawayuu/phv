@@ -558,7 +558,7 @@ fn pg_query(vm: &mut Vm, c: &mut Pooled<PgConn>, q: &Value) -> R {
         let mut m = IndexMap::with_capacity(names.len());
         for (i, n) in names.iter().enumerate() {
             let PgOut(v) = row.try_get(i)?;
-            m.insert(Key::Str(n.clone()), v);
+            m.insert(Key::Str(n.clone()), v.into_value());
         }
         out.push(Value::map(m));
         if vm.check_memory().is_err() {
@@ -847,7 +847,7 @@ fn numeric_decode(raw: &[u8]) -> Result<String, BoxError> {
 }
 
 /// A column value read from PostgreSQL.
-struct PgOut(Value);
+struct PgOut(Scalar);
 
 impl<'a> postgres::types::FromSql<'a> for PgOut {
     fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, BoxError> {
@@ -855,7 +855,7 @@ impl<'a> postgres::types::FromSql<'a> for PgOut {
     }
 
     fn from_sql_null(_: &postgres::types::Type) -> Result<Self, BoxError> {
-        Ok(PgOut(Value::Null))
+        Ok(PgOut(Scalar::Null))
     }
 
     fn accepts(_: &postgres::types::Type) -> bool {
@@ -863,26 +863,26 @@ impl<'a> postgres::types::FromSql<'a> for PgOut {
     }
 }
 
-fn pg_decode(ty: &postgres::types::Type, raw: &[u8]) -> Result<Value, BoxError> {
+fn pg_decode(ty: &postgres::types::Type, raw: &[u8]) -> Result<Scalar, BoxError> {
     use postgres::types::{FromSql, Kind, Type};
     use std::fmt::Write;
     if let Kind::Domain(inner) = ty.kind() {
         return pg_decode(inner, raw);
     }
     if is_text_type(ty) || *ty == Type::JSON {
-        return Ok(Value::str(String::from_utf8_lossy(raw).into_owned()));
+        return Ok(Scalar::Str(String::from_utf8_lossy(raw).into_owned()));
     }
     Ok(match *ty {
-        Type::BOOL => Value::Bool(bool::from_sql(ty, raw)?),
-        Type::INT2 => Value::Int(i16::from_sql(ty, raw)? as i64),
-        Type::INT4 => Value::Int(i32::from_sql(ty, raw)? as i64),
-        Type::INT8 => Value::Int(i64::from_sql(ty, raw)?),
-        Type::OID => Value::Int(u32::from_sql(ty, raw)? as i64),
-        Type::FLOAT4 => Value::Float(f32::from_sql(ty, raw)? as f64),
-        Type::FLOAT8 => Value::Float(f64::from_sql(ty, raw)?),
-        Type::NUMERIC => Value::str(numeric_decode(raw)?),
+        Type::BOOL => Scalar::Bool(bool::from_sql(ty, raw)?),
+        Type::INT2 => Scalar::Int(i16::from_sql(ty, raw)? as i64),
+        Type::INT4 => Scalar::Int(i32::from_sql(ty, raw)? as i64),
+        Type::INT8 => Scalar::Int(i64::from_sql(ty, raw)?),
+        Type::OID => Scalar::Int(u32::from_sql(ty, raw)? as i64),
+        Type::FLOAT4 => Scalar::Float(f32::from_sql(ty, raw)? as f64),
+        Type::FLOAT8 => Scalar::Float(f64::from_sql(ty, raw)?),
+        Type::NUMERIC => Scalar::Str(numeric_decode(raw)?),
         Type::JSONB => match raw.split_first() {
-            Some((1, rest)) => Value::str(String::from_utf8_lossy(rest).into_owned()),
+            Some((1, rest)) => Scalar::Str(String::from_utf8_lossy(rest).into_owned()),
             _ => return Err("unsupported jsonb version".into()),
         },
         Type::UUID if raw.len() == 16 => {
@@ -893,7 +893,7 @@ fn pg_decode(ty: &postgres::types::Type, raw: &[u8]) -> Result<Value, BoxError> 
                 }
                 write!(s, "{b:02x}").unwrap();
             }
-            Value::str(s)
+            Scalar::Str(s)
         }
         Type::BYTEA => {
             let mut s = String::with_capacity(2 + raw.len() * 2);
@@ -901,17 +901,17 @@ fn pg_decode(ty: &postgres::types::Type, raw: &[u8]) -> Result<Value, BoxError> 
             for b in raw {
                 write!(s, "{b:02x}").unwrap();
             }
-            Value::str(s)
+            Scalar::Str(s)
         }
-        Type::DATE => Value::str(chrono::NaiveDate::from_sql(ty, raw)?.format("%Y-%m-%d").to_string()),
-        Type::TIME => Value::str(chrono::NaiveTime::from_sql(ty, raw)?.format("%H:%M:%S%.f").to_string()),
+        Type::DATE => Scalar::Str(chrono::NaiveDate::from_sql(ty, raw)?.format("%Y-%m-%d").to_string()),
+        Type::TIME => Scalar::Str(chrono::NaiveTime::from_sql(ty, raw)?.format("%H:%M:%S%.f").to_string()),
         Type::TIMESTAMP => {
-            Value::str(chrono::NaiveDateTime::from_sql(ty, raw)?.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+            Scalar::Str(chrono::NaiveDateTime::from_sql(ty, raw)?.format("%Y-%m-%d %H:%M:%S%.f").to_string())
         }
-        Type::TIMESTAMPTZ => Value::str(
+        Type::TIMESTAMPTZ => Scalar::Str(
             chrono::DateTime::<chrono::Utc>::from_sql(ty, raw)?.format("%Y-%m-%d %H:%M:%S%.f+00:00").to_string(),
         ),
-        Type::VOID => Value::Null,
+        Type::VOID => Scalar::Null,
         _ => {
             return Err(
                 format!("PHV cannot read values of type {ty}; cast the column in the SQL, e.g. column::text").into()
@@ -1094,18 +1094,18 @@ fn my_params(params: &[Value]) -> mysql::Params {
     )
 }
 
-fn my_value(v: mysql::Value, col: &mysql::Column) -> Result<Value, String> {
+fn my_value(v: mysql::Value, col: &mysql::Column) -> Result<Scalar, String> {
     use mysql::consts::ColumnType;
     Ok(match v {
-        mysql::Value::NULL => Value::Null,
-        mysql::Value::Int(i) => Value::Int(i),
+        mysql::Value::NULL => Scalar::Null,
+        mysql::Value::Int(i) => Scalar::Int(i),
         mysql::Value::UInt(u) => {
-            Value::Int(i64::try_from(u).map_err(|_| format!("column {}: {u} is too large for int", col.name_str()))?)
+            Scalar::Int(i64::try_from(u).map_err(|_| format!("column {}: {u} is too large for int", col.name_str()))?)
         }
-        mysql::Value::Float(f) => Value::Float(f as f64),
-        mysql::Value::Double(f) => Value::Float(f),
-        mysql::Value::Bytes(b) => Value::str(String::from_utf8_lossy(&b).into_owned()),
-        mysql::Value::Date(y, mo, d, h, mi, s, us) => Value::str(match col.column_type() {
+        mysql::Value::Float(f) => Scalar::Float(f as f64),
+        mysql::Value::Double(f) => Scalar::Float(f),
+        mysql::Value::Bytes(b) => Scalar::Str(String::from_utf8_lossy(&b).into_owned()),
+        mysql::Value::Date(y, mo, d, h, mi, s, us) => Scalar::Str(match col.column_type() {
             ColumnType::MYSQL_TYPE_DATE | ColumnType::MYSQL_TYPE_NEWDATE => format!("{y:04}-{mo:02}-{d:02}"),
             _ if us > 0 => format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{us:06}"),
             _ => format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}"),
@@ -1113,7 +1113,7 @@ fn my_value(v: mysql::Value, col: &mysql::Column) -> Result<Value, String> {
         mysql::Value::Time(neg, days, h, mi, s, us) => {
             let sign = if neg { "-" } else { "" };
             let hours = days as u64 * 24 + h as u64;
-            Value::str(if us > 0 {
+            Scalar::Str(if us > 0 {
                 format!("{sign}{hours:02}:{mi:02}:{s:02}.{us:06}")
             } else {
                 format!("{sign}{hours:02}:{mi:02}:{s:02}")
@@ -1142,7 +1142,7 @@ fn my_query(vm: &mut Vm, c: &mut Pooled<MyConn>, q: &Value) -> R {
             for ((n, v), col) in names.iter().zip(values).zip(&columns) {
                 match my_value(v, col) {
                     Ok(v) => {
-                        m.insert(Key::Str(n.clone()), v);
+                        m.insert(Key::Str(n.clone()), v.into_value());
                     }
                     Err(e) => {
                         convert_error = Some(e);
@@ -1189,6 +1189,328 @@ fn my_execute(vm: &mut Vm, c: &mut Pooled<MyConn>, q: &Value) -> R {
     drop(kill);
     r.map_err(|e| my_error(vm, c, e))?;
     Ok(Value::Int(c.get().conn.affected_rows().try_into().unwrap_or(i64::MAX)))
+}
+
+// ----- Statements run in the background (queryAsync) --------------------------
+
+/// A value read from a row, before it becomes a PHV value: rows read in the
+/// background cross threads, which values cannot.
+pub(crate) enum Scalar {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+impl Scalar {
+    fn into_value(self) -> Value {
+        match self {
+            Scalar::Null => Value::Null,
+            Scalar::Bool(b) => Value::Bool(b),
+            Scalar::Int(i) => Value::Int(i),
+            Scalar::Float(f) => Value::Float(f),
+            Scalar::Str(t) => Value::str(t),
+        }
+    }
+
+    /// Roughly the memory the value takes once it is a PHV value.
+    fn size(&self) -> usize {
+        match self {
+            Scalar::Str(t) => 32 + t.len(),
+            _ => 16,
+        }
+    }
+}
+
+/// What a statement run in the background returned.
+pub(crate) enum Detached {
+    Rows(Vec<String>, Vec<Vec<Scalar>>),
+    Count(u64),
+}
+
+/// The rows (as maps) or the number of changed rows.
+pub(crate) fn detached_value(d: Detached) -> Value {
+    match d {
+        Detached::Count(n) => Value::Int(n.try_into().unwrap_or(i64::MAX)),
+        Detached::Rows(names, rows) => {
+            let names: Vec<Rc<String>> = names.into_iter().map(Rc::new).collect();
+            let rows = rows
+                .into_iter()
+                .map(|r| {
+                    let m: IndexMap<Key, Value> =
+                        names.iter().zip(r).map(|(n, v)| (Key::Str(n.clone()), v.into_value())).collect();
+                    Value::map(m)
+                })
+                .collect();
+            Value::list(rows)
+        }
+    }
+}
+
+/// How long background work may take without a script time limit.
+const DETACHED_WAIT: Duration = Duration::from_secs(300);
+
+/// What a statement read in the background may take: a sixteenth of the
+/// memory left to the script (other work may run at the same time).
+fn detached_budget(vm: &Vm) -> usize {
+    (vm.memory_left() / 16).max(64 << 10)
+}
+
+const OVER_BUDGET: &str = "the result is larger than the memory a background statement may use";
+
+/// `__db_start(handle, query, execute)`: runs a statement on a connection of
+/// its own, in the background (`queryAsync`, `executeAsync`). It runs outside
+/// the script's transaction.
+pub fn start_query(vm: &mut Vm, a: &[Value]) -> R {
+    let name = handle_name(vm, &a[0])?;
+    let (spec, url) = spec_of(vm, &name)?;
+    let (text, params) = parts(&a[1]);
+    let execute = matches!(a[2], Value::Bool(true));
+    let until = crate::netio::until(vm, DETACHED_WAIT);
+    let budget = detached_budget(vm);
+    let fail = format!("database \"{name}\": ");
+    match kind_of(&url) {
+        Kind::Postgres => {
+            let text = render_sql(text, Dialect::Postgres);
+            let params: Vec<PgParam> = params.iter().map(PgParam::new).collect();
+            crate::asyncio::start(vm, until, move || {
+                let r = pg_detached(&spec, &url, &text, &params, execute, until, budget);
+                crate::asyncio::Outcome::Db(r.map_err(|e| format!("{fail}{e}")))
+            })
+        }
+        Kind::MySql => {
+            let text = render_sql(text, Dialect::MySql);
+            let params = my_params(params);
+            crate::asyncio::start(vm, until, move || {
+                let r = my_detached(&spec, &url, &text, params, execute, until, budget);
+                crate::asyncio::Outcome::Db(r.map_err(|e| format!("{fail}{e}")))
+            })
+        }
+        Kind::Redis => Err(wrong_kind(vm, &name, true)),
+    }
+}
+
+/// `__redis_start(handle, command, args)`: one Redis command in the background.
+pub fn start_redis(vm: &mut Vm, a: &[Value]) -> R {
+    let name = handle_name(vm, &a[0])?;
+    let (spec, _) = spec_of(vm, &name)?;
+    let command = s(&a[1]).to_string();
+    let args: Vec<String> = list(&a[2]).iter().map(|v| s(v).to_string()).collect();
+    let allowed = command != "HGETALL"
+        && REDIS_COMMANDS.iter().any(|&(n, lo, hi)| n == command && (lo..=hi).contains(&args.len()));
+    if !allowed {
+        return Err(VmError::Fatal(format!("__redis_start: unexpected command {command}")));
+    }
+    let until = crate::netio::until(vm, MAX_WAIT);
+    let budget = detached_budget(vm);
+    let fail = format!("database \"{name}\": ");
+    crate::asyncio::start(vm, until, move || {
+        let r = (|| {
+            let mut c = redis_conn(&spec, until)?;
+            let mut argv: Vec<&[u8]> = vec![command.as_bytes()];
+            argv.extend(args.iter().map(|a| a.as_bytes()));
+            match c.get().command(&argv, until, budget) {
+                Ok(v) => Ok(v),
+                Err(RedisError::Server(m)) => Err(m),
+                Err(RedisError::TooLarge) => {
+                    c.broken = true;
+                    Err(OVER_BUDGET.to_string())
+                }
+                Err(RedisError::Broken(m)) => {
+                    c.broken = true;
+                    Err(m)
+                }
+            }
+        })();
+        crate::asyncio::Outcome::Redis(r.map_err(|e| format!("{fail}{e}")))
+    })
+}
+
+/// The `[databases]` name of the connection behind handle `h`.
+fn handle_name(vm: &Vm, h: &Value) -> Result<String, VmError> {
+    vm.resources
+        .get(int(h) as usize)
+        .and_then(|r| r.as_ref())
+        .and_then(|b| b.downcast_ref::<NetDb>())
+        .map(|d| d.name.clone())
+        .ok_or_else(|| vm.throw("DatabaseError", "the database connection is closed"))
+}
+
+fn spec_of(vm: &Vm, name: &str) -> Result<(DatabaseSpec, String), VmError> {
+    let spec = vm.host.databases.get(name).cloned();
+    let Some(spec) = spec else { return Err(vm.throw("DatabaseError", format!("no database named \"{name}\""))) };
+    let Some(url) = spec.url.clone() else {
+        let var = spec.url_env.as_deref().unwrap_or("?");
+        return Err(
+            vm.throw("DatabaseError", format!("database \"{name}\": the environment variable {var} is not set"))
+        );
+    };
+    tls_init();
+    Ok((spec, url))
+}
+
+fn detached_conn<C: Driver>(
+    registry: &Registry<C>,
+    spec: &DatabaseSpec,
+    url: &str,
+    until: Instant,
+    connect: impl FnOnce(Duration) -> Result<C, String>,
+) -> Result<Pooled<C>, String> {
+    let key = format!("{:?}|{}|{}", spec.tls, spec.pool_size, url);
+    let timeout = until.saturating_duration_since(Instant::now()).clamp(Duration::from_millis(100), CONNECT_TIMEOUT);
+    match pool_for(registry, &key, spec.pool_size).acquire(until, || connect(timeout)) {
+        Ok(c) => Ok(c),
+        Err(AcquireError::Busy) => Err(format!("all {} connections are in use (raise pool_size?)", spec.pool_size)),
+        Err(AcquireError::Connect(e)) => Err(format!("cannot connect: {e}")),
+    }
+}
+
+fn pg_detached(
+    spec: &DatabaseSpec,
+    url: &str,
+    text: &str,
+    params: &[PgParam],
+    execute: bool,
+    until: Instant,
+    budget: usize,
+) -> Result<Detached, String> {
+    use postgres::types::ToSql;
+    let mut c = detached_conn(&PG_POOLS, spec, url, until, |t| pg_connect(url, spec, t))?;
+    let error = |c: &mut Pooled<PgConn>, e: postgres::Error| -> String {
+        if c.get().client.is_closed() {
+            c.broken = true;
+        }
+        match c.get().meter.tripped() {
+            Some(Trip::Budget) => {
+                c.broken = true;
+                OVER_BUDGET.to_string()
+            }
+            Some(Trip::Deadline) => {
+                c.broken = true;
+                "the statement ran out of time".to_string()
+            }
+            None if e.code() == Some(&postgres::error::SqlState::QUERY_CANCELED) => {
+                "the statement ran out of time".to_string()
+            }
+            None => pg_message(&e),
+        }
+    };
+    c.get().meter.set(Some(until + Duration::from_millis(TIMEOUT_MARGIN_MS)), budget);
+    let ms = until.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as u64;
+    if needs_new_timeout(c.get().timeout_ms, ms) {
+        let r = c.get().client.batch_execute(&format!("SET statement_timeout = {}", ms + TIMEOUT_MARGIN_MS));
+        r.map_err(|e| error(&mut c, e))?;
+        c.get().timeout_ms = Some(ms);
+    }
+    if execute {
+        let refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        let n = c.get().client.execute(text, &refs).map_err(|e| error(&mut c, e))?;
+        return Ok(Detached::Count(n));
+    }
+    let stmt = c.get().client.prepare(text).map_err(|e| error(&mut c, e))?;
+    let names: Vec<String> = stmt.columns().iter().map(|col| col.name().to_string()).collect();
+    let mut rows = Vec::new();
+    let mut used = 0usize;
+    let mut over = false;
+    let result = c.get().client.query_each(&stmt, params.iter().map(|p| p as &dyn ToSql), |row| {
+        let mut r = Vec::with_capacity(names.len());
+        for i in 0..names.len() {
+            let PgOut(v) = row.try_get(i)?;
+            used += v.size();
+            r.push(v);
+        }
+        rows.push(r);
+        if used > budget {
+            over = true;
+            return Ok(false);
+        }
+        Ok(true)
+    });
+    result.map_err(|e| error(&mut c, e))?;
+    if over {
+        c.broken = true;
+        return Err(OVER_BUDGET.into());
+    }
+    Ok(Detached::Rows(names, rows))
+}
+
+fn my_detached(
+    spec: &DatabaseSpec,
+    url: &str,
+    text: &str,
+    params: mysql::Params,
+    execute: bool,
+    until: Instant,
+    budget: usize,
+) -> Result<Detached, String> {
+    use mysql::prelude::Queryable;
+    let left = until.saturating_duration_since(Instant::now());
+    let mut c = detached_conn(&MY_POOLS, spec, url, until, |t| my_connect(url, spec, t, Some(budget * 2), Some(left)))?;
+    let error = |c: &mut Pooled<MyConn>, e: mysql::Error| -> String {
+        match &e {
+            mysql::Error::MySqlError(m) if m.code == 3024 || m.code == 1317 => {
+                return "the statement ran out of time".to_string();
+            }
+            mysql::Error::MySqlError(_) => {}
+            _ => c.broken = true,
+        }
+        my_message(&e)
+    };
+    let ms = left.as_millis().min(u32::MAX as u128) as u64;
+    if needs_new_timeout(c.get().timeout_ms, ms) {
+        let r = c.get().conn.query_drop(format!("SET SESSION max_execution_time = {}", ms + TIMEOUT_MARGIN_MS));
+        r.map_err(|e| error(&mut c, e))?;
+        c.get().timeout_ms = Some(ms);
+    }
+    let id = c.get().conn.connection_id();
+    let kill = KillAt::arm(&c.get().opts, id, Some(until + Duration::from_millis(TIMEOUT_MARGIN_MS)));
+    if execute {
+        let r = c.get().conn.exec_drop(text, params);
+        drop(kill);
+        r.map_err(|e| error(&mut c, e))?;
+        return Ok(Detached::Count(c.get().conn.affected_rows()));
+    }
+    let mut names = Vec::new();
+    let mut rows = Vec::new();
+    let mut used = 0usize;
+    let mut problem: Option<String> = None;
+    let result: Result<(), mysql::Error> = (|| {
+        let mut result = c.get().conn.exec_iter(text, params)?;
+        let Some(set) = result.iter() else { return Ok(()) };
+        let columns: Vec<mysql::Column> = set.columns().as_ref().to_vec();
+        names = columns.iter().map(|col| col.name_str().into_owned()).collect();
+        for row in set {
+            let values = row?.unwrap();
+            let mut r = Vec::with_capacity(columns.len());
+            for (v, col) in values.into_iter().zip(&columns) {
+                match my_value(v, col) {
+                    Ok(v) => {
+                        used += v.size();
+                        r.push(v);
+                    }
+                    Err(e) => {
+                        problem = Some(e);
+                        return Ok(());
+                    }
+                }
+            }
+            rows.push(r);
+            if used > budget {
+                problem = Some(OVER_BUDGET.into());
+                return Ok(());
+            }
+        }
+        Ok(())
+    })();
+    drop(kill);
+    result.map_err(|e| error(&mut c, e))?;
+    if let Some(e) = problem {
+        // The rest of the result was not read: the connection is out of step.
+        c.broken = true;
+        return Err(e);
+    }
+    Ok(Detached::Rows(names, rows))
 }
 
 // ----- Redis -----------------------------------------------------------------
@@ -1329,7 +1651,7 @@ const REDIS_COMMANDS: &[(&str, usize, usize)] = &[
     ("LRANGE", 3, 3),
 ];
 
-fn redis_value(v: Reply) -> Value {
+pub(crate) fn redis_value(v: Reply) -> Value {
     match v {
         Reply::Nil => Value::Null,
         Reply::Int(i) => Value::Int(i),

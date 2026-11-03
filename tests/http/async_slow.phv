@@ -1,0 +1,5 @@
+import std.net.HttpClient;
+import std.async.await;
+
+$f = HttpClient::connect("api")->getAsync("/slow");
+echo await($f)->status;

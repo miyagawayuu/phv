@@ -1,0 +1,24 @@
+import std.net.HttpClient;
+import std.async.{Future, await, await_all};
+
+$api = HttpClient::connect("api");
+$futures = [$api->getAsync("/wait"), $api->getAsync("/wait"), $api->getAsync("/wait")];
+foreach (await_all($futures) as $i => $res) {
+    echo $i, ": ", $res->status, " ", $res->body, "\n";
+}
+
+// Awaiting again gives the same response.
+$missing = $api->postJsonAsync("/missing", ["a" => 1]);
+echo "missing: ", await($missing)->status, " ", await($missing)->body, "\n";
+
+// Mistakes in the request (here, a header whose variable is not set) throw
+// when it is started.
+try {
+    HttpClient::connect("broken")->getAsync("/wait");
+} catch (NetworkError $e) {
+    echo "error: ", $e->getMessage(), "\n";
+}
+
+// A Future can also wrap any deferred work.
+$later = new Future(fn(): int => 6 * 7);
+echo "deferred: ", await($later), "\n";

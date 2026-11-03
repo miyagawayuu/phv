@@ -1,0 +1,12 @@
+import std.net.HttpClient;
+
+$api = HttpClient::connect("api");
+$started = 0;
+try {
+    for ($i = 0; $i < 20; $i++) {
+        $api->getAsync("/slow");
+        $started++;
+    }
+} catch (RuntimeException $e) {
+    echo "started ", $started, ": ", $e->getMessage(), "\n";
+}

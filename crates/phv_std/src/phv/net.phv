@@ -19,6 +19,8 @@
 // Network failures and a server closing the connection raise NetworkError.
 
 /** The answer to an HTTP request. Header names are lowercase. */
+import std.async.Future;
+
 export class HttpResponse {
     public function __construct(
         public readonly int $status,
@@ -93,7 +95,35 @@ export class HttpClient {
         map<string, string> $headers = [],
         map<string, string> $query = [],
     ): HttpResponse {
-        $r = __http_request($this->name, $method, $path, $query, $headers, $body);
+        return HttpClient::response(__http_request($this->name, $method, $path, $query, $headers, $body));
+    }
+
+    /** `get()` sent in the background: wait for the response with `await()` (std.async). */
+    public function getAsync(string $path, map<string, string> $query = [], map<string, string> $headers = []): Future<HttpResponse> {
+        return $this->requestAsync("GET", $path, "", $headers, $query);
+    }
+
+    public function postAsync(string $path, string $body = "", map<string, string> $headers = []): Future<HttpResponse> {
+        return $this->requestAsync("POST", $path, $body, $headers);
+    }
+
+    public function postJsonAsync(string $path, any $data, map<string, string> $headers = []): Future<HttpResponse> {
+        return $this->requestAsync("POST", $path, json_encode($data), ["Content-Type" => "application/json"]->merge($headers));
+    }
+
+    /** `request()` sent in the background. */
+    public function requestAsync(
+        string $method,
+        string $path,
+        string $body = "",
+        map<string, string> $headers = [],
+        map<string, string> $query = [],
+    ): Future<HttpResponse> {
+        $id = __http_start($this->name, $method, $path, $query, $headers, $body);
+        return new Future(fn(): HttpResponse => HttpClient::response(__async_map($id)));
+    }
+
+    private static function response(map<string, any> $r): HttpResponse {
         $status = $r["status"] ?? 0;
         $hs = $r["headers"] ?? null;
         $text = $r["body"] ?? "";

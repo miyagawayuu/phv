@@ -1,0 +1,12 @@
+// Run by crates/phv_driver/tests/databases.rs: Redis commands in the background.
+import std.db.Redis;
+import std.async.{await, await_all};
+
+$r = Redis::connect("main");
+await_all([$r->setAsync("phv:async:a", "1", 60), $r->setAsync("phv:async:b", "2")]);
+$a = $r->getAsync("phv:async:a");
+$b = $r->getAsync("phv:async:b");
+$none = $r->getAsync("phv:async:none");
+echo "a=", await($a) ?? "null", " b=", await($b) ?? "null", " none=", await($none) ?? "null", "\n";
+$r->delete("phv:async:a");
+$r->delete("phv:async:b");

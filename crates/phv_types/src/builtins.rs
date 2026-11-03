@@ -222,6 +222,13 @@ pub static BUILTINS: &[BuiltinSig] = &[
         "__http_request",
         "fn(string, string, string, map<string, string>, map<string, string>, string): map<string, any>",
     ),
+    internal("__http_start", "fn(string, string, string, map<string, string>, map<string, string>, string): int"),
+    internal("__db_start", "fn(int, Sql, bool): int"),
+    internal("__redis_start", "fn(int, string, list<string>): int"),
+    internal("__async_any", "fn(int): any"),
+    internal("__async_map", "fn(int): map<string, any>"),
+    internal("__async_rows", "fn(int): list<map<string, any>>"),
+    internal("__async_int", "fn(int): int"),
 ];
 
 /// Hints for PHP functions that do not exist in PHV.
