@@ -647,14 +647,14 @@ impl<'a> Checker<'a> {
         match &e.kind {
             ExprKind::Int(i) => hconst(HConst::Int(*i), Type::Int, span),
             ExprKind::Float(f) => hconst(HConst::Float(*f), Type::Float, span),
-            ExprKind::Str(s) => hconst(HConst::Str(s.clone()), Type::Str, span),
+            ExprKind::Str(s) => hconst(HConst::Str(s.as_str().into()), Type::Str, span),
             ExprKind::Bool(b) => hconst(HConst::Bool(*b), Type::Bool, span),
             ExprKind::Null => hconst(HConst::Null, Type::Null, span),
             ExprKind::Interp(parts) => {
                 let mut items = Vec::new();
                 for p in parts {
                     match p {
-                        InterpPart::Lit(s) => items.push(hconst(HConst::Str(s.clone()), Type::Str, span)),
+                        InterpPart::Lit(s) => items.push(hconst(HConst::Str(s.as_str().into()), Type::Str, span)),
                         InterpPart::Expr(x) => {
                             let h = self.expr(x, None);
                             self.check_stringable(&h, "interpolate");
@@ -704,7 +704,7 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
-                let query = hconst(HConst::Str(text), Type::Str, span);
+                let query = hconst(HConst::Str(text.into()), Type::Str, span);
                 let params = HExpr { kind: HExprKind::List(params), ty: Type::list(Type::Any), span };
                 mk(HExprKind::List(vec![query, params]), Type::Sql)
             }
@@ -1310,6 +1310,15 @@ impl<'a> Checker<'a> {
         let mut bounds = vec![None; infer.len()];
         if let Some(cb) = owner.filter(|_| !infer.is_empty()).and_then(|c| self.class_bounds.get(&c)) {
             bounds = cb.clone();
+        }
+        // `new Box(...)` whose class arguments come from the expected type.
+        if let Some(c) = owner.filter(|_| infer.is_empty() && !fixed.is_empty()) {
+            if self.funcs[fid as usize].kind == FuncKind::Ctor {
+                if let Some(cb) = self.class_bounds.get(&c).cloned() {
+                    let (names, tys): (Vec<String>, Vec<Type>) = fixed.iter().cloned().unzip();
+                    self.check_bounds(&format!("`{}`", self.class_names[c as usize]), &names, &cb, &tys, span);
+                }
+            }
         }
         let own = self.func_bounds.get(&fid).cloned().unwrap_or_else(|| vec![None; tps.len() - infer.len()]);
         bounds.extend(own);
@@ -2530,6 +2539,7 @@ impl<'a> Checker<'a> {
     /// A `match` on an enum or a `bool` without `default` must have an arm for
     /// every value (and for `null` when the subject may be null).
     fn check_exhaustive(&mut self, sty: &Type, arms: &[(Vec<HExpr>, HExpr)], span: Span) {
+        const MAX_NAMED: usize = 5;
         let conds = || arms.iter().flat_map(|(c, _)| c.iter()).map(|h| &h.kind);
         let mut missing: Vec<String> = Vec::new();
         match sty.without_null() {
@@ -2541,10 +2551,19 @@ impl<'a> Checker<'a> {
                     })
                     .collect();
                 let cname = &self.class_names[cid as usize];
-                for (i, (case, _)) in self.classes[cid as usize].cases.iter().enumerate() {
+                let cases = &self.classes[cid as usize].cases;
+                let count = cases.len() - covered.iter().filter(|j| (**j as usize) < cases.len()).count();
+                // Only the first few are named, so the search stops soon.
+                for (i, (case, _)) in cases.iter().enumerate() {
+                    if missing.len() == MAX_NAMED {
+                        break;
+                    }
                     if !covered.contains(&(i as u32)) {
                         missing.push(format!("`{cname}::{case}`"));
                     }
+                }
+                if count > missing.len() {
+                    missing.push(format!("{} more cases", count - missing.len()));
                 }
             }
             Type::Bool => {

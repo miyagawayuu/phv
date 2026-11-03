@@ -270,6 +270,9 @@ const MAX_CONST_STR: usize = 1 << 20;
 /// Bytes of all strings built by constant expressions in a program.
 const MAX_CONST_TOTAL: usize = 16 << 20;
 
+/// Members of a union type written in the source (each use of one checks them all).
+const MAX_UNION: usize = 256;
+
 /// Type aliases resolved inside each other (`type A = B; type B = C; ...`).
 const MAX_ALIAS_DEPTH: usize = 64;
 
@@ -808,7 +811,20 @@ impl<'a> Checker<'a> {
 
     /// `<T: Shape>`: the bound of each type parameter (with the parameters in scope).
     fn resolve_bounds(&mut self, bounds: &[Option<TypeExpr>], self_class: Option<ClassId>) -> Vec<Option<Type>> {
-        bounds.iter().map(|b| b.as_ref().map(|t| self.resolve_type(t, self_class))).collect()
+        let mut out = Vec::new();
+        for b in bounds {
+            let t = b.as_ref().map(|t| (self.resolve_type(t, self_class), t.span));
+            out.push(match t {
+                // `<T: U, U: T>` would make every check go round in a circle.
+                Some((Type::Param(n), span)) => {
+                    self.error(format!("a bound cannot be another type parameter (`{n}`)"), span)
+                        .add_note("bound it by a class or an interface");
+                    None
+                }
+                t => t.map(|(t, _)| t),
+            });
+        }
+        out
     }
 
     fn resolve_class_bounds(&mut self) {
@@ -940,9 +956,10 @@ impl<'a> Checker<'a> {
         let module = std::mem::replace(&mut self.module, self.aliases[a].module);
         let outer = std::mem::replace(&mut self.type_params, params);
         // An alias's parameters have no bounds: classes it applies to them are
-        // checked where the alias is used, once the arguments are known.
+        // checked where the alias is used, once the arguments are known. An
+        // alias without parameters is checked here, once.
         let bounds = std::mem::take(&mut self.bounds);
-        let in_alias = std::mem::replace(&mut self.in_alias, true);
+        let in_alias = std::mem::replace(&mut self.in_alias, !decl.type_params.is_empty());
         let mut t = self.resolve_type(&decl.ty, None);
         self.in_alias = in_alias;
         self.bounds = bounds;
@@ -1271,6 +1288,11 @@ impl<'a> Checker<'a> {
                 Type::nullable(i)
             }
             TypeExprKind::Union(ms) => {
+                if ms.len() > MAX_UNION {
+                    self.error(format!("a union type can have at most {MAX_UNION} members"), t.span)
+                        .add_note("use an interface that the classes implement");
+                    return Type::Error;
+                }
                 let members: Vec<Type> = ms.iter().map(|m| self.resolve_type(m, self_class)).collect();
                 if members.contains(&Type::Void) {
                     self.error("`void` cannot be part of a union", t.span);
@@ -1328,7 +1350,7 @@ impl<'a> Checker<'a> {
         let v = match &e.kind {
             ExprKind::Int(i) => Int(*i),
             ExprKind::Float(f) => Float(*f),
-            ExprKind::Str(s) => Str(s.clone()),
+            ExprKind::Str(s) => Str(s.as_str().into()),
             ExprKind::Bool(b) => Bool(*b),
             ExprKind::Null => HConst::Null,
             ExprKind::Paren(inner) => return self.fold_const(inner, self_class),
@@ -2035,7 +2057,7 @@ impl<'a> Checker<'a> {
                     vis: Visibility::Public,
                     readonly: true,
                     owner: cid,
-                    default: Some(HConst::Str(String::new())),
+                    default: Some(HConst::Str("".into())),
                     required: false,
                     span: decl.name_span,
                 };
@@ -2075,7 +2097,7 @@ impl<'a> Checker<'a> {
                     let dup_name = self.classes[ci].case_index.insert(case.name.clone(), idx).is_some();
                     let dup_value = match &value {
                         HConst::Int(i) => !values.insert(i.to_string()),
-                        HConst::Str(s) => !values.insert(s.clone()),
+                        HConst::Str(s) => !values.insert(s.to_string()),
                         _ => false,
                     };
                     if dup_name {
@@ -2814,15 +2836,19 @@ fn fold_binary(op: BinOp, l: &HConst, r: &HConst) -> Result<HConst, Option<&'sta
         // Floats are left out: their text is the runtime's to decide.
         (BinOp::Concat, Str(_) | Int(_), Str(_) | Int(_)) if matches!((l, r), (Str(_), _) | (_, Str(_))) => {
             let text = |c: &HConst| match c {
-                Str(s) => s.clone(),
+                Str(s) => s.to_string(),
                 Int(i) => i.to_string(),
                 _ => unreachable!(),
             };
-            let (a, b) = (text(l), text(r));
-            if a.len() + b.len() > MAX_CONST_STR {
+            let len = |c: &HConst| match c {
+                Str(s) => s.len(),
+                _ => 20,
+            };
+            // Measured before the text is built.
+            if len(l) + len(r) > MAX_CONST_STR {
                 return Err(Some("this constant string is too long (at most 1 MiB)"));
             }
-            Str(a + &b)
+            Str((text(l) + &text(r)).into())
         }
         (BinOp::BitAnd, Int(a), Int(b)) => Int(a & b),
         (BinOp::BitOr, Int(a), Int(b)) => Int(a | b),

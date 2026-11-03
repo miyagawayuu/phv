@@ -19,4 +19,11 @@ error: `match` does not handle `false`
    |            ^^^^^^^^^^^^
    = note: add an arm for each, or a `default` arm
 
-3 errors found
+error: `match` does not handle `Many::B`, `Many::C`, `Many::D`, `Many::E`, `Many::F` and 2 more cases
+  --> err_match_exhaustive.phv:38:12
+   |
+38 |     return match ($m) {
+   |            ^^^^^^^^^^^^
+   = note: add an arm for each, or a `default` arm
+
+4 errors found

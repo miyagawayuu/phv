@@ -384,6 +384,15 @@ fn constants_aliases_and_spreads_stay_small() {
             "the constant strings of this program are too long in total",
         ),
         ("unicode.phv", format!("<?phv\necho \"{}\";\n", "\\u{".repeat(200_000)), "unterminated unicode escape"),
+        (
+            "union.phv",
+            format!(
+                "<?phv\n{}function f({} $x): void {{}}\n",
+                (0..300).map(|i| format!("class K{i} {{}}\n")).collect::<String>(),
+                (0..300).map(|i| format!("K{i}")).collect::<Vec<_>>().join("|")
+            ),
+            "a union type can have at most 256 members",
+        ),
     ];
     for (name, src, message) in cases {
         let file = dir.join(name);
@@ -394,6 +403,16 @@ fn constants_aliases_and_spreads_stay_small() {
         };
         assert!(rendered.contains(message), "{name}: {rendered}");
     }
+    // A constant string is shared by its uses: 3,000 uses of 1 MiB used to take 3 GB.
+    let file = dir.join("shared.phv");
+    let uses: String = (0..3000).map(|i| format!("const B{i} = A;\n")).collect();
+    std::fs::write(&file, format!("<?phv\nconst A = \"{}\";\n{uses}echo strlen(B2999);\n", "x".repeat(1 << 20)))
+        .unwrap();
+    let c = phv_driver::compile(&dir, &file).unwrap_or_else(|e| panic!("{}", e.render(false)));
+    assert_eq!(
+        run(&c, RunOptions { html: false, limits: Default::default(), http: None, host: None }).output,
+        "1048576"
+    );
     // 100,000 spreads in one literal are joined in pairs, not nested 100,000 deep.
     let file = dir.join("spreads.phv");
     std::fs::write(

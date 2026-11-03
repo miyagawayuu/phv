@@ -10,4 +10,10 @@ error: type parameters of a type alias cannot have bounds
 5 | type Alias<T: Named> = list<T>;
   |               ^^^^^
 
-2 errors found
+error: at most 4 type parameters are supported
+ --> err_destructure_syntax.phv:6:27
+  |
+6 | function many<A, B, C, D, E, F, G, H, I: int>(int $x): void {}
+  |                           ^
+
+3 errors found

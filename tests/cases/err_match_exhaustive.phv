@@ -22,3 +22,20 @@ function flag(bool $b): int {
         true => 1,
     };
 }
+
+enum Many {
+    case A;
+    case B;
+    case C;
+    case D;
+    case E;
+    case F;
+    case G;
+    case H;
+}
+
+function only_a(Many $m): int {
+    return match ($m) {
+        Many::A => 1,
+    };
+}

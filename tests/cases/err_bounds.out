@@ -29,6 +29,12 @@ error: `int` does not satisfy the bound `T: Named` of `Box`
 26 | Box<int> $c = new Box(new Dog());
    | ^^^^^^^^
 
+error: `int` does not satisfy the bound `T: Named` of `Box`
+  --> err_bounds.phv:26:15
+   |
+26 | Box<int> $c = new Box(new Dog());
+   |               ^^^^^^^^^^^^^^^^^^
+
 error: expected `int`, found `Dog`
   --> err_bounds.phv:26:23
    |
@@ -47,6 +53,12 @@ error: `T` does not satisfy the bound `T: Named` of `Box`
 37 |     public function boxed(): Box<T> {
    |                              ^^^^^^
 
+error: `T` does not satisfy the bound `T: Named` of `Box`
+  --> err_bounds.phv:38:16
+   |
+38 |         return new Box($this->item);
+   |                ^^^^^^^^^^^^^^^^^^^^
+
 error: `Child::m` overrides `Base::m` with an incompatible signature
   --> err_bounds.phv:52:21
    |
@@ -60,10 +72,30 @@ error: `int` does not satisfy the bound `T: float` of `half`
 61 | echo half(5);
    |      ^^^^^^^
 
-error: at most 4 type parameters are supported
-  --> err_bounds.phv:64:10
+error: `int` does not satisfy the bound `T: Named` of `Box`
+  --> err_bounds.phv:64:15
    |
-64 | function many<A, B, C, D, E, F, G, H, I: int>(int $x): void {}
-   |          ^^^^
+64 | type BadBox = Box<int>;
+   |               ^^^^^^^^
 
-11 errors found
+error: `int` does not satisfy the bound `T: Named` of `Box`
+  --> err_bounds.phv:65:14
+   |
+65 | BadBox $bb = new Box(5);
+   |              ^^^^^^^^^^
+
+error: a bound cannot be another type parameter (`U`)
+  --> err_bounds.phv:68:20
+   |
+68 | function cyclic<T: U, U: T>(T $x): void {}
+   |                    ^
+   = note: bound it by a class or an interface
+
+error: a bound cannot be another type parameter (`T`)
+  --> err_bounds.phv:68:26
+   |
+68 | function cyclic<T: U, U: T>(T $x): void {}
+   |                          ^
+   = note: bound it by a class or an interface
+
+16 errors found

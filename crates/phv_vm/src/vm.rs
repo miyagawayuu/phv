@@ -558,12 +558,19 @@ impl Vm {
     pub fn describe_exception(&self, e: &Exc) -> String {
         let mut out = String::new();
         let mut cur = e.value.clone();
+        let mut seen: Vec<*const RefCell<Object>> = Vec::new();
         // A bounded walk: a class could make an exception its own cause.
         for depth in 0..16 {
             let Value::Object(o) = &cur else {
                 out.push_str(cur.type_name());
                 break;
             };
+            if seen.contains(&Rc::as_ptr(o)) {
+                out.push_str(" (caused by ...");
+                out.push_str(&")".repeat(depth));
+                return out;
+            }
+            seen.push(Rc::as_ptr(o));
             let next = {
                 let o = o.borrow();
                 let cls = &self.prog.classes[o.class as usize];

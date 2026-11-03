@@ -11,7 +11,8 @@ pub enum HConst {
     Bool(bool),
     Int(i64),
     Float(f64),
-    Str(String),
+    /// Shared: a constant used many times is not copied each time.
+    Str(std::rc::Rc<str>),
     EmptyList,
     EmptyMap,
 }

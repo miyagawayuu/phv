@@ -1,0 +1,50 @@
+<?phv
+// A variable a loop or `try` assigns through a pattern loses its narrowing.
+class Foo {
+    public string $s = "foo";
+}
+class Vault {
+    public function __construct(private string $secret) {}
+}
+function pick(int $i): Foo|Vault {
+    return $i == 0 ? new Foo() : new Vault("secret");
+}
+function maybe(): ?Foo {
+    return new Foo();
+}
+function nulls(): list<?Foo> {
+    return [null];
+}
+
+$x = pick(0);
+if ($x is Foo) {
+    foreach ([0, 1] as $i) {
+        echo $x->s, $i;
+        [$x] = [pick(1)];
+    }
+}
+
+$y = maybe();
+if ($y != null) {
+    while (true) {
+        echo $y->s;
+        ["k" => $y] = ["k" => maybe()];
+    }
+}
+
+$z = maybe();
+if ($z != null) {
+    foreach ([nulls()] as [$z]) {
+        echo $z->s;
+    }
+}
+
+$w = maybe();
+if ($w != null) {
+    try {
+        [[$w], $_n] = [nulls(), nulls()];
+        throw new RuntimeException("x");
+    } catch (RuntimeException) {
+        echo $w->s;
+    }
+}

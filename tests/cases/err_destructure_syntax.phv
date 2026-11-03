@@ -3,3 +3,4 @@ foreach ([[1, 2]] as [$m] => $n) {
     echo $m, $n;
 }
 type Alias<T: Named> = list<T>;
+function many<A, B, C, D, E, F, G, H, I: int>(int $x): void {}

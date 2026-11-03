@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates six audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, and §13 what was added for v0.5.2.
+This report consolidates seven audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, and §14 what was added for v0.6.0.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14: 2026-11-04)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -532,6 +532,86 @@ and the 80,000 parameters 0.2 s. Regression tests: `oversized_functions_are_erro
 locals, a literal of 40,000 pairs) and `tests/cases/err_mixed.phv` (a chain through `lib/chain.phv`), with
 `err_final`, `err_final_syntax` and `lints` for the features themselves. All tests pass on Windows, and on Linux and
 macOS in CI, with clippy (`-D warnings`) and rustfmt, and the fuzzer ran 1,500 mutations per program.
+
+Dependencies: `cargo audit` (CI) and `npm audit --omit=dev` in the extension and the website find nothing; Dependabot
+has no open alerts.
+
+## 14. Seventh Assessment (v0.6.0: destructuring, variadics, functions as values, type aliases, bounds, constant expressions)
+
+Date: 2026-11-04. Scope: everything changed after v0.5.2 (`git diff v0.5.2..main`): heredoc and nowdoc strings and
+`\x` escapes; constant expressions; `import ... as`; type aliases; variadic parameters and `...` spreading;
+functions as values (`f(...)`, which builds a closure around a call); destructuring and `foreach` patterns; `match`
+exhaustiveness and narrowing in `match (true)`; bounds on type parameters; and the exception's code, cause and trace
+(`record_trace` and the cause chain in the VM). The only other change is the demo's Dockerfile.
+
+### Method
+
+The features were reviewed three times: by the author while writing them (timing generated sources against a
+release build), by an independent reviewer looking for correctness bugs, and by a second independent reviewer doing
+this audit with the threat model of §12–§13: hostile source in an untrusted workspace for `phv check` and `phv lsp`
+(within the 8 MB per file), type soundness (a program that type-checks must not break a type at run time, which is how
+private and readonly state is protected), and no VM panic for any checked program. Every finding was confirmed with a
+working PoC against a release build, timed and measured (peak memory), and rerun against the fixed build. Several
+findings were older slow paths that the new features made easy to reach; they are marked.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| High | 3 | Fixed |
+| Medium | 4 | Fixed |
+| Low | 1 | Fixed |
+| Info | 2 | Fixed / no change needed |
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R7-1 | A variable assigned through a destructuring pattern (`[$x] = ...`, `foreach (... as [$x])`) inside a loop or a `try` was not seen as assigned there, so a narrowing from before the loop survived it. With `$x` narrowed to `Foo` and `[$x] = [pick()]` in the loop, the next pass read and wrote a private property of another class through `$x->s` (the PoC printed a `Vault`'s secret), or stopped the VM with an internal error | Every variable of a pattern (nested, map values, `...$rest`) counts as assigned, like a plain assignment |
+| R7-2 | Bounds on type parameters could be bypassed: through an unbounded `T` (`f<T>` calling `g<U: Shape>($x)`, also in class headers and constructors), by an override adding a bound, by an `int` for `T: float` (used as a float without conversion), by a type alias without parameters (`type Bad = Box<int>;`), and by `new Box(5)` taking its class arguments from the expected type. Each ended in a VM internal error with an `int` where an object was expected | Bounds are checked in signatures and class headers too, exactly (no conversion), on every alias use and on constructor arguments from the expected type; an override may drop a bound but not add or change one |
+| R7-3 | Bounds that name each other (`<T: U, U: T>`) made the bound check loop forever: `phv check` and `phv lsp` hung | A bound cannot be another type parameter |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R7-4 | Constant expressions and type aliases could take exponential memory or time: constants that double a string (`const B = A . A;`), aliases that double a type (`type T2 = fn(T1): T1;`), generic aliases applied to large aliases, and many uses of a large alias (a 295 KB file took 57 s); and a chain of 100,000 aliases overflowed the stack. Copies of constant strings were not limited either: 3,000 uses of a 1 MiB constant took 3 GB (uses in function bodies did so before this release too) | A constant string is at most 1 MiB, 16 MiB for a whole program, and is shared by its uses (`Rc<str>`) instead of copied; an alias stands for at most 10,000 type nodes, all uses together for 2,000,000, measured before it is copied; aliases nest at most 64 deep |
+| R7-5 | A `match` that misses cases named every missing case: an enum of 20,000 cases and 20,000 one-arm matches took 51 s and 9.5 GB | At most 5 missing values are named ("and N more cases"), and the search stops after them |
+| R7-6 | Type parameters are looked up by name for each use: an alias with 700,000 parameters took 38 s, and a function with very many took 10 s before the "at most 4" error (the latter since 0.5.0) | More than 4 type parameters is refused while parsing |
+| R7-7 | Each use of a union type looks at all of its members: a bound of 3,000 members used 100,000 times took 23 s, and a parameter of 3,000 members called 100,000 times 37 s (the latter since earlier releases) | A union written in the source has at most 256 members |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R7-8 | More than 8 type parameters made the bound check index past a fixed array: `phv check` panicked | Fixed with R7-6, and the lookup no longer indexes past the end |
+
+The author's own review fixed, before the independent reviews: many spreads in one literal nested the compiler 100,000
+deep (now joined in pairs), the exhaustiveness check compared every arm with every case, and two older linear searches
+made a `match` over 60,000 enum cases take 4.6 s (enum cases and class constants are now looked up by name: 0.2 s);
+an unclosed `\u{` scanned the rest of the file for each one (older; now at most 8 digits are read).
+
+### Info
+
+| Item | Result |
+|---|---|
+| An exception whose cause is itself repeated its message 16 times in the uncaught-error text | Fixed: a cycle is shown once (`(caused by ...)`) |
+| What the new exception data exposes | No change: in production (`--prod`) an uncaught error still shows only the generic error page; `getTraceAsString()` gives function names and file paths as the program names them, and reaches visitors only if the program echoes it |
+
+### Residual Risks
+
+None.
+
+### Verification
+
+All PoCs were rerun against the fixed build. The type-confusion and bound PoCs are compile errors; the hanging bound
+check is a compile error; the 0.9 MB exhaustiveness PoC takes 0.16 s and 82 MB (was 51 s and 9.5 GB); 3,000 uses of a
+1 MiB constant peak at 9 MB (was 3.0 GB); the alias, union and type-parameter PoCs end with their errors in under
+0.7 s; 200,000 spreads run in 0.9 s. Regression tests: `tests/cases/err_flow_destructure.phv` (loops, `foreach` and
+`try`), `err_bounds.phv`, `err_match_exhaustive.phv`, `err_destructure_syntax.phv`, and
+`constants_aliases_and_spreads_stay_small` in `crates/phv_driver/tests/golden.rs` (constant strings, alias size, depth
+and total, unions, `\u{`, shared constants, spreads), with golden tests for each feature. All tests pass on Windows, and
+on Linux and macOS in CI, with clippy (`-D warnings`) and rustfmt, and the fuzzer mutates the new test programs too.
 
 Dependencies: `cargo audit` (CI) and `npm audit --omit=dev` in the extension and the website find nothing; Dependabot
 has no open alerts.

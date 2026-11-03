@@ -1270,6 +1270,13 @@ impl Parser {
             }
             self.expect_gt()?;
         }
+        // Each use of a type looks its parameters up by name: a long list would
+        // make checking quadratic, so it is refused before anything is resolved.
+        if names.len() > 4 {
+            self.diags.push(Diagnostic::error("at most 4 type parameters are supported", names[4].1));
+            names.truncate(4);
+            bounds.truncate(4);
+        }
         Ok((names, bounds))
     }
 

@@ -78,7 +78,7 @@ fn to_const(c: &HConst) -> Const {
         HConst::Bool(b) => Const::Bool(*b),
         HConst::Int(i) => Const::Int(*i),
         HConst::Float(f) => Const::Float(*f),
-        HConst::Str(s) => Const::Str(s.clone()),
+        HConst::Str(s) => Const::Str(s.to_string()),
         HConst::EmptyList => Const::EmptyList,
         HConst::EmptyMap => Const::EmptyMap,
     }
@@ -298,6 +298,11 @@ impl<'a> FnC<'a> {
             HConst::Null => self.emit(Instr::Null(dst)),
             HConst::Bool(b) => self.emit(Instr::Bool(dst, *b)),
             HConst::Int(i) => self.emit(Instr::Int(dst, *i)),
+            // Looked up in the pool without copying the text first.
+            HConst::Str(s) => {
+                let idx = self.pc.str_const(s);
+                self.emit(Instr::Const(dst, idx))
+            }
             other => {
                 let idx = self.pc.constant(to_const(other));
                 self.emit(Instr::Const(dst, idx))

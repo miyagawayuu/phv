@@ -512,7 +512,9 @@ class Registry<T: Shape> { ... }
 
 With `T: Bound`, a value of type `T` has the methods and properties of `Bound` and can be passed where a `Bound` is
 expected, and every type argument must be a `Bound`: `largest([new Circle()])` gives a `?Circle`, while
-`largest([1, 2])` is a compile error.
+`largest([1, 2])` is a compile error. A type argument meets a bound without conversion (an `int` is not a `T: float`),
+a bound cannot be another type parameter, and an overriding method may drop a bound but not add or change one.
+A type parameter of a type alias has no bound, so an alias cannot pass its own parameter to a bounded class.
 
 ### Generic Classes
 
@@ -1467,6 +1469,8 @@ It then runs the type checker and shows the places that need manual work, such a
 | Properties of one class (inherited ones included) | 65,535 | Compile error |
 | A string built by a constant expression | 1 MiB (16 MiB for all of a program's) | Compile error |
 | Type aliases resolved inside each other | 64 | Compile error |
+| Type parameters of a function, class or type alias | 4 | Compile error |
+| Members of a union type written in the source | 256 | Compile error |
 | Size of the type an alias stands for | 10,000 type nodes (2,000,000 for all uses together) | Compile error |
 
 `unsafe` is used only in the allocator that counts memory usage (`phv_vm/src/alloc.rs`), in the JIT

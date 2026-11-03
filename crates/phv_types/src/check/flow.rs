@@ -212,11 +212,7 @@ impl FnCtx {
 pub(crate) fn assigned_vars(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
         match &s.kind {
-            StmtKind::Assign { target, .. } | StmtKind::IncDec { target, .. } => {
-                if let Some(n) = base_var(target) {
-                    out.insert(n);
-                }
-            }
+            StmtKind::Assign { target, .. } | StmtKind::IncDec { target, .. } => target_vars(target, out),
             StmtKind::TypedDecl { name, .. } => {
                 out.insert(name.clone());
             }
@@ -257,6 +253,25 @@ pub(crate) fn assigned_vars(stmts: &[Stmt], out: &mut HashSet<String>) {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// The variables an assignment to `e` changes: its base variable, or every
+/// target of a destructuring pattern (`[$a, ["k" => $b], ...$rest]`).
+fn target_vars(e: &phv_syntax::ast::Expr, out: &mut HashSet<String>) {
+    use phv_syntax::ast::ExprKind;
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        match &e.kind {
+            ExprKind::List(items) => stack.extend(items.iter()),
+            ExprKind::Map(pairs) => stack.extend(pairs.iter().map(|(_, v)| v)),
+            ExprKind::Spread(inner) => stack.push(inner),
+            _ => {
+                if let Some(n) = base_var(e) {
+                    out.insert(n);
+                }
+            }
         }
     }
 }

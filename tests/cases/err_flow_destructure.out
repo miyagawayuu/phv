@@ -1,0 +1,28 @@
+error: `Foo|Vault` has no properties
+  --> err_flow_destructure.phv:22:18
+   |
+22 |         echo $x->s, $i;
+   |                  ^
+
+error: cannot read `->s` on `?Foo` because it might be null
+  --> err_flow_destructure.phv:30:14
+   |
+30 |         echo $y->s;
+   |              ^^
+   = note: check `!= null` first, or use `?->`
+
+error: cannot read `->s` on `?Foo` because it might be null
+  --> err_flow_destructure.phv:38:14
+   |
+38 |         echo $z->s;
+   |              ^^
+   = note: check `!= null` first, or use `?->`
+
+error: cannot read `->s` on `?Foo` because it might be null
+  --> err_flow_destructure.phv:48:14
+   |
+48 |         echo $w->s;
+   |              ^^
+   = note: check `!= null` first, or use `?->`
+
+4 errors found

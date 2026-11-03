@@ -60,6 +60,9 @@ function half<T: float>(T $x): float {
 }
 echo half(5);
 
-// More type parameters than supported is an error, not a crash.
-function many<A, B, C, D, E, F, G, H, I: int>(int $x): void {}
-many(1);
+// An alias without parameters, and arguments taken from the expected type, meet bounds too.
+type BadBox = Box<int>;
+BadBox $bb = new Box(5);
+
+// A bound is a class or an interface, not another parameter.
+function cyclic<T: U, U: T>(T $x): void {}
