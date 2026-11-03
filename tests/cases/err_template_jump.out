@@ -1,0 +1,29 @@
+error: this jump leaves the HTML inside a tag, attribute, comment or `<script>`
+ --> err_template_jump.phv:7:67
+  |
+7 | function link(bool $short): void { ?><a href="<?phv if ($short) { return; } ?>/home">home</a><?phv }
+  |                                                                   ^^^^^^
+  = note: close what was opened before `break`, `continue`, `return` or `throw`: the output that follows would otherwise land in the wrong place
+
+error: this jump leaves the HTML inside a tag, attribute, comment or `<script>`
+  --> err_template_jump.phv:18:27
+   |
+18 |         ?><b title="<?phv break; ?>">x</b><?phv
+   |                           ^^^^^
+   = note: close what was opened before `break`, `continue`, `return` or `throw`: the output that follows would otherwise land in the wrong place
+
+error: this jump leaves the HTML inside a tag, attribute, comment or `<script>`
+ --> views/jump_in_tag.phv.html:2:62
+  |
+2 | <?phv foreach ($ids as $id): ?><a href="<?phv if ($id < 0) { break; } ?>/item/<?= $id ?>">item</a><?phv endforeach; ?>
+  |                                                              ^^^^^
+  = note: close what was opened before `break`, `continue`, `return` or `throw`: the output that follows would otherwise land in the wrong place
+
+error: this jump leaves the HTML inside a tag, attribute, comment or `<script>`
+ --> views/jump_in_tag.phv.html:4:30
+  |
+4 | <?phv try { ?><a href="<?phv throw new ValueError("x"); ?>/home">home</a><?phv } catch (ValueError $e) { ?><?= $name ?><?phv } ?>
+  |                              ^^^^^
+  = note: close what was opened before `break`, `continue`, `return` or `throw`: the output that follows would otherwise land in the wrong place
+
+4 errors found

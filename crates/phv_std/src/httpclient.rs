@@ -426,7 +426,7 @@ pub fn start(vm: &mut Vm, a: &[Value]) -> R {
     let (base, req, fail) = prepare(vm, a)?;
     let limit = (vm.memory_left() / 16).clamp(64 << 10, MAX_BODY);
     let until = until(vm, REQUEST_TIMEOUT);
-    crate::asyncio::start(vm, until, move || {
+    crate::asyncio::start(vm, until, None, move || {
         crate::asyncio::Outcome::Http(exchange(&base, &req, until, limit).map_err(|e| format!("{fail}{e}")))
     })
 }

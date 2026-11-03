@@ -79,9 +79,28 @@ pub struct EditorIndex {
     pub map_methods: Vec<Item>,
 }
 
+/// Longest completion detail: a signature is shortened past this (a huge type
+/// argument repeated in every parameter would otherwise make huge responses).
+const MAX_DETAIL: usize = 2000;
+
+/// `s` cut to `max` bytes (at a character boundary), with `…` when it was longer.
+fn shorten(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+        s.push('…');
+    }
+    s
+}
+
 /// Replaces the type parameter names `names` in a rendered signature by
 /// `values` (whole words only; `$name` parameter names are left alone).
+/// The result is at most about `MAX_DETAIL` bytes.
 fn subst_words(s: &str, names: &[String], values: &[String]) -> String {
+    let values: Vec<String> = values.iter().map(|v| shorten(v.clone(), 200)).collect();
     let mut out = String::new();
     let mut word = String::new();
     let mut after_dollar = false;
@@ -93,6 +112,9 @@ fn subst_words(s: &str, names: &[String], values: &[String]) -> String {
         word.clear();
     };
     for ch in s.chars() {
+        if out.len() > MAX_DETAIL {
+            break;
+        }
         if ch.is_alphanumeric() || ch == '_' {
             word.push(ch);
             continue;
@@ -102,7 +124,7 @@ fn subst_words(s: &str, names: &[String], values: &[String]) -> String {
         out.push(ch);
     }
     flush(&mut word, &mut out, after_dollar);
-    out
+    shorten(out, MAX_DETAIL)
 }
 
 fn contains(span: Span, file: u32, offset: u32) -> bool {
@@ -183,5 +205,21 @@ impl EditorIndex {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A huge type argument repeated in many parameters gives a short detail.
+    #[test]
+    fn substituted_details_are_bounded() {
+        let names = vec!["T".to_string()];
+        let detail = format!("({})", vec!["T $x"; 10_000].join(", "));
+        let out = subst_words(&detail, &names, &["N".repeat(100_000)]);
+        assert!(out.len() <= MAX_DETAIL + 300, "{}", out.len());
+        assert!(out.ends_with('…'));
+        assert_eq!(subst_words("(T $T): T", &names, &["int".into()]), "(int $T): int");
     }
 }

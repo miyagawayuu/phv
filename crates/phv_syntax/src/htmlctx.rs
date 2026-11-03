@@ -229,6 +229,11 @@ impl HtmlTracker {
     /// raw-text element or foreign content. A template must end here, so that
     /// joining its output with other `Html` values cannot move them into
     /// another context.
+    /// Whether the output is at exactly the same place as at `other`.
+    pub fn same_place(&self, other: &HtmlTracker) -> bool {
+        self.state == other.state && self.pending == other.pending && self.foreign == other.foreign
+    }
+
     pub fn at_top_level(&self) -> bool {
         self.state == State::Text && self.pending.is_none() && self.foreign == 0
     }

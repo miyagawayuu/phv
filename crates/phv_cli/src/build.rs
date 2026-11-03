@@ -22,7 +22,7 @@ pub fn build(path: &Path, output: &Path) -> ExitCode {
     } else {
         bundle::build_script(&find_root(path), path)
     };
-    let b = match built {
+    let mut b = match built {
         Ok(b) => b,
         Err(e) => {
             eprint!("{e}");
@@ -32,6 +32,8 @@ pub fn build(path: &Path, output: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Only the files the server would serve from public/ (not, say, a stray .toml or .env.bak).
+    b.statics.retain(|(rel, _)| phv_server::serves_static(Path::new(rel)));
     if let Err(e) = bundle::write(&b, output) {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;

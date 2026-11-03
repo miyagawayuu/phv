@@ -112,3 +112,41 @@ fn golden_jit_cases_are_compiled() {
         assert_compiled(&c, names);
     }
 }
+
+/// Native recursion is bounded by the stack, not only by the depth: a function
+/// with a large frame that recurses deep fails with a depth error instead of
+/// overflowing the thread's stack (a server worker's 16 MB).
+#[test]
+fn deep_recursion_of_large_frames_does_not_overflow() {
+    let mut src = String::from("<?php\nfunction f(int $n): int {\n    $v0 = $n;\n");
+    for i in 1..300 {
+        src.push_str(&format!("    $v{i} = ($v{} * 31 + $n) % 1000003;\n", i - 1));
+    }
+    src.push_str("    $r = 0;\n    if ($n > 0) {\n        $r = f($n - 1);\n    }\n    return $r");
+    for i in 0..300 {
+        src.push_str(&format!(" + $v{i}"));
+    }
+    src.push_str(";\n}\necho f(9900) > 0 ? \"ok\" : \"no\";\n");
+    let src = src.replace("<?php", "<?phv");
+    let dir = std::env::temp_dir().join(format!("phv-jit-test-{}-deep", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("main.phv");
+    std::fs::write(&entry, src).unwrap();
+    let out = std::thread::Builder::new()
+        .stack_size(16 << 20)
+        .spawn(move || {
+            let mut c = compile(&dir, &entry).unwrap_or_else(|e| panic!("{}", e.render(false)));
+            c.enable_jit();
+            assert_compiled(&c, &["f"]);
+            let outcome = run(&c, RunOptions { html: false, limits: Limits::default(), http: None, host: None });
+            (outcome.output, outcome.error.map(|e| e.render()))
+        })
+        .unwrap()
+        .join()
+        .expect("the run crashed");
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("phv-jit-test-{}-deep", std::process::id())));
+    match out {
+        (o, None) => assert_eq!(o, "ok"),
+        (_, Some(e)) => assert!(e.contains("maximum call stack depth"), "{e}"),
+    }
+}

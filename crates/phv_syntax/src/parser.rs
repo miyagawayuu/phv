@@ -62,6 +62,17 @@ struct Parser {
     /// Tokens that `expect_gt` split (`>>` into `>` `>`), with their original
     /// form, so a parse that backtracks can put them back.
     splits: Vec<(usize, Token)>,
+    /// The loops and `try` blocks around the statement being parsed (in the
+    /// current function), with the HTML state where each began: `break`,
+    /// `continue`, `return` and `throw` must leave the HTML where the code
+    /// they jump to expects it.
+    exits: Vec<(Exit, crate::htmlctx::HtmlTracker)>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Exit {
+    Loop,
+    Try,
 }
 
 const BP_IS: u8 = 31;
@@ -126,6 +137,7 @@ impl Parser {
             depth: 0,
             halted: false,
             splits: Vec::new(),
+            exits: Vec::new(),
         }
     }
 
@@ -380,9 +392,59 @@ impl Parser {
     /// is tracked from a fresh document and must end in plain text.
     fn body_block(&mut self) -> PResult<Vec<Stmt>> {
         let outer = std::mem::take(&mut self.html);
+        let exits = std::mem::take(&mut self.exits);
         let body = self.block();
         self.html = outer;
+        self.exits = exits;
         body
+    }
+
+    /// Parses a loop's or `try` block's body with `kind` as a target of exits.
+    fn exit_target<T>(&mut self, kind: Exit, body: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        self.exits.push((kind, self.html.clone()));
+        let r = body(self);
+        self.exits.pop();
+        r
+    }
+
+    /// Checks a `break`/`continue` (`loop_level` > 0) or a `return`/`throw`:
+    /// the HTML must be where the code it jumps to began (the loop, the `try`
+    /// block, or the start of the function), and where every `try` block it
+    /// leaves began (their `finally` runs on the way out).
+    fn check_exit(&mut self, loop_level: u32, throw: bool, span: Span) {
+        let mut checked = Vec::new();
+        let mut loops = 0;
+        let mut target = None;
+        for (kind, at) in self.exits.iter().rev() {
+            match kind {
+                Exit::Try if throw => {
+                    target = Some(at.clone());
+                    break;
+                }
+                Exit::Try => checked.push(at.clone()),
+                Exit::Loop if loop_level > 0 => {
+                    loops += 1;
+                    if loops == loop_level {
+                        target = Some(at.clone());
+                        break;
+                    }
+                }
+                Exit::Loop => {}
+            }
+        }
+        if loop_level > 0 && target.is_none() {
+            return; // Not inside that many loops: the type checker reports it.
+        }
+        checked.push(target.unwrap_or_default());
+        if self.halted || checked.iter().all(|at| self.html.same_place(at)) {
+            return;
+        }
+        let mut d = Diagnostic::error("this jump leaves the HTML inside a tag, attribute, comment or `<script>`", span);
+        d.add_note(
+            "close what was opened before `break`, `continue`, `return` or `throw`: the output that follows \
+             would otherwise land in the wrong place",
+        );
+        self.diags.push(d);
     }
 
     fn stmt(&mut self) -> PResult<Stmt> {
@@ -429,19 +491,21 @@ impl Parser {
             Tok::While => {
                 self.advance();
                 let cond = self.paren_expr()?;
-                let body = if self.eat(&Tok::Colon) {
-                    let b = self.block_until(&[Tok::Endwhile]);
-                    self.expect(Tok::Endwhile)?;
-                    self.semi()?;
-                    b
-                } else {
-                    self.stmt_or_block()?
-                };
+                let body = self.exit_target(Exit::Loop, |p| {
+                    if p.eat(&Tok::Colon) {
+                        let b = p.block_until(&[Tok::Endwhile]);
+                        p.expect(Tok::Endwhile)?;
+                        p.semi()?;
+                        Ok(b)
+                    } else {
+                        p.stmt_or_block()
+                    }
+                })?;
                 StmtKind::While { cond, body }
             }
             Tok::Do => {
                 self.advance();
-                let body = self.stmt_or_block()?;
+                let body = self.exit_target(Exit::Loop, |p| p.stmt_or_block())?;
                 self.expect(Tok::While)?;
                 let cond = self.paren_expr()?;
                 self.semi()?;
@@ -451,7 +515,8 @@ impl Parser {
             Tok::Foreach => return self.foreach_stmt(),
             Tok::Try => return self.try_stmt(),
             Tok::Return => {
-                self.advance();
+                let span = self.advance().span;
+                self.check_exit(0, false, span);
                 let value =
                     if matches!(self.peek(), Tok::Semi | Tok::CloseTag | Tok::Eof) { None } else { Some(self.expr()?) };
                 self.semi()?;
@@ -459,12 +524,13 @@ impl Parser {
             }
             Tok::Break | Tok::Continue => {
                 let is_break = self.at(&Tok::Break);
-                self.advance();
+                let span = self.advance().span;
                 let mut level = 1;
                 if let Tok::Int(n) = *self.peek() {
                     self.advance();
                     level = n.max(1) as u32;
                 }
+                self.check_exit(level, false, span);
                 self.semi()?;
                 if is_break {
                     StmtKind::Break(level)
@@ -473,7 +539,8 @@ impl Parser {
                 }
             }
             Tok::Throw => {
-                self.advance();
+                let span = self.advance().span;
+                self.check_exit(0, true, span);
                 let e = self.expr()?;
                 self.semi()?;
                 StmtKind::Throw(e)
@@ -664,14 +731,16 @@ impl Parser {
             }
         }
         self.expect(Tok::RParen)?;
-        let body = if self.eat(&Tok::Colon) {
-            let b = self.block_until(&[Tok::Endfor]);
-            self.expect(Tok::Endfor)?;
-            self.semi()?;
-            b
-        } else {
-            self.stmt_or_block()?
-        };
+        let body = self.exit_target(Exit::Loop, |p| {
+            if p.eat(&Tok::Colon) {
+                let b = p.block_until(&[Tok::Endfor]);
+                p.expect(Tok::Endfor)?;
+                p.semi()?;
+                Ok(b)
+            } else {
+                p.stmt_or_block()
+            }
+        })?;
         let kind = StmtKind::For { init, cond, step, body };
         Ok(Stmt { kind, span: start.to(self.prev_span()) })
     }
@@ -684,21 +753,23 @@ impl Parser {
         let first = self.expect_var()?;
         let (key, value) = if self.eat(&Tok::FatArrow) { (Some(first), self.expect_var()?) } else { (None, first) };
         self.expect(Tok::RParen)?;
-        let body = if self.eat(&Tok::Colon) {
-            let b = self.block_until(&[Tok::Endforeach]);
-            self.expect(Tok::Endforeach)?;
-            self.semi()?;
-            b
-        } else {
-            self.stmt_or_block()?
-        };
+        let body = self.exit_target(Exit::Loop, |p| {
+            if p.eat(&Tok::Colon) {
+                let b = p.block_until(&[Tok::Endforeach]);
+                p.expect(Tok::Endforeach)?;
+                p.semi()?;
+                Ok(b)
+            } else {
+                p.stmt_or_block()
+            }
+        })?;
         let kind = StmtKind::Foreach { subject, key, value, body };
         Ok(Stmt { kind, span: start.to(self.prev_span()) })
     }
 
     fn try_stmt(&mut self) -> PResult<Stmt> {
         let start = self.advance().span;
-        let body = self.block()?;
+        let body = self.exit_target(Exit::Try, |p| p.block())?;
         let mut catches = Vec::new();
         while self.at(&Tok::Catch) {
             let cstart = self.advance().span;

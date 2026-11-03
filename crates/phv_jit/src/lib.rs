@@ -34,6 +34,16 @@ const CTX_DEPTH: i32 = 8;
 const CTX_MAX_DEPTH: i32 = 16;
 const CTX_BUDGET: i32 = 24;
 const CTX_DETAIL: i32 = 40;
+const CTX_STACK_LIMIT: i32 = 56;
+const _: () = {
+    use std::mem::offset_of;
+    assert!(offset_of!(phv_vm::jit::JitCtx, error) == CTX_ERROR as usize);
+    assert!(offset_of!(phv_vm::jit::JitCtx, depth) == CTX_DEPTH as usize);
+    assert!(offset_of!(phv_vm::jit::JitCtx, max_depth) == CTX_MAX_DEPTH as usize);
+    assert!(offset_of!(phv_vm::jit::JitCtx, budget) == CTX_BUDGET as usize);
+    assert!(offset_of!(phv_vm::jit::JitCtx, detail) == CTX_DETAIL as usize);
+    assert!(offset_of!(phv_vm::jit::JitCtx, stack_limit) == CTX_STACK_LIMIT as usize);
+};
 
 /// Owns the JIT's executable memory.
 struct Code(#[allow(dead_code)] JITModule);
@@ -127,6 +137,10 @@ fn well_formed(prog: &Program, f: &Function, ok: &HashSet<u32>) -> Option<Checke
         let targets = match flow {
             Flow::Next => [Some(i + 1), None],
             Flow::Jump(t) => [Some(t as usize), None],
+            // Only `Jump` checks the clock when it goes back: the compiler's
+            // loops branch forward and jump back, and other bytecode could
+            // loop without ever checking the time limit.
+            Flow::Branch(t) if t as usize <= i => return None,
             Flow::Branch(t) => [Some(i + 1), Some(t as usize)],
             Flow::Stop => [None, None],
         };
@@ -248,6 +262,10 @@ fn step(
             set(st, d, K::Str)?;
         }
         Concat(d, start, n, false) => {
+            // The interpreter reads registers `start..start + n` even when `n` is 0.
+            if n == 0 {
+                return None;
+            }
             for i in 0..n {
                 kind(st, start.checked_add(i)?)?;
             }
@@ -757,6 +775,11 @@ impl<'a, 'b> Translator<'a, 'b> {
         let max = self.b.ins().load(I64, self.mf, self.ctx, CTX_MAX_DEPTH);
         let deep = self.b.ins().icmp(IntCC::SignedGreaterThan, d, max);
         self.fail_if(deep, JIT_ERR_DEPTH);
+        // Large frames: the native stack, not only the depth, is bounded.
+        let sp = self.b.ins().get_stack_pointer(I64);
+        let floor = self.b.ins().load(I64, self.mf, self.ctx, CTX_STACK_LIMIT);
+        let low = self.b.ins().icmp(IntCC::UnsignedLessThan, sp, floor);
+        self.fail_if(low, JIT_ERR_DEPTH);
         if self.checked.strings {
             let mask =
                 self.sig.params.iter().enumerate().filter(|(_, p)| **p == ValKind::Str).map(|(i, _)| 1 << i).sum();
@@ -1239,6 +1262,9 @@ mod tests {
         assert!(!one(func(vec![ValKind::Bool, S], S, 2, vec![JumpIfFalse(0, 2), Ret(1), RetNull])));
         // HTML concatenation and builtins other than strlen
         assert!(!one(func(vec![S], S, 2, vec![Concat(1, 0, 1, true), Ret(1)])));
+        // `Concat` of no registers, and a branch back (which would not check the clock).
+        assert!(!one(func(vec![S], S, 2, vec![Concat(1, 9, 0, false), Ret(1)])));
+        assert!(!one(func(vec![I], ValKind::Void, 1, vec![JumpIfNotLtIImm(0, 5, 0), RetNull])));
         let prog = Program {
             funcs: vec![func(vec![S], I, 2, vec![CallBuiltin { dst: 1, id: 0, args: 0, argc: 1 }, Ret(1)])],
             builtin_names: vec!["strtoupper".into()],

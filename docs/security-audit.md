@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates four audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, and §10 the follow-up on the residual risks.
+This report consolidates five audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, and §11 what was added for v0.5.0.
 
-Date: 2026-11-02 (§9, §10: 2026-11-03)
+Date: 2026-11-02 (§9–§11: 2026-11-03)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -358,3 +358,92 @@ PostgreSQL 17, MySQL 8.4 and Redis 7, and the fuzzer ran 1,500 mutations per pro
 end check (`tests/cases`), the journal and `-shm` links (`phv_std` `db::vfs`), the shared rate limit and an unreachable
 store (`tests/db`, run in CI against Redis), the lookup deadline (`netio`), the worker limit (`phv_server` HTTP test)
 and counted output, the file session flood (`session`), and the batched and cancelled LSP messages (`lsp`).
+
+## 11. Fifth Assessment (v0.5.0: generics, annotations, async I/O, database sessions, packages, `phv build`, JIT)
+
+Date: 2026-11-03. Scope: everything changed after v0.4.1: generic classes and annotations, `#[` and the template end
+check, asynchronous I/O (`std.async`), sessions in a database, shared rate limits, the server's worker limit, packages
+of packages and the registry (`phv install`, the loader, the Packages page and the registry's own check), `phv build`,
+the JIT for floats and strings, and line wrapping in `phv fmt`.
+
+### Method
+
+Three new reviewers, each given only the source and one area (packages and tooling; async, sessions and the server;
+the language, templates, JIT and formatter), confirmed every finding with a working attack: hostile git repositories
+and registries, two server processes on one session store, real PostgreSQL 17, MySQL 8.4 and Redis 7 servers in
+Docker, a site served over HTTP, forged bytecode against the JIT, and a formatter harness (all 112 `.phv` files of the
+repository at widths 6–80 and about 20,000 mutations). All PoCs were rerun against the fixed build, and regression
+tests were added.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| High | 7 | All fixed |
+| Medium | 10 | All fixed |
+| Low | 6 | All fixed |
+| Info | 4 | 2 fixed, 2 documented |
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R5-1 | `phv install` wrote through a `vendor` (or `vendor/<name>`) that was a symbolic link or junction, so a cloned or planted link could make it delete and replace any directory outside the project | `vendor`, `vendor/<name>` and `phv.lock` are refused when they are links (or Windows reparse points); git runs with `core.symlinks=false` |
+| R5-2 | `phv.lock` was written through a link, and git URLs could hold shell characters: with the lock linked to `.bashrc`, a dependency URL `…$(touch${IFS}PWNED)` ran when the shell started | The lock is written to a temporary file and renamed into place. Git URLs may hold only URL characters (at most 500) |
+| R5-3 | A sign-out raced with a slow request: the session store read the session, then wrote it back, so a request that finished after the logout brought the session back (file, Redis and SQL stores; also across processes). Two logins regenerating one session both took it over | Stores insert a session only under a new id and update it only while it exists, each as one atomic step: the file store under an OS lock on `.phv-session.lock`, Redis with Lua scripts, SQL with `INSERT … ON CONFLICT DO NOTHING` / `INSERT IGNORE` and `UPDATE … WHERE id`. A regenerated session must be removed by this request before its new id is stored. Test: 20 rounds of 8 threads saving through two stores while a third logs out |
+| R5-4 | A caller's type parameter was captured by a method's type parameter of the same name: through `Box<U>`, `map<U>` turned any value into `SafeUrl` or `SafeJs` (a `javascript:` link, a nonced script) | A method's own type parameters become inference variables before the receiver's type arguments are substituted |
+| R5-5 | `is Box` and `catch (Box $e)` narrowed to `Box<any>`, which could be written: `$a->value = "…"` on a `Box<SafeJs>` put a string into a nonced `<script>` | They narrow to `Box<?>`: reads give `any`, writes accept nothing, and it is not a `Box<T>` |
+| R5-6 | A generic interface reached through two paths with different type arguments (`UrlSrc extends Src<SafeUrl>`, `StrSrc extends Src<string>`) kept the last one, so a `string` came out as `SafeUrl` | A class reaching one generic class or interface with two argument lists is an error |
+| R5-7 | The override check compared type parameters by name, so a method's `T` matched a subclass's class parameter `T`, and `Base<int>::m<T>` was overridden by `m<V>(T $x)` writing a string into a `SafeUrl` property | Each method's own parameters are compared by position |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R5-8 | Package names differing only in case were different packages but one directory on Windows and macOS: a dependency could replace another package's code | Package names are lowercase letters, digits and `_` |
+| R5-9 | A package's phv.toml was read with no size or type limit, through links (`/dev/zero`, a link to a secret), and a parse error echoed its content | Read only as a regular file of at most 1 MB; messages do not quote it |
+| R5-10 | Registry entries and packages' dependencies could use `file:////host/share` (UNC): Windows connected over SMB and sent NTLM credentials | Registry entries and dependencies of packages must be `https://` (a `file:///` registry may name `file:///` packages, for tests); `file:////` is refused everywhere |
+| R5-11 | LSP completion details of nested generic types grew without bound: about 300 KB of source made a 1 GB detail | Details are at most 2,000 characters, and substitution is capped |
+| R5-12 | Async work outlived its request: a short request could start 16 queries and end, holding DB connections and threads for the whole time limit without holding a worker | Work never awaited is waited for when the script ends (so it keeps the worker); a script may use at most half of a database's pool at once; at most 1,024 operations in the process |
+| R5-13 | The Redis session store had no count or byte limit, so a flood of new sessions filled Redis and then broke the rate limits and logins | Redis keeps within 50,000 sessions and 256 MB as they are written (sorted sets of new and returning sessions, sizes, a byte counter, all in the write script), removing new sessions first. SQL stores also have the byte limit and sweep early after 1,000 new sessions |
+| R5-14 | `rate_limit_reset()` scanned the whole Redis keyspace, and failed at about 3 million keys | Each key's windows are one Redis hash (`phv:ratelimit:<hash>`) updated by a script, so a reset is one `DEL` |
+| R5-15 | `break`, `continue`, `return` and `throw` inside a tag moved the output that follows into the tag (`<a href="<?phv if ($id < 0) { break; } ?>…` put a later value at the start of the URL) | A jump must leave the HTML where its target (the loop, the `try`, the start of the function) began, and where every `try` it leaves began |
+| R5-16 | `json_html()` (`SafeJs`) could be used as `Html`, so through an `Html` template parameter it was placed in a quoted attribute, whose quotes it ended (attribute injection) | `SafeJs` is no longer `Html` |
+| R5-17 | Deep recursion of JIT code with large frames overflowed the 16 MB stack of a server worker and killed `phv serve` (only depth was bounded) | Native code also stops (as too deep) when it would use more than 8 MB of stack below its outermost call |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R5-18 | A symbolic link inside a package could make a module of another package or of the project its own, getting around the import boundary | A package's module must be inside the package after resolving links |
+| R5-19 | A package named like a directory of the project shadowed the project's own modules | An error names the clash (a `path` package that is that very directory is allowed) |
+| R5-20 | The Packages page read registry entries with a regular expression and could show a different repository than `phv install` uses | Entries must be exactly the two lines `git = "https://…"` and `description = "…"`, checked the same way by the site, the registry's pull-request check (with a TOML comparison) and the installer |
+| R5-21 | A MySQL server that accepts connections but never answers used up the 32 slots for blocking work, so name lookups of every other service failed | MySQL connects have their own slots |
+| R5-22 | The JIT's check let `Concat` of no registers name a register out of range, aborting the process (needs forged signed bytecode) | Refused by the check |
+| R5-23 | `phv fmt` changed strings and output: it trimmed spaces before a newline inside a string, rewrote line endings inside strings, and added a newline after trailing inline HTML | Lines that end inside a string or inline HTML keep their end and their line ending; a file ending in HTML ends as it did |
+
+### Info
+
+| Item | Result |
+|---|---|
+| `phv build` included every file under `public/` (for example a stray `.toml`) | Fixed: only files the server would serve |
+| A conditional jump backwards never checks the clock (forged bytecode only) | Fixed in the JIT's check; the compiler only branches forward |
+| phv.toml is included in `phv build` executables, with any secret written in it | Documented: use `url_env` / `headers_env` |
+| Growing the register window comes before the memory check (both engines; present in v0.4.1) | Kept: the overshoot is bounded by the function's register count, and the check follows at once |
+
+### Residual Risks
+
+| Item | Description |
+|---|---|
+| `json_html()` through `any` | A `SafeJs` value passed as `any` and narrowed with `is Html` is `Html` at run time (one runtime type), and could then be placed in an attribute. It takes code that does this on purpose |
+| JIT and deep recursion | A function with a large frame can stop at a smaller depth under the JIT than in the interpreter (8 MB of native stack) |
+
+### Verification
+
+All PoCs were rerun against the fixed build. Regression tests: the logout race across two stores and the regeneration
+race (`session`, also against PostgreSQL, MySQL and Redis), the Redis count and byte limits, the rate-limit windows and
+reset (`tests/db`), unawaited work (`tests/http`), separate slots for MySQL connects (`netio`), the generic soundness
+cases, template jumps and `json_html()` (`tests/cases`), deep JIT recursion (`jit`), the JIT check (`phv_jit`), the
+formatter (`format`), links, URLs and names in `phv install` (`install`), and the package boundary
+(`tests/packages`). All tests pass on Windows and on Linux (Docker) with clippy (`-D warnings`) and rustfmt;
+`tests/db` passed against PostgreSQL 17, MySQL 8.4 and Redis 7, and the fuzzer ran 1,500 mutations per program.

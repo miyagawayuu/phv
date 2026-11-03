@@ -117,3 +117,85 @@ fn installs_packages_of_packages() {
     assert!(!ok && out.contains("no package \"nothere\" in the registry"), "{out}");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Makes `link` a link to the directory `target`: a symbolic link, or on
+/// Windows a junction when symbolic links need privileges.
+fn link_dir(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+            || Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|o| o.status.success())
+    }
+}
+
+/// What a repository or a package can plant is refused: links at vendor/ and
+/// phv.lock (which would make the install write elsewhere), packages of
+/// packages that are not https://, uppercase names, and huge manifests.
+#[test]
+fn refuses_what_a_repository_or_package_plants() {
+    let base: PathBuf = std::env::temp_dir().join(format!("phv-install-refuse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    repo(&base.join("pkg"), &[("v1.0.0", &[("m.phv", "export function f(): int { return 1; }\n")])]);
+    let pkg = url(&base.join("pkg"));
+    // Not a local registry: packages of packages must be https://.
+    let registry = "https://registry.invalid/index.git";
+    let app = base.join("app");
+    let app_s = app.to_string_lossy().to_string();
+    write(&app, "phv.toml", &format!("[dependencies]\npkg = {{ git = \"{pkg}\", version = \"^1\" }}\n"));
+
+    // vendor/ is a link to a directory outside the project.
+    let outside = base.join("outside");
+    write(&outside, "pkg/precious.txt", "keep me");
+    if link_dir(&outside, &app.join("vendor")) {
+        let (ok, out) = phv(&["install", &app_s], registry);
+        assert!(!ok && out.contains("is a link"), "{out}");
+        assert_eq!(std::fs::read_to_string(outside.join("pkg/precious.txt")).unwrap(), "keep me");
+        std::fs::remove_dir(app.join("vendor")).or_else(|_| std::fs::remove_file(app.join("vendor"))).unwrap();
+    } else {
+        eprintln!("skipped the vendor link: cannot create links here");
+    }
+
+    // phv.lock is a link to a file outside the project.
+    write(&outside, "dotfile", "keep me too");
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(outside.join("dotfile"), app.join("phv.lock")).is_ok();
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(outside.join("dotfile"), app.join("phv.lock")).is_ok();
+    if linked {
+        let (ok, out) = phv(&["install", &app_s], registry);
+        assert!(!ok && out.contains("phv.lock is a link"), "{out}");
+        assert_eq!(std::fs::read_to_string(outside.join("dotfile")).unwrap(), "keep me too");
+        std::fs::remove_file(app.join("phv.lock")).unwrap();
+    } else {
+        eprintln!("skipped the phv.lock link: cannot create symbolic links here");
+    }
+
+    // A package asking for a package over file:// (or ssh://), an uppercase
+    // name, a huge phv.toml.
+    let local = format!("[dependencies]\nother = {{ git = \"{pkg}\", version = \"^1\" }}\n");
+    let upper = "[dependencies]\nOther = { git = \"https://example.invalid/o.git\" }\n".to_string();
+    let huge = format!("# {}\n", "x".repeat(2 << 20));
+    for (i, (manifest, expect)) in
+        [(local.as_str(), "not https://"), (upper.as_str(), "invalid package name"), (huge.as_str(), "at most 1 MB")]
+            .into_iter()
+            .enumerate()
+    {
+        let name = format!("bad{i}");
+        repo(&base.join(&name), &[("v1.0.0", &[("phv.toml", manifest), ("m.phv", "export const X = 1;\n")])]);
+        let toml = format!("[dependencies]\n{name} = {{ git = \"{}\", version = \"^1\" }}\n", url(&base.join(&name)));
+        write(&app, "phv.toml", &toml);
+        let (ok, out) = phv(&["install", &app_s], registry);
+        assert!(!ok && out.contains(expect), "{name}: {out}");
+        assert!(!out.contains("xxxxxxxx"), "the manifest is echoed: {name}");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

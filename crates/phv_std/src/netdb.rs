@@ -955,6 +955,9 @@ impl Driver for MyConn {
     }
 }
 
+/// MySQL connects still running (see `netio::with_deadline_in`).
+static MY_CONNECTING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn my_connect(
     url: &str,
     spec: &DatabaseSpec,
@@ -984,9 +987,11 @@ fn my_connect(
         .write_timeout(Some(io_timeout))
         .max_allowed_packet(Some(packet));
     let opts = mysql::Opts::from(builder.clone());
-    // The driver looks the host up itself, with no deadline of its own.
-    let conn = crate::netio::with_deadline(Instant::now() + timeout, move || mysql::Conn::new(builder))?
-        .map_err(|e| my_message(&e))?;
+    // The driver looks the host up itself, with no deadline of its own, and
+    // waits for a server's greeting as long as for any answer.
+    let conn =
+        crate::netio::with_deadline_in(&MY_CONNECTING, Instant::now() + timeout, move || mysql::Conn::new(builder))?
+            .map_err(|e| my_message(&e))?;
     Ok(MyConn { conn, timeout_ms: None, opts })
 }
 
@@ -1270,11 +1275,12 @@ pub fn start_query(vm: &mut Vm, a: &[Value]) -> R {
     let until = crate::netio::until(vm, DETACHED_WAIT);
     let budget = detached_budget(vm);
     let fail = format!("database \"{name}\": ");
+    let pool = Some((name.clone(), spec.pool_size));
     match kind_of(&url) {
         Kind::Postgres => {
             let text = render_sql(text, Dialect::Postgres);
             let params: Vec<PgParam> = params.iter().map(PgParam::new).collect();
-            crate::asyncio::start(vm, until, move || {
+            crate::asyncio::start(vm, until, pool, move || {
                 let r = pg_detached(&spec, &url, &text, &params, execute, until, budget);
                 crate::asyncio::Outcome::Db(r.map_err(|e| format!("{fail}{e}")))
             })
@@ -1282,7 +1288,7 @@ pub fn start_query(vm: &mut Vm, a: &[Value]) -> R {
         Kind::MySql => {
             let text = render_sql(text, Dialect::MySql);
             let params = my_params(params);
-            crate::asyncio::start(vm, until, move || {
+            crate::asyncio::start(vm, until, pool, move || {
                 let r = my_detached(&spec, &url, &text, params, execute, until, budget);
                 crate::asyncio::Outcome::Db(r.map_err(|e| format!("{fail}{e}")))
             })
@@ -1305,9 +1311,10 @@ pub fn start_redis(vm: &mut Vm, a: &[Value]) -> R {
     let until = crate::netio::until(vm, MAX_WAIT);
     let budget = detached_budget(vm);
     let fail = format!("database \"{name}\": ");
-    crate::asyncio::start(vm, until, move || {
+    let pool = Some((name.clone(), spec.pool_size));
+    crate::asyncio::start(vm, until, pool, move || {
         let r = (|| {
-            let mut c = redis_conn(&spec, until)?;
+            let mut c = redis_conn(&spec, PoolUse::Scripts, until)?;
             let mut argv: Vec<&[u8]> = vec![command.as_bytes()];
             argv.extend(args.iter().map(|a| a.as_bytes()));
             match c.get().command(&argv, until, budget) {
@@ -1350,16 +1357,36 @@ fn spec_of(vm: &Vm, name: &str) -> Result<(DatabaseSpec, String), VmError> {
     Ok((spec, url))
 }
 
+/// Who a pooled connection is for: scripts (and their background work) share
+/// one pool per database; the session store and the shared rate limits each
+/// have a small pool of their own, so scripts cannot starve them.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum PoolUse {
+    Scripts,
+    Sessions,
+    RateLimits,
+}
+
+fn pool_key(spec: &DatabaseSpec, url: &str, use_: PoolUse) -> (String, usize) {
+    let key = format!("{:?}|{}|{}", spec.tls, spec.pool_size, url);
+    match use_ {
+        PoolUse::Scripts => (key, spec.pool_size),
+        PoolUse::Sessions => (format!("sessions|{key}"), spec.pool_size.min(4)),
+        PoolUse::RateLimits => (format!("ratelimit|{key}"), spec.pool_size.min(4)),
+    }
+}
+
 fn detached_conn<C: Driver>(
     registry: &Registry<C>,
     spec: &DatabaseSpec,
     url: &str,
+    use_: PoolUse,
     until: Instant,
     connect: impl FnOnce(Duration) -> Result<C, String>,
 ) -> Result<Pooled<C>, String> {
-    let key = format!("{:?}|{}|{}", spec.tls, spec.pool_size, url);
+    let (key, size) = pool_key(spec, url, use_);
     let timeout = until.saturating_duration_since(Instant::now()).clamp(Duration::from_millis(100), CONNECT_TIMEOUT);
-    match pool_for(registry, &key, spec.pool_size).acquire(until, || connect(timeout)) {
+    match pool_for(registry, &key, size).acquire(until, || connect(timeout)) {
         Ok(c) => Ok(c),
         Err(AcquireError::Busy) => Err(format!("all {} connections are in use (raise pool_size?)", spec.pool_size)),
         Err(AcquireError::Connect(e)) => Err(format!("cannot connect: {e}")),
@@ -1376,7 +1403,7 @@ fn pg_detached(
     budget: usize,
 ) -> Result<Detached, String> {
     use postgres::types::ToSql;
-    let mut c = detached_conn(&PG_POOLS, spec, url, until, |t| pg_connect(url, spec, t))?;
+    let mut c = detached_conn(&PG_POOLS, spec, url, PoolUse::Scripts, until, |t| pg_connect(url, spec, t))?;
     let error = |c: &mut Pooled<PgConn>, e: postgres::Error| -> String {
         if c.get().client.is_closed() {
             c.broken = true;
@@ -1446,7 +1473,9 @@ fn my_detached(
 ) -> Result<Detached, String> {
     use mysql::prelude::Queryable;
     let left = until.saturating_duration_since(Instant::now());
-    let mut c = detached_conn(&MY_POOLS, spec, url, until, |t| my_connect(url, spec, t, Some(budget * 2), Some(left)))?;
+    let mut c = detached_conn(&MY_POOLS, spec, url, PoolUse::Scripts, until, |t| {
+        my_connect(url, spec, t, Some(budget * 2), Some(left))
+    })?;
     let error = |c: &mut Pooled<MyConn>, e: mysql::Error| -> String {
         match &e {
             mysql::Error::MySqlError(m) if m.code == 3024 || m.code == 1317 => {
@@ -1514,6 +1543,9 @@ fn my_detached(
 }
 
 // ----- Sessions stored in a database ([security] session_store = "db:<name>") --
+//
+// A session is inserted only under a new id and updated only while it exists,
+// so a write never brings back a session that a logout removed meanwhile.
 
 /// One stored session: its values as JSON, Unix times, and whether its
 /// visitor came back (sent the cookie) at least once.
@@ -1524,12 +1556,18 @@ pub struct SessionRow {
     pub returned: bool,
 }
 
+/// How long sessions live and how many the store keeps.
+pub struct SessionLimits {
+    pub ttl: Duration,
+    pub max_lifetime: Duration,
+    pub max_sessions: usize,
+    pub max_bytes: usize,
+}
+
 /// How long one session operation may take.
 const SESSION_WAIT: Duration = Duration::from_secs(5);
 
-/// A session that has not come back yet lives at most this long in Redis
-/// (whose own memory policy, not PHV, would otherwise decide what a flood of
-/// new sessions pushes out).
+/// A session that has not come back yet lives at most this long.
 const NEW_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Databases whose `phv_sessions` table this process has created (by URL).
@@ -1547,20 +1585,20 @@ fn session_conn(spec: &DatabaseSpec) -> Result<(SessionConn, Instant), String> {
     };
     tls_init();
     let until = Instant::now() + SESSION_WAIT;
-    let conn = match kind_of(&url) {
-        Kind::Redis => SessionConn::Redis(redis_conn(spec, until)?),
+    let use_ = PoolUse::Sessions;
+    let mut conn = match kind_of(&url) {
+        Kind::Redis => SessionConn::Redis(redis_conn(spec, use_, until)?),
         Kind::Postgres => {
-            let mut c = detached_conn(&PG_POOLS, spec, &url, until, |t| pg_connect(&url, spec, t))?;
-            c.get().meter.set(Some(until), 2 << 20);
+            let mut c = detached_conn(&PG_POOLS, spec, &url, use_, until, |t| pg_connect(&url, spec, t))?;
+            c.get().meter.set(Some(until), 8 << 20);
             SessionConn::Pg(Box::new(c))
         }
-        Kind::MySql => SessionConn::My(Box::new(detached_conn(&MY_POOLS, spec, &url, until, |t| {
-            my_connect(&url, spec, t, Some(4 << 20), Some(SESSION_WAIT))
+        Kind::MySql => SessionConn::My(Box::new(detached_conn(&MY_POOLS, spec, &url, use_, until, |t| {
+            my_connect(&url, spec, t, Some(8 << 20), Some(SESSION_WAIT))
         })?)),
     };
     // The table is created once per process and database.
     if !matches!(conn, SessionConn::Redis(_)) && !lock(&SESSION_TABLES).contains(&url) {
-        let mut conn = conn;
         let sql = "CREATE TABLE IF NOT EXISTS phv_sessions (id varchar(64) PRIMARY KEY, data text NOT NULL, \
                    created bigint NOT NULL, last bigint NOT NULL, returned smallint NOT NULL)";
         match &mut conn {
@@ -1572,10 +1610,70 @@ fn session_conn(spec: &DatabaseSpec) -> Result<(SessionConn, Instant), String> {
             SessionConn::Redis(_) => {}
         }
         lock(&SESSION_TABLES).insert(url);
-        return Ok((conn, until));
     }
     Ok((conn, until))
 }
+
+/// Writes a session in Redis: `mode` "insert" (only if absent) or "update"
+/// (only if present). Each session is `phv:session:<key>` with an expiry; two
+/// sorted sets (new and returned sessions, by last use), a hash of sizes and a
+/// byte counter keep the store within its limits, evicting new sessions first.
+const REDIS_SESSION_WRITE: &str = r#"
+local id, value, px, back, now, size, mode = ARGV[1], ARGV[2], ARGV[3], ARGV[4], tonumber(ARGV[5]), tonumber(ARGV[6]), ARGV[7]
+local ttl, new_ttl, max_n, max_b = tonumber(ARGV[8]), tonumber(ARGV[9]), tonumber(ARGV[10]), tonumber(ARGV[11])
+local k = 'phv:session:' .. id
+local exists = redis.call('EXISTS', k) == 1
+if (mode == 'update' and not exists) or (mode == 'insert' and exists) then return 0 end
+local function drop(x)
+  local sz = tonumber(redis.call('HGET', 'phv:sessions:size', x) or '0')
+  redis.call('DEL', 'phv:session:' .. x)
+  redis.call('HDEL', 'phv:sessions:size', x)
+  redis.call('ZREM', 'phv:sessions:new', x)
+  redis.call('ZREM', 'phv:sessions:back', x)
+  return redis.call('INCRBY', 'phv:sessions:bytes', -sz)
+end
+-- Forget sessions Redis has expired since (a few per write).
+for _, x in ipairs(redis.call('ZRANGEBYSCORE', 'phv:sessions:new', '-inf', now - new_ttl, 'LIMIT', 0, 50)) do drop(x) end
+for _, x in ipairs(redis.call('ZRANGEBYSCORE', 'phv:sessions:back', '-inf', now - ttl, 'LIMIT', 0, 50)) do drop(x) end
+local old = tonumber(redis.call('HGET', 'phv:sessions:size', id) or '0')
+redis.call('SET', k, value, 'PX', px)
+redis.call('HSET', 'phv:sessions:size', id, size)
+local total = redis.call('INCRBY', 'phv:sessions:bytes', size - old)
+if back == '1' then
+  redis.call('ZREM', 'phv:sessions:new', id)
+  redis.call('ZADD', 'phv:sessions:back', now, id)
+else
+  redis.call('ZADD', 'phv:sessions:new', now, id)
+end
+local count = redis.call('ZCARD', 'phv:sessions:new') + redis.call('ZCARD', 'phv:sessions:back')
+-- The oldest session of a set, other than the one being written.
+local function oldest(z)
+  for _, x in ipairs(redis.call('ZRANGE', z, 0, 1)) do
+    if x ~= id then return x end
+  end
+  return nil
+end
+while count > max_n or total > max_b do
+  local v = oldest('phv:sessions:new') or oldest('phv:sessions:back')
+  if not v then break end
+  total = drop(v)
+  count = count - 1
+end
+return 1
+"#;
+
+/// Removes a session from Redis with its bookkeeping; 1 if it existed.
+const REDIS_SESSION_REMOVE: &str = r#"
+local id = ARGV[1]
+local existed = redis.call('EXISTS', 'phv:session:' .. id)
+local sz = tonumber(redis.call('HGET', 'phv:sessions:size', id) or '0')
+redis.call('DEL', 'phv:session:' .. id)
+redis.call('HDEL', 'phv:sessions:size', id)
+redis.call('ZREM', 'phv:sessions:new', id)
+redis.call('ZREM', 'phv:sessions:back', id)
+redis.call('INCRBY', 'phv:sessions:bytes', -sz)
+return existed
+"#;
 
 fn redis_session_key(key: &str) -> String {
     format!("phv:session:{key}")
@@ -1650,108 +1748,198 @@ pub fn session_read(spec: &DatabaseSpec, key: &str) -> Result<Option<SessionRow>
     }
 }
 
-/// Stores (or replaces) the session under `key`; Redis forgets it after `ttl`
-/// (and a new session sooner), the SQL table in `session_sweep`.
-pub fn session_write(spec: &DatabaseSpec, key: &str, row: &SessionRow, ttl: Duration) -> Result<(), String> {
+/// Stores a session under a new `key`; false if one is there already.
+pub fn session_insert(
+    spec: &DatabaseSpec,
+    key: &str,
+    row: &SessionRow,
+    limits: &SessionLimits,
+) -> Result<bool, String> {
+    session_store(spec, key, row, limits, true)
+}
+
+/// Replaces the session under `key`; false (and nothing is stored) if it is gone.
+pub fn session_update(
+    spec: &DatabaseSpec,
+    key: &str,
+    row: &SessionRow,
+    limits: &SessionLimits,
+) -> Result<bool, String> {
+    session_store(spec, key, row, limits, false)
+}
+
+fn session_store(
+    spec: &DatabaseSpec,
+    key: &str,
+    row: &SessionRow,
+    limits: &SessionLimits,
+    insert: bool,
+) -> Result<bool, String> {
     let (mut conn, until) = session_conn(spec)?;
     let returned = i16::from(row.returned);
+    let (created, last) = (row.created as i64, row.last as i64);
     match &mut conn {
         SessionConn::Redis(c) => {
-            let k = redis_session_key(key);
-            let life = if row.returned { ttl } else { ttl.min(NEW_SESSION_TTL) };
-            let ms = life.as_millis().max(1).to_string();
-            let v = redis_session_text(row);
-            redis_run(c, &[b"SET", k.as_bytes(), v.as_bytes(), b"PX", ms.as_bytes()], until).map(|_| ())
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            // Until the visitor comes back, a session lives an hour at most; never past its lifetime.
+            let mut life = if row.returned { limits.ttl } else { limits.ttl.min(NEW_SESSION_TTL) };
+            let left = (row.created + limits.max_lifetime.as_secs()).saturating_sub(now);
+            life = life.min(Duration::from_secs(left.max(1)));
+            let px = life.as_millis().max(1).to_string();
+            let value = redis_session_text(row);
+            let args: Vec<String> = vec![
+                now.to_string(),
+                value.len().to_string(),
+                if insert { "insert" } else { "update" }.into(),
+                limits.ttl.as_secs().to_string(),
+                NEW_SESSION_TTL.as_secs().to_string(),
+                limits.max_sessions.to_string(),
+                limits.max_bytes.to_string(),
+            ];
+            let mut argv: Vec<&[u8]> = vec![
+                b"EVAL",
+                REDIS_SESSION_WRITE.as_bytes(),
+                b"0",
+                key.as_bytes(),
+                value.as_bytes(),
+                px.as_bytes(),
+                if row.returned { b"1" } else { b"0" },
+            ];
+            argv.extend(args.iter().map(|a| a.as_bytes()));
+            match redis_run(c, &argv, until)? {
+                Reply::Int(n) => Ok(n == 1),
+                _ => Err("the server sent an invalid reply".into()),
+            }
         }
-        SessionConn::Pg(c) => {
-            let (created, last) = (row.created as i64, row.last as i64);
-            c.get()
-                .client
-                .execute(
-                    "INSERT INTO phv_sessions (id, data, created, last, returned) VALUES ($1, $2, $3, $4, $5) \
-                     ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, last = EXCLUDED.last, \
-                     returned = EXCLUDED.returned",
-                    &[&key, &row.data, &created, &last, &returned],
-                )
-                .map(|_| ())
-                .map_err(|e| pg_message(&e))
-        }
-        SessionConn::My(c) => {
-            use mysql::prelude::Queryable;
-            c.get()
-                .conn
-                .exec_drop(
-                    "INSERT INTO phv_sessions (id, data, created, last, returned) VALUES (?, ?, ?, ?, ?) AS n \
-                     ON DUPLICATE KEY UPDATE data = n.data, last = n.last, returned = n.returned",
-                    (key, &row.data, row.created, row.last, returned),
-                )
-                .map_err(|e| my_message(&e))
-        }
-    }
-}
-
-/// Removes the session stored under `key`.
-pub fn session_remove(spec: &DatabaseSpec, key: &str) -> Result<(), String> {
-    let (mut conn, until) = session_conn(spec)?;
-    match &mut conn {
-        SessionConn::Redis(c) => {
-            let k = redis_session_key(key);
-            redis_run(c, &[b"DEL", k.as_bytes()], until).map(|_| ())
-        }
-        SessionConn::Pg(c) => c
-            .get()
-            .client
-            .execute("DELETE FROM phv_sessions WHERE id = $1", &[&key])
-            .map(|_| ())
-            .map_err(|e| pg_message(&e)),
-        SessionConn::My(c) => {
-            use mysql::prelude::Queryable;
-            c.get().conn.exec_drop("DELETE FROM phv_sessions WHERE id = ?", (key,)).map_err(|e| my_message(&e))
-        }
-    }
-}
-
-/// Removes sessions unused for `ttl` or older than `max_lifetime`, and, when
-/// more than `max` are left, those whose visitor never came back first, then
-/// the least recently used, down to 90%. (Redis expires sessions itself.)
-pub fn session_sweep(spec: &DatabaseSpec, ttl: Duration, max_lifetime: Duration, max: usize) -> Result<(), String> {
-    let (mut conn, _) = session_conn(spec)?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-    let (idle, old) = (now - ttl.as_secs() as i64, now - max_lifetime.as_secs() as i64);
-    let keep = (max * 9 / 10) as i64;
-    match &mut conn {
-        SessionConn::Redis(_) => Ok(()),
         SessionConn::Pg(c) => {
             let client = &c.get().client;
-            let pg = |e: postgres::Error| pg_message(&e);
-            client.execute("DELETE FROM phv_sessions WHERE last < $1 OR created < $2", &[&idle, &old]).map_err(pg)?;
-            let count: i64 =
-                client.query("SELECT count(*) FROM phv_sessions", &[]).map_err(pg)?[0].try_get(0).map_err(pg)?;
-            if count > max as i64 {
-                let excess = count - keep;
-                client
-                    .execute(
-                        "DELETE FROM phv_sessions WHERE id IN \
-                         (SELECT id FROM phv_sessions ORDER BY returned, last LIMIT $1)",
-                        &[&excess],
-                    )
-                    .map_err(pg)?;
-            }
-            Ok(())
+            let n = if insert {
+                client.execute(
+                    "INSERT INTO phv_sessions (id, data, created, last, returned) VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (id) DO NOTHING",
+                    &[&key, &row.data, &created, &last, &returned],
+                )
+            } else {
+                client.execute(
+                    "UPDATE phv_sessions SET data = $2, last = $3, returned = $4 WHERE id = $1",
+                    &[&key, &row.data, &last, &returned],
+                )
+            };
+            n.map(|n| n > 0).map_err(|e| pg_message(&e))
         }
         SessionConn::My(c) => {
             use mysql::prelude::Queryable;
             let my = |e: mysql::Error| my_message(&e);
             let conn = &mut c.get().conn;
-            conn.exec_drop("DELETE FROM phv_sessions WHERE last < ? OR created < ?", (idle, old)).map_err(my)?;
-            let count: i64 = conn.query_first("SELECT count(*) FROM phv_sessions").map_err(my)?.unwrap_or(0);
-            if count > max as i64 {
-                let excess = count - keep;
-                conn.exec_drop("DELETE FROM phv_sessions ORDER BY returned, last LIMIT ?", (excess,)).map_err(my)?;
+            if insert {
+                conn.exec_drop(
+                    "INSERT IGNORE INTO phv_sessions (id, data, created, last, returned) VALUES (?, ?, ?, ?, ?)",
+                    (key, &row.data, created, last, returned),
+                )
+                .map_err(my)?;
+                return Ok(conn.affected_rows() > 0);
             }
-            Ok(())
+            conn.exec_drop(
+                "UPDATE phv_sessions SET data = ?, last = ?, returned = ? WHERE id = ?",
+                (&row.data, last, returned, key),
+            )
+            .map_err(my)?;
+            // MySQL counts only rows it changed: an unchanged row is still there.
+            if conn.affected_rows() > 0 {
+                return Ok(true);
+            }
+            let found: Option<i64> = conn.exec_first("SELECT 1 FROM phv_sessions WHERE id = ?", (key,)).map_err(my)?;
+            Ok(found.is_some())
         }
     }
+}
+
+/// Removes the session stored under `key`; true if it was there.
+pub fn session_remove(spec: &DatabaseSpec, key: &str) -> Result<bool, String> {
+    let (mut conn, until) = session_conn(spec)?;
+    match &mut conn {
+        SessionConn::Redis(c) => {
+            match redis_run(c, &[b"EVAL", REDIS_SESSION_REMOVE.as_bytes(), b"0", key.as_bytes()], until)? {
+                Reply::Int(n) => Ok(n == 1),
+                _ => Err("the server sent an invalid reply".into()),
+            }
+        }
+        SessionConn::Pg(c) => c
+            .get()
+            .client
+            .execute("DELETE FROM phv_sessions WHERE id = $1", &[&key])
+            .map(|n| n > 0)
+            .map_err(|e| pg_message(&e)),
+        SessionConn::My(c) => {
+            use mysql::prelude::Queryable;
+            let conn = &mut c.get().conn;
+            conn.exec_drop("DELETE FROM phv_sessions WHERE id = ?", (key,)).map_err(|e| my_message(&e))?;
+            Ok(conn.affected_rows() > 0)
+        }
+    }
+}
+
+/// Removes sessions unused for `ttl` or older than `max_lifetime`, and, when
+/// more than `max_sessions` (or `max_bytes` of data) are left, those whose
+/// visitor never came back first, then the least recently used, down to 90%.
+/// (Redis keeps within its limits as sessions are written.)
+pub fn session_sweep(spec: &DatabaseSpec, limits: &SessionLimits) -> Result<(), String> {
+    let (mut conn, _) = session_conn(spec)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let (idle, old) = (now - limits.ttl.as_secs() as i64, now - limits.max_lifetime.as_secs() as i64);
+    let (max_n, max_b) = (limits.max_sessions as i64, limits.max_bytes as i64);
+    // Deleting a tenth at a time until both limits hold (each pass is bounded).
+    for _ in 0..20 {
+        let (count, bytes): (i64, i64) = match &mut conn {
+            SessionConn::Redis(_) => return Ok(()),
+            SessionConn::Pg(c) => {
+                let client = &c.get().client;
+                let pg = |e: postgres::Error| pg_message(&e);
+                client
+                    .execute("DELETE FROM phv_sessions WHERE last < $1 OR created < $2", &[&idle, &old])
+                    .map_err(pg)?;
+                let r = client
+                    .query("SELECT count(*), coalesce(sum(length(data)), 0)::bigint FROM phv_sessions", &[])
+                    .map_err(pg)?;
+                (r[0].try_get(0).map_err(pg)?, r[0].try_get(1).map_err(pg)?)
+            }
+            SessionConn::My(c) => {
+                use mysql::prelude::Queryable;
+                let my = |e: mysql::Error| my_message(&e);
+                let conn = &mut c.get().conn;
+                conn.exec_drop("DELETE FROM phv_sessions WHERE last < ? OR created < ?", (idle, old)).map_err(my)?;
+                let r: Option<(i64, i64)> = conn
+                    .query_first("SELECT count(*), CAST(coalesce(sum(length(data)), 0) AS SIGNED) FROM phv_sessions")
+                    .map_err(my)?;
+                r.unwrap_or((0, 0))
+            }
+        };
+        if count <= max_n && bytes <= max_b {
+            return Ok(());
+        }
+        let excess = (count - max_n * 9 / 10).max(count / 10).max(1);
+        match &mut conn {
+            SessionConn::Pg(c) => {
+                c.get()
+                    .client
+                    .execute(
+                        "DELETE FROM phv_sessions WHERE id IN \
+                         (SELECT id FROM phv_sessions ORDER BY returned, last LIMIT $1)",
+                        &[&excess],
+                    )
+                    .map_err(|e| pg_message(&e))?;
+            }
+            SessionConn::My(c) => {
+                use mysql::prelude::Queryable;
+                c.get()
+                    .conn
+                    .exec_drop("DELETE FROM phv_sessions ORDER BY returned, last LIMIT ?", (excess,))
+                    .map_err(|e| my_message(&e))?;
+            }
+            SessionConn::Redis(_) => {}
+        }
+    }
+    Ok(())
 }
 
 // ----- Redis -----------------------------------------------------------------
@@ -1775,6 +1963,23 @@ fn redis_connect(url: &str, spec: &DatabaseSpec, timeout: Duration) -> Result<Re
 
 // ----- Shared rate limits ------------------------------------------------------
 
+/// Counts a hit in one window: the key's hash holds one field per window
+/// length, `<slot> <count>`, so resetting the key is a single DEL. The hash
+/// lives as long as its longest window.
+const RATE_HIT: &str = r#"
+local k, field, slot, ms = KEYS[1], ARGV[1], ARGV[2], tonumber(ARGV[3])
+local cur = redis.call('HGET', k, field)
+local count = 0
+if cur then
+  local s, c = string.match(cur, '^(%d+) (%d+)$')
+  if s == slot then count = tonumber(c) end
+end
+count = count + 1
+redis.call('HSET', k, field, slot .. ' ' .. count)
+if redis.call('PTTL', k) < ms then redis.call('PEXPIRE', k, ms) end
+return count
+"#;
+
 /// Counts a hit in a fixed window on the Redis server `spec` (see
 /// `ratelimit::hit_shared`). Every server process using the same server shares
 /// the counters. Returns whether the hit is allowed and the seconds until the
@@ -1787,69 +1992,45 @@ pub(crate) fn redis_hit(
     until: Instant,
 ) -> Result<(bool, u64), String> {
     let ms = window.as_millis().max(1) as u64;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
     let slot = now / ms;
-    let rkey = format!("{}{ms}:{slot}", redis_prefix(key));
-    let mut conn = redis_conn(spec, until)?;
-    let n = match conn.get().command(&[b"INCR", rkey.as_bytes()], until, 1024) {
+    let rkey = redis_rate_key(key);
+    let (field, slot_s) = (ms.to_string(), slot.to_string());
+    // The hash outlives the window a little (clock skew between servers).
+    let keep = ((slot + 1) * ms - now + 1000).to_string();
+    let mut conn = redis_conn(spec, PoolUse::RateLimits, until)?;
+    let args: [&[u8]; 7] =
+        [b"EVAL", RATE_HIT.as_bytes(), b"1", rkey.as_bytes(), field.as_bytes(), slot_s.as_bytes(), keep.as_bytes()];
+    let n = match conn.get().command(&args, until, 1024) {
         Ok(Reply::Int(n)) => n,
         other => {
             conn.broken = true;
             return Err(redis_failure(other.err()));
         }
     };
-    if n == 1 {
-        // The counter lives as long as its window (plus a margin for clock skew).
-        let ttl = (ms + 1000).to_string();
-        if conn.get().command(&[b"PEXPIRE", rkey.as_bytes(), ttl.as_bytes()], until, 1024).is_err() {
-            conn.broken = true;
-        }
-    }
     Ok((n <= i64::from(max), ((slot + 1) * ms - now) / 1000 + 1))
 }
 
 /// Forgets every window of `key` on the Redis server `spec`.
 pub(crate) fn redis_reset(spec: &DatabaseSpec, key: &str, until: Instant) -> Result<(), String> {
-    let pattern = format!("{}*", redis_prefix(key));
-    let mut conn = redis_conn(spec, until)?;
-    let mut cursor = b"0".to_vec();
-    loop {
-        let reply =
-            conn.get().command(&[b"SCAN", &cursor, b"MATCH", pattern.as_bytes(), b"COUNT", b"1000"], until, 1 << 20);
-        let mut parts = match reply {
-            Ok(Reply::Array(parts)) => parts,
-            other => {
-                conn.broken = true;
-                return Err(redis_failure(other.err()));
-            }
-        };
-        let (Some(Reply::Array(keys)), Some(Reply::Bulk(next))) = (parts.pop(), parts.pop()) else {
+    let rkey = redis_rate_key(key);
+    let mut conn = redis_conn(spec, PoolUse::RateLimits, until)?;
+    match conn.get().command(&[b"DEL", rkey.as_bytes()], until, 1024) {
+        Ok(_) => Ok(()),
+        Err(e) => {
             conn.broken = true;
-            return Err("the server sent an invalid reply".into());
-        };
-        for k in keys {
-            if let Reply::Bulk(k) = k {
-                if conn.get().command(&[b"DEL", &k], until, 1024).is_err() {
-                    conn.broken = true;
-                    return Err("the server did not answer".into());
-                }
-            }
+            Err(redis_failure(Some(e)))
         }
-        if next == b"0" {
-            return Ok(());
-        }
-        cursor = next;
     }
 }
 
-/// Counter keys of `key`: hashed, so they hold no glob characters for `SCAN`
-/// and their length is bounded.
-fn redis_prefix(key: &str) -> String {
+/// The hash of a rate limit key: hashed, so its length is bounded.
+fn redis_rate_key(key: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("phv:ratelimit:{:x}:", Sha256::digest(key.as_bytes()))
+    format!("phv:ratelimit:{:x}", Sha256::digest(key.as_bytes()))
 }
 
-fn redis_conn(spec: &DatabaseSpec, until: Instant) -> Result<Pooled<RedisConn>, String> {
+fn redis_conn(spec: &DatabaseSpec, use_: PoolUse, until: Instant) -> Result<Pooled<RedisConn>, String> {
     let Some(url) = spec.url.clone() else {
         return Err(format!("the environment variable {} is not set", spec.url_env.as_deref().unwrap_or("?")));
     };
@@ -1857,9 +2038,9 @@ fn redis_conn(spec: &DatabaseSpec, until: Instant) -> Result<Pooled<RedisConn>, 
         return Err("it is not a Redis server".into());
     }
     tls_init();
-    let key = format!("{:?}|{}|{}", spec.tls, spec.pool_size, url);
+    let (key, size) = pool_key(spec, &url, use_);
     let timeout = until.saturating_duration_since(Instant::now()).clamp(Duration::from_millis(100), CONNECT_TIMEOUT);
-    match pool_for(&REDIS_POOLS, &key, spec.pool_size).acquire(until, || redis_connect(&url, spec, timeout)) {
+    match pool_for(&REDIS_POOLS, &key, size).acquire(until, || redis_connect(&url, spec, timeout)) {
         Ok(c) => Ok(c),
         Err(AcquireError::Busy) => Err("all its connections are in use".into()),
         Err(AcquireError::Connect(e)) => Err(e),

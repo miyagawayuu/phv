@@ -1,0 +1,55 @@
+<?phv
+// Generic classes cannot turn one type into another (all errors).
+
+class Box<T> {
+    public function __construct(public T $value) {}
+
+    public function set(T $value): void {
+        $this->value = $value;
+    }
+
+    public function map<U>(fn(T): U $f): Box<U> {
+        return new Box($f($this->value));
+    }
+}
+
+// A caller's type parameter is not the method's parameter of the same name.
+function as_url<U>(Box<U> $b): SafeUrl {
+    return $b->map(fn(SafeUrl $x): SafeUrl => $x)->value;
+}
+
+// `is Box` does not know the type argument: nothing can be written through it.
+function poison(any $a): void {
+    if ($a is Box) {
+        $a->value = "javascript:alert(1)";
+        $a->set("javascript:alert(1)");
+        any $read = $a->value;
+        Box<any> $wide = $a;
+    }
+}
+
+// One interface reached with two type arguments.
+interface Src<T> {
+    public function get(): T;
+}
+interface UrlSrc extends Src<SafeUrl> {}
+interface StrSrc extends Src<string> {}
+class Both implements UrlSrc, StrSrc {
+    public function get(): string {
+        return "javascript:alert(1)";
+    }
+}
+
+// A method's own type parameter is not the class's parameter of that name.
+class Base<X> {
+    public function m<T>(T $x): T {
+        return $x;
+    }
+}
+class Sub<T> extends Base<int> {
+    public function __construct(public T $val) {}
+
+    public function m<V>(T $x): T {
+        return $x;
+    }
+}

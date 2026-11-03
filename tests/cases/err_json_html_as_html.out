@@ -1,0 +1,15 @@
+error: expected `Html`, found `SafeJs`
+ --> err_json_html_as_html.phv:4:11
+  |
+4 | Html $h = json_html("x\" onmouseover=alert(1) y=\"");
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: a `json_html()` value is only for `<script>` (declare it `SafeJs`); in an attribute, use `escape(json_encode($value))`
+
+error: expected `Html`, found `SafeJs`
+ --> err_json_html_as_html.phv:5:41
+  |
+5 | echo render("views/titled.phv.html", h: json_html("x"));
+  |                                         ^^^^^^^^^^^^^^
+  = note: a `json_html()` value is only for `<script>` (declare it `SafeJs`); in an attribute, use `escape(json_encode($value))`
+
+2 errors found

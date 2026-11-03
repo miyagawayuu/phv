@@ -1,0 +1,5 @@
+import std.net.HttpClient;
+
+// Started and never awaited: the script still ends only once it is done.
+HttpClient::connect("api")->getAsync("/wait");
+echo "ended";

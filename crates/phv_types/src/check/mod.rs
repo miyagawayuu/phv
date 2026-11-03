@@ -1251,14 +1251,20 @@ impl<'a> Checker<'a> {
     fn compatible_override(&self, sub: FuncId, base: FuncId, through: ClassId) -> bool {
         let (a, b) = (&self.funcs[sub as usize], &self.funcs[base as usize]);
         let Type::Class(_, own) = self.own_type(through) else { return false };
-        let view = |t: &Type, owner: Option<ClassId>| match owner {
-            Some(o) => self.member_type(t, through, &own, o),
-            None => t.clone(),
+        // Each method's own type parameters become positions first, so they
+        // match by position and never by name (a method's `T` is not the
+        // class's `T`).
+        let view = |t: &Type, f: &FuncInfo<'_>| {
+            let t = expr::instantiate(t, &f.type_params);
+            match f.class {
+                Some(o) => self.member_type(&t, through, &own, o),
+                None => t,
+            }
         };
         a.type_params.len() == b.type_params.len()
             && a.params.len() == b.params.len()
-            && a.params.iter().zip(&b.params).all(|(x, y)| view(&x.ty, a.class) == view(&y.ty, b.class))
-            && self.assignable(&view(&a.ret, a.class), &view(&b.ret, b.class))
+            && a.params.iter().zip(&b.params).all(|(x, y)| view(&x.ty, a) == view(&y.ty, b))
+            && self.assignable(&view(&a.ret, a), &view(&b.ret, b))
     }
 
     /// Counts `n` more inherited members; true (after reporting it once) when
@@ -1332,19 +1338,35 @@ impl<'a> Checker<'a> {
             }
             for (s, written, span) in supers_written {
                 let args = self.class_args(s, written, Some(cid), span);
-                if args.is_empty() {
-                    let inherited = self.classes[s as usize].super_args.clone();
-                    super_args.extend(inherited);
-                    continue;
-                }
                 let stps = self.classes[s as usize].type_params.clone();
-                let inherited: Vec<(ClassId, Vec<Type>)> = self.classes[s as usize]
+                let mut reached: Vec<(ClassId, Vec<Type>)> = self.classes[s as usize]
                     .super_args
                     .iter()
                     .map(|(k, v)| (*k, v.iter().map(|t| subst_params(t, &stps, &args)).collect()))
                     .collect();
-                super_args.extend(inherited);
-                super_args.insert(s, args);
+                if !args.is_empty() {
+                    reached.push((s, args));
+                }
+                reached.sort_by_key(|(k, _)| *k);
+                // A generic class or interface reached along two paths must
+                // have the same type arguments on both: a value seen through
+                // either is then the same type.
+                for (k, v) in reached {
+                    match super_args.get(&k) {
+                        Some(old) if *old != v => {
+                            let name = self.classes[k as usize].name.clone();
+                            let (a, b) = (self.tn(&Type::Class(k, old.clone())), self.tn(&Type::Class(k, v)));
+                            self.error(
+                                format!("`{class_name}` would be both `{a}` and `{b}`; `{name}` can have one type argument list only"),
+                                span,
+                            );
+                        }
+                        Some(_) => {}
+                        None => {
+                            super_args.insert(k, v);
+                        }
+                    }
+                }
             }
             self.classes[ci].super_args = super_args;
             self.type_params.clear();

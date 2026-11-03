@@ -345,6 +345,11 @@ fn resolve(state: &State, url_path: &str) -> Option<Target> {
 
 /// Static files are served only for these extensions, so stray source or
 /// secret files (`.php`, `.bak`, `.toml`, `.sql`, ...) in public/ are not exposed.
+/// Whether the server serves a file like `path` from public/ (by its type).
+pub fn serves_static(path: &Path) -> bool {
+    content_type(path).is_some()
+}
+
 fn content_type(path: &Path) -> Option<&'static str> {
     Some(match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
         "html" | "htm" => "text/html; charset=utf-8",

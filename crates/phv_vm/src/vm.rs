@@ -275,6 +275,8 @@ pub struct Vm {
     pub resources: Vec<Option<Box<dyn std::any::Any>>>,
     pub jit: Option<Arc<JitTable>>,
     jit_rt: JitRt,
+    /// `JitCtx::stack_limit` of the outermost native call running, or 0.
+    jit_stack_limit: usize,
     limits: Limits,
     mem_base: isize,
     deadline: Option<Instant>,
@@ -460,6 +462,7 @@ impl Vm {
             resources: Vec::new(),
             jit: None,
             jit_rt: JitRt::default(),
+            jit_stack_limit: 0,
             limits,
             mem_base: crate::alloc::thread_allocated(),
             deadline: limits.max_time.map(|d| Instant::now() + d),
@@ -662,6 +665,13 @@ impl Vm {
         rt.prog.get_or_insert_with(|| Arc::clone(&self.prog));
         rt.consts = std::mem::take(&mut self.consts);
         rt.start(args);
+        // Native code nested in this call (through the interpreter) shares the
+        // outermost call's stack limit.
+        let outermost = self.jit_stack_limit == 0;
+        if outermost {
+            let here = &raw as *const _ as usize;
+            self.jit_stack_limit = here.saturating_sub(crate::jit::JIT_STACK).max(1);
+        }
         let mut ctx = JitCtx {
             error: 0,
             depth: self.frames.len() as i64,
@@ -670,11 +680,15 @@ impl Vm {
             limits: &limits,
             detail: 0,
             rt: &mut rt,
+            stack_limit: self.jit_stack_limit as i64,
         };
         // SAFETY: the JIT creates entries only for functions it checked
         // (`phv_jit::well_formed`), the arguments match their native signature
         // (checked above), and `ctx`, `limits` and `rt` outlive the call.
         let r = unsafe { entry(&mut ctx, raw.as_ptr()) };
+        if outermost {
+            self.jit_stack_limit = 0;
+        }
         let ret = rt.finish();
         self.consts = std::mem::take(&mut rt.consts);
         self.jit_rt = rt;

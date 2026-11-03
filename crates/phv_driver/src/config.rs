@@ -426,11 +426,13 @@ pub fn check_dependencies(deps: &BTreeMap<String, Dependency>) -> Result<(), Str
     Ok(())
 }
 
-/// Package names: letters, digits and `_`, not `std` (which is the standard library).
+/// Package names: lowercase letters, digits and `_`, not `std` (which is the
+/// standard library). Lowercase only: on Windows and macOS `Greet` and `greet`
+/// would be the same directory in vendor/.
 pub fn valid_package_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         && !name.starts_with("std")
 }
 

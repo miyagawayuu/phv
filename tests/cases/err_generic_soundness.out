@@ -1,0 +1,66 @@
+error: expected `fn(U): SafeUrl`, found `fn(SafeUrl): SafeUrl`
+  --> err_generic_soundness.phv:18:20
+   |
+18 |     return $b->map(fn(SafeUrl $x): SafeUrl => $x)->value;
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: expected `never`, found `string`
+  --> err_generic_soundness.phv:24:21
+   |
+24 |         $a->value = "javascript:alert(1)";
+   |                     ^^^^^^^^^^^^^^^^^^^^^
+   = note: `is` and `catch` do not know a generic class's type arguments (`?`): nothing can be written through such a value, and it cannot be passed on as one with known type arguments
+
+error: expected `never`, found `string`
+  --> err_generic_soundness.phv:25:17
+   |
+25 |         $a->set("javascript:alert(1)");
+   |                 ^^^^^^^^^^^^^^^^^^^^^
+   = note: `is` and `catch` do not know a generic class's type arguments (`?`): nothing can be written through such a value, and it cannot be passed on as one with known type arguments
+
+error: expected `Box<any>`, found `Box<?>`
+  --> err_generic_soundness.phv:27:26
+   |
+27 |         Box<any> $wide = $a;
+   |                          ^^
+   = note: `is` and `catch` do not know a generic class's type arguments (`?`): nothing can be written through such a value, and it cannot be passed on as one with known type arguments
+
+error: `Both::get` does not match the signature of `Src::get`
+  --> err_generic_soundness.phv:37:7
+   |
+37 | class Both implements UrlSrc, StrSrc {
+   |       ^^^^
+
+error: `Both::get` does not match the signature of `Src::get`
+  --> err_generic_soundness.phv:37:7
+   |
+37 | class Both implements UrlSrc, StrSrc {
+   |       ^^^^
+
+error: `Both::get` does not match the signature of `Src::get`
+  --> err_generic_soundness.phv:37:7
+   |
+37 | class Both implements UrlSrc, StrSrc {
+   |       ^^^^
+
+error: `Both` would be both `Src<SafeUrl>` and `Src<string>`; `Src` can have one type argument list only
+  --> err_generic_soundness.phv:37:31
+   |
+37 | class Both implements UrlSrc, StrSrc {
+   |                               ^^^^^^
+
+error: `Both::get` overrides `Src::get` with an incompatible signature
+  --> err_generic_soundness.phv:38:21
+   |
+38 |     public function get(): string {
+   |                     ^^^
+   = note: overriding methods must keep the same parameter types and a compatible return type
+
+error: `Sub::m` overrides `Base::m` with an incompatible signature
+  --> err_generic_soundness.phv:52:21
+   |
+52 |     public function m<V>(T $x): T {
+   |                     ^
+   = note: overriding methods must keep the same parameter types and a compatible return type
+
+10 errors found

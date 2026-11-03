@@ -246,3 +246,14 @@ fn async_requests_are_limited() {
     let out = run_script(&host(&server(), None), "async_many", Some(Duration::from_secs(10)));
     assert!(out.contains("started 16") && out.contains("at most 16 operations"), "{out}");
 }
+
+/// Work a script started and never awaited is waited for when the script
+/// ends, so a request cannot leave it running (holding a thread and a
+/// connection) after its worker is free again.
+#[test]
+fn unawaited_requests_are_waited_for() {
+    let start = Instant::now();
+    let out = run_script(&host(&server(), None), "async_abandoned", Some(Duration::from_secs(10)));
+    assert_eq!(out, "ended");
+    assert!(start.elapsed() >= Duration::from_millis(700), "took {:?}", start.elapsed());
+}

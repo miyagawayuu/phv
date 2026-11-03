@@ -39,6 +39,11 @@ pub enum Type {
     Sql,
     /// "Not known yet" inside an expected type, e.g. a closure's return type.
     Infer,
+    /// A type argument that is not known: `is Box` and `catch` prove `Box<?>`
+    /// only. A member read through it is `any`; nothing can be written
+    /// through it (it accepts only `never`), and it is the same as no other
+    /// type, itself included, so the value cannot be passed on as a `Box<T>`.
+    Unknown,
 }
 
 impl Type {
@@ -123,6 +128,41 @@ impl Type {
         matches!(self, Type::Int | Type::Float)
     }
 
+    /// Whether a type argument in `self` is `Unknown`.
+    pub fn is_open(&self) -> bool {
+        match self {
+            Type::Unknown => true,
+            Type::List(t) => t.is_open(),
+            Type::Map(k, v) => k.is_open() || v.is_open(),
+            Type::Func(ps, r) => ps.iter().any(|p| p.is_open()) || r.is_open(),
+            Type::Union(ms) => ms.iter().any(|m| m.is_open()),
+            Type::Class(_, args) => args.iter().any(|a| a.is_open()),
+            _ => false,
+        }
+    }
+
+    /// A member's type read through a receiver with unknown type arguments:
+    /// where a value comes out (`read`, e.g. a property read or a return
+    /// value) an unknown type is `any`; where one goes in (a property write,
+    /// a parameter) it is `never`. Type arguments of classes stay unknown.
+    pub fn resolve_open(&self, read: bool) -> Type {
+        if !self.is_open() {
+            return self.clone();
+        }
+        match self {
+            Type::Unknown if read => Type::Any,
+            Type::Unknown => Type::Never,
+            Type::List(t) => Type::list(t.resolve_open(read)),
+            Type::Map(k, v) => Type::map(k.resolve_open(read), v.resolve_open(read)),
+            // A closure's parameters receive values: the other way round.
+            Type::Func(ps, r) => {
+                Type::Func(ps.iter().map(|p| p.resolve_open(!read)).collect(), Box::new(r.resolve_open(read)))
+            }
+            Type::Union(ms) => Type::union(ms.iter().map(|m| m.resolve_open(read)).collect()),
+            other => other.clone(),
+        }
+    }
+
     pub fn has_unknown(&self) -> bool {
         match self {
             Type::Infer | Type::Generic(_) => true,
@@ -159,6 +199,7 @@ impl fmt::Display for TypeDisplay<'_> {
             Type::SafeUrl => write!(f, "SafeUrl"),
             Type::SafeJs => write!(f, "SafeJs"),
             Type::Any => write!(f, "any"),
+            Type::Unknown => write!(f, "?"),
             Type::Error => write!(f, "{{unknown}}"),
             Type::List(t) => write!(f, "list<{}>", t.display(self.names)),
             Type::Map(k, v) => write!(f, "map<{}, {}>", k.display(self.names), v.display(self.names)),

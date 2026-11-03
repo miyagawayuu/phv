@@ -1,0 +1,22 @@
+<?phv
+// `break`, `continue`, `return` and `throw` cannot leave the HTML inside a
+// tag, attribute, comment or `<script>`: the output after the jump would land
+// there. (The last loop of the template, which jumps from plain text, is fine.)
+echo render("views/jump_in_tag.phv.html", ids: [1, -1], name: "n");
+
+function link(bool $short): void { ?><a href="<?phv if ($short) { return; } ?>/home">home</a><?phv }
+
+function fine(bool $short): void {
+    ?><p>x</p><?phv
+    if ($short) {
+        return;
+    }
+}
+
+foreach ([1] as $i) {
+    try {
+        ?><b title="<?phv break; ?>">x</b><?phv
+    } finally {
+        echo "";
+    }
+}

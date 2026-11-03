@@ -24,7 +24,9 @@ mod web;
 mod websocket;
 
 pub use httpclient::{check_header_name, check_header_value, check_http_url};
-pub use netdb::{session_read, session_remove, session_sweep, session_write, SessionRow};
+pub use netdb::{
+    session_insert, session_read, session_remove, session_sweep, session_update, SessionLimits, SessionRow,
+};
 pub use sys::{constant_time_eq, sha256_hex};
 pub use web::{csrf_expected, json_decode, random_hex};
 

@@ -457,6 +457,17 @@ impl Loader {
             }
             let rel: PathBuf = rest.iter().collect::<PathBuf>().with_extension("phv");
             let path = base.join(rel);
+            // A package's module must really be inside the package (not a link out of it).
+            let root_of = self.package_roots.iter().find(|(n, _)| n == segments[0]).map(|(_, d)| d.clone());
+            if let (Some(pr), Ok(c)) = (root_of, path.canonicalize()) {
+                if !c.starts_with(&pr) {
+                    self.diags.push(Diagnostic::error(
+                        format!("module `{name}` is outside the package `{}`", segments[0]),
+                        span,
+                    ));
+                    continue;
+                }
+            }
             self.imports.insert(name.clone(), usize::MAX);
             match self.load_file(path, ModuleKind::User, span, &format!("module `{name}`")) {
                 Some(i) => {
@@ -576,6 +587,24 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
     let (packages, package_deps) = package_graph(root, &config);
     let package_roots: Vec<(String, PathBuf)> =
         packages.iter().filter_map(|(n, d)| Some((n.clone(), d.canonicalize().ok()?))).collect();
+    // Imports are known by name in the whole program, so a package may not
+    // share its name with a directory or module of the project (`import
+    // lib.posts` must mean one thing), unless it is that directory.
+    let mut clashes: Vec<&String> = packages
+        .iter()
+        .filter(|(n, dir)| {
+            let own = root.join(n.as_str());
+            let same = own.canonicalize().ok().is_some_and(|o| dir.canonicalize().ok() == Some(o));
+            (own.is_dir() && !same) || root.join(format!("{n}.phv")).is_file()
+        })
+        .map(|(n, _)| n)
+        .collect();
+    clashes.sort();
+    for n in clashes {
+        messages.push(format!(
+            "the package `{n}` has the name of a directory or module of this project; rename one of them"
+        ));
+    }
     let mut allowed: Vec<PathBuf> = package_roots.iter().map(|(_, d)| d.clone()).collect();
     allowed.extend(root.canonicalize().ok());
     let mut loader = Loader {
@@ -597,6 +626,14 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
     };
     let toml = root.join("phv.toml");
     loader.deps.push(Dep::new(&toml, std::fs::read(&toml).ok().as_deref()));
+    // The packages' own [dependencies] decide what their modules may import.
+    let mut manifests: Vec<PathBuf> = loader.packages.values().map(|d| d.join("phv.toml")).collect();
+    manifests.sort();
+    for m in manifests {
+        if let Ok(text) = read_source(&m) {
+            loader.deps.push(Dep::new(&m, Some(text.as_bytes())));
+        }
+    }
     loader.add("<std>/prelude.phv".into(), None, phv_std::PRELUDE.to_string(), ModuleKind::Prelude);
     let overlaid = entry.canonicalize().ok().and_then(|c| loader.overlay.get(&c).cloned());
     let text = match overlaid.map(Ok).unwrap_or_else(|| read_source(entry)) {

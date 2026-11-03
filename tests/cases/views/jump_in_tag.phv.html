@@ -1,0 +1,5 @@
+<?phv params(list<int> $ids, string $name) ?>
+<?phv foreach ($ids as $id): ?><a href="<?phv if ($id < 0) { break; } ?>/item/<?= $id ?>">item</a><?phv endforeach; ?>
+<?phv foreach ($ids as $id): ?><a href="/item/<?= $id ?>"><?phv if ($id < 0) { continue; } ?>item</a><?phv endforeach; ?>
+<?phv try { ?><a href="<?phv throw new ValueError("x"); ?>/home">home</a><?phv } catch (ValueError $e) { ?><?= $name ?><?phv } ?>
+<?phv foreach ($ids as $id): ?><a href="/item/<?= $id ?>">item</a><?phv if ($id < 0) { break; } ?><?phv endforeach; ?>

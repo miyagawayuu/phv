@@ -188,12 +188,14 @@ async function registryPackages() {
     const signal = AbortSignal.timeout(15000);
     const res = await fetch(`https://api.github.com/repos/${REGISTRY_REPO}/contents/index`, { signal, headers: { "User-Agent": "phv-lang.org" } });
     if (!res.ok) return null;
-    const files = (await res.json()).filter((f) => /^[A-Za-z0-9_]+\.toml$/.test(f.name));
+    const files = (await res.json()).filter((f) => /^[a-z0-9_]+\.toml$/.test(f.name));
     const out = [];
     for (const f of files) {
       const text = await (await fetch(f.download_url, { signal })).text();
-      const field = (k) => (new RegExp(`^${k}\\s*=\\s*"([^"\\n]*)"`, "m").exec(text) || [])[1] || "";
-      out.push({ name: f.name.replace(/\.toml$/, ""), git: field("git"), description: field("description") });
+      // Exactly the two lines the registry's check allows, so the page shows
+      // the same `git` URL that `phv install` reads; anything else is skipped.
+      const m = /^git = "(https:\/\/[^"\\\s]+)"\r?\ndescription = "([^"\\\r\n]{1,200})"\r?\n?$/.exec(text);
+      if (m) out.push({ name: f.name.replace(/\.toml$/, ""), git: m[1], description: m[2] });
     }
     return out.sort((a, b) => a.name.localeCompare(b.name));
   } catch {

@@ -45,14 +45,53 @@ struct Locked {
     dependencies: Vec<String>,
 }
 
-/// Only plain transports; refuses `ext::` and option-looking URLs.
+/// Only plain transports; refuses `ext::`, option-looking URLs, `file://`
+/// URLs naming another machine (`file:////host/share`, which Windows would
+/// reach over SMB), and characters that a URL does not need (so that a URL
+/// copied into phv.lock or a shell is plain text).
 fn safe_git_url(url: &str) -> bool {
     let ok_scheme = url.starts_with("https://")
         || url.starts_with("ssh://")
-        || url.starts_with("file://")
+        || (url.starts_with("file:///") && !url.starts_with("file:////") && !url.contains('\\'))
         || (url.contains('@') && url.contains(':') && !url.contains("://"));
-    ok_scheme && !url.starts_with('-') && !url.contains("::") && !url.chars().any(|c| c.is_control() || c == ' ')
+    ok_scheme
+        && !url.starts_with('-')
+        && !url.contains("::")
+        && url.len() <= 500
+        && url.chars().all(|c| c.is_ascii_alphanumeric() || "-._~:/@%+".contains(c))
 }
+
+/// What the packages of packages and registry entries may name: public
+/// repositories over https. Other transports (ssh offers the user's keys,
+/// `file://` reads the user's disk) are for the project's own phv.toml.
+/// A local registry (`PHV_REGISTRY=file:///...`, for offline mirrors and
+/// tests) may also name local repositories.
+fn public_git_url(url: &str) -> bool {
+    let local_registry = std::env::var("PHV_REGISTRY").is_ok_and(|r| r.starts_with("file:///"));
+    (url.starts_with("https://") || (local_registry && url.starts_with("file:///"))) && safe_git_url(url)
+}
+
+/// True for a symbolic link, a junction or another reparse point: the
+/// installer never writes through one (a repository could commit `vendor`
+/// or `phv.lock` as a link to somewhere else).
+fn is_link(p: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(p) else { return false };
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Packages one install may bring in.
+const MAX_PACKAGES: usize = 500;
 
 /// A tag, branch or commit name that cannot be mistaken for a git option.
 fn safe_rev(rev: &str) -> bool {
@@ -76,6 +115,9 @@ fn git(args: &[&str], dir: Option<&Path>) -> Result<String, String> {
     cmd.args(["-c", &hooks, "-c", "core.fsmonitor=false", "-c", "advice.detachedHead=false"]);
     cmd.args(["-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always"]);
     cmd.args(["-c", "protocol.file.allow=always", "-c", "submodule.recurse=false"]);
+    // Links in a package are checked out as plain files holding the target's
+    // name: a package cannot point at files outside itself.
+    cmd.args(["-c", "core.symlinks=false"]);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     if let Some(d) = dir {
         cmd.arg("-C").arg(d);
@@ -152,8 +194,8 @@ impl Installer<'_> {
             git: String,
         }
         let e: Entry = toml::from_str(&entry).map_err(|_| format!("the registry entry of \"{name}\" is invalid"))?;
-        if !safe_git_url(&e.git) {
-            return Err(format!("the registry entry of \"{name}\" has an unsafe git URL"));
+        if !public_git_url(&e.git) {
+            return Err(format!("the registry entry of \"{name}\" does not give an https:// git URL"));
         }
         Ok(e.git)
     }
@@ -264,7 +306,10 @@ impl Installer<'_> {
             None => self.registry_url(name)?,
         };
         if !safe_git_url(&url) {
-            return Err(format!("refusing git URL \"{url}\" (use https://, ssh:// or file://)"));
+            return Err(format!("refusing git URL \"{url}\" (use https://, ssh:// or file:///)"));
+        }
+        if by != "phv.toml" && !public_git_url(&url) {
+            return Err(format!("package \"{by}\" names \"{name}\" by a git URL that is not https://"));
         }
         if let Some(text) = &dep.version {
             let req = VersionReq::parse(text).map_err(|_| format!("invalid version requirement \"{text}\""))?;
@@ -283,7 +328,14 @@ impl Installer<'_> {
         let dest = self.root.join("vendor").join(name);
         let tmp = self.root.join("vendor").join(format!(".tmp-{name}-{}", std::process::id()));
         let result = (|| -> Result<String, String> {
-            std::fs::create_dir_all(self.root.join("vendor")).map_err(|e| e.to_string())?;
+            let vendor = self.root.join("vendor");
+            if is_link(&vendor) || is_link(&dest) {
+                return Err(
+                    "vendor/ (or the package's directory in it) is a link; remove it and run `phv install` again"
+                        .into(),
+                );
+            }
+            std::fs::create_dir_all(&vendor).map_err(|e| e.to_string())?;
             let _ = std::fs::remove_dir_all(&tmp);
             git(&["clone", "--quiet", "--no-checkout", "--", &url, &tmp.to_string_lossy()], None)?;
             let target = match (&c.commit, c.rev.as_deref()) {
@@ -323,14 +375,21 @@ fn cache_dir() -> PathBuf {
 }
 
 /// The `[dependencies]` of the package in `dir` (none without a phv.toml).
+/// Only a regular file of at most 1 MB is read, and its text is not echoed
+/// in errors.
 fn package_dependencies(dir: &Path) -> Result<BTreeMap<String, Dependency>, String> {
-    let Ok(text) = std::fs::read_to_string(dir.join("phv.toml")) else { return Ok(BTreeMap::new()) };
+    let path = dir.join("phv.toml");
+    let Ok(meta) = std::fs::symlink_metadata(&path) else { return Ok(BTreeMap::new()) };
+    if is_link(&path) || !meta.is_file() || meta.len() > 1 << 20 {
+        return Err("its phv.toml is not a regular file of at most 1 MB".into());
+    }
+    let text = std::fs::read_to_string(&path).map_err(|_| "its phv.toml cannot be read".to_string())?;
     #[derive(Deserialize)]
     struct Manifest {
         #[serde(default)]
         dependencies: BTreeMap<String, Dependency>,
     }
-    let m: Manifest = toml::from_str(&text).map_err(|e| format!("its phv.toml is invalid: {e}"))?;
+    let m: Manifest = toml::from_str(&text).map_err(|_| "its phv.toml is not valid TOML".to_string())?;
     check_dependencies(&m.dependencies)?;
     Ok(m.dependencies)
 }
@@ -348,6 +407,10 @@ pub fn install(dir: &Path, locked_only: bool) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let lock_path = dir.join("phv.lock");
+    if is_link(&lock_path) {
+        eprintln!("error: phv.lock is a link; remove it and run `phv install` again");
+        return ExitCode::FAILURE;
+    }
     let old: Lock = std::fs::read_to_string(&lock_path).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default();
     if let Some(bad) = old.packages.iter().find(|l| !is_commit_hash(&l.commit)) {
         eprintln!("error: {}: phv.lock has an invalid commit \"{}\"", bad.name, bad.commit);
@@ -365,7 +428,11 @@ pub fn install(dir: &Path, locked_only: bool) -> ExitCode {
                     "# Generated by `phv install`. Commit this file.\n{}",
                     toml::to_string(&new).unwrap_or_default()
                 );
-                if let Err(e) = std::fs::write(&lock_path, text) {
+                // A new file renamed over the old one: never written through a link.
+                let tmp = dir.join(format!(".phv.lock.{}", std::process::id()));
+                let written = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &lock_path));
+                if let Err(e) = written {
+                    let _ = std::fs::remove_file(&tmp);
                     eprintln!("error: cannot write phv.lock: {e}");
                     return ExitCode::FAILURE;
                 }
@@ -430,6 +497,9 @@ fn resolve(ins: &mut Installer, root_deps: &BTreeMap<String, Dependency>) -> Res
             // What this package asked for before is replaced by what it asks for now.
             for list in requests.values_mut() {
                 list.retain(|r| r.by != name);
+            }
+            if requests.len() + deps.len() > MAX_PACKAGES {
+                return Err(format!("more than {MAX_PACKAGES} packages are needed"));
             }
             for (dname, dep) in &deps {
                 if dname == &name {

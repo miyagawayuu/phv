@@ -81,7 +81,7 @@ fn in_nullsafe_chain(e: &Expr) -> bool {
 
 /// Replaces type parameters (a function's own, and a class's while it is
 /// created) with inference variables.
-fn instantiate(t: &Type, tps: &[String]) -> Type {
+pub(super) fn instantiate(t: &Type, tps: &[String]) -> Type {
     match t {
         Type::Param(n) => match tps.iter().position(|p| p == n) {
             Some(i) => Type::Generic(i as u8),
@@ -118,7 +118,7 @@ impl<'a> Checker<'a> {
     }
 
     fn assignable_inner(&self, from: &Type, to: &Type, coerce: bool) -> bool {
-        if from == to {
+        if from == to && !from.is_open() {
             return true;
         }
         match (from, to) {
@@ -128,8 +128,9 @@ impl<'a> Checker<'a> {
             (Type::Union(ms), _) => ms.iter().all(|m| self.assignable_inner(m, to, false)),
             (_, Type::Union(ts)) => ts.iter().any(|t| self.assignable_inner(from, t, coerce)),
             (Type::Int, Type::Float) => coerce,
-            // Context-checked HTML is still HTML (not the other way round).
-            (Type::SafeUrl | Type::SafeJs, Type::Html) => true,
+            // A checked URL is still HTML (not the other way round). A
+            // `json_html()` value is not: its quotes would end an attribute.
+            (Type::SafeUrl, Type::Html) => true,
             // Type arguments are invariant: `Box<int>` is not a `Box<any>`.
             (Type::Class(a, aa), Type::Class(b, ba)) => {
                 ba.is_empty() && self.is_subclass(*a, *b)
@@ -149,7 +150,7 @@ impl<'a> Checker<'a> {
     }
 
     fn same(&self, a: &Type, b: &Type) -> bool {
-        a == b || *a == Type::Error || *b == Type::Error
+        (a == b && !a.is_open()) || *a == Type::Error || *b == Type::Error
     }
 
     /// Smallest type both `a` and `b` fit in. With `widen`, `int` and `float` join to `float`.
@@ -215,6 +216,16 @@ impl<'a> Checker<'a> {
             e.add_note("use `escape($s)` to make safe HTML, or `raw($s)` if it is trusted markup");
         } else if matches!((&h.ty, target), (Type::Float, Type::Int)) {
             e.add_note("use `(int)$value` to truncate, or `round()` first");
+        } else if matches!((&h.ty, target), (Type::SafeJs, Type::Html)) {
+            e.add_note(
+                "a `json_html()` value is only for `<script>` (declare it `SafeJs`); in an attribute, use \
+                 `escape(json_encode($value))`",
+            );
+        } else if *target == Type::Never || h.ty.is_open() || target.is_open() {
+            e.add_note(
+                "`is` and `catch` do not know a generic class's type arguments (`?`): nothing can be written \
+                 through such a value, and it cannot be passed on as one with known type arguments",
+            );
         }
         HExpr { ty: Type::Error, ..h }
     }
@@ -489,7 +500,7 @@ impl<'a> Checker<'a> {
                     Some(t) => t.clone(),
                     None => {
                         let f = &self.classes[c as usize].fields[slot as usize];
-                        self.member_type(&f.ty, c, &args, f.owner)
+                        self.member_type(&f.ty, c, &args, f.owner).resolve_open(true)
                     }
                 };
                 Some((FactKey::Prop(id, slot), ty))
@@ -566,10 +577,10 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Class `c` with `any` for each type argument: what `is C` proves (type
+    /// Class `c` with unknown type arguments: what `is C` proves (type
     /// arguments are not known at run time).
     pub(crate) fn any_args(&self, c: ClassId) -> Type {
-        Type::Class(c, vec![Type::Any; self.classes[c as usize].type_params.len()])
+        Type::Class(c, vec![Type::Unknown; self.classes[c as usize].type_params.len()])
     }
 
     fn test_type(&self, test: TestKind) -> Type {
@@ -753,7 +764,8 @@ impl<'a> Checker<'a> {
                 let ho = self.expr(obj, None);
                 let f = |c: &mut Self, recv: HExpr| match c.prop_access(&recv, name, *name_span) {
                     Some((slot, f)) => {
-                        c.apply_prop_fact(HExpr { kind: HExprKind::Prop(Box::new(recv), slot), ty: f.ty, span })
+                        let ty = f.ty.resolve_open(true);
+                        c.apply_prop_fact(HExpr { kind: HExprKind::Prop(Box::new(recv), slot), ty, span })
                     }
                     None => err(span),
                 };
@@ -1207,13 +1219,10 @@ impl<'a> Checker<'a> {
         self.warn_deprecated(what, reason, owner, span);
         let info = &self.funcs[fid as usize];
         let (mut params, mut ret, fname) = (info.params.clone(), info.ret.clone(), info.name.clone());
-        if !fixed.is_empty() {
-            let (names, tys): (Vec<String>, Vec<Type>) = fixed.iter().cloned().unzip();
-            for p in params.iter_mut() {
-                p.ty = super::subst_params(&p.ty, &names, &tys);
-            }
-            ret = super::subst_params(&ret, &names, &tys);
-        }
+        // The parameters to infer become variables first: the receiver's type
+        // arguments, substituted next, may name the caller's own type
+        // parameters, which must not be captured by a method's parameter of
+        // the same name.
         let mut tps = infer.to_vec();
         tps.extend(info.type_params.iter().cloned());
         if !tps.is_empty() {
@@ -1222,8 +1231,17 @@ impl<'a> Checker<'a> {
             }
             ret = instantiate(&ret, &tps);
         }
+        if !fixed.is_empty() {
+            let (names, tys): (Vec<String>, Vec<Type>) = fixed.iter().cloned().unzip();
+            // Through a receiver whose type arguments are not known (`is Box`),
+            // parameters accept nothing that needs them, and results are `any`.
+            for p in params.iter_mut() {
+                p.ty = super::subst_params(&p.ty, &names, &tys).resolve_open(false);
+            }
+            ret = super::subst_params(&ret, &names, &tys).resolve_open(true);
+        }
         let (hargs, b) = self.call_args_b(&fname, &params, args, span);
-        let mut ret = subst(&ret, &b);
+        let mut ret = subst(&ret, &b).resolve_open(true);
         if ret.has_unknown() {
             self.error(format!("cannot infer the type parameters of `{fname}` from its arguments"), span);
             ret = Type::Error;
@@ -1568,7 +1586,9 @@ impl<'a> Checker<'a> {
                     self.error(format!("cannot modify readonly property `${name}`"), e.span)
                         .add_note("readonly properties can only be set in the constructor of their class");
                 }
-                Some((HPlace { base: HPlaceBase::Prop(Box::new(ho), slot), path: Vec::new() }, f.ty))
+                // Written through: a type argument that is not known accepts nothing.
+                let ty = f.ty.resolve_open(false);
+                Some((HPlace { base: HPlaceBase::Prop(Box::new(ho), slot), path: Vec::new() }, ty))
             }
             ExprKind::Index { base, index } => {
                 let (mut p, bty) = self.place(base)?;

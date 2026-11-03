@@ -398,7 +398,13 @@ Box<float> $f = new Box(1);       // from the declared type: Box<float>
 - Type arguments are invariant: `Box<int>` cannot be used where `Box<any>` or `Box<float>` is expected (a `Box<any>`
   could otherwise be given a string).
 - Type arguments exist only at compile time. `is` checks the class: `$x is Box` (writing `is Box<int>` is an error),
-  and narrows to `Box<any>`.
+  and narrows to `Box<?>`, a `Box` whose type argument is not known (so does `catch (Box $e)`). What is read through
+  it is `any`; nothing can be written through it (`$b->value = ...` and `$b->set(...)` are errors), and it cannot be
+  used where a `Box<T>` is expected.
+- A class reaches each generic class or interface with one list of type arguments: `class C implements UrlSrc,
+  StrSrc` is an error when one extends `Src<SafeUrl>` and the other `Src<string>`.
+- A method's own type parameters are its own: a method `m<T>` and a class parameter `T` are different types, also in
+  an override, and a caller's type parameter never takes the place of a method's parameter of the same name.
 
 ### Annotations
 
@@ -514,8 +520,9 @@ are output as is. `echo` and `<?= ?>` follow the same rules.
 - `safe_url($url)` … Returns a `SafeUrl` that lets through only `http(s)`, `mailto`, `tel`, and relative URLs, and replaces `javascript:` and others with `#`.
 - `json_html($value)` … Returns, as `SafeJs`, a JavaScript value (JSON) that is safe to place inside `<script>`.
   The `"` in strings is left as is, so the value cannot be placed inside an attribute value (a compile error; use `escape(json_encode($v))`).
-- `SafeUrl` and `SafeJs` can also be used as `Html` (not the reverse). The result of `escape()` is `Html`, so it
-  cannot be placed in a URL or inside `<script>`. This is because HTML escaping cannot stop `javascript:` or script code.
+- `SafeUrl` can also be used as `Html` (not the reverse). `SafeJs` cannot: its quotes would end an attribute, where
+  `Html` may be placed. The result of `escape()` is `Html`, so it cannot be placed in a URL or inside `<script>`. This
+  is because HTML escaping cannot stop `javascript:` or script code.
 - `Html` and `string` cannot be concatenated with `.` (the error suggests `escape()`).
 - Escaping is turned off only for the Content-Types `text/plain`, `application/json`, `text/csv`, `text/css`, `text/javascript`,
   `text/markdown`, `text/calendar`, `application/pdf`, `application/octet-stream`, and image, audio, and video types
@@ -545,6 +552,9 @@ and text such as `</scripts>` that looks like an end tag but is not one.
 
 - The bodies of functions and closures, and `if` and loop blocks, must end in the same HTML state they started in
   (leaving a `<script>` or an attribute open at the end of a block is an error). This prevents the context from drifting with call order or repetition.
+- For the same reason, `break` and `continue` must be in the HTML state where their loop began, `throw` where its
+  `try` began (or at the start of the function), and `return` at the start of the function: `<a href="<?phv if ($x)
+  { break; } ?>...` is an error, since the output after the jump would land inside the attribute.
 - Expressions and statements can be nested up to 500 levels (this prevents deeply nested source from overflowing the implementation's stack).
 
 ## 14. Web server
@@ -636,12 +646,15 @@ session()->destroy();                 // log out
 - With `[security] session_store = "db:<name>"`, sessions are kept in that database of `[databases]` (Redis, PostgreSQL
   or MySQL), shared by every server process and machine that uses it. Redis keeps each under `phv:session:<hash>` and
   expires it itself; a session whose visitor has not sent the cookie back expires after an hour at most. PostgreSQL and
-  MySQL keep them in a table `phv_sessions`, created when first needed; every 30 seconds a server removes expired
-  sessions and keeps the table within the limit below. If the database cannot be reached, the request goes on without
-  its session and a warning is logged.
-- The store holds at most 50,000 sessions (the file store also at most 256 MB). When it is full, sessions whose visitor
-  never came back are removed first, then the least recently used: a flood of requests without a cookie (each creating
-  a session) removes its own sessions, not those of returning visitors.
+  MySQL keep them in a table `phv_sessions`, created when first needed; every 30 seconds (sooner after 1,000 new
+  sessions) a server removes expired sessions and keeps the table within the limits below. If the database cannot be
+  reached, the request goes on without its session and a warning is logged.
+- In every store, a session is saved only while it still exists (a new or regenerated id only if it is new), each as
+  one atomic step: a request that finishes after a logout, in this process or another, cannot bring the session back,
+  and of two requests that regenerate the same session only one gets it.
+- The store holds at most 50,000 sessions and 256 MB of session data (Redis keeps within both as sessions are written).
+  When it is full, sessions whose visitor never came back are removed first, then the least recently used: a flood of
+  requests without a cookie (each creating a session) removes its own sessions, not those of returning visitors.
 
 ### CSRF protection
 
@@ -918,13 +931,16 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
   gives the same result. `await_all($fs)` waits for a list of them. A mistake in the request itself (an unset
   environment variable, a path that is not allowed) throws when the work is started.
 - The work stops at the script's time limit (without one: 30 seconds for HTTP and Redis, 300 for SQL), and so does
-  waiting for it. A script can have 16 operations running at once; starting more throws `RuntimeException`.
+  waiting for it. A script can have 16 operations running at once, and on one database at most half its `pool_size`
+  (at least 1); starting more throws `RuntimeException`.
 - The work's result may take a sixteenth of the memory left to the script when it starts (and at most 16 MB for an
   HTTP response); a larger result is an error. It is counted against the script's limit when it is awaited.
 - `queryAsync` / `executeAsync` on a database server use a connection of their own from the pool, so they run
   outside the script's transaction; give `pool_size` room for them. With SQLite the statement runs right away.
-- `new Future(fn(): T => ...)` defers any work: it runs once, when the future is first awaited. Work that is never
-  awaited is dropped when the script ends.
+- Work that was started and never awaited is still waited for when the script ends (until its time limit at most):
+  a request cannot leave work running after it, holding a thread and a connection.
+- `new Future(fn(): T => ...)` defers any work: it runs once, when the future is first awaited. Deferred work that is
+  never awaited does not run.
 
 ### Dates, cryptography, and encoding
 
@@ -1132,7 +1148,9 @@ phv build tools/report.phv -o report    # a script: runs it
 ahead of time and appends them, with the site's static files and phv.toml, to a copy of the phv executable. The result
 runs without the sources and without compiling at startup. It needs no other files except the directories the project
 reads and writes (`[permissions]`, a session directory), which are looked up under `--root` (default: the current
-directory). Files and directories whose names start with `.` or `_` are not included, as the server never serves them.
+directory). Only the static files the server would serve are included (not those starting with `.` or `_`, nor
+types it never serves, such as `.toml` or `.env`). phv.toml is included: keep secrets in environment variables
+(`url_env`, `headers_env`), not written in phv.toml, or they are in the executable.
 
 The bundle carries its SHA-256 and the version of phv that built it; a damaged bundle, or one from another version,
 is refused at startup. Build the executable on the platform it runs on (it is a copy of that platform's phv).
@@ -1218,7 +1236,12 @@ import textutils.strings.slugify;      // vendor/textutils/strings.phv
   and fails if it is out of date (for CI). A checked-out commit that differs from the lock is an error.
 - A module imports the modules of its own package (`import pkg.module`), of the packages it depends on, and `std`.
   The project imports only the packages in its own `[dependencies]`, not those installed for them.
-- Only `https://`, `ssh://`, `git@host:...`, and `file://` URLs are allowed.
+- Only `https://`, `ssh://`, `git@host:...`, and `file:///` URLs are allowed, made of URL characters only. Registry
+  entries and the dependencies of packages must use `https://` (a `file:///` registry may name `file:///` packages,
+  for tests).
+- Package names are lowercase letters, digits and `_`. A package cannot have the name of a directory or module of the
+  project. `phv install` refuses a `vendor/`, `vendor/<name>` or `phv.lock` that is a link, never follows links in
+  what it clones, and reads a package's phv.toml only if it is a regular file of at most 1 MB.
 - Packages are PHV source code. No package code runs at install time.
 
 ### Migration
@@ -1243,7 +1266,9 @@ It then runs the type checker and shows the places that need manual work, such a
      `(string)`, `strlen()` and `->len()`). Numbers stay in machine registers; strings live in a register window and
      are handled by the interpreter's own code, so results, error messages and memory checks are identical.
      Integer overflow, division and modulo by zero, negative shifts, out-of-range float to int conversion, recursion
-     depth, and the execution time and memory limits are checked in the JIT just as in the interpreter. Before
+     depth, and the execution time and memory limits are checked in the JIT just as in the interpreter. Native
+     recursion also stops when it would use more than 8 MB of stack (a function with a large frame can then reach a
+     smaller depth than in the interpreter). Before
      compiling, the JIT checks every instruction and the kind of every register on every path, so bytecode from the
      cache is never trusted. It can be disabled with `PHV_JIT=0`. The stack trace of an exception raised inside the JIT
      goes back only as far as the caller.

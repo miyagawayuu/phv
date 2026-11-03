@@ -155,6 +155,7 @@ fn reindent(src: &str) -> Result<String, String> {
     };
     let mut ti = 0;
     let mut blank_run = 0;
+    let mut last_kept = false;
     // Openers unmatched when the current `echo` statement began.
     let mut echo_at: Option<usize> = None;
     for (line_no, raw) in src.split_inclusive('\n').enumerate() {
@@ -208,15 +209,24 @@ fn reindent(src: &str) -> Result<String, String> {
 
         let inside =
             protected.iter().any(|(s, e, html)| (line_start > *s || (*html && line_start == *s)) && line_start < *e);
-        let content = raw.trim_end_matches(['\n', '\r']).trim();
+        let text = raw.trim_end_matches(['\n', '\r']);
+        // The end of the line is inside a string or inline HTML: its trailing
+        // spaces and its own line ending are part of the value or the output.
+        let text_end = line_start + text.len();
+        let tail_kept =
+            protected.iter().any(|(s, e, html)| *s <= text_end && (text_end < *e || (*html && text_end == *e)));
+        let own_end = &raw[text.len()..];
+        last_kept = tail_kept || inside;
+        let content = if tail_kept { text.trim_start() } else { text.trim() };
         let mixed = content.starts_with("<?")
             || line_toks.clone().any(|k| matches!(toks[k].tok, Tok::CloseTag | Tok::EchoOpen));
         if inside {
-            out.push_str(raw.trim_end_matches(['\n', '\r']));
-            out.push_str(newline);
+            out.push_str(text);
+            out.push_str(if tail_kept { own_end } else { newline });
             blank_run = 0;
             continue;
         }
+        let newline_here = if tail_kept { own_end } else { newline };
         if content.is_empty() {
             blank_run += 1;
             if blank_run <= 1 && !out.is_empty() {
@@ -226,8 +236,8 @@ fn reindent(src: &str) -> Result<String, String> {
         }
         blank_run = 0;
         if mixed {
-            out.push_str(raw.trim_end_matches(['\n', '\r']).trim_end());
-            out.push_str(newline);
+            out.push_str(if tail_kept { text } else { text.trim_end() });
+            out.push_str(newline_here);
             continue;
         }
         if continues {
@@ -237,13 +247,17 @@ fn reindent(src: &str) -> Result<String, String> {
         out.push_str(&"    ".repeat(level));
         out.push_str(extra);
         out.push_str(content);
-        out.push_str(newline);
+        out.push_str(newline_here);
     }
-    while out.ends_with(&format!("{newline}{newline}")) {
-        out.truncate(out.len() - newline.len());
-    }
-    if !out.ends_with(newline) {
-        out.push_str(newline);
+    // A file that ends in inline HTML (or inside a string) ends as it did:
+    // its last characters are output.
+    if !last_kept {
+        while out.ends_with(&format!("{newline}{newline}")) {
+            out.truncate(out.len() - newline.len());
+        }
+        if !out.ends_with(newline) {
+            out.push_str(newline);
+        }
     }
     Ok(out)
 }
@@ -510,6 +524,22 @@ mod tests {
         let want = "<?phv\nfunction f(int $x): int {\n    if ($x > 0) {\n        return $x;\n    }\n\n    return 0;\n}\n$s = \"multi\n   line\";\n$y = $obj\n    ->a()\n    ->b();\n";
         assert_eq!(format_source(src).unwrap(), want);
         assert_eq!(format_source(want).unwrap(), want);
+    }
+
+    /// What strings hold and what inline HTML outputs stays as it is: spaces
+    /// before a newline inside a string, each line ending inside a string,
+    /// and the end of a file that ends in HTML.
+    #[test]
+    fn keeps_string_contents_and_trailing_html() {
+        let src = "<?phv\n$s = \"abc   \nxyz\";\n";
+        assert_eq!(format_source(src).unwrap(), src);
+        let src = "<?phv\r\n$s = \"a\nb\";\r\necho $s;\r\n";
+        assert_eq!(format_source(src).unwrap(), src);
+        for src in ["<?phv echo 1; ?>tail", "<?phv echo 1; ?>tail  ", "<?phv echo 1; ?>\n\n\n"] {
+            assert_eq!(format_source(src).unwrap(), src);
+        }
+        let src = "<?phv echo 1; ?>text  \n<?phv echo 2;\n";
+        assert_eq!(format_source(src).unwrap(), src);
     }
 
     #[test]

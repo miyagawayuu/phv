@@ -164,17 +164,29 @@ pub(crate) fn with_deadline<T: Send + 'static>(
     until: Instant,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, String> {
-    if PENDING.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING {
-        PENDING.fetch_sub(1, Ordering::SeqCst);
+    with_deadline_in(&PENDING, until, work)
+}
+
+/// `with_deadline`, counting the work in `pending` (at most `MAX_PENDING`):
+/// work that can hang for long (the MySQL driver's connect, when a server
+/// accepts but never answers) has its own count, so it cannot use up the
+/// slots of name lookups.
+pub(crate) fn with_deadline_in<T: Send + 'static>(
+    pending: &'static AtomicUsize,
+    until: Instant,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    if pending.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING {
+        pending.fetch_sub(1, Ordering::SeqCst);
         return Err("too many network connections are being set up".into());
     }
     let (send, recv) = std::sync::mpsc::sync_channel(1);
     let spawned = std::thread::Builder::new().stack_size(256 << 10).spawn(move || {
         let _ = send.send(work());
-        PENDING.fetch_sub(1, Ordering::SeqCst);
+        pending.fetch_sub(1, Ordering::SeqCst);
     });
     if spawned.is_err() {
-        PENDING.fetch_sub(1, Ordering::SeqCst);
+        pending.fetch_sub(1, Ordering::SeqCst);
         return Err("cannot start the connection".into());
     }
     recv.recv_timeout(until.saturating_duration_since(Instant::now())).map_err(|_| "timed out".to_string())
@@ -284,5 +296,21 @@ mod tests {
         std::thread::sleep(Duration::from_secs(2));
         let local = resolve("localhost", 80, Instant::now() + Duration::from_secs(5)).unwrap();
         assert!(local.iter().all(|a| a.ip().is_loopback()), "{local:?}");
+    }
+
+    /// Work counted on its own (MySQL connects to a server that never
+    /// answers) cannot use up the slots of name lookups.
+    #[test]
+    fn hanging_work_of_its_own_kind_leaves_lookups_alone() {
+        static OWN: AtomicUsize = AtomicUsize::new(0);
+        let stuck: Vec<_> = (0..MAX_PENDING + 2)
+            .map(|_| {
+                with_deadline_in(&OWN, Instant::now() + Duration::from_millis(10), || {
+                    std::thread::sleep(Duration::from_secs(2))
+                })
+            })
+            .collect();
+        assert!(stuck.iter().any(|r| r.as_ref().is_err_and(|e| e.starts_with("too many"))), "{stuck:?}");
+        assert_eq!(with_deadline(Instant::now() + Duration::from_secs(1), || 7), Ok(7));
     }
 }

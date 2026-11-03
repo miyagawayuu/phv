@@ -82,7 +82,7 @@ fn check_memory_limit(host: &Arc<Host>, name: &str) {
 /// Statements started with `*Async` take connections of their own, so the
 /// pool has room for them; the two one-second statements run at the same time.
 fn check_async(url: &str, name: &str) {
-    let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 4 };
+    let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 8 };
     let host =
         Arc::new(Host { root: root(), databases: BTreeMap::from([("main".to_string(), spec)]), ..Host::default() });
     let start = std::time::Instant::now();
@@ -146,6 +146,18 @@ fn redis() {
     }
     assert!(!phv_std::ratelimit::hit_shared(&shared, "app:other", 3, minute, until).unwrap().0);
     assert!(phv_std::ratelimit::hit("app:other", 3, minute), "the process's own counters were used");
+    phv_std::ratelimit::reset_shared(&shared, "app:other", until).unwrap();
+    assert!(phv_std::ratelimit::hit_shared(&shared, "app:other", 3, minute, until).unwrap().0);
+
+    // Two windows of one key count apart, and one reset (a single key on the
+    // server, never a scan of all keys) forgets both.
+    let second = Duration::from_secs(1);
+    assert!(phv_std::ratelimit::hit_shared(&shared, "app:two", 1, minute, until).unwrap().0);
+    assert!(phv_std::ratelimit::hit_shared(&shared, "app:two", 1, second, until).unwrap().0);
+    assert!(!phv_std::ratelimit::hit_shared(&shared, "app:two", 1, minute, until).unwrap().0);
+    phv_std::ratelimit::reset_shared(&shared, "app:two", until).unwrap();
+    assert!(phv_std::ratelimit::hit_shared(&shared, "app:two", 1, minute, until).unwrap().0);
+    phv_std::ratelimit::reset_shared(&shared, "app:two", until).unwrap();
     phv_std::ratelimit::reset_shared(&shared, "app:other", until).unwrap();
 }
 

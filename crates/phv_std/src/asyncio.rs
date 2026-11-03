@@ -7,6 +7,10 @@
 //! Memory used by the work is not counted by the allocator of the script's
 //! thread: each kind of work has a byte budget instead, taken from the memory
 //! left to the script when it starts.
+//!
+//! Work that is never awaited is still waited for when the script ends (until
+//! its deadline at most), so a request cannot leave work running after it:
+//! the work keeps the request's worker, and its connection, busy until done.
 
 use crate::{int, R};
 use phv_vm::{Value, Vm};
@@ -18,7 +22,7 @@ use std::time::{Duration, Instant};
 const MAX_PER_SCRIPT: usize = 16;
 
 /// Work running in the whole process (each holds a thread).
-const MAX_RUNNING: usize = 256;
+const MAX_RUNNING: usize = 1024;
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
 
 /// What background work produced, in data that can cross threads.
@@ -32,21 +36,58 @@ enum Task {
     Running {
         rx: mpsc::Receiver<Outcome>,
         until: Instant,
+        /// The database whose pool the work takes a connection from.
+        pool: Option<String>,
     },
     /// The result, kept so that awaiting again gives it again.
     Done(Result<Value, (&'static str, String)>),
 }
 
+impl Drop for Task {
+    /// Work dropped unawaited (when the script ends) is waited for.
+    fn drop(&mut self) {
+        if let Task::Running { rx, until, .. } = self {
+            let left = until.saturating_duration_since(Instant::now());
+            if !left.is_zero() {
+                let _ = rx.recv_timeout(left + Duration::from_secs(1));
+            }
+        }
+    }
+}
+
 /// Runs `work` on its own thread and returns the handle `await()` takes.
 /// The work must end by `until` on its own; waiting stops there too.
-pub(crate) fn start(vm: &mut Vm, until: Instant, work: impl FnOnce() -> Outcome + Send + 'static) -> R {
-    let running =
-        vm.resources.iter().flatten().filter(|r| matches!(r.downcast_ref(), Some(Task::Running { .. }))).count();
-    if running >= MAX_PER_SCRIPT {
+/// `pool` names the database (and the size of its pool) the work takes a
+/// connection from: a script may use at most half of a pool at once.
+pub(crate) fn start(
+    vm: &mut Vm,
+    until: Instant,
+    pool: Option<(String, usize)>,
+    work: impl FnOnce() -> Outcome + Send + 'static,
+) -> R {
+    let running: Vec<&Option<String>> = vm
+        .resources
+        .iter()
+        .flatten()
+        .filter_map(|r| match r.downcast_ref() {
+            Some(Task::Running { pool, .. }) => Some(pool),
+            _ => None,
+        })
+        .collect();
+    if running.len() >= MAX_PER_SCRIPT {
         return Err(vm.throw(
             "RuntimeException",
             format!("at most {MAX_PER_SCRIPT} operations can run at once; await some of them first"),
         ));
+    }
+    if let Some((name, size)) = &pool {
+        let max = (size / 2).max(1);
+        if running.iter().filter(|p| p.as_ref() == Some(name)).count() >= max {
+            return Err(vm.throw(
+                "RuntimeException",
+                format!("at most {max} operations on the database \"{name}\" can run at once (half its pool); await some of them first"),
+            ));
+        }
     }
     if RUNNING.fetch_add(1, Ordering::SeqCst) >= MAX_RUNNING {
         RUNNING.fetch_sub(1, Ordering::SeqCst);
@@ -61,7 +102,7 @@ pub(crate) fn start(vm: &mut Vm, until: Instant, work: impl FnOnce() -> Outcome 
         RUNNING.fetch_sub(1, Ordering::SeqCst);
         return Err(vm.throw("RuntimeException", "cannot start a background operation"));
     }
-    vm.resources.push(Some(Box::new(Task::Running { rx, until })));
+    vm.resources.push(Some(Box::new(Task::Running { rx, until, pool: pool.map(|p| p.0) })));
     Ok(Value::Int(vm.resources.len() as i64 - 1))
 }
 
@@ -86,9 +127,9 @@ pub fn wait(vm: &mut Vm, a: &[Value]) -> R {
         }
         None => return Err(vm.throw("ValueError", "not a background operation")),
     };
-    let result = match task {
-        Task::Done(r) => r,
-        Task::Running { rx, until } => {
+    let result = match &task {
+        Task::Done(r) => r.clone(),
+        Task::Running { rx, until, .. } => {
             // A little past the work's own deadline, so its error arrives first.
             let left = until.saturating_duration_since(Instant::now()) + Duration::from_secs(1);
             match rx.recv_timeout(left) {
@@ -100,6 +141,12 @@ pub fn wait(vm: &mut Vm, a: &[Value]) -> R {
             }
         }
     };
+    // Done, or waited for past its deadline: dropping it waits no longer.
+    let mut task = task;
+    if let Task::Running { until, .. } = &mut task {
+        *until = Instant::now();
+    }
+    drop(task);
     vm.resources[i as usize] = Some(Box::new(Task::Done(result.clone())));
     vm.check_limits()?;
     match result {

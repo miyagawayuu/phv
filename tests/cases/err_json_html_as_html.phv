@@ -1,0 +1,5 @@
+<?phv
+// A `json_html()` value is for `<script>` only: it is not `Html`, whose
+// values can be placed in attributes (the JSON's quotes would end one).
+Html $h = json_html("x\" onmouseover=alert(1) y=\"");
+echo render("views/titled.phv.html", h: json_html("x"));

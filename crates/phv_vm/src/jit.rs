@@ -28,7 +28,14 @@ pub struct JitCtx {
     /// More about the error: the bits of the float `JIT_ERR_FLOAT_TO_INT` could not convert.
     pub detail: i64,
     pub rt: *mut JitRt,
+    /// The lowest stack address native code may use: a function entered below
+    /// it fails as too deep (depth alone does not bound large frames).
+    pub stack_limit: i64,
 }
+
+/// Native stack the JIT's code may use below the outermost native call.
+/// Scripts run on threads with more (16 MB for server workers, 64 MB for the CLI).
+pub const JIT_STACK: usize = 8 << 20;
 
 pub const JIT_ERR_OVERFLOW: i64 = 1;
 /// `%` by zero (int or float).

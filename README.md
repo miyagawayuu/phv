@@ -56,7 +56,7 @@ echo greet($name);                                 // HTML-escaped automatically
     hard links are not followed, and paths cannot be swapped between the check and the use.
   - **Limits**: memory, time and recursion depth are limited.
   - **No dynamic execution**: there is no `eval` and no variable variables.
-  - The results of four security audits are in [docs/security-audit.md](docs/security-audit.md).
+  - The results of five security audits are in [docs/security-audit.md](docs/security-audit.md).
     To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - **Speed**: a register-based bytecode VM specialized by type, a Cranelift JIT, and an on-disk bytecode cache.
 - **Tools**: test runner, formatter, Language Server, package manager, and a migration tool from PHP.
