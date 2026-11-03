@@ -3,9 +3,9 @@
 English | [日本語](security-audit.ja.md)
 
 This report consolidates four audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), and §9 covers what was added up to v0.4.0.
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, and §10 the follow-up on the residual risks.
 
-Date: 2026-11-02 (§9: 2026-11-03)
+Date: 2026-11-02 (§9, §10: 2026-11-03)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -319,3 +319,42 @@ All PoCs were rerun against the fixed build. Regression tests were added for the
 and database reset (`tests/db`, run in CI against PostgreSQL, MySQL and Redis), the template contexts (`tests/cases`),
 the session flood, the deadline socket, URL, path, header and chunk parsing, and the fuzzer (1,500 mutations per
 program, also through the editor analysis).
+
+## 10. Follow-up on the Residual Risks (after v0.4.1)
+
+Date: 2026-11-03. The residual risks of §5, §7 and §9 were revisited; each was fixed or kept with its reason. Reading
+the code for them turned up one new problem (N2) and showed that one risk was larger than described (R2'').
+
+| # | Risk | Fix | Verified |
+|---|---|---|---|
+| N2 | (New, Medium) A template could end inside a tag, attribute, comment, raw-text element or `<svg>`, and its output was still `Html`. Joining it with another `Html` value (`render(...) . escape($u)`) put that value at the start of a URL, in a `<script>`, and so on, without the context check | A template must end outside every tag, comment, raw-text element and foreign content (compile error otherwise). Every source of `Html` except `raw()` is now a complete fragment, so joining them keeps each value in the context it was checked in | `tests/cases/err_template_end.phv`; all example sites and templates still compile |
+| R2'' | §4's SQLite check ran before and after `Database::open`, but SQLite opens `-journal` / `-wal` at every transaction and `-shm` outside `xOpen`, and the Windows VFS follows links (`SQLITE_OPEN_NOFOLLOW` only works on Unix, for the main file). The gap was every transaction, not a small window at open | Databases are opened through a thin VFS (`phv_std/src/db/vfs.rs`) that forwards all I/O to the default one and checks each file SQLite opens by name right after the open, through SQLite's own handle on Windows (not a reparse point, one link, final path as expected); `-shm` is checked (and held on Windows) before its first mapping. On Unix SQLite already refuses symbolic links; hard links are refused by checking the name after the open | Tests plant a symbolic and a hard link at `-journal` and `-shm`: the write fails and the target is unchanged (Windows with the symlink privilege, and Linux). The same tests fail with the default VFS. 8 threads × DELETE and WAL mode: no errors |
+| R6 | Rate limits were counted per process | `[security] rate_limit_store` names a Redis database; `rate_limit()`, `rate_limit_reset()` and `requests_per_minute` then count in fixed windows on that server (`INCR` + `PEXPIRE`, hashed keys under `phv:ratelimit:`). If it cannot be reached, `rate_limit()` refuses and the per-client limit counts in the process, with a log line | Two `phv serve` processes on one Redis: 3 requests allowed across both, then 429 from either. `tests/db/redis_ratelimit.phv` (CI) and a test with an unreachable store |
+| R7 | Name lookups had no deadline | Lookups (and the MySQL driver's connect, which looks the host up itself) run on a helper thread that is given up on at the deadline; at most 32 abandoned at once. PostgreSQL connects to the addresses PHV looked up | Unit test with work that never finishes: it ends at the deadline, and the cap applies |
+| R8 | A page's output was held in memory up to its request's memory limit, for each of up to 1024 connections | At most `[server] workers` scripts run at once (two per CPU, at least 8; 10 seconds' wait, then 503). Output waiting to be sent is counted until the connection has written it; above `workers` × `memory_limit_mb`, new scripts get 503 with `Retry-After` | HTTP test with one worker: the second request gets 503 after 10 seconds, static files are still served. 80 parallel clients that do not read a 4 MB page: peak 35 MB with 2 workers |
+| R9 | The file session store evicted by age only (R4-18 covered the memory store) | New sessions are `n-<hash>.json` until their cookie comes back, then renamed to `<hash>.json`; the sweep removes `n-` files first, from the directory listing alone | A flood past the limits keeps the returning visitor's file even when it is the oldest (the test fails with the old order) |
+| R10 | `phv lsp` analysed every change as it arrived and ignored `$/cancelRequest` | Messages are read on their own thread (at most about 64 MiB unprocessed). Each batch applies the text changes, answers requests in order and checks each changed document once; cancelled requests get `RequestCancelled` | 100 back-to-back `didChange` give one `publishDiagnostics`; a cancelled completion gets -32800 |
+| R11 | Actions were referenced by tag; the deploy job resolved wrangler's dependencies (with install scripts) while holding the Cloudflare token; `cargo-audit` was the latest version | Every action is pinned to the commit of its release (Dependabot updates the pins). wrangler 4.151.1 comes from a lockfile in `.github/deploy`, installed with `npm ci --ignore-scripts` in a step without the token. `cargo-audit` 0.22.2 | The YAML parses; every `uses:` is a 40-hex SHA; `npm ci --ignore-scripts` gives a working wrangler |
+
+The owner settings listed in §9 were applied on 2026-11-03: the `marketplace` environment needs a reviewer and only
+deploys from `v*` tags, a ruleset lets only admins create, move or delete `v*` tags, and Dependabot security updates,
+secret scanning and push protection are on. `.github/dependabot.yml` keeps the actions and the deploy tooling current.
+
+### Kept, with reasons
+
+| Item | Reason |
+|---|---|
+| `raw()` and source-order context detection (§5) | `raw()` is the documented way to output trusted markup and is the user's responsibility; the default CSP stops injected scripts. With N2, every other `Html` value is a complete fragment |
+| CSRF assumes HTTPS and `secure_cookies` in production; the Content-Type list (§7) | Documented in the spec; browsers render none of the listed types as HTML |
+| Dependencies with a `path` outside the project are read by the editor (§9) | A supported feature (shared code next to the project). Only `.phv` module files are read, regular files of at most 8 MB, and nothing leaves the machine |
+| Unix: a hard link swapped in and back out between SQLite's open and the name check (R2'') | Needs write access to the database directory, which other users cannot have (`o+w` directories are refused) |
+| Windows: a symbolic link at `-journal` to a missing file lets Windows create that empty file before the check closes it (R2'') | No data is written to it, and file symbolic links need administrator rights or Developer Mode |
+| Abandoned name lookups keep a thread until the OS gives up (R7) | At most 32 at once; beyond that, connections fail at once instead of waiting |
+
+### Verification
+
+All new tests pass on Windows and on Linux (Docker), with clippy (`-D warnings`) and rustfmt; `tests/db` passed against
+PostgreSQL 17, MySQL 8.4 and Redis 7, and the fuzzer ran 1,500 mutations per program. Regression tests: the template
+end check (`tests/cases`), the journal and `-shm` links (`phv_std` `db::vfs`), the shared rate limit and an unreachable
+store (`tests/db`, run in CI against Redis), the lookup deadline (`netio`), the worker limit (`phv_server` HTTP test)
+and counted output, the file session flood (`session`), and the batched and cancelled LSP messages (`lsp`).

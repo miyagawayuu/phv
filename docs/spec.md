@@ -1,4 +1,4 @@
-# PHV Language Specification (v0.2)
+# PHV Language Specification
 
 English | [日本語](spec.ja.md)
 
@@ -431,6 +431,9 @@ echo render("views/layout.phv.html", title: "Home", body: $html);
 - A template declares typed parameters with `params(...)`. Calls to `render()` are type-checked at compile time.
 - The path given to `render()` is a string literal, relative to the project root (`..` is not allowed). The extension is `.phv.html`.
 - `render()` returns `Html`, so the result can be passed directly to another template and embedded there (layouts).
+- A template must close everything it opens: it cannot end inside a tag, an attribute, a comment, a `<script>` /
+  `<style>` / `<textarea>` element or `<svg>` / `<math>` (compile error). `Html` values can be joined with `.`, and a
+  template that ended at `<a href="` would put the next value at the start of a URL without the check above.
 
 ## 13. Output and escaping
 
@@ -502,8 +505,14 @@ phv serve examples/site --port 8080
   receiving the body 30 seconds, 1024 concurrent connections, 1000 query and form fields. A connection is closed when the
   client accepts no data for 30 seconds. Static files (and `response()->file()`) are sent from disk as they are read,
   so they do not take memory.
+- At most `[server] workers` scripts run at once (default: two per CPU, at least 8); a request waits up to 10 seconds
+  for one. A request that cannot get one in time, or that arrives while the output waiting to be sent to clients is
+  more than the workers could produce (`workers` × `memory_limit_mb`), gets `503 Service Unavailable` with
+  `Retry-After: 5`. Static files do not need a worker. So the memory a server uses stays around twice
+  `workers` × `memory_limit_mb`, however many clients connect.
 - If `[security] requests_per_minute` is set, the number of requests accepted per minute from a single client address is limited to that number
-  (beyond it, the response is `429 Too Many Requests` with `Retry-After`). The default is unlimited.
+  (beyond it, the response is `429 Too Many Requests` with `Retry-After`). The default is unlimited. With
+  `[security] rate_limit_store`, all server processes share the count (see "Rate limiting").
 - Headers sent by default: `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`,
   `Referrer-Policy: strict-origin-when-cross-origin`, and Content-Security-Policy (see "Content-Security-Policy" below).
   HSTS if `secure_cookies = true`. `Cache-Control: private, no-store` on responses that use sessions or cookies, or
@@ -562,10 +571,11 @@ session()->destroy();                 // log out
 - By default, sessions are stored in memory and are lost when the server restarts. If you set a directory in the project,
   as in `[security] session_store = "sessions/"`, each session is stored in its own file. Sessions then survive restarts and can be shared by
   multiple server processes that use the same directory. File names are hashes of the IDs, so the IDs cannot be learned from a directory listing.
-  A directory inside `public/` cannot be specified.
-- The store holds at most 50,000 sessions. When it is full, sessions whose visitor never came back are removed first,
-  then the least recently used: a flood of requests without a cookie (each creating a session) removes its own sessions,
-  not those of returning visitors.
+  A directory inside `public/` cannot be specified. A new session's file is named `n-<hash>.json` until its visitor
+  sends the cookie back, and is then renamed to `<hash>.json`.
+- The store holds at most 50,000 sessions (the file store also at most 256 MB). When it is full, sessions whose visitor
+  never came back are removed first, then the least recently used: a flood of requests without a cookie (each creating
+  a session) removes its own sessions, not those of returning visitors.
 
 ### CSRF protection
 
@@ -810,8 +820,8 @@ when the body is not JSON).
 - **TLS (`https://`) is required for every host except `localhost`**, with the server certificate checked against the
   public CAs. `tls = false` allows `http://` to such a host.
 - Each request uses its own connection and waits at most until the script's time limit (30 seconds when it has none),
-  whatever the server sends: every read and write stops at that deadline, and at most 10 interim (`1xx`) responses
-  are skipped. Request and response bodies are at most 16 MB. The body is read as UTF-8 text.
+  whatever the server sends: the name lookup, every read and every write stop at that deadline, and at most 10
+  interim (`1xx`) responses are skipped. Request and response bodies are at most 16 MB. The body is read as UTF-8 text.
 - Connection failures and network errors raise `NetworkError`, naming the service but never its URL, host or headers
   (errors are described in fixed words, such as "the server's TLS certificate is not valid"). An
   unset `url_env` or `headers_env` variable is reported when a request is sent, so `phv check` works without the
@@ -866,6 +876,11 @@ rate_limit_reset("login:" . ip_group(request()->ip));
 
 - `rate_limit($key, $max, $seconds)` counts one use and returns `true` if the key has not yet reached `$max` in the current window,
   and returns `false` if it has. Counters are shared within the server process and are lost on restart.
+- To share the counters between server processes (or machines), name a Redis database from `[databases]` in
+  `[security] rate_limit_store`. `rate_limit()`, `rate_limit_reset()` and `requests_per_minute` then count on that
+  server, in keys starting with `phv:ratelimit:` that expire with their window. If the server cannot be reached,
+  `rate_limit()` returns `false` (a limit that cannot be counted refuses), `rate_limit_reset()` throws
+  `DatabaseError`, and `requests_per_minute` counts in the process; each failure is logged.
 - The same key is counted separately for each window length (you can apply both 5 per minute and 50 per day). When there are more than 100,000 keys,
   keys that have not reached their limit are discarded first, so using a large number of keys does not release keys that are currently limited.
 - `requests_per_minute` counts IPv6 addresses grouped by /64. Do the same in keys: `ip_group($ip)` returns the /64 of
@@ -911,6 +926,10 @@ memory_limit_mb = 128   # per request (one execution)
 csp = "default"         # "off" or a custom policy that may contain {nonce}
 requests_per_minute = 0 # limit per client address (0 means unlimited)
 session_store = "memory"  # or a directory ("sessions/")
+rate_limit_store = "cache"  # count rate limits on this Redis database (default: in the process)
+
+[server]
+workers = 16            # scripts running at once (default: two per CPU, at least 8)
 
 [permissions]
 write = ["data/"]
@@ -1067,11 +1086,14 @@ It then runs the type checker and shows the places that need manual work, such a
 | Memory | 128 MB (`[security] memory_limit_mb`) | Fatal error |
 | Call depth | 10,000 | Fatal error |
 | Request body | 8 MB | 413 |
+| Scripts running at once (`serve`) | two per CPU, at least 8 (`[server] workers`) | waits up to 10 seconds, then 503 |
+| Output waiting to be sent (`serve`) | `workers` × `memory_limit_mb` | 503 |
 | Source file (module, template, script) | 8 MB | Compile error |
 | Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits) |
 
-`unsafe` is used only in the allocator that counts memory usage (`phv_vm/src/alloc.rs`) and in the JIT
-(`phv_jit`, for calling generated code).
+`unsafe` is used only in the allocator that counts memory usage (`phv_vm/src/alloc.rs`), in the JIT
+(`phv_jit`, for calling generated code), in calls to OS file APIs (`phv_std/src/safefs.rs`) and in the SQLite VFS
+that checks journal files (`phv_std/src/db/vfs.rs`).
 
 ## 18. Roadmap
 
@@ -1080,6 +1102,6 @@ It then runs the type checker and shows the places that need manual work, such a
 - Wider JIT coverage (functions that handle floats and strings), AOT compilation
 - Transitive dependency resolution, a package registry
 - Line wrapping in `phv fmt`
-- Rate limiting shared across multiple processes, sessions stored in a database
+- Sessions stored in a database
 
 See [security-audit.md](security-audit.md) for the results of the security audit and the remaining risks.

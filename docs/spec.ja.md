@@ -1,4 +1,4 @@
-# PHV 言語仕様 (v0.2)
+# PHV 言語仕様
 
 [English](spec.md) | 日本語
 
@@ -431,6 +431,9 @@ echo render("views/layout.phv.html", title: "Home", body: $html);
 - テンプレートは `params(...)` で型付きの引数を宣言する。`render()` の呼び出しはコンパイル時に型チェックされる。
 - `render()` のパスは文字列リテラルで、プロジェクトのルートからの相対パス(`..` は使えない)。拡張子は `.phv.html`。
 - `render()` は `Html` を返すので、別のテンプレートにそのまま渡して埋め込める(レイアウト)。
+- テンプレートは開いたものをすべて閉じる。タグ、属性、コメント、`<script>` / `<style>` / `<textarea>` 要素、
+  `<svg>` / `<math>` の途中で終わるテンプレートはコンパイルエラー。`Html` の値は `.` で連結できるので、`<a href="` で
+  終わるテンプレートがあると、次の値が上の検査を受けずに URL の先頭に入ってしまうため。
 
 ## 13. 出力とエスケープ
 
@@ -501,8 +504,13 @@ phv serve examples/site --port 8080
 - 上限: 実行時間 30 秒(`--time-limit`)、メモリ 128 MB(`[security] memory_limit_mb`)、本文 8 MB、ヘッダーの受信 10 秒、
   本文の受信 30 秒、同時接続 1024、クエリ・フォームの項目 1000 個。クライアントが 30 秒データを受け取らなければ
   接続を閉じる。静的ファイル(と `response()->file()`)はディスクから読みながら送るので、メモリを使わない。
+- 同時に実行するスクリプトは `[server] workers` 個まで(既定は CPU 数の 2 倍、最小 8)。空きを最大 10 秒待つ。
+  時間内に空かなかったリクエストと、クライアントへの送信待ちの出力が workers で作れる量(`workers` × `memory_limit_mb`)を
+  超えているときに来たリクエストには、`503 Service Unavailable` と `Retry-After: 5` を返す。静的ファイルには空きは要らない。
+  そのため、何人が接続しても、サーバーのメモリはおよそ `workers` × `memory_limit_mb` の 2 倍に収まる。
 - `[security] requests_per_minute` を書くと、1 つの接続元アドレスから 1 分間に受け付けるリクエストをその数までにする
-  (超えると `429 Too Many Requests` と `Retry-After`)。既定は無制限。
+  (超えると `429 Too Many Requests` と `Retry-After`)。既定は無制限。`[security] rate_limit_store` を書くと、
+  すべてのサーバープロセスで数を共有する(「レート制限」を参照)。
 - 既定で付けるヘッダー: `X-Content-Type-Options: nosniff`、`X-Frame-Options: SAMEORIGIN`、
   `Referrer-Policy: strict-origin-when-cross-origin`、Content-Security-Policy(下の「Content-Security-Policy」)。
   `secure_cookies = true` なら HSTS。セッションや Cookie を使うレスポンスと、CSRF トークンを含むレスポンス
@@ -561,8 +569,9 @@ session()->destroy();                 // ログアウト
 - 既定の保存先はメモリで、サーバーを再起動すると消える。`[security] session_store = "sessions/"` のように
   プロジェクト内のディレクトリを書くと、1 セッション 1 ファイルで保存する。再起動しても残り、同じディレクトリを使う
   複数のサーバープロセスで共有できる。ファイル名は ID のハッシュなので、ディレクトリの一覧から ID は分からない。
-  `public/` の中は指定できない。
-- 保存できるセッションは最大 50,000。いっぱいになると、訪問者が一度も戻ってこなかったセッションから先に消し、
+  `public/` の中は指定できない。新しいセッションのファイル名は、訪問者が Cookie を送り返すまでは `n-<hash>.json` で、
+  送り返したときに `<hash>.json` に変わる。
+- 保存できるセッションは最大 50,000(ファイルの保存先は 256 MB まで)。いっぱいになると、訪問者が一度も戻ってこなかったセッションから先に消し、
   その次に最も長く使われていないものを消す。Cookie なしのリクエストを大量に送られても(それぞれがセッションを作る)、
   消えるのはそのセッションで、戻ってくる訪問者のセッションは残る。
 
@@ -803,7 +812,7 @@ echo $res->status, " ", $res->header("content-type") ?? "", "\n", $res->body;
 - **`localhost` 以外のホストには TLS(`https://`)が必要**で、サーバー証明書は公開 CA で検証する。`tls = false` でそのホストへの
   `http://` を許す。
 - リクエストごとに新しい接続を使い、待つのはスクリプトの時間制限まで(制限がなければ 30 秒)。サーバーが何を送っても
-  同じで、読み書きはすべてその期限で止まり、途中の応答(`1xx`)は 10 個までしか読み飛ばさない。リクエストとレスポンスの
+  同じで、名前解決と読み書きはすべてその期限で止まり、途中の応答(`1xx`)は 10 個までしか読み飛ばさない。リクエストとレスポンスの
   本文は最大 16 MB。本文は UTF-8 のテキストとして読む。
 - 接続の失敗やネットワークのエラーは `NetworkError`。メッセージにはサービスの名前が出るが、URL、ホスト名、ヘッダーは出ない
   (エラーは「the server's TLS certificate is not valid」のような決まった言葉で表す)。
@@ -859,6 +868,11 @@ rate_limit_reset("login:" . ip_group(request()->ip));
 
 - `rate_limit($key, $max, $seconds)` は、そのキーの今の時間枠でまだ `$max` 回に達していなければ 1 回数えて `true`、
   達していれば `false` を返す。カウンターはサーバープロセスの中で共有され、再起動で消える。
+- サーバープロセス(やマシン)の間でカウンターを共有するには、`[databases]` の Redis の名前を
+  `[security] rate_limit_store` に書く。`rate_limit()`、`rate_limit_reset()`、`requests_per_minute` はそのサーバーで数え、
+  キーは `phv:ratelimit:` で始まり、時間枠とともに消える。サーバーに届かないとき、`rate_limit()` は `false` を返し
+  (数えられない制限は拒否する側に倒す)、`rate_limit_reset()` は `DatabaseError` を投げ、`requests_per_minute` は
+  プロセスの中で数える。失敗はそれぞれログに出る。
 - 同じキーでも時間枠の長さごとに別に数える(1 分 5 回と 1 日 50 回を両方かけられる)。キーが 10 万個を超えると、
   上限に達していないものから捨てるので、大量のキーを使っても制限中のキーは外れない。
 - `requests_per_minute` は IPv6 のアドレスを /64 ごとにまとめて数える。キーも同じようにする。`ip_group($ip)` は IPv6 の
@@ -904,6 +918,10 @@ memory_limit_mb = 128   # 1 リクエスト(1 回の実行)あたり
 csp = "default"         # "off" か、{nonce} を含められる独自のポリシー
 requests_per_minute = 0 # 接続元アドレスごとの上限(0 は無制限)
 session_store = "memory"  # またはディレクトリ("sessions/")
+rate_limit_store = "cache"  # この Redis のデータベースでレート制限を数える(既定: プロセスの中)
+
+[server]
+workers = 16            # 同時に実行するスクリプトの数(既定: CPU 数の 2 倍、最小 8)
 
 [permissions]
 write = ["data/"]
@@ -1060,11 +1078,14 @@ phv migrate legacy/page.php      # page.phv を書き出す
 | メモリ | 128 MB(`[security] memory_limit_mb`) | 致命的エラー |
 | 呼び出しの深さ | 10,000 | 致命的エラー |
 | リクエスト本文 | 8 MB | 413 |
+| 同時に実行するスクリプト(`serve`) | CPU 数の 2 倍、最小 8(`[server] workers`) | 最大 10 秒待ち、その後 503 |
+| 送信待ちの出力(`serve`) | `workers` × `memory_limit_mb` | 503 |
 | ソースファイル(モジュール、テンプレート、スクリプト) | 8 MB | コンパイルエラー |
 | 全クラスが継承するメンバーの合計 | 200,000 | コンパイルエラー(各クラスは継承したものの写しを持つ) |
 
-`unsafe` を使っているのは、メモリ使用量を数えるアロケータ(`phv_vm/src/alloc.rs`)と JIT
-(`phv_jit`、生成したコードの呼び出し)だけ。
+`unsafe` を使っているのは、メモリ使用量を数えるアロケータ(`phv_vm/src/alloc.rs`)、JIT
+(`phv_jit`、生成したコードの呼び出し)、OS のファイル API の呼び出し(`phv_std/src/safefs.rs`)、ジャーナルファイルを
+検査する SQLite の VFS(`phv_std/src/db/vfs.rs`)だけ。
 
 ## 18. 今後の予定
 
@@ -1073,6 +1094,6 @@ phv migrate legacy/page.php      # page.phv を書き出す
 - JIT の対象拡大(float・文字列を扱う関数)、AOT コンパイル
 - 推移的な依存関係の解決、パッケージレジストリ
 - `phv fmt` の行の折り返し
-- 複数プロセスで共有できるレート制限、データベースに保存するセッション
+- データベースに保存するセッション
 
 セキュリティ監査の結果と残っているリスクは [security-audit.ja.md](security-audit.ja.md) を参照。
