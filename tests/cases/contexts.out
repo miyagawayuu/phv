@@ -1,9 +1,11 @@
 <a href="https://example.com/a?b=1">safe URL in a variable</a>
-<script>var data = {"a":1,"s":"\u003c/script\u003e"}; var n = 3;</script>
+<script>var data = {"a":1,"s":"\u003c\u002fscript\u003e"}; var n = 3;</script>
 <a href="/post?id=5&q=x y">query string</a>
 <option value="1" selected>one</option>
 <ul><li class="item">a</li><li class="item"><b></li></ul>
 <a href="https://example.com/a?b=1&page=2">after a safe URL</a>
+<a href="https://example.com/a?b=1&amp;page=2">one checked URL</a>
+<script>var t = `n=${7}${{"a":1,"s":"\u003c\u002fscript\u003e"}.a}`; var r = /'"`/.test("4"); var q = (8) / {"a":1,"s":"\u003c\u002fscript\u003e"}.a; /* 5 */</script>
 <textarea></textarea><b></textarea>
 <svg><a href="https://example.com/a?b=1">svg link</a></svg>
 <p title="&quot;q&quot;">a<br>

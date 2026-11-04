@@ -182,6 +182,8 @@ struct FnC<'a> {
     too_big: bool,
     /// The function's source file (statements from other files are not covered).
     file: u32,
+    /// Inside statements that refuse output from the functions they call.
+    guarded: bool,
 }
 
 impl<'a> FnC<'a> {
@@ -215,6 +217,7 @@ impl<'a> FnC<'a> {
             off: f.span.start,
             too_big: false,
             file: f.span.file,
+            guarded: false,
         };
         if c.pc.call_counts {
             c.emit(Instr::Enter);
@@ -845,6 +848,23 @@ impl<'a> FnC<'a> {
             }
         }
         match s {
+            HStmt::Guarded(body) => {
+                if self.guarded {
+                    for s in body {
+                        self.stmt(s);
+                    }
+                } else {
+                    // Jumps out of such HTML are compile errors, so `EndGuard` is
+                    // reached unless an exception leaves (the VM then drops the guard).
+                    self.guarded = true;
+                    self.emit(Instr::GuardOutput);
+                    for s in body {
+                        self.stmt(s);
+                    }
+                    self.emit(Instr::EndGuard);
+                    self.guarded = false;
+                }
+            }
             HStmt::Expr(e) => {
                 let t = self.alloc();
                 self.expr_into(e, t);

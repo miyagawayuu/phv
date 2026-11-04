@@ -10,15 +10,31 @@ const MAX_CSV_CELLS: usize = 1_000_000;
 
 /// RFC 4180: fields separated by commas, rows by `\n` or `\r\n`, quoted
 /// fields may contain commas, line breaks and `""` for a quote.
-pub fn csv_parse(text: &str) -> Result<Vec<Vec<String>>, String> {
+#[cfg(test)]
+fn csv_parse(text: &str) -> Result<Vec<Vec<String>>, String> {
+    csv_parse_checked(text, || Ok(())).unwrap_or_else(|_: ()| Err(String::new()))
+}
+
+/// `csv_parse`, calling `check` every 4,096 fields: short fields build far
+/// more than their text, so a script's limits are checked as they grow.
+fn csv_parse_checked<E>(
+    text: &str,
+    mut check: impl FnMut() -> Result<(), E>,
+) -> Result<Result<Vec<Vec<String>>, String>, E> {
     let mut rows = Vec::new();
     let mut row = Vec::new();
     let mut field = String::new();
     let mut cells = 0usize;
+    let mut read = 0usize;
     let mut chars = text.chars().peekable();
     let mut quoted = false;
     let mut at_start = true;
     while let Some(c) = chars.next() {
+        // Every 64 KB of text too: a few huge fields are built from it as well.
+        read += 1;
+        if read.is_multiple_of(1 << 16) {
+            check()?;
+        }
         if quoted {
             match c {
                 '"' if chars.peek() == Some(&'"') => {
@@ -53,17 +69,20 @@ pub fn csv_parse(text: &str) -> Result<Vec<Vec<String>>, String> {
             }
         }
         if cells > MAX_CSV_CELLS {
-            return Err(format!("more than {MAX_CSV_CELLS} fields"));
+            return Ok(Err(format!("more than {MAX_CSV_CELLS} fields")));
+        }
+        if matches!(c, ',' | '\n') && cells.is_multiple_of(4096) {
+            check()?;
         }
     }
     if quoted {
-        return Err("a quoted field is not closed".into());
+        return Ok(Err("a quoted field is not closed".into()));
     }
     if !field.is_empty() || !row.is_empty() {
         row.push(field);
         rows.push(row);
     }
-    Ok(rows)
+    Ok(Ok(rows))
 }
 
 fn csv_quoted(f: &str) -> bool {
@@ -167,8 +186,23 @@ fn no_stdin(vm: &mut Vm) -> Result<(), VmError> {
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
     let f: BuiltinFn = match name {
         "csv_parse" => |vm, a| {
-            let rows = csv_parse(s(&a[0])).map_err(|e| vm.throw("ValueError", format!("csv_parse(): {e}")))?;
-            Ok(Value::list(rows.into_iter().map(|r| Value::list(r.into_iter().map(Value::str).collect())).collect()))
+            let rows = csv_parse_checked(s(&a[0]), || vm.check_limits())?
+                .map_err(|e| vm.throw("ValueError", format!("csv_parse(): {e}")))?;
+            let mut out = Vec::with_capacity(rows.len());
+            // Checked every 4,096 fields, also within one long row.
+            let mut fields = 0usize;
+            for r in rows {
+                let mut row = Vec::with_capacity(r.len());
+                for f in r {
+                    fields += 1;
+                    if fields.is_multiple_of(4096) {
+                        vm.check_limits()?;
+                    }
+                    row.push(Value::str(f));
+                }
+                out.push(Value::list(row));
+            }
+            Ok(Value::list(out))
         },
         "csv_encode" => |vm, a| {
             let rows: Vec<Vec<&str>> = list(&a[0]).iter().map(|r| list(r).iter().map(s).collect()).collect();

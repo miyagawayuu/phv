@@ -540,10 +540,47 @@ fn json_html(vm: &Vm, v: &Value) -> Result<String, VmError> {
     let mut out = String::new();
     json(vm, v, &mut out, 0)?;
     let mut safe = String::with_capacity(out.len());
+    let escape = |safe: &mut String, c: char| {
+        let mut buf = [0u16; 2];
+        for u in c.encode_utf16(&mut buf) {
+            safe.push_str(&format!("\\u{u:04x}"));
+        }
+    };
+    // Inside its strings, every character but letters and digits is written as
+    // `\uXXXX` (and `\"`, `\\` too). Outside them there are only brackets,
+    // commas, colons, numbers, `true`, `false` and `null`. So wherever the value
+    // lands in a script, it cannot end what holds it: in a '...' string,
+    // template literal, comment or regular expression there is no `'`, `` ` ``,
+    // `$`, `/` or line break; and if a "..." string written around it (by
+    // mistake) turns its strings' contents into code, they are names and
+    // numbers next to string literals, a syntax error rather than a call.
+    let (mut in_string, mut after_backslash) = (false, false);
     for c in out.chars() {
-        match c {
-            '<' | '>' | '&' | '\'' | '\u{2028}' | '\u{2029}' => safe.push_str(&format!("\\u{:04x}", c as u32)),
-            c => safe.push(c),
+        if after_backslash {
+            after_backslash = false;
+            match c {
+                '"' => safe.push_str("u0022"),
+                '\\' => safe.push_str("u005c"),
+                '/' => safe.push_str("u002f"),
+                c => safe.push(c),
+            }
+        } else if !in_string {
+            in_string = c == '"';
+            safe.push(c);
+        } else {
+            match c {
+                '"' => {
+                    in_string = false;
+                    safe.push(c);
+                }
+                '\\' => {
+                    after_backslash = true;
+                    safe.push(c);
+                }
+                c if c.is_ascii_alphanumeric() => safe.push(c),
+                c if c.is_ascii() || c.is_whitespace() || c == '\u{feff}' => escape(&mut safe, c),
+                c => safe.push(c),
+            }
         }
     }
     Ok(safe)
@@ -566,10 +603,14 @@ fn safe_url(url: &str) -> String {
     let b = cleaned.as_bytes();
     let slash = |c: u8| c == b'/' || c == b'\\';
     let ok = ok && !(b.len() >= 2 && slash(b[0]) && slash(b[1]));
-    if ok {
-        cleaned
-    } else {
+    if !ok {
         "#".into()
+    } else if !cleaned.is_empty() && !cleaned.contains([':', '/', '?', '#']) {
+        // `java` is a relative URL, but text after it could make it
+        // `javascript:`; `./java` is the same URL with its start decided.
+        format!("./{cleaned}")
+    } else {
+        cleaned
     }
 }
 
@@ -697,6 +738,7 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::str(out))
         },
         "dump" => |vm, a| {
+            vm.check_output()?;
             let mut out = String::new();
             dump_value(vm, &a[0], &mut out, 0)?;
             vm.echo(&Value::str(out));

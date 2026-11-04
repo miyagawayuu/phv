@@ -208,6 +208,10 @@ pub enum Instr {
     EchoNonce,
     PushOut,
     PopOutHtml(Reg),
+    /// Statements in HTML other than element text start: output from
+    /// functions called until `EndGuard` is refused (a runtime error).
+    GuardOutput,
+    EndGuard,
 }
 
 /// Kinds of values a natively compiled function takes and returns.

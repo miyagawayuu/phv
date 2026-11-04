@@ -2,6 +2,7 @@
 // Values in places where HTML escaping does not protect them (all errors).
 $q = "x";
 $h = escape($q);
+bool $c = true;
 ?>
 <a href="<?= htmlspecialchars($q) ?>">escaped is not a safe URL</a>
 <script>var a = <?= escape($q) ?>;</script>
@@ -26,3 +27,14 @@ $h = escape($q);
 <svg><script href="<?= safe_url($q) ?>"></script></svg>
 <meta http-equiv="refresh" content="0;url=<?= $q ?>">
 <meta content="0;url=<?= $q ?>" http-equiv="refresh">
+<script>var j = `<?= json_html($q) ?>`;</script>
+<script>var k = "<?= json_html([$q]) ?>";</script>
+<script>/* <?= json_html($q) ?> */</script>
+<script>var l = /<?= json_html($q) ?>/;</script>
+<script>var m = `${1}<?= json_html($q) ?>`; // <?= json_html($q) ?>
+</script>
+<a href="<?= safe_url($q) ?><?= $q ?>">a value after a safe URL</a>
+<a href="<?= safe_url($q) ?>&<?= $q ?>">or after a safe URL and an entity</a>
+<meta http-equiv="refresh" name="x" content="<?= $q ?>">
+<script><!--> var s = "<script>"; </script><a href=<?= json_html($q) ?>>an escape that ended at once</a>
+<a href="<?phv if ($c) { ?>j<?phv } if ($c) { ?>a<?phv } if ($c) { ?>v<?phv } if ($c) { ?> <?phv } if ($c) { ?>A<?phv } ?>javascript:<?= $q ?>">many ways to begin</a>

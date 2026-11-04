@@ -91,6 +91,24 @@ for ($j = 0; $j < 600; $j++) {
 echo parse_query(implode("&", $parts))->len();
 "#,
     );
+    // 900 KB of line breaks are 900,000 rows (v0.9.1).
+    assert_stops_at_limit("csv_parse", r#"<?phv echo count(csv_parse(str_repeat("\n", 900000)));"#);
+    // A token signed with the site's key may still carry claims of many values (v0.9.1).
+    assert_stops_at_limit(
+        "jwt_decode",
+        r#"<?phv
+$k = str_repeat("k", 32);
+// Each level holds the one below twice: 19 lists here, a million once decoded.
+list<int> $empty = [];
+any $x = $empty;
+for ($i = 0; $i < 19; $i++) {
+    $x = [$x, $x];
+}
+$token = jwt_encode(["d" => $x], $k);
+any $c = jwt_decode($token, $k);
+echo $c is map ? 1 : 0;
+"#,
+    );
     assert_stops_at_limit("group_by", "<?phv echo range(0, 299999)->groupBy(fn(int $i): int => $i)->len();");
 }
 

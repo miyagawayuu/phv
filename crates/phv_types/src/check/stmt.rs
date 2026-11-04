@@ -37,6 +37,16 @@ impl Checker<'_> {
     }
 
     pub(crate) fn stmt(&mut self, s: &Stmt, out: &mut Vec<HStmt>) {
+        if s.out.is_some() {
+            let mut inner = Vec::new();
+            self.stmt_here(s, &mut inner);
+            out.push(HStmt::Guarded(inner));
+        } else {
+            self.stmt_here(s, out);
+        }
+    }
+
+    fn stmt_here(&mut self, s: &Stmt, out: &mut Vec<HStmt>) {
         match &s.kind {
             StmtKind::Expr(e) => {
                 let h = self.expr(e, None);

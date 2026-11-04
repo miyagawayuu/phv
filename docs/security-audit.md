@@ -3,9 +3,9 @@
 English | [日本語](security-audit.ja.md)
 
 This report consolidates ten audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, and §19 the follow-up on an outside review of v0.9.0 (v0.9.1).
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, and §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1).
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20: 2026-11-05)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -934,3 +934,45 @@ second fix: over 1 GB with 800); 4 million form fields get 400 in 0.01 s at 17 M
 and `parse_query` cases of `json_and_list_builders_stay_within_the_memory_limit` (phv_driver, each held 100 MB or
 more without the fix), and `hooks_directories_are_private_and_new` (phv_cli). All tests pass on Windows, and on Linux
 and macOS in CI, with clippy (`-D warnings`) and rustfmt. Dependencies: no new crates.
+
+## 20. Follow-up: a Second Outside Review of v0.9.0 (v0.9.1)
+
+Date: 2026-11-05. A second outside review of the source, made with ChatGPT before v0.9.1 was published, reported four
+items from reading the code. Each was confirmed with a PoC and fixed; four new reviewers then attacked the fixes in
+turn, each round's findings were fixed and attacked again, and the work turned up six more. The PoCs ran the page's
+scripts in node with `alert` hooked. All the findings are older than v0.9.0, except those in earlier versions of
+the fixes (R13-7), which were never released.
+
+| # | Finding | Fix |
+|---|---|---|
+| R13-1 (High) | The HTML context check treated all of `<script>` as one place, so `json_html()` was accepted inside a JavaScript string, template literal, comment or regular expression. In `` `<?= json_html($q) ?>` `` a request value `${alert(1)}` ran, as did `"<?= json_html([$q]) ?>"` (its quotes end the string) and `/* <?= json_html($q) ?> */` (`*/`); the template's script carries the CSP nonce, so the policy did not stop it | The checker follows the script's JavaScript (strings, templates and `${}`, comments including `<!--` and `-->`, regular expressions, regex or division from the token before) and accepts `json_html()` only where an expression goes; elsewhere only numbers. Where the text alone does not decide (`}` before `/`, a block that may not run), every reading is followed and all must agree. Inside its strings, `json_html()` now writes every character but letters, digits and non-ASCII non-space characters as `\uXXXX`, so a value cannot end a string, template, comment or regular expression it lands in by mistake; in a `"..."` around it, its contents are names, a syntax error |
+| R13-2 (Medium) | After `<?= safe_url($a) ?>` a URL attribute's start was taken as decided, so `href="<?= safe_url($a) ?><?= $b ?>"` with `java` and `script:alert(1)` made a `javascript:` URL | The start stays undecided after an inserted value (`safe_url("")` is empty), so the second value must be a `SafeUrl` too; `safe_url()` returns a relative URL with no `:`, `/`, `?` or `#` as `./x` |
+| R13-3 (Low) | `csv_parse()` built up to a million fields before the script's memory limit was checked: 900 KB of line breaks held 188 MB under a 16 MB limit | The limits are checked every 4,096 fields and every 64 KB of text, and while the rows are converted |
+| R13-4 (Low) | `jwt_decode()` decoded the header and claims without the limits of `json_decode()` (R12-3): a token signed with the site's key whose claims were a nested list held 81 MB under a 16 MB limit | It uses the limited decoder |
+| R13-5 (High) | The body of a function, closure or method is checked as element text wherever it is called, so calling one that writes `<?= $s ?>` inside a `<script>`, an attribute, a URL or CSS put a request string there unchecked (`<script><?phv show($q); ?></script>` ran it). Older than v0.5.0 | A statement in HTML other than element text marks its output; a function it calls that writes to that output, and `dump()`, stop the script with a runtime error. Output into a template being rendered is not affected |
+| R13-6 (High) | An exception thrown inside a `<script>`, a tag or an attribute and caught outside it left what the `try` wrote open, and the `catch` block, checked from where the `try` began, wrote inside it: `show("` then the catch's `json_html()` ended the string and ran the value; in a tag, the catch's text became attributes | When such an exception is caught, or the `try` began inside such HTML, what the `try` wrote is dropped, so the `catch` writes where the `try` began. Other exceptions keep the output written before them |
+| R13-7 (Medium, in earlier versions of R13-1's fix) | Places where the tracker read a script differently from browsers, each letting a value in a `"..."` mistake run: postfix `++`/`--`, `)` of `if (...)` before a regular expression, `\` with CRLF, numbers inserted inside literals, `<!--` and `-->`, blocks whose `/` reads differently, `}` before `/`, properties named like keywords (`counts.in / n`, `#new`), `for await (`, comments before `(`, `break` then a line break | Each is read as browsers read it; the readings are compared in full when blocks merge; and the escaping of R13-1 makes any remaining difference a syntax error rather than code |
+| R13-8 (Low) | A URL attribute's start after a block kept only the block's prefix: in `href="<?phv if ($c) { ?>x<?phv } ?>javascript:void(<?= $q ?>)"` the start looked like `xjavascript:`; many one-character blocks overflowed the set that replaced it | The start is the set of ways the text may have begun, normalised as browsers read schemes; only those that may still become `javascript:`, `vbscript:` or `data:` are kept |
+| R13-9 (Low) | `<!-->` and `<!--->` inside a script end its escaped state at once in browsers, but not in the checker: after a later `"<script>"` in the script, the HTML that followed it was checked as script (an unquoted attribute accepted `json_html()`) | They end the escaped state at once, as in browsers |
+| R13-10 (Low) | `<meta http-equiv="refresh" name="x" content="<?= $q ?>">` took text because a `name` came before `content`, and browsers still redirect | `content` takes text only without `http-equiv`; an `http-equiv` after inserted text is a compile error |
+
+`1 -<?= json_html(-1) ?>` writes `1 --1`, a syntax error: a request value can make a page's own script fail, but no
+code runs. It is kept.
+
+### Residual Risks
+
+- The checker follows a script's JavaScript as browsers read it in ordinary code; for unusual code it may read
+  differently (it treats `<script type="module">` and scripts in SVG like other scripts). Because of the escaping of
+  `json_html()`, such a difference can make the page's script fail with a syntax error but cannot run a value.
+- Output from functions inside HTML other than element text is refused when the page runs, not when it compiles.
+
+### Verification
+
+The 55 PoCs of the four rounds were rerun against the fixed build: each is refused by `phv check`, stops with the
+runtime error, or runs without the alert firing in node. A fuzz of `json_html()` with 13 attacking strings, as strings,
+lists and maps, in 9 places in a script (code, `"..."`, `'...'`, a template literal, both comments, a regular
+expression and its class, between strings) gives 351 cases: none runs the value (with v0.9.0's `json_html()`, 11 do).
+Regression tests: `err_context`, `contexts`, `guarded_output` and `err_meta_refresh` in `tests/cases`;
+`follows_javascript_literals_and_comments` and `blocks_merge_url_starts_and_script_states` (phv_syntax); the
+`csv_parse` and `jwt_decode` cases of the limits test (188 MB and 81 MB without the fixes). All tests pass on Windows,
+and on Linux and macOS in CI, with clippy (`-D warnings`) and rustfmt. Dependencies: no new crates.

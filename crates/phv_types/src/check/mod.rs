@@ -2648,7 +2648,7 @@ impl<'a> Checker<'a> {
                     });
                     let callee = Box::new(ast::Expr { kind: ExprKind::Name("render".into()), span });
                     let render = ast::Expr { kind: ExprKind::Call { callee, args }, span };
-                    let echo = ast::Stmt { kind: StmtKind::Echo(vec![render]), span };
+                    let echo = ast::Stmt { kind: StmtKind::Echo(vec![render]), span, out: None };
                     self.stmt(&echo, &mut out);
                 }
             }

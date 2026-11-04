@@ -195,6 +195,9 @@ pub enum HStmt {
         catches: Vec<HCatch>,
         finally: Option<Vec<HStmt>>,
     },
+    /// Statements in HTML other than element text: functions they call must
+    /// not write output there (checked when the program runs).
+    Guarded(Vec<HStmt>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

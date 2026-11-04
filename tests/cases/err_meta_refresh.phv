@@ -1,0 +1,5 @@
+<?phv
+// `http-equiv` after a value inserted into a `<meta>`'s `content` (an error).
+$q = "0;url=https://example.com/";
+?>
+<meta name="x" content="<?= $q ?>" http-equiv="refresh">

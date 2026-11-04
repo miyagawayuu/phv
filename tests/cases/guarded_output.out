@@ -1,0 +1,8 @@
+<b>text is fine</b><ul><b>item 1</b><b>item 2</b><i>closure</i></ul>
+<script>var v = 2;</script>
+<b>caught</b><script>function show(m) {}
+label = "\u002balert\u00281\u0029\u002b";</script>
+<a title="x href=javascript:alert(1) y">link</a>
+<script>var b = 1; 
+--- runtime error ---
+Fatal error: a function wrote output inside a `<script>`, an attribute, a URL or CSS, where HTML escaping does not protect it; return the value (or `Html`) from the function and insert it with `<?= ?>`

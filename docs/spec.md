@@ -688,7 +688,12 @@ are output as is. `echo` and `<?= ?>` follow the same rules.
 - `raw($s)` … Treats trusted markup as `Html` (use with care to avoid XSS).
 - `nl2br($s)` … Escapes the string, then returns `Html` with line breaks converted to `<br>`.
 - `safe_url($url)` … Returns a `SafeUrl` that lets through only `http(s)`, `mailto`, `tel`, and relative URLs, and replaces `javascript:` and others with `#`.
-- `json_html($value)` … Returns, as `SafeJs`, a JavaScript value (JSON) that is safe to place inside `<script>`.
+  A relative URL with no `:`, `/`, `?` or `#` (`page.html`) is returned as `./page.html`, the same URL, so no text after it can make it a scheme.
+- `json_html($value)` … Returns, as `SafeJs`, a JavaScript value (JSON) that is safe to place inside `<script>` where an
+  expression goes. Inside its strings, every character except ASCII letters and digits and non-ASCII characters
+  other than spaces is written as `\uXXXX`, so the value cannot end a string, template literal, comment or regular
+  expression it lands in by mistake (in a `"..."` written around it, its strings' contents would only be names: a
+  syntax error, not code that runs).
   The `"` in strings is left as is, so the value cannot be placed inside an attribute value (a compile error; use `escape(json_encode($v))`).
 - `SafeUrl` can also be used as `Html` (not the reverse). `SafeJs` cannot: its quotes would end an attribute, where
   `Html` may be placed. The result of `escape()` is `Html`, so it cannot be placed in a URL or inside `<script>`. This
@@ -711,20 +716,28 @@ and text such as `</scripts>` that looks like an end tag but is not one.
 | Element content, quoted attribute value | `<p><?= $s ?></p>`, `title="<?= $s ?>"` | Escaped and output. `Html` is output as it is, except that in an attribute value its `"` and `'` are written as `&quot;` and `&#039;`, so no `Html` can end the attribute |
 | Unquoted attribute value | `href=<?= $u ?>` | Error (add quotes) |
 | Inside a tag (between attributes) | `<div <?= $attrs ?>>` | Error |
-| Start of a URL attribute | `href="<?= $u ?>"`, `src="<?= $u ?>"` | Only `SafeUrl` (`safe_url($u)`) and numbers. If the preceding text contains `/` `?` `#` `:`, it is not the start (`href="/post?id=<?= $id ?>"` is allowed). `href="j<?= ?>"` or only a character reference such as `&#106;` still counts as the start |
+| Start of a URL attribute | `href="<?= $u ?>"`, `src="<?= $u ?>"` | Only `SafeUrl` (`safe_url($u)`) and numbers. If the preceding text contains `/` `?` `#` `:`, it is not the start (`href="/post?id=<?= $id ?>"` is allowed). `href="j<?= ?>"` or only a character reference such as `&#106;` still counts as the start, and so does the text after an inserted value (`safe_url("")` is empty): `href="<?= safe_url($a) ?><?= $b ?>"` is an error; check the whole URL with `safe_url($a . $b)` |
 | `javascript:` / `data:` URL | `href="javascript:go(<?= $v ?>)"` | Error (numbers are allowed) |
-| Inside `<script>` | `var x = <?= $v ?>;` | Only `SafeJs` (`json_html($v)`) and numbers |
+| Inside `<script>` | `var x = <?= $v ?>;` | Only `SafeJs` (`json_html($v)`) and numbers, where an expression goes. Inside a JavaScript string, template literal, comment or regular expression (`` `<?= $v ?>` ``, `"<?= $v ?>"`), only numbers: a JSON value's quotes would end the string, and `${...}` in a template literal runs. Write `const s = <?= json_html($v) ?>;` |
 | `<style>`, `style="..."` | | Error (numbers are allowed) |
 | Event attribute | `onclick="go(<?= $v ?>)"` | Error. Put the value in a `data-*` attribute and read it from JavaScript |
 | `<iframe srcdoc="...">` | | Error (the value is parsed as a separate HTML document) |
 | URL of a `<script>` | `<script src="<?= $u ?>">` (and `href` in SVG) | Error, also for `SafeUrl`: the tag gets the CSP nonce, so any URL there would run as a trusted script. Write the URL in the template |
-| `content` of a `<meta>` | `<meta http-equiv="refresh" content="0;url=<?= $u ?>">` | Only numbers, unless a `name`, `property` or `itemprop` attribute comes before `content` (`<meta property="og:title" content="<?= $t ?>">` is text) |
+| `content` of a `<meta>` | `<meta http-equiv="refresh" content="0;url=<?= $u ?>">` | Only numbers, unless a `name`, `property` or `itemprop` attribute comes before `content` and the tag has no `http-equiv` (`<meta property="og:title" content="<?= $t ?>">` is text; `http-equiv` after such text is an error) |
 
 - The bodies of functions and closures, and `if` and loop blocks, must end in the same HTML state they started in
   (leaving a `<script>` or an attribute open at the end of a block is an error). This prevents the context from drifting with call order or repetition.
 - For the same reason, `break` and `continue` must be in the HTML state where their loop began, `throw` where its
   `try` began (or at the start of the function), and `return` at the start of the function: `<a href="<?phv if ($x)
   { break; } ?>...` is an error, since the output after the jump would land inside the attribute.
+- A function's body is checked as element text, wherever it is called. So a function (or closure or method) that
+  writes output may not be called where its output would land elsewhere: `<script><?phv show($s); ?></script>` or
+  `title="<?phv show($s); ?>"` stops the script with a runtime error, as does `dump()` there. Return the value (or
+  `Html`) instead and insert it with `<?= ?>`. Output into a template being rendered, or other captured output, is
+  not affected.
+- When an exception thrown inside a `<script>`, a tag or an attribute is caught, what the `try` block wrote is
+  dropped, so the `catch` block writes where the `try` began rather than inside what was left open. Other
+  exceptions keep the output written before them.
 - Expressions and statements can be nested up to 500 levels (this prevents deeply nested source from overflowing the implementation's stack).
 
 ## 14. Web server

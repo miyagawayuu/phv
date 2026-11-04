@@ -10,7 +10,9 @@ function item(string $label): void { ?><li class="item"><?= $label ?></li><?phv 
 <a href="/post?id=<?= 5 ?>&q=<?= "x y" ?>">query string</a>
 <option value="1" <?phv if ($sel): ?>selected<?phv endif; ?>>one</option>
 <ul><?phv foreach (["a", "<b>"] as $l) { item($l); } ?></ul>
-<a href="<?= $u ?>&page=<?= "2" ?>">after a safe URL</a>
+<a href="<?= $u ?>&page=<?= 2 ?>">after a safe URL</a>
+<a href="<?= safe_url("https://example.com/a?b=1&page=" . "2") ?>">one checked URL</a>
+<script>var t = `n=${<?= 7 ?>}${<?= $js ?>.a}`; var r = /'"`/.test("<?= 4 ?>"); var q = (8) / <?= $js ?>.a; /* <?= 5 ?> */</script>
 <textarea><?= "</textarea><b>" ?></textarea>
 <svg><a href="<?= $u ?>">svg link</a></svg>
 <p title="<?= escape("\"q\"") ?>"><?= nl2br("a\nb") ?></p>

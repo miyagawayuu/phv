@@ -132,30 +132,39 @@ fn time_claim(m: &phv_vm::Map, name: &str) -> Result<Option<f64>, ()> {
 }
 
 /// The claims of an HS256 token signed with `key`, if it is valid at `now`.
-fn jwt_decode(token: &str, key: &[u8], now: i64) -> Option<Value> {
+/// With a script's `vm`, its memory and time limits are checked while the
+/// JSON is decoded (a token signed by the site may still carry large claims).
+fn jwt_decode(vm: Option<&Vm>, token: &str, key: &[u8], now: i64) -> Result<Option<Value>, VmError> {
+    let json = |part: &str| -> Result<Option<Value>, VmError> {
+        let Ok(bytes) = URL_SAFE_NO_PAD.decode(part) else { return Ok(None) };
+        let Ok(text) = std::str::from_utf8(&bytes) else { return Ok(None) };
+        Ok(match vm {
+            Some(vm) => super::web::json_decode_in(vm, text)?.ok(),
+            None => super::web::json_decode(text).ok(),
+        })
+    };
     let mut parts = token.split('.');
-    let (h, p, sig) = (parts.next()?, parts.next()?, parts.next()?);
-    if parts.next().is_some() {
-        return None;
+    let (Some(h), Some(p), Some(sig), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+        return Ok(None);
+    };
+    let Ok(sig) = URL_SAFE_NO_PAD.decode(sig) else { return Ok(None) };
+    if hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, key), format!("{h}.{p}").as_bytes(), &sig).is_err() {
+        return Ok(None);
     }
-    let sig = URL_SAFE_NO_PAD.decode(sig).ok()?;
-    hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, key), format!("{h}.{p}").as_bytes(), &sig).ok()?;
-    let header = super::web::json_decode(std::str::from_utf8(&URL_SAFE_NO_PAD.decode(h).ok()?).ok()?).ok()?;
-    let Value::Map(header) = &header else { return None };
+    let Some(header) = json(h)? else { return Ok(None) };
+    let Value::Map(header) = &header else { return Ok(None) };
     match header.get(&Key::Str("alg".to_string().into())) {
         Some(Value::Str(alg)) if alg.as_str() == "HS256" => {}
-        _ => return None,
+        _ => return Ok(None),
     }
-    let claims = super::web::json_decode(std::str::from_utf8(&URL_SAFE_NO_PAD.decode(p).ok()?).ok()?).ok()?;
-    let Value::Map(m) = &claims else { return None };
+    let Some(claims) = json(p)? else { return Ok(None) };
+    let Value::Map(m) = &claims else { return Ok(None) };
     let now = now as f64;
-    if time_claim(m, "exp").ok()?.is_some_and(|exp| now >= exp) {
-        return None;
+    let (Ok(exp), Ok(nbf)) = (time_claim(m, "exp"), time_claim(m, "nbf")) else { return Ok(None) };
+    if exp.is_some_and(|exp| now >= exp) || nbf.is_some_and(|nbf| now < nbf) {
+        return Ok(None);
     }
-    if time_claim(m, "nbf").ok()?.is_some_and(|nbf| now < nbf) {
-        return None;
-    }
-    Some(claims)
+    Ok(Some(claims))
 }
 
 fn text(vm: &Vm, bytes: Vec<u8>, f: &str) -> Result<Value, VmError> {
@@ -209,7 +218,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "jwt_decode" => |vm, a| {
             let k = key(vm, &a[1], "jwt_decode")?;
-            Ok(jwt_decode(s(&a[0]), k, now()).unwrap_or(Value::Null))
+            Ok(jwt_decode(Some(vm), s(&a[0]), k, now())?.unwrap_or(Value::Null))
         },
         _ => return None,
     };
@@ -252,14 +261,15 @@ mod tests {
     fn jwt_rejects_other_algorithms() {
         let claims = URL_SAFE_NO_PAD.encode(r#"{"sub":"7","exp":2000}"#);
         let none = format!("{}.{claims}.", URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#));
-        assert!(jwt_decode(&none, K, 0).is_none());
+        assert!(jwt_decode(None, &none, K, 0).is_ok_and(|c| c.is_none()));
         let h = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS512"}"#);
         let mac = jwt_mac(K, &format!("{h}.{claims}"));
-        assert!(jwt_decode(&format!("{h}.{claims}.{}", URL_SAFE_NO_PAD.encode(mac.as_ref())), K, 0).is_none());
+        assert!(jwt_decode(None, &format!("{h}.{claims}.{}", URL_SAFE_NO_PAD.encode(mac.as_ref())), K, 0)
+            .is_ok_and(|c| c.is_none()));
         let h = URL_SAFE_NO_PAD.encode(JWT_HEADER);
         let mac = jwt_mac(K, &format!("{h}.{claims}"));
         let good = format!("{h}.{claims}.{}", URL_SAFE_NO_PAD.encode(mac.as_ref()));
-        assert!(jwt_decode(&good, K, 1999).is_some());
-        assert!(jwt_decode(&good, K, 2000).is_none(), "expired");
+        assert!(jwt_decode(None, &good, K, 1999).is_ok_and(|c| c.is_some()));
+        assert!(jwt_decode(None, &good, K, 2000).is_ok_and(|c| c.is_none()), "expired");
     }
 }

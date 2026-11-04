@@ -315,6 +315,13 @@ impl Parser {
                 "`javascript:` URLs do not run under the default Content-Security-Policy".to_string(),
                 "use a button with an event listener added from a `<script>` in the template",
             ),
+            InlineCode::MetaHttpEquiv => {
+                let mut d =
+                    Diagnostic::error("`http-equiv` after a value inserted into the `content` of this `<meta>`", span);
+                d.add_note("`http-equiv=\"refresh\"` would redirect to the value; write `http-equiv` before `content`, where only numbers are accepted");
+                self.diags.push(d);
+                return;
+            }
         };
         let mut d = Diagnostic::warning(msg, span);
         d.add_note(note);
@@ -448,6 +455,15 @@ impl Parser {
     }
 
     fn stmt(&mut self) -> PResult<Stmt> {
+        let ctx = self.html.context();
+        let mut s = self.stmt_here()?;
+        if ctx != EchoContext::Text && !matches!(s.kind, StmtKind::InlineHtml(..)) {
+            s.out = Some(ctx);
+        }
+        Ok(s)
+    }
+
+    fn stmt_here(&mut self) -> PResult<Stmt> {
         let start = self.span();
         let kind = match self.peek().clone() {
             Tok::InlineHtml(text) => {
@@ -457,7 +473,7 @@ impl Parser {
                     let pos = start.start + at as u32;
                     let len = match &what {
                         crate::htmlctx::InlineCode::Handler(name) => name.len() as u32,
-                        crate::htmlctx::InlineCode::ScriptUrl => 1,
+                        crate::htmlctx::InlineCode::ScriptUrl | crate::htmlctx::InlineCode::MetaHttpEquiv => 1,
                     };
                     self.inline_code_warning(Span { start: pos, end: pos + len, ..start }, what);
                 }
@@ -602,7 +618,7 @@ impl Parser {
                 kind
             }
         };
-        Ok(Stmt { kind, span: start.to(self.prev_span()) })
+        Ok(Stmt { out: None, kind, span: start.to(self.prev_span()) })
     }
 
     /// Assignment, increment/decrement, typed declaration or expression statement.
@@ -709,7 +725,7 @@ impl Parser {
             }
         }
         let kind = StmtKind::If { cond, then, elifs, els };
-        Ok(Stmt { kind, span: start.to(self.prev_span()) })
+        Ok(Stmt { out: None, kind, span: start.to(self.prev_span()) })
     }
 
     fn for_stmt(&mut self) -> PResult<Stmt> {
@@ -719,7 +735,7 @@ impl Parser {
         while !self.at(&Tok::Semi) {
             let s = self.span();
             let kind = self.simple_stmt()?;
-            init.push(Stmt { kind, span: s.to(self.prev_span()) });
+            init.push(Stmt { out: None, kind, span: s.to(self.prev_span()) });
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -731,7 +747,7 @@ impl Parser {
         while !self.at(&Tok::RParen) {
             let s = self.span();
             let kind = self.simple_stmt()?;
-            step.push(Stmt { kind, span: s.to(self.prev_span()) });
+            step.push(Stmt { out: None, kind, span: s.to(self.prev_span()) });
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -748,7 +764,7 @@ impl Parser {
             }
         })?;
         let kind = StmtKind::For { init, cond, step, body };
-        Ok(Stmt { kind, span: start.to(self.prev_span()) })
+        Ok(Stmt { out: None, kind, span: start.to(self.prev_span()) })
     }
 
     fn foreach_stmt(&mut self) -> PResult<Stmt> {
@@ -781,7 +797,7 @@ impl Parser {
             body.insert(0, p);
         }
         let kind = StmtKind::Foreach { subject, key, value, body };
-        Ok(Stmt { kind, span: start.to(self.prev_span()) })
+        Ok(Stmt { out: None, kind, span: start.to(self.prev_span()) })
     }
 
     /// The variable after `as`. `as [$a, $b]` takes the value into a hidden
@@ -795,8 +811,11 @@ impl Parser {
         let span = start.to(self.prev_span());
         let name = format!("%v{}", span.start);
         let value = Expr { kind: ExprKind::Var(name.clone()), span };
-        *pattern =
-            Some(Stmt { kind: StmtKind::Assign { target: Expr { kind, span }, op: AssignOp::Set, value }, span });
+        *pattern = Some(Stmt {
+            out: None,
+            kind: StmtKind::Assign { target: Expr { kind, span }, op: AssignOp::Set, value },
+            span,
+        });
         Ok((name, span))
     }
 
@@ -824,7 +843,7 @@ impl Parser {
             return Err(self.error_here("expected `catch` or `finally` after `try` block"));
         }
         let kind = StmtKind::Try { body, catches, finally };
-        Ok(Stmt { kind, span: start.to(self.prev_span()) })
+        Ok(Stmt { out: None, kind, span: start.to(self.prev_span()) })
     }
 
     fn params(&mut self) -> PResult<Vec<Param>> {

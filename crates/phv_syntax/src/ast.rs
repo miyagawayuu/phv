@@ -13,6 +13,10 @@ pub struct Module {
 pub struct Stmt {
     pub kind: StmtKind,
     pub span: Span,
+    /// Set when the statement is in HTML other than element text (a
+    /// `<script>`, an attribute, a URL, CSS...): output written by the
+    /// functions it calls would land there, escaped only for text.
+    pub out: Option<EchoContext>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,8 +115,11 @@ pub enum EchoContext {
     Unquoted,
     /// Inside a tag, between attributes.
     Tag,
-    /// Inside `<script>`.
+    /// Inside `<script>`, where an expression goes.
     Script,
+    /// Inside `<script>`, in a string, template literal, comment or regular
+    /// expression, where a JSON value's quotes or text would change the code.
+    ScriptLiteral,
     /// Inside `<style>` or a `style="..."` attribute.
     Style,
     /// An event handler attribute (`onclick="..."`).

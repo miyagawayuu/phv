@@ -1,0 +1,8 @@
+error: `http-equiv` after a value inserted into the `content` of this `<meta>`
+ --> err_meta_refresh.phv:5:56
+  |
+5 | <meta name="x" content="<?= $q ?>" http-equiv="refresh">
+  |                                                        ^
+  = note: `http-equiv="refresh"` would redirect to the value; write `http-equiv` before `content`, where only numbers are accepted
+
+1 error found

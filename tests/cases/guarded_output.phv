@@ -1,0 +1,19 @@
+<?phv
+// Functions write output escaped for element text, so they may not be called
+// to write inside a <script>, an attribute, a URL or CSS (a runtime error).
+function say(string $s): void { ?><b><?= $s ?></b><?phv }
+function fail(): int { throw new RuntimeException("no value"); }
+function value(): int { return 2; }
+$show = function (string $s): void { ?><i><?= $s ?></i><?phv };
+say("text is fine");
+int $zero = 0;
+?>
+<ul><?phv foreach ([1, 2] as $i) { say("item $i"); } $show("closure"); ?></ul>
+<script>var v = <?= value() ?>;</script>
+<?phv try { ?><script>var a = <?= fail() ?>;</script><?phv } catch (RuntimeException) { say("caught"); } ?>
+<script>function show(m) {}
+<?phv try { ?>show("<?= intdiv(100, $zero) ?> per item");<?phv } catch (DivisionByZeroError) { ?>label = <?= json_html("+alert(1)+") ?>;<?phv } ?>
+</script>
+<a <?phv try { ?>data-per="<?= intdiv(100, $zero) ?>"<?phv } catch (DivisionByZeroError) { ?>title="<?= "x href=javascript:alert(1) y" ?>"<?phv } ?>>link</a>
+<script>var b = 1; <?phv say("alert(1)"); ?></script>
+not reached

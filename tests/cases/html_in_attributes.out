@@ -1,2 +1,2 @@
-<div title="&quot;x\&quot; onmouseover=alert(1) y=\&quot;&quot;" data-x='&quot;x\&quot; onmouseover=alert(1) y=\&quot;&quot;' data-p="<b class=&quot;name&quot;>a&quot;b</b>
-" data-s="q&quot;&#039;">"x\" onmouseover=alert(1) y=\""</div>
+<div title="&quot;x\u0022\u0020onmouseover\u003dalert\u00281\u0029\u0020y\u003d\u0022&quot;" data-x='&quot;x\u0022\u0020onmouseover\u003dalert\u00281\u0029\u0020y\u003d\u0022&quot;' data-p="<b class=&quot;name&quot;>a&quot;b</b>
+" data-s="q&quot;&#039;">"x\u0022\u0020onmouseover\u003dalert\u00281\u0029\u0020y\u003d\u0022"</div>

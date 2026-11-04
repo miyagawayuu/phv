@@ -13,8 +13,9 @@ use crate::ast::EchoContext;
 /// What is known about the start of a URL attribute's value.
 #[derive(Clone, Debug, PartialEq)]
 enum UrlState {
-    /// Only this literal text so far; the scheme is not decided yet.
-    Undecided(String),
+    /// Only literal text so far; the scheme is not decided yet. After a block
+    /// that may or may not have run, each way the text may have begun.
+    Undecided(Vec<String>),
     /// The scheme is decided (`https:`, a relative path, or an inserted safe URL).
     Safe,
     /// A `javascript:`, `vbscript:` or `data:` URL written in the template.
@@ -72,7 +73,444 @@ enum State {
     Raw {
         tag: String,
         escape: u8,
+        /// Where the script's JavaScript has reached (`<script>` only).
+        js: Js,
     },
+}
+
+/// Where inside a script's JavaScript the text has reached. Values are safe
+/// only where an expression goes: inside a string, template, comment or
+/// regular expression, a JSON value's quotes or text would change what the
+/// code means (`${...}` in a template literal runs).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum JsMode {
+    Code,
+    /// After `/` in code: a comment, a regular expression or a division.
+    Slash,
+    Str(char),
+    StrEscape(char),
+    /// After `\` and a carriage return in a string (a line continuation).
+    StrEscapeCr(char),
+    Template,
+    TemplateEscape,
+    /// After `$` in a template literal (`${` starts a substitution).
+    TemplateDollar,
+    LineComment,
+    BlockComment,
+    /// After `*` in a block comment.
+    BlockStar,
+    Regex,
+    RegexEscape,
+    RegexClass,
+    RegexClassEscape,
+}
+
+/// The most readings of a script followed at once; past it, no value may be
+/// inserted until the script ends.
+const MAX_READINGS: usize = 8;
+
+/// The JavaScript of a `<script>`, as every way it may have been read so far.
+/// Where the text alone does not decide (a `/` after `}` divides after an
+/// object literal and starts a regular expression after a block), or a block
+/// may or may not have run, each possibility is followed, and a value goes in
+/// only where all of them are code.
+#[derive(Clone, Debug)]
+struct Js {
+    readings: Vec<Reading>,
+    /// Too many readings: nothing is inserted into this script any more.
+    lost: bool,
+}
+
+impl Default for Js {
+    fn default() -> Self {
+        Js { readings: vec![Reading::default()], lost: false }
+    }
+}
+
+impl PartialEq for Js {
+    fn eq(&self, other: &Js) -> bool {
+        self.lost == other.lost
+            && self.readings.iter().all(|r| other.readings.contains(r))
+            && other.readings.iter().all(|r| self.readings.contains(r))
+    }
+}
+
+impl Js {
+    /// True where a value is a whole expression in every reading.
+    fn in_code(&self) -> bool {
+        !self.lost && self.readings.iter().all(|r| r.in_code())
+    }
+
+    fn step(&mut self, c: char) {
+        let mut forks = Vec::new();
+        for r in &mut self.readings {
+            r.step(c);
+            if std::mem::take(&mut r.fork) {
+                let mut other = r.clone();
+                other.regex = !other.regex;
+                forks.push(other);
+            }
+        }
+        self.readings.extend(forks);
+        self.settle();
+    }
+
+    /// A value was inserted (a number, unless every reading is code).
+    fn inserted(&mut self) {
+        for r in &mut self.readings {
+            r.inserted();
+        }
+        self.settle();
+    }
+
+    /// The readings of a block that may or may not have run: both may follow.
+    fn merge(&mut self, other: &Js) {
+        self.lost |= other.lost;
+        self.readings.extend(other.readings.iter().cloned());
+        self.settle();
+    }
+
+    /// Whether the two have the same open strings, comments, brackets and
+    /// parentheses (a block must end where it started).
+    fn same_shape(&self, other: &Js) -> bool {
+        let shape = |js: &Js| -> Vec<(JsMode, Vec<bool>, Vec<bool>)> {
+            let mut v: Vec<_> = js.readings.iter().map(|r| (r.mode, r.braces.clone(), r.parens.clone())).collect();
+            v.dedup();
+            v
+        };
+        let (a, b) = (shape(self), shape(other));
+        a.iter().all(|x| b.contains(x)) && b.iter().all(|x| a.contains(x))
+    }
+
+    fn settle(&mut self) {
+        let mut kept: Vec<Reading> = Vec::new();
+        for r in self.readings.drain(..) {
+            if !kept.contains(&r) {
+                kept.push(r);
+            }
+        }
+        if kept.len() > MAX_READINGS {
+            self.lost = true;
+            kept.truncate(MAX_READINGS);
+        }
+        self.readings = kept;
+    }
+}
+
+/// One way of reading a script's JavaScript.
+#[derive(Clone, Debug)]
+struct Reading {
+    mode: JsMode,
+    /// For each open `{`: whether it opened a template substitution (`${`).
+    braces: Vec<bool>,
+    /// For each open `(`: whether it holds the condition of `if`, `while`,
+    /// `for` or `with` (a `/` after its `)` starts a regular expression).
+    parens: Vec<bool>,
+    /// Whether a `/` here would start a regular expression rather than
+    /// divide, decided from the token before it.
+    regex: bool,
+    /// The identifier or number being read, and whether it follows `.` (a
+    /// property name such as `.in` or `.return` is not a keyword).
+    word: String,
+    property: bool,
+    /// The keyword just read, if it can begin a condition (`if`, `for`...).
+    keyword: &'static str,
+    /// The last character of code, and `regex` before it (for `i++ / 2`).
+    last: char,
+    regex_before_last: bool,
+    /// The last three characters of code, as written (for `<!--`).
+    recent: [char; 3],
+    /// Non-blank characters on this line so far, up to 3 (`-->` at the start
+    /// of a line is a comment).
+    line: String,
+    /// Set by `code` on a `/` right after `}`.
+    fork: bool,
+}
+
+impl Default for Reading {
+    fn default() -> Self {
+        Reading {
+            mode: JsMode::Code,
+            braces: Vec::new(),
+            parens: Vec::new(),
+            regex: true,
+            word: String::new(),
+            property: false,
+            keyword: "",
+            last: ' ',
+            regex_before_last: true,
+            recent: [' '; 3],
+            line: String::new(),
+            fork: false,
+        }
+    }
+}
+
+// Two readings are the same if everything that decides how later text is read
+// is the same.
+impl PartialEq for Reading {
+    fn eq(&self, other: &Reading) -> bool {
+        // Only these characters change how what follows them is read.
+        let last = |r: &Reading| if matches!(r.last, '}' | '+' | '-' | '.') { r.last } else { ' ' };
+        // How much of `<!-` the recent characters end with.
+        let comment = |r: &Reading| match r.recent {
+            [_, '<', '!'] => 2,
+            [_, _, '<'] => 1,
+            ['<', '!', '-'] => 3,
+            _ => 0,
+        };
+        fn line(r: &Reading) -> &str {
+            if "-->".starts_with(r.line.as_str()) {
+                r.line.as_str()
+            } else {
+                "x"
+            }
+        }
+        self.mode == other.mode
+            && self.braces == other.braces
+            && self.parens == other.parens
+            && self.regex == other.regex
+            && self.word == other.word
+            && self.property == other.property
+            && self.keyword == other.keyword
+            && last(self) == last(other)
+            && (!matches!(self.last, '+' | '-')
+                || (self.regex_before_last == other.regex_before_last && self.recent[2] == other.recent[2]))
+            && comment(self) == comment(other)
+            && line(self) == line(other)
+    }
+}
+
+/// Keywords after which `/` starts a regular expression.
+const REGEX_KEYWORDS: &[&str] = &[
+    "return",
+    "typeof",
+    "instanceof",
+    "in",
+    "of",
+    "new",
+    "delete",
+    "void",
+    "throw",
+    "case",
+    "do",
+    "else",
+    "yield",
+    "await",
+    // A line break after these ends the statement.
+    "break",
+    "continue",
+    "debugger",
+];
+
+fn line_break(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+}
+
+impl Reading {
+    /// True where a value is a whole expression (not inside a literal or comment).
+    fn in_code(&self) -> bool {
+        self.mode == JsMode::Code || (self.mode == JsMode::Slash && !self.regex)
+    }
+
+    /// A value was inserted. Where an expression goes, a `/` after it divides;
+    /// elsewhere only a number may be inserted, read like a digit.
+    fn inserted(&mut self) {
+        if self.in_code() {
+            self.mode = JsMode::Code;
+            self.word.clear();
+            self.property = false;
+            self.keyword = "";
+            self.regex = false;
+            self.last = '0';
+            self.recent = [self.recent[1], self.recent[2], '0'];
+            if self.line.len() < 3 {
+                self.line.push('0');
+            }
+        } else {
+            self.step('0');
+        }
+    }
+
+    fn end_word(&mut self) {
+        if !self.word.is_empty() {
+            let word = std::mem::take(&mut self.word);
+            let keyword = !std::mem::take(&mut self.property);
+            self.regex = keyword && REGEX_KEYWORDS.contains(&word.as_str());
+            // `for await (` holds a condition like `for (`.
+            self.keyword = match word.as_str() {
+                "if" if keyword => "if",
+                "while" if keyword => "while",
+                "for" if keyword => "for",
+                "with" if keyword => "with",
+                "await" if keyword && self.keyword == "for" => "for",
+                _ => "",
+            };
+        }
+    }
+
+    fn step(&mut self, c: char) {
+        use JsMode::*;
+        if line_break(c) && matches!(self.mode, Code | Slash | LineComment | BlockComment | BlockStar) {
+            self.line.clear();
+        } else if !c.is_whitespace() && self.line.len() < 3 {
+            self.line.push(c);
+        }
+        self.mode = match self.mode {
+            Code => return self.code(c),
+            Slash => match c {
+                // A comment between `if` and `(` keeps the keyword.
+                '/' => LineComment,
+                '*' => BlockComment,
+                _ if self.regex => {
+                    self.keyword = "";
+                    self.mode = Regex;
+                    return self.regex_char(c);
+                }
+                _ => {
+                    self.keyword = "";
+                    self.mode = Code;
+                    self.regex = true;
+                    self.last = '/';
+                    return self.code(c);
+                }
+            },
+            Str(q) => match c {
+                '\\' => StrEscape(q),
+                '\n' | '\r' => Code,
+                c if c == q => {
+                    self.regex = false;
+                    self.last = c;
+                    Code
+                }
+                _ => Str(q),
+            },
+            StrEscape(q) if c == '\r' => StrEscapeCr(q),
+            StrEscape(q) => Str(q),
+            StrEscapeCr(q) => match c {
+                '\n' => Str(q),
+                _ => {
+                    self.mode = Str(q);
+                    return self.step(c);
+                }
+            },
+            Template => match c {
+                '\\' => TemplateEscape,
+                '$' => TemplateDollar,
+                '`' => {
+                    self.regex = false;
+                    self.last = c;
+                    Code
+                }
+                _ => Template,
+            },
+            TemplateEscape => Template,
+            TemplateDollar => match c {
+                '{' => {
+                    self.braces.push(true);
+                    self.regex = true;
+                    self.last = c;
+                    Code
+                }
+                '\\' => TemplateEscape,
+                '$' => TemplateDollar,
+                '`' => {
+                    self.regex = false;
+                    self.last = c;
+                    Code
+                }
+                _ => Template,
+            },
+            LineComment if line_break(c) => Code,
+            LineComment => LineComment,
+            BlockComment if c == '*' => BlockStar,
+            BlockComment => BlockComment,
+            BlockStar => match c {
+                '/' => Code,
+                '*' => BlockStar,
+                _ => BlockComment,
+            },
+            Regex | RegexEscape | RegexClass | RegexClassEscape => return self.regex_char(c),
+        };
+    }
+
+    fn regex_char(&mut self, c: char) {
+        use JsMode::*;
+        self.mode = match (self.mode, c) {
+            (Regex, '\\') => RegexEscape,
+            (Regex, '[') => RegexClass,
+            (Regex, '/') => {
+                self.regex = false;
+                self.last = c;
+                Code
+            }
+            (RegexClass, '\\') => RegexClassEscape,
+            (RegexClass, ']') => Regex,
+            // A regular expression cannot span lines.
+            (_, c) if line_break(c) => Code,
+            (RegexEscape, _) => Regex,
+            (RegexClassEscape, _) => RegexClass,
+            (m, _) => m,
+        };
+    }
+
+    fn code(&mut self, c: char) {
+        let recent = self.recent;
+        self.recent = [recent[1], recent[2], c];
+        if c.is_alphanumeric() || c == '_' || c == '$' {
+            if self.word.is_empty() {
+                // A name right after `.` (or `?.`) is a property, not a keyword;
+                // after a digit, `.` is a decimal point and never a keyword either.
+                self.property = matches!(self.last, '.' | '#');
+            }
+            self.word.push(c);
+            self.last = c;
+            return;
+        }
+        self.end_word();
+        if c.is_whitespace() {
+            return;
+        }
+        // A `/` may start a comment, which keeps the keyword before it.
+        let keyword = if c == '/' { self.keyword } else { std::mem::take(&mut self.keyword) };
+        let (last, before_last) = (self.last, self.regex_before_last);
+        self.last = c;
+        self.regex_before_last = self.regex;
+        match c {
+            // `<!--` anywhere and `-->` at the start of a line begin a comment.
+            '-' if recent == ['<', '!', '-'] => self.mode = JsMode::LineComment,
+            '>' if last == '-' && self.line == "-->" => self.mode = JsMode::LineComment,
+            '"' | '\'' => self.mode = JsMode::Str(c),
+            '`' => self.mode = JsMode::Template,
+            '/' => {
+                self.mode = JsMode::Slash;
+                self.fork = last == '}';
+            }
+            '{' => {
+                self.braces.push(false);
+                self.regex = true;
+            }
+            '}' => {
+                if self.braces.pop() == Some(true) {
+                    self.mode = JsMode::Template;
+                } else {
+                    // A block; after an object literal `/` divides (see `fork`).
+                    self.regex = true;
+                }
+            }
+            '(' => {
+                self.parens.push(!keyword.is_empty());
+                self.regex = true;
+            }
+            // After the condition of `if (...)` a statement starts, which may be a
+            // regular expression; after other parentheses, `/` divides.
+            ')' => self.regex = self.parens.pop().unwrap_or(false),
+            ']' => self.regex = false,
+            // `i++ / 2` divides: `++` right after an operand.
+            '+' | '-' if last == c && recent[2] == c && !before_last => self.regex = false,
+            _ => self.regex = true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,6 +526,10 @@ pub struct HtmlTracker {
     found: Vec<(usize, InlineCode)>,
     /// Names of the attributes of the current tag seen so far.
     attrs: Vec<String>,
+    /// A value was inserted into the `content` of the current `<meta>` as text.
+    meta_text: bool,
+    /// Byte offset (in the chunk being fed) of the character being read.
+    here: usize,
 }
 
 /// JavaScript written directly in template HTML, which a Content-Security-Policy
@@ -98,11 +540,23 @@ pub enum InlineCode {
     Handler(String),
     /// A `javascript:` (or `vbscript:`) URL.
     ScriptUrl,
+    /// `http-equiv` after a value inserted into a `<meta>`'s `content` as text
+    /// (an error: `http-equiv="refresh"` would redirect to it).
+    MetaHttpEquiv,
 }
 
 impl Default for HtmlTracker {
     fn default() -> Self {
-        HtmlTracker { state: State::Text, pending: None, foreign: 0, mark: 0, found: Vec::new(), attrs: Vec::new() }
+        HtmlTracker {
+            state: State::Text,
+            pending: None,
+            foreign: 0,
+            mark: 0,
+            found: Vec::new(),
+            attrs: Vec::new(),
+            meta_text: false,
+            here: 0,
+        }
     }
 }
 
@@ -175,7 +629,13 @@ impl HtmlTracker {
         }
         match &self.state {
             State::Text | State::Comment | State::Bogus => EchoContext::Text,
-            State::Raw { tag, .. } if tag == "script" => EchoContext::Script,
+            State::Raw { tag, js, .. } if tag == "script" => {
+                if js.in_code() {
+                    EchoContext::Script
+                } else {
+                    EchoContext::ScriptLiteral
+                }
+            }
             State::Raw { tag, .. } if tag == "style" => EchoContext::Style,
             State::Raw { .. } => EchoContext::Text,
             State::Tag { .. } | State::AttrName { .. } => EchoContext::Tag,
@@ -190,7 +650,8 @@ impl HtmlTracker {
             State::Quoted { tag, name, .. }
                 if tag == "meta"
                     && name == "content"
-                    && !self.attrs.iter().any(|a| matches!(a.as_str(), "name" | "property" | "itemprop")) =>
+                    && (self.attrs.iter().any(|a| a == "http-equiv")
+                        || !self.attrs.iter().any(|a| matches!(a.as_str(), "name" | "property" | "itemprop"))) =>
             {
                 EchoContext::MetaContent
             }
@@ -217,11 +678,20 @@ impl HtmlTracker {
         std::mem::take(&mut self.found)
     }
 
-    /// Records that a value was inserted. In a URL attribute the inserted
-    /// value (a checked `SafeUrl` or a number) decides the scheme.
+    /// Records that a value was inserted. In a URL attribute the start stays
+    /// undecided: a checked `SafeUrl` may be empty or end before its scheme
+    /// would (`safe_url("")`), so a value after it is checked as a URL too.
+    /// In a script, the value was an expression.
     pub fn inserted(&mut self) {
-        if let State::Quoted { url: Some(u @ UrlState::Undecided(_)), .. } = &mut self.state {
-            *u = UrlState::Safe;
+        if self.context() == EchoContext::Attr {
+            if let State::Quoted { tag, name, .. } = &self.state {
+                self.meta_text |= tag == "meta" && name == "content";
+            }
+        }
+        if let State::Raw { tag, js, .. } = &mut self.state {
+            if tag == "script" {
+                js.inserted();
+            }
         }
     }
 
@@ -258,11 +728,27 @@ impl HtmlTracker {
             ) => {
                 let same = t1 == t2 && c1 == c2 && n1 == n2 && q1 == q2 && u1.is_some() == u2.is_some();
                 if same {
-                    if let (Some(a), Some(b)) = (u1.as_ref(), u2.as_ref()) {
-                        if b.rank() > a.rank() {
-                            *u1 = Some(b.clone());
+                    if let (Some(a), Some(b)) = (u1.as_mut(), u2.as_ref()) {
+                        if let (UrlState::Undecided(x), UrlState::Undecided(y)) = (&mut *a, b) {
+                            // Either way may follow: keep both (a few at most).
+                            for p in y {
+                                if !x.contains(p) {
+                                    x.push(p.clone());
+                                }
+                            }
+                            // At most the prefixes of the three schemes, and `&`.
+                        } else if b.rank() > a.rank() {
+                            *a = b.clone();
                         }
                     }
+                }
+                same
+            }
+            // A script continues after the block in every way it may have been read.
+            (State::Raw { tag: t1, escape: e1, js: j1 }, State::Raw { tag: t2, escape: e2, js: j2 }) => {
+                let same = t1 == t2 && e1 == e2 && j1.same_shape(j2);
+                if same {
+                    j1.merge(j2);
                 }
                 same
             }
@@ -278,11 +764,14 @@ impl HtmlTracker {
     }
 
     fn end_tag(&mut self, tag: String, closing: bool) {
+        if std::mem::take(&mut self.meta_text) && tag == "meta" && self.attrs.iter().any(|a| a == "http-equiv") {
+            self.found.push((self.here, InlineCode::MetaHttpEquiv));
+        }
         if matches!(tag.as_str(), "svg" | "math") {
             self.foreign = if closing { self.foreign.saturating_sub(1) } else { self.foreign + 1 };
         }
         let raw = if self.foreign > 0 { tag == "script" || tag == "style" } else { RAW_TAGS.contains(&tag.as_str()) };
-        self.state = if !closing && raw { State::Raw { tag, escape: 0 } } else { State::Text };
+        self.state = if !closing && raw { State::Raw { tag, escape: 0, js: Js::default() } } else { State::Text };
     }
 
     /// Advances over literal HTML. Returns the byte offsets just after the
@@ -298,6 +787,7 @@ impl HtmlTracker {
         let mut i = 0;
         while i < chars.len() {
             let c = chars[i];
+            self.here = offsets[i];
             if let Some(name) = &mut self.pending {
                 if c.is_ascii_alphanumeric() || c == '-' || c == ':' {
                     name.push(c.to_ascii_lowercase());
@@ -314,10 +804,12 @@ impl HtmlTracker {
                     scripts.push(offsets[i]);
                 }
                 self.attrs.clear();
+                self.meta_text = false;
                 self.state = State::Tag { name: tag, closing };
                 continue;
             }
             let state = std::mem::replace(&mut self.state, State::Text);
+            let (from, in_script) = (i, matches!(&state, State::Raw { tag, .. } if tag == "script"));
             self.state = match state {
                 State::Text => {
                     if c != '<' {
@@ -378,30 +870,40 @@ impl HtmlTracker {
                         State::Bogus
                     }
                 }
-                State::Raw { tag, escape } => {
+                State::Raw { tag, escape, js } => {
                     let end = format!("</{tag}");
                     let n = end.len();
                     if starts(i, &end) && is_delim(chars.get(i + n)) {
                         if tag == "script" && escape == 2 {
                             i += n - 1;
-                            State::Raw { tag, escape: 1 }
+                            State::Raw { tag, escape: 1, js }
                         } else {
                             i += n - 1;
                             State::Tag { name: tag, closing: true }
                         }
                     } else if tag != "script" {
-                        State::Raw { tag, escape }
+                        State::Raw { tag, escape, js }
                     } else if escape == 0 && starts(i, "<!--") {
-                        i += 3;
-                        State::Raw { tag, escape: 1 }
+                        // `<!-->` and `<!--->` return to script data at once.
+                        let mut j = i + 4;
+                        while chars.get(j) == Some(&'-') {
+                            j += 1;
+                        }
+                        if chars.get(j) == Some(&'>') {
+                            i = j;
+                            State::Raw { tag, escape: 0, js }
+                        } else {
+                            i += 3;
+                            State::Raw { tag, escape: 1, js }
+                        }
                     } else if escape > 0 && starts(i, "-->") {
                         i += 2;
-                        State::Raw { tag, escape: 0 }
+                        State::Raw { tag, escape: 0, js }
                     } else if escape == 1 && starts(i, "<script") && is_delim(chars.get(i + 7)) {
                         i += 6;
-                        State::Raw { tag, escape: 2 }
+                        State::Raw { tag, escape: 2, js }
                     } else {
-                        State::Raw { tag, escape }
+                        State::Raw { tag, escape, js }
                     }
                 }
                 State::Tag { name, closing } => {
@@ -447,7 +949,7 @@ impl HtmlTracker {
                 }
                 State::BeforeValue { tag, closing, name } => {
                     if c == '"' || c == '\'' {
-                        let url = is_url_attr(&tag, &name).then(|| UrlState::Undecided(String::new()));
+                        let url = is_url_attr(&tag, &name).then(|| UrlState::Undecided(vec![String::new()]));
                         self.mark = offsets[i];
                         State::Quoted { tag, closing, name, quote: c, url }
                     } else if c.is_whitespace() {
@@ -464,21 +966,51 @@ impl HtmlTracker {
                     if c == quote {
                         State::Tag { name: tag, closing }
                     } else {
-                        if let Some(UrlState::Undecided(p)) = &mut url {
-                            if p.len() < 256 {
-                                p.push(c);
-                            }
-                            if let Some(d) = decide_url(p) {
-                                // `data:` is fine for images; only script URLs are inline code.
-                                let scheme: String =
-                                    p.chars().filter(|c| !c.is_ascii_whitespace() && !c.is_control()).collect();
-                                let scheme = scheme.to_ascii_lowercase();
-                                if d == UrlState::Script
-                                    && (scheme.starts_with("javascript:") || scheme.starts_with("vbscript:"))
-                                {
-                                    self.found.push((self.mark, InlineCode::ScriptUrl));
+                        if let Some(UrlState::Undecided(ps)) = &mut url {
+                            // The strictest of the ways the text may have begun.
+                            let (mut script, mut inline) = (false, false);
+                            ps.retain_mut(|p| {
+                                // Browsers ignore whitespace and case in a scheme.
+                                if !c.is_ascii_whitespace() && !c.is_control() && p.len() < 256 {
+                                    p.push(c.to_ascii_lowercase());
                                 }
-                                url = Some(d);
+                                match decide_url(p) {
+                                    Some(UrlState::Script) => {
+                                        // `data:` is fine for images; only script URLs are inline code.
+                                        let scheme: String = p
+                                            .chars()
+                                            .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
+                                            .collect::<String>()
+                                            .to_ascii_lowercase();
+                                        if scheme.starts_with("javascript:") || scheme.starts_with("vbscript:") {
+                                            inline = true;
+                                        }
+                                        script = true;
+                                        false
+                                    }
+                                    Some(_) => false,
+                                    // Text that can no longer become a script scheme is a safe start;
+                                    // a character reference (`&`) may be anything.
+                                    None => {
+                                        p.contains('&')
+                                            || ["javascript:", "vbscript:", "data:"]
+                                                .iter()
+                                                .any(|s| s.starts_with(p.as_str()))
+                                    }
+                                }
+                            });
+                            for p in ps.iter_mut().filter(|p| p.contains('&')) {
+                                *p = "&".into();
+                            }
+                            ps.sort();
+                            ps.dedup();
+                            if inline {
+                                self.found.push((self.mark, InlineCode::ScriptUrl));
+                            }
+                            if script {
+                                url = Some(UrlState::Script);
+                            } else if ps.is_empty() {
+                                url = Some(UrlState::Safe);
                             }
                         }
                         State::Quoted { tag, closing, name, quote, url }
@@ -496,6 +1028,14 @@ impl HtmlTracker {
                     }
                 }
             };
+            // The script's text, including what the HTML tokenizer read in one step.
+            if in_script {
+                if let State::Raw { js, .. } = &mut self.state {
+                    for &c in &chars[from..=i] {
+                        js.step(c);
+                    }
+                }
+            }
             i += 1;
         }
         scripts
@@ -540,7 +1080,8 @@ mod tests {
         assert_eq!(ctx("<!---><script>var c = "), EchoContext::Script);
         assert_eq!(ctx("<!-- --!><script>var d = "), EchoContext::Script);
         // `<!--<script>` inside a script: `</script>` does not end it.
-        assert_eq!(ctx("<script><!--<script></script>var e = "), EchoContext::Script);
+        // (`<!--` also starts a line comment in JavaScript.)
+        assert_eq!(ctx("<script><!--<script></script>\nvar e = "), EchoContext::Script);
         assert_eq!(ctx("<script><!--<script></script>--></script><p>"), EchoContext::Text);
         // Raw-text and RCDATA elements hide markup.
         assert_eq!(ctx("<textarea><a title=\"</textarea><script>var f = "), EchoContext::Script);
@@ -553,6 +1094,131 @@ mod tests {
         assert_eq!(ctx("<? x ><script>var h = "), EchoContext::Script);
         // srcdoc is a document of its own.
         assert_eq!(ctx("<iframe srcdoc=\""), EchoContext::Srcdoc);
+    }
+
+    #[test]
+    fn follows_javascript_literals_and_comments() {
+        use EchoContext::{Script, ScriptLiteral};
+        for (js, want) in [
+            ("var a = ", Script),
+            ("var a = '", ScriptLiteral),
+            ("var a = \"x\\\"", ScriptLiteral),
+            ("var a = \"x\\\\\" + ", Script),
+            ("var a = `", ScriptLiteral),
+            ("var a = `${", Script),
+            ("var a = `${ {b: 1}.b }", ScriptLiteral),
+            ("var a = `${ `${", Script),
+            ("var a = `$", ScriptLiteral),
+            ("var a = `x` + ", Script),
+            ("// ", ScriptLiteral),
+            ("// x\nvar a = ", Script),
+            ("/* ", ScriptLiteral),
+            ("/* * / */ var a = ", Script),
+            ("var r = /", ScriptLiteral),
+            ("var r = /[/]'/; var a = ", Script),
+            ("var r = /\\/'/; var a = ", Script),
+            ("var q = (1) / ", Script),
+            ("var q = a[0] / ", Script),
+            ("var q = x / ", Script),
+            ("return /", ScriptLiteral),
+            ("if (a) { } /", ScriptLiteral),
+            ("var a = 'it''s' + ", Script),
+            // Found by the v0.9.1 audit: each flipped the quotes the checker saw.
+            ("var h = i++ / 2; var p = \"/a/\" + h; var m = \"", ScriptLiteral),
+            ("var h = i-- / 2; var m = ", Script),
+            ("var h = ++i; var r = /\"/; var m = ", Script),
+            ("if (s) /\"/.test(s); var m = \"", ScriptLiteral),
+            ("while (s) /\"/.test(s); var m = ", Script),
+            ("var q = f(s) / \"x\".length; var m = ", Script),
+            ("var s = \"a\\\r\nb\"; var m = ", Script),
+            ("var s = \"a\\\r\nb", ScriptLiteral),
+            ("<!-- \"\nvar m = ", Script),
+            ("var a = 1; <!-- `\nvar m = ", Script),
+            ("\n --> /*\nvar m = ", Script),
+            ("var a = 1 --> 0; var m = ", Script),
+            // After `}`, `/` may divide (an object literal) or start a regular
+            // expression (a block): a value goes in only where both are code.
+            ("if (a) { } /\"/.test(s); var m = ", ScriptLiteral),
+            ("var o = {a: 1}\n/\"/.test(s);\nvar m = ", Script),
+            // A property named like a keyword divides; `for await (` is a condition.
+            ("var r = counts.in / total + \"/\" + n; var m = ", Script),
+            ("var r = a?.return / 2; var m = \"", ScriptLiteral),
+            ("for await (x of y) /\"/.test(x); var m = \"", ScriptLiteral),
+            ("var r = n + +/\"/.source; var m = ", Script),
+            // A comment, or a second `}`, after an object literal.
+            ("var x = {} /* c */ /\"/.test(s) + \"+1; var m = ", ScriptLiteral),
+            ("{}/\"/.test(s); x = {}/\"/.test(s); var m = ", ScriptLiteral),
+            // Found by the last review of v0.9.1.
+            ("if /* c */ (s) /\"/.test(s); var m = \"", ScriptLiteral),
+            ("if // c\n(s) /\"/.test(s); var m = \"", ScriptLiteral),
+            ("while (a) break\n/\"/.test(s); var m = \"", ScriptLiteral),
+            ("class A { #new = 1; f() { return this.#new / 2 + \"/\"; } } var m = ", Script),
+        ] {
+            assert_eq!(ctx(&format!("<script>{js}")), want, "{js}");
+        }
+        // A value inserted where an expression goes: a `/` after it divides.
+        let mut t = HtmlTracker::default();
+        t.feed("<script>var a = ");
+        t.inserted();
+        t.feed(" / 2; var b = '");
+        assert_eq!(t.context(), ScriptLiteral);
+        t.feed("'; var c = ");
+        assert_eq!(t.context(), Script);
+        // A number inserted inside a literal is read like a digit.
+        let mut t = HtmlTracker::default();
+        t.feed("<script>var re = /");
+        assert_eq!(t.context(), ScriptLiteral);
+        t.inserted();
+        t.feed("*/g; var s = \"a*/b\"; var m = ");
+        assert_eq!(t.context(), Script);
+        let mut t = HtmlTracker::default();
+        t.feed("<script>var t = `$");
+        t.inserted();
+        t.feed("{\"`; var m = ");
+        assert_eq!(t.context(), Script);
+    }
+
+    #[test]
+    fn blocks_merge_url_starts_and_script_states() {
+        // Either way the block went, the text after it is checked.
+        let mut t = HtmlTracker::default();
+        t.feed("<a href=\"");
+        let entry = t.clone();
+        t.feed("x");
+        assert!(t.end_block(&entry));
+        t.feed("javascript:void(");
+        assert_eq!(t.context(), EchoContext::ScriptUrl);
+        // A block that leaves `/` dividing where it was a regular expression:
+        // both readings follow it.
+        let mut t = HtmlTracker::default();
+        t.feed("<script>var a = ");
+        let entry = t.clone();
+        t.feed("b");
+        assert!(t.end_block(&entry));
+        t.feed("/\"/.test(s); var m = ");
+        assert_eq!(t.context(), EchoContext::ScriptLiteral);
+        t.feed("\nvar n = ");
+        assert_eq!(t.context(), EchoContext::Script);
+        // A block may not leave a string or bracket open.
+        let mut t = HtmlTracker::default();
+        t.feed("<script>var a = ");
+        let entry = t.clone();
+        t.feed("\"b");
+        assert!(!t.end_block(&entry));
+        // Found by the v0.9.1 audit: what a block leaves behind decides later text.
+        for (before, block, after) in [
+            ("<script>s\n", "if", " (s) /\"/.test(s); var m = "),
+            ("<script>var a = ", "{}", "/\"/.test(s); var m = "),
+            ("<script>/* ", "*/ y /*", " */ /\"/.test(s); var m = "),
+        ] {
+            let mut t = HtmlTracker::default();
+            t.feed(before);
+            let entry = t.clone();
+            t.feed(block);
+            assert!(t.end_block(&entry), "{block}");
+            t.feed(after);
+            assert_eq!(t.context(), EchoContext::ScriptLiteral, "{block}");
+        }
     }
 
     #[test]

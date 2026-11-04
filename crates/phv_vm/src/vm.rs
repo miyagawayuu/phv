@@ -382,7 +382,20 @@ struct Handler {
     catch_pc: u32,
     exc_reg: Reg,
     out_depth: usize,
+    /// The length of that output when the `try` began. An exception thrown
+    /// inside a `<script>`, tag or attribute (a guard) may leave a string or
+    /// attribute open, so what the `try` wrote is dropped and the `catch`
+    /// writes where the `try` began.
+    out_len: usize,
+    /// Whether the `try` itself began inside such HTML (a guard of its frame).
+    in_guard: bool,
+    /// `guards` when the `try` began.
+    guards: usize,
 }
+
+/// Why output was refused (see `Vm::guards`).
+const GUARDED_OUTPUT: &str = "a function wrote output inside a `<script>`, an attribute, a URL or CSS, where HTML \
+    escaping does not protect it; return the value (or `Html`) from the function and insert it with `<?= ?>`";
 
 pub struct Vm {
     pub prog: Arc<Program>,
@@ -390,6 +403,10 @@ pub struct Vm {
     regs: Vec<Value>,
     frames: Vec<Frame>,
     handlers: Vec<Handler>,
+    /// Statements running in HTML other than element text, as (frame, output
+    /// depth): functions they call may not write to that output, where text
+    /// escaping would not protect what they write.
+    guards: Vec<(usize, usize)>,
     consts: Vec<Option<Value>>,
     pub out: Vec<OutBuf>,
     pub http: HttpCtx,
@@ -599,6 +616,7 @@ impl Vm {
             regs: Vec::with_capacity(256),
             frames: Vec::new(),
             handlers: Vec::new(),
+            guards: Vec::new(),
             consts: vec![None; nconsts],
             out: vec![OutBuf { buf: String::new(), html: html_output }],
             http: HttpCtx::default(),
@@ -753,6 +771,21 @@ impl Vm {
             Value::Str(s) if out.html => html_escape_into(s, &mut out.buf),
             other => other.append_to(&mut out.buf),
         }
+    }
+
+    /// Output from frame `frame` (or deeper) is refused while a statement of a
+    /// frame below it runs in HTML other than element text, into the same output.
+    fn output_allowed(&self, frame: usize) -> Result<(), VmError> {
+        let depth = self.out.len();
+        if self.guards.iter().any(|&(f, d)| f < frame && d == depth) {
+            return Err(VmError::Fatal(GUARDED_OUTPUT.to_string()));
+        }
+        Ok(())
+    }
+
+    /// For builtins that write output (`dump()`): refused anywhere in such HTML.
+    pub fn check_output(&self) -> Result<(), VmError> {
+        self.output_allowed(self.frames.len())
     }
 
     pub fn write_raw(&mut self, s: &str) {
@@ -1045,6 +1078,14 @@ impl Vm {
                             let h = self.handlers.pop().unwrap();
                             self.frames.truncate(h.frame + 1);
                             self.out.truncate(h.out_depth);
+                            if h.in_guard || self.guards.len() > h.guards {
+                                if let Some(o) = self.out.last_mut() {
+                                    if o.buf.len() > h.out_len {
+                                        o.buf.truncate(h.out_len);
+                                    }
+                                }
+                            }
+                            self.guards.truncate(h.guards);
                             let fr = &mut self.frames[h.frame];
                             fr.pc = h.catch_pc;
                             let base = fr.base;
@@ -1070,6 +1111,7 @@ impl Vm {
         let base = self.frames[stop_at].base;
         self.frames.truncate(stop_at);
         self.handlers.retain(|h| h.frame < stop_at);
+        self.guards.retain(|g| g.0 < stop_at);
         self.regs.truncate(base);
     }
 
@@ -1174,6 +1216,9 @@ impl Vm {
                     let v = $v;
                     while matches!(self.handlers.last(), Some(h) if h.frame == fi) {
                         self.handlers.pop();
+                    }
+                    while matches!(self.guards.last(), Some(g) if g.0 >= fi) {
+                        self.guards.pop();
                     }
                     let fr = self.frames.pop().unwrap();
                     // The callee's registers are left as they are: the next
@@ -1621,7 +1666,18 @@ impl Vm {
                     }
                     Instr::TryBegin { catch, exc } => {
                         let out_depth = self.out.len();
-                        self.handlers.push(Handler { frame: fi, catch_pc: *catch, exc_reg: *exc, out_depth });
+                        let out_len = self.out.last().map_or(0, |o| o.buf.len());
+                        let guards = self.guards.len();
+                        let in_guard = self.guards.iter().any(|&(f, d)| f == fi && d == out_depth);
+                        self.handlers.push(Handler {
+                            frame: fi,
+                            catch_pc: *catch,
+                            exc_reg: *exc,
+                            out_depth,
+                            out_len,
+                            in_guard,
+                            guards,
+                        });
                     }
                     Instr::TryEnd => {
                         self.handlers.pop();
@@ -1683,7 +1739,16 @@ impl Vm {
                         reg!(*dst) = Value::Closure(Rc::new(Closure { func: *f, caps }));
                     }
 
+                    Instr::GuardOutput => self.guards.push((fi, self.out.len())),
+                    Instr::EndGuard => {
+                        if matches!(self.guards.last(), Some(g) if g.0 == fi) {
+                            self.guards.pop();
+                        }
+                    }
                     Instr::Echo(r) | Instr::EchoAttr(r) => {
+                        if !self.guards.is_empty() {
+                            tri!(self.output_allowed(fi));
+                        }
                         let v = reg!(*r).clone();
                         // The output buffer grows with every echo; large pieces
                         // (and escaping, up to 6x) are checked before they are added.
@@ -1711,11 +1776,17 @@ impl Vm {
                         }
                     }
                     Instr::EchoHtml(c) => {
+                        if !self.guards.is_empty() {
+                            tri!(self.output_allowed(fi));
+                        }
                         if let Const::Str(s) = &prog.consts[*c as usize] {
                             self.out.last_mut().unwrap().buf.push_str(s);
                         }
                     }
                     Instr::EchoNonce => {
+                        if !self.guards.is_empty() {
+                            tri!(self.output_allowed(fi));
+                        }
                         if let Some(n) = &self.http.csp_nonce {
                             let buf = &mut self.out.last_mut().unwrap().buf;
                             buf.push_str(" nonce=\"");

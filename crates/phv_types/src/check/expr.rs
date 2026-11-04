@@ -337,6 +337,11 @@ impl<'a> Checker<'a> {
                 "only `json_html()` values and numbers can be inserted into `<script>`",
                 "use `json_html($value)`, which produces a JavaScript value that is safe inside a script; `escape()` does not make code safe",
             ),
+            ScriptLiteral if numeric => return,
+            ScriptLiteral => (
+                "values cannot be inserted inside a JavaScript string, template literal, comment or regular expression",
+                "insert the value where an expression goes, outside the quotes: `const message = <?= json_html($value) ?>;`",
+            ),
             Style if numeric => return,
             Style => ("values cannot be inserted into CSS", "use a class name, or a `data-*` attribute"),
             Handler if numeric => return,
