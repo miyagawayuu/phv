@@ -621,3 +621,51 @@ fn watch_mode_reloads_pages_on_changes() {
     assert_eq!(get(addr, "/__phv/changes", "").status, 404);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Request bodies are bounded before they are read (v0.9.1): a body of more
+/// than 8 MB is refused at once, a client holding a large body keeps the next
+/// one waiting for the budget (one worker: 8 MB), and a form of millions of
+/// fields is refused while it is parsed.
+#[test]
+fn request_bodies_are_bounded_before_they_are_read() {
+    let dir = std::env::temp_dir().join(format!("phv-http-bodies-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phv.toml", "[security]\ncsrf = false\n\n[server]\nworkers = 1\n");
+    write(&dir, "public/index.phv", "<?phv\nimport std.http.request;\necho count(request()->formParams);\n");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let opts = ServeOptions {
+        root: dir.clone(),
+        host: "127.0.0.1".into(),
+        port: 0,
+        dev: false,
+        time_limit: Duration::from_secs(5),
+        watch: false,
+    };
+    std::thread::spawn(move || serve_on(listener, opts).unwrap());
+    assert_eq!(post(addr, "/", "", "a=1&b=2").body, "2");
+
+    let huge = format!("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", 9 << 20);
+    assert_eq!(request(addr, &huge).status, 413);
+
+    let fields = "a&".repeat(1001);
+    assert_eq!(post(addr, "/", "", &fields).status, 400);
+    let start = std::time::Instant::now();
+    assert_eq!(post(addr, "/", "", &"a&".repeat(4 << 20)).status, 400);
+    assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+
+    // A client sends the start of an 8 MB body and stops: it holds the whole budget.
+    let mut slow = TcpStream::connect(addr).unwrap();
+    let head =
+        format!("POST / HTTP/1.1\r\nHost: t\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\nx", 8 << 20);
+    slow.write_all(head.as_bytes()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let start = std::time::Instant::now();
+    let r = post(addr, "/", "", &format!("a={}", "x".repeat(100_000)));
+    assert_eq!(r.status, 503, "{}", r.body);
+    assert!(start.elapsed() >= Duration::from_secs(9), "{:?}", start.elapsed());
+    // Small bodies do not need the budget.
+    assert_eq!(post(addr, "/", "", "a=1").body, "1");
+    drop(slow);
+    let _ = std::fs::remove_dir_all(&dir);
+}

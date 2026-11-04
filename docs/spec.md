@@ -748,7 +748,10 @@ phv serve examples/site --port 8080
 - At most `[server] workers` scripts run at once (default: two per CPU, at least 8); a request waits up to 10 seconds
   for one. A request that cannot get one in time, or that arrives while the output waiting to be sent to clients is
   more than the workers could produce (`workers` × `memory_limit_mb`), gets `503 Service Unavailable` with
-  `Retry-After: 5`. Static files do not need a worker. A connection buffers at most 64 KB for a client that reads
+  `Retry-After: 5`. Static files do not need a worker. Request bodies larger than 64 KB are received only within a
+  budget of `workers` × 8 MB, reserved before the body is read (its `Content-Length`, or 8 MB when it is sent in
+  chunks) and kept until its script ends; a request that cannot get its share within 10 seconds gets the same 503.
+  Query and form fields are counted as they are parsed. A connection buffers at most 64 KB for a client that reads
   slowly. So the memory a server uses stays around twice `workers` × `memory_limit_mb`, however many clients connect.
 - If `[security] requests_per_minute` is set, the number of requests accepted per minute from a single client address is limited to that number
   (beyond it, the response is `429 Too Many Requests` with `Retry-After`). The default is unlimited. With
@@ -1890,6 +1893,7 @@ It then runs the type checker and shows the places that need manual work, such a
 | Request body | 8 MB | 413 |
 | Scripts running at once (`serve`) | two per CPU, at least 8 (`[server] workers`) | waits up to 10 seconds, then 503 |
 | Output waiting to be sent (`serve`) | `workers` × `memory_limit_mb` | 503 |
+| Request bodies over 64 KB being received or held (`serve`) | `workers` × 8 MB | waits up to 10 seconds, then 503 |
 | Source file (module, template, script) | 8 MB | Compile error |
 | Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits) |
 | Variables and temporary values of one function | 65,534 | Compile error (split the function) |

@@ -16,7 +16,16 @@ const MAX_SESSION_BYTES: usize = 64 * 1024;
 struct Json<'a> {
     s: &'a [u8],
     i: usize,
+    /// The run whose memory and time limits apply while values are built
+    /// (a few megabytes of `[[],[],...]` make hundreds of megabytes of values).
+    vm: Option<&'a Vm>,
+    values: usize,
+    /// The limit that stopped the parse, if one did.
+    stopped: Option<VmError>,
 }
+
+/// Values built between two checks of the run's limits.
+const JSON_CHECK_EVERY: usize = 4096;
 
 impl Json<'_> {
     fn ws(&mut self) {
@@ -32,6 +41,13 @@ impl Json<'_> {
     fn value(&mut self, depth: usize) -> Result<Value, String> {
         if depth > 128 {
             return self.err("JSON is nested too deeply");
+        }
+        self.values += 1;
+        if self.values.is_multiple_of(JSON_CHECK_EVERY) {
+            if let Some(Err(e)) = self.vm.map(Vm::check_limits) {
+                self.stopped = Some(e);
+                return Err(String::new());
+            }
         }
         self.ws();
         match self.s.get(self.i) {
@@ -201,13 +217,33 @@ impl Json<'_> {
 }
 
 pub fn json_decode(text: &str) -> Result<Value, String> {
-    let mut p = Json { s: text.as_bytes(), i: 0 };
+    let mut p = Json { s: text.as_bytes(), i: 0, vm: None, values: 0, stopped: None };
     let v = p.value(0)?;
     p.ws();
     if p.i != p.s.len() {
         return p.err("unexpected text after JSON value");
     }
     Ok(v)
+}
+
+/// `json_decode` for a script: the run's memory and time limits are checked as
+/// the values are built, not only once they all are. The outer error is the
+/// limit; the inner one, text that is not JSON (for a `ValueError`).
+pub fn json_decode_in(vm: &Vm, text: &str) -> Result<Result<Value, String>, VmError> {
+    let mut p = Json { s: text.as_bytes(), i: 0, vm: Some(vm), values: 0, stopped: None };
+    let v = p.value(0);
+    if let Some(e) = p.stopped.take() {
+        return Err(e);
+    }
+    let v = match v {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    p.ws();
+    if p.i != p.s.len() {
+        return Ok(p.err("unexpected text after JSON value"));
+    }
+    Ok(Ok(v))
 }
 
 // ----- cookies --------------------------------------------------------------
@@ -354,7 +390,7 @@ pub fn csrf_token(vm: &mut Vm) -> Result<String, VmError> {
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
     let f: BuiltinFn = match name {
         "json_decode" => {
-            |vm, a| json_decode(s(&a[0])).map_err(|e| vm.throw("ValueError", format!("json_decode(): {e}")))
+            |vm, a| json_decode_in(vm, s(&a[0]))?.map_err(|e| vm.throw("ValueError", format!("json_decode(): {e}")))
         }
         "__req_cookies" => |vm, _| Ok(Value::map(cookies(vm))),
         "__resp_cookie" => set_cookie,

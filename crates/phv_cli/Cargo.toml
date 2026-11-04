@@ -11,6 +11,7 @@ name = "phv"
 path = "src/main.rs"
 
 [dependencies]
+getrandom.workspace = true
 phv_std.workspace = true
 phv_syntax.workspace = true
 phv_driver.workspace = true

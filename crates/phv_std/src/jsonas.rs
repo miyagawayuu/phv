@@ -7,7 +7,7 @@
 //! Shapes: `i f s b a`, `?X`, `lX`, `msX` / `miX`, `cN`, `eN` (enum by value),
 //! `nN` (pure enum by case name).
 
-use super::{s, web::json_decode};
+use super::{s, web::json_decode_in};
 use phv_vm::value::Object;
 use phv_vm::vm::const_value;
 use phv_vm::{BuiltinFn, Key, Map, Value, Vm, VmError};
@@ -258,7 +258,8 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let Some((top, classes)) = parse_desc(s(&a[1])) else {
                 return Err(vm.throw("RuntimeException", "json_decode_as(): bad type description"));
             };
-            let v = json_decode(s(&a[0])).map_err(|e| vm.throw("ValueError", format!("json_decode_as(): {e}")))?;
+            let v =
+                json_decode_in(vm, s(&a[0]))?.map_err(|e| vm.throw("ValueError", format!("json_decode_as(): {e}")))?;
             let defaults = super::list(&a[2]).clone();
             Builder { classes: &classes, defaults: &defaults, path: "$".into() }.build(vm, &v, &top)
         },

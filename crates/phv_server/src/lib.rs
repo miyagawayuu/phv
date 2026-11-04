@@ -35,6 +35,8 @@ use tokio::net::TcpListener;
 
 /// Request bodies larger than this are rejected with 413.
 const MAX_BODY: usize = 8 * 1024 * 1024;
+/// Bodies up to this size are read without a share of the body budget.
+const SMALL_BODY: u64 = 64 * 1024;
 /// Static files larger than this are not served (use a CDN or reverse proxy).
 const MAX_STATIC: u64 = 64 * 1024 * 1024;
 /// Connections handled at the same time; further clients wait in the backlog.
@@ -93,6 +95,10 @@ struct State {
     embedded: Option<Embedded>,
     /// Scripts running at once (`[server] workers`).
     workers: Arc<tokio::sync::Semaphore>,
+    /// Bytes of request bodies being received or held, in KiB: as much as the
+    /// workers can use at once. A body larger than `SMALL_BODY` takes its share
+    /// before it is read and keeps it until its script ends.
+    body_budget: Arc<tokio::sync::Semaphore>,
     /// Bytes of script output waiting to be sent, over all connections.
     buffered: Arc<AtomicUsize>,
     /// No new script runs while `buffered` is above this.
@@ -133,6 +139,7 @@ impl State {
             csrf_cookie: if config.secure_cookies { "__Host-PHVCSRF" } else { "PHVCSRF" },
             csrf_secret: secret,
             workers: Arc::new(tokio::sync::Semaphore::new(config.workers)),
+            body_budget: Arc::new(tokio::sync::Semaphore::new(config.workers.max(1) * (MAX_BODY / 1024))),
             buffered: Arc::new(AtomicUsize::new(0)),
             // As much output as the workers could make at once.
             buffered_cap: config.workers * (config.memory_limit_mb as usize) * 1024 * 1024,
@@ -966,15 +973,16 @@ impl State {
             .iter()
             .map(|(k, v)| (k.as_str().to_ascii_lowercase(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
             .collect();
-        let query: Vec<(String, String)> =
-            form_urlencoded::parse(parts.uri.query().unwrap_or("").as_bytes()).into_owned().collect();
+        let too_many = || simple(StatusCode::BAD_REQUEST, "text/plain", "bad request: too many fields".into());
+        let Some(query) = fields(parts.uri.query().unwrap_or("").as_bytes()) else { return too_many() };
         let raw_content_type = parts.headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
         let content_type = raw_content_type.to_ascii_lowercase();
         let mut form = Vec::new();
         let mut files = Vec::new();
         let mut raw_body = true;
         if content_type.starts_with("application/x-www-form-urlencoded") {
-            form = form_urlencoded::parse(&body).into_owned().collect();
+            let Some(f) = fields(&body) else { return too_many() };
+            form = f;
         } else if let Some(b) = multipart::boundary(raw_content_type) {
             raw_body = false;
             match multipart::parse(&body, &b) {
@@ -985,8 +993,8 @@ impl State {
                 Err(e) => return simple(StatusCode::BAD_REQUEST, "text/plain", format!("bad request: {e}")),
             }
         }
-        if query.len() > MAX_FIELDS || form.len() > MAX_FIELDS {
-            return simple(StatusCode::BAD_REQUEST, "text/plain", "bad request: too many fields".into());
+        if form.len() > MAX_FIELDS {
+            return too_many();
         }
         let cookie_header = parts.headers.get(hyper::header::COOKIE).and_then(|v| v.to_str().ok());
         let session = self.sessions.load(cookie_header);
@@ -1203,6 +1211,19 @@ impl State {
     }
 }
 
+/// The fields of a query string or a URL-encoded form; `None` past `MAX_FIELDS`
+/// (counted while parsing, so millions of short fields are never all decoded).
+fn fields(bytes: &[u8]) -> Option<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for (k, v) in form_urlencoded::parse(bytes) {
+        if out.len() == MAX_FIELDS {
+            return None;
+        }
+        out.push((k.into_owned(), v.into_owned()));
+    }
+    Some(out)
+}
+
 async fn run_script(
     state: &Arc<State>,
     script: PathBuf,
@@ -1212,17 +1233,33 @@ async fn run_script(
     kind: Page,
 ) -> Resp {
     let (parts, body) = req.into_parts();
-    let body = match tokio::time::timeout(BODY_TIMEOUT, Limited::new(body, MAX_BODY).collect()).await {
-        Ok(Ok(b)) => b.to_bytes(),
-        Ok(Err(_)) => return simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "request body too large".into()),
-        Err(_) => return simple(StatusCode::REQUEST_TIMEOUT, "text/plain", "request body timed out".into()),
-    };
-    // Memory is bounded by the scripts running at once and the output waiting
-    // to be sent; past either limit, new requests are turned away for now.
+    // Memory is bounded by the scripts running at once, the bodies they read and
+    // the output waiting to be sent; past a limit, new requests are turned away for now.
     let busy = || {
         let mut r = simple(StatusCode::SERVICE_UNAVAILABLE, "text/plain", "the server is busy; try again soon".into());
         r.headers_mut().insert("retry-after", HeaderValue::from_static("5"));
         r
+    };
+    // A large body takes its share of the budget before it is read (its stated
+    // length, or the most a body may be when it is sent in chunks), so slow
+    // clients holding bodies cannot pile up gigabytes.
+    let expected = hyper::body::Body::size_hint(&body).upper().unwrap_or(MAX_BODY as u64);
+    if expected > MAX_BODY as u64 {
+        return simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "request body too large".into());
+    }
+    let reserved = if expected <= SMALL_BODY {
+        None
+    } else {
+        let kib = (expected as usize).div_ceil(1024) as u32;
+        match tokio::time::timeout(QUEUE_WAIT, state.body_budget.clone().acquire_many_owned(kib)).await {
+            Ok(Ok(p)) => Some(p),
+            _ => return busy(),
+        }
+    };
+    let body = match tokio::time::timeout(BODY_TIMEOUT, Limited::new(body, MAX_BODY).collect()).await {
+        Ok(Ok(b)) => b.to_bytes(),
+        Ok(Err(_)) => return simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "request body too large".into()),
+        Err(_) => return simple(StatusCode::REQUEST_TIMEOUT, "text/plain", "request body timed out".into()),
     };
     if state.buffered.load(Ordering::Relaxed) > state.buffered_cap {
         return busy();
@@ -1233,6 +1270,7 @@ async fn run_script(
     let st = state.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _reserved = reserved;
         st.execute(&script, params, ip, parts, body, kind)
     })
     .await

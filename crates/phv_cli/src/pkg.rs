@@ -105,12 +105,45 @@ fn is_commit_hash(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// An empty directory only this process created and only this user can write:
+/// git's hooks are looked up in it, so none run. A fixed name in a shared
+/// temporary directory could be created first, with hooks in it, by another
+/// user; this one has a random name, is created new (never reused) and is
+/// removed when dropped.
+struct NoHooks(PathBuf);
+
+impl NoHooks {
+    fn new() -> Result<NoHooks, String> {
+        for _ in 0..16 {
+            let mut r = [0u8; 16];
+            getrandom::fill(&mut r).map_err(|e| format!("cannot make a temporary directory: {e}"))?;
+            let name: String = r.iter().map(|b| format!("{b:02x}")).collect();
+            let dir = std::env::temp_dir().join(format!("phv-no-hooks-{name}"));
+            #[allow(unused_mut)] // the mode is set on Unix only
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            match builder.create(&dir) {
+                Ok(()) => return Ok(NoHooks(dir)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("cannot make a temporary directory: {e}")),
+            }
+        }
+        Err("cannot make a temporary directory".into())
+    }
+}
+
+impl Drop for NoHooks {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
 fn git(args: &[&str], dir: Option<&Path>) -> Result<String, String> {
     // Hooks, fsmonitor commands and unusual transports never run; repositories
     // are always fresh clones, so no repository-local config is trusted.
-    let no_hooks = std::env::temp_dir().join("phv-empty-hooks");
-    let _ = std::fs::create_dir_all(&no_hooks);
-    let hooks = format!("core.hooksPath={}", no_hooks.display());
+    let no_hooks = NoHooks::new()?;
+    let hooks = format!("core.hooksPath={}", no_hooks.0.display());
     let mut cmd = Command::new("git");
     cmd.args(["-c", &hooks, "-c", "core.fsmonitor=false", "-c", "advice.detachedHead=false"]);
     cmd.args(["-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always"]);
@@ -535,6 +568,24 @@ fn resolve(ins: &mut Installer, root_deps: &BTreeMap<String, Dependency>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each git command gets its own new directory for hooks (a fixed name in a
+    /// shared temporary directory could be created first by another user).
+    #[test]
+    fn hooks_directories_are_private_and_new() {
+        let a = NoHooks::new().unwrap();
+        let b = NoHooks::new().unwrap();
+        assert_ne!(a.0, b.0);
+        assert!(std::fs::read_dir(&a.0).unwrap().next().is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&a.0).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        let path = a.0.clone();
+        drop(a);
+        assert!(!path.exists());
+    }
 
     #[test]
     fn rejects_dangerous_urls() {

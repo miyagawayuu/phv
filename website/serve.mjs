@@ -21,7 +21,15 @@ for (const line of lines.slice(lines.indexOf("/*") + 1)) {
 
 http
   .createServer((req, res) => {
-    let rel = decodeURIComponent(new URL(req.url, "http://x").pathname);
+    let rel;
+    try {
+      rel = decodeURIComponent(new URL(req.url, "http://x").pathname);
+    } catch {
+      // A malformed URL or escape (`%E0%A4%A`) is the request's fault, not a reason to stop.
+      res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+      res.end("bad request");
+      return;
+    }
     if (rel.endsWith("/")) rel += "index.html";
     const file = path.join(dist, path.normalize(rel));
     if (!file.startsWith(dist + path.sep) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {

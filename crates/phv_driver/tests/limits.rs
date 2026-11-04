@@ -71,6 +71,15 @@ echo strlen(csv_encode($rows));
 "#,
     );
     assert_stops_at_limit("chunk", "<?phv echo range(0, 299999)->chunk(1)->len();");
+    // 3 MB of empty lists decode to far more than 16 MB of values (v0.9.1).
+    assert_stops_at_limit(
+        "json_decode",
+        r#"<?phv
+$text = "[" . str_repeat("[],", 1000000) . "[]]";
+any $v = json_decode($text);
+echo $v is list ? count($v) : 0;
+"#,
+    );
     assert_stops_at_limit("group_by", "<?phv echo range(0, 299999)->groupBy(fn(int $i): int => $i)->len();");
 }
 
