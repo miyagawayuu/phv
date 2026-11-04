@@ -899,7 +899,8 @@ impl State {
                 .find(|(k, _)| k == "_csrf")
                 .map(|(_, v)| v.as_str())
                 .or_else(|| parts.headers.get("x-csrf-token").and_then(|v| v.to_str().ok()));
-            let ok = matches!((&expected, submitted), (Some(e), Some(s)) if phv_std::constant_time_eq(e.as_bytes(), s.as_bytes()));
+            // Tokens are masked with a pad of their own on each page (BREACH).
+            let ok = matches!((&expected, submitted), (Some(e), Some(s)) if phv_std::csrf_matches(e, s));
             if !ok {
                 let hint = if self.dev {
                     "<p class=\"hint\">Add <code>&lt;?= csrf_field() ?&gt;</code> inside the form, or send the token from \

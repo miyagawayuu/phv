@@ -21,5 +21,5 @@ denied: read access to "secret.txt" is not allowed; keep files in a directory li
 denied: "../outside.txt" must be a path relative to the project without `..`
 denied: reading the environment variable "PATH" is not allowed; add it to [permissions].env in phv.toml
 user=ann flash=ann after=-
-64 stable token
+128 masked each time
 no cookie

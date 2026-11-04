@@ -301,6 +301,43 @@ pub fn csrf_expected(secret: &[u8], cookie: &str) -> String {
     m.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A CSRF token as written into a page: a fresh random pad, then the token
+/// XORed with it. The text differs on every response, so a page compressed by
+/// any proxy or CDN on the way does not give the token away through its size
+/// (BREACH), while the server can still recover the token (`csrf_matches`).
+pub fn mask_csrf(token: &str) -> String {
+    let t = from_hex(token).unwrap_or_default();
+    let mut pad = vec![0u8; t.len()];
+    getrandom::fill(&mut pad).expect("operating system random number generator failed");
+    let masked: Vec<u8> = t.iter().zip(&pad).map(|(a, b)| a ^ b).collect();
+    format!("{}{}", to_hex(&pad), to_hex(&masked))
+}
+
+/// Whether a submitted token is `expected`: masked (`mask_csrf`), or written
+/// as it is (pages served before tokens were masked).
+pub fn csrf_matches(expected: &str, submitted: &str) -> bool {
+    let plain = if submitted.len() == expected.len() * 2 {
+        // Decoded whole first: a value with other characters is refused, never split mid-character.
+        let Some(bytes) = from_hex(submitted) else { return false };
+        let (pad, masked) = bytes.split_at(bytes.len() / 2);
+        to_hex(&pad.iter().zip(masked).map(|(a, b)| a ^ b).collect::<Vec<u8>>())
+    } else {
+        submitted.to_string()
+    };
+    crate::constant_time_eq(expected.as_bytes(), plain.as_bytes())
+}
+
 pub fn csrf_token(vm: &mut Vm) -> Result<String, VmError> {
     vm.http.personalized = true;
     let cookie = match (&vm.http.new_csrf_cookie, &vm.http.csrf_cookie) {
@@ -311,7 +348,7 @@ pub fn csrf_token(vm: &mut Vm) -> Result<String, VmError> {
             c
         }
     };
-    Ok(csrf_expected(&vm.http.csrf_secret, &cookie))
+    Ok(mask_csrf(&csrf_expected(&vm.http.csrf_secret, &cookie)))
 }
 
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
@@ -411,5 +448,29 @@ mod tests {
         assert!(json_decode("{\"a\":1} x").is_err());
         assert!(json_decode(&"[".repeat(1000)).is_err());
         assert!(matches!(json_decode("12345678901234567890").unwrap(), Value::Float(_)));
+    }
+}
+
+#[cfg(test)]
+mod csrf_tests {
+    use super::*;
+
+    #[test]
+    fn masked_tokens_differ_and_verify() {
+        let token = csrf_expected(b"secret", "cookie");
+        let (a, b) = (mask_csrf(&token), mask_csrf(&token));
+        assert_ne!(a, b, "a fresh pad on every page");
+        assert_eq!(a.len(), 128);
+        assert!(!a.contains(&token));
+        assert!(csrf_matches(&token, &a) && csrf_matches(&token, &b));
+        assert!(csrf_matches(&token, &token), "plain tokens from older pages still work");
+        let other = mask_csrf(&csrf_expected(b"secret", "other"));
+        assert!(!csrf_matches(&token, &other));
+        let mut flipped = a.clone().into_bytes();
+        flipped[100] = if flipped[100] == b'0' { b'1' } else { b'0' };
+        assert!(!csrf_matches(&token, &String::from_utf8(flipped).unwrap()));
+        // 128 bytes with multi-byte characters: refused, not split mid-character.
+        assert!(!csrf_matches(&token, &"é".repeat(64)));
+        assert!(!csrf_matches(&token, ""));
     }
 }

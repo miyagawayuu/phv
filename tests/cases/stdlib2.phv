@@ -88,5 +88,5 @@ try {
 // sessions (in memory when run from the command line)
 session()->set("user", "ann");
 echo "user=", session()->get("user") ?? "-", " flash=", session()->flash("user") ?? "-", " after=", session()->get("user") ?? "-", "\n";
-echo strlen(csrf_token()), " ", csrf_token() == csrf_token() ? "stable token" : "changed", "\n";
+echo strlen(csrf_token()), " ", csrf_token() != csrf_token() ? "masked each time" : "same", "\n";
 echo request()->cookie("missing") ?? "no cookie", "\n";

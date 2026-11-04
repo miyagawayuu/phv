@@ -814,7 +814,10 @@ new route files are picked up within a second.
   accepts it (`[server] compress = false` turns this off). Responses for one visitor (they set a cookie, use the session
   or carry a CSRF token, whatever `Cache-Control` the page sets) and pages answering a request that carries cookies or
   an `Authorization` header are never compressed, so a secret in them cannot be guessed from the compressed size
-  (BREACH). Static files are compressed once per version and kept (up to 32 MB).
+  (BREACH). Static files are compressed once per version and kept (up to 32 MB). A proxy or CDN in front of the
+  server may compress every response anyway (Fly.io's proxy does): CSRF tokens stay safe because they are masked
+  (see "CSRF protection"), but other secrets a page shows next to text from the request may not be. Turn the proxy's
+  compression off for such pages if it allows that.
 - `[cors]` lets pages of other origins call the site from a browser:
 
   ```toml
@@ -917,6 +920,9 @@ When sending from JavaScript, put the value of `csrf_token()` in the `X-CSRF-Tok
 JSON requests require a CORS preflight, so other sites cannot send them.
 
 The token is an HMAC of a per-browser cookie (`PHVCSRF`), so this relies on attackers being unable to overwrite that cookie.
+`csrf_field()` and `csrf_token()` write it masked with a random pad of its own each time it is written (128 hex digits), so
+the text differs each time and a page compressed on the way, by the server or by a proxy or CDN in front of it, does
+not give the token away through its size (BREACH). The server accepts the masked form and the plain one.
 In production, serve over HTTPS and set `secure_cookies = true` (the cookie gets the `__Host-` prefix and can no longer be overwritten
 over plaintext connections or from subdomains).
 It can be disabled with `[security] csrf = false`.

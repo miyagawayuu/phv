@@ -3,9 +3,9 @@
 English | [日本語](security-audit.ja.md)
 
 This report consolidates eight audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, and §15 what was added for v0.7.0.
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, and §16 the follow-up on compressing proxies (v0.7.1).
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§15: 2026-11-04)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§15: 2026-11-04, §16: 2026-11-05)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -685,3 +685,24 @@ in CI, with clippy (`-D warnings`) and rustfmt.
 
 Dependencies: `cargo audit` (CI) and `npm audit --omit=dev` in the extension and the website find nothing; Dependabot
 has no open alerts. New crates: `signal-hook-registry` and `errno` (Unix only, for tokio's signal handling).
+
+## 16. Follow-up: Compressing Proxies (v0.7.1)
+
+Date: 2026-11-05. After v0.7.0 was deployed to the demo, its pages were checked through Fly.io: `/board`, which
+carries a CSRF token and is sent uncompressed by PHV (§15, R8-1), arrived compressed. Fly.io's proxy compresses every
+response the app leaves without a `Content-Encoding` header, and other proxies and CDNs can do the same, so PHV's rule
+of not compressing personal responses does not protect them behind such a proxy.
+
+| # | Finding | Fix |
+|---|---|---|
+| R9-1 (Medium) | Behind a compressing proxy, a page's CSRF token was compressed next to text from the request, so its size could reveal the token (BREACH) | `csrf_field()` and `csrf_token()` write the token masked with a random pad of its own each time (pad, then token XOR pad: 128 hex digits); the server unmasks it before comparing, and still accepts the plain token, which nothing writes any more |
+
+Other secrets a page shows next to request text are the application's, and are not masked; spec §14 now says that a
+compressing proxy can undo the server's rule and suggests turning its compression off for such pages.
+
+Verification: a new reviewer checked the change against a release build with raw HTTP. Masked tokens (also replayed,
+in uppercase, in `X-CSRF-Token`) and plain tokens are accepted; empty, short, long, non-hex and non-ASCII values, a pad
+paired with itself, another session's token and tokens from before `regenerate()` are refused, and no input made the
+server panic. No other code writes or compares the token. Regression tests: `masked_tokens_differ_and_verify` in
+`crates/phv_std/src/web.rs`, `serves_pages_safely` (two loads of a form give different tokens that both work) and
+`tests/cases/stdlib2.phv`. Residual risks: none.

@@ -103,6 +103,12 @@ fn serves_pages_safely() {
     let ok = post(addr, "/form", &cookie, &format!("v=hello&_csrf={token}"));
     assert_eq!(ok.status, 200);
     assert!(ok.body.contains("saved hello"), "{}", ok.body);
+    // Masked on each page (BREACH): another load of the form shows other text, which works too.
+    assert_eq!(token.len(), 128);
+    let again = get(addr, "/form", &cookie);
+    let token2 = again.body.split("value=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    assert_ne!(token, token2);
+    assert_eq!(post(addr, "/form", &cookie, &format!("v=again&_csrf={token2}")).status, 200);
     // A token from another session does not work.
     let other = get(addr, "/form", "");
     let other_cookie = other.header("set-cookie").unwrap().split(';').next().unwrap().to_string();
