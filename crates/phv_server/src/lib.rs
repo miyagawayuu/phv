@@ -1237,11 +1237,11 @@ fn busy() -> Resp {
 /// budget as it arrives, so a client holds only what it has really sent, and
 /// slow clients cannot pile up gigabytes. The permits are returned with the
 /// body and are kept until its script ends.
-async fn read_body(state: &State, mut body: Incoming) -> Result<(Bytes, Option<OwnedSemaphorePermit>), Resp> {
+async fn read_body(state: &State, mut body: Incoming) -> Result<(Bytes, Option<OwnedSemaphorePermit>), Box<Resp>> {
     let too_large = || simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "request body too large".into());
     let stated = hyper::body::Body::size_hint(&body).upper();
     if stated.is_some_and(|n| n > MAX_BODY as u64) {
-        return Err(too_large());
+        return Err(Box::new(too_large()));
     }
     let deadline = tokio::time::Instant::now() + BODY_TIMEOUT;
     let timed_out = || simple(StatusCode::REQUEST_TIMEOUT, "text/plain", "request body timed out".into());
@@ -1255,15 +1255,17 @@ async fn read_body(state: &State, mut body: Incoming) -> Result<(Bytes, Option<O
     let mut held_kib = 0usize;
     loop {
         let frame = match tokio::time::timeout_at(deadline, body.frame()).await {
-            Err(_) => return Err(timed_out()),
+            Err(_) => return Err(Box::new(timed_out())),
             Ok(None) => break,
-            Ok(Some(Err(_))) => return Err(simple(StatusCode::BAD_REQUEST, "text/plain", "bad request body".into())),
+            Ok(Some(Err(_))) => {
+                return Err(Box::new(simple(StatusCode::BAD_REQUEST, "text/plain", "bad request body".into())))
+            }
             Ok(Some(Ok(f))) => f,
         };
         let Ok(chunk) = frame.into_data() else { continue };
         let len = data.len() + chunk.len();
         if len > MAX_BODY {
-            return Err(too_large());
+            return Err(Box::new(too_large()));
         }
         if len > data.capacity() {
             // Room grows by doubling, up to the stated length (only as bytes arrive).
@@ -1275,7 +1277,7 @@ async fn read_body(state: &State, mut body: Incoming) -> Result<(Bytes, Option<O
                 let permit =
                     match tokio::time::timeout_at(wait, state.body_budget.clone().acquire_many_owned(more)).await {
                         Ok(Ok(p)) => p,
-                        _ => return Err(busy()),
+                        _ => return Err(Box::new(busy())),
                     };
                 match &mut held {
                     Some(h) => h.merge(permit),
@@ -1303,7 +1305,7 @@ async fn run_script(
     // the output waiting to be sent; past a limit, new requests are turned away for now.
     let (body, reserved) = match read_body(state, body).await {
         Ok(b) => b,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if state.buffered.load(Ordering::Relaxed) > state.buffered_cap {
         return busy();
