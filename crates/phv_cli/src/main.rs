@@ -1,5 +1,7 @@
 mod build;
+mod dap;
 mod db;
+mod doc;
 mod lsp;
 mod migrate;
 mod new;
@@ -63,6 +65,9 @@ enum Command {
         /// Stop the script after this many seconds.
         #[arg(long)]
         time_limit: Option<f64>,
+        /// After the run, show the calls and time of each function (on standard error).
+        #[arg(long)]
+        profile: bool,
     },
     /// Type-check a script and everything it imports, without running it.
     Check { file: PathBuf },
@@ -97,6 +102,8 @@ enum Command {
     },
     /// Start the language server (for editors) on stdin/stdout.
     Lsp,
+    /// Start the debug adapter (Debug Adapter Protocol, for editors) on stdin/stdout.
+    Dap,
     /// Fetch the [dependencies] listed in phv.toml.
     Install {
         #[arg(default_value = ".")]
@@ -159,6 +166,23 @@ enum Command {
         #[arg(long, conflicts_with = "prod")]
         watch: bool,
     },
+    /// Write an API reference from the `/** */` comments of exported declarations.
+    Doc {
+        /// Files or directories (default: the current directory).
+        paths: Vec<PathBuf>,
+        /// Also document the standard library's modules (alone when no paths are given).
+        #[arg(long)]
+        std: bool,
+        /// `html` (one page) or `md` (one Markdown file).
+        #[arg(long, default_value = "html")]
+        format: String,
+        /// The file to write (default: doc/index.html or doc/api.md).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// The page's title.
+        #[arg(long, default_value = "API reference")]
+        title: String,
+    },
     /// Create a new project: a script, or a site with `--site`.
     New {
         /// The directory to create; its name is the project's name.
@@ -203,6 +227,33 @@ fn write_migrated(input: &Path, out: &Path, text: &str, force: bool) -> Result<(
     f.write_all(text.as_bytes()).map_err(|e| format!("cannot write {shown}: {e}"))
 }
 
+/// The functions that took the most time, then those called most.
+fn profile_report(prog: &phv_vm::Program, p: &phv_vm::vm::Profile) -> String {
+    let mut rows: Vec<usize> = (0..prog.funcs.len()).filter(|&i| p.calls[i] > 0).collect();
+    rows.sort_by(|&a, &b| p.self_time[b].cmp(&p.self_time[a]).then(p.calls[b].cmp(&p.calls[a])));
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let total: f64 = rows.iter().map(|&i| ms(p.self_time[i])).sum();
+    let mut out = String::from("\nprofile (self: in the function and its builtins; total: also in what it called)\n");
+    out.push_str(&format!("{:>10} {:>6} {:>10} {:>10}  function\n", "self ms", "self%", "total ms", "calls"));
+    for &i in rows.iter().take(40) {
+        let f = &prog.funcs[i];
+        let file = prog.files.get(f.file as usize).map(|x| x.name.as_str()).unwrap_or("");
+        let share = if total > 0.0 { ms(p.self_time[i]) * 100.0 / total } else { 0.0 };
+        out.push_str(&format!(
+            "{:>10.2} {:>5.1}% {:>10.2} {:>10}  {} ({file})\n",
+            ms(p.self_time[i]),
+            share,
+            ms(p.total_time[i]),
+            p.calls[i],
+            f.name
+        ));
+    }
+    if rows.len() > 40 {
+        out.push_str(&format!("  ... and {} more\n", rows.len() - 40));
+    }
+    out
+}
+
 fn main() -> ExitCode {
     // An executable made by `phv build` runs what it carries instead.
     if let Some(bundle) = phv_driver::bundle::read_own() {
@@ -232,9 +283,11 @@ fn main() -> ExitCode {
 fn exec(cmd: Command) -> ExitCode {
     let color = std::io::stderr().is_terminal();
     match cmd {
-        Command::Run { file, html, time_limit, args } => {
+        Command::Run { file, html, time_limit, args, profile } => {
             let root = find_root(&file);
-            let mut compiled = match compile_cached(&root, &file) {
+            let compiled =
+                if profile { phv_driver::compile_for_profile(&root, &file) } else { compile_cached(&root, &file) };
+            let mut compiled = match compiled {
                 Ok(c) => c,
                 Err(e) => {
                     eprint!("{}", e.render(color));
@@ -258,11 +311,19 @@ fn exec(cmd: Command) -> ExitCode {
             let mut host = (*config.host).clone();
             host.cli = true;
             host.args = args;
-            let outcome =
-                run(&compiled, RunOptions { html, limits, http: None, host: Some(std::sync::Arc::new(host)) });
+            let opts = RunOptions { html, limits, http: None, host: Some(std::sync::Arc::new(host)) };
+            let (outcome, measured) = if profile {
+                let (o, p) = phv_driver::run_profiled(&compiled, opts);
+                (o, Some(p))
+            } else {
+                (run(&compiled, opts), None)
+            };
             let mut stdout = std::io::stdout();
             let _ = stdout.write_all(outcome.output.as_bytes());
             let _ = stdout.flush();
+            if let Some(p) = measured {
+                eprint!("{}", profile_report(&compiled.program, &p));
+            }
             match outcome.error {
                 Some(err) => {
                     eprint!("{}", err.render());
@@ -290,6 +351,10 @@ fn exec(cmd: Command) -> ExitCode {
             tools::test(paths, tools::TestOptions { filter, json, junit, coverage, color })
         }
         Command::Fmt { paths, check, width } => tools::fmt(paths, check, width),
+        Command::Dap => {
+            dap::run();
+            ExitCode::SUCCESS
+        }
         Command::Lsp => {
             lsp::run();
             ExitCode::SUCCESS
@@ -376,6 +441,40 @@ fn exec(cmd: Command) -> ExitCode {
             } else {
                 eprint!("{}", phv_syntax::diag::render(&sources, &diags, color));
                 ExitCode::FAILURE
+            }
+        }
+        Command::Doc { paths, std, format, output, title } => {
+            let md = match format.as_str() {
+                "html" => false,
+                "md" | "markdown" => true,
+                other => {
+                    eprintln!("error: unknown format `{other}` (use html or md)");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let paths = if paths.is_empty() && !std { vec![PathBuf::from(".")] } else { paths };
+            let modules = doc::collect_modules(&paths, std);
+            if modules.is_empty() {
+                eprintln!("error: nothing to document (only exported declarations are documented)");
+                return ExitCode::FAILURE;
+            }
+            let text = if md { doc::markdown(&modules, &title) } else { doc::html(&modules, &title) };
+            let out = output.unwrap_or_else(|| PathBuf::from(if md { "doc/api.md" } else { "doc/index.html" }));
+            if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("error: cannot create {}: {e}", parent.display());
+                    return ExitCode::FAILURE;
+                }
+            }
+            match write_migrated(Path::new(""), &out, &text, true) {
+                Ok(()) => {
+                    println!("{} module(s) documented in {}", modules.len(), out.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
             }
         }
         Command::New { dir, site } => match new::create(&dir, site) {

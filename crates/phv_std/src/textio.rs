@@ -157,6 +157,13 @@ fn cli_only(vm: &mut Vm, what: &str) -> Result<(), VmError> {
     }
 }
 
+fn no_stdin(vm: &mut Vm) -> Result<(), VmError> {
+    if vm.host.no_stdin {
+        return Err(vm.throw("RuntimeException", "standard input cannot be read under the debugger"));
+    }
+    Ok(())
+}
+
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
     let f: BuiltinFn = match name {
         "csv_parse" => |vm, a| {
@@ -221,6 +228,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "stdin_read_line" => |vm, _| {
             cli_only(vm, "stdin_read_line()")?;
+            no_stdin(vm)?;
             use std::io::{BufRead, Read};
             let left = vm.memory_left();
             let mut line = String::new();
@@ -233,6 +241,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "stdin_read_all" => |vm, _| {
             cli_only(vm, "stdin_read_all()")?;
+            no_stdin(vm)?;
             use std::io::Read;
             // Read no more than the memory limit leaves room for.
             let left = vm.memory_left();

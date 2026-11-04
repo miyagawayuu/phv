@@ -1184,6 +1184,7 @@ mod tests {
 
     fn func(params: Vec<ValKind>, ret: ValKind, num_regs: u16, code: Vec<Instr>) -> Function {
         Function {
+            locals: Vec::new(),
             native: Some(NativeSig { params: params.clone(), ret }),
             num_params: params.len() as u16,
             num_regs,

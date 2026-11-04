@@ -15,6 +15,9 @@ Language support for [PHV](https://phv-lang.org):
     (Ctrl+T);
   - quick fixes (Ctrl+.): close names for unknown names, removing unused imports, `$_name` for unused variables;
   - semantic colouring of names, and the inferred type before variables (inlay hints).
+- Debugging with `phv dap`: add a launch configuration of type `phv` (`"program": "${file}"` runs the open
+  script), then set breakpoints and step through the code (F10, F11, Shift+F11); the Variables view opens lists,
+  maps and objects, and hovering a variable shows its value.
 - Comment toggling, bracket matching and auto-closing pairs.
 
 ## Installing

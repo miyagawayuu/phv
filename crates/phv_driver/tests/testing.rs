@@ -1,7 +1,7 @@
 //! How `phv test` finds tests (`test_*` functions and `#[Test]` / `#[Skip]`),
 //! runs `#[Before]` / `#[After]` around them, and measures coverage.
 
-use phv_driver::{compile, compile_for_tests, run_test, RunOptions};
+use phv_driver::{compile, compile_for_profile, compile_for_tests, run_test, RunOptions};
 
 #[test]
 fn finds_named_and_marked_tests() {
@@ -93,5 +93,41 @@ function test_covers(): void {
     // Without coverage, nothing is recorded and the program has no coverage instructions.
     let plain = compile_for_tests(&root, &entry, false).map_err(|e| e.render(false)).unwrap();
     assert!(plain.program.funcs.iter().all(|f| !f.code.iter().any(|i| matches!(i, phv_vm::Instr::Cover(_)))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn profiles_calls_and_time() {
+    let dir = std::env::temp_dir().join(format!("phv-profile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = r#"<?phv
+function fib(int $n): int {
+    return $n < 2 ? $n : fib($n - 1) + fib($n - 2);
+}
+function spin(): int {
+    $s = 0;
+    for ($i = 0; $i < 3000000; $i++) {
+        $s += $i % 3;
+    }
+    return $s;
+}
+echo fib(15), " ", spin(), " ", range(1, 1000)->map(fn(int $x): int => $x * 2)->len();
+"#;
+    std::fs::write(dir.join("p.phv"), src).unwrap();
+    let root = dir.canonicalize().unwrap();
+    let mut c = compile_for_profile(&root, &root.join("p.phv")).map_err(|e| e.render(false)).unwrap();
+    c.enable_jit();
+    let opts = RunOptions { html: false, limits: Default::default(), http: None, host: None };
+    let (outcome, p) = phv_driver::run_profiled(&c, opts);
+    assert!(outcome.error.is_none());
+    assert_eq!(outcome.output, "610 3000000 1000");
+    let id = |name: &str| c.program.funcs.iter().position(|f| f.name == name).unwrap();
+    assert_eq!(p.calls[id("fib")], 1973, "every call is counted (the JIT is not used)");
+    assert_eq!(p.calls[id("spin")], 1);
+    assert_eq!(p.calls[id("{closure}")], 1000, "calls from builtins count");
+    let main = id("{main}");
+    assert!(p.self_time[id("spin")] > p.self_time[id("fib")], "{p:?}");
+    assert!(p.total_time[main] >= p.total_time[id("spin")]);
     let _ = std::fs::remove_dir_all(&dir);
 }

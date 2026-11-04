@@ -768,20 +768,26 @@ pub fn compile_with_overlay(
     entry: &Path,
     overlay: HashMap<PathBuf, String>,
 ) -> Result<Compiled, CompileError> {
-    compile_full(root, entry, overlay, false)
+    compile_full(root, entry, overlay, Default::default())
 }
 
 /// Like `compile`; with `coverage`, the program records which statements run
 /// (`run_test`), and the JIT does not compile it.
 pub fn compile_for_tests(root: &Path, entry: &Path, coverage: bool) -> Result<Compiled, CompileError> {
-    compile_full(root, entry, HashMap::new(), coverage)
+    let opts = phv_compiler::Options { statement_markers: coverage, ..Default::default() };
+    compile_full(root, entry, HashMap::new(), opts)
+}
+
+/// Like `compile`, counting the calls of each function for `run_profiled`.
+pub fn compile_for_profile(root: &Path, entry: &Path) -> Result<Compiled, CompileError> {
+    compile_full(root, entry, HashMap::new(), phv_compiler::Options { call_counts: true, ..Default::default() })
 }
 
 fn compile_full(
     root: &Path,
     entry: &Path,
     overlay: HashMap<PathBuf, String>,
-    coverage: bool,
+    opts: phv_compiler::Options,
 ) -> Result<Compiled, CompileError> {
     let a = analyze(root, entry, overlay);
     if !a.messages.is_empty() || a.diags.iter().any(|d| d.is_error()) || a.hir.is_none() {
@@ -791,7 +797,7 @@ fn compile_full(
     let mut warnings: Vec<Diagnostic> = a.diags.iter().filter(|d| !d.is_error()).cloned().collect();
     warnings.sort_by_key(|d| (d.span.file, d.span.start));
     let warnings = diag::render(&a.sources, &warnings, false);
-    let program = match phv_compiler::compile_with(&hir, &a.sources, coverage) {
+    let program = match phv_compiler::compile_with(&hir, &a.sources, opts) {
         Ok(p) => p,
         Err(d) => return Err(CompileError { sources: a.sources, diags: vec![d], messages: Vec::new() }),
     };
@@ -892,6 +898,38 @@ pub fn run_test(
     let output = vm.take_output();
     let http = std::mem::take(&mut vm.http);
     RunOutcome { output, error, http }
+}
+
+/// Like `compile`, with a marker before each statement for the debugger (and
+/// no JIT, which would skip the markers).
+pub fn compile_for_debug(root: &Path, entry: &Path) -> Result<Compiled, CompileError> {
+    compile_full(root, entry, HashMap::new(), phv_compiler::Options { statement_markers: true, ..Default::default() })
+}
+
+/// Runs the program with `hook` called before each statement (`phv dap`).
+pub fn run_debug(c: &Compiled, opts: RunOptions, hook: Box<dyn phv_vm::vm::DebugHook>) -> RunOutcome {
+    let mut vm = new_vm(c, opts);
+    vm.jit = None;
+    vm.debug = Some(hook);
+    let error = call_caught(&mut vm, c.program.main);
+    vm.debug = None;
+    let output = vm.take_output();
+    let http = std::mem::take(&mut vm.http);
+    RunOutcome { output, error, http }
+}
+
+/// Runs the program as `run` does, measuring the calls and time of each function
+/// (`phv run --profile`). `c` comes from `compile_for_profile`; the JIT is not
+/// used, so every call is seen.
+pub fn run_profiled(c: &Compiled, opts: RunOptions) -> (RunOutcome, phv_vm::vm::Profile) {
+    let mut vm = new_vm(c, opts);
+    vm.jit = None;
+    vm.profile = Some(phv_vm::vm::Profile::new(c.program.funcs.len()));
+    let error = call_caught(&mut vm, c.program.main);
+    let profile = vm.profile.take().unwrap_or_default();
+    let output = vm.take_output();
+    let http = std::mem::take(&mut vm.http);
+    (RunOutcome { output, error, http }, profile)
 }
 
 fn new_vm(c: &Compiled, opts: RunOptions) -> Vm {

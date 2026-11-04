@@ -66,12 +66,14 @@ echo greet($name);                                 // Web ページでは自動�
 - **速度**: 型に特化したレジスタ型バイトコード VM、Cranelift による JIT、バイトコードのディスクキャッシュ
 - **ツール**: プロジェクトやサイトを作る `phv new`、テストランナー(同じプロセスで動く HTTP クライアント `std.testing`、
   前後のフック、JUnit の報告、カバレッジ付き)、ライブリロード(`phv serve --watch`)、フォーマッタ、Language Server
-  (名前の変更・参照・クイックフィックス・整形など)、パッケージマネージャ、データベースのマイグレーション、PHP からの
-  移行ツール。
-  VS Code 拡張(色分けと Language Server)は [editors/vscode](editors/vscode) にあり、各リリースに
+  (名前の変更・参照・クイックフィックス・整形など)、デバッガ(`phv dap`)、プロファイラ(`phv run --profile`)、
+  ドキュメントコメントからの API リファレンス(`phv doc`)、パッケージマネージャ、データベースのマイグレーション、
+  PHP からの移行ツール。
+  VS Code 拡張(色分け・Language Server・デバッガ)は [editors/vscode](editors/vscode) にあり、各リリースに
   `phv-<version>.vsix` として含まれる。
 
-詳しくは [言語仕様 (docs/spec.ja.md)](docs/spec.ja.md) を参照してください。脆弱性の報告方法は [SECURITY.md](SECURITY.md) にあります。
+まず[チュートリアル](docs/tutorial.ja.md)から始めてください。詳しくは [言語仕様 (docs/spec.ja.md)](docs/spec.ja.md)、標準ライブラリは
+[リファレンス (docs/stdlib.md、英語)](docs/stdlib.md) を参照してください。脆弱性の報告方法は [SECURITY.md](SECURITY.md) にあります。
 
 ## ビルド
 
@@ -94,7 +96,8 @@ phv serve examples/site                  # http://127.0.0.1:8080 でサイトを
 phv build examples/site -o site-server   # ソースなしでサイトを配信する 1 つの実行ファイルを作る
 phv test examples                        # *_test.phv の test_* 関数を実行(--coverage、--junit)
 phv fmt examples                         # インデントと空白を整える(--check で確認だけ)
-phv lsp                                  # エディタ用の Language Server
+phv lsp                                  # エディタ用の Language Server(phv dap はデバッガ)
+phv doc lib -o doc/index.html            # /** */ コメントから API リファレンスを作る
 phv install                              # phv.toml の [dependencies] を取得
 phv migrate legacy/page.php              # PHP を変換し、手作業が必要な箇所を一覧にする
 phv db migrate --sqlite data/app.db      # migrations/ の SQL ファイルのうち未適用のものを適用

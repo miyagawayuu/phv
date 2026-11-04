@@ -151,8 +151,10 @@ pub enum Instr {
     Ret(Reg),
     RetNull,
     /// The statement at this source offset (of the function's file) runs.
-    /// Only in programs compiled for `phv test --coverage`.
+    /// Only in programs compiled with statement markers (`phv test --coverage`, `phv dap`).
     Cover(u32),
+    /// The function starts. Only in programs compiled for `phv run --profile`.
+    Enter,
 
     NewObject(Reg, u32),
     GetProp(Reg, Reg, u16),
@@ -237,6 +239,10 @@ pub struct Function {
     pub code: Vec<Instr>,
     /// Source byte offset of each instruction, for stack traces.
     pub offsets: Vec<u32>,
+    /// The variables of the source, their registers, and whether their type
+    /// allows null (for the debugger).
+    #[serde(default)]
+    pub locals: Vec<(String, u16, bool)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

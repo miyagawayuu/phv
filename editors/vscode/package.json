@@ -1,7 +1,7 @@
 {
   "name": "phv-language",
   "displayName": "PHV Language",
-  "description": "PHV language support: syntax highlighting for .phv and .phv.html, and diagnostics, hover types, completion and go to definition from `phv lsp`.",
+  "description": "PHV language support: syntax highlighting for .phv and .phv.html; diagnostics, completion, navigation, rename and quick fixes from `phv lsp`; and debugging with `phv dap`.",
   "version": "0.8.0",
   "publisher": "phv-lang",
   "license": "MIT",
@@ -15,10 +15,13 @@
     "vscode": "^1.82.0"
   },
   "categories": [
-    "Programming Languages"
+    "Programming Languages",
+    "Debuggers"
   ],
   "main": "./extension.js",
-  "activationEvents": [],
+  "activationEvents": [
+    "onDebugResolve:phv"
+  ],
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": true
@@ -80,6 +83,67 @@
         }
       }
     ],
+    "breakpoints": [
+      {
+        "language": "phv"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "phv",
+        "label": "PHV",
+        "languages": [
+          "phv"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "The script to run.",
+                "default": "${file}"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Arguments for the script (read with argv()).",
+                "default": []
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Stop at the first statement.",
+                "default": false
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "phv",
+            "request": "launch",
+            "name": "Run the current PHV script",
+            "program": "${file}"
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "PHV: run a script",
+            "description": "Run a .phv script under the debugger",
+            "body": {
+              "type": "phv",
+              "request": "launch",
+              "name": "Run ${1:script}",
+              "program": "^\"\\${workspaceFolder}/${1:main.phv}\""
+            }
+          }
+        ]
+      }
+    ],
     "configuration": {
       "title": "PHV",
       "properties": {
@@ -87,7 +151,7 @@
           "type": "string",
           "default": "phv",
           "scope": "machine",
-          "description": "The phv executable used for the language server. A user setting only: a workspace cannot change which program runs."
+          "description": "The phv executable used for the language server and the debugger. A user setting only: a workspace cannot change which program runs."
         },
         "phv.lsp.enabled": {
           "type": "boolean",

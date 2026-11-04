@@ -71,12 +71,14 @@ echo greet($name);                                 // HTML-escaped automatically
 - **Speed**: a register-based bytecode VM specialized by type, a Cranelift JIT, and an on-disk bytecode cache.
 - **Tools**: `phv new` for a project or a site, a test runner (with an in-process HTTP client, `std.testing`,
   before/after hooks, JUnit reports and coverage), live reload (`phv serve --watch`), a formatter, a Language Server
-  (rename, references, quick fixes, formatting and more), a package manager, database migrations, and a migration
-  tool from PHP.
-  A VS Code extension (highlighting and the language server) is in [editors/vscode](editors/vscode); each release
+  (rename, references, quick fixes, formatting and more), a debugger (`phv dap`), a profiler (`phv run --profile`),
+  an API reference from doc comments (`phv doc`), a package manager, database migrations, and a migration tool from
+  PHP.
+  A VS Code extension (highlighting, the language server and the debugger) is in [editors/vscode](editors/vscode); each release
   includes it as `phv-<version>.vsix`.
 
-The full language specification is in [docs/spec.md](docs/spec.md).
+Start with the [tutorial](docs/tutorial.md). The full language specification is in [docs/spec.md](docs/spec.md), and the
+standard library's reference in [docs/stdlib.md](docs/stdlib.md).
 
 ## Building
 
@@ -99,7 +101,8 @@ phv serve examples/site                  # serve the site on http://127.0.0.1:80
 phv build examples/site -o site-server   # one executable that serves the site, without the sources
 phv test examples                        # run the test_* functions in *_test.phv files (--coverage, --junit)
 phv fmt examples                         # fix indentation and spacing (--check only reports)
-phv lsp                                  # Language Server for editors
+phv lsp                                  # Language Server for editors (phv dap: the debugger)
+phv doc lib -o doc/index.html            # an API reference from the /** */ comments
 phv install                              # fetch the [dependencies] in phv.toml
 phv migrate legacy/page.php              # convert PHP and list what needs manual work
 phv db migrate --sqlite data/app.db      # apply the SQL files of migrations/ that have not run yet

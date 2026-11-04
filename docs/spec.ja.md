@@ -1569,7 +1569,7 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
 
 | コマンド | 説明 |
 |---|---|
-| `phv run file.phv [引数...]` | 型検査して実行(`--html`、`--time-limit 秒`)。ファイルの後の引数は `argv()` で受け取る |
+| `phv run file.phv [引数...]` | 型検査して実行(`--html`、`--time-limit 秒`、`--profile`)。ファイルの後の引数は `argv()` で受け取る |
 | `phv check file.phv` | 型検査だけ(import しているモジュールとテンプレートも) |
 | `phv serve dir` | Web サーバー(`--port`、`--host`、`--prod`、`--time-limit`。`--watch` を付けると、サイトのファイルを保存したときにブラウザで開いているページを再読み込みする。開発時だけ) |
 | `phv build path -o file` | サイトかスクリプトを 1 つの実行ファイルにする(下を参照) |
@@ -1577,6 +1577,8 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
 | `phv test [paths]` | `*_test.phv` の `test_*` 関数を実行(1 テストごとに新しい VM。`--filter`、`--json`、`--junit`、`--coverage` はテストの節を参照) |
 | `phv fmt [paths] [--check] [--width N]` | インデントと空白を整え、長い行を折り返す(文字列・コメント・HTML は変えない) |
 | `phv lsp` | エディタ用の Language Server(下のエディタの節を参照) |
+| `phv dap` | エディタ用のデバッグアダプタ(下のデバッグの節を参照) |
+| `phv doc [paths] [--std] [--format html\|md] [-o file]` | ドキュメントコメントから API リファレンスを作る(下の API リファレンスの節を参照) |
 | `phv install [--locked]` | `[dependencies]` とそれらが使うパッケージを取得して `phv.lock` に固定 |
 | `phv migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
 | `phv disasm file.phv` | バイトコードを表示 |
@@ -1596,6 +1598,39 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
   import の削除、`mt_rand()` に `random_int()`。
 - 名前の意味による色分け(クラス・関数・メソッド・プロパティ・変数・定数)と、変数を最初に代入した所の前に推論した型を
   表示(`$total = ...` に `int`)。
+
+### デバッグとプロファイル
+
+`phv dap` はデバッグアダプタ(Debug Adapter Protocol)で、VS Code 拡張が種類 `phv` の起動構成で起動する:
+
+```json
+{ "type": "phv", "request": "launch", "name": "Run the open script", "program": "${file}", "args": [] }
+```
+
+スクリプトを `phv run` と同じように実行し(`stopOnEntry` で最初の文で止まる)、ブレークポイント、ステップオーバー・
+ステップイン・ステップアウト、一時停止、コールスタック、各フレームの変数(list・map・オブジェクトは開ける)、
+マウスを置いた変数の値を扱う。そのためにプログラムは各文の前に印を入れてコンパイルし、JIT なしで実行する。標準ライブラリ
+の中にはステップインせず、スクリプトは標準入力を読めない(プロトコルが使うため)。
+
+`phv run --profile` は実行のあとに、時間のかかった関数を表示する: 関数自身の時間(呼んだ組み込み関数を含む)、合計の
+時間(呼んだ関数を含む)、呼び出し回数。呼び出しは正確に数え、時間は 1,000 ステップごとにコールスタックに割り当てるので、
+短い関数は時間が 0 になることがある。JIT は使わない。
+
+### API リファレンス
+
+`phv doc [paths]` は、`paths` の下のモジュールが export する関数・クラス・定数・型エイリアスのリファレンスを書き出す。
+public なメンバー、それぞれの前の `/** ... */` コメント、各ファイルの先頭の `//` コメントを含む。`--format md` で HTML の
+1 ページの代わりに Markdown の 1 ファイルを書く(`-o` でファイルを選ぶ。既定は `doc/index.html` か `doc/api.md`)。
+`--std` は標準ライブラリのモジュールを書き出す([stdlib.md](stdlib.md) を参照)。昇格した引数がすべて public では
+ないコンストラクタと、`export` のない宣言は含めない。
+
+```phv
+/**
+ * The total of the order, with tax.
+ * Throws `ValueError` for an order without items.
+ */
+export function total(Order $order): float { ... }
+```
 
 ### エラーと警告
 
@@ -1696,7 +1731,7 @@ function clean_up(): void { unlink("data/test.json"); }
 | `--filter 文字列` | 名前にその文字列を含むテストだけ |
 | `--json` | 報告の代わりに、すべての結果を 1 つの JSON にして標準出力へ(`status` は `pass`・`fail`・`skip`) |
 | `--junit report.xml` | 結果を JUnit XML にしても書き出す(CI のサービスが表示できる) |
-| `--coverage` | 報告のあとに、テストが実行したプロジェクトの文の割合をファイルごとに、実行されなかった文の行と一緒に示す(テストファイルと標準ライブラリは除く)。このときテストは JIT なしで実行する |
+| `--coverage` | 報告のあとに、テストが実行したプロジェクトの文の割合をファイルごとに、実行されなかった文の行と一緒に示す(テストファイルと標準ライブラリ、サイトがコンパイルする `TestClient` 経由のページは除く)。このときテストは JIT なしで実行する |
 
 プロジェクト自身のサイト(`public/` のあるプロジェクト)へのリクエストは `std.testing` で、同じプロセスの中で送る。
 サーバーもネットワークも要らない。ページは開発モードの `phv serve` と同じように実行される(ルート、ミドルウェア、
@@ -1853,8 +1888,10 @@ phv migrate legacy/page.php      # page.phv を書き出す
   タイムゾーン付きの日時、クラスへの JSON のデコード、暗号化と署名付きトークン、UUID、ディレクトリ、ログ、
   URL、CSV、スクリプトの引数と標準入力。
 - **0.9 ツール**: `phv lsp` の名前の変更・参照の検索・整形・シグネチャヘルプ・シンボル・クイックフィックス・意味による
-  色分け・型の表示、`phv new`、`phv serve --watch`、フック・絞り込み・JSON と JUnit の報告・カバレッジ付きの `phv test`
-  (実装済み)。残り: `phv doc`、デバッガ、対応プラットフォームの追加、チュートリアルと標準ライブラリのリファレンス。
+  色分け・型の表示、`phv new`、`phv serve --watch`、フック・絞り込み・JSON と JUnit の報告・カバレッジ付きの
+  `phv test`、`phv doc` と標準ライブラリのリファレンス、デバッガ(`phv dap`)、`phv run --profile`、チュートリアル
+  (実装済み)。
+  残り: 対応プラットフォームの追加(ARM の Linux、静的リンクのビルド、Docker イメージ、Homebrew と Scoop)。
 - **1.0 速度と安定性**: 実行中の循環参照の解放、JIT の対象拡大、HTTP/2、TLS、WebSocket サーバー、`Set` 型、
   言語仕様の安定化。
 

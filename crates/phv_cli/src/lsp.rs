@@ -20,7 +20,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 /// Messages on the stream, with the length of their body: `None` means the
 /// stream ended or its framing is broken (nothing more can be read); a message
 /// of `None` is well framed but not valid JSON, answered with a parse error.
-fn read_message(input: &mut impl BufRead) -> Option<(Option<Value>, usize)> {
+pub(crate) fn read_message(input: &mut impl BufRead) -> Option<(Option<Value>, usize)> {
     let mut length = None;
     loop {
         let mut line = String::new();

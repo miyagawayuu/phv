@@ -1,6 +1,8 @@
 // Builds the static phv-lang.org site into dist/:
 //   /                 landing page (English)     /ja/              landing page (Japanese)
+//   /docs/tutorial/   tutorial                   /ja/docs/tutorial/
 //   /docs/spec/       language specification     /ja/docs/spec/
+//   /docs/stdlib/     standard library reference (English only, made by `phv doc --std`)
 //   /docs/security/   security audit report      /ja/docs/security/
 //   /packages/        packages of the registry   /ja/packages/
 //   /404.html         page for unknown paths
@@ -59,8 +61,24 @@ function slug(text, seen) {
 
 // Where the Markdown files' relative links go on the site.
 const docLinks = {
-  en: { "spec.md": "../spec/", "spec.ja.md": "../../ja/docs/spec/", "security-audit.md": "../security/", "security-audit.ja.md": "../../ja/docs/security/" },
-  ja: { "spec.md": "../../../docs/spec/", "spec.ja.md": "../spec/", "security-audit.md": "../../../docs/security/", "security-audit.ja.md": "../security/" },
+  en: {
+    "spec.md": "../spec/",
+    "spec.ja.md": "../../ja/docs/spec/",
+    "security-audit.md": "../security/",
+    "security-audit.ja.md": "../../ja/docs/security/",
+    "tutorial.md": "../tutorial/",
+    "tutorial.ja.md": "../../ja/docs/tutorial/",
+    "stdlib.md": "../stdlib/",
+  },
+  ja: {
+    "spec.md": "../../../docs/spec/",
+    "spec.ja.md": "../spec/",
+    "security-audit.md": "../../../docs/security/",
+    "security-audit.ja.md": "../security/",
+    "tutorial.md": "../../../docs/tutorial/",
+    "tutorial.ja.md": "../tutorial/",
+    "stdlib.md": "../../../docs/stdlib/",
+  },
 };
 
 /** Renders a Markdown document; returns the HTML and its table of contents. */
@@ -95,8 +113,8 @@ function renderDoc(markdown, lang) {
 }
 
 const strings = {
-  en: { docs: "Docs", spec: "Specification", security: "Security", packages: "Packages", download: "Download", contents: "Contents", other: "日本語", otherLang: "ja" },
-  ja: { docs: "ドキュメント", spec: "言語仕様", security: "セキュリティ", packages: "パッケージ", download: "ダウンロード", contents: "目次", other: "English", otherLang: "en" },
+  en: { docs: "Docs", tutorial: "Tutorial", spec: "Specification", stdlib: "Library", security: "Security", packages: "Packages", download: "Download", contents: "Contents", other: "日本語", otherLang: "ja" },
+  ja: { docs: "ドキュメント", tutorial: "チュートリアル", spec: "言語仕様", stdlib: "ライブラリ", security: "セキュリティ", packages: "パッケージ", download: "ダウンロード", contents: "目次", other: "English", otherLang: "en" },
 };
 
 /** The page frame shared by every page. `depth` is how far the page is below the site root. */
@@ -126,7 +144,9 @@ export function layout({ lang, title, description, body, depth, active, otherHre
   <div class="inner">
     <a class="logo" href="${home}"><img src="${up}logo.svg" alt="" width="30" height="30">PHV</a>
     <nav>
+      ${nav("tutorial", `${docs}tutorial/`, t.tutorial)}
       ${nav("spec", `${docs}spec/`, t.spec)}
+      ${nav("stdlib", `${up}docs/stdlib/`, t.stdlib)}
       ${nav("security", `${docs}security/`, t.security)}
       ${nav("packages", `${home}packages/`, t.packages)}
       ${nav("download", `${home}#download`, t.download)}
@@ -245,6 +265,10 @@ for (const lang of ["en", "ja"]) {
 
 docPage("spec.md", "en", "docs/spec/index.html", "spec", "../../ja/docs/spec/");
 docPage("spec.ja.md", "ja", "ja/docs/spec/index.html", "spec", "../../../docs/spec/");
+docPage("tutorial.md", "en", "docs/tutorial/index.html", "tutorial", "../../ja/docs/tutorial/");
+docPage("tutorial.ja.md", "ja", "ja/docs/tutorial/index.html", "tutorial", "../../../docs/tutorial/");
+// The library reference is generated from the sources' comments, in English; both languages link to it.
+docPage("stdlib.md", "en", "docs/stdlib/index.html", "stdlib", "../../ja/");
 docPage("security-audit.md", "en", "docs/security/index.html", "security", "../../ja/docs/security/");
 docPage("security-audit.ja.md", "ja", "ja/docs/security/index.html", "security", "../../../docs/security/");
 for (const dir of ["docs", "ja/docs"]) {

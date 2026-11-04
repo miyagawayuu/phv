@@ -168,6 +168,8 @@ pub struct Host {
     pub cli: bool,
     /// The arguments after the script's name (`phv run script.phv a b`).
     pub args: Vec<String>,
+    /// Standard input is not the script's (under `phv dap` it carries the protocol).
+    pub no_stdin: bool,
 }
 
 /// A mail server named in phv.toml (`[mail.<name>]`). The URL holds credentials
@@ -296,6 +298,74 @@ impl std::fmt::Debug for HttpSpec {
 const MAX_NATIVE_DEPTH: u32 = 200;
 
 pub(crate) const BUDGET: u32 = 10_000;
+/// Called before each statement of a program compiled with statement markers
+/// (`phv dap`): it may look at the VM, wait for the debugger's commands, or
+/// stop the program by returning an error.
+pub trait DebugHook {
+    fn statement(&mut self, vm: &Vm, file: u32, offset: u32) -> Result<(), VmError>;
+}
+
+/// A frame of the call stack, for the debugger: the function, the instruction
+/// after the call it is in (for frames below the top), and its registers.
+#[derive(Clone, Copy, Debug)]
+pub struct DebugFrame {
+    pub func: u32,
+    pub pc: u32,
+    pub base: usize,
+}
+
+/// Ticks between the samples of `phv run --profile`.
+const PROFILE_BUDGET: u32 = 1_000;
+
+/// `phv run --profile`: calls of each function, and the time spent in each
+/// (`self_time`: in its own code and the builtins it called; `total_time`:
+/// also in the functions it called). Calls are counted exactly; time is
+/// charged to the call stack every few thousand steps, so short functions
+/// may show no time.
+#[derive(Clone, Debug, Default)]
+pub struct Profile {
+    pub calls: Vec<u64>,
+    pub self_time: Vec<Duration>,
+    pub total_time: Vec<Duration>,
+    last: Option<Instant>,
+    /// Per function, the sample in which its total time was last charged
+    /// (a recursive function is charged once per sample).
+    seen: Vec<u64>,
+    samples: u64,
+}
+
+impl Profile {
+    pub fn new(funcs: usize) -> Profile {
+        Profile {
+            calls: vec![0; funcs],
+            self_time: vec![Duration::ZERO; funcs],
+            total_time: vec![Duration::ZERO; funcs],
+            last: None,
+            seen: vec![0; funcs],
+            samples: 0,
+        }
+    }
+
+    /// Charges the time since the last sample to the functions on `stack` (innermost last).
+    fn sample(&mut self, stack: impl DoubleEndedIterator<Item = u32>) {
+        let now = Instant::now();
+        let Some(last) = self.last.replace(now) else { return };
+        let elapsed = now - last;
+        self.samples += 1;
+        let mut stack = stack.rev();
+        if let Some(top) = stack.next() {
+            self.self_time[top as usize] += elapsed;
+            self.total_time[top as usize] += elapsed;
+            self.seen[top as usize] = self.samples;
+        }
+        for f in stack {
+            if self.seen[f as usize] != self.samples {
+                self.seen[f as usize] = self.samples;
+                self.total_time[f as usize] += elapsed;
+            }
+        }
+    }
+}
 
 struct Frame {
     func: u32,
@@ -343,6 +413,10 @@ pub struct Vm {
     argbuf: Vec<Value>,
     /// Enum cases are singletons within one VM (one request).
     enum_cache: std::collections::HashMap<(u32, u32), Value>,
+    /// `phv dap`: called before each statement (see `DebugHook`).
+    pub debug: Option<Box<dyn DebugHook>>,
+    /// `phv run --profile`: calls and time per function (the JIT is not used then).
+    pub profile: Option<Profile>,
     /// `phv test --coverage`: the statements that ran, as (file, source offset).
     pub coverage: Option<std::collections::HashSet<(u32, u32)>>,
     /// Objects created by this run. Reference counting cannot free cycles
@@ -544,12 +618,24 @@ impl Vm {
             enum_cache: std::collections::HashMap::new(),
             objects: Vec::new(),
             coverage: None,
+            profile: None,
+            debug: None,
         }
     }
 
     pub fn run_main(&mut self) -> Result<(), VmError> {
         let main = self.prog.main;
         self.call_function(main, &[]).map(|_| ())
+    }
+
+    /// The call stack, outermost first (for the debugger).
+    pub fn debug_frames(&self) -> Vec<DebugFrame> {
+        self.frames.iter().map(|f| DebugFrame { func: f.func, pc: f.pc, base: f.base }).collect()
+    }
+
+    /// Register `i` of the register file (`DebugFrame::base` plus a register number).
+    pub fn register(&self, i: usize) -> Option<&Value> {
+        self.regs.get(i)
     }
 
     /// Takes everything written to the base output buffer so far.
@@ -927,6 +1013,10 @@ impl Vm {
     #[cold]
     fn check_deadline(&mut self) -> Result<(), VmError> {
         self.budget = BUDGET;
+        if let Some(p) = &mut self.profile {
+            self.budget = PROFILE_BUDGET;
+            p.sample(self.frames.iter().map(|f| f.func));
+        }
         self.check_memory()?;
         {
             if let Some(d) = self.deadline {
@@ -1397,9 +1487,25 @@ impl Vm {
                     }
                     Instr::Ret(r) => ret!(std::mem::take(&mut reg!(*r))),
                     Instr::RetNull => ret!(Value::Null),
+                    Instr::Enter => {
+                        if let Some(p) = &mut self.profile {
+                            p.calls[self.frames[fi].func as usize] += 1;
+                            if p.last.is_none() {
+                                p.last = Some(Instant::now());
+                            }
+                        }
+                        // A step, so that calls from builtins (`map`...) are sampled too.
+                        tri!(self.tick());
+                    }
                     Instr::Cover(off) => {
                         if let Some(c) = &mut self.coverage {
                             c.insert((func.file, *off));
+                        }
+                        if let Some(mut hook) = self.debug.take() {
+                            self.frames[fi].pc = pc as u32;
+                            let r = hook.statement(self, func.file, *off);
+                            self.debug = Some(hook);
+                            tri!(r);
                         }
                     }
 

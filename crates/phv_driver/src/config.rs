@@ -843,6 +843,7 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
             site: None,
             mail,
             cli: false,
+            no_stdin: false,
             args: Vec::new(),
         }),
         csrf: file.security.csrf,

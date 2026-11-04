@@ -1592,7 +1592,7 @@ When code uses a PHP function name, the error message suggests the alternative
 
 | Command | Description |
 |---|---|
-| `phv run file.phv [args...]` | Type-check and run (`--html`, `--time-limit seconds`); `argv()` returns the arguments after the file |
+| `phv run file.phv [args...]` | Type-check and run (`--html`, `--time-limit seconds`, `--profile`); `argv()` returns the arguments after the file |
 | `phv check file.phv` | Type-check only (including imported modules and templates) |
 | `phv serve dir` | Web server (`--port`, `--host`, `--prod`, `--time-limit`; `--watch` reloads the pages open in the browser when a file of the site is saved, in development only) |
 | `phv build path -o file` | Compile a site or a script into one executable (see below) |
@@ -1600,6 +1600,8 @@ When code uses a PHP function name, the error message suggests the alternative
 | `phv test [paths]` | Run the `test_*` functions in `*_test.phv` files (a new VM for each test; `--filter`, `--json`, `--junit`, `--coverage`, see Testing) |
 | `phv fmt [paths] [--check] [--width N]` | Normalize indentation and whitespace and wrap long lines (strings, comments, and HTML are not changed) |
 | `phv lsp` | Language Server for editors (see Editors below) |
+| `phv dap` | Debug adapter for editors (see Debugging below) |
+| `phv doc [paths] [--std] [--format html\|md] [-o file]` | An API reference from doc comments (see API reference below) |
 | `phv install [--locked]` | Fetch `[dependencies]` and the packages they need, and pin them in `phv.lock` |
 | `phv migrate file.php` | Convert PHP mechanically and list the places that need manual work |
 | `phv disasm file.phv` | Show the bytecode |
@@ -1618,6 +1620,41 @@ When code uses a PHP function name, the error message suggests the alternative
   that is never used, removing an unused import, `random_int()` for `mt_rand()`;
 - semantic colouring of names (classes, functions, methods, properties, variables, constants), and the inferred type
   of a variable shown before the variable where it is first assigned (`$total = ...` shows `int`).
+
+### Debugging and profiling
+
+`phv dap` is a debug adapter (the Debug Adapter Protocol), which the VS Code extension starts for launch
+configurations of type `phv`:
+
+```json
+{ "type": "phv", "request": "launch", "name": "Run the open script", "program": "${file}", "args": [] }
+```
+
+It runs a script as `phv run` does (`stopOnEntry` stops at its first statement) with breakpoints, stepping over,
+into and out, pause, the call stack, the variables of each frame (lists, maps and objects can be opened), and the
+value of a variable on hover. The program is compiled with a marker before each statement for this and runs without
+the JIT; the standard library is not stepped into, and the script cannot read standard input (the protocol uses it).
+
+`phv run --profile` prints, after the run, the functions that took the most time: their own time (with the builtins
+they called), their total time (with the functions they called), and the number of calls. Calls are counted exactly;
+time is charged to the call stack every thousand steps, so a short function may show none. The JIT is not used.
+
+### API reference
+
+`phv doc [paths]` writes a reference of the exported functions, classes, constants and type aliases of the modules
+under `paths`, with their public members and the `/** ... */` comment before each, and the `//` comment at the top
+of each file. `--format md` writes one Markdown file instead of one HTML page (`-o` chooses the file; the default is
+`doc/index.html` or `doc/api.md`); `--std` documents the standard library's modules (see
+[stdlib.md](stdlib.md)). A constructor whose promoted parameters are not all public is left out, as is a
+declaration without `export`.
+
+```phv
+/**
+ * The total of the order, with tax.
+ * Throws `ValueError` for an order without items.
+ */
+export function total(Order $order): float { ... }
+```
 
 ### Errors and warnings
 
@@ -1721,7 +1758,7 @@ function clean_up(): void { unlink("data/test.json"); }
 | `--filter text` | Only the tests whose name contains `text` |
 | `--json` | One JSON document on standard output with every result (`status`: `pass`, `fail` or `skip`), instead of the report |
 | `--junit report.xml` | Also write the results as JUnit XML, which CI services display |
-| `--coverage` | After the report, the share of the project's statements that the tests ran, per file, with the lines of those that did not run (test files and the standard library are left out). The tests then run without the JIT |
+| `--coverage` | After the report, the share of the project's statements that the tests ran, per file, with the lines of those that did not run (test files and the standard library are left out; so are pages run through `TestClient`, which the site compiles). The tests then run without the JIT |
 
 Requests to the project's own site (a project with `public/`) are made with `std.testing`, in-process: no server
 or network is needed. Pages run as under `phv serve` in development mode (routes, middleware, sessions, error pages),
@@ -1882,8 +1919,9 @@ Planned, in this order. Each release is audited before it is published, as befor
   logging, URLs, CSV, and arguments and standard input for scripts.
 - **0.9, tools**: rename, find references, formatting, signature help, symbols, quick fixes, semantic colouring
   and inlay types in `phv lsp`, `phv new`, `phv serve --watch`, and `phv test` with hooks, filters, JSON and JUnit
-  reports and coverage (done); still to come: `phv doc`, a debugger, more platforms, a tutorial and a reference of
-  the standard library.
+  reports and coverage, `phv doc` and a reference of the standard library, a debugger (`phv dap`), `phv run
+  --profile`, and a tutorial (done); still to come: more platforms (Linux on ARM, static builds, a Docker image,
+  Homebrew and Scoop).
 - **1.0, speed and stability**: freeing reference cycles while a script runs, a JIT that covers more code, HTTP/2,
   TLS and a WebSocket server, a `Set` type, and a stable language specification.
 

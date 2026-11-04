@@ -12,14 +12,25 @@ use std::collections::HashMap;
 /// Fails only for a function too large for the register file (each frame has
 /// at most `NO_REG` registers).
 pub fn compile(h: &HProgram, sources: &SourceMap) -> Result<Program, Diagnostic> {
-    compile_with(h, sources, false)
+    compile_with(h, sources, Options::default())
 }
 
-/// `compile`, with `coverage` adding an `Instr::Cover` before each statement
-/// (for `phv test --coverage`).
-pub fn compile_with(h: &HProgram, sources: &SourceMap, coverage: bool) -> Result<Program, Diagnostic> {
+/// What a program is compiled for besides running.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options {
+    /// An `Instr::Cover` before each statement (`phv test --coverage`, `phv dap`),
+    /// and the variables cleared when a function starts (so the debugger never
+    /// shows a value left by an earlier call).
+    pub statement_markers: bool,
+    /// An `Instr::Enter` at the start of each function (`phv run --profile`).
+    pub call_counts: bool,
+}
+
+/// `compile` with `opts`.
+pub fn compile_with(h: &HProgram, sources: &SourceMap, opts: Options) -> Result<Program, Diagnostic> {
     let mut pc = ProgCtx {
-        coverage,
+        coverage: opts.statement_markers,
+        call_counts: opts.call_counts,
         consts: Vec::new(),
         str_consts: HashMap::new(),
         builtins: Vec::new(),
@@ -93,6 +104,7 @@ fn to_const(c: &HConst) -> Const {
 
 struct ProgCtx {
     coverage: bool,
+    call_counts: bool,
     consts: Vec<Const>,
     str_consts: HashMap<String, u32>,
     builtins: Vec<String>,
@@ -204,6 +216,19 @@ impl<'a> FnC<'a> {
             too_big: false,
             file: f.span.file,
         };
+        if c.pc.call_counts {
+            c.emit(Instr::Enter);
+        }
+        if c.pc.coverage {
+            // Registers keep what earlier calls left in them; the debugger must not show that.
+            let given: Vec<u32> = f.captures.iter().chain(f.params.iter()).copied().collect();
+            for id in 0..f.locals.len() {
+                if !given.contains(&(id as u32)) {
+                    let r = c.reg_of[id];
+                    c.emit(Instr::Null(r));
+                }
+            }
+        }
         match f.kind {
             FuncKind::Template => {
                 c.emit(Instr::PushOut);
@@ -220,7 +245,17 @@ impl<'a> FnC<'a> {
         if c.too_big {
             return Err(too_large(f));
         }
+        // Variables as the source names them (temporaries have other names).
+        let locals = f
+            .locals
+            .iter()
+            .zip(&c.reg_of)
+            .filter(|(l, _)| l.name.chars().next().is_some_and(|ch| ch.is_alphabetic() || ch == '_'))
+            .filter(|(l, _)| l.name.chars().all(|ch| ch.is_alphanumeric() || ch == '_'))
+            .map(|(l, r)| (l.name.clone(), *r, l.ty.is_nullable() || l.ty == phv_types::types::Type::Any))
+            .collect();
         Ok(Function {
+            locals,
             native: native_sig(f),
             name: f.name.clone(),
             file: f.file,

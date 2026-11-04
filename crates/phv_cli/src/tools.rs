@@ -351,7 +351,11 @@ pub fn test(paths: Vec<PathBuf>, opts: TestOptions) -> ExitCode {
         let failed_tests = failed - file_errors;
         let errors = if file_errors > 0 { format!(", {file_errors} file(s) did not compile") } else { String::new() };
         println!("\n{colour}{passed} passed, {failed_tests} failed{skipped}{errors}{reset} ({secs:.2}s)");
-        if opts.coverage {
+        if opts.coverage && coverage.is_empty() {
+            println!(
+                "\ncoverage: the tests use no module of the project (pages run through TestClient are not measured)"
+            );
+        } else if opts.coverage {
             println!("\ncoverage (statements run by the tests):");
             let width = coverage.keys().map(|k| k.len()).max().unwrap_or(0);
             let (mut all, mut ran) = (0, 0);
