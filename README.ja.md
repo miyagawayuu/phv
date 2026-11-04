@@ -75,6 +75,15 @@ echo greet($name);                                 // Web ページでは自動�
 まず[チュートリアル](docs/tutorial.ja.md)から始めてください。詳しくは [言語仕様 (docs/spec.ja.md)](docs/spec.ja.md)、標準ライブラリは
 [リファレンス (docs/stdlib.md、英語)](docs/stdlib.md) を参照してください。脆弱性の報告方法は [SECURITY.md](SECURITY.md) にあります。
 
+## インストール
+
+各[リリース](https://github.com/miyagawayuu/phv/releases)に、Windows・Linux(x64 と ARM64。C ライブラリの要らない静的リンクの
+ビルドも)・macOS 向けのアーカイブと `SHA256SUMS` があります。0.9.0 からは、`phv` だけを入れた Docker イメージもあります:
+
+```bash
+docker run --rm -p 8080:8080 -v "$PWD:/app" --user "$(id -u):$(id -g)" ghcr.io/miyagawayuu/phv serve --host 0.0.0.0 --prod
+```
+
 ## ビルド
 
 最近の安定版 Rust が必要です(1.97 で確認)。SQLite を同梱してビルドするため、C コンパイラ

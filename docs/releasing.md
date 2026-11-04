@@ -71,6 +71,11 @@ Publishing runs `.github/workflows/publish-extension.yml`, which waits for appro
 environment. Approve it under **Review deployments** in the run; it checks the `.vsix` against `SHA256SUMS` and
 publishes it to the Visual Studio Marketplace.
 
+It also runs `.github/workflows/docker.yml`, which downloads the release's static (musl) archives, checks them
+against `SHA256SUMS`, and pushes `ghcr.io/miyagawayuu/phv:X.Y.Z` and `:latest` for amd64 and arm64 (the image was
+already built and run from the same executables by the release workflow). Check that the run passed; the first
+time, make the package public in its settings on GitHub (packages start private).
+
 ## 6. After the release
 
 - Set `ARG PHV_VERSION` in `examples/demo/Dockerfile` to the new version, push it, and deploy the demo

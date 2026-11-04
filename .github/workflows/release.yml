@@ -4,6 +4,8 @@ name: Release
 # extension (`phv-X.Y.Z.vsix`), and creates a *draft* GitHub release with them
 # and their SHA-256 checksums; it is published by hand after checking it. Running the workflow by hand (Actions
 # tab, or `gh workflow run release.yml`) only builds and tests the archives.
+# The static (musl) builds also go into the Docker image, which is tested here
+# and pushed by docker.yml once the release is published.
 on:
   push:
     tags: ["v*"]
@@ -23,6 +25,10 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, native: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, native: true }
+          # Static executables (no C library needed), also used by the Docker image.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, native: true, musl: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, native: true, musl: true }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, native: true }
           - { os: macos-latest, target: aarch64-apple-darwin, native: true }
           - { os: macos-latest, target: x86_64-apple-darwin, native: false }
@@ -38,6 +44,11 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
           rustup default stable
+      - name: musl C compiler (SQLite and ring are C)
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
       - name: Version
         id: version
         run: |
@@ -57,6 +68,12 @@ jobs:
           out=$("$bin" run examples/hello/hello.phv)
           echo "$out"
           test -n "$out"
+      - name: Check that it is static
+        if: matrix.musl
+        run: |
+          info=$(file target/${{ matrix.target }}/release/phv)
+          echo "$info"
+          echo "$info" | grep -Eq "statically linked|static-pie linked"
       - name: Package
         run: |
           name=phv-${{ steps.version.outputs.version }}-${{ matrix.target }}
@@ -77,6 +94,31 @@ jobs:
           name: phv-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
+
+  docker:
+    name: test the Docker image
+    needs: [build]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: phv-x86_64-unknown-linux-musl
+          path: dist
+      - name: Build and run the image (amd64; docker.yml pushes both architectures)
+        run: |
+          mkdir -p ctx/amd64 ctx/tmp
+          tar -xzf dist/*.tar.gz -C dist
+          cp dist/phv-*/phv ctx/amd64/phv
+          cp docker/Dockerfile ctx/
+          docker buildx build --platform linux/amd64 --load -t phv-test ctx
+          docker run --rm phv-test --version
+          docker run --rm -v "$PWD/examples/hello:/app" --user "$(id -u):$(id -g)" phv-test run hello.phv
 
   extension:
     name: build (VS Code extension)
@@ -121,7 +163,7 @@ jobs:
 
   publish:
     name: draft release
-    needs: [build, extension]
+    needs: [build, extension, docker]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:

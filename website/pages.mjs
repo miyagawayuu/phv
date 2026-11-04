@@ -38,6 +38,7 @@ const text = {
     archive: "Archive",
     verify: "Check the archive against <code>SHA256SUMS</code> from the same release, then run it:",
     source: "Or build from source with a recent stable Rust and a C compiler: <code>cargo build --release</code>.",
+    docker: (image) => `Or run the Docker image (Linux, amd64 and arm64), which holds only <code>phv</code>: <code>${image}</code>.`,
     editor: (version) => `For VS Code, install <a href="${marketplace}">PHV Language</a> from the Marketplace (<code>code --install-extension phv-lang.phv-language</code>) for highlighting and live diagnostics. It is also attached to each release as <a href="${releases}/download/v${version}/phv-${version}.vsix"><code>phv-${version}.vsix</code></a>.`,
     securityTitle: "Security",
     securityLead: `PHV has been through nine security audits, each followed by fixes and regression tests. Read the <a href="docs/security/">audit report</a>. To report a vulnerability, email <a href="mailto:security@phv-lang.org">security@phv-lang.org</a>.`,
@@ -66,6 +67,7 @@ const text = {
     archive: "アーカイブ",
     verify: "同じリリースの <code>SHA256SUMS</code> でアーカイブを確かめてから実行します:",
     source: "ソースからビルドするなら、最近の安定版 Rust と C コンパイラで <code>cargo build --release</code>。",
+    docker: (image) => `Docker のイメージ(Linux、amd64 と arm64。中身は <code>phv</code> だけ)でも動かせます: <code>${image}</code>。`,
     editor: (version) => `VS Code では、Marketplace から <a href="${marketplace}">PHV Language</a> を入れると(<code>code --install-extension phv-lang.phv-language</code>)、色分けと入力中のエラー表示が使えます。各リリースにも <a href="${releases}/download/v${version}/phv-${version}.vsix"><code>phv-${version}.vsix</code></a> として付いています。`,
     securityTitle: "セキュリティ",
     securityLead: `PHV は 9 回のセキュリティ監査を受け、そのたびに修正と回帰テストを加えています。<a href="docs/security/">監査報告</a>をご覧ください。脆弱性の報告は <a href="mailto:security@phv-lang.org">security@phv-lang.org</a> へ。`,
@@ -75,9 +77,19 @@ const text = {
 
 export function landing(lang, version, code) {
   const t = text[lang];
+  // ARM Linux, the static builds and the Docker image exist from 0.9.0 on.
+  const [major, minor] = version.split(".").map(Number);
+  const more = major > 0 || minor >= 9;
   const platforms = [
     ["Windows x64", `phv-${version}-x86_64-pc-windows-msvc.zip`],
     ["Linux x64", `phv-${version}-x86_64-unknown-linux-gnu.tar.gz`],
+    ...(more
+      ? [
+          ["Linux ARM64", `phv-${version}-aarch64-unknown-linux-gnu.tar.gz`],
+          ["Linux x64 (static)", `phv-${version}-x86_64-unknown-linux-musl.tar.gz`],
+          ["Linux ARM64 (static)", `phv-${version}-aarch64-unknown-linux-musl.tar.gz`],
+        ]
+      : []),
     ["macOS (Apple Silicon)", `phv-${version}-aarch64-apple-darwin.tar.gz`],
     ["macOS (Intel)", `phv-${version}-x86_64-apple-darwin.tar.gz`],
   ];
@@ -121,6 +133,7 @@ ${rows}
   </table></div>
   <p>${t.verify}</p>
   ${code(`sha256sum -c SHA256SUMS --ignore-missing\ntar -xzf phv-${version}-x86_64-unknown-linux-gnu.tar.gz\n./phv-${version}-x86_64-unknown-linux-gnu/phv --version\n./phv-${version}-x86_64-unknown-linux-gnu/phv serve mysite   # http://127.0.0.1:8080`, "bash")}
+  ${more ? `<p>${t.docker(`docker run --rm ghcr.io/miyagawayuu/phv:${version} --version`)}</p>` : ""}
   <p>${t.source}</p>
   <p>${t.editor(version)}</p>
 </section>

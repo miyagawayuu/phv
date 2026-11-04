@@ -1891,7 +1891,8 @@ phv migrate legacy/page.php      # page.phv を書き出す
   色分け・型の表示、`phv new`、`phv serve --watch`、フック・絞り込み・JSON と JUnit の報告・カバレッジ付きの
   `phv test`、`phv doc` と標準ライブラリのリファレンス、デバッガ(`phv dap`)、`phv run --profile`、チュートリアル
   (実装済み)。
-  残り: 対応プラットフォームの追加(ARM の Linux、静的リンクのビルド、Docker イメージ、Homebrew と Scoop)。
+  このリリースからの ARM の Linux 向けビルド、静的リンクの Linux 向けビルド、Docker イメージ(`ghcr.io/miyagawayuu/phv`)も
+  実装済み。残り: Homebrew と Scoop。
 - **1.0 速度と安定性**: 実行中の循環参照の解放、JIT の対象拡大、HTTP/2、TLS、WebSocket サーバー、`Set` 型、
   言語仕様の安定化。
 

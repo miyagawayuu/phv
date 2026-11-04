@@ -80,6 +80,16 @@ echo greet($name);                                 // HTML-escaped automatically
 Start with the [tutorial](docs/tutorial.md). The full language specification is in [docs/spec.md](docs/spec.md), and the
 standard library's reference in [docs/stdlib.md](docs/stdlib.md).
 
+## Installing
+
+Each [release](https://github.com/miyagawayuu/phv/releases) has archives for Windows, Linux (x64 and ARM64; also
+static builds that need no C library) and macOS, with `SHA256SUMS`. From 0.9.0 there is also a Docker image that
+holds only `phv`:
+
+```bash
+docker run --rm -p 8080:8080 -v "$PWD:/app" --user "$(id -u):$(id -g)" ghcr.io/miyagawayuu/phv serve --host 0.0.0.0 --prod
+```
+
 ## Building
 
 You need a recent stable Rust (tested with 1.97). SQLite is built in, so a C compiler is also needed

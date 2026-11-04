@@ -1,0 +1,76 @@
+name: Publish Docker image
+
+# Pushes ghcr.io/<owner>/phv:X.Y.Z (and :latest) for linux/amd64 and
+# linux/arm64 when a release is published (after the draft has been checked).
+# The image holds the release's static (musl) executables, downloaded from the
+# release and checked against its SHA256SUMS, so it contains exactly what was
+# checked; docker/Dockerfile comes from the released tag. Only the docker CLI
+# is used (no third-party actions); the token is this run's GITHUB_TOKEN.
+# Run it by hand with a tag to publish an earlier release's image.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag whose executables to publish (e.g. v0.9.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+      - name: Download and check the executables
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::not a release tag: $TAG"; exit 1; }
+          version=${TAG#v}
+          mkdir -p dl ctx/amd64 ctx/arm64 ctx/tmp
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dl \
+            --pattern "phv-$version-x86_64-unknown-linux-musl.tar.gz" \
+            --pattern "phv-$version-aarch64-unknown-linux-musl.tar.gz" \
+            --pattern SHA256SUMS
+          (cd dl && sha256sum -c SHA256SUMS --ignore-missing --strict)
+          test "$(cd dl && ls *.tar.gz | wc -l)" = 2
+          for pair in "amd64 x86_64" "arm64 aarch64"; do
+            set -- $pair
+            tar -xzf "dl/phv-$version-$2-unknown-linux-musl.tar.gz" -C dl
+            cp "dl/phv-$version-$2-unknown-linux-musl/phv" "ctx/$1/phv"
+          done
+          cp docker/Dockerfile ctx/
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Build and push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/phv"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx create --use --name phv-builder
+          docker buildx build ctx \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "VERSION=$VERSION" \
+            --tag "$image:$VERSION" \
+            --tag "$image:latest" \
+            --push
+          docker logout ghcr.io
+      - name: Check the published image
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/phv:$VERSION"
+          docker run --rm "$image" --version | tee version.txt
+          grep -q "$VERSION" version.txt
