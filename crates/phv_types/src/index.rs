@@ -178,22 +178,31 @@ impl EditorIndex {
             return vec![def];
         }
         let name = m.item.name.clone();
-        let related = |a: usize, b: usize| {
-            self.supers.get(a).is_some_and(|s| s.contains(&(b as ClassId)))
-                || self.supers.get(b).is_some_and(|s| s.contains(&(a as ClassId)))
+        // The classes that declare a member of that name, and which of them are
+        // related (one is an ancestor or interface of the other), searched
+        // breadth first: each pair is looked at once.
+        let candidates: Vec<usize> = (0..self.classes.len()).filter(|&c| declared(c, &name).is_some()).collect();
+        let supers: Vec<std::collections::HashSet<ClassId>> =
+            candidates.iter().map(|&c| self.supers.get(c).into_iter().flatten().copied().collect()).collect();
+        let related = |i: usize, j: usize| {
+            supers[i].contains(&(candidates[j] as ClassId)) || supers[j].contains(&(candidates[i] as ClassId))
         };
-        let mut set = vec![m.owner as usize];
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for c in 0..self.classes.len() {
-                if !set.contains(&c) && declared(c, &name).is_some() && set.iter().any(|&s| related(c, s)) {
-                    set.push(c);
-                    changed = true;
+        let mut found = vec![false; candidates.len()];
+        let mut queue: Vec<usize> = Vec::new();
+        if let Some(start) = candidates.iter().position(|&c| c == m.owner as usize) {
+            found[start] = true;
+            queue.push(start);
+        }
+        while let Some(i) = queue.pop() {
+            for (j, seen) in found.iter_mut().enumerate() {
+                if !*seen && related(i, j) {
+                    *seen = true;
+                    queue.push(j);
                 }
             }
         }
-        let mut out: Vec<Span> = set.into_iter().filter_map(|c| declared(c, &name)).collect();
+        let set = candidates.iter().zip(&found).filter(|(_, f)| **f).map(|(c, _)| *c);
+        let mut out: Vec<Span> = set.filter_map(|c| declared(c, &name)).collect();
         if !out.contains(&def) {
             out.push(def);
         }
@@ -270,6 +279,29 @@ impl EditorIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chain of 1,500 classes that all declare `m()` (the v0.9.0 audit's case,
+    /// cubic before): every one is found, at once.
+    #[test]
+    fn related_members_of_a_long_chain() {
+        let n = 1500u32;
+        let mut ix = EditorIndex::default();
+        for c in 0..n {
+            let def = Span::new(0, c, c + 1);
+            ix.classes.push(vec![Member {
+                item: Item { name: "m".into(), kind: ItemKind::Method, detail: String::new(), def: Some(def) },
+                is_static: false,
+                vis: Visibility::Public,
+                owner: c,
+            }]);
+            // Listed backwards: each class extends the one after it.
+            ix.supers.push((c..n).collect());
+        }
+        let start = std::time::Instant::now();
+        let found = ix.related_defs(Span::new(0, 700, 701));
+        assert_eq!(found.len(), n as usize);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
+    }
 
     /// A huge type argument repeated in many parameters gives a short detail.
     #[test]

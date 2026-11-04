@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates nine audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), and §17 what was added for v0.8.0.
+This report consolidates ten audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, and §18 what was added for v0.9.0.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§17: 2026-11-04)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§18: 2026-11-04)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -796,3 +796,96 @@ Windows, and on Linux and macOS in CI, with clippy (`-D warnings`) and rustfmt.
 
 Dependencies: `cargo audit` (CI) and `npm audit --omit=dev` in the extension and the website find nothing. New crates:
 `chrono-tz`, `phf` and `phf_shared`; `regex`, `regex-automata`, `url` and `ring` were already in the lockfile.
+
+## 18. Tenth Assessment (v0.9.0: editor features, debugger, test tools, distribution)
+
+Date: 2026-11-04. Scope: everything changed after v0.8.0 (`git diff v0.8.0..main`): the new features of `phv lsp`
+(references, rename, formatting, signature help, symbols, quick fixes, semantic tokens, inlay hints), `phv new`,
+`phv serve --watch`, `phv test` (hooks, filters, JSON and JUnit reports, coverage), `phv run --profile`, `phv doc`,
+the debugger (`phv dap`) and the VS Code extension's debug type, and the release workflows for Linux on ARM, static
+builds, the Docker image, Homebrew and Scoop.
+
+### Method
+
+A new reviewer, given the source and the change, attacked a release build as the author of an untrusted repository
+that a developer opens in the editor or runs the tools on (with an LSP and a DAP client measuring time and memory),
+as a web page the developer visits while `phv serve --watch` runs, and as someone who can push to the repository or
+control a release's assets (the workflows were read and their steps reproduced locally, as GitHub Actions cannot be
+run here). Every finding was confirmed with a working PoC, and rerun against the fixed build.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| High | 0 | – |
+| Medium | 4 | Fixed |
+| Low | 6 | Fixed |
+| Info | 7 | Fixed / documented |
+
+None of the findings escapes `[permissions]`.
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R11-1 | The workflows that publish a release (`docker.yml`, `package-managers.yml`, and `publish-extension.yml` since 0.5) checked out the release's tag by its bare name, and `actions/checkout` prefers a branch of the same name: whoever can push a branch `v0.9.0` could have the Dockerfile, the formula generator or vsce's lockfile come from it, with the job's token for ghcr.io, the Homebrew tap or the Marketplace | Each checks out `refs/tags/<tag>` and checks that the commit is the tag's before anything else |
+| R11-2 | Semantic tokens (asked for whenever a file is opened, also in an untrusted workspace) looked every definition up by a linear search and computed each position from the line's start: a file of 100,000 uses of one variable on one line took 20 s, and 800,000 uses 160 s and 1.3 GB, with the server answering nothing else | Definitions are looked up in a map built once, and positions are found in one pass over the text; at most 100,000 tokens |
+| R11-3 | Inlay hints computed each position from the start of the file (a 589 KB line of assignments: 28 s), and the quick fixes compared unknown names with every known one by edit distance whatever their length (a 60,000-character name: 2.5 s per cursor move, minutes near the 8 MB limit) | One pass for positions; names longer than 64 bytes, or of very different length, are not compared |
+| R11-4 | `workspace/symbol` read every `.phv` file of the project whole, of any size (a 100 MB file: 27 s and 25 GB of memory; 2 GB: 196 GB committed), where the compiler reads at most 8 MB and only regular files | Every file the language server and `phv doc` read goes through the compiler's reader (regular files, at most 8 MB) |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R11-5 | Find references re-read the file of each result (100,000 results: 25 s); references and rename analyzed up to 300 files with no time bound after walking the whole tree; finding the methods related by overriding was cubic (1,500 classes: 30 s) | Each file is read once; the walk stops at 300 files and the search after 10 seconds (rename then refuses rather than rename part of the uses); the related methods are found breadth first with sets |
+| R11-6 | `phv doc` wrote through a link or junction planted on the output directory (`doc/` of a cloned project could point anywhere), and read source files of any size | A link anywhere on the output's directories is refused before anything is created; files are read as the compiler reads them |
+| R11-7 | The debugger escaped a string in full before shortening it, and showed map keys in full: a 40 MB key gave a 240 MB message (916 MB in the adapter), and a list of 1,000 such strings did not answer in 120 s | Strings and keys are shown from their first 500 characters only |
+| R11-8 | `/__phv/changes` of `phv serve --watch` counted only files toward its limit, so a tree of 60,000 empty directories took 7 s a request, asked for each second by every open tab (and any page in the browser) | Directories count toward the limit; the stamp is kept for a second, shared by all requests |
+| R11-9 | `docker.yml` created a BuildKit builder from an unpinned image, which received the push credentials | The engine builds each architecture itself (the Dockerfile only copies files), and a manifest list joins them: no builder image |
+| R11-10 | The publish workflows ran for any published release and on manual dispatch with any tag, so publishing an older release (or a dispatch) moved `:latest`, the Homebrew formula and the Scoop manifest back | They refuse a release that is not the latest; `docker.yml` runs in an environment of its own |
+
+### Info
+
+| Item | Result |
+|---|---|
+| `docker.yml` accepted an archive missing from `SHA256SUMS` (`--ignore-missing`) and copied `phv` even if it was a link | Fixed: each archive must be listed by its exact name with that hash, and `phv` must be a regular file |
+| The environments of the publish workflows should allow deployments from `v*` tags only, and `package-managers` (which holds a token) needs a reviewer | Documented in releasing.md; settings for the owner |
+| A crafted `import` with braces in a comment made the "remove the import" quick fix panic (caught; answered as an internal error) | Fixed: such an import gets no fix |
+| `--junit` wrote U+FFFE and U+FFFF, which XML cannot hold | Fixed |
+| Doc comments reached the website's library reference as HTML (`(?<name>...)` was taken for a tag) | Fixed: `phv doc --format md` writes `<` and `&` in prose as entities |
+| The tutorial's tests empty the database the site uses | Documented in the tutorial |
+| A source file of 8 MB of NUL bytes gave one error per byte (2.45 GB, also in the language server on every keystroke; older than this release) | Fixed: the lexer stops after 200 errors in a file |
+
+Diagnostics had the same problem as R11-3: one long line with 60,000 warnings took 20 s before every other answer.
+The language server now publishes at most 1,000 per file (errors first), with their positions found in one pass.
+
+### Residual Risks
+
+- References and rename stop searching after 10 seconds: in a project large enough to reach that limit, references
+  may be incomplete (rename refuses instead).
+- The publish workflows were checked by reading them and running their steps locally; they first run on GitHub
+  when 0.9.0 is published.
+
+### Verification
+
+All PoCs were rerun against the fixed build: semantic tokens on the 800 KB line 0.18 s (was 19.75 s), inlay hints 0.39 s
+(27.7 s), the quick fix with a 60,000-character name 0.01 s (2.47 s), references with 100,000 results 1.7 s (25.4 s),
+the 1,500-class chain 0.19 s (30 s), opening the file with 60,000 warnings 0.24 s (20 s), `workspace/symbol` with a
+100 MB file 0.00 s and 8 MB (27 s, 25.5 GB), the 40-file project stops at the time limit (33 s); `phv doc` refuses
+the junctioned `doc` and skips the 30 MB file (6.4 GB); the debugger's map with a 40 MB key 3 KB in 0.00 s (240 MB)
+and the list of 1,000 such strings 0.02 s (over 120 s); `/__phv/changes` over 60,000 directories 1.2 s once a second
+and under 1 ms otherwise (7 s each); the crafted import gets no fix and no error. The image's two architectures were
+built locally with the engine's builder. Regression tests: `positions_in_one_pass_and_bounded_suggestions` and
+`workspace_symbols_skip_huge_files` (phv_cli), `related_members_of_a_long_chain` (phv_types), `junk_files_give_few_errors`
+(phv_syntax), `huge_values_are_shown_short` and `junit_xml_holds_only_xml_characters` (phv_cli), and the link test of
+`phv doc` (Unix). What held up: rename stays inside the project (a junctioned `lib` is refused as an import) and only
+returns edits; `phv doc` escapes everything in HTML; `phv new` validates names and never writes over or through
+anything; the debugger keeps stdin from the script, evaluates only variable names, and applies phv.toml's permissions
+and memory limit; hooks with parameters are compile errors; coverage and profiling markers exist only when asked
+for; `--watch` is refused with `--prod`; `render.py` rejects a version that could inject Ruby and a missing archive;
+workflow inputs reach scripts only through the environment and are checked; the image is `FROM scratch` and runs as
+an unprivileged user; `phv.path` stays machine-scoped. All tests pass on Windows, and on Linux and macOS in CI, with
+clippy (`-D warnings`) and rustfmt.
+
+Dependencies: no new crates; `cargo audit` (CI) and `npm audit --omit=dev` in the extension and the website find
+nothing.

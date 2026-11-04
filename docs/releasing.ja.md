@@ -67,6 +67,11 @@ gh release edit vX.Y.Z --notes-file notes.md --draft=false --latest
 公開すると `.github/workflows/publish-extension.yml` が動き、`marketplace` 環境の承認待ちになる。実行の画面の
 **Review deployments** で承認すると、`.vsix` を `SHA256SUMS` と照合して Visual Studio Marketplace に公開する。
 
+これらのワークフローはどれもリリースのタグをチェックアウトし(同じ名前のブランチではなく)、最新でないリリースは扱わない
+ので、利用者が古いバージョンに戻されることはない。それぞれの環境(`marketplace`、`docker`、`package-managers`)は、`v*` の
+タグからのデプロイだけを許すこと(Settings → Environments → Deployment branches and tags)。`package-managers` はトークンを
+持つので、承認者も付ける。
+
 `.github/workflows/docker.yml` も動き、リリースの静的リンク(musl)のアーカイブをダウンロードして `SHA256SUMS` と照合し、
 amd64 と arm64 の `ghcr.io/miyagawayuu/phv:X.Y.Z` と `:latest` をプッシュする(同じ実行ファイルからのイメージは、リリースの
 ワークフローがすでにビルドして実行している)。実行が成功したことを確かめる。初回は、GitHub のパッケージの設定で公開に

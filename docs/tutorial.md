@@ -172,8 +172,9 @@ phv test
 ```
 
 A `TestClient` runs the site's pages in the same process, keeping cookies like a browser; no server is started.
-`#[Before]` runs before each test (here it empties the database). `phv test --junit report.xml` writes a report
-for CI.
+`#[Before]` runs before each test (here it empties the database). The tests use `data/notes.db`, the same
+database as `phv serve`, so running them removes the notes you added in the browser; a real project would give its
+tests a database of their own. `phv test --junit report.xml` writes a report for CI.
 
 ## 7. Debug
 

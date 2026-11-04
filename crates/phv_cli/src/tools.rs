@@ -10,7 +10,15 @@ const SKIP_DIRS: &[&str] = &["target", "vendor", ".git", ".jj", "node_modules"];
 
 /// Files under `paths` accepted by `want` (directories are walked).
 pub fn collect(paths: &[PathBuf], want: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
-    fn walk(dir: &Path, want: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) {
+    collect_max(paths, want, usize::MAX)
+}
+
+/// `collect`, stopping once `max` files are found (a huge tree is not walked to the end).
+pub fn collect_max(paths: &[PathBuf], want: &dyn Fn(&Path) -> bool, max: usize) -> Vec<PathBuf> {
+    fn walk(dir: &Path, want: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>, max: usize) {
+        if out.len() >= max {
+            return;
+        }
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         // Links (symlinks, junctions) are not followed: a loop would never end,
         // and `phv fmt` must not rewrite files outside the tree it was given.
@@ -22,9 +30,12 @@ pub fn collect(paths: &[PathBuf], want: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> 
                 continue;
             }
             let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if out.len() >= max {
+                return;
+            }
             if ty.is_dir() {
                 if !SKIP_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
-                    walk(&p, want, out);
+                    walk(&p, want, out, max);
                 }
             } else if want(&p) {
                 out.push(p);
@@ -33,10 +44,13 @@ pub fn collect(paths: &[PathBuf], want: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> 
     }
     let mut out = Vec::new();
     for p in paths {
+        if out.len() >= max {
+            break;
+        }
         if p.is_file() {
             out.push(p.clone());
         } else {
-            walk(p, want, &mut out);
+            walk(p, want, &mut out, max);
         }
     }
     out
@@ -119,11 +133,19 @@ fn xml_escape(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             // Characters XML 1.0 cannot hold.
-            c if (c as u32) < 0x20 && !matches!(c, '\n' | '\r' | '\t') => out.push('\u{FFFD}'),
+            c if ((c as u32) < 0x20 && !matches!(c, '\n' | '\r' | '\t')) || matches!(c, '\u{FFFE}' | '\u{FFFF}') => {
+                out.push('\u{FFFD}')
+            }
             c => out.push(c),
         }
     }
     out
+}
+
+#[cfg(test)]
+#[test]
+fn junit_xml_holds_only_xml_characters() {
+    assert_eq!(xml_escape("a\u{1}b\u{FFFF}c\u{FFFE}<&>\"\n"), "a\u{FFFD}b\u{FFFD}c\u{FFFD}&lt;&amp;&gt;&quot;\n");
 }
 
 fn junit(results: &[TestResult], seconds: f64) -> String {

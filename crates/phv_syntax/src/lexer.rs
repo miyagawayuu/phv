@@ -30,6 +30,7 @@ pub fn lex_with_comments(src: &str, file: u32, base: u32, mode: Mode) -> (Vec<To
         toks: Vec::new(),
         diags: Vec::new(),
         comments: Vec::new(),
+        stopped: false,
     };
     lx.run(mode);
     (lx.toks, lx.comments, lx.diags)
@@ -44,7 +45,13 @@ struct Lexer<'a> {
     toks: Vec<Token>,
     diags: Vec<Diagnostic>,
     comments: Vec<Span>,
+    /// Set after `MAX_ERRORS` errors: the rest of the file is not read (a file
+    /// of junk would otherwise give one error per byte).
+    stopped: bool,
 }
+
+/// Errors reported for one file before the lexer gives up on it.
+const MAX_ERRORS: usize = 200;
 
 fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
@@ -65,8 +72,15 @@ impl<'a> Lexer<'a> {
     }
 
     fn error(&mut self, msg: impl Into<String>, start: usize, end: usize) {
+        if self.stopped {
+            return;
+        }
         let span = self.span(start, end);
         self.diags.push(Diagnostic::error(msg, span));
+        if self.diags.len() >= MAX_ERRORS {
+            self.diags.push(Diagnostic::error("too many errors; the rest of this file is not read", span));
+            self.stopped = true;
+        }
     }
 
     /// Skips at most `n` spaces or tabs (the indentation of a heredoc line).
@@ -100,7 +114,7 @@ impl<'a> Lexer<'a> {
         if mode == Mode::Code && self.base == 0 && self.starts_with("<?phv") {
             self.pos += 5;
         }
-        while self.pos < self.bytes.len() {
+        while self.pos < self.bytes.len() && !self.stopped {
             mode = match mode {
                 Mode::Html => self.html(),
                 Mode::Code => self.code(),
@@ -651,5 +665,20 @@ impl<'a> Lexer<'a> {
                 out.push('\\');
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file of junk gives a bounded number of errors (one per byte before the
+    /// v0.9.0 audit: 8 MB of NUL bytes took 2.45 GB).
+    #[test]
+    fn junk_files_give_few_errors() {
+        let junk = "\0".repeat(8 << 20);
+        let (_, diags) = lex(&junk, 0, 0, Mode::Code);
+        assert!(diags.len() <= MAX_ERRORS + 1, "{}", diags.len());
+        assert!(diags.last().unwrap().message.contains("too many errors"));
     }
 }

@@ -278,7 +278,7 @@ impl Hook {
                 for (k, x) in m.iter().take(MAX_CHILDREN) {
                     let key = match k {
                         Key::Int(i) => i.to_string(),
-                        Key::Str(s) => format!("{:?}", s.as_str()),
+                        Key::Str(s) => quoted_prefix(s),
                     };
                     out.push(self.variable(format!("[{key}]"), x));
                 }
@@ -307,14 +307,23 @@ const FRAME_REF: usize = 1;
 const VALUE_REF: usize = 100_000;
 
 /// A short text for a value.
+/// A string quoted with escapes, from its first characters only (a huge string
+/// is not copied to be shown).
+fn quoted_prefix(s: &str) -> String {
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(MAX_TEXT).collect();
+    let more = chars.next().is_some();
+    format!("{head:?}{}", if more { "…" } else { "" })
+}
+
 fn show(prog: &Program, v: &Value) -> String {
     let s = match v {
         Value::Null => "null".to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
         Value::Float(f) => phv_vm::value::format_float(*f),
-        Value::Str(s) => format!("{:?}", s.as_str()),
-        Value::Html(s) => format!("Html({:?})", s.as_str()),
+        Value::Str(s) => quoted_prefix(s),
+        Value::Html(s) => format!("Html({})", quoted_prefix(s)),
         Value::List(l) => format!("list({})", l.len()),
         Value::Map(m) => format!("map({})", m.len()),
         Value::Object(o) => {
@@ -676,6 +685,18 @@ mod tests {
         fn response(&self, seq: i64) -> Json {
             self.wait("response", |m| m["type"] == "response" && m["request_seq"] == seq)
         }
+    }
+
+    /// A huge string (or map key) is shown from its first characters, cheaply.
+    #[test]
+    fn huge_values_are_shown_short() {
+        let s = "\u{1}".repeat(20_000_000);
+        let start = std::time::Instant::now();
+        let shown = quoted_prefix(&s);
+        assert!(shown.len() < 8 * MAX_TEXT, "{}", shown.len()); // escapes take up to 7 bytes a character
+        assert!(shown.ends_with('…'));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(quoted_prefix("a\"b"), "\"a\\\"b\"");
     }
 
     #[test]

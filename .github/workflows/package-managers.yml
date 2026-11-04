@@ -11,14 +11,16 @@ name: Update Homebrew and Scoop
 # Pushing needs PACKAGE_REPOS_TOKEN, a fine-grained token that can write the
 # contents of those two repositories and nothing else, stored in the
 # `package-managers` environment. Only the gh and git CLIs are used.
-# Run it by hand with a tag to update them for an earlier release.
+# The tag is checked out as refs/tags/... (never a branch of the same name),
+# and only the latest release is published, so users never move back.
+# Run it by hand with the latest tag to push them again.
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish to Homebrew and Scoop (e.g. v0.9.0)"
+        description: "The latest release's tag (e.g. v0.9.0)"
         required: true
 
 permissions:
@@ -36,13 +38,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
           persist-credentials: false
-      - name: Write the formula and the manifest
+      - name: Check the tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::not a release tag: $TAG"; exit 1; }
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          [[ "$latest" == "$TAG" ]] || { echo "::error::$TAG is not the latest release ($latest)"; exit 1; }
+      - name: Write the formula and the manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dl --pattern SHA256SUMS
           python3 packaging/render.py "${TAG#v}" dl/SHA256SUMS out
       - name: Push to the tap and the bucket

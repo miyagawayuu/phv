@@ -73,11 +73,17 @@ fn distance(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
+/// Longest name suggestions are looked for (the edit distance takes the product of the lengths).
+const MAX_SUGGESTED_NAME: usize = 64;
+
 /// Names close to `wrong`, closest first (at most three).
 fn close_names<'a>(wrong: &str, names: impl Iterator<Item = &'a str>) -> Vec<String> {
+    if wrong.len() > MAX_SUGGESTED_NAME {
+        return Vec::new();
+    }
     let limit = if wrong.chars().count() <= 3 { 1 } else { 2 };
     let mut found: Vec<(usize, String)> = names
-        .filter(|n| *n != wrong)
+        .filter(|n| *n != wrong && n.len() <= MAX_SUGGESTED_NAME && n.len().abs_diff(wrong.len()) <= 4 * limit)
         .map(|n| (distance(wrong, n), n.to_string()))
         .filter(|(d, _)| *d <= limit)
         .collect();
@@ -95,6 +101,55 @@ fn quoted_after<'a>(message: &'a str, prefix: &str) -> Option<&'a str> {
 fn source(path: &Path, text: String) -> SourceFile {
     SourceFile::new(String::new(), Some(path.to_path_buf()), text)
 }
+
+/// LSP positions of byte offsets of `text`, for offsets that mostly increase:
+/// each is found from the previous one, so a whole file takes one pass.
+struct Positions<'a> {
+    text: &'a str,
+    at: usize,
+    line: u64,
+    col: u64,
+}
+
+impl<'a> Positions<'a> {
+    fn new(text: &'a str) -> Positions<'a> {
+        Positions { text, at: 0, line: 0, col: 0 }
+    }
+
+    fn get(&mut self, offset: usize) -> (u64, u64) {
+        let mut offset = offset.min(self.text.len());
+        while !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        if offset < self.at {
+            *self = Positions::new(self.text);
+        }
+        for ch in self.text[self.at..offset].chars() {
+            if ch == '\n' {
+                self.line += 1;
+                self.col = 0;
+            } else {
+                self.col += ch.len_utf16() as u64;
+            }
+        }
+        self.at = offset;
+        (self.line, self.col)
+    }
+}
+
+/// The LSP positions of `offsets` (in any order), found in one pass over `text`.
+pub(super) fn positions_of(text: &str, offsets: impl Iterator<Item = u32>) -> HashMap<u32, (u64, u64)> {
+    let mut sorted: Vec<u32> = offsets.collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut p = Positions::new(text);
+    sorted.into_iter().map(|o| (o, p.get(o as usize))).collect()
+}
+
+/// Semantic tokens and inlay hints given at most (an editor shows far fewer).
+const MAX_TOKENS: usize = 100_000;
+/// How long references and rename may spend analyzing the project's files.
+const SEARCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn range_in(src: &SourceFile, start: u32, end: u32) -> Value {
     json!({ "start": position(src, start), "end": position(src, end) })
@@ -125,7 +180,7 @@ impl Server {
             let s = p.to_string_lossy();
             s.ends_with(".phv") && !s.ends_with(".phv.html")
         };
-        for p in crate::tools::collect(std::slice::from_ref(&root), &want) {
+        for p in crate::tools::collect_max(std::slice::from_ref(&root), &want, MAX_PROJECT_FILES) {
             if entries.len() >= MAX_PROJECT_FILES {
                 break;
             }
@@ -136,9 +191,10 @@ impl Server {
         entries
     }
 
-    /// The text of an open document, or of the file on disk.
+    /// The text of an open document, or of the file on disk (a regular file of
+    /// at most 8 MB, as the compiler reads them).
     fn text_of(&self, path: &Path) -> Option<String> {
-        self.open.get(path).cloned().or_else(|| std::fs::read_to_string(path).ok())
+        self.open.get(path).cloned().or_else(|| phv_driver::read_source(path).ok())
     }
 
     /// The definition the cursor is on: a use of it or the definition itself.
@@ -150,17 +206,25 @@ impl Server {
             return None;
         }
         let is_variable = item.kind == ItemKind::Variable;
-        let defs: Vec<Place> = ix.related_defs(def).into_iter().filter_map(|d| place(a, d)).collect();
-        let in_project = !defs.is_empty() && defs.len() == ix.related_defs(def).len();
+        let related = ix.related_defs(def);
+        let defs: Vec<Place> = related.iter().filter_map(|d| place(a, *d)).collect();
+        let in_project = !defs.is_empty() && defs.len() == related.len();
         Some(Target { defs, name: item.name.clone(), in_project, is_variable })
     }
 
-    /// Every place the target is defined or used, in the files of the project.
-    fn places(&self, path: &Path, target: &Target) -> Vec<(Place, String)> {
+    /// Every place the target is defined or used, in the files of the project,
+    /// and whether every file was searched (not when the time ran out).
+    fn places(&self, path: &Path, target: &Target) -> (Vec<(Place, String)>, bool) {
         let mut out: Vec<(Place, String)> = Vec::new();
         let mut seen: HashSet<Place> = HashSet::new();
         let entries = if target.is_variable { vec![path.to_path_buf()] } else { self.project_entries(path) };
+        let deadline = std::time::Instant::now() + SEARCH_BUDGET;
+        let mut complete = true;
         for entry in entries {
+            if std::time::Instant::now() > deadline {
+                complete = false;
+                break;
+            }
             let Some(text) = self.text_of(&entry) else { continue };
             let a = self.analyze_text(&entry, text);
             let Some(ix) = &a.index else { continue };
@@ -188,7 +252,7 @@ impl Server {
         // Spans that do not contain the name (a module path, a template) are not uses of it.
         out.retain(|(_, text)| name_in(text, &target.name).is_some());
         out.sort_by(|a, b| (&a.0.path, a.0.start).cmp(&(&b.0.path, b.0.start)));
-        out
+        (out, complete)
     }
 
     pub(super) fn references(&self, path: &Path, line: u64, character: u64, include_decl: bool) -> Value {
@@ -196,16 +260,19 @@ impl Server {
         let offset = offset_of(text, line, character);
         let a = self.analyze_text(path, text.clone());
         let Some(target) = self.target(&a, offset) else { return json!([]) };
-        let out: Vec<Value> = self
-            .places(path, &target)
+        // Each file is read once, however many references it has.
+        let mut files: HashMap<PathBuf, Option<SourceFile>> = HashMap::new();
+        let (places, _) = self.places(path, &target);
+        let out: Vec<Value> = places
             .into_iter()
             .filter(|(p, _)| include_decl || !target.defs.contains(p))
             .filter_map(|(p, text)| {
                 let (s, e) = name_in(&text, &target.name)?;
-                let file = source(&p.path, self.text_of(&p.path)?);
+                let file =
+                    files.entry(p.path.clone()).or_insert_with(|| self.text_of(&p.path).map(|t| source(&p.path, t)));
                 Some(json!({
                     "uri": path_to_uri(&p.path),
-                    "range": range_in(&file, p.start + s as u32, p.start + e as u32),
+                    "range": range_in(file.as_ref()?, p.start + s as u32, p.start + e as u32),
                 }))
             })
             .collect();
@@ -252,7 +319,11 @@ impl Server {
         }
         let mut changes: HashMap<String, Vec<Value>> = HashMap::new();
         let mut files: HashMap<PathBuf, SourceFile> = HashMap::new();
-        for (p, span_text) in self.places(path, target) {
+        let (places, complete) = self.places(path, target);
+        if !complete {
+            return Err("the project is too large to find every use in time; nothing was renamed".into());
+        }
+        for (p, span_text) in places {
             let Some((s, e)) = name_in(&span_text, &target.name) else { continue };
             if !files.contains_key(&p.path) {
                 let Some(text) = self.text_of(&p.path) else { continue };
@@ -339,7 +410,7 @@ impl Server {
         }
         let want = |p: &Path| p.to_string_lossy().ends_with(".phv");
         let mut out = Vec::new();
-        for file in crate::tools::collect(&roots, &want).into_iter().take(MAX_PROJECT_FILES) {
+        for file in crate::tools::collect_max(&roots, &want, MAX_PROJECT_FILES) {
             let Some(text) = self.text_of(&file) else { continue };
             let template = file.to_string_lossy().ends_with(".phv.html");
             let (module, _) = phv_syntax::parser::parse_module(&text, 0, template);
@@ -448,6 +519,18 @@ impl Server {
         let a = self.analyze_text(path, text.clone());
         let (Some(ix), Some(file)) = (&a.index, a.entry_file) else { return json!({ "data": [] }) };
         let src = a.sources.get(file);
+        // Every definition by its span, first one wins (as `item_at_def` finds it).
+        let mut by_def: HashMap<phv_syntax::Span, &Item> = HashMap::new();
+        for item in ix
+            .defs
+            .iter()
+            .chain(ix.classes.iter().flatten().map(|m| &m.item))
+            .chain(ix.scopes.iter().flat_map(|s| &s.vars))
+        {
+            if let Some(d) = item.def {
+                by_def.entry(d).or_insert(item);
+            }
+        }
         let mut tokens: Vec<(u32, u32, u32, u32)> = Vec::new(); // start, end, type, modifiers
         let mut add = |span: phv_syntax::Span, item: &Item, declaration: bool| {
             let Some(kind) = token_type(item.kind) else { return };
@@ -457,28 +540,24 @@ impl Server {
         };
         for (u, d) in &ix.refs {
             if u.file == file {
-                if let Some(item) = ix.item_at_def(*d) {
+                if let Some(item) = by_def.get(d) {
                     add(*u, item, false);
                 }
             }
         }
-        let defs = ix
-            .defs
-            .iter()
-            .chain(ix.classes.iter().flatten().map(|m| &m.item))
-            .chain(ix.scopes.iter().flat_map(|s| &s.vars));
-        for item in defs {
-            if let Some(d) = item.def.filter(|d| d.file == file && d.end > d.start) {
-                add(d, item, true);
+        for (d, item) in &by_def {
+            if d.file == file && d.end > d.start {
+                add(*d, item, true);
             }
         }
         tokens.sort();
         tokens.dedup_by(|b, a| b.0 < a.1); // overlapping: keep the first
+        tokens.truncate(MAX_TOKENS);
         let mut data = Vec::with_capacity(tokens.len() * 5);
         let (mut line, mut col) = (0u64, 0u64);
+        let mut positions = Positions::new(&src.text);
         for (start, end, kind, mods) in tokens {
-            let p = position(src, start);
-            let (l, c) = (p["line"].as_u64().unwrap_or(0), p["character"].as_u64().unwrap_or(0));
+            let (l, c) = positions.get(start as usize);
             let len: usize = src.text[start as usize..end as usize].chars().map(char::len_utf16).sum();
             let dc = if l == line { c - col } else { c };
             data.extend([l - line, dc, len as u64, kind as u64, mods as u64]);
@@ -501,18 +580,29 @@ impl Server {
         );
         let a = self.analyze_text(path, text.clone());
         let (Some(ix), Some(file)) = (&a.index, a.entry_file) else { return json!([]) };
-        let mut out = Vec::new();
-        for v in ix.scopes.iter().flat_map(|s| &s.vars) {
-            let Some(d) = v.def.filter(|d| d.file == file && d.start >= from && d.start <= to) else { continue };
-            if v.detail.is_empty() || !untyped_assignment(text, d.start as usize, d.end as usize) {
-                continue;
-            }
-            out.push(json!({
-                "position": text_position(text, d.start as usize),
-                "label": format!("{} ", v.detail),
-                "kind": 1,
-            }));
-        }
+        let mut hints: Vec<(u32, &str)> = ix
+            .scopes
+            .iter()
+            .flat_map(|s| &s.vars)
+            .filter_map(|v| v.def.filter(|d| d.file == file && d.start >= from && d.start <= to).map(|d| (d, v)))
+            .filter(|(d, v)| !v.detail.is_empty() && untyped_assignment(text, d.start as usize, d.end as usize))
+            .map(|(d, v)| (d.start, v.detail.as_str()))
+            .collect();
+        hints.sort();
+        hints.dedup();
+        hints.truncate(MAX_TOKENS);
+        let mut positions = Positions::new(text);
+        let out: Vec<Value> = hints
+            .into_iter()
+            .map(|(start, detail)| {
+                let (line, character) = positions.get(start as usize);
+                json!({
+                    "position": { "line": line, "character": character },
+                    "label": format!("{detail} "),
+                    "kind": 1,
+                })
+            })
+            .collect();
         json!(out)
     }
 }
@@ -631,12 +721,17 @@ fn split_params(sig: &str) -> Vec<String> {
 /// The text to delete to remove the imported name at `start..end`: the whole
 /// `import` when it is the only name, else the name and one comma beside it.
 fn import_removal(text: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    if start > end || end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return None;
+    }
     let stmt_start = text[..start].rfind("import")?;
     let stmt_end = start + text[start..].find(';')? + 1;
     let stmt = &text[stmt_start..stmt_end];
-    let names = match (stmt.find('{'), stmt.find('}')) {
-        (Some(a), Some(b)) => stmt[a + 1..b].split(',').filter(|n| !n.trim().is_empty()).count(),
-        _ => 1,
+    // Anything but one `{ ... }` around the names (comments with braces, say) gets no fix.
+    let names = match (stmt.find('{'), stmt.find('}'), stmt.matches('{').count(), stmt.matches('}').count()) {
+        (Some(a), Some(b), 1, 1) if a < b => stmt[a + 1..b].split(',').filter(|n| !n.trim().is_empty()).count(),
+        (None, None, _, _) => 1,
+        _ => return None,
     };
     if names <= 1 {
         let line_end = if text[stmt_end..].starts_with("\r\n") {
@@ -652,6 +747,9 @@ fn import_removal(text: &str, start: usize, end: usize) -> Option<(usize, usize)
     // is after the `,` or `{` before it.
     let entry_end = end + text[end..stmt_end].find([',', '}'])?;
     let entry_start = text[..start].rfind([',', '{'])? + 1;
+    if entry_start <= stmt_start || entry_start > start {
+        return None;
+    }
     if text[entry_end..].starts_with(',') {
         // Up to the next name.
         let next = entry_end + 1;
@@ -755,6 +853,28 @@ fn flatten_symbols(symbols: &[Value], container: Option<&str>, out: &mut Vec<(St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regressions of the v0.9.0 audit (security-audit.md §18).
+    #[test]
+    fn positions_in_one_pass_and_bounded_suggestions() {
+        let text = "ab\nこんにちは😀x\n$y";
+        let mut p = Positions::new(text);
+        assert_eq!(p.get(0), (0, 0));
+        assert_eq!(p.get(3 + 15), (1, 5));
+        assert_eq!(p.get(3 + 15 + 4), (1, 7));
+        assert_eq!(p.get(text.len()), (2, 2));
+        assert_eq!(p.get(1), (0, 1), "an earlier offset starts again");
+        assert_eq!(p.get(4), (1, 0), "inside a character: its start");
+        // A huge unknown name is not compared with anything (the distance is quadratic).
+        let long = "a".repeat(60_000);
+        assert!(close_names(&format!("{long}b"), [long.as_str()].into_iter()).is_empty());
+        assert_eq!(close_names("lenght", ["length", &"x".repeat(100_000)].into_iter()), ["length"]);
+        // Braces inside a comment do not make the edit panic: no fix is offered.
+        let text = "import lib.m.{one /* importZ } { */, two};\n";
+        let two = text.find("two").unwrap();
+        assert_eq!(import_removal(text, two, two + 3), None);
+        assert_eq!(import_removal(text, 30, 10), None);
+    }
 
     #[test]
     fn names_inside_spans() {

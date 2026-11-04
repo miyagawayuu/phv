@@ -274,7 +274,8 @@ pub fn collect_modules(paths: &[PathBuf], std: bool) -> Vec<DocModule> {
     // The project root of each directory, looked up once.
     let mut roots: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
     for file in crate::tools::collect(paths, &want).into_iter().take(MAX_FILES) {
-        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        // A regular file of at most 8 MB, as the compiler reads them.
+        let Ok(text) = phv_driver::read_source(&file) else { continue };
         let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
         let root = roots.entry(dir).or_insert_with(|| phv_driver::find_root(&file)).clone();
         let rel = file.strip_prefix(&root).unwrap_or(&file).with_extension("");
@@ -304,13 +305,30 @@ fn md_text(text: &str, out: &mut String) {
         if code {
             out.push_str(line.trim_start_matches(' '));
         } else {
-            out.push_str(line);
+            out.push_str(&md_escape(line));
         }
         out.push('\n');
     }
     if in_code {
         out.push_str("```\n");
     }
+}
+
+/// Prose for Markdown: `<` and `&` outside code spans are written as entities,
+/// so a comment cannot add HTML (or lose `<name>` to it) where it is rendered.
+fn md_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, part) in text.split('`').enumerate() {
+        if i > 0 {
+            out.push('`');
+        }
+        if i % 2 == 1 {
+            out.push_str(part);
+        } else {
+            out.push_str(&part.replace('&', "&amp;").replace('<', "&lt;"));
+        }
+    }
+    out
 }
 
 fn anchor(s: &str) -> String {
@@ -331,11 +349,11 @@ pub fn markdown(modules: &[DocModule], title: &str) -> String {
         for item in &m.items {
             out.push_str(&format!("### {} {}\n\n```phv\n{}\n```\n\n", item.kind, item.name, item.signature));
             if !item.doc.is_empty() {
-                out.push_str(&item.doc);
+                out.push_str(&md_escape(&item.doc));
                 out.push_str("\n\n");
             }
             for member in &item.members {
-                let doc = member.doc.split_whitespace().collect::<Vec<_>>().join(" ");
+                let doc = md_escape(&member.doc.split_whitespace().collect::<Vec<_>>().join(" "));
                 let sep = if doc.is_empty() { "" } else { " — " };
                 out.push_str(&format!("- `{}`{sep}{doc}\n", member.signature));
             }

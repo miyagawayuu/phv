@@ -498,7 +498,7 @@ $parts = $date->match("2026-11-05");              // ["2026-11-05", "2026", "11"
 ```
 
 
-The syntax is Rust's `regex` crate: (?i) for no case, (?<name>...) for a
+The syntax is Rust's `regex` crate: (?i) for no case, (?&lt;name>...) for a
 named group, \d \w \s, Unicode classes like \p{L}. No look-around or
 back-references.
 

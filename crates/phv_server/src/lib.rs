@@ -108,6 +108,8 @@ struct State {
     gz_cache: Mutex<(HashMap<String, Bytes>, usize)>,
     /// `phv serve --watch`: pages get a script that reloads them on changes.
     watch: bool,
+    /// The last change stamp and when it was taken (every open tab asks each second).
+    watch_stamp: tokio::sync::Mutex<Option<(Instant, String)>>,
 }
 
 impl State {
@@ -145,6 +147,7 @@ impl State {
             embedded_tags: HashMap::new(),
             gz_cache: Mutex::new((HashMap::new(), 0)),
             watch: false,
+            watch_stamp: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -376,10 +379,27 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
         let mut r = match path.as_str() {
             "/__phv/live-reload.js" => simple(StatusCode::OK, "text/javascript; charset=utf-8", LIVE_RELOAD_JS.into()),
             "/__phv/changes" => {
-                let root = state.root.clone();
-                let skip: Vec<PathBuf> =
-                    state.config.host.permissions.write.iter().map(|w| root.join(w.trim_end_matches('/'))).collect();
-                let stamp = tokio::task::spawn_blocking(move || change_stamp(&root, &skip)).await.unwrap_or_default();
+                // One walk a second at most, however many tabs ask (they wait for it).
+                let mut cached = state.watch_stamp.lock().await;
+                let stamp = match cached.as_ref() {
+                    Some((at, stamp)) if at.elapsed() < Duration::from_secs(1) => stamp.clone(),
+                    _ => {
+                        let root = state.root.clone();
+                        let skip: Vec<PathBuf> = state
+                            .config
+                            .host
+                            .permissions
+                            .write
+                            .iter()
+                            .map(|w| root.join(w.trim_end_matches('/')))
+                            .collect();
+                        let stamp =
+                            tokio::task::spawn_blocking(move || change_stamp(&root, &skip)).await.unwrap_or_default();
+                        *cached = Some((Instant::now(), stamp.clone()));
+                        stamp
+                    }
+                };
+                drop(cached);
                 simple(StatusCode::OK, "text/plain; charset=utf-8", stamp)
             }
             _ => simple(StatusCode::NOT_FOUND, "text/plain", "not found".into()),
@@ -491,7 +511,7 @@ const LIVE_RELOAD_JS: &str = r#"// phv serve --watch: reloads the page when a fi
 })();
 "#;
 
-/// Files looked at for changes, at most (a huge tree is cut short, not walked).
+/// Files and directories looked at for changes, at most (a huge tree is cut short, not walked).
 const WATCH_MAX_FILES: usize = 10_000;
 
 /// The newest modification time and the number of the site's files: it
@@ -511,13 +531,14 @@ fn change_stamp(root: &Path, skip: &[PathBuf]) -> String {
             if ty.is_symlink() || name.starts_with('.') || skip.contains(&path) {
                 continue;
             }
+            // Directories count too: a tree of empty directories is no cheaper to walk.
+            count += 1;
             if ty.is_dir() {
                 if !matches!(name.as_str(), "vendor" | "node_modules" | "target") {
                     dirs.push(path);
                 }
                 continue;
             }
-            count += 1;
             if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
                 let t = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
                 newest = newest.max(t);

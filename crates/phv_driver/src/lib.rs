@@ -217,7 +217,7 @@ const MAX_SOURCE: u64 = 8 << 20;
 
 /// Reads a source file: only a regular file (not a pipe or a device, which could
 /// block forever), of at most `MAX_SOURCE` bytes.
-pub(crate) fn read_source(path: &Path) -> std::io::Result<String> {
+pub fn read_source(path: &Path) -> std::io::Result<String> {
     use std::io::{Error, ErrorKind, Read};
     let file = std::fs::File::open(path)?;
     let meta = file.metadata()?;

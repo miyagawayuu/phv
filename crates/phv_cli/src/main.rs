@@ -227,6 +227,23 @@ fn write_migrated(input: &Path, out: &Path, text: &str, force: bool) -> Result<(
     f.write_all(text.as_bytes()).map_err(|e| format!("cannot write {shown}: {e}"))
 }
 
+/// The first component of `dir` that exists and is a link or a junction.
+fn linked_component(dir: &Path) -> Option<PathBuf> {
+    let mut at = PathBuf::new();
+    for c in dir.components() {
+        at.push(c);
+        if matches!(c, std::path::Component::Prefix(_) | std::path::Component::RootDir | std::path::Component::CurDir) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => return Some(at),
+            Ok(_) => {}
+            Err(_) => break, // does not exist yet: created as a plain directory
+        }
+    }
+    None
+}
+
 /// The functions that took the most time, then those called most.
 fn profile_report(prog: &phv_vm::Program, p: &phv_vm::vm::Profile) -> String {
     let mut rows: Vec<usize> = (0..prog.funcs.len()).filter(|&i| p.calls[i] > 0).collect();
@@ -461,6 +478,12 @@ fn exec(cmd: Command) -> ExitCode {
             let text = if md { doc::markdown(&modules, &title) } else { doc::html(&modules, &title) };
             let out = output.unwrap_or_else(|| PathBuf::from(if md { "doc/api.md" } else { "doc/index.html" }));
             if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+                // A link (or junction) on the way, planted in a project, would send
+                // the file elsewhere: the directories are checked before any is created.
+                if let Some(link) = linked_component(parent) {
+                    eprintln!("error: {} is a link; refusing to write through it", link.display());
+                    return ExitCode::FAILURE;
+                }
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     eprintln!("error: cannot create {}: {e}", parent.display());
                     return ExitCode::FAILURE;
@@ -523,5 +546,27 @@ fn exec(cmd: Command) -> ExitCode {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// `phv doc` does not write through a planted link (the v0.9.0 audit).
+    #[cfg(unix)]
+    #[test]
+    fn output_directories_through_links_are_refused() {
+        let dir = std::env::temp_dir().join(format!("phv-doc-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        std::os::unix::fs::symlink(dir.join("outside"), dir.join("doc")).unwrap();
+        assert_eq!(super::linked_component(&dir.join("doc/api")), Some(dir.join("doc")));
+        assert_eq!(super::linked_component(&dir.join("plain/api")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_output_directories_are_accepted() {
+        let dir = std::env::temp_dir();
+        assert_eq!(super::linked_component(&dir.join("phv-no-such-dir/doc")), None);
     }
 }

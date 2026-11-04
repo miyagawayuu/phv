@@ -606,11 +606,15 @@ fn watch_mode_reloads_pages_on_changes() {
     assert_eq!(js.status, 200);
     assert!(js.body.contains("location.reload()"));
     let before = get(addr, "/__phv/changes", "").body;
-    std::thread::sleep(Duration::from_millis(50));
-    write(&dir, "data/written-by-the-site.txt", "x");
-    assert_eq!(get(addr, "/__phv/changes", "").body, before, "data the site writes is not a change");
+    // The stamp is kept for a second (shared by every tab that asks).
     write(&dir, "public/new.phv", "<?phv echo 1;");
-    assert_ne!(get(addr, "/__phv/changes", "").body, before);
+    assert_eq!(get(addr, "/__phv/changes", "").body, before, "within a second, the same stamp");
+    std::thread::sleep(Duration::from_millis(1100));
+    let after = get(addr, "/__phv/changes", "").body;
+    assert_ne!(after, before);
+    write(&dir, "data/written-by-the-site.txt", "x");
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(get(addr, "/__phv/changes", "").body, after, "data the site writes is not a change");
     // Without --watch, none of this exists.
     let addr = start(false);
     assert!(!get(addr, "/", "").body.contains("live-reload"));

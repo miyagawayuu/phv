@@ -4,16 +4,18 @@ name: Publish Docker image
 # linux/arm64 when a release is published (after the draft has been checked).
 # The image holds the release's static (musl) executables, downloaded from the
 # release and checked against its SHA256SUMS, so it contains exactly what was
-# checked; docker/Dockerfile comes from the released tag. Only the docker CLI
-# is used (no third-party actions); the token is this run's GITHUB_TOKEN.
-# Run it by hand with a tag to publish an earlier release's image.
+# checked; docker/Dockerfile comes from the released tag (checked out as
+# refs/tags/..., never a branch of the same name). Only the docker CLI is used
+# (no third-party actions or builder images); the token is this run's
+# GITHUB_TOKEN. Only the latest release is published, so :latest never moves
+# back. Run it by hand with the latest tag to publish its image again.
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag whose executables to publish (e.g. v0.9.0)"
+        description: "The latest release's tag (e.g. v0.9.0)"
         required: true
 
 permissions:
@@ -22,6 +24,7 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: docker
     permissions:
       contents: read
       packages: write
@@ -33,25 +36,36 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
           persist-credentials: false
-      - name: Download and check the executables
+      - name: Check the tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::not a release tag: $TAG"; exit 1; }
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          [[ "$latest" == "$TAG" ]] || { echo "::error::$TAG is not the latest release ($latest)"; exit 1; }
+      - name: Download and check the executables
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           version=${TAG#v}
           mkdir -p dl ctx/amd64 ctx/arm64 ctx/tmp
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dl \
             --pattern "phv-$version-x86_64-unknown-linux-musl.tar.gz" \
             --pattern "phv-$version-aarch64-unknown-linux-musl.tar.gz" \
             --pattern SHA256SUMS
-          (cd dl && sha256sum -c SHA256SUMS --ignore-missing --strict)
-          test "$(cd dl && ls *.tar.gz | wc -l)" = 2
           for pair in "amd64 x86_64" "arm64 aarch64"; do
             set -- $pair
-            tar -xzf "dl/phv-$version-$2-unknown-linux-musl.tar.gz" -C dl
-            cp "dl/phv-$version-$2-unknown-linux-musl/phv" "ctx/$1/phv"
+            name="phv-$version-$2-unknown-linux-musl"
+            # The archive must be listed in SHA256SUMS by its exact name, with this hash.
+            want=$(awk -v f="$name.tar.gz" '$2 == f || $2 == "*" f { print $1 }' dl/SHA256SUMS)
+            have=$(sha256sum "dl/$name.tar.gz" | cut -d' ' -f1)
+            [[ -n "$want" && "$want" == "$have" ]] || { echo "::error::$name.tar.gz does not match SHA256SUMS"; exit 1; }
+            tar -xzf "dl/$name.tar.gz" -C dl
+            [[ -f "dl/$name/phv" && ! -L "dl/$name/phv" ]] || { echo "::error::$name/phv is not a regular file"; exit 1; }
+            cp "dl/$name/phv" "ctx/$1/phv"
           done
           cp docker/Dockerfile ctx/
           echo "VERSION=$version" >> "$GITHUB_ENV"
@@ -61,16 +75,19 @@ jobs:
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/phv"
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker buildx create --use --name phv-builder
-          docker buildx build ctx \
-            --platform linux/amd64,linux/arm64 \
-            --build-arg "VERSION=$VERSION" \
-            --tag "$image:$VERSION" \
-            --tag "$image:latest" \
-            --push
+          # The Dockerfile only copies files, so the engine builds each architecture
+          # without emulation or a builder container; a manifest list joins them.
+          for arch in amd64 arm64; do
+            docker build ctx --platform "linux/$arch" --build-arg "VERSION=$VERSION" --tag "$image:$VERSION-$arch"
+            docker push "$image:$VERSION-$arch"
+          done
+          for tag in "$VERSION" latest; do
+            docker manifest create --amend "$image:$tag" "$image:$VERSION-amd64" "$image:$VERSION-arm64"
+            docker manifest push --purge "$image:$tag"
+          done
           docker logout ghcr.io
       - name: Check the published image
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/phv:$VERSION"
-          docker run --rm "$image" --version | tee version.txt
+          docker run --rm --pull always "$image" --version | tee version.txt
           grep -q "$VERSION" version.txt

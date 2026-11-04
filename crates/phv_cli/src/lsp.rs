@@ -6,6 +6,9 @@
 
 mod features;
 
+/// Diagnostics published for one file at most (errors first); an editor shows no more.
+const MAX_DIAGNOSTICS: usize = 1000;
+
 use phv_driver::{analyze, analyze_for_editor, find_root, Analysis};
 use phv_syntax::lexer::{lex_with_comments, Mode};
 use phv_syntax::token::Tok;
@@ -465,20 +468,36 @@ impl Server {
                 "severity": 1, "source": "phv", "message": m,
             }));
         }
+        // Per file: errors first, at most MAX_DIAGNOSTICS, and their positions found
+        // in one pass over the text (one long line of many warnings was quadratic).
+        let mut per_file: HashMap<u32, Vec<&phv_syntax::Diagnostic>> = HashMap::new();
         for d in &a.diags {
-            let file = a.sources.get(d.span.file);
+            per_file.entry(d.span.file).or_default().push(d);
+        }
+        for (fid, mut diags) in per_file {
+            let file = a.sources.get(fid);
             let Some(fpath) = &file.path else { continue };
-            let mut message = d.message.clone();
-            for n in &d.notes {
-                message.push_str("\nnote: ");
-                message.push_str(n);
+            diags.sort_by_key(|d| (d.severity != Severity::Error, d.span.start));
+            diags.truncate(MAX_DIAGNOSTICS);
+            let offsets = diags.iter().flat_map(|d| [d.span.start, d.span.end.max(d.span.start)]);
+            let at = features::positions_of(&file.text, offsets);
+            let pos = |o: u32| {
+                at.get(&o).map_or(json!({ "line": 0, "character": 0 }), |(l, c)| json!({ "line": l, "character": c }))
+            };
+            let list = by_file.entry(path_to_uri(fpath)).or_default();
+            for d in diags {
+                let mut message = d.message.clone();
+                for n in &d.notes {
+                    message.push_str("\nnote: ");
+                    message.push_str(n);
+                }
+                list.push(json!({
+                    "range": { "start": pos(d.span.start), "end": pos(d.span.end.max(d.span.start)) },
+                    "severity": if d.severity == Severity::Error { 1 } else { 2 },
+                    "source": "phv",
+                    "message": message,
+                }));
             }
-            by_file.entry(path_to_uri(fpath)).or_default().push(json!({
-                "range": { "start": position(file, d.span.start), "end": position(file, d.span.end.max(d.span.start)) },
-                "severity": if d.severity == Severity::Error { 1 } else { 2 },
-                "source": "phv",
-                "message": message,
-            }));
         }
         let previous = self.reported.remove(path).unwrap_or_default();
         for uri in previous {
@@ -1177,6 +1196,21 @@ mod tests {
         let hints = server.inlay_hints(&path, &all);
         let labels: Vec<&str> = hints.as_array().unwrap().iter().map(|h| h["label"].as_str().unwrap()).collect();
         assert_eq!(labels, ["Shape "], "{hints}"); // `$n` already has its type
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    /// Files over 8 MB are not read for workspace symbols (the v0.9.0 audit read
+    /// a 2 GB file of NUL bytes into memory).
+    #[test]
+    fn workspace_symbols_skip_huge_files() {
+        let p = Project::new("huge");
+        let mut big = String::from("export function hidden(): int { return 1; }\n// ");
+        big.push_str(&"x".repeat(9 << 20));
+        std::fs::write(p.dir.join("lib/big.phv"), big).unwrap();
+        let (server, _, _, _) = p.open("page.phv", "<?phv\n|");
+        let found = server.workspace_symbols("");
+        let names: Vec<&str> = found.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"make") && !names.contains(&"hidden"), "{names:?}");
         let _ = std::fs::remove_dir_all(&p.dir);
     }
 }
