@@ -1921,7 +1921,7 @@ Planned, in this order. Each release is audited before it is published, as befor
   and inlay types in `phv lsp`, `phv new`, `phv serve --watch`, and `phv test` with hooks, filters, JSON and JUnit
   reports and coverage, `phv doc` and a reference of the standard library, a debugger (`phv dap`), `phv run
   --profile`, a tutorial, and builds for Linux on ARM, static Linux builds and a Docker image
-  (`ghcr.io/miyagawayuu/phv`) from this release on (done); still to come: Homebrew and Scoop.
+  (`ghcr.io/miyagawayuu/phv`), Homebrew and Scoop from this release on (done).
 - **1.0, speed and stability**: freeing reference cycles while a script runs, a JIT that covers more code, HTTP/2,
   TLS and a WebSocket server, a `Set` type, and a stable language specification.
 

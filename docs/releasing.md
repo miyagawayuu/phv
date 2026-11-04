@@ -76,6 +76,12 @@ against `SHA256SUMS`, and pushes `ghcr.io/miyagawayuu/phv:X.Y.Z` and `:latest` f
 already built and run from the same executables by the release workflow). Check that the run passed; the first
 time, make the package public in its settings on GitHub (packages start private).
 
+And `.github/workflows/package-managers.yml` writes the Homebrew formula and the Scoop manifest from the release's
+`SHA256SUMS` (`packaging/render.py`) and pushes them to `miyagawayuu/homebrew-phv` (`Formula/phv.rb`) and
+`miyagawayuu/scoop-phv` (`bucket/phv.json`). It uses `PACKAGE_REPOS_TOKEN` of the `package-managers` environment: a
+fine-grained token with read and write access to the contents of those two repositories only. Check afterwards that
+`brew install miyagawayuu/phv/phv` and `scoop install phv` install the new version.
+
 ## 6. After the release
 
 - Set `ARG PHV_VERSION` in `examples/demo/Dockerfile` to the new version, push it, and deploy the demo

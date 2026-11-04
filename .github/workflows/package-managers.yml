@@ -1,0 +1,77 @@
+name: Update Homebrew and Scoop
+
+# When a release is published, writes the Homebrew formula and the Scoop
+# manifest from its SHA256SUMS (packaging/render.py, from the released tag) and
+# pushes them to the tap (<owner>/homebrew-phv, Formula/phv.rb) and the bucket
+# (<owner>/scoop-phv, bucket/phv.json):
+#
+#   brew install miyagawayuu/phv/phv
+#   scoop bucket add phv https://github.com/miyagawayuu/scoop-phv && scoop install phv
+#
+# Pushing needs PACKAGE_REPOS_TOKEN, a fine-grained token that can write the
+# contents of those two repositories and nothing else, stored in the
+# `package-managers` environment. Only the gh and git CLIs are used.
+# Run it by hand with a tag to update them for an earlier release.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish to Homebrew and Scoop (e.g. v0.9.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    environment: package-managers
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+      - name: Write the formula and the manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::not a release tag: $TAG"; exit 1; }
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dl --pattern SHA256SUMS
+          python3 packaging/render.py "${TAG#v}" dl/SHA256SUMS out
+      - name: Push to the tap and the bucket
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGE_REPOS_TOKEN }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::PACKAGE_REPOS_TOKEN is not set in the package-managers environment (see docs/releasing.md)"
+            exit 1
+          fi
+          gh auth setup-git
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          owner="$GITHUB_REPOSITORY_OWNER"
+          publish() {
+            local repo=$1 src=$2 dest=$3
+            rm -rf "work/$repo"
+            git clone --depth 1 "https://github.com/$owner/$repo.git" "work/$repo"
+            mkdir -p "work/$repo/$(dirname "$dest")"
+            cp "$src" "work/$repo/$dest"
+            cd "work/$repo"
+            git add "$dest"
+            if git diff --cached --quiet; then
+              echo "$repo: already up to date"
+            else
+              git commit -m "phv $TAG"
+              git push origin HEAD
+            fi
+            cd - > /dev/null
+          }
+          publish homebrew-phv out/phv.rb Formula/phv.rb
+          publish scoop-phv out/phv.json bucket/phv.json

@@ -72,6 +72,12 @@ amd64 と arm64 の `ghcr.io/miyagawayuu/phv:X.Y.Z` と `:latest` をプッシ�
 ワークフローがすでにビルドして実行している)。実行が成功したことを確かめる。初回は、GitHub のパッケージの設定で公開に
 する(パッケージは最初は非公開)。
 
+さらに `.github/workflows/package-managers.yml` が、リリースの `SHA256SUMS` から Homebrew の Formula と Scoop の manifest を
+書き(`packaging/render.py`)、`miyagawayuu/homebrew-phv`(`Formula/phv.rb`)と `miyagawayuu/scoop-phv`(`bucket/phv.json`)
+にプッシュする。`package-managers` 環境の `PACKAGE_REPOS_TOKEN` を使う: その 2 つのリポジトリの contents の読み書きだけを
+許した fine-grained トークン。そのあと `brew install miyagawayuu/phv/phv` と `scoop install phv` で新しいバージョンが
+入ることを確かめる。
+
 ## 6. リリースの後
 
 - `examples/demo/Dockerfile` の `ARG PHV_VERSION` を新しいバージョンにしてプッシュし、デモをデプロイする
