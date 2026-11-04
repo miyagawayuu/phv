@@ -146,6 +146,42 @@ impl DirGuard {
         }
         imp::remove(self, name)
     }
+
+    /// Opens `name` for appending (created if missing).
+    pub fn open_append(&self, name: &OsStr) -> Result<File, FsError> {
+        use std::io::Seek;
+        let mut f = imp::open_file(self, name, true)?;
+        check_plain(&f)?;
+        f.seek(io::SeekFrom::End(0))?;
+        Ok(f)
+    }
+
+    /// Creates the directory `name` here; an existing directory is fine.
+    pub fn make_dir(&self, name: &OsStr) -> Result<(), FsError> {
+        match imp::make_dir(self, name) {
+            Err(FsError::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // It must be a real directory, not a link or a file of that name.
+                imp::open_subdir(&self.dir, &self.path, name).map(|_| ())
+            }
+            r => r,
+        }
+    }
+
+    /// The names of the files and directories here, sorted; links and other
+    /// entries are left out.
+    pub fn entries(&self) -> Result<Vec<String>, FsError> {
+        let mut names = imp::entries(self)?;
+        names.retain(|n| valid_name(n));
+        names.sort();
+        Ok(names)
+    }
+
+    /// Moves the plain file `name` to `to_name` in `to` (replacing a plain file there).
+    pub fn rename_to(&self, name: &OsStr, to: &DirGuard, to_name: &OsStr) -> Result<(), FsError> {
+        check_plain(&imp::open_file(self, name, false)?)?;
+        to.check_plain_or_missing(to_name)?;
+        imp::rename(self, name, to, to_name)
+    }
 }
 
 fn check_plain(f: &File) -> Result<(), FsError> {
@@ -304,6 +340,65 @@ mod imp {
 
     pub fn link_count(_: &File, meta: &std::fs::Metadata) -> Result<u64, FsError> {
         Ok(meta.nlink())
+    }
+
+    pub fn make_dir(g: &DirGuard, name: &OsStr) -> Result<(), FsError> {
+        let c = cstr(name)?;
+        // SAFETY: valid descriptor and NUL-terminated name; mkdirat creates exactly that entry.
+        if unsafe { libc::mkdirat(g.dir.as_raw_fd(), c.as_ptr(), 0o755) } != 0 {
+            return Err(FsError::Io(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// The names of the regular files and directories of the open directory
+    /// (read through its own descriptor, never by path).
+    pub fn entries(g: &DirGuard) -> Result<Vec<String>, FsError> {
+        // SAFETY: `dup` gives a descriptor that `fdopendir` then owns and `closedir` closes.
+        let fd = unsafe { libc::dup(g.dir.as_raw_fd()) };
+        if fd < 0 {
+            return Err(FsError::Io(io::Error::last_os_error()));
+        }
+        let dir = unsafe { libc::fdopendir(fd) };
+        if dir.is_null() {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(FsError::Io(e));
+        }
+        // From the start, whatever was read through the original descriptor.
+        unsafe { libc::rewinddir(dir) };
+        let mut names = Vec::new();
+        loop {
+            // SAFETY: `dir` is open; the entry stays valid until the next readdir.
+            let ent = unsafe { libc::readdir(dir) };
+            if ent.is_null() {
+                break;
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+            let bytes = name.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(bytes) else { continue };
+            // lstat-like: links are left out, never followed.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let r = unsafe { libc::fstatat(g.dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+            let kind = st.st_mode & libc::S_IFMT;
+            if r == 0 && (kind == libc::S_IFREG || kind == libc::S_IFDIR) {
+                names.push(text.to_string());
+            }
+        }
+        unsafe { libc::closedir(dir) };
+        Ok(names)
+    }
+
+    pub fn rename(from: &DirGuard, name: &OsStr, to: &DirGuard, to_name: &OsStr) -> Result<(), FsError> {
+        let (a, b) = (cstr(name)?, cstr(to_name)?);
+        // SAFETY: valid descriptors and names; renameat moves the entry itself and never follows links.
+        if unsafe { libc::renameat(from.dir.as_raw_fd(), a.as_ptr(), to.dir.as_raw_fd(), b.as_ptr()) } != 0 {
+            return Err(FsError::Io(io::Error::last_os_error()));
+        }
+        Ok(())
     }
 }
 
@@ -484,6 +579,33 @@ mod imp {
         check_real_name(&f, name)?;
         drop(f);
         Ok(std::fs::remove_file(g.path.join(name))?)
+    }
+
+    /// The directories on the way are held open without FILE_SHARE_DELETE, so
+    /// the path still names the checked directory.
+    pub fn make_dir(g: &DirGuard, name: &OsStr) -> Result<(), FsError> {
+        Ok(std::fs::create_dir(g.path.join(name))?)
+    }
+
+    pub fn entries(g: &DirGuard) -> Result<Vec<String>, FsError> {
+        let mut names = Vec::new();
+        for e in std::fs::read_dir(&g.path)?.flatten() {
+            let Ok(meta) = e.metadata() else { continue };
+            if meta.file_attributes() & ATTR_REPARSE_POINT != 0 {
+                continue;
+            }
+            if let (true, Some(n)) = (meta.is_file() || meta.is_dir(), e.file_name().to_str()) {
+                names.push(n.to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    pub fn rename(from: &DirGuard, name: &OsStr, to: &DirGuard, to_name: &OsStr) -> Result<(), FsError> {
+        let f = open_entry(from, name)?;
+        check_real_name(&f, name)?;
+        drop(f);
+        Ok(std::fs::rename(from.path.join(name), to.path.join(to_name))?)
     }
 
     pub fn link_count(f: &File, _: &std::fs::Metadata) -> Result<u64, FsError> {

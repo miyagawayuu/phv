@@ -491,3 +491,49 @@ fn mail_reaches_a_local_server() {
     assert!(data.contains("Subject: Your order") && data.contains("multipart/alternative"), "{data}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Directory and file functions stay inside `[permissions]` and refuse links.
+#[test]
+fn files_and_directories() {
+    let dir = std::env::temp_dir().join(format!("phv-files-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    std::fs::create_dir_all(dir.join("content")).unwrap();
+    std::fs::write(dir.join("content/a.txt"), "hello").unwrap();
+    std::fs::write(dir.join("phv.toml"), "[permissions]\nread = [\"content/\"]\nwrite = [\"data/\"]\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir.join("content"), dir.join("data/link")).unwrap();
+    let script = r#"<?phv
+mkdir("data/a/b");
+echo is_dir("data/a/b") ? "dir" : "no", " ", is_dir("data/none") ? "?" : "missing", "\n";
+file_put_contents("data/a/log.txt", "one\n");
+file_append("data/a/log.txt", "two\n");
+echo file_get_contents("data/a/log.txt")->trim()->split("\n")->join(","), " ", filesize("data/a/log.txt"), "\n";
+copy("content/a.txt", "data/copy.txt");
+rename("data/copy.txt", "data/a/moved.txt");
+echo file_exists("data/copy.txt") ? "?" : "moved", " ", file_get_contents("data/a/moved.txt"), "\n";
+echo scandir("data/a")->join(","), " ", filemtime("data/a/moved.txt") > 0 ? "time" : "?", "\n";
+echo scandir("data")->join(","), "\n";
+try {
+    mkdir("content/x");
+} catch (PermissionError $e) {
+    echo "content is read-only\n";
+}
+try {
+    copy("content/a.txt", "../outside.txt");
+} catch (PermissionError $e) {
+    echo "no ..\n";
+}
+"#;
+    std::fs::write(dir.join("files.phv"), script).unwrap();
+    let c = phv_driver::compile(&dir, &dir.join("files.phv")).unwrap_or_else(|e| panic!("{}", e.render(false)));
+    let host = phv_driver::load_config(&dir).unwrap().host;
+    let out = run(&c, RunOptions { html: false, limits: Default::default(), http: None, host: Some(host) });
+    assert!(out.error.is_none(), "{}\n{}", out.output, out.error.map(|e| e.render()).unwrap_or_default());
+    // The link in data/ is left out of the listing.
+    assert_eq!(
+        out.output,
+        "dir missing\none,two 8\nmoved hello\nb,log.txt,moved.txt time\na\ncontent is read-only\nno ..\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

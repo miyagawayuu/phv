@@ -14,7 +14,7 @@ use std::path::{Component, Path};
 // ----- dates ----------------------------------------------------------------
 
 /// PHP `date()` formatting.
-fn format_date<Tz: TimeZone>(fmt: &str, t: &DateTime<Tz>) -> String
+pub(crate) fn format_date<Tz: TimeZone>(fmt: &str, t: &DateTime<Tz>) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
@@ -93,6 +93,8 @@ where
             'P' => write!(out, "{}", offset(true)),
             'O' => write!(out, "{}", offset(false)),
             'Z' => write!(out, "{offset_secs}"),
+            // The zone's abbreviation (JST, CET) for a named zone; the offset otherwise.
+            'T' => write!(out, "{}", t.offset()),
             'U' => write!(out, "{}", t.timestamp()),
             'c' => write!(out, "{}", t.format("%Y-%m-%dT%H:%M:%S").to_string() + &offset(true)),
             'r' => write!(out, "{}", t.format("%a, %d %b %Y %H:%M:%S ").to_string() + &offset(false)),
@@ -216,6 +218,24 @@ fn permission_error(vm: &Vm, msg: String) -> VmError {
 /// and refusing `..` and absolute paths. The directory that holds the file is
 /// opened without following links (see `safefs`) and returned with the file
 /// name; the guard keeps it pinned while the file is used.
+/// A guard on the directory `rel` itself (inside an allowed directory, no links on the way).
+fn resolve_dir(vm: &Vm, rel: &str, write: bool) -> Result<DirGuard, VmError> {
+    let trimmed = rel.trim_end_matches(['/', '\\']);
+    // The guard of a name inside it is the directory's own.
+    resolve_path(vm, &format!("{trimmed}/x"), write).map(|(dir, _)| dir)
+}
+
+/// How many components of `rel` the allowed directory it is in has (0 if none).
+fn allowed_depth(vm: &Vm, rel: &str, write: bool) -> usize {
+    let perms = &vm.host.permissions;
+    let p = Path::new(rel);
+    let allowed: Vec<&String> =
+        if write { perms.write.iter().collect() } else { perms.read.iter().chain(perms.write.iter()).collect() };
+    allowed.iter().find(|d| p.starts_with(Path::new(d.trim_end_matches('/')))).map_or(0, |d| {
+        Path::new(d.trim_end_matches('/')).components().filter(|c| matches!(c, Component::Normal(_))).count()
+    })
+}
+
 pub fn resolve_path(vm: &Vm, rel: &str, write: bool) -> Result<(DirGuard, OsString), VmError> {
     let p = Path::new(rel);
     // `Path` drops a trailing `/`, `/.` or `\`, so `x.phv/` would name `x.phv`.
@@ -467,6 +487,73 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             dir.remove(&name).map_err(|e| match e {
                 FsError::Io(e) => io_error(vm, "cannot delete", &rel, e),
                 e => fs_error(vm, &rel, "", e),
+            })?;
+            Ok(Value::Null)
+        },
+        "file_append" => |vm, a| {
+            let rel = s(&a[0]).to_string();
+            let (dir, name) = resolve_path(vm, &rel, true)?;
+            let mut f = dir.open_append(&name).map_err(|e| fs_error(vm, &rel, "", e))?;
+            f.write_all(s(&a[1]).as_bytes()).map_err(|e| io_error(vm, "cannot write", &rel, e))?;
+            Ok(Value::Null)
+        },
+        "filesize" => |vm, a| {
+            let rel = s(&a[0]).to_string();
+            let (dir, name) = resolve_path(vm, &rel, false)?;
+            let f = dir.open(&name, false).map_err(|e| fs_error(vm, &rel, "", e))?;
+            let len = f.metadata().map_err(|e| io_error(vm, "cannot read", &rel, e))?.len();
+            Ok(Value::Int(len.min(i64::MAX as u64) as i64))
+        },
+        "filemtime" => |vm, a| {
+            let rel = s(&a[0]).to_string();
+            let (dir, name) = resolve_path(vm, &rel, false)?;
+            let f = dir.open(&name, false).map_err(|e| fs_error(vm, &rel, "", e))?;
+            let t = f.metadata().and_then(|m| m.modified()).map_err(|e| io_error(vm, "cannot read", &rel, e))?;
+            Ok(Value::Int(t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)))
+        },
+        "is_dir" => |vm, a| {
+            let rel = s(&a[0]).to_string();
+            // A directory is one a guard can be opened on (no links on the way).
+            Ok(Value::Bool(resolve_dir(vm, &rel, false).is_ok()))
+        },
+        "scandir" => |vm, a| {
+            let rel = s(&a[0]).to_string();
+            let dir = resolve_dir(vm, &rel, false)?;
+            let names = dir.entries().map_err(|e| fs_error(vm, &rel, "", e))?;
+            Ok(Value::list(names.into_iter().map(Value::str).collect()))
+        },
+        "mkdir" => |vm, a| {
+            let rel = s(&a[0]).trim_end_matches(['/', '\\']).to_string();
+            // Each missing directory below the allowed one is created in turn (like `mkdir -p`).
+            let parts: Vec<&str> = rel.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").collect();
+            let allowed = allowed_depth(vm, &rel, true);
+            for i in (allowed + 1)..=parts.len() {
+                let prefix = parts[..i].join("/");
+                let (dir, name) = resolve_path(vm, &prefix, true)?;
+                dir.make_dir(&name).map_err(|e| fs_error(vm, &prefix, "", e))?;
+            }
+            Ok(Value::Null)
+        },
+        "copy" => |vm, a| {
+            let (from, to) = (s(&a[0]).to_string(), s(&a[1]).to_string());
+            let (fdir, fname) = resolve_path(vm, &from, false)?;
+            let mut src = fdir.open(&fname, false).map_err(|e| fs_error(vm, &from, "", e))?;
+            let size = src.metadata().map(|m| m.len()).unwrap_or(0);
+            vm.reserve(size as usize)?;
+            let mut bytes = Vec::with_capacity(size as usize);
+            src.read_to_end(&mut bytes).map_err(|e| io_error(vm, "cannot read", &from, e))?;
+            let (tdir, tname) = resolve_path(vm, &to, true)?;
+            let mut dst = tdir.open(&tname, true).map_err(|e| fs_error(vm, &to, "", e))?;
+            dst.write_all(&bytes).map_err(|e| io_error(vm, "cannot write", &to, e))?;
+            Ok(Value::Null)
+        },
+        "rename" => |vm, a| {
+            let (from, to) = (s(&a[0]).to_string(), s(&a[1]).to_string());
+            let (fdir, fname) = resolve_path(vm, &from, true)?;
+            let (tdir, tname) = resolve_path(vm, &to, true)?;
+            fdir.rename_to(&fname, &tdir, &tname).map_err(|e| match e {
+                FsError::Io(e) => io_error(vm, "cannot rename", &from, e),
+                e => fs_error(vm, &from, "", e),
             })?;
             Ok(Value::Null)
         },

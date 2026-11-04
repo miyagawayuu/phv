@@ -164,6 +164,10 @@ pub struct Host {
     pub site: Option<std::sync::Arc<dyn Site>>,
     /// Mail servers scripts may send through, by name (`[mail]` in phv.toml).
     pub mail: std::collections::BTreeMap<String, MailSpec>,
+    /// A script run with `phv run`: it may read its arguments and standard input.
+    pub cli: bool,
+    /// The arguments after the script's name (`phv run script.phv a b`).
+    pub args: Vec<String>,
 }
 
 /// A mail server named in phv.toml (`[mail.<name>]`). The URL holds credentials

@@ -1,0 +1,26 @@
+error: `json_decode_as()` needs to know the type to decode into
+  --> err_json_as.phv:14:6
+   |
+14 | $a = json_decode_as("1");
+   |      ^^^^^^^^^^^^^^^^^^^
+   = note: declare it, e.g. `User $u = json_decode_as($text);`, or return it from a function with that return type
+
+error: `json_decode_as()` cannot decode into `Guarded`: the constructor of `Guarded` runs code, which decoding would skip (a class decoded from JSON may only promote its constructor's parameters)
+  --> err_json_as.phv:15:14
+   |
+15 | Guarded $g = json_decode_as("{}");
+   |              ^^^^^^^^^^^^^^^^^^^^
+
+error: `json_decode_as()` cannot decode into `Secret`: `Secret` has the non-public property `$key`; JSON fills public properties only
+  --> err_json_as.phv:16:13
+   |
+16 | Secret $s = json_decode_as("{}");
+   |             ^^^^^^^^^^^^^^^^^^^^
+
+error: `json_decode_as()` cannot decode into `map<string, fn(int): int>`: `fn(int): int` has no JSON form
+  --> err_json_as.phv:17:32
+   |
+17 | map<string, fn(int): int> $f = json_decode_as("{}");
+   |                                ^^^^^^^^^^^^^^^^^^^^
+
+4 errors found

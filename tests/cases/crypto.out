@@ -1,0 +1,9 @@
+fresh each time card ending 4242
+wrong key changed junk
+user:7 wrong key changed
+reset:7
+3 "7" true
+expired not yet wrong key
+encrypt(): the key must be at least 32 bytes; make one with random_token() and keep it in an environment variable
+encrypt(): the key must be at least 32 bytes; make one with random_token() and keep it in an environment variable
+sign_token(): the lifetime must be a positive number of seconds

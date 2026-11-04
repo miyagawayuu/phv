@@ -758,6 +758,12 @@ impl<'a> Checker<'a> {
                 let hf = self.coerce(hf, &ty);
                 mk(HExprKind::Ternary(Box::new(hc), Box::new(ht), Box::new(hf)), ty)
             }
+            ExprKind::Call { callee, args }
+                if matches!(&callee.kind, ExprKind::Name(n) if n == "json_decode_as")
+                    && self.lookup_func("json_decode_as").is_none() =>
+            {
+                self.json_decode_as(args, expect, span)
+            }
             ExprKind::Call { callee, args } => self.call(callee, args, span),
             ExprKind::MethodCall { obj, name, name_span, args, nullsafe } => {
                 let ho = self.expr(obj, None);
@@ -1511,6 +1517,133 @@ impl<'a> Checker<'a> {
             pieces = next;
         }
         pieces.pop().unwrap()
+    }
+
+    /// `User $u = json_decode_as($text);`: the type the value is expected to have
+    /// is described for the runtime, which checks the JSON against it and builds
+    /// the value (objects included).
+    fn json_decode_as(&mut self, args: &[Arg], expect: Option<&Type>, span: Span) -> HExpr {
+        let [Arg { name: None, value }] = args else {
+            self.error("`json_decode_as()` takes the JSON text", span);
+            for a in args {
+                self.expr(&a.value, None);
+            }
+            return err(span);
+        };
+        let text = self.expr_to(value, &Type::Str);
+        let Some(ty) = expect.filter(|t| !t.has_unknown() && !matches!(t, Type::Any | Type::Error)).cloned() else {
+            self.error("`json_decode_as()` needs to know the type to decode into", span)
+                .add_note("declare it, e.g. `User $u = json_decode_as($text);`, or return it from a function with that return type");
+            return err(span);
+        };
+        let mut defs: Vec<(ClassId, String)> = Vec::new();
+        let mut defaults: Vec<HConst> = Vec::new();
+        let shape = match self.json_shape(&ty, &mut defs, &mut defaults) {
+            Ok(s) => s,
+            Err(msg) => {
+                self.error(format!("`json_decode_as()` cannot decode into `{}`: {msg}", self.tn(&ty)), span);
+                return err(span);
+            }
+        };
+        let mut desc = shape;
+        for (cid, fields) in defs {
+            desc.push_str(&format!("\nc{cid} {fields}"));
+        }
+        let d = hconst(HConst::Str(desc.as_str().into()), Type::Str, span);
+        let list_ty = Type::List(Box::new(Type::Any));
+        let defaults = defaults.into_iter().map(|c| hconst(c, Type::Any, span)).collect();
+        let defaults = HExpr { kind: HExprKind::List(defaults), ty: list_ty, span };
+        HExpr { kind: HExprKind::CallBuiltin("__json_as".into(), vec![text, d, defaults]), ty, span }
+    }
+
+    /// The description of a type for `__json_as`: `i f s b a`, `?X`, `lX`,
+    /// `msX` / `miX` (map with string or int keys), `eN` / `nN` (enum N, by
+    /// value or, for a pure enum, by case name), `cN` (class N, whose public
+    /// properties are listed in `defs` as `name:X`, `name!:X` when required, or
+    /// `name=K:X` when a constructor parameter gives the default `defaults[K]`).
+    fn json_shape(
+        &self,
+        t: &Type,
+        defs: &mut Vec<(ClassId, String)>,
+        defaults: &mut Vec<HConst>,
+    ) -> Result<String, String> {
+        Ok(match t {
+            Type::Int => "i".into(),
+            Type::Float => "f".into(),
+            Type::Str => "s".into(),
+            Type::Bool => "b".into(),
+            Type::Any => "a".into(),
+            t if t.is_nullable() && !matches!(t.without_null(), Type::Union(_)) => {
+                format!("?{}", self.json_shape(&t.without_null(), defs, defaults)?)
+            }
+            Type::List(e) => format!("l{}", self.json_shape(e, defs, defaults)?),
+            Type::Map(k, v) => {
+                let key = if **k == Type::Int { "i" } else { "s" };
+                format!("m{key}{}", self.json_shape(v, defs, defaults)?)
+            }
+            Type::Class(cid, args) => {
+                let ci = &self.classes[*cid as usize];
+                let name = &self.class_names[*cid as usize];
+                if ci.kind == ClassKind::Enum {
+                    return Ok(format!("{}{cid}", if ci.backing.is_some() { "e" } else { "n" }));
+                }
+                if ci.kind != ClassKind::Class {
+                    return Err(format!("`{name}` is not a plain class (interfaces, abstract classes and enums cannot be built from JSON)"));
+                }
+                if !args.is_empty() {
+                    return Err(format!("`{name}` is generic"));
+                }
+                // Decoding fills the properties without calling the constructor,
+                // so it must not skip a check the constructor makes.
+                if ci.ctor.is_some() {
+                    let (vis, owner) = ci.ctor_access;
+                    if vis != Visibility::Public {
+                        return Err(format!("`{name}` has a non-public constructor"));
+                    }
+                    let runs_code = self.classes[owner as usize]
+                        .decl
+                        .and_then(|d| d.methods.iter().find(|m| m.name == "__construct"))
+                        .is_some_and(|m| !m.body.is_empty());
+                    if runs_code {
+                        return Err(format!(
+                            "the constructor of `{}` runs code, which decoding would skip (a class decoded from JSON may only promote its constructor's parameters)",
+                            self.class_names[owner as usize]
+                        ));
+                    }
+                }
+                if !defs.iter().any(|(c, _)| c == cid) {
+                    defs.push((*cid, String::new()));
+                    let mut fields = Vec::new();
+                    for f in ci.fields.clone() {
+                        if f.vis != Visibility::Public {
+                            return Err(format!(
+                                "`{name}` has the non-public property `${}`; JSON fills public properties only",
+                                f.name
+                            ));
+                        }
+                        let param_default = ci
+                            .ctor
+                            .and_then(|fid| self.funcs[fid as usize].params.iter().find(|p| p.name == f.name))
+                            .filter(|p| p.promote.is_some())
+                            .and_then(|p| p.default.clone());
+                        let mark = match param_default {
+                            Some(c) if f.required => {
+                                defaults.push(c);
+                                format!("={}", defaults.len() - 1)
+                            }
+                            _ if f.required => "!".into(),
+                            _ => String::new(),
+                        };
+                        fields.push(format!("{}{mark}:{}", f.name, self.json_shape(&f.ty, defs, defaults)?));
+                    }
+                    if let Some(d) = defs.iter_mut().find(|(c, _)| c == cid) {
+                        d.1 = fields.join(",");
+                    }
+                }
+                format!("c{cid}")
+            }
+            other => return Err(format!("`{}` has no JSON form", self.tn(other))),
+        })
     }
 
     /// `format("{} has {:.2} points", $name, $score)`: the format string is read

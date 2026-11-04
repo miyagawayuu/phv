@@ -1,0 +1,36 @@
+<?phv
+// encrypt/decrypt, signed tokens and JWT (HS256).
+$key = "0123456789abcdef0123456789abcdef";
+$other = random_token();
+
+$box = encrypt("card ending 4242", $key);
+echo $box != encrypt("card ending 4242", $key) ? "fresh each time" : "?", " ", decrypt($box, $key) ?? "?", "\n";
+echo decrypt($box, $other) ?? "wrong key", " ", decrypt($box . "A", $key) ?? "changed", " ", decrypt("junk", $key) ?? "junk", "\n";
+
+$t = sign_token("user:7", $key);
+echo verify_token($t, $key) ?? "?", " ", verify_token($t, $other) ?? "wrong key", " ", verify_token("x" . $t, $key) ?? "changed", "\n";
+$soon = sign_token("reset:7", $key, 3600);
+echo verify_token($soon, $key) ?? "expired", "\n";
+
+$jwt = jwt_encode(["sub" => "7", "admin" => true, "exp" => time() + 60], $key);
+echo count($jwt->split(".")), " ";
+$claims = jwt_decode($jwt, $key);
+if ($claims != null) {
+    echo json_encode($claims["sub"]), " ", json_encode($claims["admin"]), "\n";
+}
+echo jwt_decode(jwt_encode(["exp" => time() - 1], $key), $key) == null ? "expired" : "?", " ";
+echo jwt_decode(jwt_encode(["nbf" => time() + 60], $key), $key) == null ? "not yet" : "?", " ";
+echo jwt_decode($jwt, $other) == null ? "wrong key" : "?", "\n";
+
+foreach (["short", ""] as $k) {
+    try {
+        encrypt("x", $k);
+    } catch (ValueError $e) {
+        echo $e->getMessage(), "\n";
+    }
+}
+try {
+    sign_token("x", $key, 0);
+} catch (ValueError $e) {
+    echo $e->getMessage(), "\n";
+}

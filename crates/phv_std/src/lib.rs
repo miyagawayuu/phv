@@ -11,8 +11,10 @@ use std::rc::Rc;
 
 mod asyncio;
 mod collections;
+mod crypt;
 mod db;
 mod httpclient;
+mod jsonas;
 mod mail;
 pub mod migrate;
 mod netdb;
@@ -24,6 +26,8 @@ mod re;
 mod redisclient;
 pub mod safefs;
 mod sys;
+mod textio;
+mod timez;
 mod twofactor;
 mod web;
 mod websocket;
@@ -53,6 +57,7 @@ pub fn std_module(name: &str) -> Option<&'static str> {
         "std.testing" => Some(include_str!("phv/testing.phv")),
         "std.mail" => Some(include_str!("phv/mail.phv")),
         "std.regex" => Some(include_str!("phv/regex.phv")),
+        "std.time" => Some(include_str!("phv/time.phv")),
         _ => None,
     }
 }
@@ -243,6 +248,14 @@ fn json(vm: &Vm, v: &Value, out: &mut String, depth: usize) -> Result<(), VmErro
         Value::Object(o) => {
             let o = o.borrow();
             let class = &vm.prog.classes[o.class as usize];
+            // An enum case is its value (`"admin"`), or its name for a pure enum,
+            // as `json_decode_as()` reads it back.
+            if !class.cases.is_empty() {
+                let field = ["value", "name"].iter().find_map(|n| class.fields.iter().position(|f| f.name == *n));
+                if let Some(x) = field.and_then(|i| o.fields.get(i)) {
+                    return json(vm, x, out, depth + 1);
+                }
+            }
             out.push('{');
             let mut first = true;
             for (f, x) in class.fields.iter().zip(o.fields.iter()) {
@@ -262,6 +275,61 @@ fn json(vm: &Vm, v: &Value, out: &mut String, depth: usize) -> Result<(), VmErro
         Value::Closure(_) => return Err(vm.throw("ValueError", "json_encode(): closures cannot be encoded")),
     }
     Ok(())
+}
+
+/// Compact JSON (as `json()` writes it) laid out on lines, indented by two
+/// spaces; `[]` and `{}` stay as they are.
+fn pretty_json(compact: &str) -> String {
+    let mut out = String::with_capacity(compact.len() * 2);
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut chars = compact.chars().peekable();
+    let newline = |out: &mut String, depth: usize| {
+        out.push('\n');
+        for _ in 0..depth {
+            out.push_str("  ");
+        }
+    };
+    while let Some(c) = chars.next() {
+        if in_str {
+            out.push(c);
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                out.push(c);
+            }
+            '[' | '{' => {
+                out.push(c);
+                if matches!(chars.peek(), Some(']' | '}')) {
+                    out.push(chars.next().unwrap_or(' '));
+                } else {
+                    depth += 1;
+                    newline(&mut out, depth);
+                }
+            }
+            ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                newline(&mut out, depth);
+                out.push(c);
+            }
+            ',' => {
+                out.push(',');
+                newline(&mut out, depth);
+            }
+            ':' => out.push_str(": "),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn dump_value(vm: &Vm, v: &Value, out: &mut String, indent: usize) -> Result<(), VmError> {
@@ -521,6 +589,10 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         .or_else(|| collections::lookup(name))
         .or_else(|| numbers::lookup(name))
         .or_else(|| re::lookup(name))
+        .or_else(|| textio::lookup(name))
+        .or_else(|| timez::lookup(name))
+        .or_else(|| jsonas::lookup(name))
+        .or_else(|| crypt::lookup(name))
 }
 
 fn core_lookup(name: &str) -> Option<BuiltinFn> {
@@ -615,6 +687,11 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             let mut out = String::new();
             json(vm, &a[0], &mut out, 0)?;
             Ok(Value::str(out))
+        },
+        "json_encode_pretty" => |vm, a| {
+            let mut out = String::new();
+            json(vm, &a[0], &mut out, 0)?;
+            Ok(Value::str(pretty_json(&out)))
         },
         "dump" => |vm, a| {
             let mut out = String::new();

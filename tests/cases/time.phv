@@ -1,0 +1,32 @@
+<?phv
+// std.time: instants in time zones, and durations.
+import std.time.{DateTime, Duration};
+
+$m = DateTime::of(2026, 11, 5, 10, 0, 0, "Asia/Tokyo");
+echo $m->timestamp, " ", $m->toIso(), " ", $m->inZone("Europe/Berlin")->format("Y-m-d H:i"), "\n";
+echo $m->weekday(), " ", $m->offset(), " ", $m->format("D, d M Y"), "\n";
+echo $m->plus(Duration::hours(36))->format("Y-m-d H:i"), " ", $m->addMonths(3)->format("Y-m-d"), "\n";
+echo DateTime::of(2026, 1, 31)->addMonths(1)->format("Y-m-d"), " ", DateTime::of(2024, 2, 29)->addYears(1)->format("Y-m-d"), "\n";
+
+// Across the change of clocks in New York (2026-03-08): a calendar day keeps the local time.
+$ny = DateTime::of(2026, 3, 7, 12, 0, 0, "America/New_York");
+echo $ny->addDays(1)->format("H:i T"), " ", $ny->plus(Duration::days(1))->format("H:i T"), "\n";
+echo $ny->addDays(1)->diff($ny)->totalHours(), " ", Duration::seconds(93784)->toText(), " ", Duration::minutes(-90)->toText(), "\n";
+
+$p = DateTime::parse("2026-11-05T01:00:00Z", "Asia/Tokyo");
+if ($p != null) {
+    echo $p->format("Y-m-d H:i"), " ", $p->equals($m) ? "same" : "different", " ", $p->isBefore($m) ? "before" : "after", "\n";
+}
+echo DateTime::parse("2026-11-05", "UTC")?->startOfDay()?->toIso() ?? "?", " ", DateTime::parse("soon") == null ? "unparsed" : "?", "\n";
+echo $m->addDays(-5)->format("m/d"), " ", $m->startOfDay()->format("H:i"), "\n";
+
+try {
+    DateTime::of(2026, 2, 30);
+} catch (ValueError) {
+    echo "no Feb 30\n";
+}
+try {
+    DateTime::now("Mars/Olympus");
+} catch (ValueError) {
+    echo "unknown zone\n";
+}

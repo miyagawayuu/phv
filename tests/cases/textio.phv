@@ -1,0 +1,19 @@
+<?phv
+// CSV, URLs and logging.
+$rows = csv_parse("name,note\r\nAnn,\"says \"\"hi\"\", then leaves\"\nBob,\"two\nlines\"\n");
+echo $rows->len(), " ", $rows[1][1], " ", $rows[2][1]->replace("\n", "|"), "\n";
+echo csv_encode([["a", "b,c"], ["q\"uote", " pad"]])->replace("\r\n", "/"), "\n";
+$u = parse_url("https://ann@example.com:8443/a/b?x=1&y=two#top");
+echo $u["scheme"], " ", $u["host"], " ", $u["port"], " ", $u["user"], " ", $u["path"], " ", $u["query"], " ", $u["fragment"], "\n";
+echo parse_url("https://example.com")->has("port") ? "?" : "no port", " ", parse_query("?a=1&b=x%20y")["b"], "\n";
+try {
+    parse_url("not a url");
+} catch (ValueError) {
+    echo "invalid url\n";
+}
+log_info("started", ["user" => "ann", "n" => 3]);
+try {
+    argv();
+} catch (RuntimeException $e) {
+    echo $e->getMessage(), "\n";
+}

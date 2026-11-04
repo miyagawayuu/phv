@@ -1,0 +1,69 @@
+<?phv
+// json_decode_as(): JSON checked against the type it is decoded into.
+enum Role: string {
+    case Admin = "admin";
+    case Member = "member";
+}
+
+enum Color {
+    case Red;
+    case Blue;
+}
+
+class Address {
+    public string $city = "unknown";
+    public ?string $zip = null;
+}
+
+class User {
+    public function __construct(
+        public int $id,
+        public string $name,
+        public Role $role,
+        public float $score,
+        public list<string> $tags = [],
+        public ?Address $address = null,
+        public map<string, int> $counts = [],
+    ) {}
+}
+
+$text = '{"id": 7, "name": "Ann", "role": "admin", "score": 9, "tags": ["a", "b"],
+          "address": {"zip": "100-0001"}, "counts": {"x": 1}, "extra": true}';
+User $u = json_decode_as($text);
+echo $u->id, " ", $u->name, " ", $u->role->name, " ", $u->score, " ", $u->tags->join(","), "\n";
+echo $u->address?->city ?? "-", " ", $u->address?->zip ?? "-", " ", $u->counts["x"], "\n";
+
+list<User> $users = json_decode_as('[{"id": 1, "name": "A", "role": "member", "score": 1.5}]');
+echo count($users), " ", $users[0]->role == Role::Member ? "member" : "?", " ", $users[0]->address == null ? "no address" : "?", "\n";
+
+map<int, Color> $colors = json_decode_as('{"1": "Red", "2": "Blue"}');
+foreach ($colors as $k => $c) {
+    echo $k, "=", $c->name, " ";
+}
+echo "\n";
+
+function load(string $s): ?list<int> {
+    return json_decode_as($s);
+}
+echo load("null") == null ? "null" : "?", " ", load("[1, 2, 3]")?->join("+") ?? "", "\n";
+
+foreach ([
+    '{"id": "7", "name": "A", "role": "admin", "score": 1}',
+    '{"id": 7, "role": "admin", "score": 1}',
+    '{"id": 7, "name": "A", "role": "owner", "score": 1}',
+    '{"id": 7, "name": "A", "role": "admin", "score": 1, "tags": ["x", 2]}',
+    '[1, 2',
+] as $bad) {
+    try {
+        User $x = json_decode_as($bad);
+        echo $x->id, "\n";
+    } catch (ValueError $e) {
+        echo $e->getMessage(), "\n";
+    }
+}
+
+// Enum cases are written as their value (or name), so they read back.
+echo json_encode([Role::Admin, Color::Blue]), "\n";
+list<int> $none = [];
+map<string, any> $doc = ["user" => $u->name, "tags" => $u->tags, "none" => $none, "role" => $u->role, "q" => "a,b:\"c\""];
+echo json_encode_pretty($doc), "\n";

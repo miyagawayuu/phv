@@ -621,7 +621,7 @@ import lib.legacy.render as render_legacy;
   ディレクトリ)からの `a/b.phv` を読み込む。
 - import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`const`、`type`、`import`)
   しか書けない。モジュールを読み込んでも副作用は起きない。
-- `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`、`std.async`、`std.validate`、`std.mail`、`std.testing`、`std.regex`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
+- `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`、`std.async`、`std.validate`、`std.mail`、`std.testing`、`std.regex`、`std.time`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
 - 読み込めるのはプロジェクトとパッケージのディレクトリの中のファイルだけ(シンボリックリンクで外に出ることはできない)。
 
 ## 12. テンプレート
@@ -958,6 +958,41 @@ if ($data is map) {
 response()->json(["ok" => true]);
 ```
 
+#### 型付きの JSON
+
+```phv
+enum Status: string {
+    case Open = "open";
+    case Closed = "closed";
+}
+
+class Item {
+    public function __construct(public string $name, public int $qty = 1, public ?string $note = null) {}
+}
+
+class Order {
+    public function __construct(public int $id, public Status $status, public list<Item> $items) {}
+}
+
+Order $order = json_decode_as(request()->text());   // JSON が Order に合わなければ ValueError
+echo json_encode_pretty($order);
+```
+
+`json_decode_as($text)` は、値が求められている型(宣言した変数、引数、戻り値の型。どれもなければコンパイルエラー)に
+デコードし、JSON がその型に合うかを検査する。使える型は `int`、`float`(整数も受け付ける)、`string`、`bool`、`any`、
+`?T`、`list<T>`、`map<string, T>`、`map<int, T>`(キーは 10 進の整数)、enum(backed enum は値で、pure enum はケース名で)、
+クラス。
+
+- クラスはコンストラクタを呼ばずに JSON のオブジェクトから作る。そのため、ジェネリックでも抽象でもなく、プロパティが
+  すべて public で、コンストラクタがあれば public で引数をプロパティにするだけのクラスに限る。中に処理のある
+  コンストラクタ(引数を検査しているかもしれない)は飛ばされてしまうので、そのようなクラスはコンパイルエラー。
+- JSON にないプロパティは、その既定値、コンストラクタ引数の既定値、nullable なら `null` になる。どれでもなければエラー。
+  クラスにないキーは無視する。
+- 合わないときの `ValueError` は場所を示す: `json_decode_as(): expected an integer, found a string at $.items[2].qty`。
+
+`json_encode` は enum のケースを値(pure enum ではケース名)として書くので、書いたものを `json_decode_as` で読み戻せる。
+`json_encode_pretty($v)` は `json_encode` の結果を行に分け、2 スペースで字下げしたもの。
+
 ### データベース(std.db)
 
 ```phv
@@ -1213,6 +1248,39 @@ Regex::escape("1+1=2?");                                   // その文字列そ
 パターンは `ValueError`。パターンは 64 KB まで、コンパイル後は 4 MB までで、スレッドごとに最近使った 64 個をコンパイル済みの
 まま保持する。`match()` ではグループ 0 がマッチ全体で、関わらなかったグループは `""`。
 
+### 日付と時刻(std.time)
+
+```phv
+import std.time.{DateTime, Duration};
+
+$meeting = DateTime::of(2026, 11, 5, 10, 0, 0, "Asia/Tokyo");
+$meeting->toIso();                                    // "2026-11-05T10:00:00+09:00"
+$meeting->inZone("Europe/Berlin")->format("H:i T");   // "02:00 CET"
+$meeting->plus(Duration::hours(36));                  // 正確な時間の長さ
+$meeting->addDays(1)->addMonths(1);                   // 暦の上で進める(現地時刻はそのまま)
+$meeting->diff(DateTime::now())->totalHours();
+DateTime::parse("2026-11-05 09:30", "Asia/Tokyo");    // ?DateTime
+```
+
+`DateTime` は、ある瞬間(`timestamp`、1970-01-01 UTC からの秒数)を IANA のタイムゾーン(`zone`。`"Asia/Tokyo"`、
+`"America/New_York"`、`"UTC"` など)で見たもの。値は変わらず、メソッドは新しい値を返す。
+
+| メンバー | 説明 |
+|---|---|
+| `DateTime::now($zone = "UTC")`、`DateTime::fromTimestamp($ts, $zone = "UTC")` | |
+| `DateTime::of($y, $m, $d, $h = 0, $i = 0, $s = 0, $zone = "UTC")` | 存在しない日付(2 月 30 日)は `ValueError` |
+| `DateTime::parse($text, $zone = "UTC"): ?DateTime` | `2026-11-05`、`2026-11-05 10:00[:30]`(`$zone` の現地時刻)、またはオフセットか `Z` 付きの RFC 3339 |
+| `year()`、`month()`、`day()`、`hour()`、`minute()`、`second()`、`weekday()`(1 = 月曜)、`offset()` | そのタイムゾーンでの値。`offset()` は UTC から東向きの秒数 |
+| `format($f)`、`toIso()` | `date()` と同じ文字。`T` はタイムゾーンの略称(`JST`、`EDT`) |
+| `inZone($zone)`、`plus(Duration)`、`minus(Duration)`、`startOfDay()` | |
+| `addDays($n)`、`addMonths($n)`、`addYears($n)` | 現地時刻を保ったまま暦の上で進める。`addMonths` は日を保ち、短い月では月末にする(1 月 31 日 + 1 か月 = 2 月 28 日) |
+| `diff($other): Duration`、`isBefore($other)`、`isAfter($other)`、`equals($other)` | 瞬間として比べる(タイムゾーンは問わない) |
+| `Duration::seconds/minutes/hours/days/weeks($n)`、`plus`、`minus`、`totalMinutes()`、`totalHours()`、`totalDays()`、`toText()` | `toText()` は `1d 2h 3m 4s` のような形 |
+
+- 時計を戻すときに 2 回ある現地時刻は早いほう、時計を進めるときに存在しない現地時刻は飛ばした後(02:30 は 03:30)になる。
+- `plus(Duration::days(1))` はちょうど 24 時間後、`addDays(1)` は翌日の同じ現地時刻で、時計の切り替えをまたぐと両者は異なる。
+- 不明なタイムゾーンは `ValueError`。
+
 ### 非同期 I/O(std.async)
 
 ```phv
@@ -1253,7 +1321,7 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
 
 | 関数 | 説明 |
 |---|---|
-| `date($format, ?$ts)` / `gmdate(...)` | PHP と同じ書式(`Y-m-d H:i:s`、`D, d M Y`、`c`、`U` など)。`date` はサーバーのローカル時刻 |
+| `date($format, ?$ts)` / `gmdate(...)` | PHP と同じ書式(`Y-m-d H:i:s`、`D, d M Y`、`c`、`U`、`T` など)。`date` はサーバーのローカル時刻。タイムゾーンは std.time を使う |
 | `mktime($h, $i, $s, $m, $d, $y)`, `strtotime($s): ?int`, `checkdate($m, $d, $y)` | `strtotime` は ISO 形式と `now`/`today`/`tomorrow`/`yesterday` |
 | `random_int($min, $max)`, `random_token($bytes = 32)` | OS の暗号論的乱数(`rand()` は暗号用途に使わない) |
 | `password_hash($pw)`, `password_verify($pw, $hash)` | Argon2id |
@@ -1262,6 +1330,13 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
 | `qr_svg($text): Html` | QR コードを `<svg>` 要素で返す(`otpauth://` の URI など)。中身は模様だけで文字列そのものは含まないので、そのまま出力してよい |
 | `base64_encode`, `base64_decode: ?string`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | |
 | `json_decode($s): any` | 深さ 128 まで |
+| `encrypt($text, $key)`、`decrypt($box, $key): ?string` | ChaCha20-Poly1305。メッセージごとに鍵を導出し(ランダムな salt で HKDF-SHA256)、nonce もランダム。結果は base64url のテキスト。`decrypt` は、テキストが変えられていたり暗号化したときと鍵が違ったりすると `null` |
+| `sign_token($data, $key)`、`sign_token($data, $key, $seconds)`、`verify_token($token, $key): ?string` | HMAC-SHA256 の署名付きのデータ。`$seconds` を渡すとその秒数だけ有効(パスワード再設定などメールのリンク用)。データは base64url にしただけで読めるので、秘密にするものは暗号化する。`verify_token` はデータを返し、トークンが変えられている、別の鍵で署名されている、期限切れのときは `null` |
+| `jwt_encode($claims, $key)`、`jwt_decode($token, $key): ?map<string, any>` | HS256 だけの JSON Web Token。ほかのアルゴリズム(`none` を含む)を名乗るトークンは拒否する。`exp` と `nbf` を検査する |
+
+`encrypt`、`sign_token`、JWT の関数の鍵は 32 バイト以上の秘密の文字列(`random_token()` で作れる)。コードには書かず、
+環境変数に入れて `getenv` で読む。`encrypt` と `sign_token` は渡された鍵からそれぞれ別の鍵を導出するので、1 つの鍵を
+両方に使ってよい。
 
 ### Content-Security-Policy
 
@@ -1312,14 +1387,24 @@ rate_limit_reset("login:" . ip_group(request()->ip));
   など)から読むのは、そのプロキシの後ろで動くときだけにする。それ以外では、そのヘッダーはクライアントが書いた文字列。
 - サイト全体の制限は `[security] requests_per_minute`(§14)。
 
+### ファイルとディレクトリ
+
+| 関数 | 説明 |
+|---|---|
+| `file_append($path, $text)` | ファイルの末尾に追記する。なければ作る(`write`) |
+| `filesize($path)`、`filemtime($path)`、`is_dir($path)` | バイト数、最終更新時刻(Unix 時刻)、ディレクトリかどうか(`read`) |
+| `scandir($dir): list<string>` | `$dir` にあるファイルとディレクトリの名前を並べ替えて返す。リンクは含めない(`read`) |
+| `mkdir($dir)` | 許可したディレクトリの中に、足りない親ごとディレクトリを作る。すでにあればそのまま(`write`) |
+| `copy($from, $to)`、`rename($from, $to)` | ファイルのコピーと名前の変更(`copy` のコピー元は `read`、ほかは `write`)。下の規則は両方のパスに適用する |
+
 ### 権限(phv.toml)
 
 スクリプトがヒープの外に触れるものは、すべて `phv.toml` で許可したものだけ。**何も書かなければ何も許可されない。**
 
 ```toml
 [permissions]
-read = ["content/"]         # file_get_contents / file_exists で読めるディレクトリ
-write = ["data/", "storage/"]  # file_put_contents / unlink / saveTo / Database::open(読み取りも可)
+read = ["content/"]         # file_get_contents / file_exists / scandir などで読めるディレクトリ
+write = ["data/", "storage/"]  # file_put_contents / unlink / mkdir / rename / saveTo / Database::open(読み取りも可)
 env = ["APP_*"]             # getenv で読める環境変数(末尾 * は前方一致)
 ```
 
@@ -1395,7 +1480,8 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 | `implode(string $sep, list<string>): string` / `explode(string $sep, string): list<string>` | 結合 / 分割 |
 | `str_repeat`, `str_contains`, `str_starts_with`, `str_ends_with`, `str_replace(search, replace, subject)` | PHP と同じ |
 | `strtoupper`, `strtolower`, `ucfirst`, `trim` | PHP と同じ |
-| `json_encode(any): string` | オブジェクトは public プロパティだけを出力 |
+| `json_encode(any): string` | オブジェクトは public プロパティだけを、enum のケースは値を出力 |
+| `json_encode_pretty(any): string`、`json_decode_as(string)` | 型付きの JSON(§14 の JSON) |
 | `dump(any): void` | `var_dump` に相当 |
 | `raw(string): Html`, `escape(string): Html`, `htmlspecialchars(string): Html`, `nl2br(string): Html` | §13 |
 | `intdiv`、`abs`、`min`、`max`、`floor`、`ceil`、`round`、`sqrt`、`fmod` | 数値 |
@@ -1418,6 +1504,11 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 | `base64_encode`、`base64_decode`、`urlencode`、`rawurlencode`、`urldecode`、`http_build_query` | エンコード |
 | `base64url_encode`、`base64url_decode`、`bin2hex`、`hex2bin` | エンコード(UTF-8 でないテキストへのデコードは `ValueError`) |
 | `file_get_contents`, `file_put_contents`, `file_exists`, `unlink`, `getenv` | `[permissions]` が必要 |
+| `file_append(path, text)`、`filesize(path)`、`filemtime(path)`、`is_dir(path)`、`scandir(dir): list<string>`、`mkdir(dir)`、`copy(from, to)`、`rename(from, to)` | ファイルとディレクトリ。`[permissions]` が必要(§14) |
+| `csv_parse(string): list<list<string>>`、`csv_encode(list<list<string>>): string` | RFC 4180(引用符で囲んだフィールド、`""`、フィールド内の改行)。`csv_encode` の行末は CRLF |
+| `parse_url(string): map<string, string>`、`parse_query(string): map<string, string>` | キーは `scheme`、`host`、`port`、`user`、`pass`、`path`、`query`、`fragment`(あるものだけ)。不正な URL は `ValueError` |
+| `log_info(msg, ?fields)`、`log_warn(...)`、`log_error(...)` | 標準エラーに 1 行(サーバー自身のログと並ぶ): `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`。空白・`"`・`=` を含む値は引用符で囲み、改行はエスケープするので、値で行を偽造できない |
+| `argv(): list<string>`、`stdin_read_line(): ?string`、`stdin_read_all(): string` | `phv run` で実行したスクリプトだけ(ほかでは `RuntimeException`): ファイルの後の引数と標準入力 |
 | `sql_ident(string): Sql` | 列名・テーブル名 |
 | `assert(bool, ?string)`, `assert_eq(any, any, ?string)` | テスト用 |
 
@@ -1468,7 +1559,7 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
 
 | コマンド | 説明 |
 |---|---|
-| `phv run file.phv` | 型検査して実行(`--html`、`--time-limit 秒`) |
+| `phv run file.phv [引数...]` | 型検査して実行(`--html`、`--time-limit 秒`)。ファイルの後の引数は `argv()` で受け取る |
 | `phv check file.phv` | 型検査だけ(import しているモジュールとテンプレートも) |
 | `phv serve dir` | Web サーバー(`--port`、`--host`、`--prod`、`--time-limit`) |
 | `phv build path -o file` | サイトかスクリプトを 1 つの実行ファイルにする(下を参照) |
@@ -1714,12 +1805,12 @@ phv migrate legacy/page.php      # page.phv を書き出す
 - **0.7 Web アプリケーション**(実装済み): パラメータ付きのルート(`public/posts/[id].phv`)、ミドルウェア、独自のエラーページ、
   フォームの検証、レイアウト、CORS、静的ファイルの圧縮とキャッシュのヘッダー、グレースフル
   シャットダウン、アクセスログ、データベースのマイグレーション、`phv test` 用の HTTP クライアント、メール送信。
-- **0.8 標準ライブラリ**: 正規表現、書式付きの文字列、list と map のメソッドの追加と `Set` 型、数学関数、
+- **0.8 標準ライブラリ**(実装済み): 正規表現、書式付きの文字列、list と map のメソッドの追加、数学関数、
   タイムゾーン付きの日時、クラスへの JSON のデコード、暗号化と署名付きトークン、UUID、ディレクトリ、ログ、
-  URL、CSV。
+  URL、CSV、スクリプトの引数と標準入力。
 - **0.9 ツール**: `phv lsp` の名前の変更・参照の検索・整形・クイックフィックス、`phv new`、`phv doc`、デバッガ、
   テストのカバレッジ、対応プラットフォームの追加、チュートリアルと標準ライブラリのリファレンス。
-- **1.0 速度と安定性**: 実行中の循環参照の解放、JIT の対象拡大、HTTP/2、TLS、WebSocket サーバー、
+- **1.0 速度と安定性**: 実行中の循環参照の解放、JIT の対象拡大、HTTP/2、TLS、WebSocket サーバー、`Set` 型、
   言語仕様の安定化。
 
 設計方針(§1)に反するため、意図して入れないものもある: `eval`、可変変数、static プロパティとグローバル変数、

@@ -1,0 +1,222 @@
+// std.time — instants in time zones, and durations.
+//
+//   import std.time.{DateTime, Duration};
+//   $meeting = DateTime::of(2026, 11, 5, 10, 0, 0, "Asia/Tokyo");
+//   echo $meeting->inZone("Europe/Berlin")->format("Y-m-d H:i T");
+//   $later = $meeting->plus(Duration::hours(36))->addMonths(1);
+//   echo $later->diff($meeting)->totalHours();
+//
+// Zones are IANA names ("Asia/Tokyo", "America/New_York", "UTC"). A local time
+// that happens twice when clocks go back is the earlier one; one that does not
+// happen when clocks go forward is moved past the gap.
+
+export class Duration {
+    private function __construct(public readonly int $seconds) {}
+
+    public static function seconds(int $n): Duration {
+        return new Duration($n);
+    }
+
+    public static function minutes(int $n): Duration {
+        return new Duration($n * 60);
+    }
+
+    public static function hours(int $n): Duration {
+        return new Duration($n * 3600);
+    }
+
+    public static function days(int $n): Duration {
+        return new Duration($n * 86400);
+    }
+
+    public static function weeks(int $n): Duration {
+        return new Duration($n * 604800);
+    }
+
+    public function plus(Duration $other): Duration {
+        return new Duration($this->seconds + $other->seconds);
+    }
+
+    public function minus(Duration $other): Duration {
+        return new Duration($this->seconds - $other->seconds);
+    }
+
+    public function totalMinutes(): int {
+        return intdiv($this->seconds, 60);
+    }
+
+    public function totalHours(): int {
+        return intdiv($this->seconds, 3600);
+    }
+
+    public function totalDays(): int {
+        return intdiv($this->seconds, 86400);
+    }
+
+    /** Like `1d 2h 3m 4s` (the parts that are not zero). */
+    public function toText(): string {
+        $s = abs($this->seconds);
+        $counts = [intdiv($s, 86400), intdiv($s % 86400, 3600), intdiv($s % 3600, 60), $s % 60];
+        $names = ["d", "h", "m", "s"];
+        list<string> $parts = [];
+        foreach ($counts as $i => $n) {
+            if ($n > 0) {
+                $parts[] = $n . $names[$i];
+            }
+        }
+        $text = $parts->isEmpty() ? "0s" : $parts->join(" ");
+        return $this->seconds < 0 ? "-" . $text : $text;
+    }
+}
+
+export class DateTime {
+    private function __construct(public readonly int $timestamp, public readonly string $zone) {}
+
+    public static function now(string $zone = "UTC"): DateTime {
+        __tz_check($zone);
+        return new DateTime(time(), $zone);
+    }
+
+    /** The instant `$timestamp` (seconds since 1970-01-01 UTC), seen in `$zone`. */
+    public static function fromTimestamp(int $timestamp, string $zone = "UTC"): DateTime {
+        __tz_check($zone);
+        return new DateTime($timestamp, $zone);
+    }
+
+    /** A local date and time in `$zone`; throws ValueError if there is no such date. */
+    public static function of(
+        int $year,
+        int $month,
+        int $day,
+        int $hour = 0,
+        int $minute = 0,
+        int $second = 0,
+        string $zone = "UTC",
+    ): DateTime {
+        return new DateTime(__tz_make($year, $month, $day, $hour, $minute, $second, $zone), $zone);
+    }
+
+    /**
+     * `2026-11-05`, `2026-11-05 10:00[:30]` (local time in `$zone`), or RFC 3339
+     * with an offset (`2026-11-05T10:00:00+09:00`, `...Z`); null if it is none of these.
+     */
+    public static function parse(string $text, string $zone = "UTC"): ?DateTime {
+        $ts = __tz_parse($text, $zone);
+        return $ts == null ? null : new DateTime($ts, $zone);
+    }
+
+    /** The same instant in another zone. */
+    public function inZone(string $zone): DateTime {
+        __tz_check($zone);
+        return new DateTime($this->timestamp, $zone);
+    }
+
+    private function field(int $i): int {
+        return __tz_fields($this->timestamp, $this->zone)[$i];
+    }
+
+    public function year(): int {
+        return $this->field(0);
+    }
+
+    public function month(): int {
+        return $this->field(1);
+    }
+
+    public function day(): int {
+        return $this->field(2);
+    }
+
+    public function hour(): int {
+        return $this->field(3);
+    }
+
+    public function minute(): int {
+        return $this->field(4);
+    }
+
+    public function second(): int {
+        return $this->field(5);
+    }
+
+    /** 1 (Monday) to 7 (Sunday). */
+    public function weekday(): int {
+        return $this->field(6);
+    }
+
+    /** The zone's offset from UTC at this instant, in seconds. */
+    public function offset(): int {
+        return $this->field(7);
+    }
+
+    /** With the letters of `date()`: `Y-m-d H:i:s`, `D, d M Y`, `T`... */
+    public function format(string $format): string {
+        return __tz_format($this->timestamp, $this->zone, $format);
+    }
+
+    /** RFC 3339 with the offset: `2026-11-05T10:00:00+09:00`. */
+    public function toIso(): string {
+        return $this->format("c");
+    }
+
+    public function plus(Duration $d): DateTime {
+        return new DateTime($this->timestamp + $d->seconds, $this->zone);
+    }
+
+    public function minus(Duration $d): DateTime {
+        return new DateTime($this->timestamp - $d->seconds, $this->zone);
+    }
+
+    /** `$n` calendar days later, at the same local time (also across a change of clocks). */
+    public function addDays(int $n): DateTime {
+        $f = __tz_fields($this->timestamp, $this->zone);
+        // The calendar date `$n` days on, counted in UTC (where every day has 24 hours).
+        $day = __tz_fields(__tz_make($f[0], $f[1], $f[2], 12, 0, 0, "UTC") + $n * 86400, "UTC");
+        return new DateTime(__tz_make($day[0], $day[1], $day[2], $f[3], $f[4], $f[5], $this->zone), $this->zone);
+    }
+
+    /** `$n` months later; the day is kept, or is the month's last day if it has fewer. */
+    public function addMonths(int $n): DateTime {
+        $f = __tz_fields($this->timestamp, $this->zone);
+        $total = $f[0] * 12 + ($f[1] - 1) + $n;
+        $year = intdiv($total, 12);
+        $month = $total % 12 + 1;
+        if ($month < 1) {
+            $month += 12;
+            $year -= 1;
+        }
+        $day = $f[2];
+        while ($day > 28 && !checkdate($month, $day, $year)) {
+            $day -= 1;
+        }
+        return new DateTime(__tz_make($year, $month, $day, $f[3], $f[4], $f[5], $this->zone), $this->zone);
+    }
+
+    public function addYears(int $n): DateTime {
+        return $this->addMonths($n * 12);
+    }
+
+    /** Midnight at the start of this local day. */
+    public function startOfDay(): DateTime {
+        $f = __tz_fields($this->timestamp, $this->zone);
+        return new DateTime(__tz_make($f[0], $f[1], $f[2], 0, 0, 0, $this->zone), $this->zone);
+    }
+
+    /** The time from `$other` to this one (negative if this one is earlier). */
+    public function diff(DateTime $other): Duration {
+        return Duration::seconds($this->timestamp - $other->timestamp);
+    }
+
+    public function isBefore(DateTime $other): bool {
+        return $this->timestamp < $other->timestamp;
+    }
+
+    public function isAfter(DateTime $other): bool {
+        return $this->timestamp > $other->timestamp;
+    }
+
+    /** The same instant (in any zone). */
+    public function equals(DateTime $other): bool {
+        return $this->timestamp == $other->timestamp;
+    }
+}

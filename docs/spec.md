@@ -629,7 +629,7 @@ import lib.legacy.render as render_legacy;
 - The top level of an imported module can contain only declarations (`function`, `class`, `interface`, `enum`, `const`, `type`, `import`).
   Loading a module has no side effects.
 - `std.*` are the standard modules (`std.http`, `std.db`, `std.net`, `std.async`, `std.validate`, `std.mail`,
-  `std.testing`, `std.regex`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
+  `std.testing`, `std.regex`, `std.time`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
 - Only files inside the project and package directories can be loaded (symbolic links cannot be used to escape them).
 
 ## 12. Templates
@@ -968,6 +968,42 @@ if ($data is map) {
 response()->json(["ok" => true]);
 ```
 
+#### Typed JSON
+
+```phv
+enum Status: string {
+    case Open = "open";
+    case Closed = "closed";
+}
+
+class Item {
+    public function __construct(public string $name, public int $qty = 1, public ?string $note = null) {}
+}
+
+class Order {
+    public function __construct(public int $id, public Status $status, public list<Item> $items) {}
+}
+
+Order $order = json_decode_as(request()->text());   // ValueError if the JSON does not fit Order
+echo json_encode_pretty($order);
+```
+
+`json_decode_as($text)` decodes into the type the value is expected to have (a declared variable, a parameter or a
+return type; without one it is a compile error) and checks the JSON against it: `int`, `float` (an integer is
+accepted), `string`, `bool`, `any`, `?T`, `list<T>`, `map<string, T>`, `map<int, T>` (keys written as decimal
+integers), enums (a backed enum by its value, a pure enum by its case name) and classes.
+
+- A class is built from a JSON object without calling its constructor, so it must be a non-generic, non-abstract
+  class whose properties are all public, and whose constructor, if it has one, is public and only promotes its
+  parameters. A constructor with code in it (which might check its arguments) would be skipped, so such a class is a
+  compile error.
+- A missing property takes its default, or the default of its constructor parameter, or `null` if it is nullable;
+  otherwise it is an error. Keys the class does not have are ignored.
+- On a mismatch the `ValueError` says where: `json_decode_as(): expected an integer, found a string at $.items[2].qty`.
+
+`json_encode` writes an enum case as its value (its name for a pure enum), so what it writes reads back with
+`json_decode_as`. `json_encode_pretty($v)` is `json_encode` laid out on lines, indented by two spaces.
+
 ### Database (std.db)
 
 ```phv
@@ -1231,6 +1267,41 @@ backtracking). An invalid pattern throws `ValueError`; patterns are at most 64 K
 thread keeps the 64 patterns it used last compiled. In `match()`, group 0 is the whole match and a group that took no
 part is `""`.
 
+### Dates and times (std.time)
+
+```phv
+import std.time.{DateTime, Duration};
+
+$meeting = DateTime::of(2026, 11, 5, 10, 0, 0, "Asia/Tokyo");
+$meeting->toIso();                                    // "2026-11-05T10:00:00+09:00"
+$meeting->inZone("Europe/Berlin")->format("H:i T");   // "02:00 CET"
+$meeting->plus(Duration::hours(36));                  // an exact length of time
+$meeting->addDays(1)->addMonths(1);                   // calendar steps, at the same local time
+$meeting->diff(DateTime::now())->totalHours();
+DateTime::parse("2026-11-05 09:30", "Asia/Tokyo");    // ?DateTime
+```
+
+A `DateTime` is an instant (`timestamp`, seconds since 1970-01-01 UTC) seen in an IANA time zone (`zone`, such as
+`"Asia/Tokyo"`, `"America/New_York"` or `"UTC"`). It never changes; its methods return new values.
+
+| Member | Description |
+|---|---|
+| `DateTime::now($zone = "UTC")`, `DateTime::fromTimestamp($ts, $zone = "UTC")` | |
+| `DateTime::of($y, $m, $d, $h = 0, $i = 0, $s = 0, $zone = "UTC")` | `ValueError` for a date that does not exist (February 30) |
+| `DateTime::parse($text, $zone = "UTC"): ?DateTime` | `2026-11-05`, `2026-11-05 10:00[:30]` (a local time in `$zone`), or RFC 3339 with an offset or `Z` |
+| `year()`, `month()`, `day()`, `hour()`, `minute()`, `second()`, `weekday()` (1 = Monday), `offset()` | In its zone; `offset()` is seconds east of UTC |
+| `format($f)`, `toIso()` | The letters of `date()`; `T` is the zone's abbreviation (`JST`, `EDT`) |
+| `inZone($zone)`, `plus(Duration)`, `minus(Duration)`, `startOfDay()` | |
+| `addDays($n)`, `addMonths($n)`, `addYears($n)` | Calendar steps at the same local time; `addMonths` keeps the day, or takes the last day of a shorter month (January 31 + 1 month = February 28) |
+| `diff($other): Duration`, `isBefore($other)`, `isAfter($other)`, `equals($other)` | Compare instants (in any zones) |
+| `Duration::seconds/minutes/hours/days/weeks($n)`, `plus`, `minus`, `totalMinutes()`, `totalHours()`, `totalDays()`, `toText()` | `toText()` is like `1d 2h 3m 4s` |
+
+- A local time that happens twice when clocks go back is the earlier one; one that does not happen when they go
+  forward is moved past the gap (02:30 becomes 03:30).
+- `plus(Duration::days(1))` is exactly 24 hours later, while `addDays(1)` is the same local time on the next day: the
+  two differ across a change of clocks.
+- An unknown zone throws `ValueError`.
+
 ### Asynchronous I/O (std.async)
 
 ```phv
@@ -1271,7 +1342,7 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
 
 | Function | Description |
 |---|---|
-| `date($format, ?$ts)` / `gmdate(...)` | Same format as PHP (`Y-m-d H:i:s`, `D, d M Y`, `c`, `U`, etc.). `date` uses the server's local time |
+| `date($format, ?$ts)` / `gmdate(...)` | Same format as PHP (`Y-m-d H:i:s`, `D, d M Y`, `c`, `U`, `T`, etc.). `date` uses the server's local time; for time zones, see std.time |
 | `mktime($h, $i, $s, $m, $d, $y)`, `strtotime($s): ?int`, `checkdate($m, $d, $y)` | `strtotime` accepts ISO formats and `now`/`today`/`tomorrow`/`yesterday` |
 | `random_int($min, $max)`, `random_token($bytes = 32)` | The OS's cryptographic random number generator (do not use `rand()` for cryptography) |
 | `password_hash($pw)`, `password_verify($pw, $hash)` | Argon2id |
@@ -1280,6 +1351,13 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
 | `qr_svg($text): Html` | A QR code as an `<svg>` element (for example of an `otpauth://` URI). The markup holds only the modules, not the text, so it is safe to output |
 | `base64_encode`, `base64_decode: ?string`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | |
 | `json_decode($s): any` | Depth up to 128 |
+| `encrypt($text, $key)`, `decrypt($box, $key): ?string` | ChaCha20-Poly1305, with a key derived for each message (HKDF-SHA256 with a random salt) and a random nonce; the result is base64url text. `decrypt` returns `null` if the text was changed or the key is not the one it was encrypted with |
+| `sign_token($data, $key)`, `sign_token($data, $key, $seconds)`, `verify_token($token, $key): ?string` | Data with an HMAC-SHA256 signature, valid for `$seconds` when given (links in e-mails, such as password resets). The data can be read (it is only base64url): encrypt what must stay secret. `verify_token` returns the data, or `null` if the token was changed, signed with another key, or has expired |
+| `jwt_encode($claims, $key)`, `jwt_decode($token, $key): ?map<string, any>` | JSON Web Tokens with HS256 only: a token that names another algorithm (`none` included) is refused. `exp` and `nbf` are checked |
+
+Keys for `encrypt`, `sign_token` and the JWT functions are secrets of at least 32 bytes (`random_token()` makes one);
+keep them in an environment variable (`getenv`), not in the code. `encrypt` and `sign_token` derive their own keys
+from the one given, so one key can serve both.
 
 ### Content-Security-Policy
 
@@ -1330,14 +1408,24 @@ rate_limit_reset("login:" . ip_group(request()->ip));
   `Fly-Client-IP` on Fly.io) only when the site runs behind that proxy: anywhere else the header is the client's own text.
 - The site-wide limit is `[security] requests_per_minute` (§14).
 
+### Files and directories
+
+| Function | Description |
+|---|---|
+| `file_append($path, $text)` | Adds to the end of a file, creating it if needed (`write`) |
+| `filesize($path)`, `filemtime($path)`, `is_dir($path)` | Size in bytes, time of the last change (Unix time), whether it is a directory (`read`) |
+| `scandir($dir): list<string>` | Names of the files and directories in `$dir`, sorted; links are left out (`read`) |
+| `mkdir($dir)` | Creates the directory and any missing parents inside the permitted one; an existing directory is fine (`write`) |
+| `copy($from, $to)`, `rename($from, $to)` | Of a file (`read` for the source of `copy`, `write` otherwise). The rules below apply to both paths |
+
 ### Permissions (phv.toml)
 
 A script can touch nothing outside the heap unless it is permitted in `phv.toml`. **If nothing is written, nothing is permitted.**
 
 ```toml
 [permissions]
-read = ["content/"]         # directories readable with file_get_contents / file_exists
-write = ["data/", "storage/"]  # file_put_contents / unlink / saveTo / Database::open (reading is also allowed)
+read = ["content/"]         # directories readable with file_get_contents / file_exists / scandir ...
+write = ["data/", "storage/"]  # file_put_contents / unlink / mkdir / rename / saveTo / Database::open (reading is also allowed)
 env = ["APP_*"]             # environment variables readable with getenv (a trailing * is a prefix match)
 ```
 
@@ -1413,7 +1501,8 @@ create files at the root of a drive), in the shared temporary directory, and on 
 | `implode(string $sep, list<string>): string` / `explode(string $sep, string): list<string>` | Join / split |
 | `str_repeat`, `str_contains`, `str_starts_with`, `str_ends_with`, `str_replace(search, replace, subject)` | Same as PHP |
 | `strtoupper`, `strtolower`, `ucfirst`, `trim` | Same as PHP |
-| `json_encode(any): string` | Outputs only the public properties of objects |
+| `json_encode(any): string` | Outputs only the public properties of objects; enum cases as their value |
+| `json_encode_pretty(any): string`, `json_decode_as(string)` | Typed JSON (§14, JSON) |
 | `dump(any): void` | Equivalent to `var_dump` |
 | `raw(string): Html`, `escape(string): Html`, `htmlspecialchars(string): Html`, `nl2br(string): Html` | §13 |
 | `intdiv`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `sqrt`, `fmod` | Numeric |
@@ -1433,9 +1522,15 @@ create files at the root of a drive), in the shared temporary directory, and on 
 | `rate_limit(string, int, int): bool`, `rate_limit_reset(string)`, `ip_group(string): string` | §14 |
 | `date`, `gmdate`, `mktime`, `strtotime`, `checkdate` | Dates (table in §14) |
 | `random_int`, `random_token`, `password_hash`, `password_verify`, `hash`, `hash_hmac`, `hash_equals`, `totp_secret`, `totp_code`, `totp_verify`, `qr_svg` | Cryptography and two-factor authentication (table in §14) |
+| `encrypt`, `decrypt`, `sign_token`, `verify_token`, `jwt_encode`, `jwt_decode` | Encryption and signed tokens (table in §14) |
 | `base64_encode`, `base64_decode`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | Encoding |
 | `base64url_encode`, `base64url_decode`, `bin2hex`, `hex2bin` | Encoding (decoding to text that is not UTF-8 throws `ValueError`) |
 | `file_get_contents`, `file_put_contents`, `file_exists`, `unlink`, `getenv` | Require `[permissions]` |
+| `file_append(path, text)`, `filesize(path)`, `filemtime(path)`, `is_dir(path)`, `scandir(dir): list<string>`, `mkdir(dir)`, `copy(from, to)`, `rename(from, to)` | Files and directories; require `[permissions]` (below) |
+| `csv_parse(string): list<list<string>>`, `csv_encode(list<list<string>>): string` | RFC 4180 (quoted fields, `""`, line breaks in fields); `csv_encode` ends lines with CRLF |
+| `parse_url(string): map<string, string>`, `parse_query(string): map<string, string>` | Keys `scheme`, `host`, `port`, `user`, `pass`, `path`, `query`, `fragment` (those present); an invalid URL throws `ValueError` |
+| `log_info(msg, ?fields)`, `log_warn(...)`, `log_error(...)` | One line on standard error, next to the server's own log: `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`. Text with spaces, `"` or `=` is quoted and line breaks are escaped, so a value cannot forge a line |
+| `argv(): list<string>`, `stdin_read_line(): ?string`, `stdin_read_all(): string` | Only in scripts run with `phv run` (elsewhere `RuntimeException`): the arguments after the file, and standard input |
 | `sql_ident(string): Sql` | Column and table names |
 | `assert(bool, ?string)`, `assert_eq(any, any, ?string)` | For tests |
 
@@ -1487,7 +1582,7 @@ When code uses a PHP function name, the error message suggests the alternative
 
 | Command | Description |
 |---|---|
-| `phv run file.phv` | Type-check and run (`--html`, `--time-limit seconds`) |
+| `phv run file.phv [args...]` | Type-check and run (`--html`, `--time-limit seconds`); `argv()` returns the arguments after the file |
 | `phv check file.phv` | Type-check only (including imported modules and templates) |
 | `phv serve dir` | Web server (`--port`, `--host`, `--prod`, `--time-limit`) |
 | `phv build path -o file` | Compile a site or a script into one executable (see below) |
@@ -1739,13 +1834,13 @@ Planned, in this order. Each release is audited before it is published, as befor
 - **0.7, web applications** (done): routes with parameters (`public/posts/[id].phv`), middleware, custom error pages, form
   validation, layouts, CORS, compression and caching headers for static files, graceful shutdown, access
   logs, database migrations, an HTTP client for `phv test`, and sending mail.
-- **0.8, the standard library**: regular expressions, formatted strings, more list and map methods and a `Set`
-  type, mathematics, dates with time zones, JSON decoded into classes, encryption and signed tokens, UUIDs,
-  directories, logging, URLs and CSV.
+- **0.8, the standard library** (done): regular expressions, formatted strings, more list and map methods,
+  mathematics, dates with time zones, JSON decoded into classes, encryption and signed tokens, UUIDs, directories,
+  logging, URLs, CSV, and arguments and standard input for scripts.
 - **0.9, tools**: rename, find references, formatting and quick fixes in `phv lsp`; `phv new`, `phv doc`, a debugger
   and test coverage; more platforms; a tutorial and a reference of the standard library.
 - **1.0, speed and stability**: freeing reference cycles while a script runs, a JIT that covers more code, HTTP/2,
-  TLS and a WebSocket server, and a stable language specification.
+  TLS and a WebSocket server, a `Set` type, and a stable language specification.
 
 Some features are left out on purpose, because they work against the design principles (§1): `eval`, variable
 variables, static properties and global variables, references (`&$x`), truthiness, `===`, `@`, `goto`, magic

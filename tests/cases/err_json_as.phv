@@ -1,0 +1,17 @@
+<?phv
+class Guarded {
+    public function __construct(public int $n) {
+        if ($n < 0) {
+            throw new ValueError("negative");
+        }
+    }
+}
+
+class Secret {
+    private string $key = "";
+}
+
+$a = json_decode_as("1");
+Guarded $g = json_decode_as("{}");
+Secret $s = json_decode_as("{}");
+map<string, fn(int): int> $f = json_decode_as("{}");

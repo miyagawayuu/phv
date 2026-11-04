@@ -1,0 +1,6 @@
+3 says "hi", then leaves two|lines
+a,"b,c"/"q""uote"," pad"/
+https example.com 8443 ann /a/b x=1&y=two top
+no port x y
+invalid url
+argv() is only available to scripts run with `phv run`

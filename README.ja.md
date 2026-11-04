@@ -45,6 +45,9 @@ echo greet($name);                                 // Web ページでは自動�
 - **Web アプリケーション**: パラメータ付きのルート(`public/posts/[id].phv`)、ミドルウェア(`_middleware.phv`)、
   独自のエラーページ、レイアウト、入力の検証(`std.validate`)、メール(`std.mail`)、データベースのマイグレーション
   (`phv db migrate`)、静的ファイルのキャッシュと範囲リクエスト、gzip、CORS、アクセスログ、穏やかな停止
+- **標準ライブラリ**: 正規表現(`std.regex`)、コンパイル時に検査する `format()`、タイムゾーン付きの日時(`std.time`)、
+  型付きのクラスへの JSON のデコード(`json_decode_as`)、暗号化・署名付きトークン・JWT、list と map のメソッド、
+  数学関数、UUID、CSV、URL、ディレクトリ、ログ、スクリプトの引数と標準入力
 - **セキュリティ**:
   - **XSS 対策**: 出力は自動でエスケープされる。加えて、エスケープでは守れない場所(引用符なしの属性、URL、
     `<script>`)への挿入はコンパイルエラーになる。URL には `safe_url()`、`<script>` には `json_html()` の値
@@ -137,7 +140,7 @@ error: a URL attribute cannot start with an unchecked value
 | `phv_compiler` | HIR → レジスタ型バイトコード |
 | `phv_vm` | 値、バイトコード形式、インタプリタ、実行時の上限 |
 | `phv_jit` | int/bool/float/string を扱う関数を Cranelift でネイティブコードにする |
-| `phv_std` | 組み込み関数(文字列・JSON・日付・暗号・ファイル・SQLite・PostgreSQL・MySQL・Redis・WebSocket・HTTP クライアント・裏で動く処理・セッション)と、PHV で書かれた prelude・`std.http`・`std.db`・`std.net`・`std.async`・`std.validate`・`std.mail`・`std.testing`。マイグレーション |
+| `phv_std` | 組み込み関数(文字列・JSON・日付・暗号・ファイル・SQLite・PostgreSQL・MySQL・Redis・WebSocket・HTTP クライアント・裏で動く処理・セッション)と、PHV で書かれた prelude・`std.http`・`std.db`・`std.net`・`std.async`・`std.validate`・`std.mail`・`std.regex`・`std.time`・`std.testing`。マイグレーション |
 | `phv_driver` | モジュールとテンプレートの読み込み、`phv.toml`、バイトコードキャッシュ、実行 |
 | `phv_server` | Web サーバー(hyper + tokio)、ルーティング、セッション、CSRF、アップロード |
 | `phv_cli` | `phv` コマンド(run / check / serve / test / fmt / lsp / install / migrate) |

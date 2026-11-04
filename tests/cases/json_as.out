@@ -1,0 +1,21 @@
+7 Ann Admin 9 a,b
+unknown 100-0001 1
+1 member no address
+1=Red 2=Blue 
+null 1+2+3
+json_decode_as(): expected an integer, found a string at $.id
+json_decode_as(): missing property `name` of User at $
+json_decode_as(): "owner" is not a value of Role at $.role
+json_decode_as(): expected a string, found a number at $.tags[1]
+json_decode_as(): expected `,` or `]` at offset 5
+["admin","Blue"]
+{
+  "user": "Ann",
+  "tags": [
+    "a",
+    "b"
+  ],
+  "none": [],
+  "role": "admin",
+  "q": "a,b:\"c\""
+}

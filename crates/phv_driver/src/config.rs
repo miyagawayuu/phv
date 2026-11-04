@@ -842,6 +842,8 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
             rate_limit_store,
             site: None,
             mail,
+            cli: false,
+            args: Vec::new(),
         }),
         csrf: file.security.csrf,
         secure_cookies: file.security.secure_cookies,

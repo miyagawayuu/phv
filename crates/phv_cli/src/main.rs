@@ -53,6 +53,9 @@ enum Command {
     /// Type-check and run a script.
     Run {
         file: PathBuf,
+        /// Arguments for the script (read with `argv()`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
         /// Escape echoed strings as HTML, like a web page.
         #[arg(long)]
         html: bool,
@@ -205,7 +208,7 @@ fn main() -> ExitCode {
 fn exec(cmd: Command) -> ExitCode {
     let color = std::io::stderr().is_terminal();
     match cmd {
-        Command::Run { file, html, time_limit } => {
+        Command::Run { file, html, time_limit, args } => {
             let root = find_root(&file);
             let mut compiled = match compile_cached(&root, &file) {
                 Ok(c) => c,
@@ -228,7 +231,11 @@ fn exec(cmd: Command) -> ExitCode {
                 max_memory: Some(config.memory_limit_mb as usize * 1024 * 1024),
                 ..Limits::default()
             };
-            let outcome = run(&compiled, RunOptions { html, limits, http: None, host: Some(config.host.clone()) });
+            let mut host = (*config.host).clone();
+            host.cli = true;
+            host.args = args;
+            let outcome =
+                run(&compiled, RunOptions { html, limits, http: None, host: Some(std::sync::Arc::new(host)) });
             let mut stdout = std::io::stdout();
             let _ = stdout.write_all(outcome.output.as_bytes());
             let _ = stdout.flush();
