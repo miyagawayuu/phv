@@ -2,11 +2,11 @@
 import std.db.Redis;
 
 $r = Redis::connect("main");
-$r->delete("phv:big");
+$r->delete("t:big");
 $chunk = str_repeat("x", 1000000);
 for ($i = 0; $i < 40; $i++) {
-    $r->rpush("phv:big", $chunk);
+    $r->rpush("t:big", $chunk);
 }
 echo "pushed\n";
-$items = $r->lrange("phv:big", 0, -1);
+$items = $r->lrange("t:big", 0, -1);
 echo "not reached: ", count($items), "\n";

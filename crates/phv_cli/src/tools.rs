@@ -419,7 +419,10 @@ pub fn test(paths: Vec<PathBuf>, opts: TestOptions) -> ExitCode {
         println!("{doc}");
     }
     if let Some(path) = &opts.junit {
-        if let Err(e) = std::fs::write(path, junit(&results, secs)) {
+        let written = crate::check_output_dirs(path).and_then(|_| {
+            phv_driver::write_new_file(path, junit(&results, secs).as_bytes()).map_err(|e| e.to_string())
+        });
+        if let Err(e) = written {
             eprintln!("error: cannot write {}: {e}", path.display());
             return ExitCode::FAILURE;
         }

@@ -131,16 +131,36 @@ fn values_named(pairs: &[(String, String)], name: &str) -> Value {
 }
 
 /// Character-based slice with PHP `substr` semantics for negative values.
+/// Where `x` is in list `l` (`contains`, `indexOf`), watching the time limit.
+fn position(vm: &Vm, l: &Value, x: &Value) -> Result<Option<usize>, VmError> {
+    for (i, y) in list(l).iter().enumerate() {
+        if i % 1024 == 1023 {
+            vm.check_limits()?;
+        }
+        if vm.equal(y, x)? {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
+}
+
 fn char_slice(text: &str, start: i64, len: Option<i64>) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len() as i64;
+    // Counted in place: a copy as characters would take four bytes each.
+    let n = text.chars().count() as i64;
     let from = if start < 0 { n.saturating_add(start).max(0) } else { start.min(n) };
     let to = match len {
         None => n,
         Some(l) if l < 0 => n.saturating_add(l).max(from),
         Some(l) => from.saturating_add(l).min(n),
     };
-    chars[from as usize..to as usize].iter().collect()
+    let at = |c: i64| text.char_indices().nth(c as usize).map_or(text.len(), |(b, _)| b);
+    let start = at(from);
+    let end = if to == n {
+        text.len()
+    } else {
+        start + text[start..].char_indices().nth((to - from) as usize).map_or(text.len() - start, |(b, _)| b)
+    };
+    text[start..end].to_string()
 }
 
 fn number_format(f: f64, decimals: usize) -> String {
@@ -249,7 +269,13 @@ fn json_to(vm: &Vm, v: &Value, out: &mut String, depth: usize, pretty: bool) -> 
             }
             let _ = write!(out, "{f:?}");
         }
-        Value::Str(s) | Value::Html(s) => json_string(s, out),
+        Value::Str(s) | Value::Html(s) => {
+            // One long string can grow six times (`\u0001`).
+            if s.len() > 4096 {
+                vm.reserve(s.len().saturating_mul(6))?;
+            }
+            json_string(s, out)
+        }
         Value::List(l) => {
             out.push('[');
             for (i, x) in l.iter().enumerate() {
@@ -329,6 +355,38 @@ pub(crate) fn stable_sort<T>(items: Vec<T>, le: &dyn Fn(&T, &T) -> bool) -> Vec<
     out.extend(l);
     out.extend(r);
     out
+}
+
+/// Sorts `items` by the values `key` gives, watching the time limit: comparing
+/// long strings can take long, so every 16 MB compared it is checked, and once
+/// it has passed the rest of the sort compares nothing.
+pub(crate) fn sort_metered<T>(vm: &Vm, items: Vec<T>, key: impl Fn(&T) -> &Value) -> Result<Vec<T>, VmError> {
+    let deadline = vm.deadline();
+    let (late, bytes) = (std::cell::Cell::new(false), std::cell::Cell::new(0usize));
+    let le = |x: &T, y: &T| -> bool {
+        if late.get() {
+            return true;
+        }
+        let (a, b) = (key(x), key(y));
+        if let (Value::Str(p), Value::Str(q)) = (a, b) {
+            let n = bytes.get() + p.len().min(q.len());
+            if n >= 16 << 20 {
+                bytes.set(0);
+                if deadline.is_some_and(|d| std::time::Instant::now() > d) {
+                    late.set(true);
+                    return true;
+                }
+            } else {
+                bytes.set(n);
+            }
+        }
+        sort_le(a, b)
+    };
+    let sorted = stable_sort(items, &le);
+    if late.get() {
+        vm.check_limits()?;
+    }
+    Ok(sorted)
 }
 
 pub(crate) fn sort_le(a: &Value, b: &Value) -> bool {
@@ -519,6 +577,31 @@ fn set_type(vm: &mut Vm, ct: &str) -> Result<(), VmError> {
     let media = ["image/", "audio/", "video/", "font/"].iter().any(|p| mime.starts_with(p)) && mime != "image/svg+xml";
     vm.http.content_type = Some(ct.to_string());
     vm.out[0].html = !(PLAIN_TYPES.contains(&mime.as_str()) || media);
+    // Every type browsers run as a script (the WHATWG list).
+    let js = matches!(
+        mime.as_str(),
+        "application/ecmascript"
+            | "application/javascript"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "text/ecmascript"
+            | "text/javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+    );
+    if js && !vm.out[0].buf.trim().is_empty() {
+        // What was written so far was not checked as JavaScript.
+        return Err(vm.throw("ValueError", "set a JavaScript Content-Type before writing any output"));
+    }
+    vm.js_output = js;
     Ok(())
 }
 
@@ -539,6 +622,8 @@ fn replace(vm: &Vm, subject: &str, search: &str, with: &str) -> R {
 fn json_html(vm: &Vm, v: &Value) -> Result<String, VmError> {
     let mut out = String::new();
     json(vm, v, &mut out, 0)?;
+    // Each character may become `\uXXXX` (six bytes).
+    vm.reserve(out.len().saturating_mul(6))?;
     let mut safe = String::with_capacity(out.len());
     let escape = |safe: &mut String, c: char| {
         let mut buf = [0u16; 2];
@@ -690,8 +775,14 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         "str_ends_with" => |_, a| Ok(Value::Bool(s(&a[0]).ends_with(s(&a[1])))),
         "str_replace" => |vm, a| replace(vm, s(&a[2]), s(&a[0]), s(&a[1])),
         "str_replace_m" => |vm, a| replace(vm, s(&a[0]), s(&a[1]), s(&a[2])),
-        "str_upper" => |_, a| Ok(Value::str(s(&a[0]).to_uppercase())),
-        "str_lower" => |_, a| Ok(Value::str(s(&a[0]).to_lowercase())),
+        "str_upper" => |vm, a| {
+            vm.reserve(s(&a[0]).len().saturating_mul(3))?;
+            Ok(Value::str(s(&a[0]).to_uppercase()))
+        },
+        "str_lower" => |vm, a| {
+            vm.reserve(s(&a[0]).len().saturating_mul(3))?;
+            Ok(Value::str(s(&a[0]).to_lowercase()))
+        },
         "str_ucfirst" => |_, a| {
             let mut c = s(&a[0]).chars();
             Ok(Value::str(match c.next() {
@@ -722,9 +813,15 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             vm.reserve(s(&a[0]).chars().count().saturating_mul(64))?;
             Ok(Value::list(s(&a[0]).chars().map(|c| Value::str(c.to_string())).collect()))
         },
-        "nl2br" => |_, a| Ok(Value::html(html_escape(s(&a[0])).replace('\n', "<br>\n"))),
+        "nl2br" => |vm, a| {
+            vm.reserve(s(&a[0]).len().saturating_mul(12))?;
+            Ok(Value::html(html_escape(s(&a[0])).replace('\n', "<br>\n")))
+        },
         "raw" => |_, a| Ok(Value::html(s(&a[0]))),
-        "escape" => |_, a| Ok(Value::html(html_escape(s(&a[0])))),
+        "escape" => |vm, a| {
+            vm.reserve(s(&a[0]).len().saturating_mul(6))?;
+            Ok(Value::html(html_escape(s(&a[0]))))
+        },
         "json_html" => |vm, a| json_html(vm, &a[0]).map(Value::html),
         "safe_url" => |_, a| Ok(Value::html(html_escape(&safe_url(s(&a[0]))))),
         "json_encode" => |vm, a| {
@@ -802,10 +899,8 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::Int((lo as i128 + r as i128) as i64))
         },
         "list_is_empty" => |_, a| Ok(Value::Bool(list(&a[0]).is_empty())),
-        "list_contains" => |_, a| Ok(Value::Bool(list(&a[0]).iter().any(|x| values_equal(x, &a[1])))),
-        "list_index_of" => {
-            |_, a| Ok(opt(list(&a[0]).iter().position(|x| values_equal(x, &a[1])), |i| Value::Int(i as i64)))
-        }
+        "list_contains" => |vm, a| Ok(Value::Bool(position(vm, &a[0], &a[1])?.is_some())),
+        "list_index_of" => |vm, a| Ok(opt(position(vm, &a[0], &a[1])?, |i| Value::Int(i as i64))),
         "list_first" => |_, a| Ok(list(&a[0]).first().cloned().unwrap_or(Value::Null)),
         "list_last" => |_, a| Ok(list(&a[0]).last().cloned().unwrap_or(Value::Null)),
         "list_slice1" | "list_slice" => |_, a| {
@@ -830,14 +925,31 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         "list_unique" => |vm, a| {
             let mut seen = HashSet::new();
             let mut out: Vec<Value> = Vec::new();
+            let mut hashed = 0usize;
             for (i, x) in list(&a[0]).iter().enumerate() {
                 // Lists and maps are compared pairwise (quadratic): watch the time limit.
                 if i % 1024 == 1023 {
                     vm.check_limits()?;
                 }
+                if let Value::Str(t) = x {
+                    hashed += t.len();
+                    if hashed >= 16 << 20 {
+                        hashed = 0;
+                        vm.check_limits()?;
+                    }
+                }
                 let fresh = match x {
                     Value::Int(_) | Value::Str(_) => seen.insert(x.to_key()),
-                    _ => !out.iter().any(|y| values_equal(x, y)),
+                    _ => {
+                        let mut found = false;
+                        for y in &out {
+                            if vm.equal(x, y)? {
+                                found = true;
+                                break;
+                            }
+                        }
+                        !found
+                    }
                 };
                 if fresh {
                     out.push(x.clone());
@@ -845,9 +957,9 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             }
             Ok(Value::list(out))
         },
-        "list_sorted" => |_, a| {
+        "list_sorted" => |vm, a| {
             let v = list(&a[0]).as_ref().clone();
-            Ok(Value::list(stable_sort(v, &sort_le)))
+            sort_metered(vm, v, |x| x).map(Value::list)
         },
         "list_sort_by" => |vm, a| {
             let f = a[1].clone();

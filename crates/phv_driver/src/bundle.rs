@@ -176,7 +176,8 @@ pub fn write(bundle: &Bundle, out: &Path) -> Result<(), String> {
     bytes.extend_from_slice(&Sha256::digest(&body));
     bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
     bytes.extend_from_slice(MAGIC);
-    std::fs::write(out, &bytes).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    // Never through a link planted at the output's name.
+    crate::write_new_file(out, &bytes).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

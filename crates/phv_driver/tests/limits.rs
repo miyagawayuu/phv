@@ -156,3 +156,37 @@ echo $r->test(str_repeat("a", 1000)) ? "match" : "small texts are searched", "\n
         "the regular expression is too large to search 300000 bytes of text in the time left (use a smaller pattern or a shorter text)\nsmall texts are searched\n"
     );
 }
+
+/// Comparing long strings, and callbacks of builtins, stop at the time limit
+/// (one `==`, `contains()` or `sorted()` could otherwise run for minutes).
+#[test]
+fn long_comparisons_and_callbacks_stop_at_the_time_limit() {
+    let cases = [
+        ("eq", "$a == $b ? 1 : 0"),
+        ("contains", "$a->contains($u) ? 1 : 0"),
+        ("sorted", "$a->sorted()->len()"),
+        ("sort_by", "range(1, 3000000)->sortBy(fn(int $x, int $y): int => $y <=> $x)->len()"),
+    ];
+    for (name, expr) in cases {
+        let src = format!(
+            r#"<?phv
+$s = str_repeat("a", 10000000);
+$t = str_repeat("a", 9999999) . "b";
+$u = str_repeat("a", 9999999) . "c";
+list<string> $a = [];
+list<string> $b = [];
+// Equal to $s and $t, but other strings: each comparison reads them whole.
+$s2 = $s . "";
+$t2 = $t . "";
+for ($i = 0; $i < 4000; $i++) {{ $a[] = $i % 2 == 0 ? $s : $t; $b[] = $i % 2 == 0 ? $s2 : $t2; }}
+echo {expr};
+"#
+        );
+        let limits =
+            Limits { max_time: Some(Duration::from_secs(1)), max_memory: Some(256 << 20), ..Limits::default() };
+        let start = Instant::now();
+        let (out, _) = run_limited(name, &src, limits);
+        assert!(start.elapsed() < Duration::from_secs(8), "{name} took {:?}", start.elapsed());
+        assert!(out.contains("maximum execution time"), "{name}: {out}");
+    }
+}

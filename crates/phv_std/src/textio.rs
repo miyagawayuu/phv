@@ -151,6 +151,24 @@ fn log_value(v: &str) -> String {
     }
 }
 
+/// A log line escapes its text (up to about ten bytes a character): reserved first.
+fn reserve_log(vm: &Vm, a: &[Value]) -> Result<(), VmError> {
+    let mut n = s(&a[0]).len();
+    if let Some(ctx) = a.get(1) {
+        for (k, v) in map(ctx).iter() {
+            n = n.saturating_add(match k {
+                Key::Str(k) => k.len(),
+                _ => 20,
+            });
+            n = n.saturating_add(match v {
+                Value::Str(t) | Value::Html(t) => t.len(),
+                _ => 32,
+            });
+        }
+    }
+    vm.reserve(n.saturating_mul(10))
+}
+
 fn log(level: &str, a: &[Value]) {
     let time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut line = format!("{time} {level} {}", log_value(s(&a[0])));
@@ -249,15 +267,18 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             }
             Ok(Value::map(m))
         },
-        "log_info" => |_, a| {
+        "log_info" => |vm, a| {
+            reserve_log(vm, a)?;
             log("INFO", a);
             Ok(Value::Null)
         },
-        "log_warn" => |_, a| {
+        "log_warn" => |vm, a| {
+            reserve_log(vm, a)?;
             log("WARN", a);
             Ok(Value::Null)
         },
-        "log_error" => |_, a| {
+        "log_error" => |vm, a| {
+            reserve_log(vm, a)?;
             log("ERROR", a);
             Ok(Value::Null)
         },

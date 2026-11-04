@@ -1,11 +1,12 @@
 //! Server-side session store. Only a random id travels in the cookie; values
 //! stay on the server. Unknown ids are never adopted (no session fixation).
 //!
-//! The store is bounded by count and by bytes; when full, the least recently
-//! used sessions are evicted, so a flood of new sessions cannot lock out
-//! real visitors or exhaust memory or disk. Sessions whose visitor never came
-//! back go first: a flood of requests without a cookie (each making a new
-//! session) then evicts its own sessions, not those of returning visitors.
+//! The store is bounded by count and by bytes, so a flood of new sessions
+//! cannot exhaust memory or disk. When full, sessions whose visitor never came
+//! back go first (the least recently used), then the newest of the rest: a
+//! flood of sessions, even ones whose cookie is sent back, evicts its own
+//! sessions and never those created before it, however long they have been
+//! idle. (Idle sessions still end after the session lifetime.)
 //!
 //! Sessions live in memory unless `[security] session_store` names a
 //! directory: then each session is a file (named by a hash of its id, so a
@@ -34,6 +35,13 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_SESSIONS: usize = 50_000;
+
+/// How much a session that came back is worth keeping when the store is full,
+/// from its age and idle time in seconds: the older, the more (a flood cannot
+/// evict sessions created before it).
+fn keep_score(age: f64, _idle: f64) -> f64 {
+    age
+}
 const MAX_BYTES: usize = 256 * 1024 * 1024;
 /// Sessions end after this long even if they stay active.
 const MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
@@ -435,9 +443,32 @@ impl FileStore {
         if live.len() <= self.max_sessions && bytes <= self.max_bytes {
             return;
         }
-        live.sort();
-        let mut count = live.len();
-        for (_, _, len, path) in live {
+        // Sessions that came back go newest first; the creation time is at the
+        // start of the file (read only when evicting).
+        let created_of = |path: &Path| -> Option<u64> {
+            use std::io::Read;
+            let mut head = [0u8; 40];
+            let n = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+            let text = std::str::from_utf8(&head[..n]).ok()?.strip_prefix("{\"created\":")?;
+            text.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+        };
+        let now_t = SystemTime::now();
+        let mut ranked: Vec<(bool, f64, u64, PathBuf)> = live
+            .into_iter()
+            .map(|(returned, modified, len, path)| {
+                let idle = now_t.duration_since(modified).map_or(0.0, |d| d.as_secs_f64());
+                let score = if returned {
+                    let age = created_of(&path).map_or(idle, |c| now.saturating_sub(c) as f64);
+                    keep_score(age, idle)
+                } else {
+                    -idle
+                };
+                (returned, score, len, path)
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        let mut count = ranked.len();
+        for (_, _, len, path) in ranked {
             if count <= self.max_sessions * 9 / 10 && bytes <= self.max_bytes * 9 / 10 {
                 break;
             }
@@ -543,10 +574,17 @@ impl Store {
         if inner.map.len() < MAX_SESSIONS && inner.bytes + room <= MAX_BYTES {
             return;
         }
-        // Drop a tenth: first sessions that were never used again, then the least recently used.
-        let mut by_age: Vec<(bool, Instant, String)> =
-            inner.map.iter().map(|(k, e)| (e.returned, e.last, k.clone())).collect();
-        by_age.sort();
+        // Drop a tenth: first sessions that were never used again (the least
+        // recently used), then the newest of those that were.
+        let mut by_age: Vec<(bool, f64, String)> = inner
+            .map
+            .iter()
+            .map(|(k, e)| {
+                let (idle, age) = (e.last.elapsed().as_secs_f64(), e.created.elapsed().as_secs_f64());
+                (e.returned, if e.returned { keep_score(age, idle) } else { -idle }, k.clone())
+            })
+            .collect();
+        by_age.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
         for (_, _, k) in by_age.into_iter().take((MAX_SESSIONS / 10).max(1)) {
             if let Some(e) = inner.map.remove(&k) {
                 inner.bytes -= e.bytes;

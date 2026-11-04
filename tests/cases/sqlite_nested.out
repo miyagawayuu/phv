@@ -1,0 +1,12 @@
+inner rolled back: inner
+inside: 2
+outer rolled back: outer
+rows: 0
+committed: 2
+ABC LIKE a%: 1
+abc LIKE %b_: 1
+日本語 LIKE 日本%: 1
+abc LIKE %x: 0
+beta GLOB [a-c]*: 1
+beta GLOB [^a-c]*: 0
+abc GLOB A*: 0

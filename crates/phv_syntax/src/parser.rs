@@ -9,9 +9,12 @@ pub fn parse_module(src: &str, file: u32, is_template: bool) -> (Module, Vec<Dia
     let (toks, mut diags) = lex(src, file, 0, mode);
     let mut p = Parser::new(toks, file, is_template);
     let stmts = p.block_until(&[]);
-    if is_template && !p.halted && !p.html.at_top_level() {
+    // A page with a layout must end at the top too: its output is joined with the layout's.
+    if (is_template || p.uses_layout) && !p.halted && !p.html.at_top_level() {
         let span = p.span();
-        let mut d = Diagnostic::error("the template ends inside a tag, comment, `<script>`/`<style>` or `<svg>`", span);
+        let what = if is_template { "template" } else { "page (it uses `layout()`)" };
+        let mut d =
+            Diagnostic::error(format!("the {what} ends inside a tag, comment, `<script>`/`<style>` or `<svg>`"), span);
         d.add_note(
             "close everything the template opens: its output is `Html`, which can be joined with other `Html` values",
         );
@@ -54,6 +57,8 @@ struct Parser {
     file: u32,
     is_template: bool,
     template_refs: Vec<(String, Span)>,
+    /// The page calls `layout()`: its output becomes the layout's body.
+    uses_layout: bool,
     /// Current nesting of expressions and blocks (see `enter`).
     depth: u32,
     /// Set when the nesting limit was hit: the rest of the file is skipped and
@@ -134,6 +139,7 @@ impl Parser {
             file,
             is_template,
             template_refs: Vec::new(),
+            uses_layout: false,
             depth: 0,
             halted: false,
             splits: Vec::new(),
@@ -315,6 +321,15 @@ impl Parser {
                 "`javascript:` URLs do not run under the default Content-Security-Policy".to_string(),
                 "use a button with an event listener added from a `<script>` in the template",
             ),
+            InlineCode::ForeignCdata => {
+                let mut d = Diagnostic::error(
+                    "a CDATA section or comment in a `<script>` or `<style>` inside `<svg>` or `<math>`",
+                    span,
+                );
+                d.add_note("browsers read the text of these elements as markup there, so it could hide the end tag; move the script out of the SVG");
+                self.diags.push(d);
+                return;
+            }
             InlineCode::MetaHttpEquiv => {
                 let mut d =
                     Diagnostic::error("`http-equiv` after a value inserted into the `content` of this `<meta>`", span);
@@ -473,7 +488,9 @@ impl Parser {
                     let pos = start.start + at as u32;
                     let len = match &what {
                         crate::htmlctx::InlineCode::Handler(name) => name.len() as u32,
-                        crate::htmlctx::InlineCode::ScriptUrl | crate::htmlctx::InlineCode::MetaHttpEquiv => 1,
+                        crate::htmlctx::InlineCode::ScriptUrl
+                        | crate::htmlctx::InlineCode::MetaHttpEquiv
+                        | crate::htmlctx::InlineCode::ForeignCdata => 1,
                     };
                     self.inline_code_warning(Span { start: pos, end: pos + len, ..start }, what);
                 }
@@ -1490,6 +1507,17 @@ impl Parser {
                 Tok::LParen => {
                     let args = self.args()?;
                     if let ExprKind::Name(n) = &e.kind {
+                        if n == "layout" {
+                            self.uses_layout = true;
+                            if !self.html.at_top_level() {
+                                let mut d = Diagnostic::error(
+                                    "`layout()` is called inside a tag, attribute, comment or `<script>`",
+                                    e.span,
+                                );
+                                d.add_note("the layout's HTML would be written there; call it where the page's HTML is at the top");
+                                self.diags.push(d);
+                            }
+                        }
                         if n == "render" || n == "layout" {
                             if let Some(Arg { name: None, value: Expr { kind: ExprKind::Str(path), span } }) =
                                 args.first()

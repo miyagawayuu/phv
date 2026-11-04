@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates ten audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, and §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1).
+This report consolidates eleven audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), and §21 an assessment of the whole implementation before 1.0.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20: 2026-11-05)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§21: 2026-11-05)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -976,3 +976,95 @@ Regression tests: `err_context`, `contexts`, `guarded_output` and `err_meta_refr
 `follows_javascript_literals_and_comments` and `blocks_merge_url_starts_and_script_states` (phv_syntax); the
 `csv_parse` and `jwt_decode` cases of the limits test (188 MB and 81 MB without the fixes). All tests pass on Windows,
 and on Linux and macOS in CI, with clippy (`-D warnings`) and rustfmt. Dependencies: no new crates.
+
+## 21. Eleventh Assessment: the Whole Implementation (before 1.0)
+
+Date: 2026-11-05. Scope: everything, at v0.9.1, before the work on 1.0 begins. Five new reviewers each took one area
+(the web server; templates and XSS; the VM, its limits and the permission sandbox; the standard library's network,
+database and cryptography; the tools and distribution) and attacked a release build locally, confirming every finding
+with a PoC. A check made with ChatGPT added two items. After the fixes, another new reviewer attacked them, and what it
+found was fixed and checked again. None of the findings escapes `[permissions]`.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| High | 4 | Fixed |
+| Medium | 12 | Fixed |
+| Low | 8 | Fixed |
+| Info | 4 | Fixed / documented |
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R14-1 | `phv install` wrote `phv.lock` through a temporary file of a predictable name (`.phv.lock.<pid>`): a repository that committed such names as links had the lock written to any file the developer could write | The lock (and every file the tools write, R14-22) goes to a new file with a random name, created only if nothing has that name, renamed into place |
+| R14-2 | `phv db migrate --sqlite` ran a repository's migrations without the restrictions scripts have: `ATTACH` created a file anywhere | Migrations open SQLite like scripts: no `ATTACH`, and the same pragmas refused |
+| R14-3 | A `<` written just before `<?= ?>` or a block was not seen as the start of a tag: the value became the tag's name and attributes (`<img src=x onerror=...>`), and the tag escaped every check (URLs, handlers, the `<script>` nonce) | What ends a piece of HTML and could start a tag or comment with what follows (`<`, `</`, `<!`, `<!-`, the start of an end tag, and in a script `<!-`, `<scr`, `-`) is read again with the next piece, and a value right there is refused |
+| R14-4 | Writing to a shared list or map copied it whole, and appending grew it, without the memory limit being checked until thousands of steps later: 3 GB under a 64 MB limit | What a path assignment copies or grows is reserved first, and a large copy makes the next step check the time |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R14-5 | The server handed a page's output to the connection whole, and the connection copied it: the output cap and the 64 KB a slow client may hold did not apply. 600 clients that stopped reading a 4 MB page took 2.3 GB | Bodies are handed over in 64 KB slices that keep the counted output alive until sent; vectored writes reach the socket; compressed output is counted |
+| R14-6 | A flood of sessions whose cookie was sent back once evicted every idle visitor's session from a full store (56,000 sessions in 20 s logged a user out) | When full, never-returned sessions go first, then the newest: a flood removes its own sessions, never those created before it (memory, files, PostgreSQL, MySQL and Redis) |
+| R14-7 | A page typed `text/javascript` wrote strings unescaped, and `script-src 'self'` let markup injected anywhere load it as a script (under the default policy). The check that followed missed other JavaScript types, a type set after output, and template output | A JavaScript response takes only `json_html()` values and numbers (any JavaScript type; the type before any output); pages run only scripts with their nonce (`'strict-dynamic'`) |
+| R14-8 | In SVG and MathML, a `<script>`'s text is markup: a CDATA section or comment hid `</script>` from browsers but not from the check, and a value after it ran in the nonce'd script | A CDATA section or comment in such a `<script>` or `<style>` is an error |
+| R14-9 | An exception's trace copied every frame's names (500 MB for one throw from a deep recursion with long names) | At most 50 innermost and 50 outermost calls, names of 200 characters |
+| R14-10 | Objects made by builtins (`json_decode_as`, built-in exceptions) were not tracked, so cycles through them outlived the request: a worker grew 481 MB in 100 requests | Every object is tracked; its fields are cleared when the run ends |
+| R14-11 | Builtins whose output is larger than their input did not reserve it: `date()` with a long format, `escape()`, `nl2br()`, `json_encode()` of a long string, `json_html()` (whose v0.9.1 escaping writes six bytes for some characters: 97 MB under 16 MB), `log_*()`, `urlencode()`, `strtoupper()`, `slice()` | Each reserves its largest output first |
+| R14-12 | `==`, `contains()`, `indexOf()`, `unique()`, `sorted()` and map sorts compared long strings without checking the time limit, and callbacks of builtins (`sortBy`, `map`) never reached a check: minutes under a 1-second limit | Comparisons count the bytes they read and check the time every 16 MB; equal strings are compared by identity first; every callback counts as a call |
+| R14-13 | SQLite results were checked against the memory limit every 256 rows, of up to 32 MB each: 3.8 GB under a 16 MB limit | Each value is reserved before it is copied, and memory is checked every row |
+| R14-14 | SQLite runs one `LIKE`, `GLOB`, `instr()`, `replace()` or `trim(X, Y)` as a single step, which the time limit could not stop (42 s, and hours for the longest values); `PRAGMA case_sensitive_like` restored the built-in `LIKE` | `LIKE` and `GLOB` are replaced by matchers that stop at the time limit (3,021 cases compared equal to SQLite's), the others by linear searches; the pragma is refused |
+| R14-15 | The language server hashed `phv.toml` by reading it whole on every keystroke (a 1.5 GB file in a cloned repository: 1.5 GB each time) | It is read like every source file, 8 MB at most |
+| R14-16 | Results of background work (`getAsync()` and friends) were allocated on the work's thread and so not counted for the script, and each awaited result was kept until the run ended: 80 responses of 512 KB were all held under a 16 MB limit | A result is counted on the script's thread when it arrives, and only the `Future` keeps it |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R14-17 | Gzipped static files were cached by ETag (size and time) alone: two files of one size and time were served each other's bytes | The cache is keyed by the file as well |
+| R14-18 | `<noscript>` was treated as raw text, so nothing in it was checked (a `<meta http-equiv="refresh">` with a value redirected browsers without scripting) | Its content is checked as markup |
+| R14-19 | A date near the end of the range in a zone with a gap panicked (`std.time`): a 500 for a visitor's date | The arithmetic is checked |
+| R14-20 | Scripts could read and write PHV's own keys in Redis (`phv:session:...`): a page that takes a key from the request could forge a session | Keys starting with `phv:` are refused |
+| R14-21 | A `transaction()` inside another sent a second `BEGIN`: PostgreSQL committed the outer work with the inner `COMMIT`, MySQL committed it at the inner `BEGIN` | Inner levels are savepoints, counted per connection |
+| R14-22 | `phv test --junit` and `phv build -o` wrote through a link at the output's name or on its directories (also with an absolute path written in other case on Windows) | New files renamed into place; links on the way refused, names compared regardless of case on Windows |
+| R14-23 | A page using `layout()` could end, or call `layout()`, inside a tag or attribute, so the layout's HTML landed there | Both are compile errors |
+| R14-24 | (In the first version of R14-3's fix) `<!` and `<!-` before a value, and `<!-`/`-` split around a value in a script, were not carried | They are |
+
+### Info
+
+| Item | Result |
+|---|---|
+| The HTTP parser accepts HTTP/1.1 without `Host`, bare LF line ends and custom methods | Kept: browsers cannot send these across sites; behind a proxy that parses differently they could matter |
+| `requests_per_minute` counts the reverse proxy's address behind one | Documented as a residual risk |
+| `LIKE`'s trailing escape, `GLOB`'s `[]-a]`, `ESCAPE NULL` and reals as text differed from SQLite in the first version of R14-14's fix | Fixed; 3,021 generated cases now give SQLite's answers |
+| `if (x <<?= $n ?>)` in a script is refused (R14-3) | Write a space: `x < <?= $n ?>` |
+
+### Residual Risks
+
+- Behind a reverse proxy, `requests_per_minute` and the session store see the proxy's address (there is no trusted-proxy
+  setting); limit requests per client at the proxy.
+- When the session store fills with real sessions, the newest are removed first.
+- The changes to PostgreSQL, MySQL and Redis (sessions, savepoints, `phv:` keys) were checked by reading and by the CI
+  jobs that run those servers; no server ran here.
+- A JavaScript response accepts any `Html` made only of the characters `json_html()` writes; such text cannot call
+  anything.
+
+### Verification
+
+Every PoC was rerun against the fixed build: the lock, junit and build links leave the files outside untouched; the
+migration's `ATTACH` is "not authorized"; a 300 MB `phv.toml` takes the language server 7 MB (309 MB); 600 stalled
+clients of a 4 MB page 95 MB, with 503 past the cap (2.3 GB); the session flood leaves the victim logged in; the
+gzip cache serves each file its own bytes; every template PoC is refused (and none of the 55 earlier script PoCs runs);
+JavaScript responses with a string, another JavaScript type, a late type or a template's output answer 500, while
+`json_html()` values work; copy on write stops at 64 MB (3 GB), a trace is 22 KB (1.9 GB), the cycles of 100 requests
+4 MB (481 MB), string builtins stop at the limit, `==`, `contains()`, `sorted()` and `sortBy()` at the time limit
+(4–60 s and more); SQLite's 200 rows of 20 MB stop at the limit (3.8 GB), `LIKE`, `instr()` and `replace()` at the time
+limit or in 0.08 s (42–58 s), also after the pragma; dates near the end of the range give no panic; async results kept
+past the budget are refused. Regression tests: `markup_split_by_a_value_is_refused` (phv_syntax), `javascript_responses_take_only_inert_values`
+and `bodies_are_sent_in_counted_slices` (phv_server), `long_comparisons_and_callbacks_stop_at_the_time_limit` and the
+`csv_parse`/`jwt_decode` cases (phv_driver), `sqlite_nested` in `tests/cases`, and the database tests (nested transactions,
+`phv:` keys) that CI runs. All tests pass on Windows, and on Linux and macOS in CI, with clippy (`-D warnings`) and
+rustfmt. Dependencies: no new crates (rusqlite's `functions` feature).

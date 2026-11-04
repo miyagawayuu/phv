@@ -14,6 +14,11 @@ use std::path::{Component, Path};
 // ----- dates ----------------------------------------------------------------
 
 /// PHP `date()` formatting.
+/// A date format letter writes at most about 40 bytes (`r`, `c`): reserved first.
+pub(crate) fn reserve_date(vm: &Vm, fmt: &str) -> Result<(), VmError> {
+    vm.reserve(fmt.len().saturating_mul(40))
+}
+
 pub(crate) fn format_date<Tz: TimeZone>(fmt: &str, t: &DateTime<Tz>) -> String
 where
     Tz::Offset: std::fmt::Display,
@@ -345,14 +350,26 @@ fn io_error(vm: &Vm, what: &str, path: &str, e: std::io::Error) -> VmError {
 
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
     let f: BuiltinFn = match name {
-        "date" => |_, a| Ok(Value::str(format_date(s(&a[0]), &Local::now()))),
+        "date" => |vm, a| {
+            reserve_date(vm, s(&a[0]))?;
+            Ok(Value::str(format_date(s(&a[0]), &Local::now())))
+        },
         "date_ts" => |vm, a| match local_at(int(&a[1])) {
-            Some(t) => Ok(Value::str(format_date(s(&a[0]), &t))),
+            Some(t) => {
+                reserve_date(vm, s(&a[0]))?;
+                Ok(Value::str(format_date(s(&a[0]), &t)))
+            }
             None => Err(vm.throw("ValueError", "timestamp out of range")),
         },
-        "gmdate" => |_, a| Ok(Value::str(format_date(s(&a[0]), &Utc::now()))),
+        "gmdate" => |vm, a| {
+            reserve_date(vm, s(&a[0]))?;
+            Ok(Value::str(format_date(s(&a[0]), &Utc::now())))
+        },
         "gmdate_ts" => |vm, a| match Utc.timestamp_opt(int(&a[1]), 0).single() {
-            Some(t) => Ok(Value::str(format_date(s(&a[0]), &t))),
+            Some(t) => {
+                reserve_date(vm, s(&a[0]))?;
+                Ok(Value::str(format_date(s(&a[0]), &t)))
+            }
             None => Err(vm.throw("ValueError", "timestamp out of range")),
         },
         "mktime" => |vm, a| {
@@ -413,7 +430,10 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let bytes = base64::engine::general_purpose::STANDARD.decode(s(&a[0]).trim()).ok();
             Ok(bytes.and_then(|b| String::from_utf8(b).ok()).map(Value::str).unwrap_or(Value::Null))
         },
-        "urlencode" => |_, a| Ok(Value::str(form_encode(s(&a[0])))),
+        "urlencode" => |vm, a| {
+            vm.reserve(s(&a[0]).len().saturating_mul(3))?;
+            Ok(Value::str(form_encode(s(&a[0]))))
+        },
         "rawurlencode" => |_, a| {
             const SET: &percent_encoding::AsciiSet =
                 &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');

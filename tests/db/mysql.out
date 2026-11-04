@@ -15,6 +15,9 @@ active: yes
 qty: 3
 rolled back: stop
 rows: 1
+inner rolled back: inner
+outer rolled back: outer
+rows: 1
 error: Column 'name' cannot be null
 multi-statement refused
 table still there: 1

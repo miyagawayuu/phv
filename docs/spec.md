@@ -296,7 +296,7 @@ try {
 ```
 
 `getTraceAsString()` gives the calls where the exception was first thrown, innermost first (empty for an exception that
-was never thrown). An uncaught exception shows its causes too: `Uncaught ConfigError: bad port (caused by ValueError: ...)`.
+was never thrown). A deep trace keeps its 50 innermost and 50 outermost calls, with names shortened to 200 characters. An uncaught exception shows its causes too: `Uncaught ConfigError: bad port (caused by ValueError: ...)`.
 
 ## 8. Functions
 
@@ -665,7 +665,8 @@ echo render("views/layout.phv.html", title: "Home", body: $html);
   ```
 
   `layout()` is a statement at the top level of a page or template, at most once. A page that ends early (with
-  `return`) or fails is not wrapped.
+  `return`) or fails is not wrapped. A page that uses `layout()`, like a template, must not call it or end inside a
+  tag, an attribute, a comment or a `<script>`: its output is joined with the layout's.
 - `render()` returns `Html`, so the result can be passed directly to another template and embedded there (layouts).
 - A template must close everything it opens: it cannot end inside a tag, an attribute, a comment, a `<script>` /
   `<style>` / `<textarea>` element or `<svg>` / `<math>` (compile error). `Html` values can be joined with `.`, and a
@@ -702,13 +703,17 @@ are output as is. `echo` and `<?= ?>` follow the same rules.
 - Escaping is turned off only for the Content-Types `text/plain`, `application/json`, `text/csv`, `text/css`, `text/javascript`,
   `text/markdown`, `text/calendar`, `application/pdf`, `application/octet-stream`, and image, audio, and video types
   (all types that browsers do not render as HTML; `X-Content-Type-Options: nosniff` is also always sent).
-  HTML, XML, SVG, and unknown types stay escaped.
+  HTML, XML, SVG, and unknown types stay escaped. A JavaScript response (`text/javascript` or any type browsers run as
+  a script) takes only `json_html()` values and numbers: a string or a template's output would be code, so writing one
+  is an error when the page runs. Its type must be set before any output.
 
 ### HTML context checks
 
 HTML escaping protects only element content and **quoted** attribute values. `<?= ?>` and `echo` anywhere else
 are a compile error. Locations are determined according to the browser's parsing rules (WHATWG), including
-the content of `<textarea>`, `<title>`, and similar elements, `<!--` inside `<script>`, comments such as `<!-->` and `--!>`, the inside of `<svg>`,
+the content of `<textarea>`, `<title>`, and similar elements, `<!--` inside `<script>`, comments such as `<!-->` and `--!>`, the inside of `<svg>`
+(where a CDATA section or comment in a `<script>` or `<style>` is an error), markup inside `<noscript>` (checked as markup), a `<` written just
+before a value or block (a value there would name a tag: an error),
 and text such as `</scripts>` that looks like an end tag but is not one.
 
 | Location | Example | Treatment |
@@ -919,8 +924,9 @@ session()->destroy();                 // log out
   one atomic step: a request that finishes after a logout, in this process or another, cannot bring the session back,
   and of two requests that regenerate the same session only one gets it.
 - The store holds at most 50,000 sessions and 256 MB of session data (Redis keeps within both as sessions are written).
-  When it is full, sessions whose visitor never came back are removed first, then the least recently used: a flood of
-  requests without a cookie (each creating a session) removes its own sessions, not those of returning visitors.
+  When it is full, sessions whose visitor never came back are removed first (the least recently used), then the newest
+  of the rest: a flood of sessions, even ones whose cookie is sent back, removes its own sessions and never those
+  created before it. Idle sessions still end after `session_lifetime`.
 
 ### CSRF protection
 
@@ -1042,11 +1048,16 @@ $db->transaction(function () use ($db): void {
 });                                         // ROLLBACK if an exception is thrown
 ```
 
+A `transaction()` inside another (even through another `Database` of the same name) is a savepoint: if it throws,
+only its own changes are undone, and nothing is committed until the outermost one ends.
+
 - **SQL can be written only as `sql"..."` literals (type `Sql`).** Values embedded with `{$x}` are always passed
   as placeholders, so SQL injection cannot occur. A `string` cannot be passed to `query()`.
 - `Sql` values can be concatenated with `.` (their parameters are carried over). `Sql` and `string` cannot be concatenated.
 - To choose a column or table name dynamically, use `sql_ident($name)` (it allows only alphanumerics and `_`, and quotes the name).
-- `ATTACH` is disabled, so databases other than the permitted files cannot be accessed.
+- `ATTACH` is disabled, so databases other than the permitted files cannot be accessed (also in `phv db migrate`).
+- `LIKE` and `GLOB` stop at the script's time limit like the rest of a query; `instr()`, `replace()` and `trim(X, Y)`
+  search in linear time. `PRAGMA case_sensitive_like` is refused (it would bring back SQLite's own `LIKE`).
 - SQL errors raise `DatabaseError`.
 
 #### PostgreSQL and MySQL
@@ -1119,7 +1130,8 @@ $redis->rpush("jobs", "a");  $redis->lpop("jobs");  $redis->lrange("jobs", 0, -1
 Methods: `get`, `set`, `delete`, `exists`, `incr`, `expire`, `ttl`, `hget`, `hset`, `hdel`, `hgetAll`, `rpush`,
 `lpop`, `lrange`, `close`. Each command waits at most until the script's time limit, and a reply larger than the
 memory left to the script is refused. Only these commands can be sent: commands such as `KEYS`, `FLUSHALL`, `CONFIG` or
-`EVAL` are not available. A remote server needs a `rediss://` URL (or `tls = false`). Errors raise `DatabaseError`.
+`EVAL` are not available. Keys starting with `phv:` belong to PHV (sessions and rate limits kept in Redis) and raise
+`ValueError`. A remote server needs a `rediss://` URL (or `tls = false`). Errors raise `DatabaseError`.
 
 ### WebSocket (std.net)
 
@@ -1392,10 +1404,13 @@ from the one given, so one key can serve both. Tokens are compared as they are: 
 Page responses get the following policy by default (`{nonce}` is a per-response `'nonce-...'`; writing `'nonce-{nonce}'` is equivalent).
 
 ```
-default-src 'self'; script-src 'self' {nonce}; style-src 'self' 'unsafe-inline';
+default-src 'self'; script-src {nonce} 'strict-dynamic'; style-src 'self' 'unsafe-inline';
 img-src 'self' data: https:; font-src 'self' data:; object-src 'none'; base-uri 'self';
 form-action 'self'; frame-ancestors 'self'
 ```
+
+A page runs only scripts carrying its nonce, and the scripts they load (`'strict-dynamic'`): a `<script src>` that
+got past escaping cannot load even a script of the site. Static files have no nonce and get `script-src 'self'` instead.
 
 - PHV automatically adds `nonce="..."` to `<script>` tags written in templates (`.phv.html` and the HTML parts of `.phv`).
   As a result, inline scripts you write yourself work as is, while scripts injected by getting
@@ -1404,7 +1419,7 @@ form-action 'self'; frame-ancestors 'self'
   Writing them in a template produces a compile-time warning (not when `csp` allows inline code).
 - When a `<script>` built from strings needs a nonce, use `csp_nonce()`
   (`raw("<script nonce=\"" . csp_nonce() . "\">...</script>")`).
-- Static files and error pages get a policy without a nonce (inline scripts in static `.html` files do not run).
+- Static files and error pages get the policy without a nonce, with `script-src 'self'` (inline scripts in static `.html` files do not run).
 - Changing the policy: `[security] csp = "off"` omits it. Writing a policy, as in `csp = "default-src 'self'; script-src 'self' {nonce}"`,
   uses that policy (`{nonce}` becomes `'nonce-...'`).
 

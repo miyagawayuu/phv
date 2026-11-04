@@ -13,6 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub fn build(path: &Path, output: &Path) -> ExitCode {
+    if let Err(e) = crate::check_output_dirs(output) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
     let built = if path.is_dir() {
         if !path.join("public").is_dir() {
             eprintln!("error: {} has no `public/` directory (give a site's directory, or a script)", path.display());

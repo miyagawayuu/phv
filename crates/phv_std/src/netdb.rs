@@ -91,7 +91,7 @@ impl<C: Driver> Pool<C> {
             if let Some((mut c, since)) = st.idle.pop() {
                 drop(st);
                 if since.elapsed() < CHECK_AFTER || c.check() {
-                    return Ok(Pooled { conn: Some(c), pool: self.clone(), broken: false });
+                    return Ok(Pooled { conn: Some(c), pool: self.clone(), broken: false, depth: 0 });
                 }
                 drop(c);
                 st = lock(&self.state);
@@ -102,7 +102,7 @@ impl<C: Driver> Pool<C> {
                 st.open += 1;
                 drop(st);
                 return match connect() {
-                    Ok(c) => Ok(Pooled { conn: Some(c), pool: self.clone(), broken: false }),
+                    Ok(c) => Ok(Pooled { conn: Some(c), pool: self.clone(), broken: false, depth: 0 }),
                     Err(e) => {
                         self.discard();
                         Err(AcquireError::Connect(e))
@@ -129,6 +129,8 @@ struct Pooled<C: Driver> {
     pool: Arc<Pool<C>>,
     /// Set after a network error: the connection is closed instead of reused.
     broken: bool,
+    /// How many `transaction()` calls are open (inner ones are savepoints).
+    depth: u32,
 }
 
 impl<C: Driver> Pooled<C> {
@@ -316,13 +318,27 @@ pub fn raw(vm: &mut Vm, a: &[Value]) -> R {
     match &mut *link {
         Link::Pg(c) => {
             pg_limit_time(vm, c)?;
-            let r = c.get().client.batch_execute(cmd);
-            r.map_err(|e| pg_error(vm, c, e))?;
+            let (sqls, depth) = crate::db::transaction_sql(cmd, c.depth);
+            if cmd == "ROLLBACK" {
+                c.depth = depth;
+            }
+            for sql in &sqls {
+                let r = c.get().client.batch_execute(sql);
+                r.map_err(|e| pg_error(vm, c, e))?;
+            }
+            c.depth = depth;
         }
         Link::My(c) => {
             use mysql::prelude::Queryable;
-            let r = c.get().conn.query_drop(cmd);
-            r.map_err(|e| my_error(vm, c, e))?;
+            let (sqls, depth) = crate::db::transaction_sql(cmd, c.depth);
+            if cmd == "ROLLBACK" {
+                c.depth = depth;
+            }
+            for sql in &sqls {
+                let r = c.get().conn.query_drop(sql);
+                r.map_err(|e| my_error(vm, c, e))?;
+            }
+            c.depth = depth;
         }
         Link::Redis(_) => unreachable!("Redis handle used as a database"),
     }
@@ -1234,6 +1250,26 @@ pub(crate) enum Detached {
     Count(u64),
 }
 
+impl Detached {
+    /// The bytes it holds on the heap.
+    pub(crate) fn heap_size(&self) -> usize {
+        match self {
+            Detached::Count(_) => 0,
+            Detached::Rows(names, rows) => {
+                let cell = std::mem::size_of::<Scalar>();
+                names.iter().map(|n| n.capacity() + 24).sum::<usize>()
+                    + rows
+                        .iter()
+                        .map(|r| {
+                            24 + r.capacity() * cell
+                                + r.iter().map(|c| if let Scalar::Str(s) = c { s.capacity() } else { 0 }).sum::<usize>()
+                        })
+                        .sum::<usize>()
+            }
+        }
+    }
+}
+
 /// The rows (as maps) or the number of changed rows.
 pub(crate) fn detached_value(d: Detached) -> Value {
     match d {
@@ -1307,6 +1343,9 @@ pub fn start_redis(vm: &mut Vm, a: &[Value]) -> R {
         && REDIS_COMMANDS.iter().any(|&(n, lo, hi)| n == command && (lo..=hi).contains(&args.len()));
     if !allowed {
         return Err(VmError::Fatal(format!("__redis_start: unexpected command {command}")));
+    }
+    if let Some(key) = args.first().filter(|k| k.starts_with(PHV_KEYS)) {
+        return Err(vm.throw("ValueError", phv_key_error(key)));
     }
     let until = crate::netio::until(vm, MAX_WAIT);
     let budget = detached_budget(vm);
@@ -1617,7 +1656,8 @@ fn session_conn(spec: &DatabaseSpec) -> Result<(SessionConn, Instant), String> {
 /// Writes a session in Redis: `mode` "insert" (only if absent) or "update"
 /// (only if present). Each session is `phv:session:<key>` with an expiry; two
 /// sorted sets (new and returned sessions, by last use), a hash of sizes and a
-/// byte counter keep the store within its limits, evicting new sessions first.
+/// byte counter keep the store within its limits, evicting new sessions first,
+/// then the newest of the returned ones (a third sorted set, by creation).
 const REDIS_SESSION_WRITE: &str = r#"
 local id, value, px, back, now, size, mode = ARGV[1], ARGV[2], ARGV[3], ARGV[4], tonumber(ARGV[5]), tonumber(ARGV[6]), ARGV[7]
 local ttl, new_ttl, max_n, max_b = tonumber(ARGV[8]), tonumber(ARGV[9]), tonumber(ARGV[10]), tonumber(ARGV[11])
@@ -1630,6 +1670,7 @@ local function drop(x)
   redis.call('HDEL', 'phv:sessions:size', x)
   redis.call('ZREM', 'phv:sessions:new', x)
   redis.call('ZREM', 'phv:sessions:back', x)
+  redis.call('ZREM', 'phv:sessions:keep', x)
   return redis.call('INCRBY', 'phv:sessions:bytes', -sz)
 end
 -- Forget sessions Redis has expired since (a few per write).
@@ -1640,8 +1681,10 @@ redis.call('SET', k, value, 'PX', px)
 redis.call('HSET', 'phv:sessions:size', id, size)
 local total = redis.call('INCRBY', 'phv:sessions:bytes', size - old)
 if back == '1' then
+  local created = tonumber(string.match(value, '^(%d+)')) or now
   redis.call('ZREM', 'phv:sessions:new', id)
   redis.call('ZADD', 'phv:sessions:back', now, id)
+  redis.call('ZADD', 'phv:sessions:keep', -created, id)
 else
   redis.call('ZADD', 'phv:sessions:new', now, id)
 end
@@ -1654,7 +1697,7 @@ local function oldest(z)
   return nil
 end
 while count > max_n or total > max_b do
-  local v = oldest('phv:sessions:new') or oldest('phv:sessions:back')
+  local v = oldest('phv:sessions:new') or oldest('phv:sessions:keep')
   if not v then break end
   total = drop(v)
   count = count - 1
@@ -1671,6 +1714,7 @@ redis.call('DEL', 'phv:session:' .. id)
 redis.call('HDEL', 'phv:sessions:size', id)
 redis.call('ZREM', 'phv:sessions:new', id)
 redis.call('ZREM', 'phv:sessions:back', id)
+redis.call('ZREM', 'phv:sessions:keep', id)
 redis.call('INCRBY', 'phv:sessions:bytes', -sz)
 return existed
 "#;
@@ -1924,7 +1968,8 @@ pub fn session_sweep(spec: &DatabaseSpec, limits: &SessionLimits) -> Result<(), 
                     .client
                     .execute(
                         "DELETE FROM phv_sessions WHERE id IN \
-                         (SELECT id FROM phv_sessions ORDER BY returned, last LIMIT $1)",
+                         (SELECT id FROM phv_sessions ORDER BY returned, \
+                          CASE WHEN returned = 1 THEN -created ELSE last END LIMIT $1)",
                         &[&excess],
                     )
                     .map_err(|e| pg_message(&e))?;
@@ -1933,7 +1978,11 @@ pub fn session_sweep(spec: &DatabaseSpec, limits: &SessionLimits) -> Result<(), 
                 use mysql::prelude::Queryable;
                 c.get()
                     .conn
-                    .exec_drop("DELETE FROM phv_sessions ORDER BY returned, last LIMIT ?", (excess,))
+                    .exec_drop(
+                        "DELETE FROM phv_sessions ORDER BY returned, \
+                         CASE WHEN returned = 1 THEN -created ELSE last END LIMIT ?",
+                        (excess,),
+                    )
                     .map_err(|e| my_message(&e))?;
             }
             SessionConn::Redis(_) => {}
@@ -2056,6 +2105,15 @@ fn redis_failure(e: Option<crate::redisclient::RedisError>) -> String {
 }
 
 /// Commands scripts may run, with their argument counts.
+/// Keys PHV keeps in Redis itself (sessions, rate limits): scripts may not
+/// read or write them, which would let a request forge a session.
+const PHV_KEYS: &str = "phv:";
+
+fn phv_key_error(key: &str) -> String {
+    let shown: String = key.chars().take(40).collect();
+    format!("Redis keys starting with `phv:` belong to PHV (sessions, rate limits): \"{shown}\"")
+}
+
 const REDIS_COMMANDS: &[(&str, usize, usize)] = &[
     ("GET", 1, 1),
     ("SET", 2, 4),
@@ -2094,6 +2152,9 @@ pub fn redis_command(vm: &mut Vm, a: &[Value]) -> R {
     let allowed = REDIS_COMMANDS.iter().any(|&(n, lo, hi)| n == name && (lo..=hi).contains(&args.len()));
     if !allowed {
         return Err(VmError::Fatal(format!("__redis: unexpected command {name}")));
+    }
+    if let Some(key) = args.first().map(s).filter(|k| k.starts_with(PHV_KEYS)) {
+        return Err(vm.throw("ValueError", phv_key_error(key)));
     }
     let left = remaining(vm)?;
     let until = Instant::now() + left.unwrap_or(MAX_WAIT);

@@ -54,6 +54,25 @@ try {
 }
 echo "rows: ", count($db->query(sql"SELECT id FROM phv_items")), "\n";
 
+// Nested transactions are savepoints: an inner one neither commits nor ends the outer one.
+try {
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"DELETE FROM phv_items");
+        try {
+            $db->transaction(function () use ($db): void {
+                $db->execute(sql"DELETE FROM phv_items");
+                throw new RuntimeException("inner");
+            });
+        } catch (RuntimeException $e) {
+            echo "inner rolled back: ", $e->message, "\n";
+        }
+        throw new RuntimeException("outer");
+    });
+} catch (RuntimeException $e) {
+    echo "outer rolled back: ", $e->message, "\n";
+}
+echo "rows: ", count($db->query(sql"SELECT id FROM phv_items")), "\n";
+
 // Errors are DatabaseError exceptions.
 try {
     $db->execute(sql"INSERT INTO phv_items (name) VALUES ({$none})");

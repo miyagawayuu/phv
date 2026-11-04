@@ -689,3 +689,55 @@ fn request_bodies_are_bounded_as_they_are_read() {
     drop(idle);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A JavaScript response takes only `json_html()` values and numbers: a string
+/// or a template's output would be code (any JavaScript type, also when the
+/// type is set after output). Pages run only scripts with their nonce.
+#[test]
+fn javascript_responses_take_only_inert_values() {
+    let dir = std::env::temp_dir().join(format!("phv-http-js-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phv.toml", "[project]\nname = \"js\"\n");
+    let head = "<?phv\nimport std.http.{request, response};\n";
+    write(&dir, "public/ok.phv", &format!("{head}response()->type(\"text/javascript\");\n$q = request()->query(\"q\") ?? \"\";\n?>\nvar c = <?= json_html([\"q\" => $q]) ?>; var n = <?= 4 ?>;\n"));
+    write(
+        &dir,
+        "public/str.phv",
+        &format!(
+            "{head}response()->type(\"text/javascript\");\n$q = request()->query(\"q\") ?? \"\";\n?>\n<?= $q ?>;\n"
+        ),
+    );
+    write(&dir, "public/xjs.phv", &format!("{head}response()->type(\"application/x-javascript\");\n$q = request()->query(\"q\") ?? \"\";\n?>\n<?= $q ?>;\n"));
+    write(
+        &dir,
+        "public/late.phv",
+        &format!("{head}$q = request()->query(\"q\") ?? \"\";\necho $q;\nresponse()->type(\"text/javascript\");\n"),
+    );
+    write(&dir, "public/page.phv", "<?phv\n?>\n<p>hi</p>\n");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let opts = ServeOptions {
+        root: dir.clone(),
+        host: "127.0.0.1".into(),
+        port: 0,
+        dev: false,
+        time_limit: Duration::from_secs(5),
+        watch: false,
+    };
+    std::thread::spawn(move || serve_on(listener, opts).unwrap());
+    let q = "?q=alert(document.domain)//";
+    let ok = get(addr, &format!("/ok{q}"), "");
+    assert_eq!(ok.status, 200);
+    assert!(
+        ok.body.contains(r#"var c = {"q":"alert\u0028document\u002edomain\u0029\u002f\u002f"}; var n = 4;"#),
+        "{}",
+        ok.body
+    );
+    for page in ["/str", "/xjs", "/late"] {
+        assert_eq!(get(addr, &format!("{page}{q}"), "").status, 500, "{page}");
+    }
+    let csp = get(addr, "/page", "");
+    let policy = csp.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-security-policy")).unwrap();
+    assert!(policy.1.contains("'strict-dynamic'") && !policy.1.contains("script-src 'self'"), "{}", policy.1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

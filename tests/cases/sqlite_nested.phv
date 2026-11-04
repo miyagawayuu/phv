@@ -1,0 +1,44 @@
+<?phv
+// Nested transactions are savepoints; LIKE and GLOB behave as SQLite's own (v0.9.2).
+import std.db.Database;
+$db = Database::open(":memory:");
+$db->execute(sql"CREATE TABLE t (x INTEGER)");
+try {
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"INSERT INTO t VALUES (1)");
+        $db->transaction(function () use ($db): void {
+            $db->execute(sql"INSERT INTO t VALUES (2)");
+        });
+        try {
+            $db->transaction(function () use ($db): void {
+                $db->execute(sql"INSERT INTO t VALUES (3)");
+                throw new RuntimeException("inner");
+            });
+        } catch (RuntimeException $e) {
+            echo "inner rolled back: ", $e->message, "\n";
+        }
+        echo "inside: ", $db->query(sql"SELECT count(*) AS n FROM t")[0]->int("n") ?? -1, "\n";
+        throw new RuntimeException("outer");
+    });
+} catch (RuntimeException $e) {
+    echo "outer rolled back: ", $e->message, "\n";
+}
+echo "rows: ", $db->query(sql"SELECT count(*) AS n FROM t")[0]->int("n") ?? -1, "\n";
+$db->transaction(function () use ($db): void {
+    $db->execute(sql"INSERT INTO t VALUES (4)");
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"INSERT INTO t VALUES (5)");
+    });
+});
+echo "committed: ", $db->query(sql"SELECT count(*) AS n FROM t")[0]->int("n") ?? -1, "\n";
+
+foreach ([["a%", "ABC"], ["%b_", "abc"], ["日本%", "日本語"], ["%x", "abc"]] as $c) {
+    $p = $c[0];
+    $t = $c[1];
+    echo $t, " LIKE ", $p, ": ", $db->query(sql"SELECT {$t} LIKE {$p} AS m")[0]->int("m") ?? -1, "\n";
+}
+foreach ([["[a-c]*", "beta"], ["[^a-c]*", "beta"], ["A*", "abc"]] as $c) {
+    $p = $c[0];
+    $t = $c[1];
+    echo $t, " GLOB ", $p, ": ", $db->query(sql"SELECT {$t} GLOB {$p} AS m")[0]->int("m") ?? -1, "\n";
+}

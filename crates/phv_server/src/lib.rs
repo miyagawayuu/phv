@@ -578,7 +578,13 @@ async fn compress(state: &State, mut resp: Resp, gzip_ok: bool, credentialed: bo
     if !gzip_ok || personal || !static_files::may_compress(&resp) {
         return resp;
     }
-    let tag = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_string).filter(|_| is_static);
+    // The cache is keyed by the file too: two files of one size and time share an ETag.
+    let tag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .zip(resp.extensions().get::<static_files::StaticFile>())
+        .map(|(t, f)| format!("{}\n{t}", f.0));
     if let Some(gz) = tag.as_ref().and_then(|t| state.gz_cache.lock().unwrap().0.get(t).cloned()) {
         *resp.body_mut() = RespBody::full(gz);
         static_files::mark_gzip(resp.headers_mut());
@@ -604,7 +610,9 @@ async fn compress(state: &State, mut resp: Resp, gzip_ok: bool, credentialed: bo
                 cache.1 += gz.len();
                 cache.0.insert(t, gz.clone());
             }
-            *resp.body_mut() = RespBody::full(gz);
+            // A page's compressed output counts like its output did.
+            *resp.body_mut() =
+                if is_static { RespBody::full(gz) } else { RespBody::counted(gz.to_vec(), &state.buffered) };
             static_files::mark_gzip(resp.headers_mut());
         }
         None => *resp.body_mut() = RespBody::full(bytes),
@@ -817,7 +825,7 @@ async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
                     None => Response::new(RespBody::full(bytes)),
                 }
             };
-            static_headers(state, &mut r, ct, &v);
+            static_headers(state, &mut r, ct, &v, req.uri().path());
             r
         }
         Some(Target::Static(p)) => {
@@ -863,7 +871,7 @@ async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
                     None => Response::new(RespBody::file(file, len)),
                 }
             };
-            static_headers(state, &mut r, ct, &v);
+            static_headers(state, &mut r, ct, &v, &p.to_string_lossy());
             r
         }
         Some(Target::Script(p, params)) => run_script(state, p, params, ip, req, Page::Normal).await,
@@ -880,8 +888,8 @@ fn partial(body: RespBody, a: u64, b: u64, len: u64) -> Resp {
     r
 }
 
-fn static_headers(state: &State, r: &mut Resp, ct: &'static str, v: &Validators) {
-    r.extensions_mut().insert(static_files::StaticFile);
+fn static_headers(state: &State, r: &mut Resp, ct: &'static str, v: &Validators, file: &str) {
+    r.extensions_mut().insert(static_files::StaticFile(file.to_string()));
     let h = r.headers_mut();
     h.insert(CONTENT_TYPE, HeaderValue::from_static(ct));
     h.insert("accept-ranges", HeaderValue::from_static("bytes"));
@@ -1142,7 +1150,7 @@ impl State {
     /// The response for what a script did: status, headers, cookies and body.
     fn respond(&self, outcome: phv_driver::RunOutcome, had_session: bool) -> Resp {
         let mut http = outcome.http;
-        let csp = self.config.csp.header(http.csp_nonce.as_deref());
+        let csp = self.config.csp.page_header(http.csp_nonce.as_deref());
         let flags = if self.config.secure_cookies { "; Secure" } else { "" };
         let session = std::mem::take(&mut http.session);
         let touched_session = had_session || session.changed;

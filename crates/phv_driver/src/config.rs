@@ -412,11 +412,29 @@ impl Csp {
     }
 
     /// The header value for a response with `nonce` (None: no inline scripts allowed).
+    /// The policy of a page's response. Under the default policy a page that
+    /// made no nonce (it has no `<script>` of its own) runs no script at all.
+    pub fn page_header(&self, nonce: Option<&str>) -> Option<String> {
+        match (self, nonce) {
+            (Csp::Policy(p), None) if p == DEFAULT_CSP => {
+                Some(p.replace("script-src 'self' {nonce}", "script-src 'none'"))
+            }
+            _ => self.header(nonce),
+        }
+    }
+
     pub fn header(&self, nonce: Option<&str>) -> Option<String> {
         match self {
             Csp::Off => None,
             Csp::Policy(p) => {
                 let n = nonce.map(|n| format!("'nonce-{n}'")).unwrap_or_default();
+                // A page under the default policy runs only scripts with its nonce (and
+                // what they load), not any script of the site: an injected `<script src>`
+                // could otherwise load a page of the site that echoes a request value.
+                // Static files have no nonce and keep `'self'`.
+                if nonce.is_some() && p == DEFAULT_CSP {
+                    return Some(p.replace("script-src 'self' {nonce}", &format!("script-src {n} 'strict-dynamic'")));
+                }
                 // `'nonce-{nonce}'` (as written in the docs) and `{nonce}` both work.
                 Some(
                     p.replace("'nonce-{nonce}'", "{nonce}")

@@ -28,7 +28,7 @@ fn local(tz: Tz, naive: NaiveDateTime) -> Option<i64> {
         LocalResult::Single(t) => Some(t.timestamp()),
         LocalResult::Ambiguous(a, b) => Some(a.timestamp().min(b.timestamp())),
         LocalResult::None => {
-            let later = naive + chrono::Duration::hours(1);
+            let later = naive.checked_add_signed(chrono::Duration::hours(1))?;
             tz.from_local_datetime(&later).earliest().map(|t| t.timestamp())
         }
     }
@@ -98,6 +98,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         "__tz_format" => |vm, a| {
             let tz = zone(vm, s(&a[1]))?;
             let t = instant(vm, int(&a[0]), tz)?;
+            super::sys::reserve_date(vm, s(&a[2]))?;
             Ok(Value::str(super::sys::format_date(s(&a[2]), &t)))
         },
         "__tz_parse" => |vm, a| {

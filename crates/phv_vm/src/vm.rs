@@ -410,6 +410,9 @@ pub struct Vm {
     consts: Vec<Option<Value>>,
     pub out: Vec<OutBuf>,
     pub http: HttpCtx,
+    /// The response is JavaScript (`text/javascript`): its output is not
+    /// escaped, so a plain string written to it would be code.
+    pub js_output: bool,
     pub host: Arc<Host>,
     /// Native handles owned by this run (e.g. database connections).
     pub resources: Vec<Option<Box<dyn std::any::Any>>>,
@@ -438,12 +441,12 @@ pub struct Vm {
     pub coverage: Option<std::collections::HashSet<(u32, u32)>>,
     /// Objects created by this run. Reference counting cannot free cycles
     /// (`$node->next = $node`), so their fields are cleared when the run ends.
-    objects: Vec<std::rc::Weak<RefCell<Object>>>,
+    objects: RefCell<Vec<std::rc::Weak<RefCell<Object>>>>,
 }
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        for w in std::mem::take(&mut self.objects) {
+        for w in std::mem::take(self.objects.get_mut()) {
             if let Some(o) = w.upgrade() {
                 let fields = std::mem::take(&mut o.borrow_mut().fields);
                 drop(o);
@@ -620,6 +623,7 @@ impl Vm {
             consts: vec![None; nconsts],
             out: vec![OutBuf { buf: String::new(), html: html_output }],
             http: HttpCtx::default(),
+            js_output: false,
             host: Arc::new(Host::default()),
             resources: Vec::new(),
             jit: None,
@@ -634,7 +638,7 @@ impl Vm {
             native_depth: 0,
             argbuf: Vec::new(),
             enum_cache: std::collections::HashMap::new(),
-            objects: Vec::new(),
+            objects: RefCell::new(Vec::new()),
             coverage: None,
             profile: None,
             debug: None,
@@ -678,10 +682,33 @@ impl Vm {
         }
     }
 
+    /// `==` of two values: comparing large strings or lists can take long in one
+    /// step, so the time limit is checked every 16 MB compared.
+    pub fn equal(&self, a: &Value, b: &Value) -> Result<bool, VmError> {
+        let deadline = self.deadline;
+        let mut since = 0usize;
+        let mut late = false;
+        let r = crate::value::values_equal_metered(a, b, &mut |bytes| {
+            since += bytes;
+            if since >= 16 << 20 {
+                since = 0;
+                late = deadline.is_some_and(|d| Instant::now() > d);
+            }
+            !late
+        });
+        match r {
+            Some(v) => Ok(v),
+            None => self.check_limits().map(|()| false),
+        }
+    }
+
     fn call_inner(&mut self, func: u32, caps: &[Value], args: &[Value]) -> Result<Value, VmError> {
         if self.native_depth >= MAX_NATIVE_DEPTH || self.frames.len() >= self.limits.max_frames {
             return Err(VmError::Fatal("maximum call stack depth exceeded".into()));
         }
+        // A callback from a builtin (`map`, `sortBy` ...) counts as a call: one
+        // without loops would otherwise never reach a time-limit check.
+        self.tick()?;
         let base = match self.frames.last() {
             Some(f) => f.base + self.prog.funcs[f.func as usize].num_regs as usize,
             None => 0,
@@ -699,6 +726,17 @@ impl Vm {
         r
     }
 
+    /// Records an object, so that its fields are cleared when the run ends (a
+    /// reference cycle through it would otherwise outlive the request).
+    pub fn track(&self, o: &Rc<RefCell<Object>>) {
+        let mut objects = self.objects.borrow_mut();
+        if objects.len() == objects.capacity() && objects.len() >= 1024 {
+            // Forget objects that are already gone before the list grows.
+            objects.retain(|w| w.strong_count() > 0);
+        }
+        objects.push(Rc::downgrade(o));
+    }
+
     /// Creates an instance of a built-in exception class such as `ValueError`.
     pub fn throw(&self, class: &str, msg: impl Into<String>) -> VmError {
         let Some(&cid) = self.prog.exc_classes.get(class) else {
@@ -709,8 +747,9 @@ impl Vm {
         if let Some(i) = cls.fields.iter().position(|f| f.name == "message") {
             fields[i] = Value::str(msg);
         }
-        let obj = Value::Object(Rc::new(RefCell::new(Object { class: cid, fields })));
-        VmError::Exception(Box::new(Exc { value: obj, trace: Vec::new() }))
+        let obj = Rc::new(RefCell::new(Object { class: cid, fields }));
+        self.track(&obj);
+        VmError::Exception(Box::new(Exc { value: Value::Object(obj), trace: Vec::new() }))
     }
 
     /// `ClassName: message` for an exception value, then `(caused by ...)` for
@@ -831,10 +870,24 @@ impl Vm {
     }
 
     fn trace(&self) -> Vec<TraceLine> {
-        self.frames
+        // At most the 50 innermost and 50 outermost calls, with names of at most
+        // 200 characters: a deep recursion with long names would otherwise build
+        // hundreds of MB for one exception.
+        const ENDS: usize = 50;
+        let short = |s: &str| -> String {
+            match s.char_indices().nth(200) {
+                Some((i, _)) => format!("{}...", &s[..i]),
+                None => s.to_string(),
+            }
+        };
+        let n = self.frames.len();
+        let mut lines: Vec<TraceLine> = self
+            .frames
             .iter()
             .rev()
-            .map(|f| {
+            .enumerate()
+            .filter(|(i, _)| *i < ENDS || *i >= n.saturating_sub(ENDS))
+            .map(|(_, f)| {
                 let func = &self.prog.funcs[f.func as usize];
                 let file = &self.prog.files[func.file as usize];
                 let off = func.offsets.get((f.pc as usize).saturating_sub(1)).copied().unwrap_or(0);
@@ -842,9 +895,17 @@ impl Vm {
                     Ok(i) => i,
                     Err(i) => i.saturating_sub(1),
                 } + 1;
-                TraceLine { func: func.name.clone(), file: file.name.clone(), line }
+                TraceLine { func: short(&func.name), file: short(&file.name), line }
             })
-            .collect()
+            .collect();
+        if n > 2 * ENDS {
+            let skipped = n - 2 * ENDS;
+            lines.insert(
+                ENDS,
+                TraceLine { func: format!("... {skipped} more calls ..."), file: String::new(), line: 0 },
+            );
+        }
+        lines
     }
 
     /// Stores where an exception was first thrown in its `trace` field, which
@@ -1118,6 +1179,19 @@ impl Vm {
     fn set_path(&mut self, base: usize, p: &PathSet) -> Result<(), VmError> {
         let keys: Vec<Value> = p.keys.iter().map(|k| self.regs[base + *k as usize].clone()).collect();
         let val = self.regs[base + p.val as usize].clone();
+        // A shared list or map on the way is copied whole, and a full list grows:
+        // accounted (and timed) before it happens.
+        let cost = match p.base {
+            PathBase::Local(r) => copy_cost(&self.regs[base + r as usize], &keys, p.push),
+            PathBase::Prop(o, slot) => match &self.regs[base + o as usize] {
+                Value::Object(o) => copy_cost(&o.borrow().fields[slot as usize], &keys, p.push),
+                _ => 0,
+            },
+        };
+        if cost > 0 {
+            self.reserve(cost)?;
+            self.long_op(cost);
+        }
         let r = match p.base {
             PathBase::Local(r) => path_assign(&mut self.regs[base + r as usize], &keys, &p.create, p.push, val),
             PathBase::Prop(o, slot) => {
@@ -1355,12 +1429,12 @@ impl Vm {
                     Instr::LtI(d, a, b) => reg!(*d) = Value::Bool(int!(*a) < int!(*b)),
                     Instr::LeI(d, a, b) => reg!(*d) = Value::Bool(int!(*a) <= int!(*b)),
                     Instr::Eq(d, a, b) => {
-                        let v = values_equal(&reg!(*a), &reg!(*b));
+                        let v = tri!(self.equal(&reg!(*a), &reg!(*b)));
                         self.long_op(str_len(&reg!(*a)));
                         reg!(*d) = Value::Bool(v);
                     }
                     Instr::Ne(d, a, b) => {
-                        let v = !values_equal(&reg!(*a), &reg!(*b));
+                        let v = !tri!(self.equal(&reg!(*a), &reg!(*b)));
                         self.long_op(str_len(&reg!(*a)));
                         reg!(*d) = Value::Bool(v);
                     }
@@ -1558,11 +1632,7 @@ impl Vm {
                         let fields =
                             prog.classes[*class as usize].fields.iter().map(|f| const_value(&f.default)).collect();
                         let o = Rc::new(RefCell::new(Object { class: *class, fields }));
-                        if self.objects.len() == self.objects.capacity() && self.objects.len() >= 1024 {
-                            // Forget objects that are already gone before the list grows.
-                            self.objects.retain(|w| w.strong_count() > 0);
-                        }
-                        self.objects.push(Rc::downgrade(&o));
+                        self.track(&o);
                         reg!(*d) = Value::Object(o);
                     }
                     Instr::GetProp(d, o, slot) => {
@@ -1750,6 +1820,12 @@ impl Vm {
                             tri!(self.output_allowed(fi));
                         }
                         let v = reg!(*r).clone();
+                        if self.js_output && self.out.len() == 1 && !inert_js(&v) {
+                            tri!(Err(self.throw(
+                                "ValueError",
+                                "only `json_html()` values and numbers can be written to a JavaScript response (a string or template output would be code)",
+                            )));
+                        }
                         // The output buffer grows with every echo; large pieces
                         // (and escaping, up to 6x) are checked before they are added.
                         let len = match &v {
@@ -1803,6 +1879,66 @@ impl Vm {
             }
         }
     }
+}
+
+/// Whether a value may be written to a JavaScript response: a number, or text
+/// made only of what `json_html()` writes (letters, digits, `"`, `\`, brackets,
+/// `:`, `,`, `.`, `-`, `+` and non-ASCII non-space characters). Such text cannot
+/// call anything (no parentheses, backticks or `=`), whatever it says.
+fn inert_js(v: &Value) -> bool {
+    match v {
+        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => true,
+        Value::Html(s) => s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '"' | '\\' | '[' | ']' | '{' | '}' | ':' | ',' | '.' | '-' | '+')
+                || (!c.is_ascii() && !c.is_whitespace() && c != '\u{feff}')
+        }),
+        _ => false,
+    }
+}
+
+/// Bytes a path assignment may allocate: each shared list or map on the way is
+/// copied (copy on write), and a list or map that is full grows.
+fn copy_cost(target: &Value, keys: &[Value], push: bool) -> usize {
+    let val = std::mem::size_of::<Value>();
+    let entry = val * 2 + 16;
+    let n = if push { keys.len() } else { keys.len().saturating_sub(1) };
+    let mut cost = 0usize;
+    let mut cur = target;
+    for depth in 0..=n {
+        let next = match cur {
+            Value::List(l) => {
+                if Rc::strong_count(l) > 1 {
+                    cost = cost.saturating_add(l.len().saturating_mul(val));
+                }
+                if depth == n && push && l.len() == l.capacity() {
+                    cost = cost.saturating_add(l.len().max(4).saturating_mul(val));
+                }
+                match keys.get(depth) {
+                    Some(Value::Int(i)) if depth < n => usize::try_from(*i).ok().and_then(|i| l.get(i)),
+                    _ => None,
+                }
+            }
+            Value::Map(m) => {
+                if Rc::strong_count(m) > 1 {
+                    cost = cost.saturating_add(m.len().saturating_mul(entry));
+                }
+                if depth == n && m.len() == m.capacity() {
+                    cost = cost.saturating_add(m.len().max(4).saturating_mul(entry));
+                }
+                match keys.get(depth) {
+                    Some(k) if depth < n => m.get(&k.to_key()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match next {
+            Some(v) => cur = v,
+            None => break,
+        }
+    }
+    cost
 }
 
 fn path_assign(

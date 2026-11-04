@@ -27,6 +27,12 @@ fn add(n: isize) {
     });
 }
 
+/// Counts `bytes` that another thread allocated and this one now holds (it
+/// will free them, which subtracts them here): background work's results.
+pub fn charge_thread(bytes: usize) {
+    add(bytes.min(isize::MAX as usize) as isize);
+}
+
 /// Bytes currently allocated (minus freed) by this thread.
 pub fn thread_allocated() -> isize {
     ALLOCATED.try_with(|a| a.get()).unwrap_or(0)

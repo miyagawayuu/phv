@@ -167,10 +167,10 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let entries = super::stable_sort(entries, &|x, y| super::sort_le(&x.0.to_value(), &y.0.to_value()));
             Ok(Value::map(entries.into_iter().collect()))
         },
-        "map_sorted_by_value" => |_, a| {
+        "map_sorted_by_value" => |vm, a| {
             let entries: Vec<(phv_vm::Key, Value)> = map(&a[0]).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             // Stable: equal values keep their order.
-            let entries = super::stable_sort(entries, &|x, y| super::sort_le(&x.1, &y.1));
+            let entries = super::sort_metered(vm, entries, |e| &e.1)?;
             Ok(Value::map(entries.into_iter().collect()))
         },
         _ => return None,

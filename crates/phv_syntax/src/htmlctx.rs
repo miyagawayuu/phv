@@ -532,6 +532,11 @@ pub struct HtmlTracker {
     meta_text: bool,
     /// Byte offset (in the chunk being fed) of the character being read.
     here: usize,
+    /// The end of the last literal text when it may start a tag (`<`, `</`, or
+    /// the start of a raw element's end tag such as `</text`): what follows
+    /// decides, so it is read again in front of the next text, and no value
+    /// may be inserted here (it would name the tag).
+    carry: String,
 }
 
 /// JavaScript written directly in template HTML, which a Content-Security-Policy
@@ -545,6 +550,9 @@ pub enum InlineCode {
     /// `http-equiv` after a value inserted into a `<meta>`'s `content` as text
     /// (an error: `http-equiv="refresh"` would redirect to it).
     MetaHttpEquiv,
+    /// `<![CDATA[` or `<!--` in a `<script>` or `<style>` in SVG or MathML (an
+    /// error: browsers read it as markup, which can hide the end tag).
+    ForeignCdata,
 }
 
 impl Default for HtmlTracker {
@@ -558,6 +566,7 @@ impl Default for HtmlTracker {
             attrs: Vec::new(),
             meta_text: false,
             here: 0,
+            carry: String::new(),
         }
     }
 }
@@ -591,7 +600,7 @@ fn is_url_attr(tag: &str, name: &str) -> bool {
 
 /// Elements whose content is not parsed as markup, in HTML (not foreign) content.
 const RAW_TAGS: &[&str] =
-    &["script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "noscript", "plaintext"];
+    &["script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "plaintext"];
 
 /// Decides a URL from the literal text at its start. Browsers strip leading
 /// spaces and controls and decode character references, so `&` leaves it
@@ -626,6 +635,9 @@ fn is_delim(c: Option<&char>) -> bool {
 impl HtmlTracker {
     /// The context a value inserted at the current position lands in.
     pub fn context(&self) -> EchoContext {
+        if !self.carry.is_empty() {
+            return EchoContext::AfterMarkup;
+        }
         if self.pending.is_some() {
             return EchoContext::Tag;
         }
@@ -703,11 +715,14 @@ impl HtmlTracker {
     /// another context.
     /// Whether the output is at exactly the same place as at `other`.
     pub fn same_place(&self, other: &HtmlTracker) -> bool {
-        self.state == other.state && self.pending == other.pending && self.foreign == other.foreign
+        self.state == other.state
+            && self.pending == other.pending
+            && self.foreign == other.foreign
+            && self.carry == other.carry
     }
 
     pub fn at_top_level(&self) -> bool {
-        self.state == State::Text && self.pending.is_none() && self.foreign == 0
+        self.state == State::Text && self.pending.is_none() && self.foreign == 0 && self.carry.is_empty()
     }
 
     /// After a block that may run zero or more times: true if it ended in the
@@ -762,7 +777,7 @@ impl HtmlTracker {
                 same
             }
         };
-        same && self.pending == entry.pending && self.foreign == entry.foreign
+        same && self.pending == entry.pending && self.foreign == entry.foreign && self.carry == entry.carry
     }
 
     fn end_tag(&mut self, tag: String, closing: bool) {
@@ -779,6 +794,22 @@ impl HtmlTracker {
     /// Advances over literal HTML. Returns the byte offsets just after the
     /// name of each opening `<script` tag, where the server's CSP nonce goes.
     pub fn feed(&mut self, text: &str) -> Vec<usize> {
+        if self.carry.is_empty() {
+            return self.feed_text(text);
+        }
+        // The end of the last text, read again in front of this one; offsets are
+        // reported in this text (the carried characters come before it).
+        let carry = std::mem::take(&mut self.carry);
+        let shift = carry.len();
+        let found = self.found.len();
+        let scripts = self.feed_text(&format!("{carry}{text}"));
+        for f in &mut self.found[found..] {
+            f.0 = f.0.saturating_sub(shift);
+        }
+        scripts.into_iter().map(|s| s.saturating_sub(shift)).collect()
+    }
+
+    fn feed_text(&mut self, text: &str) -> Vec<usize> {
         let chars: Vec<char> = text.chars().collect();
         let offsets: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
         let starts = |i: usize, s: &str| -> bool {
@@ -831,8 +862,26 @@ impl HtmlTracker {
                         }
                     } else {
                         match chars.get(i + 1) {
+                            None => {
+                                self.carry = "<".into();
+                                State::Text
+                            }
                             Some(n) if n.is_ascii_alphabetic() => {
                                 self.pending = Some(String::new());
+                                State::Text
+                            }
+                            Some('/') if i + 2 == chars.len() => {
+                                self.carry = "</".into();
+                                i += 1;
+                                State::Text
+                            }
+                            // `<!` or `<!-` at the end: a value or block could make a comment.
+                            Some('!')
+                                if chars.len() - i < 4
+                                    && "<!--".starts_with(&chars[i..].iter().collect::<String>()) =>
+                            {
+                                self.carry = chars[i..].iter().collect();
+                                i = chars.len() - 1;
                                 State::Text
                             }
                             Some('/') => match chars.get(i + 2) {
@@ -876,7 +925,25 @@ impl HtmlTracker {
                 State::Raw { tag, escape, js } => {
                     let end = format!("</{tag}");
                     let n = end.len();
-                    if starts(i, &end) && is_delim(chars.get(i + n)) {
+                    let rest: String = chars[i..].iter().collect::<String>().to_ascii_lowercase();
+                    // In a script, the starts of `<!--`, `<script` and `-->` too: they change
+                    // its escape state.
+                    let partial = |s: &str| rest.len() < s.len() && s.starts_with(&rest);
+                    let script_start = tag == "script"
+                        && ((escape == 0 && partial("<!--"))
+                            || (escape == 1 && partial("<script"))
+                            || (escape > 0 && (partial("-->") || rest == "-")));
+                    if script_start || (c == '<' && rest.len() <= n && end.starts_with(&rest)) {
+                        // `</tex` + a value or block: it might end the element.
+                        self.carry = chars[i..].iter().collect();
+                        i = chars.len() - 1;
+                        State::Raw { tag, escape, js }
+                    } else if self.foreign > 0 && (starts(i, "<![CDATA[") || starts(i, "<!--")) {
+                        // In SVG and MathML a script's text is markup: a CDATA section or
+                        // comment can hide its end tag from browsers but not from here.
+                        self.found.push((offsets[i], InlineCode::ForeignCdata));
+                        State::Raw { tag, escape, js }
+                    } else if starts(i, &end) && is_delim(chars.get(i + n)) {
                         if tag == "script" && escape == 2 {
                             i += n - 1;
                             State::Raw { tag, escape: 1, js }
@@ -1032,7 +1099,8 @@ impl HtmlTracker {
                 }
             };
             // The script's text, including what the HTML tokenizer read in one step.
-            if in_script {
+            // (Carried characters are read with the next text, not now.)
+            if in_script && self.carry.is_empty() {
                 if let State::Raw { js, .. } = &mut self.state {
                     for &c in &chars[from..=i] {
                         js.step(c);
@@ -1179,6 +1247,32 @@ mod tests {
         t.inserted();
         t.feed("{\"`; var m = ");
         assert_eq!(t.context(), Script);
+    }
+
+    /// What ends a piece of literal text and could start a tag or comment with
+    /// what follows is read again with it; a value right there is refused.
+    #[test]
+    fn markup_split_by_a_value_is_refused() {
+        for (before, after_value) in [
+            ("<p>5 <", EchoContext::AfterMarkup),
+            ("<p>5 </", EchoContext::AfterMarkup),
+            ("<p>5 <!", EchoContext::AfterMarkup),
+            ("<p>5 <!-", EchoContext::AfterMarkup),
+            ("<textarea>x </text", EchoContext::AfterMarkup),
+            ("<script>a <!-", EchoContext::AfterMarkup),
+            ("<script>a <", EchoContext::AfterMarkup),
+            ("<script>a < ", EchoContext::Script),
+            ("<p>5 < ", EchoContext::Text),
+        ] {
+            let mut t = HtmlTracker::default();
+            t.feed(before);
+            assert_eq!(t.context(), after_value, "{before}");
+        }
+        // The carried text is read with the next piece: a tag split across them is seen.
+        let mut t = HtmlTracker::default();
+        t.feed("<p><");
+        t.feed("a href=\"");
+        assert_eq!(t.context(), EchoContext::Url);
     }
 
     #[test]

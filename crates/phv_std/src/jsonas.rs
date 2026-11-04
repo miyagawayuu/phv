@@ -235,7 +235,9 @@ impl Builder<'_> {
                 },
             }
         }
-        Ok(Value::Object(Rc::new(RefCell::new(Object { class: cid, fields }))))
+        let o = Rc::new(RefCell::new(Object { class: cid, fields }));
+        vm.track(&o);
+        Ok(Value::Object(o))
     }
 }
 

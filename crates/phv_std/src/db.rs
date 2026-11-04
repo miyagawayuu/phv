@@ -75,6 +75,22 @@ fn to_sql(v: &Value) -> SqlValue {
 struct Db {
     conn: Connection,
     _dir: Option<crate::safefs::DirGuard>,
+    /// How many `transaction()` calls are open (inner ones are savepoints).
+    depth: std::cell::Cell<u32>,
+}
+
+/// The statements for `BEGIN` / `COMMIT` / `ROLLBACK` of `Database::transaction()`
+/// with `depth` transactions already open, and the depth after them. Inner
+/// levels are savepoints: an inner transaction neither commits the outer one
+/// (PostgreSQL) nor ends it silently (MySQL `BEGIN`).
+pub(crate) fn transaction_sql(cmd: &str, depth: u32) -> (Vec<String>, u32) {
+    match (cmd, depth) {
+        ("BEGIN", 0) => (vec!["BEGIN".into()], 1),
+        ("BEGIN", d) => (vec![format!("SAVEPOINT phv_{}", d + 1)], d + 1),
+        (_, 0 | 1) => (vec![cmd.to_string()], 0),
+        ("COMMIT", d) => (vec![format!("RELEASE SAVEPOINT phv_{d}")], d - 1),
+        (_, d) => (vec![format!("ROLLBACK TO SAVEPOINT phv_{d}"), format!("RELEASE SAVEPOINT phv_{d}")], d - 1),
+    }
 }
 
 /// Whether handle `h` is an SQLite database (otherwise a server connection, see `netdb`).
@@ -92,6 +108,10 @@ fn conn<'v>(vm: &'v Vm, h: &Value) -> Result<&'v Connection, VmError> {
 }
 
 fn db_error(vm: &Vm, e: rusqlite::Error) -> VmError {
+    // `LIKE` and `GLOB` stop at the time limit with an error of their own.
+    if vm.deadline().is_some_and(|d| std::time::Instant::now() > d) {
+        return VmError::Fatal("database query stopped: the time limit was reached".into());
+    }
     if let rusqlite::Error::SqliteFailure(f, _) = &e {
         if f.code == rusqlite::ErrorCode::OperationInterrupted {
             let secs = vm.deadline().map(|_| "the time limit").unwrap_or("a limit");
@@ -128,15 +148,21 @@ fn query(vm: &mut Vm, a: &[Value]) -> R {
                 ValueRef::Null => Value::Null,
                 ValueRef::Integer(i) => Value::Int(i),
                 ValueRef::Real(f) => Value::Float(f),
-                ValueRef::Text(t) => Value::str(String::from_utf8_lossy(t).into_owned()),
-                ValueRef::Blob(b) => Value::str(String::from_utf8_lossy(b).into_owned()),
+                // A value is accounted before it is copied: a row may hold 32 MB, and
+                // invalid UTF-8 in a blob grows up to three times.
+                ValueRef::Text(t) => {
+                    vm.reserve(t.len())?;
+                    Value::str(String::from_utf8_lossy(t).into_owned())
+                }
+                ValueRef::Blob(b) => {
+                    vm.reserve(b.len().saturating_mul(3))?;
+                    Value::str(String::from_utf8_lossy(b).into_owned())
+                }
             };
             m.insert(Key::Str(n.clone()), v);
         }
         out.push(Value::map(m));
-        if out.len() % 256 == 0 {
-            vm.check_memory()?;
-        }
+        vm.check_memory()?;
     }
     Ok(Value::list(out))
 }
@@ -204,8 +230,18 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
     if let Some(deadline) = vm.deadline() {
         c.progress_handler(10_000, Some(move || std::time::Instant::now() > deadline));
     }
-    // Pragmas that change process-wide state or touch other files are refused.
-    c.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
+    // SQLite runs one `LIKE` or `GLOB` as a single step, which the progress
+    // handler cannot stop (a long text and pattern take minutes): these do.
+    like_functions(&c, vm.deadline()).map_err(|e| db_error(vm, e))?;
+    c.authorizer(Some(sqlite_authorizer));
+    vm.resources.push(Some(Box::new(Db { conn: c, _dir: dir, depth: std::cell::Cell::new(0) })));
+    Ok(Value::Int(vm.resources.len() as i64 - 1))
+}
+
+/// Refuses `ATTACH`/`DETACH` and pragmas that change process-wide state, touch
+/// other files or lift the memory caps (scripts and migrations alike).
+pub(crate) fn sqlite_authorizer(ctx: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization {
+    {
         use rusqlite::hooks::{AuthAction, Authorization};
         match ctx.action {
             AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
@@ -223,6 +259,8 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
                     "cache_size",
                     "max_page_count",
                     "temp_store",
+                    // It registers SQLite's own `like()` again, which the time limit cannot stop.
+                    "case_sensitive_like",
                 ];
                 if blocked.contains(&name.as_str()) {
                     Authorization::Deny
@@ -232,9 +270,246 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
             }
             _ => Authorization::Allow,
         }
-    }));
-    vm.resources.push(Some(Box::new(Db { conn: c, _dir: dir })));
-    Ok(Value::Int(vm.resources.len() as i64 - 1))
+    }
+}
+
+/// One piece of a `LIKE` or `GLOB` pattern.
+enum Pat {
+    /// `%` or `*`.
+    Any,
+    /// `_` or `?`.
+    One,
+    Char(char),
+    /// `[...]` in `GLOB`: ranges, and whether it is negated (`[^...]`).
+    Class(Vec<(char, char)>, bool),
+}
+
+/// The longest pattern accepted (SQLite's default `SQLITE_LIMIT_LIKE_PATTERN_LENGTH`).
+const MAX_PATTERN: usize = 50_000;
+
+fn like_pattern(p: &str, escape: Option<char>) -> Vec<Pat> {
+    let mut out = Vec::new();
+    let mut it = p.chars();
+    while let Some(c) = it.next() {
+        out.push(match c {
+            c if Some(c) == escape => match it.next() {
+                Some(n) => Pat::Char(n),
+                // A pattern ending in its escape character matches nothing, as in SQLite.
+                None => Pat::Class(Vec::new(), false),
+            },
+            '%' => Pat::Any,
+            '_' => Pat::One,
+            c => Pat::Char(c),
+        });
+    }
+    out
+}
+
+fn glob_pattern(p: &str) -> Vec<Pat> {
+    let chars: Vec<char> = p.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        out.push(match c {
+            '*' => Pat::Any,
+            '?' => Pat::One,
+            '[' => {
+                let negated = chars.get(i) == Some(&'^');
+                if negated {
+                    i += 1;
+                }
+                let mut ranges = Vec::new();
+                if chars.get(i) == Some(&']') {
+                    ranges.push((']', ']'));
+                    i += 1;
+                }
+                let mut prior: Option<char> = None;
+                while i < chars.len() && chars[i] != ']' {
+                    let c = chars[i];
+                    match (c, prior, chars.get(i + 1)) {
+                        ('-', Some(lo), Some(&hi)) if hi != ']' => {
+                            ranges.push((lo, hi));
+                            prior = None;
+                            i += 2;
+                        }
+                        _ => {
+                            ranges.push((c, c));
+                            prior = Some(c);
+                            i += 1;
+                        }
+                    }
+                }
+                if i >= chars.len() {
+                    // An unclosed `[` matches nothing, as in SQLite.
+                    return vec![Pat::Class(Vec::new(), false)];
+                }
+                i += 1;
+                Pat::Class(ranges, negated)
+            }
+            c => Pat::Char(c),
+        });
+    }
+    out
+}
+
+/// Whether `text` matches `pat`, or `None` when `deadline` passed first. The
+/// usual single-backtrack wildcard match: at most text × pattern steps.
+fn wild_match(text: &str, pat: &[Pat], fold: bool, deadline: Option<std::time::Instant>) -> Option<bool> {
+    let same = |a: char, b: char| if fold { a.eq_ignore_ascii_case(&b) } else { a == b };
+    let one = |p: &Pat, c: char| match p {
+        Pat::One => true,
+        Pat::Char(x) => same(*x, c),
+        Pat::Class(ranges, negated) => ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi) != *negated,
+        Pat::Any => false,
+    };
+    let (mut t, mut p) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    let mut steps = 0u32;
+    while t < text.len() {
+        steps = steps.wrapping_add(1);
+        if steps.is_multiple_of(1 << 16) && deadline.is_some_and(|d| std::time::Instant::now() > d) {
+            return None;
+        }
+        let c = text[t..].chars().next().unwrap_or('\0');
+        if p < pat.len() && one(&pat[p], c) {
+            t += c.len_utf8();
+            p += 1;
+        } else if p < pat.len() && matches!(pat[p], Pat::Any) {
+            star = Some((p, t));
+            p += 1;
+        } else if let Some((sp, st)) = star {
+            let next = st + text[st..].chars().next().map_or(1, char::len_utf8);
+            star = Some((sp, next));
+            p = sp + 1;
+            t = next;
+        } else {
+            return Some(false);
+        }
+    }
+    while p < pat.len() && matches!(pat[p], Pat::Any) {
+        p += 1;
+    }
+    Some(p == pat.len())
+}
+
+/// Replaces SQLite's `like()` (two and three arguments) and `glob()` with
+/// versions that stop when the script's time limit passes.
+fn like_functions(c: &Connection, deadline: Option<std::time::Instant>) -> rusqlite::Result<()> {
+    use rusqlite::functions::{Context, FunctionFlags};
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    fn text(ctx: &Context, i: usize) -> rusqlite::Result<Option<String>> {
+        Ok(match ctx.get_raw(i) {
+            ValueRef::Null => None,
+            ValueRef::Text(t) | ValueRef::Blob(t) => Some(String::from_utf8_lossy(t).into_owned()),
+            ValueRef::Integer(i) => Some(i.to_string()),
+            ValueRef::Real(f) => Some(real_text(f)),
+        })
+    }
+    let run = move |ctx: &Context, glob: bool| -> rusqlite::Result<Option<bool>> {
+        let (Some(p), Some(t)) = (text(ctx, 0)?, text(ctx, 1)?) else { return Ok(None) };
+        if p.len() > MAX_PATTERN {
+            return Err(rusqlite::Error::UserFunctionError("LIKE or GLOB pattern too complex".into()));
+        }
+        let pat = if glob {
+            glob_pattern(&p)
+        } else {
+            let escape = if ctx.len() > 2 {
+                match text(ctx, 2)? {
+                    Some(e) if e.chars().count() == 1 => e.chars().next(),
+                    None => return Ok(None),
+                    _ => {
+                        return Err(rusqlite::Error::UserFunctionError(
+                            "ESCAPE expression must be a single character".into(),
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
+            like_pattern(&p, escape)
+        };
+        match wild_match(&t, &pat, !glob, deadline) {
+            Some(m) => Ok(Some(m)),
+            None => Err(rusqlite::Error::UserFunctionError("the time limit was reached".into())),
+        }
+    };
+    c.create_scalar_function("like", 2, flags, move |ctx| run(ctx, false))?;
+    c.create_scalar_function("like", 3, flags, move |ctx| run(ctx, false))?;
+    c.create_scalar_function("glob", 2, flags, move |ctx| run(ctx, true))?;
+
+    // SQLite's `instr()`, `replace()` and `trim(X, Y)` search naively (text × pattern
+    // in one step, minutes on long values): these search in linear time.
+    let text_arg = |ctx: &Context, i: usize| -> rusqlite::Result<Option<String>> { text(ctx, i) };
+    c.create_scalar_function("instr", 2, flags, move |ctx| {
+        let (Some(h), Some(n)) = (text_arg(ctx, 0)?, text_arg(ctx, 1)?) else { return Ok(None) };
+        Ok(Some(h.find(n.as_str()).map_or(0, |b| h[..b].chars().count() as i64 + 1)))
+    })?;
+    c.create_scalar_function("replace", 3, flags, move |ctx| {
+        let (Some(x), Some(y), Some(z)) = (text_arg(ctx, 0)?, text_arg(ctx, 1)?, text_arg(ctx, 2)?) else {
+            return Ok(None);
+        };
+        if y.is_empty() {
+            return Ok(Some(x));
+        }
+        let grows = z.len().saturating_sub(y.len());
+        if grows > 0 && x.len().saturating_add(x.matches(y.as_str()).count().saturating_mul(grows)) > MAX_TEXT {
+            return Err(rusqlite::Error::UserFunctionError("string or blob too big".into()));
+        }
+        Ok(Some(x.replace(y.as_str(), &z)))
+    })?;
+    for (name, left, right) in [("trim", true, true), ("ltrim", true, false), ("rtrim", false, true)] {
+        c.create_scalar_function(name, 2, flags, move |ctx| {
+            let (Some(x), Some(y)) = (text_arg(ctx, 0)?, text_arg(ctx, 1)?) else { return Ok(None) };
+            let set: std::collections::HashSet<char> = y.chars().collect();
+            let mut t = x.as_str();
+            if left {
+                t = t.trim_start_matches(|c| set.contains(&c));
+            }
+            if right {
+                t = t.trim_end_matches(|c| set.contains(&c));
+            }
+            Ok(Some(t.to_string()))
+        })?;
+    }
+    Ok(())
+}
+
+/// The longest text or blob SQLite allows here (`SQLITE_LIMIT_LENGTH`).
+const MAX_TEXT: usize = 32 * 1024 * 1024;
+
+/// A real number as SQLite writes it as text (`%!.15g`: `1.0`, `0.3`, `1.0e+20`).
+fn real_text(f: f64) -> String {
+    if !f.is_finite() {
+        return if f.is_nan() {
+            "NaN".into()
+        } else if f > 0.0 {
+            "Inf".into()
+        } else {
+            "-Inf".into()
+        };
+    }
+    let sci = format!("{f:.14e}");
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    // Trailing zeros go, but one digit stays after the point.
+    let trim = |t: &str| -> String {
+        let t = if t.contains('.') { t.trim_end_matches('0') } else { t };
+        if t.ends_with('.') {
+            format!("{t}0")
+        } else if t.contains('.') {
+            t.to_string()
+        } else {
+            format!("{t}.0")
+        }
+    };
+    if !(-4..15).contains(&exp) {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{}e{sign}{:02}", trim(mantissa), exp.abs())
+    } else {
+        trim(&format!("{:.*}", (14 - exp).max(0) as usize, f))
+    }
 }
 
 fn is_identifier(t: &str) -> bool {
@@ -275,7 +550,20 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             if !is_sqlite(vm, &a[0]) {
                 return crate::netdb::raw(vm, a);
             }
-            conn(vm, &a[0])?.execute_batch(cmd).map_err(|e| db_error(vm, e))?;
+            let db = vm
+                .resources
+                .get(int(&a[0]) as usize)
+                .and_then(|r| r.as_ref())
+                .and_then(|b| b.downcast_ref::<Db>())
+                .ok_or_else(|| vm.throw("DatabaseError", "the database connection is closed"))?;
+            let (sqls, depth) = transaction_sql(cmd, db.depth.get());
+            if cmd == "ROLLBACK" {
+                db.depth.set(depth);
+            }
+            for sql in &sqls {
+                db.conn.execute_batch(sql).map_err(|e| db_error(vm, e))?;
+            }
+            db.depth.set(depth);
             Ok(Value::Null)
         },
         "__db_close" => |vm, a| {

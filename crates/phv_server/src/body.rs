@@ -11,6 +11,12 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// The most of a body in memory handed to the connection at once. The
+/// connection copies what it is given into its own buffer, so a client that
+/// stops reading holds this much of it, while the rest stays shared (and
+/// counted in the output total) until it is sent.
+const FRAME: usize = 64 << 10;
+
 /// A response body: in memory, or read from a file as it is sent (static files
 /// and `response()->file()`), so large files never sit in memory whole.
 pub enum RespBody {
@@ -67,7 +73,18 @@ impl Body for RespBody {
 
     fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
         match &mut *self {
-            RespBody::Full(b) => Poll::Ready(b.take().filter(|b| !b.is_empty()).map(|b| Ok(Frame::data(b)))),
+            RespBody::Full(b) => {
+                let Some(rest) = b.as_mut().filter(|b| !b.is_empty()) else {
+                    *b = None;
+                    return Poll::Ready(None);
+                };
+                // A slice keeps the whole body (and its count) alive until it is sent.
+                let part = rest.split_to(rest.len().min(FRAME));
+                if rest.is_empty() {
+                    *b = None;
+                }
+                Poll::Ready(Some(Ok(Frame::data(part))))
+            }
             RespBody::File { file, left, buf } => {
                 if *left == 0 {
                     return Poll::Ready(None);
@@ -168,11 +185,54 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StallGuard<S> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
+
+    // Vectored writes let the connection queue the body's slices instead of
+    // copying them, so the shared bytes stay counted until they are written.
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_write_vectored(cx, bufs) {
+            Poll::Pending if this.stalled(cx) => Poll::Ready(Err(stall_error())),
+            Poll::Pending => Poll::Pending,
+            ready => {
+                this.timer = None;
+                ready
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A body in memory is handed over in slices of at most 64 KB, each keeping
+    /// the whole body counted until the last one is dropped.
+    #[test]
+    fn bodies_are_sent_in_counted_slices() {
+        use std::task::Waker;
+        let total = Arc::new(AtomicUsize::new(0));
+        let mut body = RespBody::counted(vec![b'x'; 200_000], &total);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut parts = Vec::new();
+        while let Poll::Ready(Some(Ok(f))) = Pin::new(&mut body).poll_frame(&mut cx) {
+            parts.push(f.into_data().unwrap());
+        }
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [65536, 65536, 65536, 3392]);
+        drop(body);
+        assert_eq!(total.load(Ordering::Relaxed), 200_000);
+        parts.truncate(1);
+        assert_eq!(total.load(Ordering::Relaxed), 200_000);
+        parts.clear();
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn counted_output_is_released_with_its_last_copy() {

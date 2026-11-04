@@ -21,6 +21,9 @@ updated: 1
 qty: 4
 rolled back: stop
 rows: 1
+inner rolled back: inner
+outer rolled back: outer
+rows: 1
 error: null value in column "name" of relation "phv_items" violates not-null constraint (Failing row contains (2, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null).)
 error: error serializing parameter 0: cannot pass a string as a parameter of type int4; cast it in the SQL, e.g. ({$value}::text)::int4
 error: error deserializing column 0: PHV cannot read values of type interval; cast the column in the SQL, e.g. column::text

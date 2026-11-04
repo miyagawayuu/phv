@@ -227,13 +227,51 @@ fn write_migrated(input: &Path, out: &Path, text: &str, force: bool) -> Result<(
     f.write_all(text.as_bytes()).map_err(|e| format!("cannot write {shown}: {e}"))
 }
 
+/// Refuses an output path with a link (or junction) among its directories
+/// below the current directory: a project could plant one to send the file
+/// elsewhere.
+/// `dir` below `base`; on Windows names are compared regardless of case
+/// (`C:\Users` and `c:\users` are one directory).
+fn strip_base(base: &Path, dir: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = dir.strip_prefix(base) {
+        return Some(rel.to_path_buf());
+    }
+    if !cfg!(windows) {
+        return None;
+    }
+    let mut d = dir.components();
+    for b in base.components() {
+        let c = d.next()?;
+        if !c.as_os_str().to_string_lossy().eq_ignore_ascii_case(&b.as_os_str().to_string_lossy()) {
+            return None;
+        }
+    }
+    Some(d.as_path().to_path_buf())
+}
+
+pub(crate) fn check_output_dirs(out: &Path) -> Result<(), String> {
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Some(link) = linked_component(&cwd, parent) {
+            return Err(format!("{} is a link; refusing to write through it", link.display()));
+        }
+    }
+    Ok(())
+}
+
 /// The first component of `dir` that exists and is a link or a junction.
 ///
 /// Only the part of `dir` below `base` (the current directory) is looked at:
 /// a link planted in a project is what is refused, while an absolute path the
 /// user wrote may go through the system's own links (`/var` on macOS).
 fn linked_component(base: &Path, dir: &Path) -> Option<PathBuf> {
-    let rel = if dir.is_absolute() { dir.strip_prefix(base).ok()? } else { dir };
+    let stripped;
+    let rel = if dir.is_absolute() {
+        stripped = strip_base(base, dir)?;
+        stripped.as_path()
+    } else {
+        dir
+    };
     let mut at = base.to_path_buf();
     for c in rel.components() {
         if !matches!(c, std::path::Component::Normal(_)) {

@@ -2,49 +2,55 @@
 import std.db.{Database, Redis};
 
 $r = Redis::connect("main");
-$r->delete("phv:greeting");
-echo "missing: ", $r->get("phv:greeting") ?? "null", "\n";
-$r->set("phv:greeting", "hello ?", 60);
-echo "get: ", $r->get("phv:greeting") ?? "null", "\n";
-echo "exists: ", $r->exists("phv:greeting") ? "yes" : "no", "\n";
-$ttl = $r->ttl("phv:greeting");
+$r->delete("t:greeting");
+echo "missing: ", $r->get("t:greeting") ?? "null", "\n";
+$r->set("t:greeting", "hello ?", 60);
+echo "get: ", $r->get("t:greeting") ?? "null", "\n";
+echo "exists: ", $r->exists("t:greeting") ? "yes" : "no", "\n";
+$ttl = $r->ttl("t:greeting");
 echo "ttl ok: ", $ttl > 0 && $ttl <= 60 ? "yes" : "no", "\n";
-$r->set("phv:greeting", "plain");
-echo "ttl after plain set: ", $r->ttl("phv:greeting"), "\n";
-echo "expire: ", $r->expire("phv:greeting", 30) ? "yes" : "no", "\n";
-echo "delete: ", $r->delete("phv:greeting") ? "yes" : "no", " ", $r->delete("phv:greeting") ? "yes" : "no", "\n";
+$r->set("t:greeting", "plain");
+echo "ttl after plain set: ", $r->ttl("t:greeting"), "\n";
+echo "expire: ", $r->expire("t:greeting", 30) ? "yes" : "no", "\n";
+echo "delete: ", $r->delete("t:greeting") ? "yes" : "no", " ", $r->delete("t:greeting") ? "yes" : "no", "\n";
 
-$r->delete("phv:counter");
-echo "incr: ", $r->incr("phv:counter"), " ", $r->incr("phv:counter", 10), " ", $r->incr("phv:counter", -3), "\n";
-$r->set("phv:text", "abc");
+$r->delete("t:counter");
+echo "incr: ", $r->incr("t:counter"), " ", $r->incr("t:counter", 10), " ", $r->incr("t:counter", -3), "\n";
+$r->set("t:text", "abc");
 try {
-    $r->incr("phv:text");
+    $r->incr("t:text");
 } catch (DatabaseError $e) {
     echo "error: ", $e->message, "\n";
 }
 
-$r->delete("phv:user");
-echo "hset: ", $r->hset("phv:user", "name", "Ann") ? "new" : "old", " ", $r->hset("phv:user", "name", "Bo") ? "new" : "old", "\n";
-$r->hset("phv:user", "city", "Kyoto");
-echo "hget: ", $r->hget("phv:user", "name") ?? "null", " ", $r->hget("phv:user", "nope") ?? "null", "\n";
-echo "hgetAll: ", json_encode($r->hgetAll("phv:user")), "\n";
-echo "hdel: ", $r->hdel("phv:user", "city") ? "yes" : "no", "\n";
+$r->delete("t:user");
+echo "hset: ", $r->hset("t:user", "name", "Ann") ? "new" : "old", " ", $r->hset("t:user", "name", "Bo") ? "new" : "old", "\n";
+$r->hset("t:user", "city", "Kyoto");
+echo "hget: ", $r->hget("t:user", "name") ?? "null", " ", $r->hget("t:user", "nope") ?? "null", "\n";
+echo "hgetAll: ", json_encode($r->hgetAll("t:user")), "\n";
+echo "hdel: ", $r->hdel("t:user", "city") ? "yes" : "no", "\n";
 
-$r->delete("phv:queue");
-$r->rpush("phv:queue", "a");
-$r->rpush("phv:queue", "b");
-echo "rpush: ", $r->rpush("phv:queue", "c"), "\n";
-echo "lrange: ", json_encode($r->lrange("phv:queue", 0, -1)), "\n";
-echo "lpop: ", $r->lpop("phv:queue") ?? "null", "\n";
-echo "lrange: ", json_encode($r->lrange("phv:queue", 0, -1)), "\n";
+$r->delete("t:queue");
+$r->rpush("t:queue", "a");
+$r->rpush("t:queue", "b");
+echo "rpush: ", $r->rpush("t:queue", "c"), "\n";
+echo "lrange: ", json_encode($r->lrange("t:queue", 0, -1)), "\n";
+echo "lpop: ", $r->lpop("t:queue") ?? "null", "\n";
+echo "lrange: ", json_encode($r->lrange("t:queue", 0, -1)), "\n";
 
 try {
     Database::connect("main");
 } catch (DatabaseError $e) {
     echo "error: ", $e->message, "\n";
 }
-foreach (["phv:counter", "phv:text", "phv:user", "phv:queue"] as $k) {
+foreach (["t:counter", "t:text", "t:user", "t:queue"] as $k) {
     $r->delete($k);
+}
+// Sessions and rate limits live under `phv:`: scripts cannot read or forge them.
+try {
+    $r->get("phv:session:x");
+} catch (ValueError $e) {
+    echo "refused: ", $e->message, "\n";
 }
 $r->close();
 try {

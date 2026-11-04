@@ -199,6 +199,13 @@ pub(crate) struct Response {
     body: Vec<u8>,
 }
 
+impl Response {
+    /// The bytes it holds on the heap.
+    pub(crate) fn heap_size(&self) -> usize {
+        self.body.capacity() + self.headers.iter().map(|(k, v)| k.capacity() + v.capacity() + 48).sum::<usize>()
+    }
+}
+
 fn encode_query(pairs: &[(String, String)]) -> String {
     const SET: &percent_encoding::AsciiSet =
         &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');

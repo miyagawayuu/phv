@@ -18,6 +18,20 @@ pub(crate) enum Reply {
     Array(Vec<Reply>),
 }
 
+impl Reply {
+    /// The bytes it holds on the heap.
+    pub(crate) fn heap_size(&self) -> usize {
+        match self {
+            Reply::Nil | Reply::Int(_) => 0,
+            Reply::Simple(s) => s.capacity(),
+            Reply::Bulk(b) => b.capacity(),
+            Reply::Array(items) => {
+                items.capacity() * std::mem::size_of::<Reply>() + items.iter().map(Reply::heap_size).sum::<usize>()
+            }
+        }
+    }
+}
+
 pub(crate) enum RedisError {
     /// The server answered with an error; the connection is still usable.
     Server(String),

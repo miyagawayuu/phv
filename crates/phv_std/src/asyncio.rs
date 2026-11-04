@@ -133,7 +133,11 @@ pub fn wait(vm: &mut Vm, a: &[Value]) -> R {
             // A little past the work's own deadline, so its error arrives first.
             let left = until.saturating_duration_since(Instant::now()) + Duration::from_secs(1);
             match rx.recv_timeout(left) {
-                Ok(outcome) => convert(outcome),
+                Ok(outcome) => {
+                    // Allocated on the work's thread, freed on this one: counted here.
+                    phv_vm::alloc::charge_thread(outcome_size(&outcome));
+                    convert(outcome)
+                }
                 Err(_) => {
                     vm.check_limits()?;
                     Err(("NetworkError", "the operation timed out".to_string()))
@@ -147,11 +151,23 @@ pub fn wait(vm: &mut Vm, a: &[Value]) -> R {
         *until = Instant::now();
     }
     drop(task);
-    vm.resources[i as usize] = Some(Box::new(Task::Done(result.clone())));
+    // The `Future` keeps the result; this handle keeps none (it would hold every
+    // response of the run until the end).
+    vm.resources[i as usize] = Some(Box::new(Task::Done(Err(("ValueError", "already awaited".to_string())))));
     vm.check_limits()?;
     match result {
         Ok(v) => Ok(v),
         Err((class, msg)) => Err(vm.throw(class, msg)),
+    }
+}
+
+/// The bytes an outcome holds on the heap.
+fn outcome_size(outcome: &Outcome) -> usize {
+    match outcome {
+        Outcome::Http(Ok(r)) => r.heap_size(),
+        Outcome::Db(Ok(d)) => d.heap_size(),
+        Outcome::Redis(Ok(r)) => r.heap_size(),
+        Outcome::Http(Err(e)) | Outcome::Db(Err(e)) | Outcome::Redis(Err(e)) => e.capacity(),
     }
 }
 

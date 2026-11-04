@@ -115,6 +115,9 @@ pub enum EchoContext {
     Unquoted,
     /// Inside a tag, between attributes.
     Tag,
+    /// Right after `<`, `</`, `<!` (or in a script `-`, `<!-`, `<scr`...): the
+    /// value would be read with them, and could start a tag or comment.
+    AfterMarkup,
     /// Inside `<script>`, where an expression goes.
     Script,
     /// Inside `<script>`, in a string, template literal, comment or regular

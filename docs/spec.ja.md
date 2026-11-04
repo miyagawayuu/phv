@@ -295,6 +295,7 @@ try {
 ```
 
 `getTraceAsString()` は、例外が最初に投げられたときの呼び出しを内側から順に返す(投げられていない例外では空)。
+深いトレースは内側と外側の 50 個ずつの呼び出しを残し、名前は 200 文字までにする。
 捕まえられなかった例外は原因も表示する: `Uncaught ConfigError: bad port (caused by ValueError: ...)`。
 
 ## 8. 関数
@@ -657,7 +658,8 @@ echo render("views/layout.phv.html", title: "Home", body: $html);
   ```
 
   `layout()` はページかテンプレートのトップレベルの文で、1 回だけ書ける。途中で終わった(`return` した)ページや失敗した
-  ページは包まれない。
+  ページは包まれない。`layout()` を使うページは、テンプレートと同じく、タグ・属性・コメント・`<script>` の中で
+  `layout()` を呼んだり終わったりしてはならない(出力がレイアウトの出力とつながるため)。
 - `render()` は `Html` を返すので、別のテンプレートにそのまま渡して埋め込める(レイアウト)。
 - テンプレートは開いたものをすべて閉じる。タグ、属性、コメント、`<script>` / `<style>` / `<textarea>` 要素、
   `<svg>` / `<math>` の途中で終わるテンプレートはコンパイルエラー。`Html` の値は `.` で連結できるので、`<a href="` で
@@ -693,14 +695,17 @@ HTML 部分はそのまま出力される。`echo` と `<?= ?>` は同じ規則�
 - エスケープを外す Content-Type は `text/plain`、`application/json`、`text/csv`、`text/css`、`text/javascript`、
   `text/markdown`、`text/calendar`、`application/pdf`、`application/octet-stream`、画像・音声・動画などに限る
   (どれもブラウザが HTML として表示しない型。`X-Content-Type-Options: nosniff` も常に付く)。
-  HTML・XML・SVG・知らない型ではエスケープしたまま。
+  HTML・XML・SVG・知らない型ではエスケープしたまま。JavaScript のレスポンス(`text/javascript` など、ブラウザがスクリプトと
+  して実行する型)に書けるのは `json_html()` の値と数値だけ。文字列やテンプレートの出力はコードになってしまうので実行時
+  エラー。型は何かを出力する前に設定する。
 
 ### HTML の文脈の検査
 
 HTML エスケープが守れるのは、要素の中身と**引用符で囲んだ**属性値だけ。`<?= ?>` と `echo` がそれ以外の場所に
 あるとコンパイルエラーになる。場所の判定はブラウザの構文解析(WHATWG)に合わせている:
-`<textarea>`・`<title>` などの中身、`<script>` の中の `<!--`、`<!-->` や `--!>` のコメント、`<svg>` の中、
-`</scripts>` のように終了タグに見えて違うもの。
+`<textarea>`・`<title>` などの中身、`<script>` の中の `<!--`、`<!-->` や `--!>` のコメント、`<svg>` の中
+(そこの `<script>`・`<style>` の中の CDATA セクションやコメントはエラー)、`<noscript>` の中のマークアップ(マークアップとして
+検査する)、値やブロックの直前の `<`(そこに入る値はタグ名になるのでエラー)、`</scripts>` のように終了タグに見えて違うもの。
 
 | 場所 | 例 | 扱い |
 |---|---|---|
@@ -905,8 +910,8 @@ session()->destroy();                 // ログアウト
   ときだけ)で、それぞれを 1 つの不可分な操作で行う。ログアウトのあとに終わったリクエストが(同じプロセスでも別の
   プロセスでも)セッションを復活させることはなく、同じセッションを作り直す 2 つのリクエストのうち、引き継げるのは 1 つだけ。
 - 保存できるセッションは最大 50,000、データは 256 MB まで(Redis は書くたびにこの範囲に収める)。いっぱいになると、訪問者が一度も戻ってこなかったセッションから先に消し、
-  その次に最も長く使われていないものを消す。Cookie なしのリクエストを大量に送られても(それぞれがセッションを作る)、
-  消えるのはそのセッションで、戻ってくる訪問者のセッションは残る。
+  その次に残りの中で一番新しいものを消す。Cookie を送り返すセッションを大量に作られても、消えるのはそのセッションで、
+  それより前に作られたセッションは消えない。使われないセッションは `session_lifetime` で終わる。
 
 ### CSRF 対策
 
@@ -1032,7 +1037,11 @@ $db->transaction(function () use ($db): void {
   渡されるので、SQL インジェクションは起こらない。`string` を `query()` に渡すことはできない。
 - `Sql` どうしは `.` で連結できる(パラメータも引き継がれる)。`Sql` と `string` は連結できない。
 - 列名やテーブル名を動的に決めたいときは `sql_ident($name)`(英数字と `_` だけを許可して引用する)。
-- `ATTACH` は無効になっていて、許可されたファイル以外のデータベースには触れない。
+- `ATTACH` は無効になっていて、許可されたファイル以外のデータベースには触れない(`phv db migrate` でも)。
+- `LIKE` と `GLOB` もクエリのほかの部分と同じくスクリプトの制限時間で止まる。`instr()`・`replace()`・`trim(X, Y)` は
+  線形時間で探す。`PRAGMA case_sensitive_like` は拒否する(SQLite 自身の `LIKE` に戻ってしまうため)。
+- `transaction()` の中の `transaction()` は(同じ名前の別の `Database` からでも)セーブポイントになる。投げると自分の
+  変更だけが取り消され、一番外側が終わるまで何もコミットされない。
 - SQL のエラーは `DatabaseError`。
 
 #### PostgreSQL と MySQL
@@ -1102,7 +1111,8 @@ $redis->rpush("jobs", "a");  $redis->lpop("jobs");  $redis->lrange("jobs", 0, -1
 
 メソッド: `get`、`set`、`delete`、`exists`、`incr`、`expire`、`ttl`、`hget`、`hset`、`hdel`、`hgetAll`、
 `rpush`、`lpop`、`lrange`、`close`。送れるのはこれらのコマンドだけで、`KEYS`、`FLUSHALL`、`CONFIG`、`EVAL`
-などは使えません。リモートのサーバーには `rediss://` の URL が必要です(または `tls = false`)。エラーは `DatabaseError`。
+などは使えません。`phv:` で始まるキーは PHV のもの(Redis に置くセッションとレート制限)で、`ValueError` になります。
+リモートのサーバーには `rediss://` の URL が必要です(または `tls = false`)。エラーは `DatabaseError`。
 各コマンドが待つのはスクリプトの制限時間までで、スクリプトに残っているメモリより大きい応答は拒否します。
 
 ### WebSocket (std.net)
@@ -1367,7 +1377,7 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
 ページのレスポンスには既定で次のポリシーが付く(`{nonce}` はレスポンスごとの `'nonce-...'`。`'nonce-{nonce}'` と書いても同じ)。
 
 ```
-default-src 'self'; script-src 'self' {nonce}; style-src 'self' 'unsafe-inline';
+default-src 'self'; script-src {nonce} 'strict-dynamic'; style-src 'self' 'unsafe-inline';
 img-src 'self' data: https:; font-src 'self' data:; object-src 'none'; base-uri 'self';
 form-action 'self'; frame-ancestors 'self'
 ```
@@ -1379,7 +1389,9 @@ form-action 'self'; frame-ancestors 'self'
   テンプレートに書くとコンパイル時に警告が出る(`csp` でインラインのコードを許可しているときは出ない)。
 - 文字列から組み立てた `<script>` に nonce が必要なときは `csp_nonce()` を使う
   (`raw("<script nonce=\"" . csp_nonce() . "\">...</script>")`)。
-- 静的ファイルとエラーページには nonce のないポリシーが付く(静的な `.html` のインラインスクリプトは動かない)。
+- ページが実行するのは nonce の付いたスクリプトと、それが読み込むスクリプトだけ(`'strict-dynamic'`)。エスケープを
+  すり抜けた `<script src>` は、サイトのスクリプトも読み込めない。
+- 静的ファイルとエラーページには nonce のない、`script-src 'self'` のポリシーが付く(静的な `.html` のインラインスクリプトは動かない)。
 - 変更: `[security] csp = "off"` で付けない。`csp = "default-src 'self'; script-src 'self' {nonce}"` のように
   書くとそのポリシーを使う(`{nonce}` は `'nonce-...'` になる)。
 

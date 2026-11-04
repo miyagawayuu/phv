@@ -325,6 +325,10 @@ impl<'a> Checker<'a> {
                 "values cannot be inserted between the attributes of a tag",
                 "write each attribute as `name=\"<?= $value ?>\"`",
             ),
+            AfterMarkup => (
+                "a value cannot follow `<` (or `</`, `<!`, `-`) here: it would be read with it",
+                "it could start a tag, comment or end tag; put a space between them (`a < <?= $n ?>`)",
+            ),
             // Only values checked for this context: HTML escaping (`escape()`,
             // templates) does not stop `javascript:` URLs or script code.
             Url if numeric || h.ty == Type::SafeUrl => return,

@@ -66,6 +66,10 @@ impl Conn {
                     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
                 }
                 let c = rusqlite::Connection::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+                // A migration from a repository is code: it may change this database,
+                // but not attach (create or overwrite) another file.
+                c.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_ATTACHED, 0).map_err(|e| e.to_string())?;
+                c.authorizer(Some(crate::db::sqlite_authorizer));
                 c.execute_batch(
                     "CREATE TABLE IF NOT EXISTS phv_migrations (name TEXT PRIMARY KEY, checksum TEXT NOT NULL, \
                      applied_at TEXT NOT NULL)",

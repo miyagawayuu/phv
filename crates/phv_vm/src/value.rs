@@ -163,6 +163,12 @@ impl Drop for Value {
 /// `int` and `float` compare numerically. Objects compare by identity.
 /// Iterative, so deeply nested values cannot overflow the stack.
 pub fn values_equal(a: &Value, b: &Value) -> bool {
+    values_equal_metered(a, b, &mut |_| true).unwrap_or(false)
+}
+
+/// `values_equal`, telling `meter` how many bytes each string comparison
+/// covers; `None` when `meter` returns false (stop: the time limit passed).
+pub fn values_equal_metered(a: &Value, b: &Value, meter: &mut dyn FnMut(usize) -> bool) -> Option<bool> {
     let mut work: Vec<(&Value, &Value)> = vec![(a, b)];
     // Pairs of lists/maps already queued. Shared structure (`$a = [$a, $a]`)
     // would otherwise be compared exponentially often; each pair is compared once.
@@ -175,11 +181,20 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
             (Value::Int(x), Value::Int(y)) => x == y,
             (Value::Float(x), Value::Float(y)) => x == y,
             (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => (*x as f64) == *y,
-            (Value::Str(x), Value::Str(y)) | (Value::Html(x), Value::Html(y)) => x == y,
+            (Value::Str(x), Value::Str(y)) | (Value::Html(x), Value::Html(y)) => {
+                if Rc::ptr_eq(x, y) {
+                    true
+                } else {
+                    if !meter(x.len().min(y.len()) + 1) {
+                        return None;
+                    }
+                    x == y
+                }
+            }
             (Value::List(x), Value::List(y)) => {
                 if !Rc::ptr_eq(x, y) && first_visit(Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize) {
                     if x.len() != y.len() {
-                        return false;
+                        return Some(false);
                     }
                     work.extend(x.iter().zip(y.iter()));
                 }
@@ -188,12 +203,12 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
             (Value::Map(x), Value::Map(y)) => {
                 if !Rc::ptr_eq(x, y) && first_visit(Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize) {
                     if x.len() != y.len() {
-                        return false;
+                        return Some(false);
                     }
                     for (k, v) in x.iter() {
                         match y.get(k) {
                             Some(w) => work.push((v, w)),
-                            None => return false,
+                            None => return Some(false),
                         }
                     }
                 }
@@ -204,10 +219,10 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
             _ => false,
         };
         if !same {
-            return false;
+            return Some(false);
         }
     }
-    true
+    Some(true)
 }
 
 /// Ordering for `<`, `<=`, `<=>` and sorting. The type checker only allows
@@ -218,6 +233,7 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
         (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
         (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal),
+        (Value::Str(x), Value::Str(y)) if Rc::ptr_eq(x, y) => Ordering::Equal,
         (Value::Str(x), Value::Str(y)) => x.as_str().cmp(y.as_str()),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         _ => Ordering::Equal,

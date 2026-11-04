@@ -173,9 +173,10 @@ pub fn accepts_gzip(req: &HeaderMap) -> bool {
 #[derive(Clone, Copy)]
 pub struct Personal;
 
-/// Marks a static file's response (its bytes come from the site, not the request).
-#[derive(Clone, Copy)]
-pub struct StaticFile;
+/// Marks a static file's response (its bytes come from the site, not the
+/// request), with the file it comes from.
+#[derive(Clone)]
+pub struct StaticFile(pub String);
 
 /// Whether a response may be compressed. Responses for one visitor (they set
 /// cookies, use the session or carry a CSRF token) are not: compressing a

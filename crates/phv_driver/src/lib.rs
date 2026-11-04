@@ -215,6 +215,30 @@ fn find_root_in(cwd: &Path, entry: &Path) -> PathBuf {
 /// Largest source file (module, template or entry script) that is read.
 const MAX_SOURCE: u64 = 8 << 20;
 
+/// Writes `bytes` to `path` without following a link there: into a new file
+/// with a random name beside it (created only if nothing has that name), then
+/// renamed over `path`, which replaces a link rather than writing to its target.
+pub fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no file name"))?;
+    let mut r = [0u8; 8];
+    getrandom::fill(&mut r).map_err(|e| Error::other(e.to_string()))?;
+    let hex: String = r.iter().map(|b| format!("{b:02x}")).collect();
+    let tmp = dir.join(format!(".{}.{hex}.tmp", name.to_string_lossy()));
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
 /// Reads a source file: only a regular file (not a pipe or a device, which could
 /// block forever), of at most `MAX_SOURCE` bytes.
 pub fn read_source(path: &Path) -> std::io::Result<String> {
@@ -638,7 +662,8 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
         deps: Vec::new(),
     };
     let toml = root.join("phv.toml");
-    loader.deps.push(Dep::new(&toml, std::fs::read(&toml).ok().as_deref()));
+    // Bounded like every source file (a huge phv.toml would be read whole on each keystroke).
+    loader.deps.push(Dep::new(&toml, read_source(&toml).ok().as_ref().map(|t| t.as_bytes())));
     // The packages' own [dependencies] decide what their modules may import.
     let mut manifests: Vec<PathBuf> = loader.packages.values().map(|d| d.join("phv.toml")).collect();
     manifests.sort();
