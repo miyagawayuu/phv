@@ -228,13 +228,22 @@ fn write_migrated(input: &Path, out: &Path, text: &str, force: bool) -> Result<(
 }
 
 /// The first component of `dir` that exists and is a link or a junction.
-fn linked_component(dir: &Path) -> Option<PathBuf> {
-    let mut at = PathBuf::new();
-    for c in dir.components() {
-        at.push(c);
-        if matches!(c, std::path::Component::Prefix(_) | std::path::Component::RootDir | std::path::Component::CurDir) {
+///
+/// Only the part of `dir` below `base` (the current directory) is looked at:
+/// a link planted in a project is what is refused, while an absolute path the
+/// user wrote may go through the system's own links (`/var` on macOS).
+fn linked_component(base: &Path, dir: &Path) -> Option<PathBuf> {
+    let rel = if dir.is_absolute() { dir.strip_prefix(base).ok()? } else { dir };
+    let mut at = base.to_path_buf();
+    for c in rel.components() {
+        if !matches!(c, std::path::Component::Normal(_)) {
+            // `..` leaves what can be checked; `.` changes nothing.
+            if matches!(c, std::path::Component::ParentDir) {
+                return None;
+            }
             continue;
         }
+        at.push(c);
         match std::fs::symlink_metadata(&at) {
             Ok(m) if m.file_type().is_symlink() => return Some(at),
             Ok(_) => {}
@@ -480,7 +489,8 @@ fn exec(cmd: Command) -> ExitCode {
             if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
                 // A link (or junction) on the way, planted in a project, would send
                 // the file elsewhere: the directories are checked before any is created.
-                if let Some(link) = linked_component(parent) {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                if let Some(link) = linked_component(&cwd, parent) {
                     eprintln!("error: {} is a link; refusing to write through it", link.display());
                     return ExitCode::FAILURE;
                 }
@@ -551,6 +561,8 @@ fn exec(cmd: Command) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     /// `phv doc` does not write through a planted link (the v0.9.0 audit).
     #[cfg(unix)]
     #[test]
@@ -559,14 +571,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("outside")).unwrap();
         std::os::unix::fs::symlink(dir.join("outside"), dir.join("doc")).unwrap();
-        assert_eq!(super::linked_component(&dir.join("doc/api")), Some(dir.join("doc")));
-        assert_eq!(super::linked_component(&dir.join("plain/api")), None);
+        assert_eq!(super::linked_component(&dir, Path::new("doc/api")), Some(dir.join("doc")));
+        assert_eq!(super::linked_component(&dir, &dir.join("doc/api")), Some(dir.join("doc")));
+        assert_eq!(super::linked_component(&dir, Path::new("plain/api")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn plain_output_directories_are_accepted() {
+        // The temporary directory itself may be under a system link (`/var` on macOS).
         let dir = std::env::temp_dir();
-        assert_eq!(super::linked_component(&dir.join("phv-no-such-dir/doc")), None);
+        assert_eq!(super::linked_component(&dir, Path::new("phv-no-such-dir/doc")), None);
+        assert_eq!(super::linked_component(Path::new("/elsewhere"), &dir.join("x")), None);
     }
 }
