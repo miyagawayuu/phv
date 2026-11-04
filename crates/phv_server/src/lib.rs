@@ -74,6 +74,9 @@ pub struct ServeOptions {
     /// Show error details in the browser.
     pub dev: bool,
     pub time_limit: Duration,
+    /// Reload pages in the browser when a file of the site changes
+    /// (`phv serve --watch`; development only).
+    pub watch: bool,
 }
 
 struct State {
@@ -103,6 +106,8 @@ struct State {
     embedded_tags: HashMap<String, String>,
     /// Compressed static files by `ETag`, and their total size.
     gz_cache: Mutex<(HashMap<String, Bytes>, usize)>,
+    /// `phv serve --watch`: pages get a script that reloads them on changes.
+    watch: bool,
 }
 
 impl State {
@@ -139,6 +144,7 @@ impl State {
             access_log: None,
             embedded_tags: HashMap::new(),
             gz_cache: Mutex::new((HashMap::new(), 0)),
+            watch: false,
         }
     }
 
@@ -262,6 +268,7 @@ fn serve_with(
         }
     };
     let mut state = State::new(root, opts.dev, opts.time_limit, config);
+    state.watch = opts.watch && opts.dev && state.embedded.is_none();
     if let Some((path, _)) = &state.config.access_log {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -365,6 +372,22 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
     // A page answering a request that carries credentials may hold the visitor's
     // secrets next to text from the request: it is never compressed (BREACH).
     let credentialed = req.headers().contains_key("cookie") || req.headers().contains_key("authorization");
+    if state.watch && method == Method::GET && path.starts_with("/__phv/") {
+        let mut r = match path.as_str() {
+            "/__phv/live-reload.js" => simple(StatusCode::OK, "text/javascript; charset=utf-8", LIVE_RELOAD_JS.into()),
+            "/__phv/changes" => {
+                let root = state.root.clone();
+                let skip: Vec<PathBuf> =
+                    state.config.host.permissions.write.iter().map(|w| root.join(w.trim_end_matches('/'))).collect();
+                let stamp = tokio::task::spawn_blocking(move || change_stamp(&root, &skip)).await.unwrap_or_default();
+                simple(StatusCode::OK, "text/plain; charset=utf-8", stamp)
+            }
+            _ => simple(StatusCode::NOT_FOUND, "text/plain", "not found".into()),
+        };
+        r.headers_mut().insert("cache-control", HeaderValue::from_static("no-store"));
+        add_security_headers(&state, &mut r);
+        return Ok(r);
+    }
     let origin = req.headers().get("origin").and_then(|v| v.to_str().ok()).map(str::to_string);
     let cors = state.config.cors.as_ref().zip(origin.as_deref()).filter(|(c, o)| c.allows(o)).map(|(c, _)| c);
     // A CORS preflight is answered here, before rate limits and pages.
@@ -445,6 +468,72 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
     add_security_headers(&state, &mut resp);
     log_request(&state, &ip, &method, &path, resp.status().as_u16(), start);
     Ok(resp)
+}
+
+/// The script `phv serve --watch` adds to pages: it asks for the stamp of the
+/// site's files every second and reloads the page when it changes.
+const LIVE_RELOAD_JS: &str = r#"// phv serve --watch: reloads the page when a file of the site changes.
+(() => {
+  let seen = null;
+  const poll = async () => {
+    try {
+      const r = await fetch("/__phv/changes", { cache: "no-store" });
+      const stamp = await r.text();
+      if (seen !== null && stamp !== seen) {
+        location.reload();
+        return;
+      }
+      seen = stamp;
+    } catch (e) {}
+    setTimeout(poll, 1000);
+  };
+  poll();
+})();
+"#;
+
+/// Files looked at for changes, at most (a huge tree is cut short, not walked).
+const WATCH_MAX_FILES: usize = 10_000;
+
+/// The newest modification time and the number of the site's files: it
+/// changes when a file is saved, added or removed. Data the site writes
+/// (`[permissions] write`), hidden directories and packages are left out.
+fn change_stamp(root: &Path, skip: &[PathBuf]) -> String {
+    let (mut newest, mut count) = (0u128, 0usize);
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            if count >= WATCH_MAX_FILES {
+                break;
+            }
+            let (path, name) = (e.path(), e.file_name().to_string_lossy().into_owned());
+            let Ok(ty) = e.file_type() else { continue };
+            if ty.is_symlink() || name.starts_with('.') || skip.contains(&path) {
+                continue;
+            }
+            if ty.is_dir() {
+                if !matches!(name.as_str(), "vendor" | "node_modules" | "target") {
+                    dirs.push(path);
+                }
+                continue;
+            }
+            count += 1;
+            if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                let t = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+                newest = newest.max(t);
+            }
+        }
+    }
+    format!("{newest}-{count}")
+}
+
+/// Adds the live-reload script before `</body>` (or at the end).
+fn inject_live_reload(html: &mut String) {
+    const TAG: &str = "<script src=\"/__phv/live-reload.js\" defer></script>";
+    match html.to_ascii_lowercase().rfind("</body>") {
+        Some(i) => html.insert_str(i, TAG),
+        None => html.push_str(TAG),
+    }
 }
 
 /// gzip for a text response in memory, when the client accepts it. Static
@@ -1048,7 +1137,11 @@ impl State {
                 Err(Err(_)) => RespBody::full(Bytes::new()),
             }
         } else {
-            RespBody::counted(outcome.output.into_bytes(), &self.buffered)
+            let mut output = outcome.output;
+            if self.watch && http.content_type.as_deref().is_none_or(|c| c.starts_with("text/html")) {
+                inject_live_reload(&mut output);
+            }
+            RespBody::counted(output.into_bytes(), &self.buffered)
         };
         let mut r = Response::new(body);
         *r.status_mut() = status;

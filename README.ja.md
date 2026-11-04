@@ -64,8 +64,10 @@ echo greet($name);                                 // Web ページでは自動�
   - **動的な実行がない**: `eval` や可変変数はない。
   - 9 回の監査と脆弱性診断の結果は [docs/security-audit.ja.md](docs/security-audit.ja.md) にある。
 - **速度**: 型に特化したレジスタ型バイトコード VM、Cranelift による JIT、バイトコードのディスクキャッシュ
-- **ツール**: テストランナー(同じプロセスで動く HTTP クライアント `std.testing` 付き)、フォーマッタ、Language Server、
-  パッケージマネージャ、データベースのマイグレーション、PHP からの移行ツール。
+- **ツール**: プロジェクトやサイトを作る `phv new`、テストランナー(同じプロセスで動く HTTP クライアント `std.testing`、
+  前後のフック、JUnit の報告、カバレッジ付き)、ライブリロード(`phv serve --watch`)、フォーマッタ、Language Server
+  (名前の変更・参照・クイックフィックス・整形など)、パッケージマネージャ、データベースのマイグレーション、PHP からの
+  移行ツール。
   VS Code 拡張(色分けと Language Server)は [editors/vscode](editors/vscode) にあり、各リリースに
   `phv-<version>.vsix` として含まれる。
 
@@ -85,11 +87,12 @@ cargo build --release
 ## 使い方
 
 ```bash
+phv new my-site --site                   # 新しいサイト(ページ・レイアウト・テスト)
 phv run examples/hello/hello.phv         # 型検査して実行
 phv check examples/site/public/index.phv # 型検査だけ
-phv serve examples/site                  # http://127.0.0.1:8080 でサイトを配信
+phv serve examples/site                  # http://127.0.0.1:8080 でサイトを配信(--watch: 保存で再読み込み)
 phv build examples/site -o site-server   # ソースなしでサイトを配信する 1 つの実行ファイルを作る
-phv test examples                        # *_test.phv の test_* 関数を実行
+phv test examples                        # *_test.phv の test_* 関数を実行(--coverage、--junit)
 phv fmt examples                         # インデントと空白を整える(--check で確認だけ)
 phv lsp                                  # エディタ用の Language Server
 phv install                              # phv.toml の [dependencies] を取得

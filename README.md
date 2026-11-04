@@ -69,8 +69,10 @@ echo greet($name);                                 // HTML-escaped automatically
   - The results of nine security audits are in [docs/security-audit.md](docs/security-audit.md).
     To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - **Speed**: a register-based bytecode VM specialized by type, a Cranelift JIT, and an on-disk bytecode cache.
-- **Tools**: test runner (with an in-process HTTP client, `std.testing`), formatter, Language Server, package
-  manager, database migrations, and a migration tool from PHP.
+- **Tools**: `phv new` for a project or a site, a test runner (with an in-process HTTP client, `std.testing`,
+  before/after hooks, JUnit reports and coverage), live reload (`phv serve --watch`), a formatter, a Language Server
+  (rename, references, quick fixes, formatting and more), a package manager, database migrations, and a migration
+  tool from PHP.
   A VS Code extension (highlighting and the language server) is in [editors/vscode](editors/vscode); each release
   includes it as `phv-<version>.vsix`.
 
@@ -90,11 +92,12 @@ The executable is `target/release/phv` (`phv.exe` on Windows).
 ## Usage
 
 ```bash
+phv new my-site --site                   # a new site (a page, a layout and a test)
 phv run examples/hello/hello.phv         # type-check and run
 phv check examples/site/public/index.phv # type-check only
-phv serve examples/site                  # serve the site on http://127.0.0.1:8080
+phv serve examples/site                  # serve the site on http://127.0.0.1:8080 (--watch: reload on save)
 phv build examples/site -o site-server   # one executable that serves the site, without the sources
-phv test examples                        # run the test_* functions in *_test.phv files
+phv test examples                        # run the test_* functions in *_test.phv files (--coverage, --junit)
 phv fmt examples                         # fix indentation and spacing (--check only reports)
 phv lsp                                  # Language Server for editors
 phv install                              # fetch the [dependencies] in phv.toml

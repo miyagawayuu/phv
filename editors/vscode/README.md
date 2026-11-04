@@ -8,7 +8,13 @@ Language support for [PHV](https://phv-lang.org):
   - errors and warnings as you type, and the type of an expression on hover;
   - completion of variables, properties and methods after `->` and `::`, functions, classes and keywords;
   - go to definition (F12) for variables, functions, classes, methods, properties, imports and the templates
-    passed to `render()`.
+    passed to `render()`;
+  - find all references (Shift+F12) and rename (F2) across the project; a method is renamed with the methods that
+    override it;
+  - format document (as `phv fmt`), parameter hints while typing a call, the outline of a file and symbol search
+    (Ctrl+T);
+  - quick fixes (Ctrl+.): close names for unknown names, removing unused imports, `$_name` for unused variables;
+  - semantic colouring of names, and the inferred type before variables (inlay hints).
 - Comment toggling, bracket matching and auto-closing pairs.
 
 ## Installing

@@ -343,6 +343,8 @@ pub struct Vm {
     argbuf: Vec<Value>,
     /// Enum cases are singletons within one VM (one request).
     enum_cache: std::collections::HashMap<(u32, u32), Value>,
+    /// `phv test --coverage`: the statements that ran, as (file, source offset).
+    pub coverage: Option<std::collections::HashSet<(u32, u32)>>,
     /// Objects created by this run. Reference counting cannot free cycles
     /// (`$node->next = $node`), so their fields are cleared when the run ends.
     objects: Vec<std::rc::Weak<RefCell<Object>>>,
@@ -541,6 +543,7 @@ impl Vm {
             argbuf: Vec::new(),
             enum_cache: std::collections::HashMap::new(),
             objects: Vec::new(),
+            coverage: None,
         }
     }
 
@@ -1394,6 +1397,11 @@ impl Vm {
                     }
                     Instr::Ret(r) => ret!(std::mem::take(&mut reg!(*r))),
                     Instr::RetNull => ret!(Value::Null),
+                    Instr::Cover(off) => {
+                        if let Some(c) = &mut self.coverage {
+                            c.insert((func.file, *off));
+                        }
+                    }
 
                     Instr::NewObject(d, class) => {
                         let fields =

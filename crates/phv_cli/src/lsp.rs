@@ -1,6 +1,10 @@
 //! `phv lsp`: a Language Server Protocol server over stdin/stdout.
 //! It publishes type errors as you type, shows types on hover, completes
-//! names and jumps to definitions.
+//! names and jumps to definitions; `features` adds references, rename,
+//! formatting, signature help, symbols, quick fixes, semantic tokens and
+//! inlay hints.
+
+mod features;
 
 use phv_driver::{analyze, analyze_for_editor, find_root, Analysis};
 use phv_syntax::lexer::{lex_with_comments, Mode};
@@ -646,6 +650,15 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                         "hoverProvider": true,
                         "completionProvider": { "triggerCharacters": ["$", ">", ":"] },
                         "definitionProvider": true,
+                        "referencesProvider": true,
+                        "renameProvider": { "prepareProvider": true },
+                        "documentFormattingProvider": true,
+                        "signatureHelpProvider": { "triggerCharacters": ["(", ","], "retriggerCharacters": [","] },
+                        "documentSymbolProvider": true,
+                        "workspaceSymbolProvider": true,
+                        "codeActionProvider": { "codeActionKinds": ["quickfix"] },
+                        "semanticTokensProvider": { "legend": features::token_legend(), "full": true },
+                        "inlayHintProvider": true,
                     },
                     "serverInfo": { "name": "phv", "version": env!("CARGO_PKG_VERSION") },
                 })),
@@ -683,6 +696,53 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                     }
                     None => Value::Null,
                 }),
+                "textDocument/references" => Some(match doc_path(params) {
+                    Some(p) => {
+                        let (line, character) = position();
+                        let decl = params["context"]["includeDeclaration"].as_bool().unwrap_or(true);
+                        server.references(&p, line, character, decl)
+                    }
+                    None => Value::Null,
+                }),
+                "textDocument/prepareRename" | "textDocument/rename" => {
+                    let (line, character) = position();
+                    let answer = match doc_path(params) {
+                        None => Err("the document is not open".to_string()),
+                        Some(p) if method == "textDocument/prepareRename" => server.prepare_rename(&p, line, character),
+                        Some(p) => server.rename(&p, line, character, params["newName"].as_str().unwrap_or("")),
+                    };
+                    match answer {
+                        Ok(v) => Some(v),
+                        Err(message) => {
+                            send(
+                                out,
+                                &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32803, "message": message } }),
+                            );
+                            None
+                        }
+                    }
+                }
+                "textDocument/formatting" => Some(doc_path(params).map_or(Value::Null, |p| server.formatting(&p))),
+                "textDocument/signatureHelp" => Some(match doc_path(params) {
+                    Some(p) => {
+                        let (line, character) = position();
+                        server.signature_help(&p, line, character)
+                    }
+                    None => Value::Null,
+                }),
+                "textDocument/documentSymbol" => {
+                    Some(doc_path(params).map_or(Value::Null, |p| server.document_symbols(&p)))
+                }
+                "workspace/symbol" => Some(server.workspace_symbols(params["query"].as_str().unwrap_or(""))),
+                "textDocument/codeAction" => {
+                    Some(doc_path(params).map_or(json!([]), |p| server.code_actions(&p, &params["range"])))
+                }
+                "textDocument/semanticTokens/full" => {
+                    Some(doc_path(params).map_or(Value::Null, |p| server.semantic_tokens(&p)))
+                }
+                "textDocument/inlayHint" => {
+                    Some(doc_path(params).map_or(json!([]), |p| server.inlay_hints(&p, &params["range"])))
+                }
                 _ => {
                     if id.is_some() {
                         send(
@@ -991,5 +1051,132 @@ mod tests {
         ] {
             assert!(uri_to_path(uri).is_none(), "{uri}");
         }
+    }
+
+    /// The text each edit of a rename would replace, by file name, sorted.
+    fn edits(result: &Value) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (uri, list) in result["changes"].as_object().unwrap() {
+            let path = uri_to_path(uri).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            for e in list.as_array().unwrap() {
+                let r = &e["range"];
+                let s =
+                    offset_of(&text, r["start"]["line"].as_u64().unwrap(), r["start"]["character"].as_u64().unwrap());
+                let t = offset_of(&text, r["end"]["line"].as_u64().unwrap(), r["end"]["character"].as_u64().unwrap());
+                out.push((
+                    name.clone(),
+                    format!("{}->{}", &text[s as usize..t as usize], e["newText"].as_str().unwrap()),
+                ));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn renames_across_files_and_overrides() {
+        let p = Project::new("rename");
+        let page = "<?phv\nimport lib.shapes.{Shape, make};\n$s = ma|ke(\"a\");\necho $s->area(), make(\"b\")->name;\n";
+        std::fs::write(p.dir.join("page.phv"), page.replace('|', "")).unwrap();
+        let (server, path, line, character) = p.open("page.phv", page);
+        let refs = server.references(&path, line, character, true);
+        assert_eq!(refs.as_array().unwrap().len(), 4, "{refs}"); // the definition, the import and two calls
+        let got = edits(&server.rename(&path, line, character, "build").unwrap());
+        assert_eq!(
+            got,
+            [
+                ("page.phv".to_string(), "make->build".to_string()),
+                ("page.phv".into(), "make->build".into()),
+                ("page.phv".into(), "make->build".into()),
+                ("shapes.phv".into(), "make->build".into()),
+            ]
+        );
+        // A method is renamed with the methods that override it.
+        std::fs::write(
+            p.dir.join("lib/more.phv"),
+            "import lib.shapes.Shape;\nexport class Square extends Shape {\n    public function area(): float { return 1.0; }\n}\n",
+        )
+        .unwrap();
+        let page = "<?phv\nimport lib.more.Square;\n$q = new Square(\"q\");\necho $q->ar|ea();\n";
+        std::fs::write(p.dir.join("page.phv"), page.replace('|', "")).unwrap();
+        let (server, path, line, character) = p.open("page.phv", page);
+        let got = edits(&server.rename(&path, line, character, "size").unwrap());
+        let files: Vec<&str> = got.iter().map(|(f, _)| f.as_str()).collect();
+        assert_eq!(files, ["more.phv", "page.phv", "shapes.phv"], "{got:?}");
+        // Variables, and the standard library, which cannot be renamed.
+        let (server, path, line, character) = p.open("page.phv", "<?phv\n$cou|nt = 1;\necho $count + 1;\n");
+        assert_eq!(edits(&server.rename(&path, line, character, "$n").unwrap()).len(), 2);
+        let (server, path, line, character) = p.open("page.phv", "<?phv\necho strl|en(\"x\");\n");
+        assert!(server.prepare_rename(&path, line, character).is_err());
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    #[test]
+    fn formats_helps_with_signatures_and_lists_symbols() {
+        let p = Project::new("tools");
+        let (server, path, _, _) = p.open("page.phv", "<?phv\nfunction f(int $a): int {\nreturn $a;   \n}|\n");
+        let edits = server.formatting(&path);
+        assert_eq!(edits[0]["newText"], "<?phv\nfunction f(int $a): int {\n    return $a;\n}\n", "{edits}");
+        let (server, path, line, character) = p.open(
+            "page.phv",
+            "<?phv\nimport lib.shapes.make;\nfunction g(int $a, string $b): int { return $a; }\ng(1, |);\n",
+        );
+        let help = server.signature_help(&path, line, character);
+        assert_eq!(help["signatures"][0]["label"], "g(int $a, string $b): int", "{help}");
+        assert_eq!(help["activeParameter"], 1);
+        let (server, path, line, character) = p.open("page.phv", "<?phv\necho str_repeat(\"a\", |);\n");
+        assert_eq!(server.signature_help(&path, line, character)["activeParameter"], 1);
+        let (server, path, _, _) = p.open("page.phv", &format!("{}|", SHAPES.replace("export ", "")));
+        let symbols = server.document_symbols(&path);
+        let names: Vec<&str> = symbols.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["Shape", "Color", "make"]);
+        let shape: Vec<&str> =
+            symbols[0]["children"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+        assert_eq!(shape, ["$secret", "$name", "__construct", "area", "unit"]);
+        let found = server.workspace_symbols("mak");
+        assert!(found.as_array().unwrap().iter().any(|s| s["name"] == "make"), "{found}");
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    #[test]
+    fn offers_quick_fixes() {
+        let p = Project::new("fixes");
+        let all = json!({ "start": { "line": 0, "character": 0 }, "end": { "line": 99, "character": 0 } });
+        let titles = |text: &str| {
+            let (server, path, _, _) = p.open("page.phv", text);
+            let actions = server.code_actions(&path, &all);
+            actions.as_array().unwrap().iter().map(|a| a["title"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(titles("<?phv\n$total = 1;\necho $totl;|\n"), ["Change to `$total`", "Rename to `$_total`"]);
+        assert!(titles("<?phv\necho strlenn(\"x\");|\n").contains(&"Change to `strlen`".to_string()));
+        assert!(titles("<?phv\necho mt_rand(1, 6);|\n").contains(&"Use `random_int`".to_string()));
+        assert_eq!(titles("<?phv\nfunction f(): void {\n    $unused = 1;\n}|\n"), ["Rename to `$_unused`"]);
+        assert_eq!(
+            titles("<?phv\nimport lib.shapes.{make, Color};\necho make(\"x\")->name;|\n"),
+            ["Remove `Color` from the import"]
+        );
+        let (server, path, _, _) = p.open("page.phv", "<?phv\nimport lib.shapes.make;\necho make(\"x\")->aera();|\n");
+        let a = server.code_actions(&path, &all);
+        assert_eq!(a[0]["title"], "Change to `area`", "{a}");
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    #[test]
+    fn colours_names_and_shows_inferred_types() {
+        let p = Project::new("tokens");
+        let text = "<?phv\nimport lib.shapes.make;\n$s = make(\"a\");\nint $n = 2;\necho $s->area() + $n;|\n";
+        let (server, path, _, _) = p.open("page.phv", text);
+        let data = server.semantic_tokens(&path)["data"].as_array().unwrap().clone();
+        assert_eq!(data.len() % 5, 0);
+        // `make` (import and call), `$s` twice, `$n` twice, `area`: types 4, 7, 5.
+        let kinds: Vec<u64> = data.chunks(5).map(|t| t[3].as_u64().unwrap()).collect();
+        assert!(kinds.contains(&4) && kinds.contains(&5) && kinds.contains(&7), "{kinds:?}");
+        let all = json!({ "start": { "line": 0, "character": 0 }, "end": { "line": 99, "character": 0 } });
+        let hints = server.inlay_hints(&path, &all);
+        let labels: Vec<&str> = hints.as_array().unwrap().iter().map(|h| h["label"].as_str().unwrap()).collect();
+        assert_eq!(labels, ["Shape "], "{hints}"); // `$n` already has its type
+        let _ = std::fs::remove_dir_all(&p.dir);
     }
 }

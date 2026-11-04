@@ -220,6 +220,7 @@ pub(crate) struct Checker<'a> {
     deprecated_fields: HashMap<(ClassId, String), String>,
     /// `#[Test]` and `#[Skip]` functions.
     tests: Vec<(FuncId, Option<String>)>,
+    hooks: Vec<(FuncId, bool)>,
     /// Names each module has looked up in its own scope (`(module, name)`),
     /// to tell which imports are used. Lookups take `&self`, hence the cell.
     used_names: RefCell<HashSet<(usize, String)>>,
@@ -256,10 +257,12 @@ struct Annotations {
     is_override: bool,
     test: bool,
     skip: Option<String>,
+    before: bool,
+    after: bool,
 }
 
 /// Annotations PHV knows; any other name is an error (a typo would otherwise be ignored).
-const ANNOTATIONS: &str = "Deprecated, Override, Test, Skip";
+const ANNOTATIONS: &str = "Deprecated, Override, Test, Skip, Before, After";
 
 /// Members (fields, methods, constants) all classes may inherit together.
 const MAX_INHERITED_MEMBERS: usize = 200_000;
@@ -344,6 +347,7 @@ impl<'a> Checker<'a> {
             deprecated_classes: HashMap::new(),
             deprecated_fields: HashMap::new(),
             tests: Vec::new(),
+            hooks: Vec::new(),
             used_names: RefCell::new(HashSet::new()),
             aliases: Vec::new(),
             func_bounds: HashMap::new(),
@@ -369,7 +373,7 @@ impl<'a> Checker<'a> {
             let allowed: &[AnnTarget] = match a.name.as_str() {
                 "Deprecated" => &[AnnTarget::Function, AnnTarget::Method, AnnTarget::Class, AnnTarget::Property],
                 "Override" => &[AnnTarget::Method],
-                "Test" | "Skip" => &[AnnTarget::Function],
+                "Test" | "Skip" | "Before" | "After" => &[AnnTarget::Function],
                 _ => {
                     self.error(format!("unknown annotation `#[{}]`", a.name), a.name_span)
                         .add_note(format!("PHV knows {ANNOTATIONS}"));
@@ -412,6 +416,8 @@ impl<'a> Checker<'a> {
                 "Deprecated" => out.deprecated = Some(text),
                 "Override" => out.is_override = true,
                 "Test" => out.test = true,
+                "Before" => out.before = true,
+                "After" => out.after = true,
                 _ => out.skip = Some(text),
             }
         }
@@ -652,6 +658,37 @@ impl<'a> Checker<'a> {
         let mut ix = self.index.take().unwrap_or_default();
         ix.class_names = self.class_names.clone();
         ix.type_params = self.classes.iter().map(|c| c.type_params.clone()).collect();
+        ix.supers = self.classes.iter().map(|c| c.supers.iter().copied().collect()).collect();
+        for (fid, f) in self.funcs.iter().enumerate() {
+            let kind = match f.kind {
+                FuncKind::Normal => ItemKind::Function,
+                FuncKind::Method | FuncKind::Ctor => ItemKind::Method,
+                _ => continue,
+            };
+            let name = f.name.rsplit("::").next().unwrap_or(&f.name).to_string();
+            ix.defs.push(Item { name, kind, detail: self.signature(fid as FuncId), def: Some(f.span) });
+        }
+        for c in &self.classes {
+            let kind = match c.kind {
+                ClassKind::Interface => ItemKind::Interface,
+                ClassKind::Enum => ItemKind::Enum,
+                ClassKind::Class | ClassKind::Abstract => ItemKind::Class,
+            };
+            let detail = c.ctor.map(|f| self.signature(f)).unwrap_or_default();
+            ix.defs.push(Item { name: c.name.clone(), kind, detail, def: Some(c.span) });
+        }
+        for s in &self.scopes {
+            for (name, (_, ty)) in &s.consts {
+                if let Some(def) = s.const_spans.get(name) {
+                    ix.defs.push(Item {
+                        name: name.clone(),
+                        kind: ItemKind::Constant,
+                        detail: self.tn(ty),
+                        def: Some(*def),
+                    });
+                }
+            }
+        }
         for (cid, c) in self.classes.iter().enumerate() {
             let cid = cid as ClassId;
             let Type::Class(_, own) = self.own_type(cid) else { continue };
@@ -1574,6 +1611,15 @@ impl<'a> Checker<'a> {
                                 self.error("a test cannot take parameters", d.name_span);
                             }
                             self.tests.push((fid, ann.skip));
+                        }
+                        if ann.before || ann.after {
+                            if !d.params.is_empty() {
+                                self.error("a `#[Before]` or `#[After]` function cannot take parameters", d.name_span);
+                            }
+                            if ann.before && ann.after {
+                                self.error("a function is either `#[Before]` or `#[After]`", d.name_span);
+                            }
+                            self.hooks.push((fid, ann.after));
                         }
                         let scope = &mut self.scopes[mi];
                         if scope.funcs.insert(d.name.clone(), fid).is_some() {
@@ -2742,7 +2788,8 @@ impl<'a> Checker<'a> {
             })
             .collect();
         let tests = std::mem::take(&mut self.tests);
-        let program = HProgram { funcs, classes, main: self.main.unwrap_or(0), exc_classes, tests };
+        let hooks = std::mem::take(&mut self.hooks);
+        let program = HProgram { funcs, classes, main: self.main.unwrap_or(0), exc_classes, tests, hooks };
         (program, self.diags)
     }
 }

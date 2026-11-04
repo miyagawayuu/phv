@@ -32,6 +32,8 @@ pub struct Compiled {
     pub from_cache: bool,
     /// Functions marked `#[Test]` or `#[Skip("...")]` (with the reason), by index.
     pub marked_tests: Vec<(u32, Option<String>)>,
+    /// Functions marked `#[Before]` (false) or `#[After]` (true), by index.
+    pub test_hooks: Vec<(u32, bool)>,
 }
 
 impl Compiled {
@@ -68,6 +70,17 @@ impl Compiled {
         }
         out.sort_by_key(|(i, ..)| *i);
         out
+    }
+
+    /// The `#[Before]` and `#[After]` functions of the entry file, in the order
+    /// they are declared.
+    pub fn hooks(&self) -> (Vec<u32>, Vec<u32>) {
+        let of_entry = |f: &u32| self.program.funcs.get(*f as usize).is_some_and(|f| f.file == self.entry_file);
+        let mut hooks: Vec<(u32, bool)> = self.test_hooks.iter().filter(|(f, _)| of_entry(f)).copied().collect();
+        hooks.sort();
+        let before = hooks.iter().filter(|(_, after)| !after).map(|(f, _)| *f).collect();
+        let after = hooks.iter().filter(|(_, after)| *after).map(|(f, _)| *f).collect();
+        (before, after)
     }
 
     /// Top-level functions of the entry file whose names start with `prefix`
@@ -755,6 +768,21 @@ pub fn compile_with_overlay(
     entry: &Path,
     overlay: HashMap<PathBuf, String>,
 ) -> Result<Compiled, CompileError> {
+    compile_full(root, entry, overlay, false)
+}
+
+/// Like `compile`; with `coverage`, the program records which statements run
+/// (`run_test`), and the JIT does not compile it.
+pub fn compile_for_tests(root: &Path, entry: &Path, coverage: bool) -> Result<Compiled, CompileError> {
+    compile_full(root, entry, HashMap::new(), coverage)
+}
+
+fn compile_full(
+    root: &Path,
+    entry: &Path,
+    overlay: HashMap<PathBuf, String>,
+    coverage: bool,
+) -> Result<Compiled, CompileError> {
     let a = analyze(root, entry, overlay);
     if !a.messages.is_empty() || a.diags.iter().any(|d| d.is_error()) || a.hir.is_none() {
         return Err(CompileError { sources: a.sources, diags: a.diags, messages: a.messages });
@@ -763,11 +791,12 @@ pub fn compile_with_overlay(
     let mut warnings: Vec<Diagnostic> = a.diags.iter().filter(|d| !d.is_error()).cloned().collect();
     warnings.sort_by_key(|d| (d.span.file, d.span.start));
     let warnings = diag::render(&a.sources, &warnings, false);
-    let program = match phv_compiler::compile(&hir, &a.sources) {
+    let program = match phv_compiler::compile_with(&hir, &a.sources, coverage) {
         Ok(p) => p,
         Err(d) => return Err(CompileError { sources: a.sources, diags: vec![d], messages: Vec::new() }),
     };
     let marked_tests = hir.tests.iter().map(|(f, skip)| (*f, skip.clone())).collect();
+    let test_hooks = hir.hooks.clone();
     let builtins = phv_std::link(&program.builtin_names).map_err(|m| CompileError {
         sources: SourceMap::default(),
         diags: Vec::new(),
@@ -782,6 +811,7 @@ pub fn compile_with_overlay(
         jit: None,
         from_cache: false,
         marked_tests,
+        test_hooks,
     })
 }
 
@@ -823,6 +853,48 @@ pub fn run(c: &Compiled, opts: RunOptions) -> RunOutcome {
 
 /// Runs one function of a compiled program (with no arguments) in a fresh VM.
 pub fn run_func(c: &Compiled, func: u32, opts: RunOptions) -> RunOutcome {
+    let mut vm = new_vm(c, opts);
+    let error = call_caught(&mut vm, func);
+    let output = vm.take_output();
+    let http = std::mem::take(&mut vm.http);
+    RunOutcome { output, error, http }
+}
+
+/// Runs test `test` with the `before` functions first and the `after` ones
+/// last (also when the test fails), in one VM. With `coverage`, the
+/// statements that ran (as file and source offset) are added to it.
+pub fn run_test(
+    c: &Compiled,
+    before: &[u32],
+    test: u32,
+    after: &[u32],
+    opts: RunOptions,
+    coverage: Option<&mut std::collections::HashSet<(u32, u32)>>,
+) -> RunOutcome {
+    let mut vm = new_vm(c, opts);
+    if coverage.is_some() {
+        vm.coverage = Some(std::collections::HashSet::new());
+    }
+    let mut error = None;
+    for f in before.iter().chain(std::iter::once(&test)) {
+        error = call_caught(&mut vm, *f);
+        if error.is_some() {
+            break;
+        }
+    }
+    for f in after {
+        let e = call_caught(&mut vm, *f);
+        error = error.or(e);
+    }
+    if let (Some(all), Some(ran)) = (coverage, vm.coverage.take()) {
+        all.extend(ran);
+    }
+    let output = vm.take_output();
+    let http = std::mem::take(&mut vm.http);
+    RunOutcome { output, error, http }
+}
+
+fn new_vm(c: &Compiled, opts: RunOptions) -> Vm {
     let mut vm = Vm::new(c.program.clone(), c.builtins.clone(), opts.html, opts.limits);
     if let Some(h) = opts.http {
         vm.http = h;
@@ -831,8 +903,13 @@ pub fn run_func(c: &Compiled, func: u32, opts: RunOptions) -> RunOutcome {
         vm.host = host;
     }
     vm.jit = c.jit.clone();
+    vm
+}
+
+/// Calls function `func` with no arguments; the error it ended with, if any.
+fn call_caught(vm: &mut Vm, func: u32) -> Option<RuntimeError> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.call_function(func, &[]).map(|_| ())));
-    let error = match result {
+    match result {
         Ok(Ok(())) => None,
         Ok(Err(VmError::Exception(e))) => {
             Some(RuntimeError { message: format!("Uncaught {}", vm.describe_exception(&e)), trace: e.trace })
@@ -846,10 +923,7 @@ pub fn run_func(c: &Compiled, func: u32, opts: RunOptions) -> RunOutcome {
                 .unwrap_or_else(|| "unknown".into());
             Some(RuntimeError { message: format!("Internal error: {msg}"), trace: Vec::new() })
         }
-    };
-    let output = vm.take_output();
-    let http = std::mem::take(&mut vm.http);
-    RunOutcome { output, error, http }
+    }
 }
 
 #[cfg(test)]

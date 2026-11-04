@@ -150,6 +150,9 @@ pub enum Instr {
     },
     Ret(Reg),
     RetNull,
+    /// The statement at this source offset (of the function's file) runs.
+    /// Only in programs compiled for `phv test --coverage`.
+    Cover(u32),
 
     NewObject(Reg, u32),
     GetProp(Reg, Reg, u16),

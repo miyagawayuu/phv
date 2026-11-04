@@ -78,6 +78,7 @@ fn serves_pages_safely() {
         port: 0,
         dev: true,
         time_limit: Duration::from_secs(1),
+        watch: false,
     };
     std::thread::spawn(move || serve_on(listener, opts).unwrap());
 
@@ -131,6 +132,7 @@ fn start(dir: &Path) -> SocketAddr {
         port: 0,
         dev: true,
         time_limit: Duration::from_secs(5),
+        watch: false,
     };
     std::thread::spawn(move || serve_on(listener, opts).unwrap());
     addr
@@ -316,6 +318,7 @@ fn busy_servers_answer_503() {
         port: 0,
         dev: true,
         time_limit: Duration::from_secs(14),
+        watch: false,
     };
     std::thread::spawn(move || serve_on(listener, opts).unwrap());
     assert_eq!(get(addr, "/", "").status, 200);
@@ -345,6 +348,7 @@ fn start_with(dir: &Path, dev: bool) -> SocketAddr {
         port: 0,
         dev,
         time_limit: Duration::from_secs(5),
+        watch: false,
     };
     std::thread::spawn(move || serve_on(listener, opts).unwrap());
     addr
@@ -441,6 +445,7 @@ fn caching_ranges_gzip_cors_and_shutdown() {
         port: 0,
         dev: true,
         time_limit: Duration::from_secs(5),
+        watch: false,
     };
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let stop = async move {
@@ -565,5 +570,50 @@ fn test_client_runs_pages_in_process() {
     let out = phv_driver::run(&c, opts);
     assert!(out.error.is_none(), "{}", out.error.map(|e| e.render()).unwrap_or_default());
     assert_eq!(out.output, "item 7|404|302 /me|hi ann");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn watch_mode_reloads_pages_on_changes() {
+    let dir = std::env::temp_dir().join(format!("phv-http-watch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phv.toml", "[permissions]\nwrite = [\"data/\"]\n");
+    write(&dir, "public/index.phv", "<?phv echo raw(\"<html><body><p>hi</p></body></html>\");");
+    write(&dir, "public/api.phv", "<?phv\nimport std.http.response;\nresponse()->json([\"a\" => 1]);\n");
+    let start = |watch: bool| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let opts = ServeOptions {
+            root: dir.clone(),
+            host: "127.0.0.1".into(),
+            port: 0,
+            dev: true,
+            time_limit: Duration::from_secs(5),
+            watch,
+        };
+        std::thread::spawn(move || serve_on(listener, opts).unwrap());
+        addr
+    };
+    let addr = start(true);
+    let page = get(addr, "/", "");
+    assert!(
+        page.body.ends_with("<p>hi</p><script src=\"/__phv/live-reload.js\" defer></script></body></html>"),
+        "{}",
+        page.body
+    );
+    assert!(!get(addr, "/api", "").body.contains("live-reload"), "only HTML gets the script");
+    let js = get(addr, "/__phv/live-reload.js", "");
+    assert_eq!(js.status, 200);
+    assert!(js.body.contains("location.reload()"));
+    let before = get(addr, "/__phv/changes", "").body;
+    std::thread::sleep(Duration::from_millis(50));
+    write(&dir, "data/written-by-the-site.txt", "x");
+    assert_eq!(get(addr, "/__phv/changes", "").body, before, "data the site writes is not a change");
+    write(&dir, "public/new.phv", "<?phv echo 1;");
+    assert_ne!(get(addr, "/__phv/changes", "").body, before);
+    // Without --watch, none of this exists.
+    let addr = start(false);
+    assert!(!get(addr, "/", "").body.contains("live-reload"));
+    assert_eq!(get(addr, "/__phv/changes", "").status, 404);
     let _ = std::fs::remove_dir_all(&dir);
 }

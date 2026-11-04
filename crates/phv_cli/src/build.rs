@@ -108,6 +108,7 @@ pub fn run_bundle(b: Bundle) -> ExitCode {
             port: args.port,
             dev: args.dev || (!args.prod && loopback),
             time_limit: Duration::from_secs_f64(args.time_limit),
+            watch: false,
         };
         let embedded = phv_server::Embedded { pages, statics, config: b.config };
         return match phv_server::serve_embedded(opts, embedded) {

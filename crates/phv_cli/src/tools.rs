@@ -1,6 +1,6 @@
 //! `phv test` and `phv fmt`.
 
-use phv_driver::{compile, find_root, load_config, run_func, RunOptions};
+use phv_driver::{compile_for_tests, find_root, load_config, run_test, RunOptions};
 use phv_vm::Limits;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -46,31 +46,206 @@ fn name_of(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
 }
 
-pub fn test(paths: Vec<PathBuf>, color: bool) -> ExitCode {
+/// What `phv test` was asked for besides the files.
+pub struct TestOptions {
+    /// Only tests whose name contains this.
+    pub filter: Option<String>,
+    /// One JSON document on stdout instead of the text report.
+    pub json: bool,
+    /// Also write a JUnit XML report here.
+    pub junit: Option<PathBuf>,
+    /// Report which statements of the project's files the tests ran.
+    pub coverage: bool,
+    pub color: bool,
+}
+
+/// One test's result.
+struct TestResult {
+    file: String,
+    name: String,
+    /// "pass", "fail" or "skip".
+    status: &'static str,
+    seconds: f64,
+    /// The error, or the reason for a skip.
+    message: String,
+    output: String,
+}
+
+/// Statements of one source file that can run, and those that did.
+#[derive(Default)]
+struct FileCoverage {
+    line_starts: Vec<u32>,
+    all: std::collections::BTreeSet<u32>,
+    ran: std::collections::BTreeSet<u32>,
+}
+
+impl FileCoverage {
+    fn line_of(&self, off: u32) -> usize {
+        self.line_starts.partition_point(|s| *s <= off)
+    }
+
+    /// The lines with a statement that did not run, as `3, 7-9`.
+    fn missed_lines(&self) -> String {
+        let mut lines: Vec<usize> = self.all.difference(&self.ran).map(|o| self.line_of(*o)).collect();
+        lines.dedup();
+        let mut parts: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let mut j = i;
+            while j + 1 < lines.len() && lines[j + 1] == lines[j] + 1 {
+                j += 1;
+            }
+            parts.push(if i == j { lines[i].to_string() } else { format!("{}-{}", lines[i], lines[j]) });
+            i = j + 1;
+        }
+        parts.join(", ")
+    }
+
+    fn percent(&self) -> f64 {
+        if self.all.is_empty() {
+            100.0
+        } else {
+            self.ran.len() as f64 * 100.0 / self.all.len() as f64
+        }
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            // Characters XML 1.0 cannot hold.
+            c if (c as u32) < 0x20 && !matches!(c, '\n' | '\r' | '\t') => out.push('\u{FFFD}'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn junit(results: &[TestResult], seconds: f64) -> String {
+    let mut files: Vec<&str> = Vec::new();
+    for r in results {
+        if !files.contains(&r.file.as_str()) {
+            files.push(&r.file);
+        }
+    }
+    let count = |rs: &[&TestResult], s: &str| rs.iter().filter(|r| r.status == s).count();
+    let all: Vec<&TestResult> = results.iter().collect();
+    let mut out = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites name=\"phv test\" tests=\"{}\" failures=\"{}\" skipped=\"{}\" time=\"{seconds:.3}\">\n",
+        all.len(),
+        count(&all, "fail"),
+        count(&all, "skip")
+    );
+    for file in files {
+        let rs: Vec<&TestResult> = results.iter().filter(|r| r.file == file).collect();
+        let time: f64 = rs.iter().map(|r| r.seconds).sum();
+        out.push_str(&format!(
+            "  <testsuite name=\"{}\" tests=\"{}\" failures=\"{}\" skipped=\"{}\" time=\"{time:.3}\">\n",
+            xml_escape(file),
+            rs.len(),
+            count(&rs, "fail"),
+            count(&rs, "skip")
+        ));
+        for r in rs {
+            out.push_str(&format!(
+                "    <testcase classname=\"{}\" name=\"{}\" time=\"{:.3}\"",
+                xml_escape(file),
+                xml_escape(&r.name),
+                r.seconds
+            ));
+            match r.status {
+                "fail" => {
+                    let first = r.message.lines().next().unwrap_or("");
+                    out.push_str(&format!(
+                        ">\n      <failure message=\"{}\">{}</failure>\n",
+                        xml_escape(first),
+                        xml_escape(&r.message)
+                    ));
+                    if !r.output.is_empty() {
+                        out.push_str(&format!("      <system-out>{}</system-out>\n", xml_escape(&r.output)));
+                    }
+                    out.push_str("    </testcase>\n");
+                }
+                "skip" => out.push_str(&format!(
+                    ">\n      <skipped message=\"{}\"/>\n    </testcase>\n",
+                    xml_escape(&r.message)
+                )),
+                _ => out.push_str("/>\n"),
+            }
+        }
+        out.push_str("  </testsuite>\n");
+    }
+    out.push_str("</testsuites>\n");
+    out
+}
+
+pub fn test(paths: Vec<PathBuf>, opts: TestOptions) -> ExitCode {
     let paths = if paths.is_empty() { vec![PathBuf::from(".")] } else { paths };
     let files = collect(&paths, &|p| name_of(p).ends_with("_test.phv"));
+    let text = !opts.json;
+    let say = |s: String| {
+        if text {
+            println!("{s}");
+        }
+    };
     if files.is_empty() {
-        println!("no test files found (test files are named *_test.phv)");
+        say("no test files found (test files are named *_test.phv)".into());
+        if opts.json {
+            println!("{}", serde_json::json!({ "passed": 0, "failed": 0, "skipped": 0, "tests": [] }));
+        }
         return ExitCode::SUCCESS;
     }
     let (green, red, yellow, reset) =
-        if color { ("\x1b[32m", "\x1b[31m", "\x1b[33m", "\x1b[0m") } else { ("", "", "", "") };
-    let (mut passed, mut failed, mut skipped) = (0, 0, 0);
+        if opts.color && text { ("\x1b[32m", "\x1b[31m", "\x1b[33m", "\x1b[0m") } else { ("", "", "", "") };
+    let mut results: Vec<TestResult> = Vec::new();
+    // Compile errors and files that could not run, as failures without a test.
+    let mut file_errors = 0;
+    let mut coverage: std::collections::BTreeMap<String, FileCoverage> = std::collections::BTreeMap::new();
     let start = Instant::now();
     let mut sites: std::collections::HashMap<PathBuf, Option<std::sync::Arc<dyn phv_vm::Site>>> =
         std::collections::HashMap::new();
     for file in files {
         let root = find_root(&file);
-        println!("{}", file.display());
-        let mut compiled = match compile(&root, &file) {
+        let shown = file.display().to_string();
+        let mut compiled = match compile_for_tests(&root, &file, opts.coverage) {
             Ok(c) => c,
             Err(e) => {
-                print!("{}", e.render(color));
-                failed += 1;
+                say(shown.clone());
+                if text {
+                    print!("{}", e.render(opts.color));
+                }
+                file_errors += 1;
+                results.push(TestResult {
+                    file: shown,
+                    name: "(compile)".into(),
+                    status: "fail",
+                    seconds: 0.0,
+                    message: e.render(false),
+                    output: String::new(),
+                });
                 continue;
             }
         };
-        compiled.enable_jit();
+        if !opts.coverage {
+            compiled.enable_jit();
+        }
+        let tests: Vec<(u32, String, Option<String>)> = compiled
+            .tests()
+            .into_iter()
+            .filter(|(_, name, _)| opts.filter.as_deref().is_none_or(|f| name.contains(f)))
+            .collect();
+        if opts.filter.is_some() && tests.is_empty() {
+            continue;
+        }
+        say(shown.clone());
+        if tests.is_empty() {
+            say("  (no test_* or #[Test] functions)".into());
+        }
         let config = load_config(&root).unwrap_or_else(|_| phv_driver::Config::default_for(&root));
         // A project with public/ gets its site, for `std.testing`.
         let mut host = (*config.host).clone();
@@ -80,42 +255,85 @@ pub fn test(paths: Vec<PathBuf>, color: bool) -> ExitCode {
                 std::collections::hash_map::Entry::Vacant(e) => match phv_server::test_site(&root) {
                     Ok(site) => host.site = e.insert(Some(site)).clone(),
                     Err(err) => {
-                        println!("  {yellow}warning{reset}: the site cannot be used in tests: {err}");
+                        say(format!("  {yellow}warning{reset}: the site cannot be used in tests: {err}"));
                         e.insert(None);
                     }
                 },
             }
         }
         let host = std::sync::Arc::new(host);
-        let tests = compiled.tests();
-        if tests.is_empty() {
-            println!("  (no test_* or #[Test] functions)");
-        }
+        let (before, after) = compiled.hooks();
+        let mut ran: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
         for (fid, name, skip) in tests {
             if let Some(reason) = skip {
-                skipped += 1;
-                let reason = if reason.is_empty() { String::new() } else { format!(" ({reason})") };
-                println!("  {yellow}skip{reset}  {name}{reason}");
+                let shown_reason = if reason.is_empty() { String::new() } else { format!(" ({reason})") };
+                say(format!("  {yellow}skip{reset}  {name}{shown_reason}"));
+                results.push(TestResult {
+                    file: shown.clone(),
+                    name,
+                    status: "skip",
+                    seconds: 0.0,
+                    message: reason,
+                    output: String::new(),
+                });
                 continue;
             }
             let limits = Limits { max_time: Some(Duration::from_secs(30)), ..Limits::default() };
-            let opts = RunOptions { html: false, limits, http: None, host: Some(host.clone()) };
-            let outcome = run_func(&compiled, fid, opts);
+            let run_opts = RunOptions { html: false, limits, http: None, host: Some(host.clone()) };
+            let t = Instant::now();
+            let cov = if opts.coverage { Some(&mut ran) } else { None };
+            let outcome = run_test(&compiled, &before, fid, &after, run_opts, cov);
+            let seconds = t.elapsed().as_secs_f64();
             match outcome.error {
                 None => {
-                    passed += 1;
-                    println!("  {green}ok{reset}    {name}");
+                    say(format!("  {green}ok{reset}    {name}"));
+                    results.push(TestResult {
+                        file: shown.clone(),
+                        name,
+                        status: "pass",
+                        seconds,
+                        message: String::new(),
+                        output: outcome.output,
+                    });
                 }
                 Some(err) => {
-                    failed += 1;
-                    println!("  {red}FAIL{reset}  {name}");
-                    for line in err.render().lines() {
-                        println!("        {line}");
+                    say(format!("  {red}FAIL{reset}  {name}"));
+                    let message = err.render();
+                    for line in message.lines() {
+                        say(format!("        {line}"));
                     }
                     if !outcome.output.is_empty() {
-                        println!("        output:");
+                        say("        output:".into());
                         for line in outcome.output.lines() {
-                            println!("          {line}");
+                            say(format!("          {line}"));
+                        }
+                    }
+                    results.push(TestResult {
+                        file: shown.clone(),
+                        name,
+                        status: "fail",
+                        seconds,
+                        message,
+                        output: outcome.output,
+                    });
+                }
+            }
+        }
+        if opts.coverage {
+            // The project's own files: not the standard library, not test files.
+            let prog = &compiled.program;
+            for f in &prog.funcs {
+                let Some(info) = prog.files.get(f.file as usize) else { continue };
+                if info.name.starts_with('<') || info.name.ends_with("_test.phv") {
+                    continue;
+                }
+                let entry = coverage.entry(info.name.clone()).or_default();
+                entry.line_starts.clone_from(&info.line_starts);
+                for ins in &f.code {
+                    if let phv_vm::Instr::Cover(off) = ins {
+                        entry.all.insert(*off);
+                        if ran.contains(&(f.file, *off)) {
+                            entry.ran.insert(*off);
                         }
                     }
                 }
@@ -123,9 +341,63 @@ pub fn test(paths: Vec<PathBuf>, color: bool) -> ExitCode {
         }
     }
     let secs = start.elapsed().as_secs_f64();
-    let colour = if failed == 0 { green } else { red };
-    let skipped = if skipped > 0 { format!(", {skipped} skipped") } else { String::new() };
-    println!("\n{colour}{passed} passed, {failed} failed{skipped}{reset} ({secs:.2}s)");
+    let count = |s: &str| results.iter().filter(|r| r.status == s).count();
+    let (passed, skipped) = (count("pass"), count("skip"));
+    let failed = count("fail");
+    coverage.retain(|_, c| !c.all.is_empty());
+    if text {
+        let colour = if failed == 0 { green } else { red };
+        let skipped = if skipped > 0 { format!(", {skipped} skipped") } else { String::new() };
+        let failed_tests = failed - file_errors;
+        let errors = if file_errors > 0 { format!(", {file_errors} file(s) did not compile") } else { String::new() };
+        println!("\n{colour}{passed} passed, {failed_tests} failed{skipped}{errors}{reset} ({secs:.2}s)");
+        if opts.coverage {
+            println!("\ncoverage (statements run by the tests):");
+            let width = coverage.keys().map(|k| k.len()).max().unwrap_or(0);
+            let (mut all, mut ran) = (0, 0);
+            for (name, c) in &coverage {
+                all += c.all.len();
+                ran += c.ran.len();
+                let missed = c.missed_lines();
+                let missed = if missed.is_empty() { String::new() } else { format!("   not run: lines {missed}") };
+                println!("  {name:width$}  {:5.1}%  ({}/{}){missed}", c.percent(), c.ran.len(), c.all.len());
+            }
+            let total = if all == 0 { 100.0 } else { ran as f64 * 100.0 / all as f64 };
+            println!("  {:width$}  {total:5.1}%  ({ran}/{all})", "total");
+        }
+    } else {
+        let tests: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "file": r.file, "name": r.name, "status": r.status, "seconds": r.seconds,
+                    "message": r.message, "output": r.output,
+                })
+            })
+            .collect();
+        let mut doc = serde_json::json!({
+            "passed": passed, "failed": failed, "skipped": skipped, "seconds": secs, "tests": tests,
+        });
+        if opts.coverage {
+            doc["coverage"] = coverage
+                .iter()
+                .map(|(name, c)| {
+                    let mut missed: Vec<usize> = c.all.difference(&c.ran).map(|o| c.line_of(*o)).collect();
+                    missed.dedup();
+                    serde_json::json!({
+                        "file": name, "statements": c.all.len(), "run": c.ran.len(), "missed_lines": missed,
+                    })
+                })
+                .collect();
+        }
+        println!("{doc}");
+    }
+    if let Some(path) = &opts.junit {
+        if let Err(e) = std::fs::write(path, junit(&results, secs)) {
+            eprintln!("error: cannot write {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    }
     if failed == 0 {
         ExitCode::SUCCESS
     } else {

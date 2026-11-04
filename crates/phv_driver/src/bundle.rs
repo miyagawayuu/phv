@@ -53,6 +53,7 @@ impl Page {
             jit: None,
             from_cache: false,
             marked_tests: Vec::new(),
+            test_hooks: Vec::new(),
         };
         c.enable_jit();
         Ok(c)

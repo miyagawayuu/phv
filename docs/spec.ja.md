@@ -1571,15 +1571,31 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
 |---|---|
 | `phv run file.phv [引数...]` | 型検査して実行(`--html`、`--time-limit 秒`)。ファイルの後の引数は `argv()` で受け取る |
 | `phv check file.phv` | 型検査だけ(import しているモジュールとテンプレートも) |
-| `phv serve dir` | Web サーバー(`--port`、`--host`、`--prod`、`--time-limit`) |
+| `phv serve dir` | Web サーバー(`--port`、`--host`、`--prod`、`--time-limit`。`--watch` を付けると、サイトのファイルを保存したときにブラウザで開いているページを再読み込みする。開発時だけ) |
 | `phv build path -o file` | サイトかスクリプトを 1 つの実行ファイルにする(下を参照) |
-| `phv test [paths]` | `*_test.phv` の `test_*` 関数を実行(1 テストごとに新しい VM) |
+| `phv new dir [--site]` | プロジェクトを作る: モジュールとテスト付きのスクリプト、または `--site` でページ・レイアウト・ページのテスト付きのサイト |
+| `phv test [paths]` | `*_test.phv` の `test_*` 関数を実行(1 テストごとに新しい VM。`--filter`、`--json`、`--junit`、`--coverage` はテストの節を参照) |
 | `phv fmt [paths] [--check] [--width N]` | インデントと空白を整え、長い行を折り返す(文字列・コメント・HTML は変えない) |
-| `phv lsp` | エディタ用の Language Server(入力中のエラー表示、ホバーで型を表示、補完、定義へのジャンプ) |
+| `phv lsp` | エディタ用の Language Server(下のエディタの節を参照) |
 | `phv install [--locked]` | `[dependencies]` とそれらが使うパッケージを取得して `phv.lock` に固定 |
 | `phv migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
 | `phv disasm file.phv` | バイトコードを表示 |
 | `phv parse file.phv` | 構文木を表示 |
+
+### エディタ
+
+`phv lsp` は Language Server で、VS Code 拡張(`editors/vscode`)や LSP に対応するエディタから使う:
+
+- 入力中のエラーと警告、ホバーで式の型、補完、定義へのジャンプ。
+- プロジェクトのファイル全体での参照の検索と名前の変更。メソッドの名前を変えると、それをオーバーライドしている
+  (またはそれがオーバーライドしている)メソッドの名前も変えるので、オーバーライドの関係は保たれる。標準ライブラリの
+  名前は変えられない。
+- 整形(`phv fmt` と同じで `[fmt] width` に従う)と、呼び出し中の関数の引数の表示(シグネチャヘルプ)。
+- ファイルのシンボル(アウトライン)とプロジェクトのシンボル(名前で検索)。
+- クイックフィックス: 不明な変数・関数・クラス・メソッド・プロパティに近い名前、使われない変数に `$_name`、使われない
+  import の削除、`mt_rand()` に `random_int()`。
+- 名前の意味による色分け(クラス・関数・メソッド・プロパティ・変数・定数)と、変数を最初に代入した所の前に推論した型を
+  表示(`$total = ...` に `int`)。
 
 ### エラーと警告
 
@@ -1663,6 +1679,24 @@ function posts_have_titles(): void { /* ... */ }
 #[Skip("needs the staging database")]
 function test_import(): void { /* ... */ }
 ```
+
+`#[Before]` を付けた関数はそのファイルの各テストの前に、`#[After]` を付けた関数は各テストの後に(テストが失敗しても)
+実行する(宣言した順に、テストと同じ VM で)。引数は取れない。
+
+```phv
+#[Before]
+function fresh_database(): void { file_put_contents("data/test.json", "[]"); }
+
+#[After]
+function clean_up(): void { unlink("data/test.json"); }
+```
+
+| オプション | |
+|---|---|
+| `--filter 文字列` | 名前にその文字列を含むテストだけ |
+| `--json` | 報告の代わりに、すべての結果を 1 つの JSON にして標準出力へ(`status` は `pass`・`fail`・`skip`) |
+| `--junit report.xml` | 結果を JUnit XML にしても書き出す(CI のサービスが表示できる) |
+| `--coverage` | 報告のあとに、テストが実行したプロジェクトの文の割合をファイルごとに、実行されなかった文の行と一緒に示す(テストファイルと標準ライブラリは除く)。このときテストは JIT なしで実行する |
 
 プロジェクト自身のサイト(`public/` のあるプロジェクト)へのリクエストは `std.testing` で、同じプロセスの中で送る。
 サーバーもネットワークも要らない。ページは開発モードの `phv serve` と同じように実行される(ルート、ミドルウェア、
@@ -1818,8 +1852,9 @@ phv migrate legacy/page.php      # page.phv を書き出す
 - **0.8 標準ライブラリ**(実装済み): 正規表現、書式付きの文字列、list と map のメソッドの追加、数学関数、
   タイムゾーン付きの日時、クラスへの JSON のデコード、暗号化と署名付きトークン、UUID、ディレクトリ、ログ、
   URL、CSV、スクリプトの引数と標準入力。
-- **0.9 ツール**: `phv lsp` の名前の変更・参照の検索・整形・クイックフィックス、`phv new`、`phv doc`、デバッガ、
-  テストのカバレッジ、対応プラットフォームの追加、チュートリアルと標準ライブラリのリファレンス。
+- **0.9 ツール**: `phv lsp` の名前の変更・参照の検索・整形・シグネチャヘルプ・シンボル・クイックフィックス・意味による
+  色分け・型の表示、`phv new`、`phv serve --watch`、フック・絞り込み・JSON と JUnit の報告・カバレッジ付きの `phv test`
+  (実装済み)。残り: `phv doc`、デバッガ、対応プラットフォームの追加、チュートリアルと標準ライブラリのリファレンス。
 - **1.0 速度と安定性**: 実行中の循環参照の解放、JIT の対象拡大、HTTP/2、TLS、WebSocket サーバー、`Set` 型、
   言語仕様の安定化。
 

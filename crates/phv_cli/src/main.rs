@@ -2,6 +2,7 @@ mod build;
 mod db;
 mod lsp;
 mod migrate;
+mod new;
 mod pkg;
 mod tools;
 
@@ -71,6 +72,18 @@ enum Command {
     Test {
         /// Files or directories (default: the current directory).
         paths: Vec<PathBuf>,
+        /// Only the tests whose name contains this text.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Print one JSON document with every result instead of the report.
+        #[arg(long)]
+        json: bool,
+        /// Also write the results as JUnit XML to this file (for CI).
+        #[arg(long)]
+        junit: Option<PathBuf>,
+        /// Report the statements of the project's files that the tests ran.
+        #[arg(long)]
+        coverage: bool,
     },
     /// Format `.phv` files (indentation, whitespace and long lines).
     Fmt {
@@ -142,6 +155,17 @@ enum Command {
         /// Per-request time limit in seconds.
         #[arg(long, default_value_t = 30.0)]
         time_limit: f64,
+        /// Reload pages in the browser when a file of the site changes (development only).
+        #[arg(long, conflicts_with = "prod")]
+        watch: bool,
+    },
+    /// Create a new project: a script, or a site with `--site`.
+    New {
+        /// The directory to create; its name is the project's name.
+        dir: PathBuf,
+        /// A web site (public/, a layout, a page test) instead of a script.
+        #[arg(long)]
+        site: bool,
     },
 }
 
@@ -261,7 +285,10 @@ fn exec(cmd: Command) -> ExitCode {
                 }
             }
         }
-        Command::Test { paths } => tools::test(paths, color),
+        Command::Test { paths, filter, json, junit, coverage } => {
+            let color = std::io::stdout().is_terminal();
+            tools::test(paths, tools::TestOptions { filter, json, junit, coverage, color })
+        }
         Command::Fmt { paths, check, width } => tools::fmt(paths, check, width),
         Command::Lsp => {
             lsp::run();
@@ -351,19 +378,43 @@ fn exec(cmd: Command) -> ExitCode {
                 ExitCode::FAILURE
             }
         }
-        Command::Serve { dir, host, port, prod, dev, time_limit } => {
+        Command::New { dir, site } => match new::create(&dir, site) {
+            Ok(files) => {
+                for f in &files {
+                    println!("  created {}", f.display());
+                }
+                let shown = dir.display();
+                if site {
+                    println!("\nNext: cd {shown} && phv serve --watch   (and phv test)");
+                } else {
+                    println!("\nNext: cd {shown} && phv run main.phv Ann   (and phv test)");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Serve { dir, host, port, prod, dev, time_limit, watch } => {
             let loopback = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
             if !dev && !prod && loopback {
                 eprintln!(
                     "note: development mode (error details are shown in the browser); behind a reverse proxy, run with --prod"
                 );
             }
+            let dev = dev || (!prod && loopback);
+            if watch && !dev {
+                eprintln!("error: --watch is for development; it cannot be used with --prod or on a public address without --dev");
+                return ExitCode::FAILURE;
+            }
             let opts = phv_server::ServeOptions {
                 root: dir,
                 host,
                 port,
-                dev: dev || (!prod && loopback),
+                dev,
                 time_limit: Duration::from_secs_f64(time_limit),
+                watch,
             };
             match phv_server::serve(opts) {
                 Ok(()) => ExitCode::SUCCESS,

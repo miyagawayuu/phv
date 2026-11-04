@@ -12,7 +12,14 @@ use std::collections::HashMap;
 /// Fails only for a function too large for the register file (each frame has
 /// at most `NO_REG` registers).
 pub fn compile(h: &HProgram, sources: &SourceMap) -> Result<Program, Diagnostic> {
+    compile_with(h, sources, false)
+}
+
+/// `compile`, with `coverage` adding an `Instr::Cover` before each statement
+/// (for `phv test --coverage`).
+pub fn compile_with(h: &HProgram, sources: &SourceMap, coverage: bool) -> Result<Program, Diagnostic> {
     let mut pc = ProgCtx {
+        coverage,
         consts: Vec::new(),
         str_consts: HashMap::new(),
         builtins: Vec::new(),
@@ -85,6 +92,7 @@ fn to_const(c: &HConst) -> Const {
 }
 
 struct ProgCtx {
+    coverage: bool,
     consts: Vec<Const>,
     str_consts: HashMap<String, u32>,
     builtins: Vec<String>,
@@ -160,6 +168,8 @@ struct FnC<'a> {
     off: u32,
     /// Set when a register beyond the register file was asked for; the code is then discarded.
     too_big: bool,
+    /// The function's source file (statements from other files are not covered).
+    file: u32,
 }
 
 impl<'a> FnC<'a> {
@@ -192,6 +202,7 @@ impl<'a> FnC<'a> {
             tries: Vec::new(),
             off: f.span.start,
             too_big: false,
+            file: f.span.file,
         };
         match f.kind {
             FuncKind::Template => {
@@ -793,6 +804,11 @@ impl<'a> FnC<'a> {
     }
 
     fn stmt(&mut self, s: &HStmt) {
+        if self.pc.coverage {
+            if let Some(span) = stmt_span(s).filter(|sp| sp.file == self.file) {
+                self.emit(Instr::Cover(span.start));
+            }
+        }
         match s {
             HStmt::Expr(e) => {
                 let t = self.alloc();
@@ -1080,6 +1096,20 @@ impl<'a> FnC<'a> {
 
 /// A function whose every local is an int, bool, float or string may be
 /// compiled natively.
+/// Where a statement starts, for coverage: its first expression.
+fn stmt_span(s: &HStmt) -> Option<phv_syntax::Span> {
+    Some(match s {
+        HStmt::Expr(e) | HStmt::Echo(e) | HStmt::EchoAttr(e) | HStmt::Throw(e) => e.span,
+        HStmt::Assign(_, e) | HStmt::Compound(_, _, e) | HStmt::CoalesceAssign(_, e) | HStmt::Append(_, e) => e.span,
+        HStmt::If(c, ..) => c.span,
+        HStmt::Loop { cond: Some(c), .. } => c.span,
+        HStmt::ForRange { from, .. } => from.span,
+        HStmt::Foreach { subject, .. } => subject.span,
+        HStmt::Return(_, span) => *span,
+        _ => return None,
+    })
+}
+
 fn native_sig(f: &HFunc) -> Option<NativeSig> {
     let kind = |t: &Type| match t {
         Type::Int => Some(ValKind::Int),

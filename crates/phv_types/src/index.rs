@@ -77,6 +77,11 @@ pub struct EditorIndex {
     pub string_methods: Vec<Item>,
     pub list_methods: Vec<Item>,
     pub map_methods: Vec<Item>,
+    /// Every function, method, class and module constant of the program (all
+    /// modules), for what a definition is (semantic tokens, signatures).
+    pub defs: Vec<Item>,
+    /// Itself, its ancestors and its interfaces, by class id.
+    pub supers: Vec<Vec<ClassId>>,
 }
 
 /// Longest completion detail: a signature is shortened past this (a huge type
@@ -139,6 +144,60 @@ impl EditorIndex {
             .filter(|(use_, _)| contains(*use_, file, offset))
             .min_by_key(|(use_, _)| use_.end - use_.start)
             .map(|(_, def)| *def)
+    }
+
+    /// What is defined at `def` (a function, class, member, constant or variable).
+    pub fn item_at_def(&self, def: Span) -> Option<&Item> {
+        let same = |i: &&Item| i.def == Some(def);
+        self.defs
+            .iter()
+            .find(same)
+            .or_else(|| self.classes.iter().flatten().map(|m| &m.item).find(same))
+            .or_else(|| self.scopes.iter().flat_map(|s| &s.vars).find(same))
+    }
+
+    /// Every use of the definition at `def` (in the files this index covers).
+    pub fn uses_of(&self, def: Span) -> impl Iterator<Item = Span> + '_ {
+        self.refs.iter().filter(move |(_, d)| *d == def).map(|(u, _)| *u)
+    }
+
+    /// The definitions that must be renamed with the member defined at `def`:
+    /// the members of that name in the classes it overrides or that override
+    /// it (and so on), so that overriding stays overriding. Just `def` for
+    /// anything else.
+    pub fn related_defs(&self, def: Span) -> Vec<Span> {
+        let declared = |c: usize, name: &str| {
+            self.classes.get(c).and_then(|ms| {
+                ms.iter()
+                    .find(|m| m.owner as usize == c && m.item.name == name && !m.is_static)
+                    .and_then(|m| m.item.def)
+            })
+        };
+        let Some(m) = self.classes.iter().flatten().find(|m| m.item.def == Some(def)) else { return vec![def] };
+        if m.is_static || !matches!(m.item.kind, ItemKind::Method | ItemKind::Property) {
+            return vec![def];
+        }
+        let name = m.item.name.clone();
+        let related = |a: usize, b: usize| {
+            self.supers.get(a).is_some_and(|s| s.contains(&(b as ClassId)))
+                || self.supers.get(b).is_some_and(|s| s.contains(&(a as ClassId)))
+        };
+        let mut set = vec![m.owner as usize];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for c in 0..self.classes.len() {
+                if !set.contains(&c) && declared(c, &name).is_some() && set.iter().any(|&s| related(c, s)) {
+                    set.push(c);
+                    changed = true;
+                }
+            }
+        }
+        let mut out: Vec<Span> = set.into_iter().filter_map(|c| declared(c, &name)).collect();
+        if !out.contains(&def) {
+            out.push(def);
+        }
+        out
     }
 
     /// What can be written at the member site that starts at `start`.

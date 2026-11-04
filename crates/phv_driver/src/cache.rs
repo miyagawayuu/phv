@@ -34,6 +34,8 @@ struct Entry {
     warnings: String,
     entry_file: u32,
     marked_tests: Vec<(u32, Option<String>)>,
+    #[serde(default)]
+    test_hooks: Vec<(u32, bool)>,
     program: Program,
 }
 
@@ -154,6 +156,7 @@ fn load(root: &Path, entry: &Path, key: &[u8; 32], stamp: &str) -> Option<Compil
         jit: None,
         from_cache: true,
         marked_tests: e.marked_tests,
+        test_hooks: e.test_hooks,
     })
 }
 
@@ -199,6 +202,7 @@ pub fn compile_cached(root: &Path, entry: &Path) -> Result<Compiled, CompileErro
             warnings: c.warnings.clone(),
             entry_file: c.entry_file,
             marked_tests: c.marked_tests.clone(),
+            test_hooks: c.test_hooks.clone(),
             program: clone_program(&c.program),
         };
         store(root, entry, key, &e);

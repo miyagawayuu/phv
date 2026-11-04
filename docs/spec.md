@@ -1594,15 +1594,30 @@ When code uses a PHP function name, the error message suggests the alternative
 |---|---|
 | `phv run file.phv [args...]` | Type-check and run (`--html`, `--time-limit seconds`); `argv()` returns the arguments after the file |
 | `phv check file.phv` | Type-check only (including imported modules and templates) |
-| `phv serve dir` | Web server (`--port`, `--host`, `--prod`, `--time-limit`) |
+| `phv serve dir` | Web server (`--port`, `--host`, `--prod`, `--time-limit`; `--watch` reloads the pages open in the browser when a file of the site is saved, in development only) |
 | `phv build path -o file` | Compile a site or a script into one executable (see below) |
-| `phv test [paths]` | Run the `test_*` functions in `*_test.phv` files (a new VM for each test) |
+| `phv new dir [--site]` | Create a project: a script with a module and a test, or with `--site` a site with a page, a layout and a page test |
+| `phv test [paths]` | Run the `test_*` functions in `*_test.phv` files (a new VM for each test; `--filter`, `--json`, `--junit`, `--coverage`, see Testing) |
 | `phv fmt [paths] [--check] [--width N]` | Normalize indentation and whitespace and wrap long lines (strings, comments, and HTML are not changed) |
-| `phv lsp` | Language Server for editors (errors as you type, types on hover, completion, go to definition) |
+| `phv lsp` | Language Server for editors (see Editors below) |
 | `phv install [--locked]` | Fetch `[dependencies]` and the packages they need, and pin them in `phv.lock` |
 | `phv migrate file.php` | Convert PHP mechanically and list the places that need manual work |
 | `phv disasm file.phv` | Show the bytecode |
 | `phv parse file.phv` | Show the syntax tree |
+
+### Editors
+
+`phv lsp` is a Language Server, used by the VS Code extension (`editors/vscode`) and any editor that speaks LSP:
+
+- errors and warnings as you type, the type of an expression on hover, completion, go to definition;
+- find references and rename across the project's files. Renaming a method also renames the methods that override
+  it (or that it overrides), so that overriding still works; names of the standard library cannot be renamed;
+- formatting (as `phv fmt`, with `[fmt] width`), and the parameters of the function being called (signature help);
+- the symbols of a file (outline) and of the project (search by name);
+- quick fixes: a close name for an unknown variable, function, class, method or property, `$_name` for a variable
+  that is never used, removing an unused import, `random_int()` for `mt_rand()`;
+- semantic colouring of names (classes, functions, methods, properties, variables, constants), and the inferred type
+  of a variable shown before the variable where it is first assigned (`$total = ...` shows `int`).
 
 ### Errors and warnings
 
@@ -1689,6 +1704,24 @@ function posts_have_titles(): void { /* ... */ }
 #[Skip("needs the staging database")]
 function test_import(): void { /* ... */ }
 ```
+
+Functions marked `#[Before]` run before each test of their file, and those marked `#[After]` after each one, also
+when the test fails (in the order they are declared, in the same VM as the test). They take no parameters.
+
+```phv
+#[Before]
+function fresh_database(): void { file_put_contents("data/test.json", "[]"); }
+
+#[After]
+function clean_up(): void { unlink("data/test.json"); }
+```
+
+| Option | |
+|---|---|
+| `--filter text` | Only the tests whose name contains `text` |
+| `--json` | One JSON document on standard output with every result (`status`: `pass`, `fail` or `skip`), instead of the report |
+| `--junit report.xml` | Also write the results as JUnit XML, which CI services display |
+| `--coverage` | After the report, the share of the project's statements that the tests ran, per file, with the lines of those that did not run (test files and the standard library are left out). The tests then run without the JIT |
 
 Requests to the project's own site (a project with `public/`) are made with `std.testing`, in-process: no server
 or network is needed. Pages run as under `phv serve` in development mode (routes, middleware, sessions, error pages),
@@ -1847,8 +1880,10 @@ Planned, in this order. Each release is audited before it is published, as befor
 - **0.8, the standard library** (done): regular expressions, formatted strings, more list and map methods,
   mathematics, dates with time zones, JSON decoded into classes, encryption and signed tokens, UUIDs, directories,
   logging, URLs, CSV, and arguments and standard input for scripts.
-- **0.9, tools**: rename, find references, formatting and quick fixes in `phv lsp`; `phv new`, `phv doc`, a debugger
-  and test coverage; more platforms; a tutorial and a reference of the standard library.
+- **0.9, tools**: rename, find references, formatting, signature help, symbols, quick fixes, semantic colouring
+  and inlay types in `phv lsp`, `phv new`, `phv serve --watch`, and `phv test` with hooks, filters, JSON and JUnit
+  reports and coverage (done); still to come: `phv doc`, a debugger, more platforms, a tutorial and a reference of
+  the standard library.
 - **1.0, speed and stability**: freeing reference cycles while a script runs, a JIT that covers more code, HTTP/2,
   TLS and a WebSocket server, a `Set` type, and a stable language specification.
 
