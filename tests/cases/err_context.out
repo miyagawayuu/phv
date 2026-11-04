@@ -245,19 +245,19 @@ error: values in attributes must be quoted
    |                                                        ^^^^^^^^^^^^^
    = note: write `attr="<?= $value ?>"`: escaping does not protect unquoted attribute values
 
+warning: `javascript:` URLs do not run under the default Content-Security-Policy
+  --> err_context.phv:40:133
+   |
+40 | ...f ($c) { ?> <?phv } if ($c) { ?>A<?phv } ?>javascript:<?= $q ?>">many ways to begin</a>
+   |                                                         ^
+   = note: use a button with an event listener added from a `<script>` in the template
+   = note: or allow inline code with `[security] csp` in phv.toml (not recommended)
+
 error: values cannot be inserted into a `javascript:` (or `data:`) URL
   --> err_context.phv:40:138
    |
 40 | ...) { ?> <?phv } if ($c) { ?>A<?phv } ?>javascript:<?= $q ?>">many ways to begin</a>
    |                                                         ^^
    = note: put the value in a `data-*` attribute and read it from a script
-
-warning: `javascript:` URLs do not run under the default Content-Security-Policy
-  --> err_context.phv:40:165
-   |
-40 | ...A<?phv } ?>javascript:<?= $q ?>">many ways to begin</a>
-   |                                                         ^
-   = note: use a button with an event listener added from a `<script>` in the template
-   = note: or allow inline code with `[security] csp` in phv.toml (not recommended)
 
 34 errors found

@@ -520,8 +520,10 @@ pub struct HtmlTracker {
     pending: Option<String>,
     /// Depth of `<svg>` / `<math>` (foreign content has no RCDATA elements).
     foreign: u32,
-    /// Byte offset (in the chunk being fed) of the attribute name or value being read.
-    mark: usize,
+    /// Byte offset (in the chunk being fed) of the attribute name or value being
+    /// read, if it began in this chunk (else what is found is reported where
+    /// it is decided).
+    mark: Option<usize>,
     /// Inline JavaScript found in the last `feed` (see `InlineCode`).
     found: Vec<(usize, InlineCode)>,
     /// Names of the attributes of the current tag seen so far.
@@ -551,7 +553,7 @@ impl Default for HtmlTracker {
             state: State::Text,
             pending: None,
             foreign: 0,
-            mark: 0,
+            mark: None,
             found: Vec::new(),
             attrs: Vec::new(),
             meta_text: false,
@@ -785,6 +787,7 @@ impl HtmlTracker {
         };
         let mut scripts = Vec::new();
         let mut i = 0;
+        self.mark = None;
         while i < chars.len() {
             let c = chars[i];
             self.here = offsets[i];
@@ -914,7 +917,7 @@ impl HtmlTracker {
                     } else if c.is_whitespace() || c == '/' {
                         State::Tag { name, closing }
                     } else {
-                        self.mark = offsets[i];
+                        self.mark = Some(offsets[i]);
                         State::AttrName { tag: name, closing, name: c.to_ascii_lowercase().to_string() }
                     }
                 }
@@ -924,7 +927,7 @@ impl HtmlTracker {
                         let handler =
                             name.len() > 2 && name.starts_with("on") && name.bytes().all(|b| b.is_ascii_lowercase());
                         if handler && !closing {
-                            self.found.push((self.mark, InlineCode::Handler(name.clone())));
+                            self.found.push((self.mark.unwrap_or(self.here), InlineCode::Handler(name.clone())));
                         }
                         self.attrs.push(name.clone());
                         State::BeforeValue { tag, closing, name }
@@ -950,7 +953,7 @@ impl HtmlTracker {
                 State::BeforeValue { tag, closing, name } => {
                     if c == '"' || c == '\'' {
                         let url = is_url_attr(&tag, &name).then(|| UrlState::Undecided(vec![String::new()]));
-                        self.mark = offsets[i];
+                        self.mark = Some(offsets[i]);
                         State::Quoted { tag, closing, name, quote: c, url }
                     } else if c.is_whitespace() {
                         State::BeforeValue { tag, closing, name }
@@ -1005,7 +1008,7 @@ impl HtmlTracker {
                             ps.sort();
                             ps.dedup();
                             if inline {
-                                self.found.push((self.mark, InlineCode::ScriptUrl));
+                                self.found.push((self.mark.unwrap_or(self.here), InlineCode::ScriptUrl));
                             }
                             if script {
                                 url = Some(UrlState::Script);
