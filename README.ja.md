@@ -62,7 +62,7 @@ echo greet($name);                                 // Web ページでは自動�
     パスの検査と使用の間にすり替えられることもない。
   - **上限**: メモリ・時間・再帰の深さに上限がある。
   - **動的な実行がない**: `eval` や可変変数はない。
-  - 8 回の監査と脆弱性診断の結果は [docs/security-audit.ja.md](docs/security-audit.ja.md) にある。
+  - 9 回の監査と脆弱性診断の結果は [docs/security-audit.ja.md](docs/security-audit.ja.md) にある。
 - **速度**: 型に特化したレジスタ型バイトコード VM、Cranelift による JIT、バイトコードのディスクキャッシュ
 - **ツール**: テストランナー(同じプロセスで動く HTTP クライアント `std.testing` 付き)、フォーマッタ、Language Server、
   パッケージマネージャ、データベースのマイグレーション、PHP からの移行ツール。
@@ -154,6 +154,7 @@ cargo test --workspace
 - `tests/cases/*.phv` を実行して `.out` と比べるゴールデンテスト。JIT を有効にした実行と、
   `phv fmt` をかけた後の実行でも同じ結果になることを確かめる。
 - セキュリティの回帰テスト(`err_security.phv`、`err_context.phv`、`security.phv` など)。
+- 大きな結果を作る組み込み関数(`limits.rs`)と JIT(`jit.rs`)のメモリと時間の制限のテスト。
 - 実サーバーを起動して HTTP で確かめる結合テスト。
 - 変異させたプログラムによるファジング(`PHV_FUZZ_ITERATIONS` で回数を変えられる)。
 

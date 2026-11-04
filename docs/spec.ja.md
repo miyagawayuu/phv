@@ -974,7 +974,7 @@ class Order {
     public function __construct(public int $id, public Status $status, public list<Item> $items) {}
 }
 
-Order $order = json_decode_as(request()->text());   // JSON が Order に合わなければ ValueError
+Order $order = json_decode_as(request()->body);     // JSON が Order に合わなければ ValueError
 echo json_encode_pretty($order);
 ```
 
@@ -986,6 +986,7 @@ echo json_encode_pretty($order);
 - クラスはコンストラクタを呼ばずに JSON のオブジェクトから作る。そのため、ジェネリックでも抽象でもなく、プロパティが
   すべて public で、コンストラクタがあれば public で引数をプロパティにするだけのクラスに限る。中に処理のある
   コンストラクタ(引数を検査しているかもしれない)は飛ばされてしまうので、そのようなクラスはコンパイルエラー。
+  コンストラクタ引数でない readonly プロパティ(値は既定値にしかなりえない)があるクラスも同じ。
 - JSON にないプロパティは、その既定値、コンストラクタ引数の既定値、nullable なら `null` になる。どれでもなければエラー。
   クラスにないキーは無視する。
 - 合わないときの `ValueError` は場所を示す: `json_decode_as(): expected an integer, found a string at $.items[2].qty`。
@@ -1243,10 +1244,19 @@ Regex::escape("1+1=2?");                                   // その文字列そ
 ```
 
 文法は Rust の `regex` クレートのもの: `(?i)` で大文字小文字を区別しない、`(?<name>...)` で名前付きグループ、`\d \w \s`、
-`\p{L}` などの Unicode のクラス。先読み・後読みと後方参照はない。その代わり、どんなパターンでもテキストの長さに比例した
-時間で照合するので、訪問者からのパターンやテキストでページが止まることはない(壊滅的なバックトラックがない)。不正な
-パターンは `ValueError`。パターンは 64 KB まで、コンパイル後は 4 MB までで、スレッドごとに最近使った 64 個をコンパイル済みの
-まま保持する。`match()` ではグループ 0 がマッチ全体で、関わらなかったグループは `""`。
+`\p{L}` などの Unicode のクラス。先読み・後読みと後方参照はない。その代わり壊滅的なバックトラックはなく、検索にかかる
+時間は最大でもテキストの長さとコンパイルしたパターンの大きさの積に比例する(たいていはずっと短い)。
+
+- 検索そのものは途中で止められないので、最悪の場合(パターンの状態数 × テキストの長さ)にスクリプトの残り時間で
+  終わらない検索は、始める前に `RuntimeException` にする。普通のパターンなら数 MB を検索できる(状態が約 1,000 の
+  メールアドレスのパターンで、30 秒あれば約 3 MB)。Unicode のクラスの長い繰り返し(`\w{40}`)のような非常に大きな
+  パターンでは、より短いテキストまで。そのため、訪問者からのパターンでワーカーが制限時間を超えて止まることはない。
+- 不正なパターンは `ValueError`。パターンは 64 KB まで、コンパイル後は 2 MB まで、グループは 1,000 個まで。グループの
+  検索に 16 MB を超えるメモリ(状態数 × グループ数)が要るパターンも拒否する。
+- 結果は作りながらメモリ制限に数える。
+- スレッドごとに最近使ったパターンをコンパイル済みのまま保持する(64 個、32 MB まで)。
+
+`match()` ではグループ 0 がマッチ全体で、関わらなかったグループは `""`。
 
 ### 日付と時刻(std.time)
 
@@ -1332,11 +1342,11 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
 | `json_decode($s): any` | 深さ 128 まで |
 | `encrypt($text, $key)`、`decrypt($box, $key): ?string` | ChaCha20-Poly1305。メッセージごとに鍵を導出し(ランダムな salt で HKDF-SHA256)、nonce もランダム。結果は base64url のテキスト。`decrypt` は、テキストが変えられていたり暗号化したときと鍵が違ったりすると `null` |
 | `sign_token($data, $key)`、`sign_token($data, $key, $seconds)`、`verify_token($token, $key): ?string` | HMAC-SHA256 の署名付きのデータ。`$seconds` を渡すとその秒数だけ有効(パスワード再設定などメールのリンク用)。データは base64url にしただけで読めるので、秘密にするものは暗号化する。`verify_token` はデータを返し、トークンが変えられている、別の鍵で署名されている、期限切れのときは `null` |
-| `jwt_encode($claims, $key)`、`jwt_decode($token, $key): ?map<string, any>` | HS256 だけの JSON Web Token。ほかのアルゴリズム(`none` を含む)を名乗るトークンは拒否する。`exp` と `nbf` を検査する |
+| `jwt_encode($claims, $key)`、`jwt_decode($token, $key): ?map<string, any>` | HS256 だけの JSON Web Token。ほかのアルゴリズム(`none` を含む)を名乗るトークンは拒否する。`exp` と `nbf` を検査する。鍵は(ほかの JWT のライブラリと同じく)そのまま使うので、同じ鍵を `hash_hmac()` に使わない: 訪問者のテキストの HMAC が正しい署名になってしまう |
 
 `encrypt`、`sign_token`、JWT の関数の鍵は 32 バイト以上の秘密の文字列(`random_token()` で作れる)。コードには書かず、
 環境変数に入れて `getenv` で読む。`encrypt` と `sign_token` は渡された鍵からそれぞれ別の鍵を導出するので、1 つの鍵を
-両方に使ってよい。
+両方に使ってよい。トークンはそのまま比べるので、前後に空白があると無効。
 
 ### Content-Security-Policy
 
@@ -1505,9 +1515,9 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 | `base64url_encode`、`base64url_decode`、`bin2hex`、`hex2bin` | エンコード(UTF-8 でないテキストへのデコードは `ValueError`) |
 | `file_get_contents`, `file_put_contents`, `file_exists`, `unlink`, `getenv` | `[permissions]` が必要 |
 | `file_append(path, text)`、`filesize(path)`、`filemtime(path)`、`is_dir(path)`、`scandir(dir): list<string>`、`mkdir(dir)`、`copy(from, to)`、`rename(from, to)` | ファイルとディレクトリ。`[permissions]` が必要(§14) |
-| `csv_parse(string): list<list<string>>`、`csv_encode(list<list<string>>): string` | RFC 4180(引用符で囲んだフィールド、`""`、フィールド内の改行)。`csv_encode` の行末は CRLF |
+| `csv_parse(string): list<list<string>>`、`csv_encode(list<list<string>>): string` | RFC 4180(引用符で囲んだフィールド、`""`、フィールド内の改行)。`csv_encode` の行末は CRLF。表計算ソフトは `=`・`+`・`-`・`@` で始まるセルを数式として実行するので、訪問者のテキストを表計算ソフトで開くファイルに入れるときは、そのようなセルの前に `'` を付ける |
 | `parse_url(string): map<string, string>`、`parse_query(string): map<string, string>` | キーは `scheme`、`host`、`port`、`user`、`pass`、`path`、`query`、`fragment`(あるものだけ)。不正な URL は `ValueError` |
-| `log_info(msg, ?fields)`、`log_warn(...)`、`log_error(...)` | 標準エラーに 1 行(サーバー自身のログと並ぶ): `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`。空白・`"`・`=` を含む値は引用符で囲み、改行はエスケープするので、値で行を偽造できない |
+| `log_info(msg, ?fields)`、`log_warn(...)`、`log_error(...)` | 標準エラーに 1 行(サーバー自身のログと並ぶ): `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`。空白・`"`・`=` を含む値は引用符で囲み、改行・制御文字・テキストの向きを変える文字(U+202E など)はエスケープするので、値で行を偽造できない |
 | `argv(): list<string>`、`stdin_read_line(): ?string`、`stdin_read_all(): string` | `phv run` で実行したスクリプトだけ(ほかでは `RuntimeException`): ファイルの後の引数と標準入力 |
 | `sql_ident(string): Sql` | 列名・テーブル名 |
 | `assert(bool, ?string)`, `assert_eq(any, any, ?string)` | テスト用 |
@@ -1540,7 +1550,7 @@ format("[{:>6}] [{:<6}] [{:*^7}] [{:05}] [{:x}] [{:08b}] {{braces}}", "r", "l", 
 (短いほうの長さまで)、`partition(fn($x) => bool): list<list<T>>`(`[$yes, $no] = ...`)、
 `count(fn($x) => bool)`、`min(): ?T` / `max(): ?T`(int、float、string)、`removeAt($i)`、`insertAt($i, $v)`
 
-メソッドは新しい list を返し、呼び出した list はそのまま。
+メソッドは新しい list を返し、呼び出した list はそのまま。`sorted()` は `NAN` をどの数よりも後ろに置く。
 
 要素の追加は `$xs[] = $v;`、更新は `$xs[$i] = $v;`(範囲外は `IndexError`)。
 

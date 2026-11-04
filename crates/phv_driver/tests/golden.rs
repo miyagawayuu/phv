@@ -505,6 +505,7 @@ fn files_and_directories() {
     std::os::unix::fs::symlink(dir.join("content"), dir.join("data/link")).unwrap();
     let script = r#"<?phv
 mkdir("data/a/b");
+mkdir("./data/a/b/");
 echo is_dir("data/a/b") ? "dir" : "no", " ", is_dir("data/none") ? "?" : "missing", "\n";
 file_put_contents("data/a/log.txt", "one\n");
 file_append("data/a/log.txt", "two\n");

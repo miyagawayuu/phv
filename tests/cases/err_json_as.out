@@ -23,4 +23,10 @@ error: `json_decode_as()` cannot decode into `map<string, fn(int): int>`: `fn(in
 17 | map<string, fn(int): int> $f = json_decode_as("{}");
    |                                ^^^^^^^^^^^^^^^^^^^^
 
-4 errors found
+error: `json_decode_as()` cannot decode into `Account`: `Account` has the readonly property `$admin`, which is not a constructor parameter and so cannot be set from JSON
+  --> err_json_as.phv:23:16
+   |
+23 | Account $acc = json_decode_as('{"name": "x", "admin": true}');
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+5 errors found

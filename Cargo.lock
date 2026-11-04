@@ -1617,6 +1617,7 @@ dependencies = [
  "postgres",
  "qrcode",
  "regex",
+ "regex-automata",
  "ring",
  "rusqlite",
  "rustls",

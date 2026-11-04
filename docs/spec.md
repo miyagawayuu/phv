@@ -984,7 +984,7 @@ class Order {
     public function __construct(public int $id, public Status $status, public list<Item> $items) {}
 }
 
-Order $order = json_decode_as(request()->text());   // ValueError if the JSON does not fit Order
+Order $order = json_decode_as(request()->body);     // ValueError if the JSON does not fit Order
 echo json_encode_pretty($order);
 ```
 
@@ -996,7 +996,7 @@ integers), enums (a backed enum by its value, a pure enum by its case name) and 
 - A class is built from a JSON object without calling its constructor, so it must be a non-generic, non-abstract
   class whose properties are all public, and whose constructor, if it has one, is public and only promotes its
   parameters. A constructor with code in it (which might check its arguments) would be skipped, so such a class is a
-  compile error.
+  compile error. So is a readonly property that is not a constructor parameter: only its default can be its value.
 - A missing property takes its default, or the default of its constructor parameter, or `null` if it is nullable;
   otherwise it is an error. Keys the class does not have are ignored.
 - On a mismatch the `ValueError` says where: `json_decode_as(): expected an integer, found a string at $.items[2].qty`.
@@ -1261,11 +1261,21 @@ Regex::escape("1+1=2?");                                   // a pattern that mat
 ```
 
 The syntax is that of Rust's `regex` crate: `(?i)` for no case, `(?<name>...)` for a named group, `\d \w \s`, Unicode
-classes such as `\p{L}`; there is no look-around and no back-reference. In exchange, matching takes time linear in
-the text whatever the pattern, so a pattern or a text from a visitor cannot make a page hang (no catastrophic
-backtracking). An invalid pattern throws `ValueError`; patterns are at most 64 KB and 4 MB once compiled, and each
-thread keeps the 64 patterns it used last compiled. In `match()`, group 0 is the whole match and a group that took no
-part is `""`.
+classes such as `\p{L}`; there is no look-around and no back-reference. In exchange there is no catastrophic
+backtracking: a search takes at most time proportional to the length of the text times the size of the compiled
+pattern, and usually much less.
+
+- The search itself cannot be interrupted, so a search whose worst case (the pattern's states × the length of the
+  text) could not end in the time the script has left throws `RuntimeException` before it starts. Ordinary patterns
+  search megabytes (an e-mail pattern, with about 1,000 states, about 3 MB in 30 seconds); a very large pattern, such
+  as long repetitions of Unicode classes (`\w{40}`), only a shorter text. A pattern from a visitor therefore cannot
+  hold a worker past the time limit.
+- An invalid pattern throws `ValueError`. Patterns are at most 64 KB, 2 MB once compiled, and 1,000 groups; a pattern
+  whose groups would need more than 16 MB to search (states × groups) is refused too.
+- Results count toward the memory limit as they are built.
+- Each thread keeps the patterns it used last compiled: at most 64 of them and 32 MB.
+
+In `match()`, group 0 is the whole match and a group that took no part is `""`.
 
 ### Dates and times (std.time)
 
@@ -1353,11 +1363,11 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
 | `json_decode($s): any` | Depth up to 128 |
 | `encrypt($text, $key)`, `decrypt($box, $key): ?string` | ChaCha20-Poly1305, with a key derived for each message (HKDF-SHA256 with a random salt) and a random nonce; the result is base64url text. `decrypt` returns `null` if the text was changed or the key is not the one it was encrypted with |
 | `sign_token($data, $key)`, `sign_token($data, $key, $seconds)`, `verify_token($token, $key): ?string` | Data with an HMAC-SHA256 signature, valid for `$seconds` when given (links in e-mails, such as password resets). The data can be read (it is only base64url): encrypt what must stay secret. `verify_token` returns the data, or `null` if the token was changed, signed with another key, or has expired |
-| `jwt_encode($claims, $key)`, `jwt_decode($token, $key): ?map<string, any>` | JSON Web Tokens with HS256 only: a token that names another algorithm (`none` included) is refused. `exp` and `nbf` are checked |
+| `jwt_encode($claims, $key)`, `jwt_decode($token, $key): ?map<string, any>` | JSON Web Tokens with HS256 only: a token that names another algorithm (`none` included) is refused. `exp` and `nbf` are checked. The key is used as it is (as other JWT libraries expect), so do not also use it with `hash_hmac()`: an HMAC of a visitor's text would be a valid signature |
 
 Keys for `encrypt`, `sign_token` and the JWT functions are secrets of at least 32 bytes (`random_token()` makes one);
 keep them in an environment variable (`getenv`), not in the code. `encrypt` and `sign_token` derive their own keys
-from the one given, so one key can serve both.
+from the one given, so one key can serve both. Tokens are compared as they are: one with spaces around it is invalid.
 
 ### Content-Security-Policy
 
@@ -1527,9 +1537,9 @@ create files at the root of a drive), in the shared temporary directory, and on 
 | `base64url_encode`, `base64url_decode`, `bin2hex`, `hex2bin` | Encoding (decoding to text that is not UTF-8 throws `ValueError`) |
 | `file_get_contents`, `file_put_contents`, `file_exists`, `unlink`, `getenv` | Require `[permissions]` |
 | `file_append(path, text)`, `filesize(path)`, `filemtime(path)`, `is_dir(path)`, `scandir(dir): list<string>`, `mkdir(dir)`, `copy(from, to)`, `rename(from, to)` | Files and directories; require `[permissions]` (below) |
-| `csv_parse(string): list<list<string>>`, `csv_encode(list<list<string>>): string` | RFC 4180 (quoted fields, `""`, line breaks in fields); `csv_encode` ends lines with CRLF |
+| `csv_parse(string): list<list<string>>`, `csv_encode(list<list<string>>): string` | RFC 4180 (quoted fields, `""`, line breaks in fields); `csv_encode` ends lines with CRLF. Spreadsheets run a cell that starts with `=`, `+`, `-` or `@` as a formula: when visitors' text goes into a file people open in one, prefix such cells with `'` |
 | `parse_url(string): map<string, string>`, `parse_query(string): map<string, string>` | Keys `scheme`, `host`, `port`, `user`, `pass`, `path`, `query`, `fragment` (those present); an invalid URL throws `ValueError` |
-| `log_info(msg, ?fields)`, `log_warn(...)`, `log_error(...)` | One line on standard error, next to the server's own log: `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`. Text with spaces, `"` or `=` is quoted and line breaks are escaped, so a value cannot forge a line |
+| `log_info(msg, ?fields)`, `log_warn(...)`, `log_error(...)` | One line on standard error, next to the server's own log: `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`. Text with spaces, `"` or `=` is quoted; line breaks, control characters and the characters that reorder text (U+202E...) are escaped, so a value cannot forge a line |
 | `argv(): list<string>`, `stdin_read_line(): ?string`, `stdin_read_all(): string` | Only in scripts run with `phv run` (elsewhere `RuntimeException`): the arguments after the file, and standard input |
 | `sql_ident(string): Sql` | Column and table names |
 | `assert(bool, ?string)`, `assert_eq(any, any, ?string)` | For tests |
@@ -1563,7 +1573,7 @@ when the program is (`{:.2}` needs a number, `{:x}` an `int`). Widths and precis
 (as long as the shorter list), `partition(fn($x) => bool): list<list<T>>` (`[$yes, $no] = ...`),
 `count(fn($x) => bool)`, `min(): ?T` / `max(): ?T` (int, float or string), `removeAt($i)`, `insertAt($i, $v)`
 
-Methods return new lists and leave the list they are called on as it is.
+Methods return new lists and leave the list they are called on as it is. `sorted()` puts `NAN` after every number.
 
 Append an element with `$xs[] = $v;` and update one with `$xs[$i] = $v;` (an index out of range raises `IndexError`).
 

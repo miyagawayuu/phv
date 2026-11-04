@@ -1,6 +1,8 @@
-// std.regex — regular expressions. Matching takes time linear in the text,
-// whatever the pattern (no catastrophic backtracking), so patterns and texts
-// from visitors are safe to use.
+// std.regex — regular expressions. There is no catastrophic backtracking: a
+// search takes at most time proportional to the text times the size of the
+// pattern, and one that could not end within the time limit is refused before
+// it starts (RuntimeException), so patterns and texts from visitors cannot
+// hold a page past its limits.
 //
 //   import std.regex.Regex;
 //   $date = new Regex('^(\d{4})-(\d{2})-(\d{2})$');   // single quotes keep backslashes

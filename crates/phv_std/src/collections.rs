@@ -22,6 +22,11 @@ fn index_error(vm: &mut Vm, i: i64, len: usize) -> phv_vm::VmError {
     vm.throw("IndexError", format!("list index {i} is out of range (length {len})"))
 }
 
+/// Memory of one item of a list.
+const VALUE: usize = std::mem::size_of::<Value>();
+/// Memory of a new list (its shared header) or a map entry, beyond its items.
+const GROUP: usize = 64;
+
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
     let f: BuiltinFn = match name {
         "list_reduce" => |vm, a| {
@@ -38,15 +43,31 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let mut out = Vec::new();
             for x in list(&a[0]).iter() {
                 let part = vm.call_value(&f, std::slice::from_ref(x))?;
-                out.extend(list(&part).iter().cloned());
+                let part = list(&part);
+                // The parts may all be one shared list: count what copying adds.
+                vm.reserve(part.len().saturating_mul(VALUE))?;
+                out.reserve(part.len());
+                out.extend(part.iter().cloned());
             }
             Ok(Value::list(out))
         },
-        "list_flatten" => |_, a| Ok(Value::list(list(&a[0]).iter().flat_map(|x| list(x).iter().cloned()).collect())),
+        "list_flatten" => |vm, a| {
+            let xs = list(&a[0]);
+            let total = xs.iter().fold(0usize, |n, x| n.saturating_add(list(x).len()));
+            vm.reserve(total.saturating_mul(VALUE))?;
+            let mut out = Vec::with_capacity(total);
+            for x in xs.iter() {
+                out.extend(list(x).iter().cloned());
+            }
+            Ok(Value::list(out))
+        },
         "list_group_by" => |vm, a| {
             let f = a[1].clone();
             let mut groups: IndexMap<phv_vm::Key, Vec<Value>> = IndexMap::new();
-            for (i, x) in list(&a[0]).iter().enumerate() {
+            let xs = list(&a[0]);
+            // Each item may start a group of its own.
+            vm.reserve(xs.len().saturating_mul(VALUE + GROUP))?;
+            for (i, x) in xs.iter().enumerate() {
                 tick(vm, i)?;
                 let key = vm.call_value(&f, std::slice::from_ref(x))?;
                 groups.entry(key.to_key()).or_default().push(x.clone());
@@ -59,7 +80,10 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
                 return Err(vm.throw("ValueError", "chunk(): the size must be at least 1"));
             }
             let size = usize::try_from(n).unwrap_or(usize::MAX);
-            Ok(Value::list(list(&a[0]).chunks(size).map(|c| Value::list(c.to_vec())).collect()))
+            let xs = list(&a[0]);
+            let chunks = xs.len().div_ceil(size);
+            vm.reserve(xs.len().saturating_mul(VALUE).saturating_add(chunks.saturating_mul(VALUE + GROUP)))?;
+            Ok(Value::list(xs.chunks(size).map(|c| Value::list(c.to_vec())).collect()))
         },
         "list_zip" => |vm, a| {
             let f = a[2].clone();
@@ -139,16 +163,14 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::map(out))
         },
         "map_sorted_by_key" => |_, a| {
-            let mut entries: Vec<(phv_vm::Key, Value)> =
-                map(&a[0]).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            entries.sort_by(|x, y| compare(&x.0.to_value(), &y.0.to_value()));
+            let entries: Vec<(phv_vm::Key, Value)> = map(&a[0]).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let entries = super::stable_sort(entries, &|x, y| super::sort_le(&x.0.to_value(), &y.0.to_value()));
             Ok(Value::map(entries.into_iter().collect()))
         },
         "map_sorted_by_value" => |_, a| {
-            let mut entries: Vec<(phv_vm::Key, Value)> =
-                map(&a[0]).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let entries: Vec<(phv_vm::Key, Value)> = map(&a[0]).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             // Stable: equal values keep their order.
-            entries.sort_by(|x, y| compare(&x.1, &y.1));
+            let entries = super::stable_sort(entries, &|x, y| super::sort_le(&x.1, &y.1));
             Ok(Value::map(entries.into_iter().collect()))
         },
         _ => return None,

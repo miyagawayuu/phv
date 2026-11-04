@@ -78,7 +78,7 @@ pub fn encrypt(plain: &[u8], key: &[u8]) -> String {
 
 /// None when the text was not made by `encrypt` with this key, or was changed.
 pub fn decrypt(text: &str, key: &[u8]) -> Option<Vec<u8>> {
-    let raw = URL_SAFE_NO_PAD.decode(text.trim()).ok()?;
+    let raw = URL_SAFE_NO_PAD.decode(text).ok()?;
     if raw.len() < 1 + SALT + NONCE + TAG || raw[0] != VERSION {
         return None;
     }
@@ -104,7 +104,7 @@ pub fn sign(data: &[u8], key: &[u8], expires: i64) -> String {
 /// The signed data, or None if the token is not signed with this key, was
 /// changed, or has expired at `now`.
 pub fn verify(token: &str, key: &[u8], now: i64) -> Option<Vec<u8>> {
-    let (payload, mac) = token.trim().split_once('.')?;
+    let (payload, mac) = token.split_once('.')?;
     let payload = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let mac = URL_SAFE_NO_PAD.decode(mac).ok()?;
     hmac::verify(&sign_key(key), &[&[VERSION][..], &payload].concat(), &mac).ok()?;
@@ -133,7 +133,7 @@ fn time_claim(m: &phv_vm::Map, name: &str) -> Result<Option<f64>, ()> {
 
 /// The claims of an HS256 token signed with `key`, if it is valid at `now`.
 fn jwt_decode(token: &str, key: &[u8], now: i64) -> Option<Value> {
-    let mut parts = token.trim().split('.');
+    let mut parts = token.split('.');
     let (h, p, sig) = (parts.next()?, parts.next()?, parts.next()?);
     if parts.next().is_some() {
         return None;

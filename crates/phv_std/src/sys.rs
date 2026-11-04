@@ -526,7 +526,8 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let rel = s(&a[0]).trim_end_matches(['/', '\\']).to_string();
             // Each missing directory below the allowed one is created in turn (like `mkdir -p`).
             let parts: Vec<&str> = rel.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").collect();
-            let allowed = allowed_depth(vm, &rel, true);
+            // `./data/x` is `data/x` here as everywhere else.
+            let allowed = allowed_depth(vm, &parts.join("/"), true);
             for i in (allowed + 1)..=parts.len() {
                 let prefix = parts[..i].join("/");
                 let (dir, name) = resolve_path(vm, &prefix, true)?;
@@ -553,7 +554,8 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let (tdir, tname) = resolve_path(vm, &to, true)?;
             fdir.rename_to(&fname, &tdir, &tname).map_err(|e| match e {
                 FsError::Io(e) => io_error(vm, "cannot rename", &from, e),
-                e => fs_error(vm, &from, "", e),
+                // The check that failed may be of either name.
+                e => fs_error(vm, &format!("{from}\" or \"{to}"), "", e),
             })?;
             Ok(Value::Null)
         },

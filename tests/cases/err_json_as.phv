@@ -15,3 +15,9 @@ $a = json_decode_as("1");
 Guarded $g = json_decode_as("{}");
 Secret $s = json_decode_as("{}");
 map<string, fn(int): int> $f = json_decode_as("{}");
+
+class Account {
+    public readonly bool $admin = false;
+    public function __construct(public string $name) {}
+}
+Account $acc = json_decode_as('{"name": "x", "admin": true}');

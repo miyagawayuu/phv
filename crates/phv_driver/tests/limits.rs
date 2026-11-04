@@ -1,0 +1,120 @@
+//! Builtins that build large results in one call stay within the memory limit
+//! (they account for the result before building it), and a regular expression
+//! search that could not end within the time limit is refused before it starts.
+//! Regression tests for the v0.8.0 audit (security-audit.md §17).
+
+use phv_driver::{compile, run, RunOptions};
+use phv_vm::alloc::{reset_thread_peak, thread_allocated, thread_peak, CountingAlloc};
+use phv_vm::Limits;
+use std::time::{Duration, Instant};
+
+// Memory limits are enforced through the counting allocator.
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc;
+
+const LIMIT: usize = 16 << 20;
+
+/// Runs `src`; returns its output and first error line, and the most memory
+/// the run held at once.
+fn run_limited(name: &str, src: &str, limits: Limits) -> (String, usize) {
+    let dir = std::env::temp_dir().join(format!("phv-limits-test-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("main.phv");
+    std::fs::write(&entry, src).unwrap();
+    let c = compile(&dir, &entry).unwrap_or_else(|e| panic!("{}", e.render(false)));
+    let base = thread_allocated();
+    reset_thread_peak();
+    let outcome = run(&c, RunOptions { html: false, limits, http: None, host: None });
+    let peak = (thread_peak() - base).max(0) as usize;
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = outcome.error.map(|e| e.render().lines().next().unwrap_or_default().to_string());
+    (format!("{}{}", outcome.output, err.unwrap_or_default()), peak)
+}
+
+fn assert_stops_at_limit(name: &str, src: &str) {
+    let limits = Limits { max_memory: Some(LIMIT), ..Limits::default() };
+    let (out, peak) = run_limited(name, src, limits);
+    assert!(out.contains("allowed memory size of 16 MB exhausted"), "{name}: {out}");
+    // Without the checks, each of these allocated hundreds of MB or more at once.
+    assert!(peak < 4 * LIMIT, "{name} held {} MB", peak >> 20);
+}
+
+#[test]
+fn json_and_list_builders_stay_within_the_memory_limit() {
+    // 200,000 zeros 120 levels deep: 400 KB compact, about 50 MB indented.
+    assert_stops_at_limit(
+        "pretty",
+        r#"<?phv
+any $v = range(0, 199999)->map(fn(int $i): int => 0);
+for ($i = 0; $i < 120; $i++) { $v = [$v]; }
+echo strlen(json_encode_pretty($v));
+"#,
+    );
+    // One shared list of 100,000 items, a hundred times over.
+    let shared = r#"<?phv
+$big = range(0, 99999);
+list<list<int>> $outer = [];
+for ($i = 0; $i < 100; $i++) { $outer[] = $big; }
+"#;
+    assert_stops_at_limit("flatten", &format!("{shared}echo $outer->flatten()->len();"));
+    assert_stops_at_limit(
+        "flat_map",
+        &format!("{shared}echo range(1, 100)->flatMap(fn(int $i): list<int> => $big)->len();"),
+    );
+    assert_stops_at_limit(
+        "csv_encode",
+        r#"<?phv
+$row = [str_repeat("x", 100000)];
+list<list<string>> $rows = [];
+for ($i = 0; $i < 1000; $i++) { $rows[] = $row; }
+echo strlen(csv_encode($rows));
+"#,
+    );
+    assert_stops_at_limit("chunk", "<?phv echo range(0, 299999)->chunk(1)->len();");
+    assert_stops_at_limit("group_by", "<?phv echo range(0, 299999)->groupBy(fn(int $i): int => $i)->len();");
+}
+
+#[test]
+fn regular_expressions_stay_within_the_memory_limit() {
+    let cases = [
+        ("match_all", r#"echo (new Regex(str_repeat("(a)?", 100)))->matchAll(str_repeat("a", 2000000))->len();"#),
+        ("replace", r#"echo strlen((new Regex("a"))->replace(str_repeat("a", 100000), str_repeat('$0', 500)));"#),
+        ("split", r#"echo (new Regex(""))->split(str_repeat("a", 2000000))->len();"#),
+        (
+            "replace_with",
+            r#"$big = str_repeat("x", 1000000);
+echo strlen((new Regex("a"))->replaceWith(str_repeat("a", 100), fn(list<string> $m): string => $big));"#,
+        ),
+    ];
+    for (name, body) in cases {
+        assert_stops_at_limit(name, &format!("<?phv\nimport std.regex.Regex;\n{body}\n"));
+    } // The regex crate's table for groups grows with states × groups: a pattern
+      // that would need more than 16 MB for it is refused when compiled.
+    let src = "<?phv\nimport std.regex.Regex;\nnew Regex(str_repeat(\"(a)?\", 1000));\n";
+    let (out, peak) = run_limited("many_groups", src, Limits { max_memory: Some(LIMIT), ..Limits::default() });
+    assert!(out.contains("too many groups for its size"), "{out}");
+    assert!(peak < 4 * LIMIT, "many_groups held {} MB", peak >> 20);
+}
+
+#[test]
+fn a_regular_expression_search_that_could_outlast_the_time_limit_is_refused() {
+    let limits = Limits { max_time: Some(Duration::from_secs(2)), ..Limits::default() };
+    // About 4,000 states: searching 300,000 bytes could take 10 seconds.
+    let src = r#"<?phv
+import std.regex.Regex;
+$r = new Regex('(?-u)(\w{1,100}){20}b');
+try {
+    $r->match(str_repeat("a", 300000));
+} catch (RuntimeException $e) {
+    echo $e->getMessage(), "\n";
+}
+echo $r->test(str_repeat("a", 1000)) ? "match" : "small texts are searched", "\n";
+"#;
+    let start = Instant::now();
+    let (out, _) = run_limited("regex_time", src, limits);
+    assert!(start.elapsed() < Duration::from_secs(2), "took {:?}", start.elapsed());
+    assert_eq!(
+        out,
+        "the regular expression is too large to search 300000 bytes of text in the time left (use a smaller pattern or a shorter text)\nsmall texts are searched\n"
+    );
+}

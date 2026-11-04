@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates eight audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, and §16 the follow-up on compressing proxies (v0.7.1).
+This report consolidates nine audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), and §17 what was added for v0.8.0.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§15: 2026-11-04, §16: 2026-11-05)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§17: 2026-11-04)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -688,7 +688,7 @@ has no open alerts. New crates: `signal-hook-registry` and `errno` (Unix only, f
 
 ## 16. Follow-up: Compressing Proxies (v0.7.1)
 
-Date: 2026-11-05. After v0.7.0 was deployed to the demo, its pages were checked through Fly.io: `/board`, which
+Date: 2026-11-04. After v0.7.0 was deployed to the demo, its pages were checked through Fly.io: `/board`, which
 carries a CSRF token and is sent uncompressed by PHV (§15, R8-1), arrived compressed. Fly.io's proxy compresses every
 response the app leaves without a `Content-Encoding` header, and other proxies and CDNs can do the same, so PHV's rule
 of not compressing personal responses does not protect them behind such a proxy.
@@ -706,3 +706,93 @@ paired with itself, another session's token and tokens from before `regenerate()
 server panic. No other code writes or compares the token. Regression tests: `masked_tokens_differ_and_verify` in
 `crates/phv_std/src/web.rs`, `serves_pages_safely` (two loads of a form give different tokens that both work) and
 `tests/cases/stdlib2.phv`. Residual risks: none.
+
+## 17. Ninth Assessment (v0.8.0: the standard library)
+
+Date: 2026-11-04. Scope: everything changed after v0.7.1 (`git diff v0.7.1..main`): the new list and map methods,
+mathematics, number bases and encodings, UUIDs, `format()`, `std.regex`, the file and directory functions, CSV, URLs,
+logging, `argv()` and standard input, `std.time`, `json_decode_as()` and `json_encode_pretty()`, `encrypt` /
+`sign_token` / `jwt_*`, and the new dependencies (`regex-automata` directly, `chrono-tz`, `ring` directly).
+
+### Method
+
+A new reviewer, given the source and the change, attacked a release build: scripts under a 64 MB memory limit
+(measuring the process's peak memory), `phv serve --prod` sites whose pages pass a visitor's input to the new
+functions, and the server run in a Windows job capped at 1 GB to show what an out-of-memory machine does. The file
+functions were tried against junctions, file and directory symlinks, hard links to a file outside, device and stream
+names and code locations. Every finding was confirmed with a working PoC, and rerun against the fixed build.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| High | 4 | Fixed |
+| Medium | 1 | Fixed |
+| Low | 4 | Fixed |
+| Info | 8 | Fixed / documented |
+
+None of the findings escapes `[permissions]`; all are about the memory and time limits, or a panic.
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R10-1 | `json_encode_pretty()` indented the compact JSON afterwards, without the memory checks of `json_encode`: each item at depth 127 grows by 256 bytes, so a 4 MB JSON body sent to a page that pretty-printed it made the server allocate about 1 GB and abort | The encoder writes the indented form itself, checking the limits as it goes, like compact output |
+| R10-2 | `flatten()`, `flatMap()` and `csv_encode()` built their result before the memory limit was checked: a list that holds one shared list many times is small, but its flattened or encoded form is not (3.5 GB from a 64 MB script; a page doing it aborted the server) | The size of the result is computed first and reserved against the limit (for `flatMap`, part by part) |
+| R10-3 | `std.regex` searches cannot be interrupted, and a large pattern (about 20,000 NFA states) makes the regex crate fall back to a search that costs states × text length: a visitor's pattern held a worker for 142 seconds under a 30-second limit, and longer texts for many minutes | Before each search, its worst case (states × length of the text) is compared with the time the script has left; a search that could not end in time throws `RuntimeException` without starting. Compiled patterns are limited to 2 MB (was 4 MB) |
+| R10-4 | `matchAll()`, `replace()`, `replaceWith()` and `split()` built results of any size in one call (up to 2.9 GB from a 64 MB script), and the regex crate's table for groups grows with states × groups (30,000 empty groups); a 181 KB form post aborted the server | Patterns have at most 1,000 groups, and those whose table for groups would exceed 16 MB are refused; that table is reserved before each search for groups, and each match, replacement and piece is reserved before it is added |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R10-5 | Each worker thread kept up to 64 compiled patterns of up to 4 MB each (about 300 MB per worker), memory that outlives the request and no limit counts: 300 requests with different patterns took a 2-worker server from 4 MB to 219 MB | The cache holds at most 32 MB per thread, counted generously (the NFAs three times over, both lazy DFAs at their limit of 512 KB, and the table for groups); larger patterns are not cached |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R10-6 | Sorting floats that include NaN (`sorted()`, `sortedByValue()`, `sortedByKey()`) panicked in Rust's sort ("does not correctly implement a total order"); the new `log`, `sqrt`, `asin` and `acos` make NaN reachable from a visitor's numbers. A page gave a 500 and a script lost its output | These sorts use a merge sort that cannot panic, with NaN after every number |
+| R10-7 | `json_decode_as()` set readonly properties that are not constructor parameters (`public readonly bool $admin = false;`), which `new` can never change: a JSON body could make an `admin` the class otherwise cannot have | A class with such a property is a compile error for `json_decode_as()` |
+| R10-8 | `stdin_read_all()` and `stdin_read_line()` (only in `phv run`) read any amount of input: 600 MB piped in held 1 GB under a 64 MB limit | They read at most what the memory limit leaves, then stop with the memory error |
+| R10-9 | `chunk()` and `groupBy()` overshot the memory limit 6 to 8 times before it was checked | The result is reserved before it is built |
+
+### Info
+
+| Item | Result |
+|---|---|
+| The Typed JSON example of the spec used `request()->text()`, which does not exist | Fixed: `request()->body` |
+| `mkdir("./data/x")` was refused, unlike the same path without `./` | Fixed |
+| An error of `rename()` named the source when the destination was the link | Fixed: it names both paths |
+| Log values wrote U+2028, U+2029 and the characters that reorder text (U+202E...) as they are | Fixed: escaped like control characters |
+| `csv_encode()` writes cells starting with `= + - @` as they are, which spreadsheets run as formulas | Documented in spec §15 (CSV is data; prefix such cells with `'` for spreadsheets) |
+| `decrypt`, `verify_token` and `jwt_decode` accepted spaces around a token, so a token had several spellings | Fixed: tokens are taken as they are |
+| The JWT key is used as it is (as other JWT libraries expect), so the same key used with `hash_hmac()` on a visitor's text would sign tokens | Documented in spec §14 |
+| `log_*()` used `eprintln!`, which panics when standard error is closed | Fixed: a failed write is ignored |
+
+### Residual Risks
+
+- The time check for regular expressions uses the worst case, so a large pattern on a long text can be refused even
+  when the search would have been quick (`\w{40}` on 1 MB of text with 30 seconds left). Ordinary patterns search
+  megabytes; spec §14 explains the limit. The estimate assumes about 10^8 steps a second, about 75% of what the
+  reviewer's machine did, so on a machine several times slower a search can end some seconds after the time limit.
+
+### Verification
+
+All PoCs were rerun against the fixed build. Under a 64 MB limit the pretty-printed JSON, `flatten`, `flatMap`,
+`csv_encode`, `chunk` and the regex calls now stop at the limit (peak 2 to 78 MB, the input included, instead of 0.4
+to 3.5 GB); the NaN sorts work; the readonly class is refused; 600 MB on standard input stops at the limit. Against
+the site: the original pattern with the 1 MB body is refused in 80 ms, and a 500 KB body with a pattern of
+4,000 states ends in 14 seconds, under the 30-second limit; the pretty-printing, flattening
+and form-search pages answer 500 at the limit and the server stays at about 7 MB; 300 different patterns leave it at
+15 MB. Regression tests: `crates/phv_driver/tests/limits.rs` (every builder and regex call under a 16 MB limit, and a
+refused search under a 2-second limit), the unit tests of `re.rs`, `textio.rs` and `crypt.rs`,
+`tests/cases/collections2.phv` (NaN), `err_json_as.phv` (readonly) and `files_and_directories` (`./`). What held up:
+every file function against links, junctions, hard links, stream and device names and code locations (on Windows;
+the Unix code was reviewed and is tested by CI); `json_decode_as()` with every kind of class, nesting and number;
+`format()`; encryption (fresh salt and nonce, constant-time checks, no algorithm confusion between the token kinds
+or in JWT); `std.time` at the edges of its ranges; `argv` and standard input outside `phv run`. All tests pass on
+Windows, and on Linux and macOS in CI, with clippy (`-D warnings`) and rustfmt.
+
+Dependencies: `cargo audit` (CI) and `npm audit --omit=dev` in the extension and the website find nothing. New crates:
+`chrono-tz`, `phf` and `phf_shared`; `regex`, `regex-automata`, `url` and `ring` were already in the lockfile.

@@ -34,3 +34,10 @@ echo $ages->remove("bob")->keys()->join(","), " ", $ages->len(), "\n";
 echo $ages->filter(fn(string $k, int $v): bool => $v > 30)->keys()->join(","), "\n";
 echo $ages->map(fn(int $v): string => "{$v}y")->values()->join(","), "\n";
 echo $ages->sortedByKey()->keys()->join(","), " ", $ages->sortedByValue()->keys()->join(","), "\n";
+
+// NaN sorts after every number, so the order is total (no panic).
+list<float> $odd = [2.0, sqrt(-1.0), 1.0, sqrt(-1.0), 0.5];
+foreach ($odd->sorted() as $x) {
+    echo $x, " ";
+}
+echo ["a" => sqrt(-1.0), "b" => 3.0, "c" => -1.0]->sortedByValue()->keys()->join(","), "\n";

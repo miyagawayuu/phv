@@ -200,13 +200,43 @@ fn json_string(text: &str, out: &mut String) {
 }
 
 fn json(vm: &Vm, v: &Value, out: &mut String, depth: usize) -> Result<(), VmError> {
-    // Shared lists make the output exponential in the input (`$a = [$a, $a]`).
+    json_to(vm, v, out, depth, false)
+}
+
+/// A line break and the indentation of `depth` (two spaces a level).
+fn json_newline(out: &mut String, depth: usize) {
+    out.push('\n');
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+}
+
+/// JSON of `v`, compact or (`pretty`) on lines indented by two spaces. Past
+/// 64 KB of output the limits are checked before each value, so neither
+/// shared lists (`$a = [$a, $a]`) nor indentation can outgrow them unseen.
+fn json_to(vm: &Vm, v: &Value, out: &mut String, depth: usize, pretty: bool) -> Result<(), VmError> {
     if out.len() > 1 << 16 {
         vm.check_limits()?;
     }
     if depth > 128 {
         return Err(vm.throw("ValueError", "json_encode(): value is nested too deeply (or recursive)"));
     }
+    // Before each item of a list or an object: `,` and, when pretty, a new line.
+    let sep = |out: &mut String, i: usize| {
+        if i > 0 {
+            out.push(',');
+        }
+        if pretty {
+            json_newline(out, depth + 1);
+        }
+    };
+    let close = |out: &mut String, n: usize, c: char| {
+        if pretty && n > 0 {
+            json_newline(out, depth);
+        }
+        out.push(c);
+    };
+    let colon = if pretty { ": " } else { ":" };
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -223,27 +253,23 @@ fn json(vm: &Vm, v: &Value, out: &mut String, depth: usize) -> Result<(), VmErro
         Value::List(l) => {
             out.push('[');
             for (i, x) in l.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                json(vm, x, out, depth + 1)?;
+                sep(out, i);
+                json_to(vm, x, out, depth + 1, pretty)?;
             }
-            out.push(']');
+            close(out, l.len(), ']');
         }
         Value::Map(m) => {
             out.push('{');
             for (i, (k, x)) in m.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
+                sep(out, i);
                 match k {
                     Key::Str(s) => json_string(s, out),
                     Key::Int(n) => json_string(&n.to_string(), out),
                 }
-                out.push(':');
-                json(vm, x, out, depth + 1)?;
+                out.push_str(colon);
+                json_to(vm, x, out, depth + 1, pretty)?;
             }
-            out.push('}');
+            close(out, m.len(), '}');
         }
         Value::Object(o) => {
             let o = o.borrow();
@@ -253,83 +279,60 @@ fn json(vm: &Vm, v: &Value, out: &mut String, depth: usize) -> Result<(), VmErro
             if !class.cases.is_empty() {
                 let field = ["value", "name"].iter().find_map(|n| class.fields.iter().position(|f| f.name == *n));
                 if let Some(x) = field.and_then(|i| o.fields.get(i)) {
-                    return json(vm, x, out, depth + 1);
+                    return json_to(vm, x, out, depth + 1, pretty);
                 }
             }
             out.push('{');
-            let mut first = true;
+            let mut n = 0;
             for (f, x) in class.fields.iter().zip(o.fields.iter()) {
                 if !f.public {
                     continue;
                 }
-                if !first {
-                    out.push(',');
-                }
-                first = false;
+                sep(out, n);
+                n += 1;
                 json_string(&f.name, out);
-                out.push(':');
-                json(vm, x, out, depth + 1)?;
+                out.push_str(colon);
+                json_to(vm, x, out, depth + 1, pretty)?;
             }
-            out.push('}');
+            close(out, n, '}');
         }
         Value::Closure(_) => return Err(vm.throw("ValueError", "json_encode(): closures cannot be encoded")),
     }
     Ok(())
 }
 
-/// Compact JSON (as `json()` writes it) laid out on lines, indented by two
-/// spaces; `[]` and `{}` stay as they are.
-fn pretty_json(compact: &str) -> String {
-    let mut out = String::with_capacity(compact.len() * 2);
-    let mut depth = 0usize;
-    let mut in_str = false;
-    let mut escaped = false;
-    let mut chars = compact.chars().peekable();
-    let newline = |out: &mut String, depth: usize| {
-        out.push('\n');
-        for _ in 0..depth {
-            out.push_str("  ");
-        }
-    };
-    while let Some(c) = chars.next() {
-        if in_str {
-            out.push(c);
-            match c {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => in_str = false,
-                _ => {}
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                in_str = true;
-                out.push(c);
-            }
-            '[' | '{' => {
-                out.push(c);
-                if matches!(chars.peek(), Some(']' | '}')) {
-                    out.push(chars.next().unwrap_or(' '));
-                } else {
-                    depth += 1;
-                    newline(&mut out, depth);
-                }
-            }
-            ']' | '}' => {
-                depth = depth.saturating_sub(1);
-                newline(&mut out, depth);
-                out.push(c);
-            }
-            ',' => {
-                out.push(',');
-                newline(&mut out, depth);
-            }
-            ':' => out.push_str(": "),
-            c => out.push(c),
-        }
+/// The order `sorted()` and the map sorts use: `compare`, with NaN after every
+/// number so that the order is total.
+fn sort_order(a: &Value, b: &Value) -> std::cmp::Ordering {
+    let nan = |v: &Value| matches!(v, Value::Float(f) if f.is_nan());
+    match (nan(a), nan(b)) {
+        (false, false) => compare(a, b),
+        (x, y) => x.cmp(&y),
     }
+}
+
+/// A stable merge sort that, unlike the standard library's, cannot panic when
+/// the order is not consistent (ints and floats near 2^53 compare as floats).
+pub(crate) fn stable_sort<T>(items: Vec<T>, le: &dyn Fn(&T, &T) -> bool) -> Vec<T> {
+    if items.len() <= 1 {
+        return items;
+    }
+    let mut items = items;
+    let right = items.split_off(items.len() / 2);
+    let (left, right) = (stable_sort(items, le), stable_sort(right, le));
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    let (mut l, mut r) = (left.into_iter().peekable(), right.into_iter().peekable());
+    while let (Some(a), Some(b)) = (l.peek(), r.peek()) {
+        let take_left = le(a, b);
+        out.extend(if take_left { l.next() } else { r.next() });
+    }
+    out.extend(l);
+    out.extend(r);
     out
+}
+
+pub(crate) fn sort_le(a: &Value, b: &Value) -> bool {
+    sort_order(a, b) != std::cmp::Ordering::Greater
 }
 
 fn dump_value(vm: &Vm, v: &Value, out: &mut String, indent: usize) -> Result<(), VmError> {
@@ -690,8 +693,8 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         },
         "json_encode_pretty" => |vm, a| {
             let mut out = String::new();
-            json(vm, &a[0], &mut out, 0)?;
-            Ok(Value::str(pretty_json(&out)))
+            json_to(vm, &a[0], &mut out, 0, true)?;
+            Ok(Value::str(out))
         },
         "dump" => |vm, a| {
             let mut out = String::new();
@@ -801,9 +804,8 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::list(out))
         },
         "list_sorted" => |_, a| {
-            let mut v = list(&a[0]).as_ref().clone();
-            v.sort_by(compare);
-            Ok(Value::list(v))
+            let v = list(&a[0]).as_ref().clone();
+            Ok(Value::list(stable_sort(v, &sort_le)))
         },
         "list_sort_by" => |vm, a| {
             let f = a[1].clone();

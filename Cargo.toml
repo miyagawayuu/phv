@@ -51,6 +51,7 @@ futures-util = { version = "0.3", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1.0.10"
 regex = "1"
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "nfa-thompson"] }
 url = "2"
 chrono-tz = "0.10"
 ring = "0.17"

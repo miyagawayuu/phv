@@ -66,20 +66,39 @@ pub fn csv_parse(text: &str) -> Result<Vec<Vec<String>>, String> {
     Ok(rows)
 }
 
-pub fn csv_encode(rows: &[Vec<String>]) -> String {
-    let mut out = String::new();
+fn csv_quoted(f: &str) -> bool {
+    f.contains([',', '"', '\n', '\r']) || f.starts_with(' ') || f.ends_with(' ')
+}
+
+/// The length of `csv_encode(rows)`, computed without building it (the rows
+/// may all be one shared list).
+fn csv_len<'a>(rows: impl Iterator<Item = &'a [&'a str]>) -> usize {
+    let mut n = 0usize;
     for row in rows {
-        let cells: Vec<String> = row
-            .iter()
-            .map(|f| {
-                if f.contains([',', '"', '\n', '\r']) || f.starts_with(' ') || f.ends_with(' ') {
-                    format!("\"{}\"", f.replace('"', "\"\""))
-                } else {
-                    f.clone()
-                }
-            })
-            .collect();
-        out.push_str(&cells.join(","));
+        n = n.saturating_add(row.len().saturating_sub(1) + 2);
+        for f in row {
+            let extra = if csv_quoted(f) { 2 + f.matches('"').count() } else { 0 };
+            n = n.saturating_add(f.len() + extra);
+        }
+    }
+    n
+}
+
+pub fn csv_encode(rows: &[Vec<&str>]) -> String {
+    let mut out = String::with_capacity(csv_len(rows.iter().map(|r| r.as_slice())));
+    for row in rows {
+        for (i, f) in row.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            if csv_quoted(f) {
+                out.push('"');
+                out.push_str(&f.replace('"', "\"\""));
+                out.push('"');
+            } else {
+                out.push_str(f);
+            }
+        }
         out.push_str("\r\n");
     }
     out
@@ -95,7 +114,14 @@ fn log_value(v: &str) -> String {
             '\r' => "\\r".to_string(),
             '"' => "\\\"".to_string(),
             '\\' => "\\\\".to_string(),
-            c if c.is_control() => format!("\\u{{{:x}}}", c as u32),
+            // Also the characters that start a line or reorder text in a viewer.
+            c if c.is_control()
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{061c}')
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c) =>
+            {
+                format!("\\u{{{:x}}}", c as u32)
+            }
             c => c.to_string(),
         })
         .collect();
@@ -118,7 +144,9 @@ fn log(level: &str, a: &[Value]) {
             line.push_str(&format!(" {}={}", log_value(&key), log_value(&v.to_display_string())));
         }
     }
-    eprintln!("{line}");
+    // A closed standard error must not stop the script (`eprintln!` panics).
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
 fn cli_only(vm: &mut Vm, what: &str) -> Result<(), VmError> {
@@ -135,9 +163,9 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let rows = csv_parse(s(&a[0])).map_err(|e| vm.throw("ValueError", format!("csv_parse(): {e}")))?;
             Ok(Value::list(rows.into_iter().map(|r| Value::list(r.into_iter().map(Value::str).collect())).collect()))
         },
-        "csv_encode" => |_, a| {
-            let rows: Vec<Vec<String>> =
-                list(&a[0]).iter().map(|r| list(r).iter().map(|f| s(f).to_string()).collect()).collect();
+        "csv_encode" => |vm, a| {
+            let rows: Vec<Vec<&str>> = list(&a[0]).iter().map(|r| list(r).iter().map(s).collect()).collect();
+            vm.reserve(csv_len(rows.iter().map(|r| r.as_slice())))?;
             Ok(Value::str(csv_encode(&rows)))
         },
         "parse_url" => |vm, a| {
@@ -193,20 +221,30 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "stdin_read_line" => |vm, _| {
             cli_only(vm, "stdin_read_line()")?;
+            use std::io::{BufRead, Read};
+            let left = vm.memory_left();
             let mut line = String::new();
-            match std::io::stdin().read_line(&mut line) {
+            match std::io::stdin().lock().take(left as u64).read_line(&mut line) {
                 Ok(0) => Ok(Value::Null),
+                Ok(n) if n >= left => Err(vm.reserve(usize::MAX).expect_err("no limit allows usize::MAX bytes")),
                 Ok(_) => Ok(Value::str(line.trim_end_matches(['\n', '\r']).to_string())),
                 Err(e) => Err(vm.throw("RuntimeException", format!("stdin_read_line(): {e}"))),
             }
         },
         "stdin_read_all" => |vm, _| {
             cli_only(vm, "stdin_read_all()")?;
-            let mut text = String::new();
             use std::io::Read;
-            std::io::stdin()
+            // Read no more than the memory limit leaves room for.
+            let left = vm.memory_left();
+            let mut text = String::new();
+            let n = std::io::stdin()
+                .lock()
+                .take(left as u64)
                 .read_to_string(&mut text)
                 .map_err(|e| vm.throw("ValueError", format!("stdin_read_all(): {e}")))?;
+            if n >= left {
+                return Err(vm.reserve(usize::MAX).expect_err("no limit allows usize::MAX bytes"));
+            }
             Ok(Value::str(text))
         },
         _ => return None,
@@ -225,8 +263,12 @@ mod tests {
         assert_eq!(rows[1], ["Ann", "says \"hi\", then, leaves"]);
         assert_eq!(rows[2], ["Bob", "two\nlines"]);
         assert_eq!(rows[3], ["", ""]);
-        assert_eq!(csv_parse(&csv_encode(&rows)).unwrap(), rows);
+        let refs: Vec<Vec<&str>> = rows.iter().map(|r| r.iter().map(String::as_str).collect()).collect();
+        let encoded = csv_encode(&refs);
+        assert_eq!(csv_len(refs.iter().map(|r| r.as_slice())), encoded.len());
+        assert_eq!(csv_parse(&encoded).unwrap(), rows);
         assert!(csv_parse("\"open").is_err());
         assert_eq!(log_value("a\nb c"), "\"a\\nb c\"");
+        assert_eq!(log_value("x\u{2028}y\u{202e}"), "x\\u{2028}y\\u{202e}");
     }
 }

@@ -29,6 +29,7 @@ rustls.workspace = true
 webpki-roots.workspace = true
 mysql.workspace = true
 regex.workspace = true
+regex-automata.workspace = true
 url.workspace = true
 chrono-tz.workspace = true
 ring.workspace = true

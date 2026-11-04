@@ -1621,11 +1621,19 @@ impl<'a> Checker<'a> {
                                 f.name
                             ));
                         }
-                        let param_default = ci
+                        let param = ci
                             .ctor
                             .and_then(|fid| self.funcs[fid as usize].params.iter().find(|p| p.name == f.name))
-                            .filter(|p| p.promote.is_some())
-                            .and_then(|p| p.default.clone());
+                            .filter(|p| p.promote.is_some());
+                        // Without a constructor parameter, a readonly property can
+                        // only ever have its default: JSON must not set it either.
+                        if f.readonly && param.is_none() {
+                            return Err(format!(
+                                "`{name}` has the readonly property `${}`, which is not a constructor parameter and so cannot be set from JSON",
+                                f.name
+                            ));
+                        }
+                        let param_default = param.and_then(|p| p.default.clone());
                         let mark = match param_default {
                             Some(c) if f.required => {
                                 defaults.push(c);
