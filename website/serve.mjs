@@ -32,13 +32,30 @@ http
     }
     if (rel.endsWith("/")) rel += "index.html";
     const file = path.join(dist, path.normalize(rel));
-    if (!file.startsWith(dist + path.sep) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+    // A file that vanishes or cannot be read (a rebuild of dist/) ends this
+    // response, not the server.
+    const send = (status, name, type) => {
+      const stream = fs.createReadStream(name);
+      stream.on("open", () => {
+        res.writeHead(status, { ...headers, "content-type": type });
+        stream.pipe(res);
+      });
+      stream.on("error", () => {
+        if (!res.headersSent) res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+        res.end();
+      });
+    };
+    let stat;
+    try {
+      stat = file.startsWith(dist + path.sep) ? fs.statSync(file) : undefined;
+    } catch {
+      stat = undefined;
+    }
+    if (!stat || stat.isDirectory()) {
       // Like Cloudflare Pages: unknown paths get 404.html with status 404.
-      res.writeHead(404, { ...headers, "content-type": "text/html; charset=utf-8" });
-      fs.createReadStream(path.join(dist, "404.html")).pipe(res);
+      send(404, path.join(dist, "404.html"), "text/html; charset=utf-8");
       return;
     }
-    res.writeHead(200, { ...headers, "content-type": types[path.extname(file)] || "application/octet-stream" });
-    fs.createReadStream(file).pipe(res);
+    send(200, file, types[path.extname(file)] || "application/octet-stream");
   })
   .listen(port, "127.0.0.1", () => console.log(`http://127.0.0.1:${port}`));

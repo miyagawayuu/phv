@@ -80,6 +80,17 @@ any $v = json_decode($text);
 echo $v is list ? count($v) : 0;
 "#,
     );
+    // A query of 600,000 short fields builds far more than 16 MB (v0.9.1).
+    assert_stops_at_limit(
+        "parse_query",
+        r#"<?phv
+list<string> $parts = [];
+for ($j = 0; $j < 600; $j++) {
+    $parts[] = implode("&", range(0, 999)->map(fn(int $i): string => "k{$j}x$i"));
+}
+echo parse_query(implode("&", $parts))->len();
+"#,
+    );
     assert_stops_at_limit("group_by", "<?phv echo range(0, 299999)->groupBy(fn(int $i): int => $i)->len();");
 }
 

@@ -3,9 +3,9 @@
 English | [日本語](security-audit.ja.md)
 
 This report consolidates ten audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, and §18 what was added for v0.9.0.
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, and §19 the follow-up on an outside review of v0.9.0 (v0.9.1).
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§18: 2026-11-04)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -889,3 +889,48 @@ clippy (`-D warnings`) and rustfmt.
 
 Dependencies: no new crates; `cargo audit` (CI) and `npm audit --omit=dev` in the extension and the website find
 nothing.
+
+## 19. Follow-up: an Outside Review of v0.9.0 (v0.9.1)
+
+Date: 2026-11-04. An outside review of the v0.9.0 source, made with ChatGPT, reported six items. Each was confirmed
+with a PoC against a release build before it was fixed (one by reading: it needs a second user on a Unix machine),
+and two new reviewers then attacked the fixes in turn, which turned up three more. All the findings are older than
+v0.9.0 except R12-6 and R12-8, which were in earlier versions of a fix and never released.
+
+| # | Finding | Fix |
+|---|---|---|
+| R12-1 (Medium) | `phv serve` bounded each request body (8 MB) but not the bodies being received together: each of its 1,024 connections could hold one, so clients that sent all but the last byte of 8 MB bodies made the server hold 495 MB with 60 connections and 1,617 MB with 200 | Past its first 64 KB, a body is received only within a budget of `workers` × 8 MB, taken as the bytes arrive and kept until its script ends; bytes that cannot get their share within 10 seconds get 503, and a body stated larger than 8 MB gets 413 at once |
+| R12-2 (Medium) | Query and form fields were all decoded before their count was checked against the limit of 1,000: 8 MB of `a&` took 252 MB | Fields are counted while they are parsed; the 1,001st gives 400 |
+| R12-3 (Medium) | `json_decode`, `json_decode_as` and `request()->json()` built the whole value before the run's memory limit was checked: 8 MB of `[[],[],…]` took 249 MB under a limit of 64 MB | The run's memory and time limits are checked every 4,096 values |
+| R12-4 (Low) | `phv install` ran git with hooks from a directory of a fixed name in the shared temporary directory: on Unix another user of the machine could create it first, with hooks that git would run as the developer | Each git command gets a new directory with a random name, private to the user (0700), removed afterwards |
+| R12-5 (Low) | `website/serve.mjs` (the site's local preview) stopped on a malformed escape in a URL (`/%E0%A4%A`), and would stop on a file that vanished while it was read | Such a URL gets 400, and a read error ends only its response |
+| R12-6 (Medium, in the first fix) | The first fix of R12-1 reserved a body's share before reading it, from its stated length or 8 MB for a chunked body: `workers` requests that sent no body held the whole budget, and every upload over 64 KB got 503 | The share is taken as bytes arrive, so a client holds only what it has sent |
+| R12-7 (Low) | `parse_query()` built its whole map before the run's limits were checked: 8 MB of distinct short fields took 251 MB under a limit of 16 MB | The limits are checked every 4,096 fields |
+| R12-8 (High, in the second fix) | The second fix kept a body's chunks as they arrived: a body sent a byte at a time cost a handle per byte, about 20 times its size, and the free first 64 KB took no budget at all, so 800 connections sending 64 KB in 1-byte chunks made the server hold over 1 GB, still growing | A body is gathered in one buffer, and the budget pays for the buffer's room past its first 64 KB, not only the bytes in it |
+
+The sixth item of the review, `rustls-pemfile` (through the MySQL client), was already known: RUSTSEC-2025-0134 says
+only that it is unmaintained, and `.cargo/audit.toml` records why it is accepted.
+
+### Residual Risks
+
+- A client that sends a body at full speed holds its share of the budget until its script ends (at most the 30
+  seconds a body may take, then the script's time limit). Clients that keep doing so make other uploads over 64 KB
+  wait, then get 503, as clients that keep every worker busy already do.
+- The first 64 KB of each body, and each connection's buffers, are outside the budget: about 180 KB a connection,
+  at most 1,024 connections (1,000 connections sending their bodies a byte at a time: 178 MB).
+- `phv serve` has no limit per client address: one address that opens 1,024 idle connections makes other clients
+  wait for a free connection (up to the header timeout). A site open to the internet should run behind a reverse
+  proxy that limits connections per address (spec §14).
+
+### Verification
+
+The PoCs were rerun against the fixed release build (`workers = 4`): with 50 requests that send no body, a 100 KB
+upload gets 200 in under 0.01 s (with the first fix: 503 after 10 s with 4); 200 clients holding all but the last
+byte of 8 MB bodies make the server hold 90 MB (1,617 MB), and 1,000 sending 64 KB in 1-byte chunks 178 MB (with the
+second fix: over 1 GB with 800); 4 million form fields get 400 in 0.01 s at 17 MB
+(252 MB); the JSON bodies and `parse_query()` stop at the run's 16 MB limit, the server peaking at 36 MB and 39 MB
+(249 MB and 251 MB); hooks planted for `phv install` ran 25 times with v0.9.0 and not at all now; `serve.mjs` answers
+`/%E0%A4%A` with 400. Regression tests: `request_bodies_are_bounded_as_they_are_read` (phv_server), the `json_decode`
+and `parse_query` cases of `json_and_list_builders_stay_within_the_memory_limit` (phv_driver, each held 100 MB or
+more without the fix), and `hooks_directories_are_private_and_new` (phv_cli). All tests pass on Windows, and on Linux
+and macOS in CI, with clippy (`-D warnings`) and rustfmt. Dependencies: no new crates.

@@ -10,7 +10,7 @@ mod static_files;
 
 use body::{RespBody, StallGuard};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Limited};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue, CONTENT_TYPE};
 use hyper::server::conn::http1;
@@ -32,11 +32,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use tokio::sync::OwnedSemaphorePermit;
 
 /// Request bodies larger than this are rejected with 413.
 const MAX_BODY: usize = 8 * 1024 * 1024;
-/// Bodies up to this size are read without a share of the body budget.
-const SMALL_BODY: u64 = 64 * 1024;
+/// The first bytes of a body that are read without a share of the body budget.
+const SMALL_BODY: usize = 64 * 1024;
 /// Static files larger than this are not served (use a CDN or reverse proxy).
 const MAX_STATIC: u64 = 64 * 1024 * 1024;
 /// Connections handled at the same time; further clients wait in the backlog.
@@ -95,9 +96,10 @@ struct State {
     embedded: Option<Embedded>,
     /// Scripts running at once (`[server] workers`).
     workers: Arc<tokio::sync::Semaphore>,
-    /// Bytes of request bodies being received or held, in KiB: as much as the
-    /// workers can use at once. A body larger than `SMALL_BODY` takes its share
-    /// before it is read and keeps it until its script ends.
+    /// Bytes of request bodies received or held, in KiB: as much as the workers
+    /// can use at once. Past its first `SMALL_BODY` bytes, a body takes its share
+    /// as the bytes arrive (never for bytes not yet sent) and keeps it until its
+    /// script ends.
     body_budget: Arc<tokio::sync::Semaphore>,
     /// Bytes of script output waiting to be sent, over all connections.
     buffered: Arc<AtomicUsize>,
@@ -1224,6 +1226,70 @@ fn fields(bytes: &[u8]) -> Option<Vec<(String, String)>> {
     Some(out)
 }
 
+fn busy() -> Resp {
+    let mut r = simple(StatusCode::SERVICE_UNAVAILABLE, "text/plain", "the server is busy; try again soon".into());
+    r.headers_mut().insert("retry-after", HeaderValue::from_static("5"));
+    r
+}
+
+/// Reads a request body of at most `MAX_BODY` bytes within `BODY_TIMEOUT`.
+/// Past the first `SMALL_BODY` bytes, each KiB takes a permit from the body
+/// budget as it arrives, so a client holds only what it has really sent, and
+/// slow clients cannot pile up gigabytes. The permits are returned with the
+/// body and are kept until its script ends.
+async fn read_body(state: &State, mut body: Incoming) -> Result<(Bytes, Option<OwnedSemaphorePermit>), Resp> {
+    let too_large = || simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "request body too large".into());
+    let stated = hyper::body::Body::size_hint(&body).upper();
+    if stated.is_some_and(|n| n > MAX_BODY as u64) {
+        return Err(too_large());
+    }
+    let deadline = tokio::time::Instant::now() + BODY_TIMEOUT;
+    let timed_out = || simple(StatusCode::REQUEST_TIMEOUT, "text/plain", "request body timed out".into());
+    // One buffer, and the budget pays for its room (past `SMALL_BODY`), not only
+    // for the bytes in it: the memory a body holds is what its permits say.
+    // (Keeping the chunks as they arrive would cost a handle per chunk: a body
+    // sent a byte at a time would hold many times its size.)
+    let limit = stated.map_or(MAX_BODY, |n| n as usize);
+    let mut data: Vec<u8> = Vec::new();
+    let mut held: Option<OwnedSemaphorePermit> = None;
+    let mut held_kib = 0usize;
+    loop {
+        let frame = match tokio::time::timeout_at(deadline, body.frame()).await {
+            Err(_) => return Err(timed_out()),
+            Ok(None) => break,
+            Ok(Some(Err(_))) => return Err(simple(StatusCode::BAD_REQUEST, "text/plain", "bad request body".into())),
+            Ok(Some(Ok(f))) => f,
+        };
+        let Ok(chunk) = frame.into_data() else { continue };
+        let len = data.len() + chunk.len();
+        if len > MAX_BODY {
+            return Err(too_large());
+        }
+        if len > data.capacity() {
+            // Room grows by doubling, up to the stated length (only as bytes arrive).
+            let room = (data.capacity() * 2).max(4096).min(limit).max(len);
+            let kib = room.saturating_sub(SMALL_BODY).div_ceil(1024);
+            if kib > held_kib {
+                let wait = deadline.min(tokio::time::Instant::now() + QUEUE_WAIT);
+                let more = (kib - held_kib) as u32;
+                let permit =
+                    match tokio::time::timeout_at(wait, state.body_budget.clone().acquire_many_owned(more)).await {
+                        Ok(Ok(p)) => p,
+                        _ => return Err(busy()),
+                    };
+                match &mut held {
+                    Some(h) => h.merge(permit),
+                    None => held = Some(permit),
+                }
+                held_kib = kib;
+            }
+            data.reserve_exact(room - data.len());
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok((Bytes::from(data), held))
+}
+
 async fn run_script(
     state: &Arc<State>,
     script: PathBuf,
@@ -1235,31 +1301,9 @@ async fn run_script(
     let (parts, body) = req.into_parts();
     // Memory is bounded by the scripts running at once, the bodies they read and
     // the output waiting to be sent; past a limit, new requests are turned away for now.
-    let busy = || {
-        let mut r = simple(StatusCode::SERVICE_UNAVAILABLE, "text/plain", "the server is busy; try again soon".into());
-        r.headers_mut().insert("retry-after", HeaderValue::from_static("5"));
-        r
-    };
-    // A large body takes its share of the budget before it is read (its stated
-    // length, or the most a body may be when it is sent in chunks), so slow
-    // clients holding bodies cannot pile up gigabytes.
-    let expected = hyper::body::Body::size_hint(&body).upper().unwrap_or(MAX_BODY as u64);
-    if expected > MAX_BODY as u64 {
-        return simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "request body too large".into());
-    }
-    let reserved = if expected <= SMALL_BODY {
-        None
-    } else {
-        let kib = (expected as usize).div_ceil(1024) as u32;
-        match tokio::time::timeout(QUEUE_WAIT, state.body_budget.clone().acquire_many_owned(kib)).await {
-            Ok(Ok(p)) => Some(p),
-            _ => return busy(),
-        }
-    };
-    let body = match tokio::time::timeout(BODY_TIMEOUT, Limited::new(body, MAX_BODY).collect()).await {
-        Ok(Ok(b)) => b.to_bytes(),
-        Ok(Err(_)) => return simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "request body too large".into()),
-        Err(_) => return simple(StatusCode::REQUEST_TIMEOUT, "text/plain", "request body timed out".into()),
+    let (body, reserved) = match read_body(state, body).await {
+        Ok(b) => b,
+        Err(r) => return r,
     };
     if state.buffered.load(Ordering::Relaxed) > state.buffered_cap {
         return busy();

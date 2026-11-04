@@ -203,9 +203,14 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             }
             Ok(Value::map(m))
         },
-        "parse_query" => |_, a| {
+        "parse_query" => |vm, a| {
             let mut m = indexmap::IndexMap::new();
-            for (k, v) in url::form_urlencoded::parse(s(&a[0]).trim_start_matches('?').as_bytes()) {
+            // Millions of short fields build far more than their text: the run's
+            // limits are checked while the map grows, not only after.
+            for (i, (k, v)) in url::form_urlencoded::parse(s(&a[0]).trim_start_matches('?').as_bytes()).enumerate() {
+                if i % 4096 == 4095 {
+                    vm.check_limits()?;
+                }
                 m.insert(Key::Str(Rc::new(k.into_owned())), Value::str(v.into_owned()));
             }
             Ok(Value::map(m))

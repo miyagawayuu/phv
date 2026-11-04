@@ -622,12 +622,13 @@ fn watch_mode_reloads_pages_on_changes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Request bodies are bounded before they are read (v0.9.1): a body of more
-/// than 8 MB is refused at once, a client holding a large body keeps the next
-/// one waiting for the budget (one worker: 8 MB), and a form of millions of
+/// Request bodies are bounded as they are read (v0.9.1): a body of more than
+/// 8 MB is refused at once, a client that has sent a large body keeps the next
+/// one waiting for the budget (one worker: 8 MB), clients that only state a
+/// large body or start a chunked one hold nothing, and a form of millions of
 /// fields is refused while it is parsed.
 #[test]
-fn request_bodies_are_bounded_before_they_are_read() {
+fn request_bodies_are_bounded_as_they_are_read() {
     let dir = std::env::temp_dir().join(format!("phv-http-bodies-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     write(&dir, "phv.toml", "[security]\ncsrf = false\n\n[server]\nworkers = 1\n");
@@ -654,18 +655,37 @@ fn request_bodies_are_bounded_before_they_are_read() {
     assert_eq!(post(addr, "/", "", &"a&".repeat(4 << 20)).status, 400);
     assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
 
-    // A client sends the start of an 8 MB body and stops: it holds the whole budget.
-    let mut slow = TcpStream::connect(addr).unwrap();
-    let head =
-        format!("POST / HTTP/1.1\r\nHost: t\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\nx", 8 << 20);
-    slow.write_all(head.as_bytes()).unwrap();
+    // Clients that state 8 MB bodies or start chunked ones and stop hold nothing.
+    let mut idle = Vec::new();
+    for i in 0..8 {
+        let mut c = TcpStream::connect(addr).unwrap();
+        let head = if i % 2 == 0 {
+            format!("POST / HTTP/1.1\r\nHost: t\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\nx", 8 << 20)
+        } else {
+            "POST / HTTP/1.1\r\nHost: t\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n"
+                .into()
+        };
+        c.write_all(head.as_bytes()).unwrap();
+        idle.push(c);
+    }
     std::thread::sleep(Duration::from_millis(300));
     let start = std::time::Instant::now();
-    let r = post(addr, "/", "", &format!("a={}", "x".repeat(100_000)));
+    assert_eq!(post(addr, "/", "", &format!("a={}", "x".repeat(200_000))).body, "1");
+    assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+
+    // A client that has really sent most of an 8 MB body holds most of the budget.
+    let mut slow = TcpStream::connect(addr).unwrap();
+    let head = format!("POST / HTTP/1.1\r\nHost: t\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n", 8 << 20);
+    slow.write_all(head.as_bytes()).unwrap();
+    slow.write_all(&vec![b'x'; (8 << 20) - 1]).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let start = std::time::Instant::now();
+    let r = post(addr, "/", "", &format!("a={}", "x".repeat(200_000)));
     assert_eq!(r.status, 503, "{}", r.body);
     assert!(start.elapsed() >= Duration::from_secs(9), "{:?}", start.elapsed());
     // Small bodies do not need the budget.
     assert_eq!(post(addr, "/", "", "a=1").body, "1");
     drop(slow);
+    drop(idle);
     let _ = std::fs::remove_dir_all(&dir);
 }

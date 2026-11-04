@@ -739,13 +739,15 @@ phv serve examples/site --port 8080
 - 同時に実行するスクリプトは `[server] workers` 個まで(既定は CPU 数の 2 倍、最小 8)。空きを最大 10 秒待つ。
   時間内に空かなかったリクエストと、クライアントへの送信待ちの出力が workers で作れる量(`workers` × `memory_limit_mb`)を
   超えているときに来たリクエストには、`503 Service Unavailable` と `Retry-After: 5` を返す。静的ファイルには空きは要らない。
-  64 KB を超えるリクエスト本文は `workers` × 8 MB の枠の中でだけ受信する。枠は本文を読む前に取り(`Content-Length`、
-  チャンクで送られるなら 8 MB)、スクリプトが終わるまで持つ。10 秒以内に取れなければ同じく 503。クエリとフォームの項目は
+  リクエスト本文の最初の 64 KB より後は `workers` × 8 MB の枠の中でだけ受信する。枠はバイトが届くたびに取り(宣言しただけの
+  `Content-Length` や、まだ送られていないチャンクは枠を持たない)、スクリプトが終わるまで持つ。次のバイトの枠が 10 秒以内に
+  取れなければ同じく 503。8 MB を超える本文を宣言したリクエストにはすぐ 413 を返す。クエリとフォームの項目は
   解析しながら数える。読むのが遅いクライアントのために 1 つの接続がためるのは 64 KB まで。そのため、何人が接続しても、サーバーのメモリは
   およそ `workers` × `memory_limit_mb` の 2 倍に収まる。
 - `[security] requests_per_minute` を書くと、1 つの接続元アドレスから 1 分間に受け付けるリクエストをその数までにする
   (超えると `429 Too Many Requests` と `Retry-After`)。既定は無制限。`[security] rate_limit_store` を書くと、
-  すべてのサーバープロセスで数を共有する(「レート制限」を参照)。
+  すべてのサーバープロセスで数を共有する(「レート制限」を参照)。接続の数はアドレスごとには制限しない(全体で最大 1,024)。
+  インターネットに公開するサイトは、それを制限するリバースプロキシの後ろで動かすとよい。
 - 既定で付けるヘッダー: `X-Content-Type-Options: nosniff`、`X-Frame-Options: SAMEORIGIN`、
   `Referrer-Policy: strict-origin-when-cross-origin`、Content-Security-Policy(下の「Content-Security-Policy」)。
   `secure_cookies = true` なら HSTS。セッションや Cookie を使うレスポンスと、CSRF トークンを含むレスポンス
@@ -1862,7 +1864,7 @@ phv migrate legacy/page.php      # page.phv を書き出す
 | リクエスト本文 | 8 MB | 413 |
 | 同時に実行するスクリプト(`serve`) | CPU 数の 2 倍、最小 8(`[server] workers`) | 最大 10 秒待ち、その後 503 |
 | 送信待ちの出力(`serve`) | `workers` × `memory_limit_mb` | 503 |
-| 受信中・保持中の 64 KB を超えるリクエスト本文(`serve`) | `workers` × 8 MB | 最大 10 秒待ち、その後 503 |
+| 受信中・保持中のリクエスト本文の、最初の 64 KB より後のバイト(`serve`) | `workers` × 8 MB | 最大 10 秒待ち、その後 503 |
 | ソースファイル(モジュール、テンプレート、スクリプト) | 8 MB | コンパイルエラー |
 | 全クラスが継承するメンバーの合計 | 200,000 | コンパイルエラー(各クラスは継承したものの写しを持つ) |
 | 1 つの関数の変数と一時的な値 | 65,534 | コンパイルエラー(関数を分ける) |
