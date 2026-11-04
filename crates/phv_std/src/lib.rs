@@ -10,14 +10,17 @@ use std::fmt::Write;
 use std::rc::Rc;
 
 mod asyncio;
+mod collections;
 mod db;
 mod httpclient;
 mod mail;
 pub mod migrate;
 mod netdb;
 mod netio;
+mod numbers;
 mod pgmeter;
 pub mod ratelimit;
+mod re;
 mod redisclient;
 pub mod safefs;
 mod sys;
@@ -49,6 +52,7 @@ pub fn std_module(name: &str) -> Option<&'static str> {
         "std.validate" => Some(include_str!("phv/validate.phv")),
         "std.testing" => Some(include_str!("phv/testing.phv")),
         "std.mail" => Some(include_str!("phv/mail.phv")),
+        "std.regex" => Some(include_str!("phv/regex.phv")),
         _ => None,
     }
 }
@@ -514,6 +518,9 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         .or_else(|| websocket::lookup(name))
         .or_else(|| httpclient::lookup(name))
         .or_else(|| asyncio::lookup(name))
+        .or_else(|| collections::lookup(name))
+        .or_else(|| numbers::lookup(name))
+        .or_else(|| re::lookup(name))
 }
 
 fn core_lookup(name: &str) -> Option<BuiltinFn> {

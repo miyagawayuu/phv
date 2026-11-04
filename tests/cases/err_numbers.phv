@@ -1,0 +1,12 @@
+<?phv
+$fmt = "{}";
+echo format($fmt, 1);
+echo format("{} {}", 1);
+echo format("{}", 1, 2);
+echo format("{:.2}", "text");
+echo format("{:x}", 1.5);
+echo format("{:q}", 1);
+echo format("{name}", 1);
+echo format("{", 1);
+echo format("}", 1);
+echo format("{}", [1, 2]);

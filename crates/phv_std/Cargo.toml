@@ -8,6 +8,7 @@ documentation.workspace = true
 
 [dependencies]
 phv_vm.workspace = true
+phv_syntax.workspace = true
 indexmap.workspace = true
 chrono.workspace = true
 getrandom.workspace = true
@@ -27,6 +28,7 @@ futures-util.workspace = true
 rustls.workspace = true
 webpki-roots.workspace = true
 mysql.workspace = true
+regex.workspace = true
 tokio.workspace = true
 tungstenite.workspace = true
 httparse.workspace = true

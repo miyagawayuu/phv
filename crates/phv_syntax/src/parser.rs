@@ -860,8 +860,20 @@ impl Parser {
     }
 
     fn function_decl(&mut self, exported: bool, visibility: Visibility, is_static: bool) -> PResult<FunctionDecl> {
+        self.function_or_method(exported, visibility, is_static, false)
+    }
+
+    /// A method may be named like a keyword (`match`, `list`), as it is always
+    /// called after `->` or `::`.
+    fn function_or_method(
+        &mut self,
+        exported: bool,
+        visibility: Visibility,
+        is_static: bool,
+        method: bool,
+    ) -> PResult<FunctionDecl> {
         let start = self.expect(Tok::Function)?;
-        let (name, name_span) = self.expect_ident("a function name")?;
+        let (name, name_span) = if method { self.member_name()? } else { self.expect_ident("a function name")? };
         let (type_params, type_bounds) = self.bounded_type_params()?;
         let params = self.params()?;
         let ret = if self.eat(&Tok::Colon) { Some(self.ty()?) } else { None };
@@ -1006,7 +1018,7 @@ impl Parser {
                 self.diags.push(Diagnostic::error("only classes and methods can be `final`", mstart));
             }
             let result = if self.at(&Tok::Function) {
-                self.function_decl(false, vis, is_static).map(|mut f| {
+                self.function_or_method(false, vis, is_static, true).map(|mut f| {
                     f.attrs = attrs;
                     f.is_final = is_final;
                     if is_final && is_abstract {

@@ -393,6 +393,7 @@ class Admin extends User {
   has a constructor has properties that need initialization, the child constructor must call `parent::__construct(...)`.
 - `static` methods are called as `ClassName::method()`. **There are no static properties** (so that state is not shared between requests).
 - Objects are references; `list` and `map` are values (copy-on-write).
+- A method may be named like a keyword (`match`, `list`, `default`), since it is always called after `->` or `::`.
 ### interface and abstract
 
 ```phv
@@ -628,7 +629,7 @@ import lib.legacy.render as render_legacy;
 - The top level of an imported module can contain only declarations (`function`, `class`, `interface`, `enum`, `const`, `type`, `import`).
   Loading a module has no side effects.
 - `std.*` are the standard modules (`std.http`, `std.db`, `std.net`, `std.async`, `std.validate`, `std.mail`,
-  `std.testing`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
+  `std.testing`, `std.regex`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
 - Only files inside the project and package directories can be loaded (symbolic links cannot be used to escape them).
 
 ## 12. Templates
@@ -1208,6 +1209,28 @@ Mail::to($email)
   10 MB. The text part is always sent; `html()` adds an HTML alternative.
 - Sending waits for the server, at most the script's time limit or 30 seconds, and throws `NetworkError` if it fails.
 
+### Regular expressions (std.regex)
+
+```phv
+import std.regex.Regex;
+
+$date = new Regex('^(\d{4})-(\d{2})-(\d{2})$');       // single quotes keep the backslashes
+$date->test("2026-11-05");                                // bool
+$date->match("2026-11-05");                               // ?list<string>: ["2026-11-05", "2026", "11", "05"]
+(new Regex('\d+'))->matchAll("1 22 333");                 // list<list<string>>
+(new Regex('(?<y>\d{4})-(?<m>\d{2})'))->replace($s, '${m}/${y}');
+$words->replaceWith($s, fn(list<string> $m): string => $m[1]->upper());
+(new Regex('\s*,\s*'))->split("a , b,c");                 // ["a", "b", "c"]
+Regex::escape("1+1=2?");                                   // a pattern that matches the text as it is
+```
+
+The syntax is that of Rust's `regex` crate: `(?i)` for no case, `(?<name>...)` for a named group, `\d \w \s`, Unicode
+classes such as `\p{L}`; there is no look-around and no back-reference. In exchange, matching takes time linear in
+the text whatever the pattern, so a pattern or a text from a visitor cannot make a page hang (no catastrophic
+backtracking). An invalid pattern throws `ValueError`; patterns are at most 64 KB and 4 MB once compiled, and each
+thread keeps the 64 patterns it used last compiled. In `match()`, group 0 is the whole match and a group that took no
+part is `""`.
+
 ### Asynchronous I/O (std.async)
 
 ```phv
@@ -1394,6 +1417,12 @@ create files at the root of a drive), in the shared temporary directory, and on 
 | `dump(any): void` | Equivalent to `var_dump` |
 | `raw(string): Html`, `escape(string): Html`, `htmlspecialchars(string): Html`, `nl2br(string): Html` | §13 |
 | `intdiv`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `sqrt`, `fmod` | Numeric |
+| `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `log(x)` / `log(x, base)`, `log10`, `log2`, `hypot`, `pi()` | Mathematics (float) |
+| `clamp(x, min, max)` | int or float |
+| `random_float(): float` | In `[0, 1)`, from the operating system's random source |
+| `bindec`, `octdec`, `hexdec` (string → int), `decbin`, `decoct`, `dechex` (int → string), `base_convert(string, from, to)` | Number bases (2 to 36) |
+| `format(string, ...)` | Formatted text (below) |
+| `uuid_v4(): string`, `uuid_v7(): string` | Random UUID; v7 starts with the time, so they sort by creation |
 | `number_format(float, int $decimals = 0): string` | `1,234.50` |
 | `range(int, int): list<int>` | Includes both ends |
 | `time(): int`, `microtime(): float` | Current time |
@@ -1405,9 +1434,22 @@ create files at the root of a drive), in the shared temporary directory, and on 
 | `date`, `gmdate`, `mktime`, `strtotime`, `checkdate` | Dates (table in §14) |
 | `random_int`, `random_token`, `password_hash`, `password_verify`, `hash`, `hash_hmac`, `hash_equals`, `totp_secret`, `totp_code`, `totp_verify`, `qr_svg` | Cryptography and two-factor authentication (table in §14) |
 | `base64_encode`, `base64_decode`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | Encoding |
+| `base64url_encode`, `base64url_decode`, `bin2hex`, `hex2bin` | Encoding (decoding to text that is not UTF-8 throws `ValueError`) |
 | `file_get_contents`, `file_put_contents`, `file_exists`, `unlink`, `getenv` | Require `[permissions]` |
 | `sql_ident(string): Sql` | Column and table names |
 | `assert(bool, ?string)`, `assert_eq(any, any, ?string)` | For tests |
+
+### format()
+
+```phv
+format("{} has {:,} points ({:.1}%)", $name, 1234567, 98.26);   // "Ann has 1,234,567 points (98.3%)"
+format("[{:>6}] [{:<6}] [{:*^7}] [{:05}] [{:x}] [{:08b}] {{braces}}", "r", "l", "c", -42, 255, 5);
+```
+
+Each `{}` takes the next value; `{:spec}` formats it: `[[fill]align][0][width][,][.precision][type]`, where align is
+`<`, `>` or `^`, `,` groups thousands, `.N` gives N decimals, and type is `x` / `X` (hex), `o`, `b` or `e`. `{{` and
+`}}` are literal braces. The format string must be a literal: the number of values and each value's type are checked
+when the program is (`{:.2}` needs a number, `{:x}` an `int`). Widths and precisions are at most 1000.
 
 ### string methods
 
@@ -1421,13 +1463,20 @@ create files at the root of a drive), in the shared temporary directory, and on 
 `len()`, `isEmpty()`, `contains($v)`, `indexOf($v): ?int`, `first(): ?T`, `last(): ?T`,
 `slice($start, $length?)`, `reverse()`, `concat($other)`, `unique()`, `sorted()`, `sortBy(fn($a, $b) => int)`,
 `map(fn($x) => ...)`, `filter(fn($x) => bool)`, `find(fn($x) => bool): ?T`, `any(...)`, `all(...)`,
-`join($sep)`, `sum()`
+`join($sep)`, `sum()`, `reduce($initial, fn($acc, $x) => ...)`, `flatMap(fn($x) => list)`, `flatten()`,
+`groupBy(fn($x) => string|int): map<K, list<T>>`, `chunk($size): list<list<T>>`, `zip($other, fn($a, $b) => ...)`
+(as long as the shorter list), `partition(fn($x) => bool): list<list<T>>` (`[$yes, $no] = ...`),
+`count(fn($x) => bool)`, `min(): ?T` / `max(): ?T` (int, float or string), `removeAt($i)`, `insertAt($i, $v)`
+
+Methods return new lists and leave the list they are called on as it is.
 
 Append an element with `$xs[] = $v;` and update one with `$xs[$i] = $v;` (an index out of range raises `IndexError`).
 
 ### map methods
 
-`len()`, `isEmpty()`, `has($k)`, `get($k): ?V`, `keys()`, `values()`, `merge($other)`
+`len()`, `isEmpty()`, `has($k)`, `get($k): ?V`, `keys()`, `values()`, `merge($other)`, `remove($k)`,
+`filter(fn($k, $v) => bool)`, `map(fn($v) => ...)` (same keys), `sortedByKey()`, `sortedByValue()` (int, float or
+string values; equal values keep their order)
 
 Add or update with `$m[$k] = $v;`. Reading a missing key with `$m[$k]` raises `KeyError`; `$m[$k] ?? $default` does not throw.
 

@@ -1,0 +1,36 @@
+<?phv
+// More list and map methods (they return new values).
+$xs = [3, 1, 4, 1, 5, 9, 2, 6];
+echo $xs->reduce(0, fn(int $acc, int $x): int => $acc + $x), " ",
+    $xs->reduce("", fn(string $acc, int $x): string => $acc . $x), "\n";
+echo [[1, 2], [3]]->flatten()->join(","), " ",
+    ["a b", "c"]->flatMap(fn(string $s): list<string> => $s->split(" "))->join("|"), "\n";
+$byParity = $xs->groupBy(fn(int $x): string => $x % 2 == 0 ? "even" : "odd");
+echo $byParity["odd"]->join(","), " / ", $byParity["even"]->join(","), "\n";
+$byLen = ["a", "bb", "cc", "d"]->groupBy(fn(string $s): int => $s->len());
+echo $byLen->keys()->join(","), " ", ($byLen[2] ?? [])->join(","), "\n";
+echo $xs->chunk(3)->map(fn(list<int> $c): string => $c->join(""))->join(" "), " ", [1]->chunk(5)->len(), "\n";
+echo [1, 2, 3]->zip(["a", "b"], fn(int $n, string $s): string => $s . $n)->join(","), "\n";
+[$big, $small] = $xs->partition(fn(int $x): bool => $x > 3);
+echo $big->join(","), " | ", $small->join(","), "\n";
+echo $xs->count(fn(int $x): bool => $x == 1), " ", $xs->min() ?? -1, " ", $xs->max() ?? -1, " ",
+    ["pear", "apple"]->min() ?? "", " ", [1.5, 0.5]->max() ?? 0.0, "\n";
+list<int> $none = [];
+echo $none->min() == null ? "empty" : "?", "\n";
+echo $xs->removeAt(0)->join(","), " ", $xs->insertAt(2, 7)->join(","), " ", $xs->join(","), "\n";
+try {
+    $xs->removeAt(8);
+} catch (IndexError $e) {
+    echo $e->getMessage(), "\n";
+}
+try {
+    $xs->chunk(0);
+} catch (ValueError $e) {
+    echo $e->getMessage(), "\n";
+}
+
+$ages = ["bob" => 31, "ann" => 25, "cy" => 40];
+echo $ages->remove("bob")->keys()->join(","), " ", $ages->len(), "\n";
+echo $ages->filter(fn(string $k, int $v): bool => $v > 30)->keys()->join(","), "\n";
+echo $ages->map(fn(int $v): string => "{$v}y")->values()->join(","), "\n";
+echo $ages->sortedByKey()->keys()->join(","), " ", $ages->sortedByValue()->keys()->join(","), "\n";

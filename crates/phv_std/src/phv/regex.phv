@@ -1,0 +1,58 @@
+// std.regex — regular expressions. Matching takes time linear in the text,
+// whatever the pattern (no catastrophic backtracking), so patterns and texts
+// from visitors are safe to use.
+//
+//   import std.regex.Regex;
+//   $date = new Regex('^(\d{4})-(\d{2})-(\d{2})$');   // single quotes keep backslashes
+//   $parts = $date->match("2026-11-05");              // ["2026-11-05", "2026", "11", "05"]
+//
+// The syntax is Rust's `regex` crate: (?i) for no case, (?<name>...) for a
+// named group, \d \w \s, Unicode classes like \p{L}. No look-around or
+// back-references.
+
+export class Regex {
+    /** Compiles the pattern; throws ValueError if it is not valid. */
+    public function __construct(public readonly string $pattern) {
+        __re_check($pattern);
+    }
+
+    /** Whether the pattern matches somewhere in `$text`. */
+    public function test(string $text): bool {
+        return __re_test($this->pattern, $text);
+    }
+
+    /** The first match, or null. */
+    public function find(string $text): ?string {
+        return __re_find($this->pattern, $text);
+    }
+
+    /** The groups of the first match (0 is the whole match; a group that did not take part is ""), or null. */
+    public function match(string $text): ?list<string> {
+        return __re_match($this->pattern, $text);
+    }
+
+    /** The groups of every match, in order. */
+    public function matchAll(string $text): list<list<string>> {
+        return __re_match_all($this->pattern, $text);
+    }
+
+    /** Replaces every match; `$1` and `${name}` insert groups, `$$` a dollar sign. */
+    public function replace(string $text, string $with): string {
+        return __re_replace($this->pattern, $text, $with);
+    }
+
+    /** Replaces every match with what `$with` returns for its groups. */
+    public function replaceWith(string $text, fn(list<string>): string $with): string {
+        return __re_replace_with($this->pattern, $text, $with);
+    }
+
+    /** The text between the matches. */
+    public function split(string $text): list<string> {
+        return __re_split($this->pattern, $text);
+    }
+
+    /** `$text` with the characters that mean something in a pattern escaped. */
+    public static function escape(string $text): string {
+        return __re_escape($text);
+    }
+}

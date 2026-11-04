@@ -1,0 +1,19 @@
+<?phv
+// Mathematics, number bases, encodings, UUIDs and format().
+echo format("{:.4} {:.4} {:.4} {:.3}", sin(pi() / 2), cos(0), atan2(1, 1) * 4, log(exp(2.0))), "\n";
+echo format("{:.2} {} {} {}", log(8, 2), log10(1000), log2(1024), hypot(3, 4)), "\n";
+echo clamp(15, 0, 10), " ", clamp(-2.5, -1.0, 1.0), " ", random_float() < 1.0 ? "ok" : "?", "\n";
+echo bindec("1010"), " ", hexdec("ff"), " ", octdec("17"), " ", decbin(10), " ", dechex(255), " ", decoct(15), "\n";
+echo base_convert("255", 10, 16), " ", base_convert("-zz", 36, 2), "\n";
+echo bin2hex("hi"), " ", hex2bin("6869"), " ", base64url_encode("<<??>>"), " ", base64url_decode("PDw_Pz4-"), "\n";
+$u = uuid_v4();
+$v = uuid_v7();
+echo $u->len(), " ", $u->slice(14, 1), " ", $v->slice(14, 1), " ", $u != uuid_v4() ? "unique" : "?", "\n";
+echo format("{} has {:,} points ({:.1}%)", "Ann", 1234567, 98.26), "\n";
+echo format("[{:>6}] [{:<6}] [{:*^7}] [{:05}] [{:x}] [{:08b}] [{{literal}}]", "r", "l", "c", -42, 255, 5), "\n";
+echo format("no placeholders"), "|", format("{}", 1.5), "\n";
+try {
+    hexdec("xyz");
+} catch (ValueError $e) {
+    echo $e->getMessage(), "\n";
+}

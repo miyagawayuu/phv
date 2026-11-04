@@ -2,6 +2,7 @@
 
 pub mod ast;
 pub mod diag;
+pub mod fmtspec;
 pub mod format;
 pub mod htmlctx;
 pub mod lexer;

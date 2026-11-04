@@ -1216,6 +1216,9 @@ impl<'a> Checker<'a> {
             if name == "render" {
                 return self.render(args, span);
             }
+            if name == "format" && self.lookup_func(name).is_none() {
+                return self.format_call(args, span);
+            }
             if name == "layout" {
                 self.error("`layout()` must be a statement at the top level of a page or template", span)
                     .add_note("a page has at most one layout; it wraps what the page writes after it");
@@ -1508,6 +1511,82 @@ impl<'a> Checker<'a> {
             pieces = next;
         }
         pieces.pop().unwrap()
+    }
+
+    /// `format("{} has {:.2} points", $name, $score)`: the format string is read
+    /// when the program is checked, so the number of values and each value's
+    /// type are checked against its placeholders.
+    fn format_call(&mut self, args: &[Arg], span: Span) -> HExpr {
+        use phv_syntax::fmtspec::{parse_spec, pieces, Piece};
+        let Some(Arg { name: None, value: Expr { kind: ExprKind::Str(fmt), span: fspan } }) = args.first() else {
+            self.error("`format()` needs a format string literal first", span)
+                .add_note("for example `format(\"{} items\", $n)`; a literal lets PHV check the values");
+            for a in args {
+                self.expr(&a.value, None);
+            }
+            return err(span);
+        };
+        let fspan = *fspan;
+        let parts_of = match pieces(fmt) {
+            Ok(p) => p,
+            Err(e) => {
+                self.error(format!("format string: {e}"), fspan);
+                for a in &args[1..] {
+                    self.expr(&a.value, None);
+                }
+                return err(span);
+            }
+        };
+        let values = &args[1..];
+        let wanted = parts_of.iter().filter(|p| matches!(p, Piece::Value(_))).count();
+        if values.len() != wanted {
+            let msg = format!("the format string has {wanted} placeholder(s) but {} value(s) were given", values.len());
+            self.error(msg, span);
+        }
+        for a in values {
+            if let Some((_, nspan)) = &a.name {
+                self.error("`format()` takes its values in order, without names", *nspan);
+            }
+        }
+        let mut parts = Vec::new();
+        let mut given = values.iter();
+        for p in parts_of {
+            match p {
+                Piece::Text(t) => parts.push(hconst(HConst::Str(t.as_str().into()), Type::Str, fspan)),
+                Piece::Value(spec) => {
+                    let Some(a) = given.next() else { break };
+                    let h = self.expr(&a.value, None);
+                    let sp = parse_spec(&spec).unwrap_or_default();
+                    let int_only = matches!(sp.kind, Some('x' | 'X' | 'o' | 'b'));
+                    let numeric = sp.precision.is_some() || sp.grouping || sp.zero || sp.kind == Some('e');
+                    if h.ty != Type::Error {
+                        if int_only && h.ty != Type::Int {
+                            let msg = format!("`{{:{spec}}}` needs an `int`, found `{}`", self.tn(&h.ty));
+                            self.error(msg, h.span);
+                        } else if numeric && !matches!(h.ty, Type::Int | Type::Float) {
+                            let msg = format!("`{{:{spec}}}` needs an `int` or a `float`, found `{}`", self.tn(&h.ty));
+                            self.error(msg, h.span);
+                        } else {
+                            self.check_stringable(&h, "format");
+                        }
+                    }
+                    let spec_c = hconst(HConst::Str(spec.as_str().into()), Type::Str, h.span);
+                    let hspan = h.span;
+                    parts.push(HExpr {
+                        kind: HExprKind::CallBuiltin("__fmt".into(), vec![h, spec_c]),
+                        ty: Type::Str,
+                        span: hspan,
+                    });
+                }
+            }
+        }
+        for extra in given {
+            self.expr(&extra.value, None);
+        }
+        if parts.is_empty() {
+            return hconst(HConst::Str("".into()), Type::Str, span);
+        }
+        HExpr { kind: HExprKind::Concat(parts, false), ty: Type::Str, span }
     }
 
     fn call_builtin(

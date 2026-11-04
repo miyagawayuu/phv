@@ -391,6 +391,7 @@ class Admin extends User {
   クラスで初期化の必要なプロパティがある場合、子のコンストラクタは `parent::__construct(...)` を呼ぶ必要がある。
 - `static` メソッドは `ClassName::method()` で呼ぶ。**static プロパティはない**(リクエスト間で状態を共有させないため)。
 - オブジェクトは参照、`list` と `map` は値(コピーオンライト)。
+- メソッドはキーワードと同じ名前(`match`、`list`、`default`)にできる。常に `->` か `::` の後で呼ぶため。
 ### interface と abstract
 
 ```phv
@@ -620,7 +621,7 @@ import lib.legacy.render as render_legacy;
   ディレクトリ)からの `a/b.phv` を読み込む。
 - import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`const`、`type`、`import`)
   しか書けない。モジュールを読み込んでも副作用は起きない。
-- `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`、`std.async`、`std.validate`、`std.mail`、`std.testing`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
+- `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`、`std.async`、`std.validate`、`std.mail`、`std.testing`、`std.regex`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
 - 読み込めるのはプロジェクトとパッケージのディレクトリの中のファイルだけ(シンボリックリンクで外に出ることはできない)。
 
 ## 12. テンプレート
@@ -1191,6 +1192,27 @@ Mail::to($email)
   `html()` で HTML の版を加える。
 - 送信はサーバーを待ち(スクリプトの時間制限か 30 秒まで)、失敗すると `NetworkError` を投げる。
 
+### 正規表現(std.regex)
+
+```phv
+import std.regex.Regex;
+
+$date = new Regex('^(\d{4})-(\d{2})-(\d{2})$');       // 単一引用符ならバックスラッシュがそのまま
+$date->test("2026-11-05");                                // bool
+$date->match("2026-11-05");                               // ?list<string>: ["2026-11-05", "2026", "11", "05"]
+(new Regex('\d+'))->matchAll("1 22 333");                 // list<list<string>>
+(new Regex('(?<y>\d{4})-(?<m>\d{2})'))->replace($s, '${m}/${y}');
+$words->replaceWith($s, fn(list<string> $m): string => $m[1]->upper());
+(new Regex('\s*,\s*'))->split("a , b,c");                 // ["a", "b", "c"]
+Regex::escape("1+1=2?");                                   // その文字列そのものに当てはまるパターン
+```
+
+文法は Rust の `regex` クレートのもの: `(?i)` で大文字小文字を区別しない、`(?<name>...)` で名前付きグループ、`\d \w \s`、
+`\p{L}` などの Unicode のクラス。先読み・後読みと後方参照はない。その代わり、どんなパターンでもテキストの長さに比例した
+時間で照合するので、訪問者からのパターンやテキストでページが止まることはない(壊滅的なバックトラックがない)。不正な
+パターンは `ValueError`。パターンは 64 KB まで、コンパイル後は 4 MB までで、スレッドごとに最近使った 64 個をコンパイル済みの
+まま保持する。`match()` ではグループ 0 がマッチ全体で、関わらなかったグループは `""`。
+
 ### 非同期 I/O(std.async)
 
 ```phv
@@ -1376,7 +1398,13 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 | `json_encode(any): string` | オブジェクトは public プロパティだけを出力 |
 | `dump(any): void` | `var_dump` に相当 |
 | `raw(string): Html`, `escape(string): Html`, `htmlspecialchars(string): Html`, `nl2br(string): Html` | §13 |
-| `intdiv`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, `sqrt`, `fmod` | 数値 |
+| `intdiv`、`abs`、`min`、`max`、`floor`、`ceil`、`round`、`sqrt`、`fmod` | 数値 |
+| `sin`、`cos`、`tan`、`asin`、`acos`、`atan`、`atan2`、`exp`、`log(x)` / `log(x, base)`、`log10`、`log2`、`hypot`、`pi()` | 数学関数(float) |
+| `clamp(x, min, max)` | int か float |
+| `random_float(): float` | `[0, 1)` の値。OS の乱数源から |
+| `bindec`、`octdec`、`hexdec`(string → int)、`decbin`、`decoct`、`dechex`(int → string)、`base_convert(string, from, to)` | 進数(2〜36) |
+| `format(string, ...)` | 書式付きの文字列(下) |
+| `uuid_v4(): string`、`uuid_v7(): string` | ランダムな UUID。v7 は時刻で始まるので作った順に並ぶ |
 | `number_format(float, int $decimals = 0): string` | `1,234.50` |
 | `range(int, int): list<int>` | 両端を含む |
 | `time(): int`, `microtime(): float` | 現在時刻 |
@@ -1387,10 +1415,22 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 | `rate_limit(string, int, int): bool`, `rate_limit_reset(string)`, `ip_group(string): string` | §14 |
 | `date`, `gmdate`, `mktime`, `strtotime`, `checkdate` | 日付(§14 の表) |
 | `random_int`, `random_token`, `password_hash`, `password_verify`, `hash`, `hash_hmac`, `hash_equals`, `totp_secret`, `totp_code`, `totp_verify`, `qr_svg` | 暗号と 2 段階認証(§14 の表) |
-| `base64_encode`, `base64_decode`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | エンコード |
+| `base64_encode`、`base64_decode`、`urlencode`、`rawurlencode`、`urldecode`、`http_build_query` | エンコード |
+| `base64url_encode`、`base64url_decode`、`bin2hex`、`hex2bin` | エンコード(UTF-8 でないテキストへのデコードは `ValueError`) |
 | `file_get_contents`, `file_put_contents`, `file_exists`, `unlink`, `getenv` | `[permissions]` が必要 |
 | `sql_ident(string): Sql` | 列名・テーブル名 |
 | `assert(bool, ?string)`, `assert_eq(any, any, ?string)` | テスト用 |
+
+### format()
+
+```phv
+format("{} has {:,} points ({:.1}%)", $name, 1234567, 98.26);   // "Ann has 1,234,567 points (98.3%)"
+format("[{:>6}] [{:<6}] [{:*^7}] [{:05}] [{:x}] [{:08b}] {{braces}}", "r", "l", "c", -42, 255, 5);
+```
+
+`{}` は次の値を取り、`{:spec}` はそれを書式化する: `[[fill]align][0][width][,][.precision][type]`。align は `<`、`>`、`^`、
+`,` は 3 桁区切り、`.N` は小数 N 桁、type は `x` / `X`(16 進)、`o`、`b`、`e`。`{{` と `}}` はかっこそのもの。書式の文字列は
+リテラルでなければならず、値の数とそれぞれの型を検査のときに確かめる(`{:.2}` は数値、`{:x}` は `int`)。幅と精度は 1000 まで。
 
 ### string のメソッド
 
@@ -1404,13 +1444,20 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 `len()`、`isEmpty()`、`contains($v)`、`indexOf($v): ?int`、`first(): ?T`、`last(): ?T`、
 `slice($start, $length?)`、`reverse()`、`concat($other)`、`unique()`、`sorted()`、`sortBy(fn($a, $b) => int)`、
 `map(fn($x) => ...)`、`filter(fn($x) => bool)`、`find(fn($x) => bool): ?T`、`any(...)`、`all(...)`、
-`join($sep)`、`sum()`
+`join($sep)`、`sum()`、`reduce($initial, fn($acc, $x) => ...)`、`flatMap(fn($x) => list)`、`flatten()`、
+`groupBy(fn($x) => string|int): map<K, list<T>>`、`chunk($size): list<list<T>>`、`zip($other, fn($a, $b) => ...)`
+(短いほうの長さまで)、`partition(fn($x) => bool): list<list<T>>`(`[$yes, $no] = ...`)、
+`count(fn($x) => bool)`、`min(): ?T` / `max(): ?T`(int、float、string)、`removeAt($i)`、`insertAt($i, $v)`
+
+メソッドは新しい list を返し、呼び出した list はそのまま。
 
 要素の追加は `$xs[] = $v;`、更新は `$xs[$i] = $v;`(範囲外は `IndexError`)。
 
 ### map のメソッド
 
-`len()`、`isEmpty()`、`has($k)`、`get($k): ?V`、`keys()`、`values()`、`merge($other)`
+`len()`、`isEmpty()`、`has($k)`、`get($k): ?V`、`keys()`、`values()`、`merge($other)`、`remove($k)`、
+`filter(fn($k, $v) => bool)`、`map(fn($v) => ...)`(キーはそのまま)、`sortedByKey()`、`sortedByValue()`(値が int、float、
+string。同じ値は順序を保つ)
 
 追加・更新は `$m[$k] = $v;`。存在しないキーの読み取り `$m[$k]` は `KeyError`、`$m[$k] ?? $default` は例外にならない。
 

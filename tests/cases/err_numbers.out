@@ -1,0 +1,63 @@
+error: `format()` needs a format string literal first
+ --> err_numbers.phv:3:6
+  |
+3 | echo format($fmt, 1);
+  |      ^^^^^^^^^^^^^^^
+  = note: for example `format("{} items", $n)`; a literal lets PHV check the values
+
+error: the format string has 2 placeholder(s) but 1 value(s) were given
+ --> err_numbers.phv:4:6
+  |
+4 | echo format("{} {}", 1);
+  |      ^^^^^^^^^^^^^^^^^^
+
+error: the format string has 1 placeholder(s) but 2 value(s) were given
+ --> err_numbers.phv:5:6
+  |
+5 | echo format("{}", 1, 2);
+  |      ^^^^^^^^^^^^^^^^^^
+
+error: `{:.2}` needs an `int` or a `float`, found `string`
+ --> err_numbers.phv:6:22
+  |
+6 | echo format("{:.2}", "text");
+  |                      ^^^^^^
+
+error: `{:x}` needs an `int`, found `float`
+ --> err_numbers.phv:7:21
+  |
+7 | echo format("{:x}", 1.5);
+  |                     ^^^
+
+error: format string: unknown format type `q` (use x, X, o, b or e)
+ --> err_numbers.phv:8:13
+  |
+8 | echo format("{:q}", 1);
+  |             ^^^^^^
+
+error: format string: `{name}`: write `{}` or `{:spec}`; values are given in order
+ --> err_numbers.phv:9:13
+  |
+9 | echo format("{name}", 1);
+  |             ^^^^^^^^
+
+error: format string: a `{` is not closed (write `{{` for a brace)
+  --> err_numbers.phv:10:13
+   |
+10 | echo format("{", 1);
+   |             ^^^
+
+error: format string: a lone `}` (write `}}` for a brace)
+  --> err_numbers.phv:11:13
+   |
+11 | echo format("}", 1);
+   |             ^^^
+
+error: cannot format a value of type `list<int>` to a string
+  --> err_numbers.phv:12:19
+   |
+12 | echo format("{}", [1, 2]);
+   |                   ^^^^^^
+   = note: only `string`, `int` and `float` can be joined into strings
+
+10 errors found

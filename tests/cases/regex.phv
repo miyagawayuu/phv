@@ -1,0 +1,31 @@
+<?phv
+// std.regex: linear-time regular expressions.
+import std.regex.Regex;
+
+$date = new Regex('^(\d{4})-(\d{2})-(\d{2})$');
+echo $date->test("2026-11-05") ? "date" : "no", " ", $date->test("2026-1-5") ? "date" : "no", "\n";
+$parts = $date->match("2026-11-05");
+if ($parts != null) {
+    echo $parts->join(" | "), "\n";
+}
+echo $date->match("nope") == null ? "no match" : "?", "\n";
+
+$words = new Regex('(?i)\b(\w)(\w*)\b');
+echo $words->matchAll("Hello big World")->map(fn(list<string> $m): string => $m[1])->join(""), "\n";
+echo $words->replaceWith("hello big world", fn(list<string> $m): string => $m[1]->upper() . $m[2]), "\n";
+echo (new Regex('(?<y>\d{4})-(?<m>\d{2})'))->replace("due 2026-11", '${m}/${y} costs $$5'), "\n";
+echo (new Regex('\s*,\s*'))->split("a , b,c ,d")->join("|"), "\n";
+echo (new Regex('\d+'))->find("order 42 of 7") ?? "-", " ", (new Regex('x'))->find("abc") ?? "-", "\n";
+echo Regex::escape("1+1=2?"), " ", (new Regex(Regex::escape("a.b")))->test("axb") ? "yes" : "no", "\n";
+$opt = (new Regex('(a)|(b)'))->match("b");
+echo $opt == null ? "?" : "[" . $opt->join(",") . "]", "\n";
+echo (new Regex('^\p{L}+$'))->test("Grüße") ? "unicode" : "?", "\n";
+
+// No catastrophic backtracking: this pattern hangs backtracking engines.
+echo (new Regex('^(a+)+$'))->test("a"->repeat(50000) . "!") ? "?" : "linear", "\n";
+
+try {
+    new Regex('(unclosed');
+} catch (ValueError $e) {
+    echo $e->getMessage()->startsWith("invalid regular expression") ? "invalid pattern refused" : "?", "\n";
+}

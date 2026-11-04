@@ -304,6 +304,7 @@ fn sig_type(t: &TypeExpr) -> Type {
             ("U", []) => Type::Generic(1),
             ("K", []) => Type::Generic(2),
             ("V", []) => Type::Generic(3),
+            ("W", []) => Type::Generic(4),
             ("list", [a]) => Type::list(sig_type(a)),
             ("map", [k, v]) => Type::map(sig_type(k), sig_type(v)),
             _ => panic!("bad builtin signature type `{n}`"),
