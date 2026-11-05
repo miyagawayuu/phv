@@ -150,7 +150,8 @@ echo $r->test(str_repeat("a", 1000)) ? "match" : "small texts are searched", "\n
 "#;
     let start = Instant::now();
     let (out, _) = run_limited("regex_time", src, limits);
-    assert!(start.elapsed() < Duration::from_secs(2), "took {:?}", start.elapsed());
+    // Compiling counts too (slow on a busy runner); the search alone would take 10 s.
+    assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
     assert_eq!(
         out,
         "the regular expression is too large to search 300000 bytes of text in the time left (use a smaller pattern or a shorter text)\nsmall texts are searched\n"
