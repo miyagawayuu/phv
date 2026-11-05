@@ -258,6 +258,26 @@ mod tests {
     /// time, or one would see the other's stuck work.
     static SLOTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Work that runs until `gate` is set: the slots it holds stay taken
+    /// however slowly the test fills them (a fixed sleep could end on a
+    /// slow machine before the last slot is taken).
+    fn held_until(gate: &'static std::sync::atomic::AtomicBool) -> impl FnOnce() + Send + 'static {
+        move || {
+            while !gate.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// Waits until no work is counted in `pending`.
+    fn wait_until_idle(pending: &AtomicUsize) {
+        let start = Instant::now();
+        while pending.load(Ordering::SeqCst) > 0 {
+            assert!(start.elapsed() < Duration::from_secs(20), "work still running");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// A server that drips one byte every 200 ms: a read loop must still stop at the deadline.
     #[test]
     fn reads_stop_at_the_deadline() {
@@ -301,14 +321,14 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
         assert_eq!(with_deadline(Instant::now() + Duration::from_secs(1), || 7), Ok(7));
 
+        static GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let stuck: Vec<_> = (0..MAX_PENDING + 2)
-            .map(|_| {
-                with_deadline(Instant::now() + Duration::from_millis(10), || std::thread::sleep(Duration::from_secs(2)))
-            })
+            .map(|_| with_deadline(Instant::now() + Duration::from_millis(10), held_until(&GATE)))
             .collect();
         assert!(stuck.iter().any(|r| r.as_ref().is_err_and(|e| e.starts_with("too many"))), "{stuck:?}");
         assert_eq!(resolve("[::1]", 80, Instant::now()).unwrap(), vec!["[::1]:80".parse().unwrap()]);
-        std::thread::sleep(Duration::from_secs(2));
+        GATE.store(true, Ordering::SeqCst);
+        wait_until_idle(&PENDING);
         let local = resolve("localhost", 80, Instant::now() + Duration::from_secs(5)).unwrap();
         assert!(local.iter().all(|a| a.ip().is_loopback()), "{local:?}");
     }
@@ -319,14 +339,13 @@ mod tests {
     fn hanging_work_of_its_own_kind_leaves_lookups_alone() {
         let _slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
         static OWN: AtomicUsize = AtomicUsize::new(0);
+        static GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let stuck: Vec<_> = (0..MAX_PENDING + 2)
-            .map(|_| {
-                with_deadline_in(&OWN, Instant::now() + Duration::from_millis(10), || {
-                    std::thread::sleep(Duration::from_secs(2))
-                })
-            })
+            .map(|_| with_deadline_in(&OWN, Instant::now() + Duration::from_millis(10), held_until(&GATE)))
             .collect();
         assert!(stuck.iter().any(|r| r.as_ref().is_err_and(|e| e.starts_with("too many"))), "{stuck:?}");
         assert_eq!(with_deadline(Instant::now() + Duration::from_secs(1), || 7), Ok(7));
+        GATE.store(true, Ordering::SeqCst);
+        wait_until_idle(&OWN);
     }
 }
