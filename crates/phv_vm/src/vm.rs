@@ -1036,7 +1036,8 @@ impl Vm {
                 (ValKind::Bool, Value::Bool(b)) => *b as i64,
                 (ValKind::Float, Value::Float(f)) => f.to_bits() as i64,
                 (ValKind::Str, Value::Str(_)) => 0,
-                (ValKind::ListInt | ValKind::ListFloat | ValKind::ListStr | ValKind::ListBool, Value::List(_)) => 0,
+                // Passed in the window.
+                (ValKind::List(_), Value::List(_)) | (ValKind::Map(..), Value::Map(_)) | (ValKind::Opt(_), _) => 0,
                 (_, v) => bad("an argument of the native signature", v),
             };
         }
@@ -1114,7 +1115,7 @@ impl Vm {
             ValKind::Int => Value::Int(r),
             ValKind::Bool => Value::Bool(r != 0),
             ValKind::Float => Value::Float(f64::from_bits(r as u64)),
-            ValKind::Str | ValKind::ListInt | ValKind::ListFloat | ValKind::ListStr | ValKind::ListBool => ret,
+            ValKind::Str | ValKind::List(_) | ValKind::Map(..) | ValKind::Opt(_) => ret,
             ValKind::Void => Value::Null,
         }))
     }
@@ -2102,7 +2103,7 @@ fn index_mut<'v>(v: &'v mut Value, k: &Value, create: Option<&Const>) -> Result<
     }
 }
 
-fn key_repr(k: &Value) -> String {
+pub(crate) fn key_repr(k: &Value) -> String {
     match k {
         Value::Str(s) => format!("\"{s}\""),
         other => other.to_display_string(),

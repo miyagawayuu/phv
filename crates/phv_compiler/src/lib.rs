@@ -1165,21 +1165,24 @@ fn stmt_span(s: &HStmt) -> Option<phv_syntax::Span> {
     })
 }
 
-/// A function whose every local is an int, bool, float or string, or a list
-/// of one of them, may be compiled natively.
+/// A function whose every local is an int, bool, float or string, a
+/// nullable one, or a list or map of them, may be compiled natively.
 fn native_sig(f: &HFunc) -> Option<NativeSig> {
+    let scalar = |t: &Type| match t {
+        Type::Int => Some(Scalar::Int),
+        Type::Bool => Some(Scalar::Bool),
+        Type::Float => Some(Scalar::Float),
+        Type::Str => Some(Scalar::Str),
+        _ => None,
+    };
     let kind = |t: &Type| match t {
         Type::Int => Some(ValKind::Int),
         Type::Bool => Some(ValKind::Bool),
         Type::Float => Some(ValKind::Float),
         Type::Str => Some(ValKind::Str),
-        Type::List(e) => match **e {
-            Type::Int => Some(ValKind::ListInt),
-            Type::Float => Some(ValKind::ListFloat),
-            Type::Str => Some(ValKind::ListStr),
-            Type::Bool => Some(ValKind::ListBool),
-            _ => None,
-        },
+        Type::List(e) => Some(ValKind::List(scalar(e)?)),
+        Type::Map(k, v) if matches!(**k, Type::Int | Type::Str) => Some(ValKind::Map(scalar(k)?, scalar(v)?)),
+        t if t.is_nullable() => Some(ValKind::Opt(scalar(&t.without_null())?)),
         _ => None,
     };
     if f.kind != FuncKind::Normal || !f.captures.is_empty() || f.params.len() > 16 {

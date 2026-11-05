@@ -1993,13 +1993,16 @@ It then runs the type checker and shows the places that need manual work, such a
      objects has doubled since its last run (first at 4,096), and it looks at no more than 16 values per object made
      since then. Objects that are still reachable from a variable, a list, a map, a closure or another live object are
      never freed. When a run ends, the fields of every object left are cleared.
-   - **JIT** (Cranelift): functions whose locals are all `int`, `bool`, `float` or `string`, or lists of one of
-     them (`list<int>`, `list<float>`, `list<string>`, `list<bool>`), are compiled to native code when every
-     instruction they use is supported (arithmetic including `**`, comparisons, conversions, string constants, `.`,
-     `.=`, `(string)`, `strlen()` and `->len()`; for lists `[...]`, `$xs[$i]`, `$xs[$i] = $v`, `$xs[] = $v`, `foreach`,
-     `range()`, `count()` and `->len()`, and passing them to and returning them from other compiled functions).
-     Numbers stay in machine registers; strings and lists live in a register window and are handled by the
-     interpreter's own code, so results, error messages (such as `IndexError`) and memory checks are identical.
+   - **JIT** (Cranelift): functions whose locals are all `int`, `bool`, `float` or `string`, nullable ones (`?int`,
+     ...), or lists and maps of them (`list<int>`, `map<string, int>`, ...) are compiled to native code when every
+     instruction they use is supported: arithmetic including `**`, comparisons (also with `null`), conversions,
+     string constants, `.`, `.=`, `(string)`, `strlen()` and `->len()`; `null`, `??` and null checks; for
+     lists and maps `[...]`, `$xs[$k]`, `$xs[$k] ?? $default`, `$xs[$k] = $v`, `$xs[] = $v`, `foreach`, `range()`,
+     `count()`, `->len()` and `->has()`; and calls to other compiled functions. Numbers stay in machine registers
+     (with a null flag for nullable ones); strings, lists and maps live in a register window and are handled by the
+     interpreter's own code, so results, error messages (such as `IndexError` and `KeyError`) and memory checks are
+     identical. `PHV_JIT_EXPLAIN=1` prints, for each function the JIT leaves to the interpreter, the instruction
+     that kept it out.
      Integer overflow, division and modulo by zero, negative shifts, out-of-range float to int conversion, recursion
      depth, and the execution time and memory limits are checked in the JIT just as in the interpreter. Native code
      uses at most 8 MB of stack: a call that needs more (deep recursion of a function with a large frame) is run by
@@ -2061,7 +2064,7 @@ Planned, in this order. Each release is audited before it is published, as befor
   --profile`, a tutorial, and builds for Linux on ARM, static Linux builds and a Docker image
   (`ghcr.io/miyagawayuu/phv`), Homebrew and Scoop from this release on (done).
 - **1.0, speed and stability**: freeing reference cycles while a script runs (done), a JIT that covers more code
-  (lists: done),
+  (lists, maps and nullable values: done),
   HTTP/2 and TLS (done), a WebSocket server (done), a `Set` type (done), and a stable language specification.
 
 Some features are left out on purpose, because they work against the design principles (§1): `eval`, variable

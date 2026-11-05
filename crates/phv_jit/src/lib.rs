@@ -21,7 +21,7 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
-use phv_vm::bytecode::{Const, Function, Instr, NativeSig, PathBase, Program, Reg, ValKind, NO_REG};
+use phv_vm::bytecode::{Const, Function, Instr, NativeSig, PathBase, Program, Reg, Scalar, ValKind, NO_REG};
 use phv_vm::jit::*;
 use phv_vm::{JitEntry, JitTable};
 use std::collections::{HashMap, HashSet};
@@ -63,22 +63,56 @@ enum K {
     Str,
     /// A list of elements of one kind (in the window).
     List(E),
+    /// A map with keys and values of one kind each (in the window).
+    Map(E, E),
+    /// `null`.
+    Null,
+    /// A scalar or `null`: a machine register and a null flag (a string is
+    /// in the window).
+    Opt(E),
     /// Different kinds on different paths: must not be read.
     Mixed,
 }
 
-/// The elements of a list.
+/// The elements of a list or map, or the scalar of a nullable value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum E {
     Int,
     Bool,
     Float,
     Str,
-    /// An empty list (`[]`), which is a list of any kind.
+    /// An empty list or map (`[]`): elements of any kind.
     Empty,
 }
 
 impl E {
+    fn from(s: Scalar) -> E {
+        match s {
+            Scalar::Int => E::Int,
+            Scalar::Bool => E::Bool,
+            Scalar::Float => E::Float,
+            Scalar::Str => E::Str,
+        }
+    }
+
+    /// The element of `JIT_ELEM_*` a helper delivers for this kind.
+    fn code(self) -> i64 {
+        match self {
+            E::Float => JIT_ELEM_FLOAT,
+            E::Str => JIT_ELEM_STR,
+            _ => JIT_ELEM_INT,
+        }
+    }
+
+    /// The element kinds `a` and `b` together (an empty container's is any).
+    fn join(a: E, b: E) -> Option<E> {
+        match (a, b) {
+            _ if a == b => Some(a),
+            (E::Empty, x) | (x, E::Empty) => Some(x),
+            _ => None,
+        }
+    }
+
     fn of(k: K) -> Option<E> {
         Some(match k {
             K::Int => E::Int,
@@ -108,33 +142,98 @@ impl K {
             ValKind::Bool => Some(K::Bool),
             ValKind::Float => Some(K::Float),
             ValKind::Str => Some(K::Str),
-            ValKind::ListInt => Some(K::List(E::Int)),
-            ValKind::ListBool => Some(K::List(E::Bool)),
-            ValKind::ListFloat => Some(K::List(E::Float)),
-            ValKind::ListStr => Some(K::List(E::Str)),
+            ValKind::List(s) => Some(K::List(E::from(s))),
+            ValKind::Map(k, v) => Some(K::Map(E::from(k), E::from(v))),
+            ValKind::Opt(s) => Some(K::Opt(E::from(s))),
             ValKind::Void => None,
         }
     }
 
     /// Kept in the register window, not in a machine register.
     fn boxed(self) -> bool {
-        matches!(self, K::Str | K::List(_))
+        matches!(self, K::Str | K::List(_) | K::Map(..) | K::Opt(E::Str))
+    }
+
+    /// A scalar, nullable or not: its element kind and whether it may be null.
+    fn base(self) -> Option<(E, bool)> {
+        Some(match self {
+            K::Int => (E::Int, false),
+            K::Bool => (E::Bool, false),
+            K::Float => (E::Float, false),
+            K::Str => (E::Str, false),
+            K::Opt(e) => (e, true),
+            _ => return None,
+        })
+    }
+
+    /// The kind without `null` (a nullable value checked not to be null).
+    fn strip(self) -> K {
+        match self {
+            K::Opt(e) => e.scalar().unwrap_or(self),
+            k => k,
+        }
     }
 
     /// The kind at a point two paths reach with `self` and `other`: an empty
-    /// list is a list of any kind; other differences cannot be read.
+    /// list or map holds any kind, and a scalar meets `null` as a nullable
+    /// value; other differences cannot be read.
     fn join(self, other: K) -> K {
-        match (self, other) {
-            _ if self == other => self,
-            (K::List(E::Empty), K::List(e)) | (K::List(e), K::List(E::Empty)) => K::List(e),
-            _ => K::Mixed,
-        }
+        let j = match (self, other) {
+            _ if self == other => Some(self),
+            (K::List(a), K::List(b)) => E::join(a, b).map(K::List),
+            (K::Map(k1, v1), K::Map(k2, v2)) => E::join(k1, k2).zip(E::join(v1, v2)).map(|(k, v)| K::Map(k, v)),
+            (K::Null, x) | (x, K::Null) => x.base().map(|(e, _)| K::Opt(e)),
+            (K::Opt(e), x) | (x, K::Opt(e)) if x.base() == Some((e, false)) => Some(K::Opt(e)),
+            _ => None,
+        };
+        j.unwrap_or(K::Mixed)
     }
 }
 
-/// Whether a value of kind `have` may be used where `want` is needed.
+/// Whether a value of kind `have` may be used where `want` is needed: the
+/// same kind, an empty list or map for any, a scalar or `null` for a nullable
+/// one, and a nullable value where the scalar is needed (the type checker
+/// proved that it is not null there).
 fn fits(have: K, want: K) -> bool {
-    have == want || (have == K::List(E::Empty) && matches!(want, K::List(_)))
+    have == want
+        || match (have, want) {
+            (K::List(E::Empty), K::List(_)) | (K::Map(E::Empty, E::Empty), K::Map(..)) | (K::Null, K::Opt(_)) => true,
+            (K::Map(k1, v1), K::Map(k2, v2)) => E::join(k1, k2) == Some(k2) && E::join(v1, v2) == Some(v2),
+            (x, K::Opt(e)) => x.base().is_some_and(|(b, _)| b == e),
+            (K::Opt(e), x) => x.base() == Some((e, false)),
+            _ => false,
+        }
+}
+
+/// How `==` / `!=` is computed natively.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EqMode {
+    /// Two non-null ints, bools or strings.
+    Plain,
+    /// `null == null`.
+    BothNull,
+    /// One side is `null`: whether the other (`a` when true) is null.
+    NullTest(bool),
+    /// Nullable ints, bools or floats.
+    Opt(E),
+}
+
+fn eq_mode(ka: K, kb: K) -> Option<EqMode> {
+    match (ka, kb) {
+        (K::Null, K::Null) => Some(EqMode::BothNull),
+        (K::Null, x) => x.base().map(|_| EqMode::NullTest(false)),
+        (x, K::Null) => x.base().map(|_| EqMode::NullTest(true)),
+        _ => {
+            let ((ea, oa), (eb, ob)) = (ka.base()?, kb.base()?);
+            if ea != eb {
+                return None;
+            }
+            if !oa && !ob {
+                return matches!(ea, E::Int | E::Bool | E::Str).then_some(EqMode::Plain);
+            }
+            matches!(ea, E::Int | E::Bool | E::Float).then_some(EqMode::Opt(ea))
+        }
+    }
 }
 
 /// The element kind of list register `x`.
@@ -145,13 +244,34 @@ fn need_list(st: &[K], x: Reg) -> Option<E> {
     }
 }
 
+/// The key and value kinds of map register `x`.
+fn need_map(st: &[K], x: Reg) -> Option<(E, E)> {
+    match kind(st, x)? {
+        K::Map(k, v) => Some((k, v)),
+        _ => None,
+    }
+}
+
+/// Register `x` holds a key for a map whose keys are `ke`.
+fn need_key(st: &[K], x: Reg, ke: E) -> Option<()> {
+    let k = kind(st, x)?;
+    match ke {
+        E::Empty => matches!(k, K::Int | K::Str).then_some(()),
+        e => need(st, x, e.scalar()?),
+    }
+}
+
 /// The kind of register `x` when it holds a value.
 fn kind(st: &[K], x: Reg) -> Option<K> {
     st.get(x as usize).copied().filter(|k| !matches!(k, K::Undef | K::Mixed))
 }
 
 fn need(st: &[K], x: Reg, k: K) -> Option<()> {
-    (kind(st, x)? == k).then_some(())
+    let have = kind(st, x)?;
+    (have == k
+        || have.strip() == k && have != K::Opt(E::Str) && have.base().is_some()
+        || have == K::Opt(E::Str) && k == K::Str)
+        .then_some(())
 }
 
 fn set(st: &mut [K], x: Reg, k: K) -> Option<()> {
@@ -252,10 +372,22 @@ fn well_formed(prog: &Program, f: &Function, ok: &HashSet<u32>) -> Option<Checke
     }
     for (i, st) in kinds.iter().enumerate() {
         if let Some(st) = st {
-            step(prog, sig, ok, &f.code[i], &mut st.clone(), &mut strings)?;
+            if step(prog, sig, ok, &f.code[i], &mut st.clone(), &mut strings).is_none() {
+                explain(f, i, st);
+                return None;
+            }
         }
     }
     Some(Checked { kinds, strings })
+}
+
+/// `PHV_JIT_EXPLAIN=1`: says which instruction keeps a function out of the
+/// JIT, with the register kinds before it.
+fn explain(f: &Function, i: usize, st: &[K]) {
+    if std::env::var_os("PHV_JIT_EXPLAIN").is_some() {
+        let kinds: Vec<String> = st.iter().enumerate().map(|(r, k)| format!("r{r}={k:?}")).collect();
+        eprintln!("phv jit: {} not compiled: instruction {i} {:?} with {}", f.name, f.code[i], kinds.join(" "));
+    }
 }
 
 /// Checks one instruction against the register kinds before it and updates
@@ -272,6 +404,7 @@ fn step(
     match *ins {
         Int(d, _) => set(st, d, K::Int)?,
         Bool(d, _) => set(st, d, K::Bool)?,
+        Null(d) => set(st, d, K::Null)?,
         Const(d, c) => {
             let k = match prog.consts.get(c as usize)? {
                 phv_vm::bytecode::Const::Int(_) => K::Int,
@@ -279,6 +412,7 @@ fn step(
                 phv_vm::bytecode::Const::Float(_) => K::Float,
                 phv_vm::bytecode::Const::Str(_) => K::Str,
                 phv_vm::bytecode::Const::EmptyList => K::List(E::Empty),
+                phv_vm::bytecode::Const::EmptyMap => K::Map(E::Empty, E::Empty),
                 _ => return None,
             };
             set(st, d, k)?;
@@ -314,11 +448,14 @@ fn step(
             need(st, b, K::Int)?;
             set(st, d, K::Bool)?;
         }
-        Eq(d, a, b) | Ne(d, a, b) | Lt(d, a, b) | Le(d, a, b) | Cmp(d, a, b) => {
-            // Floats use the float forms (`EqF`, ...); lists are not compared natively.
-            let k = kind(st, a)?;
-            need(st, b, k)?;
-            if !matches!(k, K::Int | K::Bool | K::Str) {
+        Eq(d, a, b) | Ne(d, a, b) => {
+            eq_mode(kind(st, a)?, kind(st, b)?)?;
+            set(st, d, K::Bool)?;
+        }
+        Lt(d, a, b) | Le(d, a, b) | Cmp(d, a, b) => {
+            // Floats use the float forms (`LtF`, ...); lists are not compared natively.
+            let k = kind(st, a)?.strip();
+            if kind(st, b)?.strip() != k || !matches!(k, K::Int | K::Bool | K::Str) {
                 return None;
             }
             set(st, d, if matches!(ins, Cmp(..)) { K::Int } else { K::Bool })?;
@@ -373,6 +510,15 @@ fn step(
                 ("list_len", 1) => {
                     need_list(st, args)?;
                     K::Int
+                }
+                ("map_len", 1) => {
+                    need_map(st, args)?;
+                    K::Int
+                }
+                ("map_has", 2) => {
+                    let (ke, _) = need_map(st, args)?;
+                    need_key(st, args.checked_add(1)?, ke)?;
+                    K::Bool
                 }
                 ("range", 2) => {
                     need(st, args, K::Int)?;
@@ -431,8 +577,8 @@ fn step(
             }
             return Some(Flow::Stop);
         }
-        // A string or list function must return one on every path.
-        RetNull if sig.ret.boxed() => return None,
+        // A string, list or map function must return one on every path.
+        RetNull if sig.ret.boxed() && !matches!(sig.ret, ValKind::Opt(_)) => return None,
         RetNull => return Some(Flow::Stop),
         PowI(d, a, b) => {
             need(st, a, K::Int)?;
@@ -455,10 +601,65 @@ fn step(
             };
             set(st, d, K::List(e))?;
         }
-        Index(d, l, i) => {
-            let k = need_list(st, l)?.scalar()?;
-            need(st, i, K::Int)?;
+        Index(d, c, i) | IndexOrNull(d, c, i) => {
+            let e = match kind(st, c)? {
+                K::List(e) => {
+                    need(st, i, K::Int)?;
+                    e
+                }
+                K::Map(ke, ve) => {
+                    need_key(st, i, ke)?;
+                    ve
+                }
+                _ => return None,
+            };
+            let k = match (ins, e.scalar()) {
+                (IndexOrNull(..), Some(_)) => K::Opt(e),
+                // Nothing is ever found in an empty list or map.
+                (IndexOrNull(..), None) => K::Null,
+                (_, k) => k?,
+            };
             set(st, d, k)?;
+        }
+        SetPath(ref path) if matches!(path.base, PathBase::Local(r) if matches!(kind(st, r), Some(K::Map(..)))) => {
+            let PathBase::Local(r) = path.base else { return None };
+            let (ke, ve) = need_map(st, r)?;
+            let [k] = path.keys.as_slice() else { return None };
+            if path.push {
+                return None;
+            }
+            let kk = E::of(kind(st, *k)?)?;
+            let v = E::of(kind(st, path.val)?)?;
+            let (ke, ve) = (E::join(ke, kk)?, E::join(ve, v)?);
+            if !matches!(ke, E::Int | E::Str) {
+                return None;
+            }
+            set(st, r, K::Map(ke, ve))?;
+        }
+        NewMap(d, start, n) => {
+            let k = if n == 0 {
+                K::Map(E::Empty, E::Empty)
+            } else {
+                let (kk, vk) = (kind(st, start)?, kind(st, start.checked_add(1)?)?);
+                if !matches!(kk, K::Int | K::Str) {
+                    return None;
+                }
+                for i in 0..n {
+                    let at = start.checked_add(i.checked_mul(2)?)?;
+                    need(st, at, kk)?;
+                    need(st, at.checked_add(1)?, vk)?;
+                }
+                // The keys and values are moved into the map.
+                for i in 0..2 * n {
+                    set(st, start + i, K::Undef)?;
+                }
+                K::Map(E::of(kk)?, E::of(vk)?)
+            };
+            set(st, d, k)?;
+        }
+        JumpIfNull(r, t) | JumpIfNotNull(r, t) => {
+            kind(st, r)?;
+            return Some(Flow::Branch(t));
         }
         SetPath(ref path) => {
             let PathBase::Local(r) = path.base else { return None };
@@ -475,18 +676,28 @@ fn step(
             set(st, r, K::List(v))?;
         }
         IterInit(it, src) => {
-            let e = need_list(st, src)?;
-            set(st, it, K::List(e))?;
+            let k = kind(st, src)?;
+            if !matches!(k, K::List(_) | K::Map(..)) {
+                return None;
+            }
+            set(st, it, k)?;
             set(st, it.checked_add(1)?, K::Int)?;
         }
         IterNext { it, key, val, end } => {
-            let e = need_list(st, it)?;
+            let (ke, ve) = match kind(st, it)? {
+                K::List(e) => (E::Int, e),
+                K::Map(k, v) => (k, v),
+                _ => return None,
+            };
             need(st, it.checked_add(1)?, K::Int)?;
-            if key != NO_REG {
-                set(st, key, K::Int)?;
+            // A list or map known to be empty has no entries: the loop ends.
+            if ve == E::Empty {
+                return Some(Flow::Jump(end));
             }
-            // The elements of an empty list are never read.
-            set(st, val, e.scalar().unwrap_or(K::Undef))?;
+            if key != NO_REG {
+                set(st, key, ke.scalar()?)?;
+            }
+            set(st, val, ve.scalar()?)?;
             if st.iter().any(|k| k.boxed()) {
                 *strings = true;
             }
@@ -567,11 +778,18 @@ enum H {
     PowI,
     RangeFn,
     Push,
+    IsNull,
+    Unbox,
+    Get,
+    SetKey,
+    Entry,
+    Has,
+    NewMap,
 }
 
 /// Name, address, number of i64 arguments after `ctx` (None: `(f64, f64) -> f64`)
 /// and whether it returns an i64, in the order of `H`.
-fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 22] {
+fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 29] {
     [
         ("phv_jit_tick", phv_jit_tick as *const u8, Some(0), true),
         ("phv_jit_enter", phv_jit_enter as *const u8, Some(3), true),
@@ -595,6 +813,13 @@ fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 22] {
         ("phv_jit_pow_i", phv_jit_pow_i as *const u8, Some(2), true),
         ("phv_jit_range_fn", phv_jit_range_fn as *const u8, Some(3), false),
         ("phv_jit_push", phv_jit_push as *const u8, Some(3), false),
+        ("phv_jit_is_null", phv_jit_is_null as *const u8, Some(1), true),
+        ("phv_jit_unbox", phv_jit_unbox as *const u8, Some(2), true),
+        ("phv_jit_get", phv_jit_get as *const u8, Some(5), true),
+        ("phv_jit_set_key", phv_jit_set_key as *const u8, Some(3), false),
+        ("phv_jit_entry", phv_jit_entry as *const u8, Some(5), true),
+        ("phv_jit_has", phv_jit_has as *const u8, Some(2), true),
+        ("phv_jit_new_map", phv_jit_new_map as *const u8, Some(3), false),
     ]
 }
 
@@ -732,6 +957,8 @@ struct Translator<'a, 'b> {
     /// Per register: an i64 variable (ints and bools) and an f64 one.
     ivars: Vec<Variable>,
     fvars: Vec<Variable>,
+    /// Per register: 1 when it holds `null` (a nullable scalar), else 0.
+    nvars: Vec<Variable>,
     blocks: Vec<Block>,
     ctx: Value,
 }
@@ -756,6 +983,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             callees,
             ivars: Vec::new(),
             fvars: Vec::new(),
+            nvars: Vec::new(),
             blocks: Vec::new(),
             ctx: Value::from_u32(0),
         }
@@ -767,6 +995,44 @@ impl<'a, 'b> Translator<'a, 'b> {
 
     fn set(&mut self, r: u16, v: Value) {
         self.b.def_var(self.ivars[r as usize], v);
+        self.setn(r, 0);
+    }
+
+    /// Whether register `r` holds `null` (0 or 1).
+    fn getn(&mut self, r: u16) -> Value {
+        self.b.use_var(self.nvars[r as usize])
+    }
+
+    fn setn(&mut self, r: u16, null: i64) {
+        let v = self.iconst(null);
+        self.b.def_var(self.nvars[r as usize], v);
+    }
+
+    /// Whether register `r` (of kind `k`) holds `null`, as 0 or 1.
+    fn is_null(&mut self, r: Reg, k: K) -> Value {
+        match k {
+            K::Null => self.iconst(1),
+            K::Opt(E::Str) => self.call_regs(H::IsNull, &[r as i64]).unwrap(),
+            K::Opt(_) => self.getn(r),
+            _ => self.iconst(0),
+        }
+    }
+
+    /// Reads a nullable scalar from slot `r` into its machine register and null flag.
+    fn unbox(&mut self, r: Reg, e: E) {
+        if e == E::Str {
+            return;
+        }
+        let v = self.call_regs(H::Unbox, &[r as i64, e.code()]).unwrap();
+        self.check_ctx();
+        let null = self.b.ins().load(I64, self.mf, self.ctx, CTX_DETAIL);
+        if e == E::Float {
+            let f = self.b.ins().bitcast(F64, MemFlagsData::new(), v);
+            self.setf(r, f);
+        } else {
+            self.set(r, v);
+        }
+        self.b.def_var(self.nvars[r as usize], null);
     }
 
     fn getf(&mut self, r: u16) -> Value {
@@ -775,6 +1041,7 @@ impl<'a, 'b> Translator<'a, 'b> {
 
     fn setf(&mut self, r: u16, v: Value) {
         self.b.def_var(self.fvars[r as usize], v);
+        self.setn(r, 0);
     }
 
     fn iconst(&mut self, v: i64) -> Value {
@@ -896,7 +1163,24 @@ impl<'a, 'b> Translator<'a, 'b> {
     /// Stores a number or boolean in its window slot, for a string operation.
     fn spill(&mut self, r: Reg, k: K) {
         let (tag, bits) = match k {
-            K::Str | K::List(_) => return,
+            K::Str | K::List(_) | K::Map(..) | K::Opt(E::Str) => return,
+            K::Null => (JIT_PUT_NULL, self.iconst(0)),
+            K::Opt(e) => {
+                let (tag, bits) = match e {
+                    E::Float => {
+                        let f = self.getf(r);
+                        (JIT_PUT_FLOAT, self.b.ins().bitcast(I64, MemFlagsData::new(), f))
+                    }
+                    E::Bool => (JIT_PUT_BOOL, self.get(r)),
+                    _ => (JIT_PUT_INT, self.get(r)),
+                };
+                let null = self.getn(r);
+                let (t, n) = (self.iconst(tag), self.iconst(JIT_PUT_NULL));
+                let tag = self.b.ins().select(null, n, t);
+                let rv = self.iconst(r as i64);
+                self.call(H::Put, &[rv, tag, bits]);
+                return;
+            }
             K::Float => {
                 let f = self.getf(r);
                 (JIT_PUT_FLOAT, self.b.ins().bitcast(I64, MemFlagsData::new(), f))
@@ -958,6 +1242,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         let nregs = self.func.num_regs.max(1) as usize;
         self.ivars = (0..nregs).map(|_| self.b.declare_var(I64)).collect();
         self.fvars = (0..nregs).map(|_| self.b.declare_var(F64)).collect();
+        self.nvars = (0..nregs).map(|_| self.b.declare_var(I64)).collect();
 
         self.b.switch_to_block(entry);
         self.ctx = self.b.block_params(entry)[0];
@@ -976,6 +1261,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             }
             self.b.def_var(self.ivars[r], i);
             self.b.def_var(self.fvars[r], f);
+            self.b.def_var(self.nvars[r], zero);
         }
         // depth check, register window and budget
         let d = self.b.ins().load(I64, self.mf, self.ctx, CTX_DEPTH);
@@ -994,6 +1280,12 @@ impl<'a, 'b> Translator<'a, 'b> {
             let (n, m) = (self.iconst(self.func.num_regs as i64), self.iconst(mask));
             let e = self.call(H::Enter, &[n, args_base, m]).unwrap();
             self.check(e);
+            // Nullable scalar arguments come in the window.
+            for (r, p) in self.sig.params.iter().enumerate() {
+                if let ValKind::Opt(s) = p {
+                    self.unbox(r as Reg, E::from(*s));
+                }
+            }
         }
         self.tick();
         self.jump(0);
@@ -1034,18 +1326,71 @@ impl<'a, 'b> Translator<'a, 'b> {
                     }
                 },
                 Instr::Move(d, s) => match k(s) {
+                    ks if ks.boxed() => {
+                        self.call_regs(H::Move, &[d as i64, s as i64]);
+                    }
                     K::Float => {
                         let v = self.getf(s);
                         self.setf(d, v);
                     }
-                    K::Str | K::List(_) => {
-                        self.call_regs(H::Move, &[d as i64, s as i64]);
+                    K::Null | K::Opt(_) => {
+                        // The value, and whether it is null (copied also to
+                        // the window, where a string operation may read it).
+                        let (i, f, n) = (self.get(s), self.getf(s), self.getn(s));
+                        self.b.def_var(self.ivars[d as usize], i);
+                        self.b.def_var(self.fvars[d as usize], f);
+                        self.b.def_var(self.nvars[d as usize], n);
+                        if k(s) == K::Null && self.checked.strings {
+                            self.spill(d, K::Null);
+                        }
                     }
                     _ => {
                         let v = self.get(s);
                         self.set(d, v);
                     }
                 },
+                Instr::Null(d) => {
+                    let z = self.iconst(0);
+                    self.b.def_var(self.ivars[d as usize], z);
+                    self.setn(d, 1);
+                    // A nullable string is read from the window.
+                    if self.checked.strings {
+                        self.spill(d, K::Null);
+                    }
+                }
+                Instr::JumpIfNull(r, t) | Instr::JumpIfNotNull(r, t) => {
+                    let null = self.is_null(r, k(r));
+                    let (yes, no) = if matches!(ins, Instr::JumpIfNull(..)) { (t, next) } else { (next, t) };
+                    let (yes, no) = (self.blocks[yes as usize], self.blocks[no as usize]);
+                    self.b.ins().brif(null, yes, &[], no, &[]);
+                    continue;
+                }
+                Instr::Eq(d, a, b) | Instr::Ne(d, a, b) if eq_mode(k(a), k(b)) != Some(EqMode::Plain) => {
+                    let eq = match eq_mode(k(a), k(b)) {
+                        Some(EqMode::BothNull) => self.iconst(1),
+                        Some(EqMode::NullTest(true)) => self.is_null(a, k(a)),
+                        Some(EqMode::NullTest(false)) => self.is_null(b, k(b)),
+                        Some(EqMode::Opt(e)) => {
+                            // Both null, or neither and the same value.
+                            let (na, nb) = (self.is_null(a, k(a)), self.is_null(b, k(b)));
+                            let same_null = self.b.ins().icmp(IntCC::Equal, na, nb);
+                            let same_value = if e == E::Float {
+                                let (x, y) = (self.getf(a), self.getf(b));
+                                self.b.ins().fcmp(FloatCC::Equal, x, y)
+                            } else {
+                                let (x, y) = (self.get(a), self.get(b));
+                                self.b.ins().icmp(IntCC::Equal, x, y)
+                            };
+                            let same_value = self.bool_val(same_value);
+                            let either = self.b.ins().bor(na, same_value);
+                            let same_null = self.bool_val(same_null);
+                            self.b.ins().band(same_null, either)
+                        }
+                        _ => unreachable!("checked"),
+                    };
+                    let r = if matches!(ins, Instr::Ne(..)) { self.b.ins().bxor_imm_s(eq, 1) } else { eq };
+                    self.set(d, r);
+                }
                 Instr::AddI(d, a, b) | Instr::SubI(d, a, b) => {
                     let (x, y) = (self.get(a), self.get(b));
                     let r = self.add_checked(x, y, matches!(ins, Instr::SubI(..)));
@@ -1125,7 +1470,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 | Instr::Lt(d, a, b)
                 | Instr::Le(d, a, b)
                 | Instr::Cmp(d, a, b)
-                    if k(a) == K::Str =>
+                    if k(a).strip() == K::Str =>
                 {
                     // Compare the strings (-1, 0 or 1), then that with 0.
                     let c = self.call_regs(H::StrCmp, &[a as i64, b as i64]).unwrap();
@@ -1269,7 +1614,13 @@ impl<'a, 'b> Translator<'a, 'b> {
                     self.call(H::RangeFn, &[dv, x, y]);
                     self.check_ctx();
                 }
-                Instr::CallBuiltin { dst, args, .. } if matches!(k(args), K::List(_)) => {
+                Instr::CallBuiltin { dst, id, args, .. } if self.prog.builtin_names[id as usize] == "map_has" => {
+                    self.spill(args + 1, k(args + 1));
+                    let r = self.call_regs(H::Has, &[args as i64, args as i64 + 1]).unwrap();
+                    self.check_ctx();
+                    self.set(dst, r);
+                }
+                Instr::CallBuiltin { dst, args, .. } if matches!(k(args), K::List(_) | K::Map(..)) => {
                     let lv = self.iconst(args as i64);
                     let n = self.call(H::ListLen, &[lv]).unwrap();
                     self.check_ctx();
@@ -1331,12 +1682,16 @@ impl<'a, 'b> Translator<'a, 'b> {
                     let callee = self.callees[&func];
                     let csig = self.prog.funcs[func as usize].native.as_ref().unwrap();
                     let mut vals = vec![self.ctx, self.iconst(args as i64)];
-                    for r in args..args + argc {
-                        let v = match k(r) {
-                            K::Float => self.getf(r),
-                            // moved from the window by the callee
-                            K::Str | K::List(_) => self.iconst(0),
-                            _ => self.get(r),
+                    for (i, r) in (args..args + argc).enumerate() {
+                        let p = csig.params[i];
+                        let v = if p.boxed() {
+                            // Moved from the window by the callee.
+                            self.spill(r, k(r));
+                            self.iconst(0)
+                        } else if p == ValKind::Float {
+                            self.getf(r)
+                        } else {
+                            self.get(r)
                         };
                         vals.push(v);
                     }
@@ -1348,6 +1703,9 @@ impl<'a, 'b> Translator<'a, 'b> {
                         ValKind::Float => self.setf(dst, r),
                         v if v.boxed() => {
                             self.call_regs(H::TakeRet, &[dst as i64]);
+                            if let ValKind::Opt(s) = v {
+                                self.unbox(dst, E::from(s));
+                            }
                         }
                         _ => self.set(dst, r),
                     }
@@ -1359,6 +1717,8 @@ impl<'a, 'b> Translator<'a, 'b> {
                             self.ret(v, None);
                         }
                         v if v.boxed() => {
+                            // A nullable scalar goes back in the window.
+                            self.spill(r, k(r));
                             let z = self.iconst(0);
                             self.ret(z, Some(r));
                         }
@@ -1390,10 +1750,49 @@ impl<'a, 'b> Translator<'a, 'b> {
                     }
                     self.call_regs(H::NewList, &[d as i64, start as i64, n as i64]);
                 }
-                Instr::Index(d, l, i) => {
+                Instr::Index(d, l, i) if matches!(k(l), K::List(_)) => {
                     let K::List(e) = k(l) else { unreachable!("checked") };
                     let iv = self.get(i);
                     self.element(d, l, iv, e);
+                }
+                Instr::Index(d, c, key) | Instr::IndexOrNull(d, c, key) => {
+                    let or_null = matches!(ins, Instr::IndexOrNull(..));
+                    let e = match k(c) {
+                        K::List(e) => e,
+                        K::Map(_, v) => v,
+                        _ => unreachable!("checked"),
+                    };
+                    self.spill(key, k(key));
+                    let args = [d as i64, c as i64, key as i64, e.code(), or_null as i64];
+                    let v = self.call_regs(H::Get, &args).unwrap();
+                    self.check_ctx();
+                    match e {
+                        E::Float => {
+                            let f = self.b.ins().bitcast(F64, MemFlagsData::new(), v);
+                            self.setf(d, f);
+                        }
+                        E::Str => {}
+                        _ => self.set(d, v),
+                    }
+                    if or_null {
+                        let null = self.b.ins().load(I64, self.mf, self.ctx, CTX_DETAIL);
+                        let null = if e == E::Empty { self.iconst(1) } else { null };
+                        self.b.def_var(self.nvars[d as usize], null);
+                    }
+                }
+                Instr::NewMap(d, start, n) => {
+                    for r in start..start + 2 * n {
+                        self.spill(r, k(r));
+                    }
+                    self.call_regs(H::NewMap, &[d as i64, start as i64, n as i64]);
+                }
+                Instr::SetPath(ref path) if matches!(path.base, PathBase::Local(r) if matches!(k(r), K::Map(..))) => {
+                    let PathBase::Local(r) = path.base else { unreachable!("checked") };
+                    let key = path.keys[0];
+                    self.spill(key, k(key));
+                    self.spill(path.val, k(path.val));
+                    self.call_regs(H::SetKey, &[r as i64, key as i64, path.val as i64]);
+                    self.check_ctx();
                 }
                 Instr::SetPath(ref path) if path.push && k(path.val) != K::Str => {
                     let PathBase::Local(r) = path.base else { unreachable!("checked") };
@@ -1431,6 +1830,34 @@ impl<'a, 'b> Translator<'a, 'b> {
                     let len = self.call(H::ListLen, &[lv]).unwrap();
                     self.check_ctx();
                     self.set(it, len);
+                }
+                Instr::IterNext { it, key, val, end } if matches!(k(it), K::Map(..)) => {
+                    let K::Map(ke, ve) = k(it) else { unreachable!("checked") };
+                    let len = self.get(it);
+                    let idx = self.get(it + 1);
+                    let done = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx, len);
+                    let cont = self.b.create_block();
+                    self.b.ins().brif(done, self.blocks[end as usize], &[], cont, &[]);
+                    self.b.switch_to_block(cont);
+                    for (r, part, e) in [(key, 0, ke), (val, 1, ve)] {
+                        if r == NO_REG || e == E::Empty {
+                            continue;
+                        }
+                        let (rv, mv, pv, cv) =
+                            (self.iconst(r as i64), self.iconst(it as i64), self.iconst(part), self.iconst(e.code()));
+                        let v = self.call(H::Entry, &[rv, mv, idx, pv, cv]).unwrap();
+                        self.check_ctx();
+                        match e {
+                            E::Float => {
+                                let f = self.b.ins().bitcast(F64, MemFlagsData::new(), v);
+                                self.setf(r, f);
+                            }
+                            E::Str => {}
+                            _ => self.set(r, v),
+                        }
+                    }
+                    let n = self.b.ins().iadd_imm_s(idx, 1);
+                    self.set(it + 1, n);
                 }
                 Instr::IterNext { it, key, val, end } => {
                     let K::List(e) = k(it) else { unreachable!("checked") };
@@ -1508,7 +1935,7 @@ mod tests {
     #[test]
     fn checks_the_kinds_of_lists() {
         use phv_vm::bytecode::PathSet;
-        let (li, ls) = (ValKind::ListInt, ValKind::ListStr);
+        let (li, ls) = (ValKind::List(Scalar::Int), ValKind::List(Scalar::Str));
         let push = |list: u16, val: u16| {
             SetPath(Box::new(PathSet {
                 base: PathBase::Local(list),
@@ -1535,6 +1962,32 @@ mod tests {
         assert!(!one(func(vec![li, li], ValKind::Bool, 3, vec![Eq(2, 0, 1), Ret(2)])));
         // A list function returns a list on every path.
         assert!(!one(func(vec![], li, 1, vec![RetNull])));
+    }
+
+    #[test]
+    fn checks_nullable_values_and_maps() {
+        let oi = ValKind::Opt(Scalar::Int);
+        let msi = ValKind::Map(Scalar::Str, Scalar::Int);
+        // `null` or an int: a nullable int, returned as one.
+        let code = vec![JumpIfFalse(0, 3), Int(1, 5), Jump(4), Null(1), Ret(1)];
+        assert!(one(func(vec![ValKind::Bool], oi, 2, code)));
+        // ... but not returned as an int, nor joined with a float.
+        let code = vec![JumpIfFalse(0, 3), Int(1, 5), Jump(4), Null(1), Ret(1)];
+        assert!(one(func(vec![ValKind::Bool], I, 2, code)), "a nullable int is used where the checker proved an int");
+        let code = vec![JumpIfFalse(0, 3), Int(1, 5), Jump(4), Instr::Const(1, 0), Ret(1)];
+        let prog = Program {
+            funcs: vec![func(vec![ValKind::Bool], oi, 2, code)],
+            consts: vec![C::Float(1.0)],
+            ..Default::default()
+        };
+        assert!(!accepts(&prog));
+        // A map's values have its value kind; its keys its key kind.
+        assert!(one(func(vec![msi, S], I, 3, vec![Index(2, 0, 1), Ret(2)])));
+        assert!(!one(func(vec![msi, I], I, 3, vec![Index(2, 0, 1), Ret(2)])));
+        assert!(one(func(vec![msi, S], oi, 3, vec![IndexOrNull(2, 0, 1), Ret(2)])));
+        assert!(!one(func(vec![msi, S], S, 3, vec![Index(2, 0, 1), Ret(2)])));
+        // Maps are not compared natively.
+        assert!(!one(func(vec![msi, msi], ValKind::Bool, 3, vec![Eq(2, 0, 1), Ret(2)])));
     }
 
     #[test]

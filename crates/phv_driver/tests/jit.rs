@@ -319,3 +319,84 @@ echo spin(range(1, 1000));
     let out = run_both("list_time", src, limits, &["spin"]);
     assert!(out.contains("maximum execution time"), "{out}");
 }
+
+/// Maps of scalars and nullable scalars are compiled too, with the
+/// interpreter's results and errors.
+#[test]
+fn maps_and_nullable_values_are_compiled_natively() {
+    let src = r#"<?phv
+function count_keys(int $n): int {
+    map<string, int> $counts = [];
+    foreach (0..$n as $i) {
+        $key = "k" . ($i % 7);
+        $counts[$key] = ($counts[$key] ?? 0) + 1;
+    }
+    $t = 0;
+    foreach ($counts as $k => $v) {
+        $t += $v * strlen($k);
+    }
+    return $t + count($counts);
+}
+
+function first_pos(list<int> $xs, int $v): ?int {
+    ?int $found = null;
+    foreach ($xs as $i => $x) {
+        if ($x == $v && $found == null) {
+            $found = $i;
+        }
+    }
+    return $found;
+}
+
+function use_pos(list<int> $xs, int $v): int {
+    $p = first_pos($xs, $v);
+    if ($p != null) {
+        return $p + 100;
+    }
+    return $p ?? -1;
+}
+
+function lookup(map<int, string> $names, int $id): string {
+    $n = $names[$id] ?? null;
+    if ($n == null) {
+        return "?";
+    }
+    return $n . ($names->has($id + 1) ? "+" : "");
+}
+
+function strict(map<string, float> $m, string $k): float {
+    return $m[$k] * 2.0;
+}
+
+function half(?float $x): ?float {
+    if ($x == null) {
+        return null;
+    }
+    return $x / 2.0;
+}
+
+function build(int $n): map<int, bool> {
+    map<int, bool> $m = [];
+    for ($i = 0; $i < $n; $i++) {
+        $m[$i * 2] = $i % 2 == 0;
+    }
+    return $m;
+}
+
+echo count_keys(100), " ", use_pos([4, 5, 6, 5], 5), " ", use_pos([1], 9), "\n";
+echo lookup([1 => "a", 2 => "b"], 1), lookup([1 => "a", 2 => "b"], 2), lookup([1 => "a"], 3), "\n";
+echo half(3.0) ?? -1.0, " ", half(null) ?? -1.0, " ", count(build(5)), "\n";
+try {
+    echo strict(["x" => 1.5], "y");
+} catch (KeyError $e) {
+    echo "KeyError: ", $e->getMessage(), "\n";
+}
+"#;
+    let out = run_both(
+        "maps",
+        src,
+        Limits::default(),
+        &["count_keys", "first_pos", "use_pos", "lookup", "strict", "half", "build"],
+    );
+    assert_eq!(out, "207 101 -1\na+b?\n1.5 -1 5\nKeyError: undefined map key \"y\"\n");
+}

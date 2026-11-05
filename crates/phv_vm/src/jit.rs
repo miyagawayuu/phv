@@ -11,7 +11,7 @@
 use crate::bytecode::Program;
 use crate::value::{compare, Value};
 use crate::vm::{
-    const_value, copy_cost, op_append, op_concat, op_to_str, path_assign, str_len, MemLimit, BUDGET, LONG_OP,
+    const_value, copy_cost, key_repr, op_append, op_concat, op_to_str, path_assign, str_len, MemLimit, BUDGET, LONG_OP,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -59,6 +59,8 @@ pub const JIT_ERR_THROW: i64 = 10;
 pub const JIT_PUT_INT: i64 = 1;
 pub const JIT_PUT_FLOAT: i64 = 2;
 pub const JIT_PUT_BOOL: i64 = 3;
+/// `null` (a nullable value that is null).
+pub const JIT_PUT_NULL: i64 = 4;
 
 pub struct JitLimits {
     pub deadline: Option<Instant>,
@@ -279,6 +281,7 @@ pub unsafe extern "C" fn phv_jit_put(ctx: *mut JitCtx, r: i64, kind: i64, bits: 
     rt(ctx).top()[r as usize] = match kind {
         JIT_PUT_INT => Value::Int(bits),
         JIT_PUT_FLOAT => Value::Float(f64::from_bits(bits as u64)),
+        JIT_PUT_NULL => Value::Null,
         _ => Value::Bool(bits != 0),
     };
 }
@@ -431,13 +434,14 @@ pub unsafe extern "C" fn phv_jit_index(ctx: *mut JitCtx, d: i64, l: i64, i: i64,
     }
 }
 
-/// The length of the list in slot `l`.
+/// The length of the list or map in slot `l`.
 ///
 /// # Safety
 /// See `rt`.
 pub unsafe extern "C" fn phv_jit_list_len(ctx: *mut JitCtx, l: i64) -> i64 {
     match &rt(ctx).top()[l as usize] {
         Value::List(x) => x.len() as i64,
+        Value::Map(m) => m.len() as i64,
         _ => {
             wrong_value(ctx);
             0
@@ -557,4 +561,160 @@ pub unsafe extern "C" fn phv_jit_push(ctx: *mut JitCtx, r: i64, kind: i64, bits:
     if let Err((class, msg)) = path_assign(&mut w[r as usize], &[], &[], true, v) {
         throw(ctx, class, msg);
     }
+}
+
+// Nullable values and maps.
+
+/// Hands value `v` to native code as an element of kind `kind` (`JIT_ELEM_*`):
+/// returned in a machine register, or put in slot `d` (strings). A null is
+/// accepted when `nullable` is set, and reported in `ctx.detail` (1 = null).
+///
+/// # Safety
+/// See `rt`.
+unsafe fn deliver(ctx: *mut JitCtx, d: i64, kind: i64, v: Value, nullable: bool) -> i64 {
+    (*ctx).detail = 0;
+    match (kind, v) {
+        (_, Value::Null) if nullable => {
+            (*ctx).detail = 1;
+            if kind == JIT_ELEM_STR {
+                rt(ctx).top()[d as usize] = Value::Null;
+            }
+            0
+        }
+        (JIT_ELEM_INT, Value::Int(n)) => n,
+        (JIT_ELEM_INT, Value::Bool(b)) => b as i64,
+        (JIT_ELEM_FLOAT, Value::Float(f)) => f.to_bits() as i64,
+        (JIT_ELEM_STR, v @ Value::Str(_)) => {
+            rt(ctx).top()[d as usize] = v;
+            0
+        }
+        _ => {
+            wrong_value(ctx);
+            0
+        }
+    }
+}
+
+/// Whether the value in slot `r` is null.
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_is_null(ctx: *mut JitCtx, r: i64) -> i64 {
+    matches!(rt(ctx).top()[r as usize], Value::Null) as i64
+}
+
+/// The nullable scalar in slot `r` for a machine register (`JIT_ELEM_INT` or
+/// `JIT_ELEM_FLOAT`); `ctx.detail` is 1 when it is null.
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_unbox(ctx: *mut JitCtx, r: i64, kind: i64) -> i64 {
+    let v = rt(ctx).top()[r as usize].clone();
+    deliver(ctx, r, kind, v, true)
+}
+
+/// `Index` (or, with `or_null`, `IndexOrNull`) of the list or map in slot `c`
+/// at the key in slot `k`, into register `d` (see `deliver`).
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_get(ctx: *mut JitCtx, d: i64, c: i64, k: i64, kind: i64, or_null: i64) -> i64 {
+    let w = rt(ctx).top();
+    let found = match (&w[c as usize], &w[k as usize]) {
+        (Value::List(l), Value::Int(i)) => match usize::try_from(*i).ok().and_then(|x| l.get(x)) {
+            Some(v) => Ok(v.clone()),
+            None => Err(("IndexError", format!("list index {i} is out of range (length {})", l.len()))),
+        },
+        (Value::Map(m), key) => match m.get(&key.to_key()) {
+            Some(v) => Ok(v.clone()),
+            None => Err(("KeyError", format!("undefined map key {}", key_repr(key)))),
+        },
+        _ => {
+            wrong_value(ctx);
+            return 0;
+        }
+    };
+    match found {
+        Ok(v) => deliver(ctx, d, kind, v, false),
+        Err(_) if or_null != 0 => deliver(ctx, d, kind, Value::Null, true),
+        Err((class, msg)) => {
+            throw(ctx, class, msg);
+            0
+        }
+    }
+}
+
+/// `$m[$k] = $v` (or `$xs[$i] = $v`) with the key in slot `k` and the value in slot `val`.
+///
+/// # Safety
+/// See `rt` and `mem`.
+pub unsafe extern "C" fn phv_jit_set_key(ctx: *mut JitCtx, r: i64, k: i64, val: i64) {
+    let mem = mem(ctx);
+    let w = rt(ctx).top();
+    if !matches!(w[r as usize], Value::List(_) | Value::Map(_)) {
+        wrong_value(ctx);
+        return;
+    }
+    let v = w[val as usize].clone();
+    let key = [w[k as usize].clone()];
+    let cost = copy_cost(&w[r as usize], &key, false);
+    if cost > 0 {
+        if mem.reserve(cost).is_err() {
+            (*ctx).error = JIT_ERR_MEMORY;
+            return;
+        }
+        long_op(ctx, cost);
+    }
+    if let Err((class, msg)) = path_assign(&mut w[r as usize], &key, &[], false, v) {
+        throw(ctx, class, msg);
+    }
+}
+
+/// Entry `i` of the map in slot `m` (a `foreach` step): its key (`part` 0) or
+/// its value (1), into register `d` (see `deliver`).
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_entry(ctx: *mut JitCtx, d: i64, m: i64, i: i64, part: i64, kind: i64) -> i64 {
+    let w = rt(ctx).top();
+    let Value::Map(map) = &w[m as usize] else {
+        wrong_value(ctx);
+        return 0;
+    };
+    let Some((k, v)) = usize::try_from(i).ok().and_then(|x| map.get_index(x)) else {
+        wrong_value(ctx);
+        return 0;
+    };
+    let item = if part == 0 { k.to_value() } else { v.clone() };
+    deliver(ctx, d, kind, item, false)
+}
+
+/// `$m->has($k)` on the map in slot `m` with the key in slot `k`.
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_has(ctx: *mut JitCtx, m: i64, k: i64) -> i64 {
+    let w = rt(ctx).top();
+    match &w[m as usize] {
+        Value::Map(map) => map.contains_key(&w[k as usize].to_key()) as i64,
+        _ => {
+            wrong_value(ctx);
+            0
+        }
+    }
+}
+
+/// `NewMap`: `n` keys and values from slot `start` (moved out), as a map in slot `d`.
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_new_map(ctx: *mut JitCtx, d: i64, start: i64, n: i64) {
+    let w = rt(ctx).top();
+    let mut m = indexmap::IndexMap::with_capacity(n as usize);
+    for i in 0..n as usize {
+        let k = std::mem::take(&mut w[start as usize + 2 * i]);
+        let v = std::mem::take(&mut w[start as usize + 2 * i + 1]);
+        m.insert(k.to_key(), v);
+    }
+    w[d as usize] = Value::map(m);
 }

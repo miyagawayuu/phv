@@ -224,23 +224,34 @@ pub enum ValKind {
     Float,
     Str,
     Void,
-    /// `list<int>`, `list<float>`, `list<string>` and `list<bool>`.
-    ListInt,
-    ListFloat,
-    ListStr,
-    ListBool,
+    /// `list<T>` of a scalar.
+    List(Scalar),
+    /// `map<K, V>` with `int` or `string` keys and scalar values.
+    Map(Scalar, Scalar),
+    /// `?T` of a scalar.
+    Opt(Scalar),
+}
+
+/// The scalar types: the elements of lists and maps, and nullable values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Scalar {
+    Int,
+    Bool,
+    Float,
+    Str,
 }
 
 impl ValKind {
-    /// Kept in the register window as a `Value` (not in a machine register).
+    /// Passed and returned as a `Value` in the register window, not in a
+    /// machine register.
     pub fn boxed(self) -> bool {
-        matches!(self, ValKind::Str | ValKind::ListInt | ValKind::ListFloat | ValKind::ListStr | ValKind::ListBool)
+        matches!(self, ValKind::Str | ValKind::List(_) | ValKind::Map(..) | ValKind::Opt(_))
     }
 }
 
-/// Present when every local of a function is an `int`, `bool`, `float`,
-/// `string`, or a list of one of them, so the JIT may compile it to native
-/// code (it still checks every instruction, see `phv_jit`).
+/// Present when every local of a function is an `int`, `bool`, `float` or
+/// `string`, a nullable one, or a list or map of them, so the JIT may compile
+/// it to native code (it still checks every instruction, see `phv_jit`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NativeSig {
     pub params: Vec<ValKind>,
