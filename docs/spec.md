@@ -1892,6 +1892,11 @@ It then runs the type checker and shows the places that need manual work, such a
 3. Compilation to register-based bytecode (type-specialized instructions such as `AddI`, `LtI`, and `JumpIfNotLtIImm`)
 4. Execution
    - **Interpreter**: written entirely in safe Rust. Strings, lists, and maps use reference counting + copy-on-write.
+     Objects that reach each other in a cycle (`$node->next = $node`, or an object holding a closure that captured
+     it) are freed while the script runs: a cycle collector runs between instructions each time the number of live
+     objects has doubled since its last run (first at 4,096), and it looks at no more than 16 values per object made
+     since then. Objects that are still reachable from a variable, a list, a map, a closure or another live object are
+     never freed. When a run ends, the fields of every object left are cleared.
    - **JIT** (Cranelift): functions whose locals are all `int`, `bool`, `float` or `string` are compiled to native code
      when every instruction they use is supported (arithmetic, comparisons, conversions, string constants, `.`, `.=`,
      `(string)`, `strlen()` and `->len()`). Numbers stay in machine registers; strings live in a register window and

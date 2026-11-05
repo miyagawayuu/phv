@@ -2,13 +2,14 @@
 
 English | [日本語](releasing.ja.md)
 
-A release is published only after a security audit of everything it adds has been done and its findings fixed, and
-after the documentation describes the release as it is. Steps 1 and 2 are not skipped, also for small releases.
+A release is published only after a security audit of the whole implementation has been done and its findings fixed,
+and after the documentation describes the release as it is. Steps 1 and 2 are not skipped, also for small releases.
 
 ## 1. Security audit and vulnerability assessment
 
-Scope: every change since the last audited release (`git diff vX.Y.Z..main`), including CI workflows, the VS Code
-extension and the example sites.
+Scope: the whole implementation, not only the changes since the last audited release: every crate, CI workflows,
+the VS Code extension, the website and the example sites. Code fixed by an earlier audit is not an exception; each
+earlier fix is attacked again, including ways around it.
 
 - Review each area on its own (for example the network clients, the database drivers, the web server, templates,
   the editor, CI and publishing) and confirm every finding with a working attack (PoC) against a release build.

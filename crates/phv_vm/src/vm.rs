@@ -298,6 +298,13 @@ impl std::fmt::Debug for HttpSpec {
 const MAX_NATIVE_DEPTH: u32 = 200;
 
 pub(crate) const BUDGET: u32 = 10_000;
+
+/// The number of live objects at which the cycle collector first runs.
+const GC_FIRST: usize = 4096;
+
+/// The cycle collector looks at no more than this many values per object
+/// made since its last run (see `Vm::collect_cycles`).
+const GC_WORK: usize = 16;
 /// Called before each statement of a program compiled with statement markers
 /// (`phv dap`): it may look at the VM, wait for the debugger's commands, or
 /// stop the program by returning an error.
@@ -440,8 +447,15 @@ pub struct Vm {
     /// `phv test --coverage`: the statements that ran, as (file, source offset).
     pub coverage: Option<std::collections::HashSet<(u32, u32)>>,
     /// Objects created by this run. Reference counting cannot free cycles
-    /// (`$node->next = $node`), so their fields are cleared when the run ends.
+    /// (`$node->next = $node`): the cycle collector (`cycles.rs`) looks for
+    /// them while the script runs, and the fields of all objects still alive
+    /// are cleared when the run ends.
     objects: RefCell<Vec<std::rc::Weak<RefCell<Object>>>>,
+    /// The number of live objects at which the cycle collector runs next.
+    gc_next: std::cell::Cell<usize>,
+    /// Set when that number is reached; the collector runs at the next check
+    /// of the time limit, where no object is in use by an instruction.
+    gc_due: std::cell::Cell<bool>,
 }
 
 impl Drop for Vm {
@@ -639,6 +653,8 @@ impl Vm {
             argbuf: Vec::new(),
             enum_cache: std::collections::HashMap::new(),
             objects: RefCell::new(Vec::new()),
+            gc_next: std::cell::Cell::new(GC_FIRST),
+            gc_due: std::cell::Cell::new(false),
             coverage: None,
             profile: None,
             debug: None,
@@ -733,8 +749,29 @@ impl Vm {
         if objects.len() == objects.capacity() && objects.len() >= 1024 {
             // Forget objects that are already gone before the list grows.
             objects.retain(|w| w.strong_count() > 0);
+            if objects.len() >= self.gc_next.get() {
+                self.gc_due.set(true);
+            }
+            // The next check comes after as many new objects as are alive now.
+            let keep = (objects.len() * 2).max(1024);
+            objects.shrink_to(keep);
         }
         objects.push(Rc::downgrade(o));
+    }
+
+    /// Frees the objects that are reachable only through reference cycles
+    /// and returns how many there were. Runs on its own when the number of
+    /// live objects has doubled since the last time, or later when the last
+    /// walk was long (a large list held by a live object is walked each
+    /// time): at most `GC_WORK` values are looked at per object made.
+    pub fn collect_cycles(&mut self) -> usize {
+        self.gc_due.set(false);
+        let done = crate::cycles::collect(self.objects.get_mut());
+        let objects = self.objects.get_mut();
+        let live = objects.len();
+        objects.shrink_to((live * 2).max(1024));
+        self.gc_next.set((live.saturating_mul(2)).max(live + done.visited / GC_WORK).max(GC_FIRST));
+        done.freed
     }
 
     /// Creates an instance of a built-in exception class such as `ValueError`.
@@ -1110,6 +1147,9 @@ impl Vm {
         if let Some(p) = &mut self.profile {
             self.budget = PROFILE_BUDGET;
             p.sample(self.frames.iter().map(|f| f.func));
+        }
+        if self.gc_due.get() {
+            self.collect_cycles();
         }
         self.check_memory()?;
         {
@@ -1633,6 +1673,10 @@ impl Vm {
                             prog.classes[*class as usize].fields.iter().map(|f| const_value(&f.default)).collect();
                         let o = Rc::new(RefCell::new(Object { class: *class, fields }));
                         self.track(&o);
+                        if self.gc_due.get() {
+                            // Collect at the next loop step or call.
+                            self.budget = 1;
+                        }
                         reg!(*d) = Value::Object(o);
                     }
                     Instr::GetProp(d, o, slot) => {
