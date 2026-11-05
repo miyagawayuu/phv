@@ -159,6 +159,14 @@ main.wide { max-width: 1240px; }
   .toc { position: static; max-height: none; border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
 }
 
+/* Narrow screens: the links go on their own rows under the logo; the header
+   grows to hold them and scrolls away with the page. */
+@media (max-width: 760px) {
+  .site-header { position: static; }
+  .site-header .inner { height: auto; flex-wrap: wrap; row-gap: 8px; padding-top: 12px; padding-bottom: 12px; }
+  nav { width: 100%; row-gap: 6px; }
+}
+
 @media (max-width: 600px) {
   .features { grid-template-columns: 1fr; }
   nav { gap: 12px; font-size: 0.88rem; }
