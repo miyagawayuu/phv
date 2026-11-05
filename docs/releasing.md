@@ -27,7 +27,8 @@ If a finding cannot be fixed before the release, the release waits.
 Each change updates its documentation in the same commit. Before a release, check that these describe it, in both
 English and Japanese:
 
-- [spec.md](spec.md) / [spec.ja.md](spec.ja.md): every new or changed feature, limit and error, and the roadmap (§18).
+- [spec.md](spec.md) / [spec.ja.md](spec.ja.md): every new or changed feature, limit and error, the compatibility rules (§18) and the roadmap (§19). A change
+  that breaks what §18 keeps needs a major release, or must be one of its exceptions.
 - [README.md](../README.md) / [README.ja.md](../README.ja.md): features, the crate table, tests, the number of audits.
 - [SECURITY.md](../SECURITY.md): the supported versions table (the latest minor version).
 - [editors/vscode/README.md](../editors/vscode/README.md): editor features and the `.vsix` file names.

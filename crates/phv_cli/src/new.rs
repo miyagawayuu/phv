@@ -5,9 +5,16 @@ use std::path::{Path, PathBuf};
 
 const GITIGNORE: &str = ".phv-cache/\ndata/\nvendor/\n";
 
+/// `[project] phv` of a new project: this version and the later ones of the
+/// same major version (`^1.2` for PHV 1.2.x).
+fn requirement() -> String {
+    let mut parts = env!("CARGO_PKG_VERSION").split('.');
+    format!("^{}.{}", parts.next().unwrap_or("1"), parts.next().unwrap_or("0"))
+}
+
 fn script_files(name: &str) -> Vec<(&'static str, String)> {
     vec![
-        ("phv.toml", format!("[project]\nname = \"{name}\"\n")),
+        ("phv.toml", format!("[project]\nname = \"{name}\"\nphv = \"{}\"\n", requirement())),
         (
             "main.phv",
             "<?phv\nimport lib.greet.greet;\n\n// phv run main.phv Ann\necho greet(argv()->first() ?? \"world\"), \"\\n\";\n"
@@ -32,7 +39,8 @@ fn site_files(name: &str) -> Vec<(&'static str, String)> {
         (
             "phv.toml",
             format!(
-                "[project]\nname = \"{name}\"\n\n[security]\ncsrf = true\nsecure_cookies = false  # true once the site is served over HTTPS\n\n[permissions]\n# Scripts can only touch the files and variables listed here.\nwrite = [\"data/\"]\n"
+                "[project]\nname = \"{name}\"\nphv = \"{req}\"\n\n[security]\ncsrf = true\nsecure_cookies = false  # true once the site is served over HTTPS\n\n[permissions]\n# Scripts can only touch the files and variables listed here.\nwrite = [\"data/\"]\n",
+                req = requirement()
             ),
         ),
         (

@@ -264,6 +264,8 @@ fn http_spec(name: &str, h: HttpSection) -> Result<HttpSpec, String> {
 #[serde(deny_unknown_fields)]
 struct Project {
     name: Option<String>,
+    /// The versions of PHV the project works with, e.g. `"^1.2"`.
+    phv: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -684,6 +686,18 @@ fn check_dir(kind: &str, d: &str) -> Result<(), String> {
     }
 }
 
+/// `[project] phv`: the project needs a version of PHV that `req` (a semver
+/// requirement such as `"^1.2"`) accepts.
+fn check_phv_version(req: &str, running: &str) -> Result<(), String> {
+    let r = semver::VersionReq::parse(req)
+        .map_err(|e| format!("[project].phv: \"{req}\" is not a version requirement such as \"^1.0\" ({e})"))?;
+    let v = semver::Version::parse(running).map_err(|e| e.to_string())?;
+    if !r.matches(&v) {
+        return Err(format!("this project needs PHV {req} ([project].phv in phv.toml); this is PHV {v}"));
+    }
+    Ok(())
+}
+
 /// The lowercase names of a project-relative directory, for comparing paths.
 fn dir_names(d: &str) -> Vec<String> {
     Path::new(d)
@@ -714,6 +728,9 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
 /// The configuration in `text` (a phv.toml) for the project at `root`.
 pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
     let file: File = toml::from_str(text).map_err(|e| format!("phv.toml: {e}"))?;
+    if let Some(req) = &file.project.phv {
+        check_phv_version(req, env!("CARGO_PKG_VERSION"))?;
+    }
     for d in &file.permissions.read {
         check_dir("read", d)?;
     }
@@ -930,6 +947,20 @@ mod tests {
         let r = load_config(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         r
+    }
+
+    #[test]
+    fn the_project_may_require_a_phv_version() {
+        assert!(check_phv_version("^1.2", "1.4.0").is_ok());
+        assert!(check_phv_version(">=1.0, <2", "1.0.0").is_ok());
+        let e = check_phv_version("^1.2", "1.1.3").unwrap_err();
+        assert_eq!(e, "this project needs PHV ^1.2 ([project].phv in phv.toml); this is PHV 1.1.3");
+        assert!(check_phv_version("^1.2", "2.0.0").is_err());
+        assert!(check_phv_version("one", "1.0.0").unwrap_err().contains("is not a version requirement"));
+        // The running version always accepts its own major and minor.
+        let me = env!("CARGO_PKG_VERSION");
+        let v = semver::Version::parse(me).unwrap();
+        assert!(load(&format!("[project]\nphv = \"^{}.{}\"\n", v.major, v.minor)).is_ok());
     }
 
     #[test]

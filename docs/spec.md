@@ -1564,6 +1564,7 @@ env = ["APP_*"]             # environment variables readable with getenv (a trai
 ```toml
 [project]
 name = "blog"
+phv = "^1.0"            # the versions of PHV the project works with (§18)
 
 [security]
 csrf = true             # default: true
@@ -2045,7 +2046,68 @@ It then runs the type checker and shows the places that need manual work, such a
 (`phv_jit`, for calling generated code, and the helpers it calls in `phv_vm/src/jit.rs`), in calls to OS file APIs (`phv_std/src/safefs.rs`) and in the SQLite VFS
 that checks journal files (`phv_std/src/db/vfs.rs`).
 
-## 18. Roadmap
+## 18. Compatibility and versions
+
+From 1.0.0, PHV follows [semantic versioning](https://semver.org): versions are MAJOR.MINOR.PATCH.
+
+- A **patch** release (1.0.1) fixes bugs and security problems.
+- A **minor** release (1.1.0) adds features. A program that worked with an earlier 1.x release keeps working, with
+  the same results.
+- Only a **major** release (2.0.0) removes or changes what is listed below, and only after it was deprecated in a
+  minor release (see "Deprecation").
+
+**Kept within a major version:**
+
+- The language: its syntax, its type rules and what programs do. A program that compiles keeps compiling and gives
+  the same results.
+- The standard library: builtin functions, the methods of strings, lists, maps and sets, and the `std.*` modules,
+  with their names, parameters, results and exceptions. New global builtin functions come only in major releases,
+  because one could clash with a function of the same name in a project; minor releases add methods of the
+  built-in types, functions and classes in `std.*` modules, and new modules, which a project uses only once it
+  imports them.
+- `phv.toml`: its sections and keys and what they mean.
+- The tools: the commands of `phv`, their options and their exit codes, and the layout of a project and a site
+  (`public/`, `_middleware.phv`, `_404.phv`, `_500.phv`, `*.ws.phv`, `[param]` routes, templates, `tests/`).
+- What pages can rely on in the web server: `request()`, `response()`, `session()`, CSRF tokens, escaping, WebSocket
+  events.
+
+**May change in any release:**
+
+- The text of error messages and warnings, their positions, and new warnings (a warning never stops a program).
+- Speed, memory use and what the JIT compiles (results stay the same).
+- The bytecode cache (`.phv-cache/`) and the executables made by `phv build`: a new version rebuilds them.
+- How `phv fmt` formats code, the output of `phv doc`, `dump()` and `phv run --profile`, and the features of
+  `phv lsp` and `phv dap`.
+- Builtins whose names start with `__`, and the Rust crates of the implementation.
+
+**Exceptions:** a minor or patch release may refuse code or input that was accepted before, when accepting it is a
+vulnerability or the type checker missed an error (a program that could fail in a way its types say it cannot) — for
+example a template check that finds a new way to inject script, a tighter default limit, or a header the server
+adds. The release notes say what changed and how to update the code.
+
+### Deprecation
+
+What is to be removed in the next major version is deprecated at least one minor release before: functions,
+methods, classes and properties of the standard library get `#[Deprecated("...")]`, which gives a warning where
+they are used (§9), and everything else is marked in this specification and the release notes. It keeps working
+until the next major version.
+
+### The PHV version of a project
+
+```toml
+[project]
+phv = "^1.2"   # PHV 1.2.0 or any later 1.x
+```
+
+`[project] phv` gives the versions of PHV a project works with, as a semver requirement. Any other version refuses
+to run, check, test or serve the project, and says which version it needs. `phv new` writes the requirement for the
+version it is (`^1.2` for PHV 1.2.x).
+
+### Supported versions
+
+Security fixes are released for the latest minor version of the current major version ([SECURITY.md](../SECURITY.md)).
+
+## 19. Roadmap
 
 Planned, in this order. Each release is audited before it is published, as before.
 
@@ -2063,9 +2125,11 @@ Planned, in this order. Each release is audited before it is published, as befor
   reports and coverage, `phv doc` and a reference of the standard library, a debugger (`phv dap`), `phv run
   --profile`, a tutorial, and builds for Linux on ARM, static Linux builds and a Docker image
   (`ghcr.io/miyagawayuu/phv`), Homebrew and Scoop from this release on (done).
-- **1.0, speed and stability**: freeing reference cycles while a script runs (done), a JIT that covers more code
-  (lists, maps and nullable values: done),
-  HTTP/2 and TLS (done), a WebSocket server (done), a `Set` type (done), and a stable language specification.
+- **1.0, speed and stability** (done): freeing reference cycles while a script runs, a JIT that covers lists, maps
+  and nullable values, HTTPS and HTTP/2, a WebSocket server, a `Set` type, and the compatibility rules of §18.
+- **After 1.0**, in minor releases: the JIT for closures and objects, `publish()` across server processes, and more
+  of the standard library. Generators (`yield`) and traits are being considered; they would come in a minor
+  release too, since they only add to the language.
 
 Some features are left out on purpose, because they work against the design principles (§1): `eval`, variable
 variables, static properties and global variables, references (`&$x`), truthiness, `===`, `@`, `goto`, magic

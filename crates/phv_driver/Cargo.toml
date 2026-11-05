@@ -13,6 +13,7 @@ httparse.workspace = true
 serde_json.workspace = true
 
 [dependencies]
+semver.workspace = true
 phv_syntax.workspace = true
 phv_types.workspace = true
 phv_compiler.workspace = true

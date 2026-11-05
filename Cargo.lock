@@ -1597,6 +1597,7 @@ dependencies = [
  "phv_types",
  "phv_vm",
  "postcard",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
