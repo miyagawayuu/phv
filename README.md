@@ -206,10 +206,14 @@ published.
 | Building 1 million strings from numbers | 633 ms | 677 ms | 342 ms |
 | map / filter / sum over 1 million elements | 179 ms | 179 ms | 87 ms |
 | 200,000 map updates | 45 ms | 72 ms | 34 ms |
+| Sieve of Eratosthenes up to 1 million (`list<bool>`) | 96 ms | 191 ms | 103 ms |
+| Building and summing a list of 1 million floats | 73 ms | 70 ms | 76 ms |
 
-The JIT compiles functions whose values are all `int`, `bool`, `float` or `string`. Code that relies on closures,
-lists or maps runs in the interpreter and, as the table shows, can be slower than CPython; so is turning many
-numbers into strings, where formatting dominates (to be improved). Set `PHV_JIT=0` to turn the JIT off.
+The JIT compiles functions whose values are all `int`, `bool`, `float` or `string`, or lists of one of them. Lists
+are handled by the interpreter's own code, so the gain is in the loops around them (the last row is mostly
+allocating and freeing the list). Code that relies on closures or maps runs in the interpreter and, as the table
+shows, can be slower than CPython; so is turning many numbers into strings, where formatting dominates (to be
+improved). Set `PHV_JIT=0` to turn the JIT off.
 
 ## License
 

@@ -64,6 +64,29 @@ def count_keys(n):
     return len(counts)
 
 
+def sieve(n):
+    prime = []
+    for _ in range(n + 1):
+        prime.append(True)
+    count = 0
+    for i in range(2, n + 1):
+        if prime[i]:
+            count += 1
+            for j in range(i * i, n + 1, i):
+                prime[j] = False
+    return count
+
+
+def list_sum(n):
+    xs = []
+    for i in range(n):
+        xs.append(i * 0.5)
+    t = 0.0
+    for x in xs:
+        t += x
+    return t
+
+
 def ms(start):
     return f"{(time.perf_counter() - start) * 1000:,.1f} ms"
 
@@ -95,3 +118,11 @@ print(f"map/filter 1M ({r}): {ms(t)}")
 t = time.perf_counter()
 r = count_keys(200_000)
 print(f"map updates 200k ({r} keys): {ms(t)}")
+
+t = time.perf_counter()
+r = sieve(1_000_000)
+print(f"sieve 1M ({r} primes): {ms(t)}")
+
+t = time.perf_counter()
+r = list_sum(1_000_000)
+print(f"list of 1M floats ({r}): {ms(t)}")

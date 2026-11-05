@@ -224,11 +224,23 @@ pub enum ValKind {
     Float,
     Str,
     Void,
+    /// `list<int>`, `list<float>`, `list<string>` and `list<bool>`.
+    ListInt,
+    ListFloat,
+    ListStr,
+    ListBool,
 }
 
-/// Present when every local of a function is an `int`, `bool`, `float` or
-/// `string`, so the JIT may compile it to native code (it still checks every
-/// instruction, see `phv_jit`).
+impl ValKind {
+    /// Kept in the register window as a `Value` (not in a machine register).
+    pub fn boxed(self) -> bool {
+        matches!(self, ValKind::Str | ValKind::ListInt | ValKind::ListFloat | ValKind::ListStr | ValKind::ListBool)
+    }
+}
+
+/// Present when every local of a function is an `int`, `bool`, `float`,
+/// `string`, or a list of one of them, so the JIT may compile it to native
+/// code (it still checks every instruction, see `phv_jit`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NativeSig {
     pub params: Vec<ValKind>,

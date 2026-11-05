@@ -907,17 +907,12 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         "number_format" => |_, a| Ok(Value::str(number_format(float(&a[0]), int(&a[1]).clamp(0, 20) as usize))),
         "range" => |vm, a| {
             let (from, to) = (int(&a[0]), int(&a[1]));
-            let count = (to as i128 - from as i128).abs() + 1;
-            if count > 10_000_000 {
+            let count = phv_vm::value::range_len(from, to);
+            if count > phv_vm::value::MAX_RANGE {
                 return Err(vm.throw("ValueError", "range is too large (more than 10,000,000 items)"));
             }
             vm.reserve(count as usize * std::mem::size_of::<Value>())?;
-            let items: Vec<Value> = if from <= to {
-                (from..=to).map(Value::Int).collect()
-            } else {
-                (to..=from).rev().map(Value::Int).collect()
-            };
-            Ok(Value::list(items))
+            Ok(Value::list(phv_vm::value::range_items(from, to)))
         },
         "time" => |_, _| {
             let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();

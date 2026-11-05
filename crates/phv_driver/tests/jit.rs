@@ -185,3 +185,137 @@ fn deep_recursion_of_large_frames_does_not_overflow() {
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("phv-jit-test-{}-deep", std::process::id())));
     assert_eq!(out, ("ok".to_string(), None));
 }
+
+/// Functions on lists of ints, floats, strings and bools are compiled, and
+/// give what the interpreter gives: values, copies, errors and limits.
+#[test]
+fn lists_are_compiled_natively() {
+    let src = r#"<?phv
+function sieve(int $n): int {
+    list<bool> $prime = [];
+    for ($i = 0; $i <= $n; $i++) {
+        $prime[] = true;
+    }
+    $count = 0;
+    for ($i = 2; $i <= $n; $i++) {
+        if ($prime[$i]) {
+            $count++;
+            for ($j = $i * $i; $j <= $n; $j += $i) {
+                $prime[$j] = false;
+            }
+        }
+    }
+    return $count;
+}
+
+function bubble(list<int> $xs): list<int> {
+    $n = count($xs);
+    for ($i = 0; $i < $n; $i++) {
+        for ($j = 0; $j < $n - 1 - $i; $j++) {
+            if ($xs[$j] > $xs[$j + 1]) {
+                $t = $xs[$j];
+                $xs[$j] = $xs[$j + 1];
+                $xs[$j + 1] = $t;
+            }
+        }
+    }
+    return $xs;
+}
+
+function total(list<float> $xs): float {
+    $t = 0.0;
+    foreach ($xs as $x) {
+        $t += $x;
+    }
+    return $t;
+}
+
+function words(list<string> $ws): string {
+    $out = "";
+    foreach ($ws as $i => $w) {
+        $out .= $i . "=" . $w . " ";
+    }
+    return $out . count($ws);
+}
+
+function squares(int $n): list<int> {
+    list<int> $out = [];
+    foreach (range(1, $n) as $x) {
+        $out[] = $x ** 2;
+    }
+    return $out;
+}
+
+function at(list<int> $xs, int $i): int {
+    return $xs[$i];
+}
+
+function pow_of(int $a, int $b): int {
+    return $a ** $b;
+}
+
+$orig = [5, 3, 9, 1, 7];
+$sorted = bubble($orig);
+echo sieve(1000), " ", $sorted->join(","), " ", $orig->join(","), "\n";
+echo total([1.5, 2.25, 3.0]), " ", words(["a", "b", "c"]), "\n";
+echo squares(5)->join(","), " ", count(squares(0)), " ", pow_of(3, 4), "\n";
+try {
+    echo at([1, 2, 3], 5);
+} catch (IndexError $e) {
+    echo "IndexError: ", $e->getMessage(), "\n";
+}
+try {
+    echo pow_of(2, -1);
+} catch (ArithmeticError $e) {
+    echo $e->getMessage(), "\n";
+}
+try {
+    echo pow_of(10, 30);
+} catch (ArithmeticError $e) {
+    echo $e->getMessage(), "\n";
+}
+"#;
+    let out =
+        run_both("lists", src, Limits::default(), &["sieve", "bubble", "total", "words", "squares", "at", "pow_of"]);
+    assert_eq!(
+        out,
+        "168 1,3,5,7,9 5,3,9,1,7\n6.75 0=a 1=b 2=c 3\n1,4,9,16,25 2 81\n\
+         IndexError: list index 5 is out of range (length 3)\n\
+         negative exponent in int ** int; use a float base, e.g. 2.0 ** -1\ninteger overflow\n"
+    );
+}
+
+/// A list built in a native loop stops at the memory limit, and a long one
+/// at the time limit, as in the interpreter.
+#[test]
+fn native_list_loops_stop_at_the_limits() {
+    let src = r#"<?phv
+function grow(int $n): int {
+    list<int> $xs = [];
+    for ($i = 0; $i < $n; $i++) {
+        $xs[] = $i;
+    }
+    return count($xs);
+}
+echo grow(100000000);
+"#;
+    let limits = Limits { max_memory: Some(16 << 20), ..Limits::default() };
+    let out = run_both("list_memory", src, limits, &["grow"]);
+    assert!(out.contains("allowed memory size of 16 MB exhausted"), "{out}");
+
+    let src = r#"<?phv
+function spin(list<int> $xs): int {
+    $t = 0;
+    while (true) {
+        foreach ($xs as $x) {
+            $t = ($t + $x) % 1000;
+        }
+    }
+    return $t;
+}
+echo spin(range(1, 1000));
+"#;
+    let limits = Limits { max_time: Some(Duration::from_millis(500)), ..Limits::default() };
+    let out = run_both("list_time", src, limits, &["spin"]);
+    assert!(out.contains("maximum execution time"), "{out}");
+}

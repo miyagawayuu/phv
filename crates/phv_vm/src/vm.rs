@@ -1036,6 +1036,7 @@ impl Vm {
                 (ValKind::Bool, Value::Bool(b)) => *b as i64,
                 (ValKind::Float, Value::Float(f)) => f.to_bits() as i64,
                 (ValKind::Str, Value::Str(_)) => 0,
+                (ValKind::ListInt | ValKind::ListFloat | ValKind::ListStr | ValKind::ListBool, Value::List(_)) => 0,
                 (_, v) => bad("an argument of the native signature", v),
             };
         }
@@ -1043,8 +1044,8 @@ impl Vm {
         let mut rt = std::mem::take(&mut self.jit_rt);
         rt.prog.get_or_insert_with(|| Arc::clone(&self.prog));
         rt.consts = std::mem::take(&mut self.consts);
-        // Strings are moved into the native call's window: kept for a rerun.
-        let strings = sig.params.contains(&ValKind::Str).then(|| args.clone());
+        // Strings and lists are moved into the native call's window: kept for a rerun.
+        let strings = sig.params.iter().any(|p| p.boxed()).then(|| args.clone());
         rt.start(args);
         // Native code nested in this call (through the interpreter) shares the
         // outermost call's stack limit.
@@ -1099,6 +1100,10 @@ impl Vm {
                 return Err(self.throw("ValueError", format!("cannot convert {} to int", format_float(f))));
             }
             JIT_ERR_DEPTH => return Err(VmError::Fatal("maximum call stack depth exceeded".into())),
+            JIT_ERR_THROW => {
+                let (class, msg) = self.jit_rt.take_pending();
+                return Err(self.throw(class, msg));
+            }
             JIT_ERR_MEMORY => return Err(memory_error(self.limits.max_memory.unwrap_or(4 << 30))),
             _ => {
                 let secs = self.limits.max_time.map(|t| t.as_secs_f64()).unwrap_or(0.0);
@@ -1109,7 +1114,7 @@ impl Vm {
             ValKind::Int => Value::Int(r),
             ValKind::Bool => Value::Bool(r != 0),
             ValKind::Float => Value::Float(f64::from_bits(r as u64)),
-            ValKind::Str => ret,
+            ValKind::Str | ValKind::ListInt | ValKind::ListFloat | ValKind::ListStr | ValKind::ListBool => ret,
             ValKind::Void => Value::Null,
         }))
     }
@@ -1984,7 +1989,7 @@ fn inert_js(v: &Value) -> bool {
 
 /// Bytes a path assignment may allocate: each shared list or map on the way is
 /// copied (copy on write), and a list or map that is full grows.
-fn copy_cost(target: &Value, keys: &[Value], push: bool) -> usize {
+pub(crate) fn copy_cost(target: &Value, keys: &[Value], push: bool) -> usize {
     let val = std::mem::size_of::<Value>();
     let entry = val * 2 + 16;
     let n = if push { keys.len() } else { keys.len().saturating_sub(1) };
@@ -2037,7 +2042,7 @@ fn copy_cost(target: &Value, keys: &[Value], push: bool) -> usize {
     cost
 }
 
-fn path_assign(
+pub(crate) fn path_assign(
     target: &mut Value,
     keys: &[Value],
     create: &[Option<Const>],

@@ -1,11 +1,11 @@
 //! A Cranelift JIT for functions that compute with `int`, `bool`, `float`
-//! and `string` (the compiler marks them with a `NativeSig`). Everything else
-//! stays in the interpreter.
+//! and `string`, and lists of them (the compiler marks them with a
+//! `NativeSig`). Everything else stays in the interpreter.
 //!
 //! Numbers and booleans live in machine registers. A function that uses
-//! strings also gets a window of `Value` slots owned by the VM, and every
-//! string operation calls a Rust helper in `phv_vm::jit` that runs the
-//! interpreter's own code on that window.
+//! strings or lists also gets a window of `Value` slots owned by the VM, and
+//! every string or list operation calls a Rust helper in `phv_vm::jit` that
+//! runs the interpreter's own code on that window.
 //!
 //! Native code keeps the interpreter's guarantees: integer overflow, division
 //! and modulo by zero, negative shifts and out-of-range float to int
@@ -21,7 +21,7 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
-use phv_vm::bytecode::{Const, Function, Instr, NativeSig, Program, Reg, ValKind};
+use phv_vm::bytecode::{Const, Function, Instr, NativeSig, PathBase, Program, Reg, ValKind, NO_REG};
 use phv_vm::jit::*;
 use phv_vm::{JitEntry, JitTable};
 use std::collections::{HashMap, HashSet};
@@ -61,8 +61,44 @@ enum K {
     Bool,
     Float,
     Str,
+    /// A list of elements of one kind (in the window).
+    List(E),
     /// Different kinds on different paths: must not be read.
     Mixed,
+}
+
+/// The elements of a list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum E {
+    Int,
+    Bool,
+    Float,
+    Str,
+    /// An empty list (`[]`), which is a list of any kind.
+    Empty,
+}
+
+impl E {
+    fn of(k: K) -> Option<E> {
+        Some(match k {
+            K::Int => E::Int,
+            K::Bool => E::Bool,
+            K::Float => E::Float,
+            K::Str => E::Str,
+            _ => return None,
+        })
+    }
+
+    /// The kind of an element read from the list.
+    fn scalar(self) -> Option<K> {
+        Some(match self {
+            E::Int => K::Int,
+            E::Bool => K::Bool,
+            E::Float => K::Float,
+            E::Str => K::Str,
+            E::Empty => return None,
+        })
+    }
 }
 
 impl K {
@@ -72,8 +108,40 @@ impl K {
             ValKind::Bool => Some(K::Bool),
             ValKind::Float => Some(K::Float),
             ValKind::Str => Some(K::Str),
+            ValKind::ListInt => Some(K::List(E::Int)),
+            ValKind::ListBool => Some(K::List(E::Bool)),
+            ValKind::ListFloat => Some(K::List(E::Float)),
+            ValKind::ListStr => Some(K::List(E::Str)),
             ValKind::Void => None,
         }
+    }
+
+    /// Kept in the register window, not in a machine register.
+    fn boxed(self) -> bool {
+        matches!(self, K::Str | K::List(_))
+    }
+
+    /// The kind at a point two paths reach with `self` and `other`: an empty
+    /// list is a list of any kind; other differences cannot be read.
+    fn join(self, other: K) -> K {
+        match (self, other) {
+            _ if self == other => self,
+            (K::List(E::Empty), K::List(e)) | (K::List(e), K::List(E::Empty)) => K::List(e),
+            _ => K::Mixed,
+        }
+    }
+}
+
+/// Whether a value of kind `have` may be used where `want` is needed.
+fn fits(have: K, want: K) -> bool {
+    have == want || (have == K::List(E::Empty) && matches!(want, K::List(_)))
+}
+
+/// The element kind of list register `x`.
+fn need_list(st: &[K], x: Reg) -> Option<E> {
+    match kind(st, x)? {
+        K::List(e) => Some(e),
+        _ => None,
     }
 }
 
@@ -104,7 +172,7 @@ enum Flow {
 struct Checked {
     /// Register kinds before each instruction; None where it is unreachable.
     kinds: Vec<Option<Vec<K>>>,
-    /// Whether it uses strings, and so needs a register window.
+    /// Whether it uses strings or lists, and so needs a register window.
     strings: bool,
 }
 
@@ -137,13 +205,16 @@ fn well_formed(prog: &Program, f: &Function, ok: &HashSet<u32>) -> Option<Checke
     for (i, p) in sig.params.iter().enumerate() {
         entry[i] = K::of(*p)?;
     }
-    let mut strings = sig.params.contains(&ValKind::Str) || sig.ret == ValKind::Str;
+    let mut strings = sig.params.iter().any(|p| p.boxed()) || sig.ret.boxed();
     let mut kinds: Vec<Option<Vec<K>>> = vec![None; n];
     kinds[0] = Some(entry);
     let mut work = vec![0usize];
     while let Some(i) = work.pop() {
         let mut st = kinds[i].clone().unwrap();
-        let flow = step(prog, sig, ok, &f.code[i], &mut st, &mut strings)?;
+        // An instruction may fail with the kinds known so far and pass once
+        // they are complete (a list that starts as `[]` gets its element kind
+        // later in a loop): every instruction is checked again at the end.
+        let Some(flow) = step(prog, sig, ok, &f.code[i], &mut st, &mut strings) else { continue };
         let targets = match flow {
             Flow::Next => [Some(i + 1), None],
             Flow::Jump(t) => [Some(t as usize), None],
@@ -166,8 +237,9 @@ fn well_formed(prog: &Program, f: &Function, ok: &HashSet<u32>) -> Option<Checke
                 Some(old) => {
                     let mut changed = false;
                     for (o, k) in old.iter_mut().zip(&st) {
-                        if *o != *k && *o != K::Mixed {
-                            *o = K::Mixed;
+                        let j = o.join(*k);
+                        if j != *o {
+                            *o = j;
                             changed = true;
                         }
                     }
@@ -176,6 +248,11 @@ fn well_formed(prog: &Program, f: &Function, ok: &HashSet<u32>) -> Option<Checke
                     }
                 }
             }
+        }
+    }
+    for (i, st) in kinds.iter().enumerate() {
+        if let Some(st) = st {
+            step(prog, sig, ok, &f.code[i], &mut st.clone(), &mut strings)?;
         }
     }
     Some(Checked { kinds, strings })
@@ -201,6 +278,7 @@ fn step(
                 phv_vm::bytecode::Const::Bool(_) => K::Bool,
                 phv_vm::bytecode::Const::Float(_) => K::Float,
                 phv_vm::bytecode::Const::Str(_) => K::Str,
+                phv_vm::bytecode::Const::EmptyList => K::List(E::Empty),
                 _ => return None,
             };
             set(st, d, k)?;
@@ -237,10 +315,10 @@ fn step(
             set(st, d, K::Bool)?;
         }
         Eq(d, a, b) | Ne(d, a, b) | Lt(d, a, b) | Le(d, a, b) | Cmp(d, a, b) => {
-            // Floats use the float forms (`EqF`, ...).
+            // Floats use the float forms (`EqF`, ...); lists are not compared natively.
             let k = kind(st, a)?;
             need(st, b, k)?;
-            if k == K::Float {
+            if !matches!(k, K::Int | K::Bool | K::Str) {
                 return None;
             }
             set(st, d, if matches!(ins, Cmp(..)) { K::Int } else { K::Bool })?;
@@ -286,13 +364,28 @@ fn step(
             kind(st, s)?;
         }
         CallBuiltin { dst, id, args, argc } => {
-            if !matches!(prog.builtin_names.get(id as usize)?.as_str(), "strlen" | "str_len") || argc != 1 {
-                return None;
-            }
-            need(st, args, K::Str)?;
+            let ret = match (prog.builtin_names.get(id as usize)?.as_str(), argc) {
+                ("strlen" | "str_len", 1) => {
+                    need(st, args, K::Str)?;
+                    K::Int
+                }
+                // `count($xs)` and `$xs->len()`
+                ("list_len", 1) => {
+                    need_list(st, args)?;
+                    K::Int
+                }
+                ("range", 2) => {
+                    need(st, args, K::Int)?;
+                    need(st, args.checked_add(1)?, K::Int)?;
+                    K::List(E::Int)
+                }
+                _ => return None,
+            };
             // The interpreter moves arguments out of their registers.
-            set(st, args, K::Undef)?;
-            set(st, dst, K::Int)?;
+            for i in 0..argc {
+                set(st, args + i, K::Undef)?;
+            }
+            set(st, dst, ret)?;
         }
         Jump(t) => return Some(Flow::Jump(t)),
         JumpIfFalse(r, t) | JumpIfTrue(r, t) => {
@@ -317,7 +410,7 @@ fn step(
                 return None;
             }
             for (k, p) in callee.params.iter().enumerate() {
-                need(st, args.checked_add(k as u16)?, K::of(*p)?)?;
+                fits(kind(st, args.checked_add(k as u16)?)?, K::of(*p)?).then_some(())?;
             }
             for k in 0..argc {
                 set(st, args + k, K::Undef)?;
@@ -326,7 +419,7 @@ fn step(
                 ValKind::Void => K::Undef,
                 v => K::of(v)?,
             };
-            if ret == K::Str {
+            if ret.boxed() {
                 *strings = true;
             }
             set(st, dst, ret)?;
@@ -334,16 +427,79 @@ fn step(
         Ret(r) => {
             match K::of(sig.ret) {
                 None => kind(st, r).map(|_| ())?,
-                Some(k) => need(st, r, k)?,
+                Some(k) => fits(kind(st, r)?, k).then_some(())?,
             }
             return Some(Flow::Stop);
         }
-        // A string function must return a string on every path.
-        RetNull if sig.ret == ValKind::Str => return None,
+        // A string or list function must return one on every path.
+        RetNull if sig.ret.boxed() => return None,
         RetNull => return Some(Flow::Stop),
+        PowI(d, a, b) => {
+            need(st, a, K::Int)?;
+            need(st, b, K::Int)?;
+            set(st, d, K::Int)?;
+        }
+        NewList(d, start, n) => {
+            let e = if n == 0 {
+                E::Empty
+            } else {
+                let k = kind(st, start)?;
+                for i in 0..n {
+                    need(st, start.checked_add(i)?, k)?;
+                }
+                // The items are moved into the list.
+                for i in 0..n {
+                    set(st, start + i, K::Undef)?;
+                }
+                E::of(k)?
+            };
+            set(st, d, K::List(e))?;
+        }
+        Index(d, l, i) => {
+            let k = need_list(st, l)?.scalar()?;
+            need(st, i, K::Int)?;
+            set(st, d, k)?;
+        }
+        SetPath(ref path) => {
+            let PathBase::Local(r) = path.base else { return None };
+            let e = need_list(st, r)?;
+            let v = E::of(kind(st, path.val)?)?;
+            if e != E::Empty && e != v {
+                return None;
+            }
+            match (path.push, path.keys.as_slice()) {
+                (true, []) => {}
+                (false, [k]) => need(st, *k, K::Int)?,
+                _ => return None,
+            }
+            set(st, r, K::List(v))?;
+        }
+        IterInit(it, src) => {
+            let e = need_list(st, src)?;
+            set(st, it, K::List(e))?;
+            set(st, it.checked_add(1)?, K::Int)?;
+        }
+        IterNext { it, key, val, end } => {
+            let e = need_list(st, it)?;
+            need(st, it.checked_add(1)?, K::Int)?;
+            if key != NO_REG {
+                set(st, key, K::Int)?;
+            }
+            // The elements of an empty list are never read.
+            set(st, val, e.scalar().unwrap_or(K::Undef))?;
+            if st.iter().any(|k| k.boxed()) {
+                *strings = true;
+            }
+            return Some(Flow::Branch(end));
+        }
+        Range(d, a, b, _) => {
+            need(st, a, K::Int)?;
+            need(st, b, K::Int)?;
+            set(st, d, K::List(E::Int))?;
+        }
         _ => return None,
     }
-    if st.contains(&K::Str) {
+    if st.iter().any(|k| k.boxed()) {
         *strings = true;
     }
     Some(Flow::Next)
@@ -403,11 +559,19 @@ enum H {
     StrCmp,
     Fmod,
     Pow,
+    NewList,
+    Index,
+    ListLen,
+    SetIndex,
+    Range,
+    PowI,
+    RangeFn,
+    Push,
 }
 
 /// Name, address, number of i64 arguments after `ctx` (None: `(f64, f64) -> f64`)
 /// and whether it returns an i64, in the order of `H`.
-fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 14] {
+fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 22] {
     [
         ("phv_jit_tick", phv_jit_tick as *const u8, Some(0), true),
         ("phv_jit_enter", phv_jit_enter as *const u8, Some(3), true),
@@ -423,6 +587,14 @@ fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 14] {
         ("phv_jit_str_cmp", phv_jit_str_cmp as *const u8, Some(2), true),
         ("phv_jit_fmod", phv_jit_fmod as *const u8, None, false),
         ("phv_jit_pow", phv_jit_pow as *const u8, None, false),
+        ("phv_jit_new_list", phv_jit_new_list as *const u8, Some(3), false),
+        ("phv_jit_index", phv_jit_index as *const u8, Some(4), true),
+        ("phv_jit_list_len", phv_jit_list_len as *const u8, Some(1), true),
+        ("phv_jit_set_index", phv_jit_set_index as *const u8, Some(4), false),
+        ("phv_jit_range", phv_jit_range as *const u8, Some(4), false),
+        ("phv_jit_pow_i", phv_jit_pow_i as *const u8, Some(2), true),
+        ("phv_jit_range_fn", phv_jit_range_fn as *const u8, Some(3), false),
+        ("phv_jit_push", phv_jit_push as *const u8, Some(3), false),
     ]
 }
 
@@ -657,6 +829,33 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.b.switch_to_block(cont);
     }
 
+    /// Fails with the error a helper left in `ctx.error`, if any.
+    fn check_ctx(&mut self) {
+        let e = self.b.ins().load(I64, self.mf, self.ctx, CTX_ERROR);
+        self.check(e);
+    }
+
+    /// Element `i` (a machine value) of the list in slot `l`, into register
+    /// `d` (a machine register, or slot `d` for a string).
+    fn element(&mut self, d: Reg, l: Reg, i: Value, e: E) {
+        let code = match e {
+            E::Float => JIT_ELEM_FLOAT,
+            E::Str => JIT_ELEM_STR,
+            _ => JIT_ELEM_INT,
+        };
+        let (dv, lv, cv) = (self.iconst(d as i64), self.iconst(l as i64), self.iconst(code));
+        let r = self.call(H::Index, &[dv, lv, i, cv]).unwrap();
+        self.check_ctx();
+        match e {
+            E::Float => {
+                let f = self.b.ins().bitcast(F64, MemFlagsData::new(), r);
+                self.setf(d, f);
+            }
+            E::Str | E::Empty => {}
+            _ => self.set(d, r),
+        }
+    }
+
     /// Fails with the code a helper returned, unless it is 0.
     fn check(&mut self, code: Value) {
         let err = self.b.create_block();
@@ -697,7 +896,7 @@ impl<'a, 'b> Translator<'a, 'b> {
     /// Stores a number or boolean in its window slot, for a string operation.
     fn spill(&mut self, r: Reg, k: K) {
         let (tag, bits) = match k {
-            K::Str => return,
+            K::Str | K::List(_) => return,
             K::Float => {
                 let f = self.getf(r);
                 (JIT_PUT_FLOAT, self.b.ins().bitcast(I64, MemFlagsData::new(), f))
@@ -771,7 +970,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 let p = self.b.block_params(entry)[r + 2];
                 match self.sig.params[r] {
                     ValKind::Float => f = p,
-                    ValKind::Str => {}
+                    v if v.boxed() => {}
                     _ => i = p,
                 }
             }
@@ -791,8 +990,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         let low = self.b.ins().icmp(IntCC::UnsignedLessThan, sp, floor);
         self.fail_if(low, JIT_ERR_STACK);
         if self.checked.strings {
-            let mask =
-                self.sig.params.iter().enumerate().filter(|(_, p)| **p == ValKind::Str).map(|(i, _)| 1 << i).sum();
+            let mask = self.sig.params.iter().enumerate().filter(|(_, p)| p.boxed()).map(|(i, _)| 1 << i).sum();
             let (n, m) = (self.iconst(self.func.num_regs as i64), self.iconst(mask));
             let e = self.call(H::Enter, &[n, args_base, m]).unwrap();
             self.check(e);
@@ -840,7 +1038,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                         let v = self.getf(s);
                         self.setf(d, v);
                     }
-                    K::Str => {
+                    K::Str | K::List(_) => {
                         self.call_regs(H::Move, &[d as i64, s as i64]);
                     }
                     _ => {
@@ -1065,6 +1263,18 @@ impl<'a, 'b> Translator<'a, 'b> {
                     let e = self.call_regs(H::Append, &[d as i64, s as i64]).unwrap();
                     self.check(e);
                 }
+                Instr::CallBuiltin { dst, id, args, .. } if self.prog.builtin_names[id as usize] == "range" => {
+                    let (x, y) = (self.get(args), self.get(args + 1));
+                    let dv = self.iconst(dst as i64);
+                    self.call(H::RangeFn, &[dv, x, y]);
+                    self.check_ctx();
+                }
+                Instr::CallBuiltin { dst, args, .. } if matches!(k(args), K::List(_)) => {
+                    let lv = self.iconst(args as i64);
+                    let n = self.call(H::ListLen, &[lv]).unwrap();
+                    self.check_ctx();
+                    self.set(dst, n);
+                }
                 Instr::CallBuiltin { dst, id, args, .. } => {
                     // `strlen` or `str_len`: the length, or minus an error code.
                     let chars = self.prog.builtin_names[id as usize] == "str_len";
@@ -1125,7 +1335,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                         let v = match k(r) {
                             K::Float => self.getf(r),
                             // moved from the window by the callee
-                            K::Str => self.iconst(0),
+                            K::Str | K::List(_) => self.iconst(0),
                             _ => self.get(r),
                         };
                         vals.push(v);
@@ -1136,7 +1346,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                     self.check(e);
                     match csig.ret {
                         ValKind::Float => self.setf(dst, r),
-                        ValKind::Str => {
+                        v if v.boxed() => {
                             self.call_regs(H::TakeRet, &[dst as i64]);
                         }
                         _ => self.set(dst, r),
@@ -1148,7 +1358,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                             let v = self.getf(r);
                             self.ret(v, None);
                         }
-                        ValKind::Str => {
+                        v if v.boxed() => {
                             let z = self.iconst(0);
                             self.ret(z, Some(r));
                         }
@@ -1167,6 +1377,83 @@ impl<'a, 'b> Translator<'a, 'b> {
                     let z = self.zero();
                     self.ret(z, None);
                     continue;
+                }
+                Instr::PowI(d, a, b) => {
+                    let (x, y) = (self.get(a), self.get(b));
+                    let r = self.call(H::PowI, &[x, y]).unwrap();
+                    self.check_ctx();
+                    self.set(d, r);
+                }
+                Instr::NewList(d, start, n) => {
+                    for r in start..start + n {
+                        self.spill(r, k(r));
+                    }
+                    self.call_regs(H::NewList, &[d as i64, start as i64, n as i64]);
+                }
+                Instr::Index(d, l, i) => {
+                    let K::List(e) = k(l) else { unreachable!("checked") };
+                    let iv = self.get(i);
+                    self.element(d, l, iv, e);
+                }
+                Instr::SetPath(ref path) if path.push && k(path.val) != K::Str => {
+                    let PathBase::Local(r) = path.base else { unreachable!("checked") };
+                    let (tag, bits) = match k(path.val) {
+                        K::Float => {
+                            let f = self.getf(path.val);
+                            (JIT_PUT_FLOAT, self.b.ins().bitcast(I64, MemFlagsData::new(), f))
+                        }
+                        K::Bool => (JIT_PUT_BOOL, self.get(path.val)),
+                        _ => (JIT_PUT_INT, self.get(path.val)),
+                    };
+                    let (rv, tv) = (self.iconst(r as i64), self.iconst(tag));
+                    self.call(H::Push, &[rv, tv, bits]);
+                    self.check_ctx();
+                }
+                Instr::SetPath(ref path) => {
+                    let PathBase::Local(r) = path.base else { unreachable!("checked") };
+                    self.spill(path.val, k(path.val));
+                    let idx = match path.keys.first() {
+                        Some(&key) => self.get(key),
+                        None => self.iconst(0),
+                    };
+                    let (rv, pv, vv) =
+                        (self.iconst(r as i64), self.iconst(path.push as i64), self.iconst(path.val as i64));
+                    self.call(H::SetIndex, &[rv, idx, pv, vv]);
+                    self.check_ctx();
+                }
+                Instr::IterInit(it, src) => {
+                    self.call_regs(H::Move, &[it as i64, src as i64]);
+                    let z = self.iconst(0);
+                    self.set(it + 1, z);
+                    // The loop's own copy of the list does not change: its
+                    // length is kept in the (otherwise unused) i64 of `it`.
+                    let lv = self.iconst(it as i64);
+                    let len = self.call(H::ListLen, &[lv]).unwrap();
+                    self.check_ctx();
+                    self.set(it, len);
+                }
+                Instr::IterNext { it, key, val, end } => {
+                    let K::List(e) = k(it) else { unreachable!("checked") };
+                    let len = self.get(it);
+                    let idx = self.get(it + 1);
+                    let done = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx, len);
+                    let cont = self.b.create_block();
+                    self.b.ins().brif(done, self.blocks[end as usize], &[], cont, &[]);
+                    self.b.switch_to_block(cont);
+                    if key != NO_REG {
+                        self.set(key, idx);
+                    }
+                    if e != E::Empty {
+                        self.element(val, it, idx, e);
+                    }
+                    let n = self.b.ins().iadd_imm_s(idx, 1);
+                    self.set(it + 1, n);
+                }
+                Instr::Range(d, a, b, inclusive) => {
+                    let (x, y) = (self.get(a), self.get(b));
+                    let (dv, iv) = (self.iconst(d as i64), self.iconst(inclusive as i64));
+                    self.call(H::Range, &[dv, x, y, iv]);
+                    self.check_ctx();
                 }
                 _ => unreachable!("unsupported instruction reached the JIT"),
             }
@@ -1216,6 +1503,38 @@ mod tests {
             ..Default::default()
         };
         assert!(accepts(&prog));
+    }
+
+    #[test]
+    fn checks_the_kinds_of_lists() {
+        use phv_vm::bytecode::PathSet;
+        let (li, ls) = (ValKind::ListInt, ValKind::ListStr);
+        let push = |list: u16, val: u16| {
+            SetPath(Box::new(PathSet {
+                base: PathBase::Local(list),
+                keys: Vec::new(),
+                create: Vec::new(),
+                push: true,
+                val,
+            }))
+        };
+        // Reading an element gives the list's element kind.
+        assert!(one(func(vec![li, I], I, 3, vec![Index(2, 0, 1), Ret(2)])));
+        assert!(!one(func(vec![li, I], F, 3, vec![Index(2, 0, 1), Ret(2)])));
+        assert!(!one(func(vec![ls, I], I, 3, vec![Index(2, 0, 1), Ret(2)])));
+        // The index is an int; a string is not a list.
+        assert!(!one(func(vec![li, F], I, 3, vec![Index(2, 0, 1), Ret(2)])));
+        assert!(!one(func(vec![S, I], I, 3, vec![Index(2, 0, 1), Ret(2)])));
+        // `[]` takes the kind of what is appended; another kind cannot follow.
+        assert!(one(func(vec![I], li, 2, vec![NewList(1, 0, 0), push(1, 0), Ret(1)])));
+        assert!(one(func(vec![], li, 1, vec![NewList(0, 0, 0), Ret(0)])));
+        assert!(!one(func(vec![li, F], li, 2, vec![push(0, 1), Ret(0)])));
+        // Elements of a list known to be empty are never read natively.
+        assert!(!one(func(vec![I], I, 3, vec![NewList(1, 0, 0), Index(2, 1, 0), Ret(2)])));
+        // Lists are not compared natively.
+        assert!(!one(func(vec![li, li], ValKind::Bool, 3, vec![Eq(2, 0, 1), Ret(2)])));
+        // A list function returns a list on every path.
+        assert!(!one(func(vec![], li, 1, vec![RetNull])));
     }
 
     #[test]

@@ -168,6 +168,24 @@ impl Drop for Value {
     }
 }
 
+/// The number of items of `range($from, $to)` (both included, counting down
+/// when `from > to`).
+pub fn range_len(from: i64, to: i64) -> i128 {
+    (to as i128 - from as i128).abs() + 1
+}
+
+/// The items of `range($from, $to)`; check `range_len` first.
+pub fn range_items(from: i64, to: i64) -> Vec<Value> {
+    if from <= to {
+        (from..=to).map(Value::Int).collect()
+    } else {
+        (to..=from).rev().map(Value::Int).collect()
+    }
+}
+
+/// The most items `range()` makes.
+pub const MAX_RANGE: i128 = 10_000_000;
+
 /// Strict equality: values of different types are never equal, except that
 /// `int` and `float` compare numerically. Objects compare by identity.
 /// Iterative, so deeply nested values cannot overflow the stack.

@@ -3,14 +3,16 @@
 //! calls for everything that needs the runtime.
 //!
 //! Numbers and booleans live in machine registers. A native function that
-//! uses strings also gets a window of `Value` slots, one per bytecode
+//! uses strings or lists also gets a window of `Value` slots, one per bytecode
 //! register, owned by `JitRt`; the helpers below work on that window with the
 //! same code the interpreter runs, so results, memory checks and error
 //! messages are identical.
 
 use crate::bytecode::Program;
 use crate::value::{compare, Value};
-use crate::vm::{const_value, op_append, op_concat, op_to_str, str_len, MemLimit, BUDGET, LONG_OP};
+use crate::vm::{
+    const_value, copy_cost, op_append, op_concat, op_to_str, path_assign, str_len, MemLimit, BUDGET, LONG_OP,
+};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -50,6 +52,8 @@ pub const JIT_ERR_FLOAT_TO_INT: i64 = 8;
 /// Native code ran out of its stack (`JitCtx::stack_limit`): the call is run
 /// again by the interpreter, whose frames are not on the native stack.
 pub const JIT_ERR_STACK: i64 = 9;
+/// A helper raised an exception (`JitRt::pending`), as the interpreter would.
+pub const JIT_ERR_THROW: i64 = 10;
 
 /// Kinds of the scalar `phv_jit_put` stores in a window slot.
 pub const JIT_PUT_INT: i64 = 1;
@@ -93,6 +97,8 @@ pub struct JitRt {
     /// The VM's constant cache, lent for the call.
     pub(crate) consts: Vec<Option<Value>>,
     pub(crate) prog: Option<Arc<Program>>,
+    /// The exception a helper raised (`JIT_ERR_THROW`): its class and message.
+    pending: Option<(&'static str, String)>,
 }
 
 impl JitRt {
@@ -118,6 +124,29 @@ impl JitRt {
     fn top(&mut self) -> &mut [Value] {
         &mut self.windows[self.used - 1]
     }
+
+    /// The exception of `JIT_ERR_THROW`.
+    pub(crate) fn take_pending(&mut self) -> (&'static str, String) {
+        self.pending.take().unwrap_or(("RuntimeException", "internal error in native code".into()))
+    }
+}
+
+/// Makes native code stop with exception `class`.
+///
+/// # Safety
+/// See `rt`.
+unsafe fn throw(ctx: *mut JitCtx, class: &'static str, msg: String) {
+    rt(ctx).pending = Some((class, msg));
+    (*ctx).error = JIT_ERR_THROW;
+}
+
+/// A slot did not hold the value the checked bytecode promised (only bytecode
+/// that is not what the compiler makes could do that).
+///
+/// # Safety
+/// See `rt`.
+unsafe fn wrong_value(ctx: *mut JitCtx) {
+    throw(ctx, "RuntimeException", "internal error: a native list operation found another kind of value".into());
 }
 
 /// Called by native code when its budget runs out: checks the time and memory limits.
@@ -348,4 +377,184 @@ pub extern "C" fn phv_jit_fmod(x: f64, y: f64) -> f64 {
 /// `**` on floats, exactly as the interpreter computes it.
 pub extern "C" fn phv_jit_pow(x: f64, y: f64) -> f64 {
     x.powf(y)
+}
+
+// Lists of numbers, strings or booleans: the interpreter's code on the window.
+// Errors are left in `ctx.error`, which native code checks after each call.
+
+/// Element kinds `phv_jit_index` returns: in a machine register as an i64
+/// (ints and bools) or as the bits of a float, or in slot `d` (strings).
+pub const JIT_ELEM_INT: i64 = 0;
+pub const JIT_ELEM_FLOAT: i64 = 1;
+pub const JIT_ELEM_STR: i64 = 2;
+
+/// `NewList`: the `n` slots from `start` (moved out) as a list in slot `d`.
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_new_list(ctx: *mut JitCtx, d: i64, start: i64, n: i64) {
+    let w = rt(ctx).top();
+    let items: Vec<Value> = (0..n as usize).map(|i| std::mem::take(&mut w[start as usize + i])).collect();
+    w[d as usize] = Value::list(items);
+}
+
+/// `Index` of the list in slot `l` at `i`: the element (see `JIT_ELEM_*`).
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_index(ctx: *mut JitCtx, d: i64, l: i64, i: i64, kind: i64) -> i64 {
+    let w = rt(ctx).top();
+    let Value::List(list) = &w[l as usize] else {
+        wrong_value(ctx);
+        return 0;
+    };
+    let item = match usize::try_from(i).ok().and_then(|x| list.get(x)) {
+        Some(v) => v.clone(),
+        None => {
+            let msg = format!("list index {i} is out of range (length {})", list.len());
+            throw(ctx, "IndexError", msg);
+            return 0;
+        }
+    };
+    match (kind, item) {
+        (JIT_ELEM_INT, Value::Int(n)) => n,
+        (JIT_ELEM_INT, Value::Bool(b)) => b as i64,
+        (JIT_ELEM_FLOAT, Value::Float(f)) => f.to_bits() as i64,
+        (JIT_ELEM_STR, v @ Value::Str(_)) => {
+            w[d as usize] = v;
+            0
+        }
+        _ => {
+            wrong_value(ctx);
+            0
+        }
+    }
+}
+
+/// The length of the list in slot `l`.
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_list_len(ctx: *mut JitCtx, l: i64) -> i64 {
+    match &rt(ctx).top()[l as usize] {
+        Value::List(x) => x.len() as i64,
+        _ => {
+            wrong_value(ctx);
+            0
+        }
+    }
+}
+
+/// `$xs[$i] = $v` (or `$xs[] = $v` when `push` is set) on the list in slot
+/// `r`, with the value in slot `val`: copied first when shared, as the
+/// interpreter does, after the copy is accounted.
+///
+/// # Safety
+/// See `rt` and `mem`.
+pub unsafe extern "C" fn phv_jit_set_index(ctx: *mut JitCtx, r: i64, i: i64, push: i64, val: i64) {
+    let mem = mem(ctx);
+    let w = rt(ctx).top();
+    if !matches!(w[r as usize], Value::List(_)) {
+        wrong_value(ctx);
+        return;
+    }
+    let v = w[val as usize].clone();
+    let push = push != 0;
+    let key = [Value::Int(i)];
+    let keys: &[Value] = if push { &[] } else { &key };
+    let cost = copy_cost(&w[r as usize], keys, push);
+    if cost > 0 {
+        if mem.reserve(cost).is_err() {
+            (*ctx).error = JIT_ERR_MEMORY;
+            return;
+        }
+        long_op(ctx, cost);
+    }
+    if let Err((class, msg)) = path_assign(&mut w[r as usize], keys, &[], push, v) {
+        throw(ctx, class, msg);
+    }
+}
+
+/// `Range`: the ints from `from` to `to` (included when `inclusive` is set) in slot `d`.
+///
+/// # Safety
+/// See `rt` and `mem`.
+pub unsafe extern "C" fn phv_jit_range(ctx: *mut JitCtx, d: i64, from: i64, to: i64, inclusive: i64) {
+    let to = if inclusive != 0 { to.saturating_add(1) } else { to };
+    let count = to.saturating_sub(from).max(0);
+    if count > 10_000_000 {
+        throw(ctx, "ValueError", "range is too large (more than 10,000,000 items)".into());
+        return;
+    }
+    if mem(ctx).reserve(count as usize * std::mem::size_of::<Value>()).is_err() {
+        (*ctx).error = JIT_ERR_MEMORY;
+        return;
+    }
+    rt(ctx).top()[d as usize] = Value::list((from..to).map(Value::Int).collect());
+}
+
+/// `**` on ints, as the interpreter computes it.
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_pow_i(ctx: *mut JitCtx, x: i64, y: i64) -> i64 {
+    if y < 0 {
+        let msg = "negative exponent in int ** int; use a float base, e.g. 2.0 ** -1";
+        throw(ctx, "ArithmeticError", msg.into());
+        return 0;
+    }
+    match u32::try_from(y).ok().and_then(|y| x.checked_pow(y)) {
+        Some(v) => v,
+        None => {
+            (*ctx).error = JIT_ERR_OVERFLOW;
+            0
+        }
+    }
+}
+
+/// The `range($from, $to)` builtin into slot `d`.
+///
+/// # Safety
+/// See `rt` and `mem`.
+pub unsafe extern "C" fn phv_jit_range_fn(ctx: *mut JitCtx, d: i64, from: i64, to: i64) {
+    let count = crate::value::range_len(from, to);
+    if count > crate::value::MAX_RANGE {
+        throw(ctx, "ValueError", "range is too large (more than 10,000,000 items)".into());
+        return;
+    }
+    if mem(ctx).reserve(count as usize * std::mem::size_of::<Value>()).is_err() {
+        (*ctx).error = JIT_ERR_MEMORY;
+        return;
+    }
+    rt(ctx).top()[d as usize] = Value::list(crate::value::range_items(from, to));
+}
+
+/// `$xs[] = $v` with a number or boolean (`JIT_PUT_*`) on the list in slot
+/// `r`: one call instead of storing the value in the window first.
+///
+/// # Safety
+/// See `rt` and `mem`.
+pub unsafe extern "C" fn phv_jit_push(ctx: *mut JitCtx, r: i64, kind: i64, bits: i64) {
+    let mem = mem(ctx);
+    let w = rt(ctx).top();
+    if !matches!(w[r as usize], Value::List(_)) {
+        wrong_value(ctx);
+        return;
+    }
+    let v = match kind {
+        JIT_PUT_INT => Value::Int(bits),
+        JIT_PUT_FLOAT => Value::Float(f64::from_bits(bits as u64)),
+        _ => Value::Bool(bits != 0),
+    };
+    let cost = copy_cost(&w[r as usize], &[], true);
+    if cost > 0 {
+        if mem.reserve(cost).is_err() {
+            (*ctx).error = JIT_ERR_MEMORY;
+            return;
+        }
+        long_op(ctx, cost);
+    }
+    if let Err((class, msg)) = path_assign(&mut w[r as usize], &[], &[], true, v) {
+        throw(ctx, class, msg);
+    }
 }

@@ -1151,8 +1151,6 @@ impl<'a> FnC<'a> {
     }
 }
 
-/// A function whose every local is an int, bool, float or string may be
-/// compiled natively.
 /// Where a statement starts, for coverage: its first expression.
 fn stmt_span(s: &HStmt) -> Option<phv_syntax::Span> {
     Some(match s {
@@ -1167,12 +1165,21 @@ fn stmt_span(s: &HStmt) -> Option<phv_syntax::Span> {
     })
 }
 
+/// A function whose every local is an int, bool, float or string, or a list
+/// of one of them, may be compiled natively.
 fn native_sig(f: &HFunc) -> Option<NativeSig> {
     let kind = |t: &Type| match t {
         Type::Int => Some(ValKind::Int),
         Type::Bool => Some(ValKind::Bool),
         Type::Float => Some(ValKind::Float),
         Type::Str => Some(ValKind::Str),
+        Type::List(e) => match **e {
+            Type::Int => Some(ValKind::ListInt),
+            Type::Float => Some(ValKind::ListFloat),
+            Type::Str => Some(ValKind::ListStr),
+            Type::Bool => Some(ValKind::ListBool),
+            _ => None,
+        },
         _ => None,
     };
     if f.kind != FuncKind::Normal || !f.captures.is_empty() || f.params.len() > 16 {
