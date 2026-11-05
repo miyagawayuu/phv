@@ -8,12 +8,13 @@ security vulnerability, and we want to hear about it.
 
 ## Supported versions
 
-PHV is pre-1.0. Security fixes are made on the latest release only.
+Security fixes are released for the latest minor version of the current major
+version (see the compatibility rules in the specification, §18).
 
 | Version | Supported |
 |---|---|
-| 0.9.x | Yes |
-| < 0.9 | No |
+| 1.0.x | Yes |
+| < 1.0 | No |
 
 ## Reporting a vulnerability
 
