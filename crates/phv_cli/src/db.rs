@@ -23,12 +23,16 @@ fn go(project: &Path, db: Option<&str>, sqlite: Option<&str>, dir: &str, apply: 
             None => return Err(format!("phv.toml has no [databases.{name}]")),
         },
         (None, Some(file)) => {
-            // Inside the project, like every path PHV opens.
+            // Inside the project, like every path PHV opens: only names (not
+            // `..`, `\\x`, `C:x` or an absolute path; found by the 1.0 audit).
+            use std::path::Component;
             let p = Path::new(file);
-            if p.is_absolute() || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            let names = p.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+            let rel: std::path::PathBuf = p.components().filter(|c| matches!(c, Component::Normal(_))).collect();
+            if !names || rel.as_os_str().is_empty() {
                 return Err(format!("--sqlite {file}: give a path inside the project"));
             }
-            Target::Sqlite(project.join(p))
+            Target::Sqlite(project.to_path_buf(), rel)
         }
         _ => return Err("name the database: --db <name> (from [databases]) or --sqlite <file>".into()),
     };

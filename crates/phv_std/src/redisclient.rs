@@ -242,10 +242,18 @@ impl RedisConn {
                         return Err(invalid());
                     }
                     let len = len as usize;
-                    // Each element takes at least 3 bytes (`:0\r\n` is 4).
+                    // Each element takes at least 3 bytes (`:0\r\n` is 4), and in
+                    // memory, as a reply and then a value, about `ELEMENT` bytes:
+                    // charged to the budget before the list is built (found by
+                    // the 1.0 audit: 9 million empty strings took 891 MB).
                     if len > (self.budget + (self.buf.len() - self.pos)) / 3 {
                         return Err(RedisError::TooLarge);
                     }
+                    let cost = len.saturating_mul(ELEMENT);
+                    if cost > self.budget {
+                        return Err(RedisError::TooLarge);
+                    }
+                    self.budget -= cost;
                     let mut items = Vec::with_capacity(len.min(1024));
                     for _ in 0..len {
                         match self.reply(depth + 1)? {
@@ -260,6 +268,9 @@ impl RedisConn {
         }))
     }
 }
+
+/// What one element of an array reply costs in memory, beyond its bytes.
+const ELEMENT: usize = 64;
 
 #[cfg(test)]
 mod tests {

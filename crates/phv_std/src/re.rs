@@ -140,12 +140,12 @@ fn groups(vm: &Vm, caps: &regex::Captures) -> Result<Value, VmError> {
     Ok(Value::list(caps.iter().map(|m| Value::str(m.map_or("", |m| m.as_str()))).collect()))
 }
 
-/// Checks the limits every 1024 matches (searching between them is bounded by `budget`).
-fn tick(vm: &Vm, i: usize) -> Result<(), VmError> {
-    if i % 1024 == 1023 {
-        vm.check_limits()?;
-    }
-    Ok(())
+/// Checks the limits after every match. One search is bounded by `budget`,
+/// but each search for the next match may read on to the end of the text:
+/// many short matches cost the pattern's states times the text's length
+/// squared (found by the 1.0 audit: 97 seconds with a 2-second limit).
+fn tick(vm: &Vm, _i: usize) -> Result<(), VmError> {
+    vm.check_limits()
 }
 
 pub fn lookup(name: &str) -> Option<BuiltinFn> {

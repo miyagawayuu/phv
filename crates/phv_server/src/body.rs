@@ -63,7 +63,8 @@ impl RespBody {
     }
 
     pub fn file(file: tokio::fs::File, len: u64) -> RespBody {
-        RespBody::File { file, left: len, buf: vec![0u8; 64 << 10].into_boxed_slice() }
+        // 16 KB: an HTTP/2 connection may send several files at once.
+        RespBody::File { file, left: len, buf: vec![0u8; 16 << 10].into_boxed_slice() }
     }
 }
 

@@ -337,6 +337,18 @@ const MAX_NATIVE_DEPTH: u32 = 200;
 
 pub(crate) const BUDGET: u32 = 10_000;
 
+/// Gives the record of objects room for as many again as it holds (at least
+/// 1024), so that it fills, and is looked at, only after that many more.
+fn room_for_twice<T>(objects: &mut Vec<T>) {
+    let want = (objects.len() * 2).max(1024);
+    if objects.capacity() > want * 2 {
+        objects.shrink_to(want);
+    }
+    if objects.capacity() < want {
+        objects.reserve_exact(want - objects.len());
+    }
+}
+
 /// The number of live objects at which the cycle collector first runs.
 const GC_FIRST: usize = 4096;
 
@@ -613,16 +625,23 @@ pub(crate) fn str_len(v: &Value) -> usize {
     }
 }
 
-pub(crate) fn op_append(regs: &mut [Value], mem: MemLimit, d: Reg, s: Reg) -> Result<(), usize> {
+/// Returns the bytes it went over (appended, and copied when the string was shared).
+pub(crate) fn op_append(regs: &mut [Value], mem: MemLimit, d: Reg, s: Reg) -> Result<usize, usize> {
     let src = regs[s as usize].clone();
     let grow = match &src {
         Value::Str(x) | Value::Html(x) => x.len(),
         _ => 24,
     };
-    let cur = match &regs[d as usize] {
-        Value::Str(x) => x.capacity(),
-        _ => 0,
+    let (cur, shared) = match &regs[d as usize] {
+        Value::Str(x) => (x.capacity(), Rc::strong_count(x) > 1),
+        _ => (0, false),
     };
+    // A string also held elsewhere is copied first (found by the 1.0 audit:
+    // `$t = $s; $s .= "x";` copied 20 MB untimed and unaccounted).
+    let copied = if shared { str_len(&regs[d as usize]) } else { 0 };
+    if copied > 0 {
+        mem.reserve(copied.saturating_add(grow))?;
+    }
     if grow > 1 << 20 || (cur > 1 << 20 && cur < grow + cur) {
         // The string may double its buffer.
         mem.reserve(grow.max(cur) * 2)?;
@@ -638,7 +657,7 @@ pub(crate) fn op_append(regs: &mut [Value], mem: MemLimit, d: Reg, s: Reg) -> Re
     if len > 1 << 20 && len.is_power_of_two() {
         mem.check()?;
     }
-    Ok(())
+    Ok(grow + copied)
 }
 
 /// Ordering of two floats for `<`, `<=` and `<=>`, like `compare` (NaN compares equal).
@@ -791,9 +810,10 @@ impl Vm {
             if objects.len() >= self.gc_next.get() {
                 self.gc_due.set(true);
             }
-            // The next check comes after as many new objects as are alive now.
-            let keep = (objects.len() * 2).max(1024);
-            objects.shrink_to(keep);
+            // The next check comes after as many new objects as are alive now
+            // (room grown as well as shrunk: found by the 1.0 audit, a list
+            // left nearly full was searched again at every `new`).
+            room_for_twice(&mut objects);
         }
         objects.push(Rc::downgrade(o));
     }
@@ -808,7 +828,7 @@ impl Vm {
         let done = crate::cycles::collect(self.objects.get_mut());
         let objects = self.objects.get_mut();
         let live = objects.len();
-        objects.shrink_to((live * 2).max(1024));
+        room_for_twice(objects);
         self.gc_next.set((live.saturating_mul(2)).max(live + done.visited / GC_WORK).max(GC_FIRST));
         done.freed
     }
@@ -1007,6 +1027,15 @@ impl Vm {
         }
     }
 
+    /// After hashing a map key of `bytes`: a long one is timed at once, since
+    /// one step may look it up many times (found by the 1.0 audit).
+    fn long_key(&mut self, bytes: usize) -> Result<(), VmError> {
+        if bytes >= LONG_OP {
+            self.check_limits()?;
+        }
+        Ok(())
+    }
+
     #[inline]
     fn tick(&mut self) -> Result<(), VmError> {
         self.budget -= 1;
@@ -1045,8 +1074,12 @@ impl Vm {
         let mut rt = std::mem::take(&mut self.jit_rt);
         rt.prog.get_or_insert_with(|| Arc::clone(&self.prog));
         rt.consts = std::mem::take(&mut self.consts);
-        // Strings and lists are moved into the native call's window: kept for a rerun.
-        let strings = sig.params.iter().any(|p| p.boxed()).then(|| args.clone());
+        // Strings and lists are moved into the native call's window: kept for
+        // a rerun, unless the function changes them in place (found by the 1.0
+        // audit: the kept copy made that change copy a whole list).
+        let writes = self.jit.as_ref().is_some_and(|j| j.writes_args.get(func as usize).copied().unwrap_or(true));
+        let strings = (sig.params.iter().any(|p| p.boxed()) && !writes).then(|| args.clone());
+        let boxed_args = sig.params.iter().any(|p| p.boxed());
         rt.start(args);
         // Native code nested in this call (through the interpreter) shares the
         // outermost call's stack limit.
@@ -1078,6 +1111,9 @@ impl Vm {
         self.budget = ctx.budget.clamp(1, BUDGET as i64) as u32;
         match ctx.error {
             0 => {}
+            JIT_ERR_STACK if boxed_args && strings.is_none() => {
+                return Err(VmError::Fatal("maximum call stack depth exceeded".into()));
+            }
             JIT_ERR_STACK => {
                 let args = strings.unwrap_or_else(|| {
                     sig.params
@@ -1288,6 +1324,8 @@ impl Vm {
                 path_assign(&mut ob.fields[slot as usize], &keys, &p.create, p.push, val)
             }
         };
+        // Hashing long string keys takes time (found by the 1.0 audit).
+        self.long_key(keys.iter().map(str_len).sum())?;
         r.map_err(|(class, msg)| self.throw(class, msg))
     }
 
@@ -1560,8 +1598,8 @@ impl Vm {
                     }
                     Instr::AppendStr(d, s) => {
                         let mem = self.mem();
-                        tri!(op_append(&mut self.regs[base..], mem, *d, *s).map_err(memory_error));
-                        self.long_op(str_len(&reg!(*s)));
+                        let work = tri!(op_append(&mut self.regs[base..], mem, *d, *s).map_err(memory_error));
+                        self.long_op(work);
                     }
 
                     Instr::Jump(t) => {
@@ -1781,7 +1819,9 @@ impl Vm {
                             },
                             (v, _) => bad("list or map", v),
                         };
+                        let key_len = str_len(&reg!(*k));
                         reg!(*d) = v;
+                        tri!(self.long_key(key_len));
                     }
                     Instr::IndexOrNull(d, b, k) => {
                         let v = match (&reg!(*b), &reg!(*k)) {
@@ -1791,7 +1831,9 @@ impl Vm {
                             (Value::Map(m), key) => m.get(&key.to_key()).cloned().unwrap_or(Value::Null),
                             (v, _) => bad("list or map", v),
                         };
+                        let key_len = str_len(&reg!(*k));
                         reg!(*d) = v;
+                        tri!(self.long_key(key_len));
                     }
                     Instr::SetPath(p) => tri!(self.set_path(base, p)),
 

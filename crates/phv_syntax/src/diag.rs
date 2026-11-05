@@ -105,12 +105,12 @@ fn render_one(out: &mut String, sources: &SourceMap, d: &Diagnostic, color: bool
         Severity::Error => "error",
         Severity::Warning => "warning",
     };
-    let _ = writeln!(out, "{red}{kind}{reset}{bold}: {}{reset}", d.message);
+    let _ = writeln!(out, "{red}{kind}{reset}{bold}: {}{reset}", printable(&d.message));
     let file = sources.get(d.span.file);
     let (line, col) = file.line_col(d.span.start);
     let gutter = line.to_string().len();
     let pad = " ".repeat(gutter);
-    let _ = writeln!(out, "{pad}{blue}-->{reset} {}:{}:{}", file.name, line, col);
+    let _ = writeln!(out, "{pad}{blue}-->{reset} {}:{}:{}", printable(&file.name), line, col);
     let _ = writeln!(out, "{pad} {blue}|{reset}");
     let text = file.line_text(line);
     let (end_line, end_col) = file.line_col(d.span.end.max(d.span.start));
@@ -119,7 +119,7 @@ fn render_one(out: &mut String, sources: &SourceMap, d: &Diagnostic, color: bool
         if end_line == line { end_col.saturating_sub(col).max(1) } else { len.saturating_sub(col - 1).max(1) };
     // Long lines are shown as a window around the error.
     let from = if len > LINE_WINDOW { (col - 1).saturating_sub(LINE_WINDOW / 3) } else { 0 };
-    let shown: String = text.chars().skip(from).take(LINE_WINDOW).collect();
+    let shown: String = printable(&text.chars().skip(from).take(LINE_WINDOW).collect::<String>());
     let (before, after) = (if from > 0 { "..." } else { "" }, if from + LINE_WINDOW < len { "..." } else { "" });
     let _ = writeln!(out, "{blue}{line} |{reset} {before}{shown}{after}");
     let caret = col - 1 - from + before.len();
@@ -130,6 +130,26 @@ fn render_one(out: &mut String, sources: &SourceMap, d: &Diagnostic, color: bool
     }
     out.push('\n');
     for note in &d.notes {
-        let _ = writeln!(out, "{pad} {blue}={reset} {bold}note{reset}: {note}");
+        let _ = writeln!(out, "{pad} {blue}={reset} {bold}note{reset}: {}", printable(note));
+    }
+}
+
+/// Text from a source file or a name, as it may be shown on a terminal: control
+/// characters (an escape sequence could clear the screen or set the clipboard)
+/// become U+FFFD, one character each, so columns stay where they were (found
+/// by the 1.0 audit).
+fn printable(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() && c != '\t' { '\u{FFFD}' } else { c }).collect()
+}
+
+#[cfg(test)]
+mod printable_tests {
+    /// Found by the 1.0 audit: a source line with escape sequences reached
+    /// the terminal as it was.
+    #[test]
+    fn control_characters_are_not_printed() {
+        let s = super::printable("a\u{1b}]52;c;eA==\u{7}b\u{1b}[2J\tc");
+        assert!(!s.chars().any(|c| c.is_control() && c != '\t'), "{s:?}");
+        assert_eq!(s.chars().count(), "a\u{1b}]52;c;eA==\u{7}b\u{1b}[2J\tc".chars().count());
     }
 }

@@ -293,7 +293,16 @@ fn json_to(vm: &Vm, v: &Value, out: &mut String, depth: usize, pretty: bool) -> 
             for (i, k) in s.iter().enumerate() {
                 sep(out, i);
                 match k {
-                    Key::Str(s) => json_string(s, out),
+                    // As a string value: one may grow six times (found by the 1.0 audit).
+                    Key::Str(s) => {
+                        if out.len() > 1 << 16 && i % 256 == 0 {
+                            vm.check_limits()?;
+                        }
+                        if s.len() > 4096 {
+                            vm.reserve(s.len().saturating_mul(6))?;
+                        }
+                        json_string(s, out)
+                    }
                     Key::Int(n) => {
                         let _ = write!(out, "{n}");
                     }
@@ -449,6 +458,9 @@ fn dump_value(vm: &Vm, v: &Value, out: &mut String, indent: usize) -> Result<(),
         Value::Set(s) => {
             let _ = writeln!(out, "set({}) {{", s.len());
             for k in s.iter() {
+                if out.len() > 1 << 16 {
+                    vm.check_limits()?;
+                }
                 match k {
                     Key::Int(n) => {
                         let _ = writeln!(out, "{pad}  int({n})");

@@ -200,3 +200,39 @@ fn connections_are_refused_and_closed_safely() {
     assert!(matches!(closed(&mut c), Some(CloseCode::Size) | None));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Found by the 1.0 audit: `[cors] origins = ["*"]` (no credentials) let any
+/// site open a WebSocket with the visitor's cookies, and `Origin: null` too.
+/// Only a site listed by name with `credentials = true` may.
+#[test]
+fn cors_lets_other_sites_open_websockets_only_by_name_with_credentials() {
+    let dir = site("cors-any");
+    write(&dir, "phv.toml", "[cors]\norigins = [\"*\"]\n");
+    let addr = start(&dir);
+    assert_eq!(open(addr, "/chat?name=x", Some("https://evil.example")).err(), Some(403));
+    assert_eq!(open(addr, "/chat?name=x", Some("null")).err(), Some(403));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let dir = site("cors-named");
+    write(&dir, "phv.toml", "[cors]\norigins = [\"https://app.example\"]\ncredentials = true\n");
+    let addr = start(&dir);
+    let mut ws = open(addr, "/chat?name=x", Some("https://app.example")).unwrap();
+    assert_eq!(text(&mut ws), "welcome x");
+    assert_eq!(open(addr, "/chat?name=x", Some("https://evil.example")).err(), Some(403));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Found by the 1.0 audit: a request with two `Host` fields was answered (a
+/// proxy in front may read the other one).
+#[test]
+fn two_host_fields_are_refused() {
+    use std::io::{Read, Write};
+    let dir = site("hosts");
+    let addr = start(&dir);
+    let mut s = TcpStream::connect(addr).unwrap();
+    write!(s, "GET /notify HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\nConnection: close\r\n\r\n").unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -6,8 +6,12 @@
 use crate::{int, s};
 use phv_vm::{BuiltinFn, Value, Vm, VmError, WsCtx, WsEvent};
 
-/// Bytes of keys and values a connection may keep (`$ws->set()`).
+/// Bytes of keys and values a connection may keep (`$ws->set()`), each
+/// entry counting `ENTRY` more for what keeping it costs.
 pub const MAX_STATE: usize = 64 * 1024;
+const ENTRY: usize = 64;
+/// Values one connection may keep.
+pub const MAX_KEYS: usize = 256;
 /// The longest message a script may send or publish.
 pub const MAX_TEXT: usize = 1 << 20;
 /// Topics one connection may have joined.
@@ -27,7 +31,7 @@ fn ws(vm: &mut Vm) -> Result<&mut WsCtx, VmError> {
 }
 
 fn state_size(w: &WsCtx) -> usize {
-    w.state.iter().map(|(k, v)| k.len() + v.len()).sum()
+    w.state.iter().map(|(k, v)| k.len() + v.len() + ENTRY).sum()
 }
 
 fn text_arg(vm: &mut Vm, what: &str, v: &Value) -> Result<String, VmError> {
@@ -76,8 +80,11 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         "__sock_set" => |vm, a| -> R {
             let (k, v) = (s(&a[0]).to_string(), s(&a[1]).to_string());
             let w = ws(vm)?;
-            let old = w.state.get(&k).map_or(0, |o| k.len() + o.len());
-            if state_size(w) - old + k.len() + v.len() > MAX_STATE {
+            let old = w.state.get(&k).map_or(0, |o| k.len() + o.len() + ENTRY);
+            if old == 0 && w.state.len() >= MAX_KEYS {
+                return Err(vm.throw("ValueError", format!("set(): a connection keeps at most {MAX_KEYS} values")));
+            }
+            if state_size(w) - old + k.len() + v.len() + ENTRY > MAX_STATE {
                 return Err(vm.throw("ValueError", "set(): a connection keeps at most 64 KB of values"));
             }
             ws(vm)?.state.insert(k, v);

@@ -796,19 +796,23 @@ tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
 tls_key = "/etc/letsencrypt/live/example.com/privkey.pem"
 ```
 
-- With `tls_cert` and `tls_key` (PEM files; a relative path is relative to the project), `phv serve` speaks HTTPS
-  only. Clients choose HTTP/2 or HTTP/1.1 during the handshake (ALPN). TLS 1.2 and 1.3 are offered, with the safe
-  default cipher suites of rustls; 0-RTT is not.
+- With `tls_cert` and `tls_key` (PEM files on this machine; a relative path is relative to the project; a network
+  share such as `\\host\share` is refused), `phv serve` speaks HTTPS only. Clients choose HTTP/2 or
+  HTTP/1.1 during the handshake (ALPN). TLS 1.2 and 1.3 are offered, with the safe default cipher suites of rustls;
+  0-RTT is not.
 - The files are read when the server starts: a key that does not belong to the certificate, a file that is not
   PEM, or a file inside `public/` stops it with an error (which names the file, never its contents). After that
   they are looked at once a minute: a renewed certificate (certbot and the like) is used without a restart, and
   one that cannot be loaded is reported and the previous one kept.
 - Over HTTPS, `secure_cookies` is on: the session cookie is `Secure`, and `Strict-Transport-Security` is sent.
 - A client must finish the TLS handshake within 10 seconds.
-- HTTP/2 connections: at most 64 requests open at once on one connection, 64 KB of request headers, and 64 KB a
-  client may send before the server reads it (on each request and on the connection), so one connection holds no
-  more than an HTTP/1.1 connection does. A connection without a request for 30 seconds is closed. Requests share
-  the workers, the request limits and the rate limit with HTTP/1.1.
+- HTTP/2 connections: at most 8 requests open at once on one connection, 64 KB of request headers, 64 KB a client
+  may send before the server reads it (on each request and on the connection), and 16 KB of each response waiting
+  for the client, so one connection holds about what an HTTP/1.1 connection does. Request bodies count against the
+  body budget from their first byte. A connection whose responses the client takes nothing of for 30 seconds is
+  dropped, and one without a request for 30 seconds is closed (at most 10 seconds later). Requests share the
+  workers, the request limits and the rate limit with HTTP/1.1. A request with a `host` field other than its
+  `:authority`, or with two `Host` fields (HTTP/1.1), is answered with the `:authority` and 400 respectively.
 - HTTP/2 without TLS is refused unless `[server] h2c = true`, for a reverse proxy that speaks it to the server
   (the client then sends HTTP/2 from its first bytes; HTTP/1.1 keeps working on the same port).
 - Scripts see an HTTP/2 request as an HTTP/1.1 one: `request()->header("host")` is the host the client asked for,
@@ -1081,7 +1085,7 @@ only its own changes are undone, and nothing is committed until the outermost on
 - **SQL can be written only as `sql"..."` literals (type `Sql`).** Values embedded with `{$x}` are always passed
   as placeholders, so SQL injection cannot occur. A `string` cannot be passed to `query()`.
 - `Sql` values can be concatenated with `.` (their parameters are carried over). `Sql` and `string` cannot be concatenated.
-- To choose a column or table name dynamically, use `sql_ident($name)` (it allows only alphanumerics and `_`, and quotes the name).
+- To choose a column or table name dynamically, use `sql_ident($name)` (it allows only alphanumerics and `_`, and quotes the name; names starting with `phv_`, PHV's own tables such as the sessions, are refused).
 - `ATTACH` is disabled, so databases other than the permitted files cannot be accessed (also in `phv db migrate`).
 - `LIKE` and `GLOB` stop at the script's time limit like the rest of a query; `instr()`, `replace()` and `trim(X, Y)`
   search in linear time. `PRAGMA case_sensitive_like` is refused (it would bring back SQLite's own `LIKE`).
@@ -1192,14 +1196,15 @@ if ($ws->event == WsEvent::Open) {
   connection with that response), `WsEvent::Message` for each text message (`$ws->message()`), and `WsEvent::Close`.
   Each run has the time and memory limits of a page and takes a worker; between events a connection holds no VM
   and no worker. The messages of one connection are handled one at a time, in order.
-- Nothing is kept between runs except what the connection keeps with `$ws->set($key, $value)` (read with `get()`,
-  64 KB in all) and the topics it joined. `$ws->id` is a random id, the same for all the events of a connection.
+- Nothing is kept between runs except what the connection keeps with `$ws->set($key, $value)` (read with `get()`;
+  at most 256 values and 64 KB in all, each value counting 64 bytes more) and the topics it joined. `$ws->id` is a random id, the same for all the events of a connection.
 - `$ws->send($text)` sends to this connection; `publish($topic, $text)` to every connection of this server process
   that joined `$topic` (`$ws->join()`, `$ws->leave()`; 64 topics per connection). Any page may call `publish()`,
   for example after a form is saved. Messages are sent after the script ends; output (`echo`) is discarded.
   `$ws->close($code, $reason)` closes the connection (code 1000 or 3000–4999).
-- Browsers send the page's origin: a connection from another site is refused (403) unless `[cors] origins` allows
-  that site, so another site cannot open a connection with the visitor's cookies.
+- Browsers send the page's origin: a connection from another site is refused (403) unless `[cors] origins` names
+  that site and `credentials = true` (a WebSocket always carries the visitor's cookies; `"*"` and `null` never
+  allow one), so another site cannot open a connection as the visitor.
 - Limits: 1,024 connections at once (more get 503), text messages of at most 64 KB (larger ones and binary
   messages close the connection), 1 MB of messages waiting for one connection (a client that does not read is
   disconnected), 1,000 messages sent or published per run, and 1 MB per message sent. The server sends a ping every
@@ -1548,7 +1553,8 @@ write = ["data/", "storage/"]  # file_put_contents / unlink / mkdir / rename / s
 env = ["APP_*"]             # environment variables readable with getenv (a trailing * is a prefix match)
 ```
 
-- Paths are relative to the project. `..` and absolute paths are not allowed.
+- Paths are relative to the project. `..`, absolute paths and names with `~` (Windows short names such as `GIT~1`)
+  are not allowed.
 - Symbolic links and junctions under a permitted directory are not followed (a path through a link raises `PermissionError`).
   Paths are opened one level at a time from the permitted directory, rejecting links, so a directory cannot be swapped
   between the check and the use.
@@ -2008,7 +2014,9 @@ It then runs the type checker and shows the places that need manual work, such a
      depth, and the execution time and memory limits are checked in the JIT just as in the interpreter. Native code
      uses at most 8 MB of stack: a call that needs more (deep recursion of a function with a large frame) is run by
      the interpreter instead, whose frames are not on the stack. Compiled functions have no side effects, so the
-     result is the same. Functions with more than 1,024 registers or 16,384 instructions are left to the interpreter
+     result is the same; a function that changes a string, list or map parameter in place (`$xs[] = ...`) stops
+     with "maximum call stack depth exceeded" instead (its arguments are not kept for a rerun, so changing them
+     never copies them). Functions with more than 1,024 registers or 16,384 instructions are left to the interpreter
      (compiling them would take much memory). Before compiling, the JIT checks every instruction and the kind of every register on every path, so bytecode from the
      cache is never trusted. It can be disabled with `PHV_JIT=0`. The stack trace of an exception raised inside the JIT
      goes back only as far as the caller.

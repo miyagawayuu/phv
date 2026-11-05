@@ -565,7 +565,11 @@ fn step(
                 ValKind::Void => K::Undef,
                 v => K::of(v)?,
             };
-            if ret.boxed() {
+            // Arguments and results passed in the window (strings, lists,
+            // maps and nullable values) need one in the caller too (found by
+            // the 1.0 audit: an int function calling a `?int` one wrote into
+            // its caller's window).
+            if callee.ret.boxed() || callee.params.iter().any(|p| p.boxed()) {
                 *strings = true;
             }
             set(st, dst, ret)?;
@@ -823,6 +827,17 @@ fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 29] {
     ]
 }
 
+/// Whether `f` changes one of its parameters in place: a string, list or
+/// map passed in the window (see `JitTable::writes_args`).
+fn writes_args(f: &Function) -> bool {
+    let param = |r: Reg| (r as usize) < f.num_params as usize;
+    f.code.iter().any(|ins| match ins {
+        Instr::AppendStr(d, _) => param(*d),
+        Instr::SetPath(p) => matches!(p.base, PathBase::Local(r) if param(r)),
+        _ => false,
+    })
+}
+
 /// Compiles every eligible function. Returns `None` if there are none (or
 /// the host is not supported by Cranelift).
 pub fn build(prog: &Program) -> Option<JitTable> {
@@ -942,7 +957,8 @@ pub fn build(prog: &Program) -> Option<JitTable> {
         // SAFETY: `entry` was defined above with exactly the `JitEntry` signature.
         entries[f as usize] = Some(unsafe { std::mem::transmute::<*const u8, JitEntry>(p) });
     }
-    Some(JitTable { entries, keep_alive: Box::new(Code(module)) })
+    let writes_args = prog.funcs.iter().map(writes_args).collect();
+    Some(JitTable { entries, writes_args, keep_alive: Box::new(Code(module)) })
 }
 
 struct Translator<'a, 'b> {
@@ -1094,6 +1110,15 @@ impl<'a, 'b> Translator<'a, 'b> {
         let c = self.iconst(code);
         self.fail(c);
         self.b.switch_to_block(cont);
+    }
+
+    /// Empties window slot `r` after a builtin call, as the interpreter moves
+    /// arguments out of their registers: a copy left there would make the
+    /// next change of the value (`$xs[] = ...`, `.=`) copy all of it (found by
+    /// the 1.0 audit).
+    fn moved_out(&mut self, r: Reg) {
+        let (rv, tag, zero) = (self.iconst(r as i64), self.iconst(JIT_PUT_NULL), self.iconst(0));
+        self.call(H::Put, &[rv, tag, zero]);
     }
 
     /// Fails with the error a helper left in `ctx.error`, if any.
@@ -1618,12 +1643,15 @@ impl<'a, 'b> Translator<'a, 'b> {
                     self.spill(args + 1, k(args + 1));
                     let r = self.call_regs(H::Has, &[args as i64, args as i64 + 1]).unwrap();
                     self.check_ctx();
+                    self.moved_out(args);
+                    self.moved_out(args + 1);
                     self.set(dst, r);
                 }
                 Instr::CallBuiltin { dst, args, .. } if matches!(k(args), K::List(_) | K::Map(..)) => {
                     let lv = self.iconst(args as i64);
                     let n = self.call(H::ListLen, &[lv]).unwrap();
                     self.check_ctx();
+                    self.moved_out(args);
                     self.set(dst, n);
                 }
                 Instr::CallBuiltin { dst, id, args, .. } => {
@@ -1638,6 +1666,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                     let code = self.b.ins().ineg(n);
                     self.fail(code);
                     self.b.switch_to_block(cont);
+                    self.moved_out(args);
                     self.set(dst, n);
                 }
                 Instr::Jump(t) => {

@@ -42,7 +42,7 @@ const text = {
     packages: `Or use a package manager: <code>brew install miyagawayuu/phv/phv</code> (macOS and Linux), or <code>scoop bucket add phv https://github.com/miyagawayuu/scoop-phv</code> and <code>scoop install phv</code> (Windows).`,
     editor: (version) => `For VS Code, install <a href="${marketplace}">PHV Language</a> from the Marketplace (<code>code --install-extension phv-lang.phv-language</code>) for highlighting and live diagnostics. It is also attached to each release as <a href="${releases}/download/v${version}/phv-${version}.vsix"><code>phv-${version}.vsix</code></a>.`,
     securityTitle: "Security",
-    securityLead: `PHV has been through ten security audits, each followed by fixes and regression tests. Read the <a href="docs/security/">audit report</a>. To report a vulnerability, email <a href="mailto:security@phv-lang.org">security@phv-lang.org</a>.`,
+    securityLead: `PHV has been through twelve security audits, each followed by fixes and regression tests. Read the <a href="docs/security/">audit report</a>. To report a vulnerability, email <a href="mailto:security@phv-lang.org">security@phv-lang.org</a>.`,
     getStarted: "Get started",
   },
   ja: {
@@ -72,7 +72,7 @@ const text = {
     packages: `パッケージマネージャーでも入れられます: <code>brew install miyagawayuu/phv/phv</code>(macOS と Linux)、または <code>scoop bucket add phv https://github.com/miyagawayuu/scoop-phv</code> と <code>scoop install phv</code>(Windows)。`,
     editor: (version) => `VS Code では、Marketplace から <a href="${marketplace}">PHV Language</a> を入れると(<code>code --install-extension phv-lang.phv-language</code>)、色分けと入力中のエラー表示が使えます。各リリースにも <a href="${releases}/download/v${version}/phv-${version}.vsix"><code>phv-${version}.vsix</code></a> として付いています。`,
     securityTitle: "セキュリティ",
-    securityLead: `PHV は 10 回のセキュリティ監査を受け、そのたびに修正と回帰テストを加えています。<a href="docs/security/">監査報告</a>をご覧ください。脆弱性の報告は <a href="mailto:security@phv-lang.org">security@phv-lang.org</a> へ。`,
+    securityLead: `PHV は 12 回のセキュリティ監査を受け、そのたびに修正と回帰テストを加えています。<a href="docs/security/">監査報告</a>をご覧ください。脆弱性の報告は <a href="mailto:security@phv-lang.org">security@phv-lang.org</a> へ。`,
     getStarted: "はじめる",
   },
 };

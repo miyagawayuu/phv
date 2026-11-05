@@ -184,6 +184,24 @@ impl DirGuard {
     }
 }
 
+/// Why a path was refused, for messages.
+pub fn describe(e: &FsError) -> String {
+    match e {
+        FsError::Link => "a link or junction is on the way".into(),
+        FsError::HardLink => "the file has more than one hard link".into(),
+        FsError::NotFile => "it is not a file".into(),
+        FsError::NoDir => "a directory on the way is missing or not a directory".into(),
+        FsError::BadName => "the name cannot be used safely".into(),
+        FsError::Shared => "the directory is writable by other users".into(),
+        FsError::Io(e) => e.to_string(),
+    }
+}
+
+/// An open file that is a regular file with one name (no other hard link).
+pub fn single_file(f: &File) -> Result<(), FsError> {
+    check_plain(f)
+}
+
 fn check_plain(f: &File) -> Result<(), FsError> {
     let meta = f.metadata()?;
     if !meta.is_file() {

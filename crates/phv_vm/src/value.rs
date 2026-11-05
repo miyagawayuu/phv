@@ -124,6 +124,11 @@ impl Key {
     }
 }
 
+/// A value that may hold other values (and so nest deeply).
+fn holds_values(v: &Value) -> bool {
+    matches!(v, Value::List(_) | Value::Map(_) | Value::Object(_) | Value::Closure(_))
+}
+
 /// Dropping a deeply nested value must not recurse (a list nested a million
 /// levels deep would overflow the stack and abort the process). Children of
 /// containers we hold the last reference to are moved onto a heap worklist.
@@ -131,14 +136,17 @@ impl Drop for Value {
     fn drop(&mut self) {
         fn take_children(v: &mut Value, out: &mut Vec<Value>) {
             match v {
+                // Only values that hold others go on the worklist; the rest
+                // are dropped here (found by the 1.0 audit: moving every item
+                // of a large list onto the worklist doubled its memory).
                 Value::List(l) => {
                     if let Some(items) = Rc::get_mut(l) {
-                        out.append(items);
+                        out.extend(items.drain(..).filter(holds_values));
                     }
                 }
                 Value::Map(m) => {
                     if let Some(m) = Rc::get_mut(m) {
-                        out.extend(m.drain(..).map(|(_, v)| v));
+                        out.extend(m.drain(..).map(|(_, v)| v).filter(holds_values));
                     }
                 }
                 Value::Object(o) => {

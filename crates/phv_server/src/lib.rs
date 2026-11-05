@@ -30,7 +30,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -61,8 +61,15 @@ const GZ_CACHE: usize = 32 << 20;
 /// A connection's read and write buffers (hyper's default is about 400 KB):
 /// a client that stops reading holds at most this much (and a file's 64 KB).
 const CONN_BUFFER: usize = 64 * 1024;
-/// Requests one HTTP/2 connection may have open at once.
-const H2_STREAMS: u32 = 64;
+/// Requests one HTTP/2 connection may have open at once, and the bytes of a
+/// response it holds per stream: with the 16 KB a file is read in, an HTTP/2
+/// connection holds about what an HTTP/1.1 one does (found by the 1.0 audit:
+/// 64 streams of 64 KB let 200 connections hold 2.5 GB).
+const H2_STREAMS: u32 = 8;
+const H2_SEND_BUF: usize = 16 * 1024;
+/// After an HTTP/2 connection is told to close, the longest wait for its
+/// streams before it is dropped (a client may never take them).
+const H2_GRACE: Duration = Duration::from_secs(10);
 /// HTTP/2 flow control: what a client may send before the server reads it,
 /// on each stream and on the whole connection (as `CONN_BUFFER` for HTTP/1).
 const H2_WINDOW: u32 = 64 * 1024;
@@ -280,6 +287,23 @@ pub fn serve_embedded(opts: ServeOptions, embedded: Embedded) -> Result<(), Stri
 
 type Stop = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+/// Opens `[server] access_log` (a file inside the project) for appending,
+/// making its directories: links, junctions and hard links on the way are
+/// refused, so a project cannot make the server append to a file elsewhere.
+fn open_access_log(root: &Path, path: &Path) -> Result<std::fs::File, String> {
+    use phv_std::safefs::{open_parent, FsError};
+    let describe = |e: FsError| phv_std::safefs::describe(&e);
+    let rel = path.strip_prefix(root).map_err(|_| "it is not inside the project".to_string())?;
+    let parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
+    for i in 1..parts.len() {
+        let dir: PathBuf = parts[..i].iter().collect();
+        let (parent, name) = open_parent(root, &dir).map_err(describe)?;
+        parent.make_dir(&name).map_err(describe)?;
+    }
+    let (dir, name) = open_parent(root, rel).map_err(describe)?;
+    dir.open_append(&name).map_err(describe)
+}
+
 fn serve_with(
     listener: std::net::TcpListener,
     opts: ServeOptions,
@@ -301,13 +325,7 @@ fn serve_with(
     let mut state = State::new(root, opts.dev, opts.time_limit, config);
     state.watch = opts.watch && opts.dev && state.embedded.is_none();
     if let Some((path, _)) = &state.config.access_log {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
+        let file = open_access_log(&state.root, path)
             .map_err(|e| format!("cannot open the access log {}: {e}", path.display()))?;
         state.access_log = Some(Mutex::new(file));
     }
@@ -364,18 +382,20 @@ fn serve_with(
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
                 let io = StallGuard::new(stream, WRITE_STALL);
+                // Bytes of responses the connection has taken (see `Sending`).
+                let written = Arc::new(AtomicU64::new(0));
                 match acceptor {
                     Some(acceptor) => {
                         // A client that does not finish the handshake in time is dropped.
                         if let Ok(Ok(io)) = tokio::time::timeout(HEADER_TIMEOUT, acceptor.accept(io)).await {
                             if io.get_ref().1.alpn_protocol() == Some(b"h2") {
-                                serve_h2(state, peer, io, closed).await;
+                                serve_h2(state, peer, io, closed, written).await;
                             } else {
                                 serve_h1(state, peer, io, closed).await;
                             }
                         }
                     }
-                    None if state.config.h2c => serve_auto(state, peer, io, closed).await,
+                    None if state.config.h2c => serve_auto(state, peer, io, closed, written).await,
                     None => serve_h1(state, peer, io, closed).await,
                 }
                 drop(permit);
@@ -409,6 +429,8 @@ macro_rules! drive {
         tokio::pin!(conn);
         let idle: Option<Arc<Activity>> = $idle;
         let mut closed = $closed;
+        // Responses waiting to be sent, and when bytes last went out.
+        let (mut last_written, mut progress) = (0u64, Instant::now());
         loop {
             tokio::select! {
                 _ = conn.as_mut() => break,
@@ -418,9 +440,19 @@ macro_rules! drive {
                     break;
                 }
                 _ = tokio::time::sleep(Duration::from_secs(1)), if idle.is_some() => {
-                    if idle.as_ref().is_some_and(|a| a.idle_for() >= H2_IDLE) {
+                    let Some(a) = idle.as_ref() else { break };
+                    let written = a.written.load(Ordering::Relaxed);
+                    if written != last_written || a.sending.load(Ordering::SeqCst) == 0 {
+                        (last_written, progress) = (written, Instant::now());
+                    } else if progress.elapsed() >= WRITE_STALL {
+                        // Responses are waiting and the connection has taken
+                        // none of their bytes for as long as an HTTP/1.1 write
+                        // may stall: the client gives no flow-control window.
+                        break;
+                    }
+                    if a.idle_for() >= H2_IDLE {
                         conn.as_mut().graceful_shutdown();
-                        let _ = conn.await;
+                        let _ = tokio::time::timeout(H2_GRACE, conn.as_mut()).await;
                         break;
                     }
                 }
@@ -429,22 +461,80 @@ macro_rules! drive {
     }};
 }
 
-/// Requests in progress on one connection, and when the last one ended.
+/// Requests in progress on one connection, responses still being sent, and
+/// when the last of them ended; and the bytes of responses it has taken (a
+/// client without a flow-control window lets it take none: pings and other
+/// frames still go out, so the socket's writes do not tell).
 struct Activity {
     open: AtomicUsize,
+    sending: AtomicUsize,
     since: Mutex<Instant>,
+    written: Arc<AtomicU64>,
 }
 
 impl Activity {
-    fn new() -> Arc<Activity> {
-        Arc::new(Activity { open: AtomicUsize::new(0), since: Mutex::new(Instant::now()) })
+    fn new(written: Arc<AtomicU64>) -> Arc<Activity> {
+        Arc::new(Activity {
+            open: AtomicUsize::new(0),
+            sending: AtomicUsize::new(0),
+            since: Mutex::new(Instant::now()),
+            written,
+        })
     }
 
     fn idle_for(&self) -> Duration {
-        if self.open.load(Ordering::SeqCst) > 0 {
+        if self.open.load(Ordering::SeqCst) > 0 || self.sending.load(Ordering::SeqCst) > 0 {
             return Duration::ZERO;
         }
         self.since.lock().map(|t| t.elapsed()).unwrap_or_default()
+    }
+}
+
+/// A response body counted as being sent on its connection until it is dropped.
+struct Sending {
+    body: RespBody,
+    activity: Arc<Activity>,
+}
+
+impl Sending {
+    fn new(body: RespBody, activity: &Arc<Activity>) -> Sending {
+        activity.sending.fetch_add(1, Ordering::SeqCst);
+        Sending { body, activity: activity.clone() }
+    }
+}
+
+impl Drop for Sending {
+    fn drop(&mut self) {
+        if let Ok(mut t) = self.activity.since.lock() {
+            *t = Instant::now();
+        }
+        self.activity.sending.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl hyper::body::Body for Sending {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
+        let r = Pin::new(&mut self.body).poll_frame(cx);
+        if let std::task::Poll::Ready(Some(Ok(f))) = &r {
+            if let Some(d) = f.data_ref() {
+                self.activity.written.fetch_add(d.len() as u64 + 1, Ordering::Relaxed);
+            }
+        }
+        r
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -481,7 +571,7 @@ fn h2_builder() -> http2::Builder<TokioExecutor> {
         .initial_stream_window_size(H2_WINDOW)
         .initial_connection_window_size(H2_WINDOW)
         .adaptive_window(false)
-        .max_send_buf_size(CONN_BUFFER)
+        .max_send_buf_size(H2_SEND_BUF)
         .max_pending_accept_reset_streams(20)
         .max_local_error_reset_streams(256)
         .keep_alive_interval(Some(Duration::from_secs(30)))
@@ -499,38 +589,38 @@ where
     drive!(h1_builder().serve_connection(TokioIo::new(io), service).with_upgrades(), closed, None)
 }
 
-async fn serve_h2<I>(state: Arc<State>, peer: SocketAddr, io: I, closed: Closed)
+async fn serve_h2<I>(state: Arc<State>, peer: SocketAddr, io: I, closed: Closed, written: Arc<AtomicU64>)
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let activity = Activity::new();
+    let activity = Activity::new(written);
     let a = activity.clone();
     let service = service_fn(move |req| {
         let open = OpenRequest::new(&a);
-        let state = state.clone();
+        let (state, a) = (state.clone(), a.clone());
         async move {
             let r = handle(state, peer, req).await;
             drop(open);
-            r
+            r.map(|resp| resp.map(|b| Sending::new(b, &a)))
         }
     });
     drive!(h2_builder().serve_connection(TokioIo::new(io), service), closed, Some(activity))
 }
 
 /// `[server] h2c`: HTTP/1.1, or HTTP/2 when the client starts with its preface.
-async fn serve_auto<I>(state: Arc<State>, peer: SocketAddr, io: I, closed: Closed)
+async fn serve_auto<I>(state: Arc<State>, peer: SocketAddr, io: I, closed: Closed, written: Arc<AtomicU64>)
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let activity = Activity::new();
+    let activity = Activity::new(written);
     let a = activity.clone();
     let service = service_fn(move |req| {
         let open = OpenRequest::new(&a);
-        let state = state.clone();
+        let (state, a) = (state.clone(), a.clone());
         async move {
             let r = handle(state, peer, req).await;
             drop(open);
-            r
+            r.map(|resp| resp.map(|b| Sending::new(b, &a)))
         }
     });
     let mut b = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
@@ -542,7 +632,7 @@ where
         .initial_stream_window_size(H2_WINDOW)
         .initial_connection_window_size(H2_WINDOW)
         .adaptive_window(false)
-        .max_send_buf_size(CONN_BUFFER)
+        .max_send_buf_size(H2_SEND_BUF)
         .max_pending_accept_reset_streams(20)
         .max_local_error_reset_streams(256)
         .keep_alive_interval(Some(Duration::from_secs(30)))
@@ -563,11 +653,11 @@ fn as_http1_headers(mut req: Request<Incoming>) -> Request<Incoming> {
     if req.version() != hyper::Version::HTTP_2 {
         return req;
     }
-    if !req.headers().contains_key(hyper::header::HOST) {
-        let authority = req.uri().authority().map(|a| a.as_str().to_string());
-        if let Some(v) = authority.filter(|a| !a.contains('@')).and_then(|a| HeaderValue::from_str(&a).ok()) {
-            req.headers_mut().insert(hyper::header::HOST, v);
-        }
+    // `:authority` is the host; a `host` field that says otherwise is
+    // replaced (found by the 1.0 audit: scripts saw the other one).
+    let authority = req.uri().authority().map(|a| a.as_str().to_string());
+    if let Some(v) = authority.filter(|a| !a.contains('@')).and_then(|a| HeaderValue::from_str(&a).ok()) {
+        req.headers_mut().insert(hyper::header::HOST, v);
     }
     let cookies: Vec<&[u8]> = req.headers().get_all(hyper::header::COOKIE).iter().map(|v| v.as_bytes()).collect();
     if cookies.len() > 1 {
@@ -581,6 +671,10 @@ fn as_http1_headers(mut req: Request<Incoming>) -> Request<Incoming> {
 
 async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> Result<Resp, Infallible> {
     let req = as_http1_headers(req);
+    // Two `Host` fields: the server and a proxy in front may read different ones.
+    if req.headers().get_all(hyper::header::HOST).iter().count() > 1 {
+        return Ok(simple(StatusCode::BAD_REQUEST, "text/plain", "bad request: more than one Host".into()));
+    }
     let start = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
@@ -652,30 +746,7 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
         log_request(&state, &ip, &method, &path, r.status().as_u16(), start);
         return Ok(r);
     }
-    let limit = state.config.requests_per_minute;
-    let client = format!("ip:{}", phv_std::ratelimit::client_key(peer.ip()));
-    let minute = Duration::from_secs(60);
-    let limited = if limit == 0 {
-        None
-    } else if state.config.host.rate_limit_store.is_none() {
-        (!phv_std::ratelimit::hit(&client, limit, minute)).then(|| phv_std::ratelimit::retry_after(&client, minute))
-    } else {
-        // Counted on the shared Redis server; if it cannot be reached, in this process.
-        let (host, key) = (state.config.host.clone(), client.clone());
-        let until = Instant::now() + Duration::from_secs(2);
-        let shared =
-            tokio::task::spawn_blocking(move || phv_std::ratelimit::hit_shared(&host, &key, limit, minute, until))
-                .await;
-        match shared {
-            Ok(Ok((allowed, wait))) => (!allowed).then_some(wait),
-            Ok(Err(e)) => {
-                eprintln!("warning: the shared rate limit store cannot be used ({e}); counting in this process");
-                (!phv_std::ratelimit::hit(&client, limit, minute))
-                    .then(|| phv_std::ratelimit::retry_after(&client, minute))
-            }
-            Err(_) => None,
-        }
-    };
+    let limited = rate_limited(&state, peer.ip()).await;
     let mut resp = if let Some(wait) = limited {
         let mut r = simple(StatusCode::TOO_MANY_REQUESTS, "text/plain", "too many requests".into());
         r.headers_mut().insert("retry-after", HeaderValue::from(wait));
@@ -702,6 +773,35 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
     add_security_headers(&state, &mut resp);
     log_request(&state, &ip, &method, &path, resp.status().as_u16(), start);
     Ok(resp)
+}
+
+/// `[security] requests_per_minute`: counts one request (or WebSocket
+/// message) of the client at `ip`; the seconds to wait when it is over.
+async fn rate_limited(state: &State, ip: std::net::IpAddr) -> Option<u64> {
+    let limit = state.config.requests_per_minute;
+    let client = format!("ip:{}", phv_std::ratelimit::client_key(ip));
+    let minute = Duration::from_secs(60);
+    if limit == 0 {
+        None
+    } else if state.config.host.rate_limit_store.is_none() {
+        (!phv_std::ratelimit::hit(&client, limit, minute)).then(|| phv_std::ratelimit::retry_after(&client, minute))
+    } else {
+        // Counted on the shared Redis server; if it cannot be reached, in this process.
+        let (host, key) = (state.config.host.clone(), client.clone());
+        let until = Instant::now() + Duration::from_secs(2);
+        let shared =
+            tokio::task::spawn_blocking(move || phv_std::ratelimit::hit_shared(&host, &key, limit, minute, until))
+                .await;
+        match shared {
+            Ok(Ok((allowed, wait))) => (!allowed).then_some(wait),
+            Ok(Err(e)) => {
+                eprintln!("warning: the shared rate limit store cannot be used ({e}); counting in this process");
+                (!phv_std::ratelimit::hit(&client, limit, minute))
+                    .then(|| phv_std::ratelimit::retry_after(&client, minute))
+            }
+            Err(_) => None,
+        }
+    }
 }
 
 /// The script `phv serve --watch` adds to pages: it asks for the stamp of the
@@ -1080,6 +1180,13 @@ async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
                 return simple(StatusCode::METHOD_NOT_ALLOWED, "text/plain", "method not allowed".into());
             }
             let Ok(mut file) = tokio::fs::File::open(&p).await else { return not_found() };
+            // A file with another name (a hard link) may be one kept outside
+            // public/, such as the TLS key (found by the 1.0 audit).
+            let file_std = file.into_std().await;
+            if phv_std::safefs::single_file(&file_std).is_err() {
+                return not_found();
+            }
+            file = tokio::fs::File::from_std(file_std);
             let (len, modified) = match file.metadata().await {
                 Ok(m) if m.is_file() => (m.len(), m.modified().ok()),
                 _ => return not_found(),
@@ -1516,7 +1623,11 @@ fn busy() -> Resp {
 /// budget as it arrives, so a client holds only what it has really sent, and
 /// slow clients cannot pile up gigabytes. The permits are returned with the
 /// body and are kept until its script ends.
-async fn read_body(state: &State, mut body: Incoming) -> Result<(Bytes, Option<OwnedSemaphorePermit>), Box<Resp>> {
+async fn read_body(
+    state: &State,
+    mut body: Incoming,
+    small: usize,
+) -> Result<(Bytes, Option<OwnedSemaphorePermit>), Box<Resp>> {
     let too_large = || simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "request body too large".into());
     let stated = hyper::body::Body::size_hint(&body).upper();
     if stated.is_some_and(|n| n > MAX_BODY as u64) {
@@ -1549,7 +1660,7 @@ async fn read_body(state: &State, mut body: Incoming) -> Result<(Bytes, Option<O
         if len > data.capacity() {
             // Room grows by doubling, up to the stated length (only as bytes arrive).
             let room = (data.capacity() * 2).max(4096).min(limit).max(len);
-            let kib = room.saturating_sub(SMALL_BODY).div_ceil(1024);
+            let kib = room.saturating_sub(small).div_ceil(1024);
             if kib > held_kib {
                 let wait = deadline.min(tokio::time::Instant::now() + QUEUE_WAIT);
                 let more = (kib - held_kib) as u32;
@@ -1582,7 +1693,10 @@ async fn run_script(
     let (parts, body) = req.into_parts();
     // Memory is bounded by the scripts running at once, the bodies they read and
     // the output waiting to be sent; past a limit, new requests are turned away for now.
-    let (body, reserved) = match read_body(state, body).await {
+    // Over HTTP/2 a connection has several requests at once: none of their
+    // bodies is free of the budget (found by the 1.0 audit).
+    let small = if parts.version == hyper::Version::HTTP_2 { 0 } else { SMALL_BODY };
+    let (body, reserved) = match read_body(state, body, small).await {
         Ok(b) => b,
         Err(r) => return *r,
     };

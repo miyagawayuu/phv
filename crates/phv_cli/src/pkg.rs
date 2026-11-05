@@ -145,6 +145,16 @@ fn git(args: &[&str], dir: Option<&Path>) -> Result<String, String> {
     let no_hooks = NoHooks::new()?;
     let hooks = format!("core.hooksPath={}", no_hooks.0.display());
     let mut cmd = Command::new("git");
+    // Git runs in its own empty directory and never looks above it: in the
+    // project's directory it would find a repository there (a project laid
+    // out as a bare repository, `HEAD`, `config`, `objects/`, `refs/`) and
+    // read that repository's config, which can turn on transports that run
+    // commands. Paths given to git are absolute (see `abs`).
+    cmd.current_dir(&no_hooks.0);
+    cmd.env("GIT_CEILING_DIRECTORIES", &no_hooks.0);
+    for v in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY"] {
+        cmd.env_remove(v);
+    }
     cmd.args(["-c", &hooks, "-c", "core.fsmonitor=false", "-c", "advice.detachedHead=false"]);
     cmd.args(["-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always"]);
     cmd.args(["-c", "protocol.file.allow=always", "-c", "submodule.recurse=false"]);
@@ -153,7 +163,7 @@ fn git(args: &[&str], dir: Option<&Path>) -> Result<String, String> {
     cmd.args(["-c", "core.symlinks=false"]);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     if let Some(d) = dir {
-        cmd.arg("-C").arg(d);
+        cmd.arg("-C").arg(abs(d));
     }
     cmd.args(args);
     let out = cmd.output().map_err(|e| format!("cannot run git: {e}"))?;
@@ -162,6 +172,11 @@ fn git(args: &[&str], dir: Option<&Path>) -> Result<String, String> {
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
+}
+
+/// `p` as an absolute path: git runs in a directory of its own.
+fn abs(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// What a project or a package asks for under one name.
@@ -214,7 +229,7 @@ impl Installer<'_> {
             } else {
                 let _ = std::fs::remove_dir_all(&dir);
                 std::fs::create_dir_all(dir.parent().unwrap_or(&dir)).map_err(|e| e.to_string())?;
-                git(&["clone", "--quiet", "--bare", "--", &url, &dir.to_string_lossy()], None)
+                git(&["clone", "--quiet", "--bare", "--", &url, &abs(&dir).to_string_lossy()], None)
                     .map_err(|e| format!("cannot fetch the package registry: {e}"))?;
             }
             self.registry = Some(dir);
@@ -370,7 +385,7 @@ impl Installer<'_> {
             }
             std::fs::create_dir_all(&vendor).map_err(|e| e.to_string())?;
             let _ = std::fs::remove_dir_all(&tmp);
-            git(&["clone", "--quiet", "--no-checkout", "--", &url, &tmp.to_string_lossy()], None)?;
+            git(&["clone", "--quiet", "--no-checkout", "--", &url, &abs(&tmp).to_string_lossy()], None)?;
             let target = match (&c.commit, c.rev.as_deref()) {
                 (Some(commit), _) => commit.clone(),
                 (None, Some("HEAD") | None) => "origin/HEAD".into(),
@@ -444,7 +459,8 @@ pub fn install(dir: &Path, locked_only: bool) -> ExitCode {
         eprintln!("error: phv.lock is a link; remove it and run `phv install` again");
         return ExitCode::FAILURE;
     }
-    let old: Lock = std::fs::read_to_string(&lock_path).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default();
+    // At most 8 MB, like the sources: a committed lock file cannot fill the memory.
+    let old: Lock = phv_driver::read_source(&lock_path).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default();
     if let Some(bad) = old.packages.iter().find(|l| !is_commit_hash(&l.commit)) {
         eprintln!("error: {}: phv.lock has an invalid commit \"{}\"", bad.name, bad.commit);
         return ExitCode::FAILURE;
@@ -566,6 +582,18 @@ fn resolve(ins: &mut Installer, root_deps: &BTreeMap<String, Dependency>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Git never uses a repository it finds where `phv install` runs (the
+    /// project, which may be laid out as a bare repository with a config that
+    /// turns on transports that run commands). Tests run inside PHV's own
+    /// repository: git must not see it.
+    #[test]
+    fn git_ignores_the_repository_it_runs_in() {
+        if git(&["--version"], None).is_err() {
+            return;
+        }
+        assert!(git(&["rev-parse", "--git-dir"], None).is_err(), "git found a repository around phv");
+    }
 
     /// Each git command gets its own new directory for hooks (a fixed name in a
     /// shared temporary directory could be created first by another user).

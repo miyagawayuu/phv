@@ -82,6 +82,11 @@ pub type JitEntry = unsafe extern "C" fn(*mut JitCtx, *const i64) -> i64;
 /// Native code for the functions the JIT compiled, indexed by function id.
 pub struct JitTable {
     pub entries: Vec<Option<JitEntry>>,
+    /// Per function: it changes a string, list or map parameter in place
+    /// (`$xs[] = ...`, `.=`). Its arguments are not kept for a rerun (an
+    /// extra reference would make that change copy the whole value), so when
+    /// its native code runs out of stack it stops instead.
+    pub writes_args: Vec<bool>,
     /// Owns the executable memory the entries point into.
     pub keep_alive: Box<dyn std::any::Any + Send + Sync>,
 }
@@ -321,6 +326,17 @@ unsafe fn long_op(ctx: *mut JitCtx, bytes: usize) {
     }
 }
 
+/// After hashing a map key of `bytes`: a long one is timed at once (one
+/// loop step may look it up many times), as in the interpreter.
+///
+/// # Safety
+/// See `rt`.
+unsafe fn long_key(ctx: *mut JitCtx, bytes: usize) {
+    if bytes >= LONG_OP && (*(*ctx).limits).deadline.is_some_and(|d| Instant::now() > d) && (*ctx).error == 0 {
+        (*ctx).error = JIT_ERR_TIME;
+    }
+}
+
 /// `AppendStr`; returns an error code.
 ///
 /// # Safety
@@ -329,8 +345,8 @@ pub unsafe extern "C" fn phv_jit_append(ctx: *mut JitCtx, d: i64, s: i64) -> i64
     let mem = mem(ctx);
     let w = rt(ctx).top();
     match op_append(w, mem, d as u16, s as u16) {
-        Ok(()) => {
-            long_op(ctx, str_len(&w[s as usize]));
+        Ok(work) => {
+            long_op(ctx, work);
             0
         }
         Err(_) => JIT_ERR_MEMORY,
@@ -634,6 +650,7 @@ pub unsafe extern "C" fn phv_jit_get(ctx: *mut JitCtx, d: i64, c: i64, k: i64, k
             return 0;
         }
     };
+    long_key(ctx, str_len(&w[k as usize]));
     match found {
         Ok(v) => deliver(ctx, d, kind, v, false),
         Err(_) if or_null != 0 => deliver(ctx, d, kind, Value::Null, true),
@@ -657,6 +674,7 @@ pub unsafe extern "C" fn phv_jit_set_key(ctx: *mut JitCtx, r: i64, k: i64, val: 
     }
     let v = w[val as usize].clone();
     let key = [w[k as usize].clone()];
+    long_key(ctx, str_len(&key[0]));
     let cost = copy_cost(&w[r as usize], &key, false);
     if cost > 0 {
         if mem.reserve(cost).is_err() {
@@ -696,7 +714,11 @@ pub unsafe extern "C" fn phv_jit_entry(ctx: *mut JitCtx, d: i64, m: i64, i: i64,
 pub unsafe extern "C" fn phv_jit_has(ctx: *mut JitCtx, m: i64, k: i64) -> i64 {
     let w = rt(ctx).top();
     match &w[m as usize] {
-        Value::Map(map) => map.contains_key(&w[k as usize].to_key()) as i64,
+        Value::Map(map) => {
+            let found = map.contains_key(&w[k as usize].to_key()) as i64;
+            long_key(ctx, str_len(&w[k as usize]));
+            found
+        }
         _ => {
             wrong_value(ctx);
             0

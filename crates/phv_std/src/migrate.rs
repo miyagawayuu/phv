@@ -15,14 +15,15 @@ pub struct Migration {
 
 /// The database migrations run on.
 pub enum Target<'a> {
-    /// A SQLite file (inside the project).
-    Sqlite(PathBuf),
+    /// A SQLite file: the project's directory and the file's path in it.
+    Sqlite(PathBuf, PathBuf),
     /// A database server of `[databases]`.
     Server(&'a DatabaseSpec),
 }
 
 pub enum Conn {
-    Sqlite(Box<rusqlite::Connection>),
+    /// The connection, and the directories of its file held (see `db::open_file`).
+    Sqlite(Box<rusqlite::Connection>, Box<crate::safefs::DirGuard>),
     Server(MigrationConn),
 }
 
@@ -61,21 +62,26 @@ pub fn checksum(sql: &str) -> String {
 impl Conn {
     pub fn open(target: &Target) -> Result<Conn, String> {
         match target {
-            Target::Sqlite(path) => {
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            Target::Sqlite(root, rel) => {
+                // A migration from a repository is code: it may change this
+                // database, but not reach (create or overwrite) another file,
+                // through ATTACH or through a link in the repository (found by
+                // the 1.0 audit). It is opened as a script opens one.
+                let mut parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
+                parts.pop();
+                for i in 1..=parts.len() {
+                    let d: std::path::PathBuf = parts[..i].iter().collect();
+                    let (parent, name) = crate::safefs::open_parent(root, &d)
+                        .map_err(|e| format!("{}: {}", d.display(), crate::safefs::describe(&e)))?;
+                    parent.make_dir(&name).map_err(|e| format!("{}: {}", d.display(), crate::safefs::describe(&e)))?;
                 }
-                let c = rusqlite::Connection::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-                // A migration from a repository is code: it may change this database,
-                // but not attach (create or overwrite) another file.
-                c.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_ATTACHED, 0).map_err(|e| e.to_string())?;
-                c.authorizer(Some(crate::db::sqlite_authorizer));
+                let (c, dir) = crate::db::open_file(root, rel)?;
                 c.execute_batch(
                     "CREATE TABLE IF NOT EXISTS phv_migrations (name TEXT PRIMARY KEY, checksum TEXT NOT NULL, \
                      applied_at TEXT NOT NULL)",
                 )
                 .map_err(|e| e.to_string())?;
-                Ok(Conn::Sqlite(Box::new(c)))
+                Ok(Conn::Sqlite(Box::new(c), Box::new(dir)))
             }
             Target::Server(spec) => migration_conn(spec).map(Conn::Server),
         }
@@ -83,7 +89,7 @@ impl Conn {
 
     pub fn applied(&mut self) -> Result<Vec<(String, String)>, String> {
         match self {
-            Conn::Sqlite(c) => {
+            Conn::Sqlite(c, _) => {
                 let mut st =
                     c.prepare("SELECT name, checksum FROM phv_migrations ORDER BY name").map_err(|e| e.to_string())?;
                 let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?;
@@ -98,7 +104,7 @@ impl Conn {
         let sum = checksum(sql);
         let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         match self {
-            Conn::Sqlite(c) => {
+            Conn::Sqlite(c, _) => {
                 let tx = c.transaction().map_err(|e| e.to_string())?;
                 tx.execute_batch(sql).map_err(|e| e.to_string())?;
                 tx.execute(
@@ -155,7 +161,7 @@ mod tests {
         let names: Vec<String> = files(&dir.join("m")).unwrap().into_iter().map(|m| m.name).collect();
         assert_eq!(names, ["2_table.sql", "10_more.sql"]);
 
-        let target = Target::Sqlite(dir.join("db/app.db"));
+        let target = Target::Sqlite(dir.clone(), PathBuf::from("db/app.db"));
         let mut conn = Conn::open(&target).unwrap();
         for m in files(&dir.join("m")).unwrap() {
             conn.apply(&m.name, &std::fs::read_to_string(&m.path).unwrap()).unwrap();
@@ -164,7 +170,7 @@ mod tests {
         assert!(states.iter().all(|(_, s)| *s == State::Applied) && gone.is_empty());
         // A failing migration leaves nothing behind.
         assert!(conn.apply("3_bad.sql", "INSERT INTO t VALUES (3); SELECT nope FROM missing;").is_err());
-        let Conn::Sqlite(c) = &conn else { unreachable!() };
+        let Conn::Sqlite(c, _) = &conn else { unreachable!() };
         let rows: i64 = c.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 2);
         write("2_table.sql", "CREATE TABLE t (n INTEGER);");

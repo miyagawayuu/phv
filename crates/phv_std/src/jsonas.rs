@@ -119,7 +119,15 @@ struct Builder<'a> {
     defaults: &'a [Value],
     /// Where in the document the value being built is: `$.items[2].name`.
     path: String,
+    /// Values built so far: the limits are checked every `CHECK_EVERY`.
+    built: usize,
 }
+
+/// The time and memory limits are checked after this many values (found by
+/// the 1.0 audit: the second tree grew to 1.7 times the memory limit).
+const CHECK_EVERY: usize = 4096;
+/// Memory of one entry of a map or set beyond its values.
+const ENTRY: usize = 48;
 
 impl Builder<'_> {
     fn fail(&self, vm: &Vm, what: &str) -> VmError {
@@ -138,6 +146,10 @@ impl Builder<'_> {
     }
 
     fn build(&mut self, vm: &mut Vm, v: &Value, sh: &Shape) -> Result<Value, VmError> {
+        self.built += 1;
+        if self.built.is_multiple_of(CHECK_EVERY) {
+            vm.check_limits()?;
+        }
         match (sh, v) {
             (Shape::Any, v) => Ok(v.clone()),
             (Shape::Opt(_), Value::Null) => Ok(Value::Null),
@@ -153,6 +165,7 @@ impl Builder<'_> {
             (Shape::Bool, v) => Err(self.expected(vm, "true or false", v)),
             (Shape::List(item), Value::List(items)) => {
                 let len = self.path.len();
+                vm.reserve(items.len().saturating_mul(std::mem::size_of::<Value>()))?;
                 let mut out = Vec::with_capacity(items.len());
                 for (i, x) in items.iter().enumerate() {
                     self.path.push_str(&format!("[{i}]"));
@@ -164,6 +177,7 @@ impl Builder<'_> {
             (Shape::List(_), v) => Err(self.expected(vm, "an array", v)),
             (Shape::Set { int_items }, Value::List(items)) => {
                 let len = self.path.len();
+                vm.reserve(items.len().saturating_mul(ENTRY))?;
                 let mut out = phv_vm::KeySet::with_capacity(items.len());
                 for (i, x) in items.iter().enumerate() {
                     let key = match (int_items, x) {
@@ -183,6 +197,7 @@ impl Builder<'_> {
             (Shape::Set { .. }, v) => Err(self.expected(vm, "an array", v)),
             (Shape::Map { int_keys, value }, Value::Map(m)) => {
                 let len = self.path.len();
+                vm.reserve(m.len().saturating_mul(ENTRY + std::mem::size_of::<Value>()))?;
                 let mut out = Map::with_capacity(m.len());
                 for (k, x) in m.iter() {
                     let name = match k {
@@ -293,7 +308,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let v =
                 json_decode_in(vm, s(&a[0]))?.map_err(|e| vm.throw("ValueError", format!("json_decode_as(): {e}")))?;
             let defaults = super::list(&a[2]).clone();
-            Builder { classes: &classes, defaults: &defaults, path: "$".into() }.build(vm, &v, &top)
+            Builder { classes: &classes, defaults: &defaults, path: "$".into(), built: 0 }.build(vm, &v, &top)
         },
         _ => return None,
     };

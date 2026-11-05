@@ -187,7 +187,45 @@ echo {expr};
             Limits { max_time: Some(Duration::from_secs(1)), max_memory: Some(256 << 20), ..Limits::default() };
         let start = Instant::now();
         let (out, _) = run_limited(name, &src, limits);
-        assert!(start.elapsed() < Duration::from_secs(8), "{name} took {:?}", start.elapsed());
+        // Building the inputs counts too, and tests run side by side; without
+        // the checks each of these ran for minutes.
+        assert!(start.elapsed() < Duration::from_secs(20), "{name} took {:?}", start.elapsed());
         assert!(out.contains("maximum execution time"), "{name}: {out}");
+    }
+}
+
+/// Found by the 1.0 audit: encoders that did not account their output, and
+/// a set's strings written to JSON.
+#[test]
+fn encoders_and_sets_stay_within_the_memory_limit() {
+    for (name, expr) in [
+        ("rawurlencode", "strlen(rawurlencode(str_repeat(\"!\", 8 << 20)))"),
+        ("bin2hex", "strlen(bin2hex(str_repeat(\"!\", 8 << 20)))"),
+        ("http_build_query", "strlen(http_build_query([\"a\" => str_repeat(\"!\", 8 << 20)]))"),
+        ("json_set", "strlen(json_encode(set([str_repeat(\"\\x01\", 3 << 20), str_repeat(\"\\x02\", 3 << 20)])))"),
+    ] {
+        assert_stops_at_limit(name, &format!("<?phv\necho {expr};\n"));
+    }
+}
+
+/// Found by the 1.0 audit: copying a shared string for `.=`, and hashing a
+/// long map key many times in one loop step, were not timed.
+#[test]
+fn copies_and_long_keys_stop_at_the_time_limit() {
+    let cases = [
+        ("append_shared", "$s = str_repeat(\"a\", 20 << 20);\nwhile (true) { $t = $s; $s .= \"x\"; }\n"),
+        (
+            "long_key",
+            "$k = str_repeat(\"k\", 8 << 20);\nmap<string, int> $m = [$k => 1];\n$n = 0;\n\
+             while (true) { $n += $m[$k] + $m[$k] + $m[$k] + $m[$k] + $m[$k] + $m[$k] + $m[$k] + $m[$k]; }\n",
+        ),
+    ];
+    for (name, body) in cases {
+        let limits =
+            Limits { max_time: Some(Duration::from_secs(1)), max_memory: Some(256 << 20), ..Limits::default() };
+        let start = Instant::now();
+        let (out, _) = run_limited(name, &format!("<?phv\n{body}"), limits);
+        assert!(out.contains("maximum execution time"), "{name}: {out}");
+        assert!(start.elapsed() < Duration::from_secs(5), "{name} took {:?}", start.elapsed());
     }
 }

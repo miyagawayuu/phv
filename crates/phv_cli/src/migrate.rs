@@ -159,7 +159,11 @@ pub fn convert(src: &str) -> Migration {
             out.push_str("\");");
             todos += 1;
             i = end;
-        } else if word_at(i, "new") && src[i + 3..].trim_start().to_ascii_lowercase().starts_with("stdclass") {
+        } else if word_at(i, "new")
+            && src[i + 3..].trim_start().get(..8).is_some_and(|w| w.eq_ignore_ascii_case("stdclass"))
+        {
+            // Only the next word is looked at (found by the 1.0 audit: lowering
+            // the rest of the file at each `new` was quadratic).
             out.push_str("[] /* TODO(migrate): stdClass -> a map or a class */ ");
             todos += 1;
             let rest = src[i + 3..].trim_start();

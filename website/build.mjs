@@ -96,6 +96,12 @@ function renderDoc(markdown, lang) {
         if (depth === 2 || depth === 3) toc.push({ depth, id, html });
         return `<h${depth} id="${id}"><a class="anchor" href="#${id}" aria-hidden="true">#</a>${html}</h${depth}>\n`;
       },
+      // HTML written in the docs is shown as text, not made part of the page
+      // (found by the 1.0 audit: a change to the docs could add a redirect
+      // or an overlay). Markup belongs in code blocks.
+      html({ text }) {
+        return escape(text);
+      },
       link({ href, title, tokens }) {
         const text = this.parser.parseInline(tokens);
         const target = docLinks[lang][href] ?? href;

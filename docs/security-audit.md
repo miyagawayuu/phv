@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates eleven audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), and §21 an assessment of the whole implementation before 1.0.
+This report consolidates twelve audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, and §22 an assessment of the whole implementation before 1.0.0.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§21: 2026-11-05)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -1068,3 +1068,115 @@ and `bodies_are_sent_in_counted_slices` (phv_server), `long_comparisons_and_call
 `csv_parse`/`jwt_decode` cases (phv_driver), `sqlite_nested` in `tests/cases`, and the database tests (nested transactions,
 `phv:` keys) that CI runs. All tests pass on Windows, and on Linux and macOS in CI, with clippy (`-D warnings`) and
 rustfmt. Dependencies: no new crates (rusqlite's `functions` feature).
+
+## 22. Twelfth Assessment: the Whole Implementation (before 1.0.0)
+
+Date: 2026-11-05. Scope: everything at a17d29e, with the 1.0 additions (the cycle collector, `set<T>`, HTTPS and HTTP/2,
+the WebSocket server, the JIT for lists, maps and nullable values, `[project] phv`), and every earlier fix, which was
+attacked again. Six reviewers each took one area (the web server; templates and XSS; the VM, the JIT and the type
+checker; the standard library and the databases; the tools, the editor and CI; and the tools the fifth did not reach:
+the debugger, `phv migrate`, `phv db migrate`, the website and the demo) and attacked a release build locally,
+confirming every finding with a PoC. Every finding was fixed and its PoC run again against the fixed build.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| Critical | 1 | Fixed |
+| High | 3 | Fixed |
+| Medium | 15 | Fixed |
+| Low | 14 | Fixed |
+| Info | 4 | Fixed |
+
+### Critical
+
+| # | Finding | Fix |
+|---|---|---|
+| R15-1 | A function the JIT compiled that had only numbers of its own, calling one with a `?int`, `?float` or `?bool` parameter or result (passed in the register window), had no window: the call wrote into its caller's. Six ordinary lines aborted the process (`phv serve` included: one request took the server down), or emptied a caller's string | A function that passes or receives a value in the window has one; regression test `calls_with_nullable_arguments_keep_their_windows` |
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R15-2 | `phv install` ran git in the project's directory: a project laid out as a bare repository (`HEAD`, `config`, `objects/`, `refs/`) had git read its `config`, which can turn on a transport that runs commands (`ext::`) and rewrite `https://` to it | Git runs in a new empty directory of its own, never looks above it (`GIT_CEILING_DIRECTORIES`) and gets absolute paths; test `git_ignores_the_repository_it_runs_in` |
+| R15-3 | HTTP/2 responses a client never took (no flow-control window, or a client that did not read) were held per stream, 64 streams of 64 KB per connection, and the socket never stalled, so nothing closed them: 200 connections held 2.5 GB, and the counted page output made every other client get 503 | 8 streams and 16 KB per stream (16 KB file buffers): a connection holds about what an HTTP/1.1 one does. A connection whose responses take no bytes for 30 seconds is dropped, and the wait after closing one is at most 10 seconds |
+| R15-4 | The record of objects was searched again at every `new` when the number of live objects was just below its capacity (a shrink that never grew it): 29 seconds for 20,000 objects, past the time limit | The record always has room for as many objects again as are alive |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R15-5 | A TLS client that chose HTTP/2 and sent nothing was never closed; 1,024 of them shut everyone out | The wait after an idle connection is told to close is bounded: closed after 40 seconds |
+| R15-6 | HTTP/2 request bodies had the 64 KB free of the body budget per stream, 64 per connection: 750 MB held | Over HTTP/2 a body counts from its first byte |
+| R15-7 | Regular expressions: the time limit was checked every 1,024 matches, and each search for the next match may read to the end of the text: 97 seconds under a 2-second limit | The limits are checked after every match |
+| R15-8 | Each in-memory SQLite database had the script's whole memory limit, in SQLite's memory (not the VM's): 40 of them took 567 MB for a 16 MB request and made other requests' SQLite fail | A script's in-memory databases share its memory limit |
+| R15-9 | Redis array replies were counted at 3 bytes per element and became about 64 in memory: 891 MB under a 128 MB limit | 64 bytes per element are charged to the reply's budget before the list is built |
+| R15-10 | `rawurlencode()`, `http_build_query()` and `bin2hex()` did not account their output (missed in R14-11): 777 MB under 128 MB | The output is reserved before it is built |
+| R15-11 | WebSocket kept values counted only the bytes of keys and values: 15,000 empty values per connection, 2.2 MB each | At most 256 values, each counting 64 bytes more |
+| R15-12 | Hashing a long map key was not timed: 1,000 lookups of a 32 MB key in one loop step ran past the time limit (interpreter and JIT) | A key over 64 KB checks the limits when it is looked up or stored |
+| R15-13 | `.=` on a string also held elsewhere copied it untimed and unaccounted | The copy is reserved and counted as a long operation |
+| R15-14 | `json_encode()` of a set did not reserve its strings' escaped output: 832 MB under 128 MB | Set elements are accounted like strings |
+| R15-15 | In the JIT a builtin's argument (`count($xs)`, `strlen($s)`) stayed in the window, so the next change of the value copied it whole: a loop of `$xs[] = 1` took 77 seconds instead of 0.01 | The slot is emptied after the call, as the interpreter moves the argument out |
+| R15-16 | `[server] access_log` was opened through links and junctions: a repository could make `phv serve` append to a file outside it | The log is opened inside the project with `safefs`, links refused |
+| R15-17 | `[server] tls_cert` / `tls_key` took network paths (`\\host\share\...`): `phv serve` would contact that host with the user's credentials | Network and device paths are refused |
+| R15-18 | The `<meta http-equiv>` check could be passed through a block: a block that closed the tag and opened `<meta name>` left the following `content` read as descriptive text (an open redirect) | After a block the tag's attributes of both ways are kept: the `content` is checked if either way makes it act |
+| R15-19 | `phv db migrate --sqlite` followed links in the repository: a migration created or overwrote files outside the project (a `.bat` file whose text ran) | Migrations open SQLite as scripts do (`safefs`, no link or hard link on the way or for the journals, `NOFOLLOW`, PHV's VFS) |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R15-20 | `[cors] origins = ["*"]` (and `Origin: null`) let any site open a WebSocket with the visitor's cookies | Another site needs to be named in `[cors]` with `credentials = true` |
+| R15-21 | A request whose `host` differed from its `:authority`, or with two `Host` fields, reached scripts with another host than a proxy would read | `:authority` replaces `host`; two `Host` fields get 400 |
+| R15-22 | WebSocket messages were rate limited under another key than requests (each IPv6 address of a /64, never the shared store) | Messages use the requests' key and store |
+| R15-23 | `json_decode_as()` built its second tree without checking the limits: 1.7 times the memory limit | It reserves and checks the limits as it builds |
+| R15-24 | `sql_ident()` let a name from a request reach PHV's own `phv_sessions` table: a visitor could read and forge sessions | Names starting with `phv_` are refused |
+| R15-25 | Windows short names (`GIT~1`) passed the check that `[permissions].write` holds no code (`.git`, `.phv-cache`) | Names with `~` are refused in permission and session directories |
+| R15-26 | The arguments a JIT call kept for a rerun made a function that changed its list parameter copy it whole (128 MB were not enough where the interpreter needed 40) | Such functions keep no copy; out of native stack they stop with "maximum call stack depth exceeded" |
+| R15-27 | Dropping a large list moved every element onto a worklist first: twice its memory, outside the limit | Only values that hold others go on the worklist |
+| R15-28 | `phv install` read `phv.lock` whole: a 293 MB lock took 330 MB | It is read with the 8 MB limit of sources |
+| R15-29 | Migrations had weaker SQLite settings than scripts (no defensive mode, no length limits) | One function sets up every SQLite connection |
+| R15-30 | A DAP `scopes` request with a huge frame id overflowed an addition and ended the script; later requests were not answered | Frame ids are checked; requests the script can no longer answer get an error |
+| R15-31 | `phv migrate` lowered the rest of the file at each `new`: quadratic, 17 seconds for 20,000 | Only the next word is compared |
+| R15-32 | Diagnostics printed source lines as they were: escape sequences in a file reached the terminal (clipboard, screen) | Control characters are shown as U+FFFD |
+| R15-33 | The website build passed HTML written in the docs into the pages (a redirect, an overlay) | HTML in the docs is shown as text |
+
+### Info
+
+| # | Finding | Fix |
+|---|---|---|
+| R15-34 | Static files were served through hard links: a hard link in `public/` to the TLS key served it | Files with more than one name are not served |
+| R15-35 | SQLite pragmas that can corrupt a database (`schema_version`, `cell_size_check`, `trusted_schema`) were allowed | Refused, and SQLite's defensive mode is on |
+| R15-36 | `--sqlite \foo.db` (or `C:foo.db`) was not seen as outside the project | Only names inside the project are accepted |
+| R15-37 | `srcset` and animation `values` were checked as a URL only at their start | Each URL of the list is checked |
+
+### Residual Risks
+
+- SQLite's memory has one process-wide cap (512 MB). A script's in-memory databases are bounded by its memory limit,
+  but many requests at once can still reach the cap, and then SQLite fails for the others until they end.
+- `tls_cert` and `tls_key` may be absolute paths on this machine (certificates usually live outside the project); a
+  file is only parsed as PEM, and nothing of it is shown.
+- `publish()` reaches the WebSocket connections of one server process.
+- The demo's base image is not pinned by digest, and its archive is checked against the `SHA256SUMS` of the same
+  release (it detects corruption, not a replaced release).
+- The cycle collector runs on the number of objects, not when memory runs short.
+
+### Verification
+
+Every PoC was rerun against the fixed build: the `?int` call prints 42 under the JIT (it aborted); the bare repository's
+command does not run; 200 stalled HTTP/2 connections take 105 MB and are dropped after 30 seconds while another client
+gets 200 (2.5 GB and 503); a silent HTTP/2 connection closes at 40 seconds (never); bodies over 200 connections 127 MB
+(750 MB); the regular expressions stop at 2.1 and 2.4 seconds (97 and 5); the 20,000 objects take 0.005 seconds (29);
+the long key, the shared `.=` and the JIT loops stop at the time limit or run in 0.01 seconds; the JSON set stops at
+61 MB (832); the dropped list peaks at 62 MB (123); the lock 6 MB (330); the access log and the migration through links
+are refused and the files outside are untouched; the network TLS path is refused; the `<meta>` page and the forged
+session are refused; WebSockets from `*` and `null` get 403; the hard-linked key gets 404; the DAP request gets an error
+and the session continues; `phv migrate` takes 0.43 seconds (17.4) and prints no escape character. Regression tests:
+`blocks_keep_the_attributes_of_a_meta`, `every_url_of_a_list_is_checked`, `control_characters_are_not_printed`
+(phv_syntax); `calls_with_nullable_arguments_keep_their_windows`, `a_list_parameter_changed_in_place_is_not_copied`,
+`encoders_and_sets_stay_within_the_memory_limit`, `copies_and_long_keys_stop_at_the_time_limit` and
+`paths_that_leave_the_machine_or_hide_a_name_are_refused` (phv_driver); `cors_lets_other_sites_open_websockets_only_by_name_with_credentials`
+and `two_host_fields_are_refused` (phv_server); `git_ignores_the_repository_it_runs_in` and the DAP session test (phv_cli);
+`sql_ident_reserved` in `tests/cases`; and `every_builtin_has_one_implementation` (phv_std), which found two builtins
+of one name while the WebSocket server was written. All tests pass on Windows, and on Linux and macOS in CI, with clippy
+(`-D warnings`) and rustfmt. `npm audit` finds nothing in the extension and the website, and `cargo audit` runs in CI.

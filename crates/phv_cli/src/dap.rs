@@ -216,7 +216,13 @@ impl Hook {
                 self.out.respond(req, json!({ "stackFrames": frames, "totalFrames": frames.len() }));
             }
             "scopes" => {
+                // A frame id from the editor: one of the frames shown (found by
+                // the 1.0 audit: a huge one overflowed the addition).
                 let id = args["frameId"].as_u64().unwrap_or(0) as usize;
+                if id >= self.frames(vm).len() {
+                    self.out.fail(req, "no such frame");
+                    return;
+                }
                 self.out.respond(
                     req,
                     json!({ "scopes": [{ "name": "Locals", "variablesReference": FRAME_REF + id, "expensive": false }] }),
@@ -546,7 +552,12 @@ fn serve(input: &mut impl BufRead, out: &Out) {
             "threads" => out.respond(&req, json!({ "threads": [{ "id": 1, "name": "main" }] })),
             "stackTrace" | "scopes" | "variables" | "evaluate" => {
                 if shared.stopped.load(Ordering::SeqCst) {
-                    let _ = tx.send(Cmd::Inspect(req.clone()));
+                    // The script's thread may be gone (it stopped with an error):
+                    // the request is answered anyway.
+                    if tx.send(Cmd::Inspect(req.clone())).is_err() {
+                        shared.stopped.store(false, Ordering::SeqCst);
+                        out.fail(&req, "the script has ended");
+                    }
                 } else if req["command"] == "stackTrace" {
                     out.respond(&req, json!({ "stackFrames": [], "totalFrames": 0 }));
                 } else {
@@ -744,20 +755,26 @@ mod tests {
         let xs_ref = find("$xs")["variablesReference"].as_i64().unwrap();
         s.request("variables", json!({ "variablesReference": xs_ref }));
         assert_eq!(s.response(7)["body"]["variables"][2]["value"], "3");
+        // Found by the 1.0 audit: a frame id that is not one of the frames
+        // overflowed an addition and ended the script.
+        s.request("scopes", json!({ "frameId": u64::MAX }));
+        assert_eq!(s.response(8)["success"], false);
+        s.request("stackTrace", json!({ "threadId": 1 }));
+        assert_eq!(s.response(9)["body"]["stackFrames"][0]["line"], 7);
 
         // Into `double`, then out again.
         s.request("stepIn", json!({ "threadId": 1 }));
         s.wait_stopped(2);
         s.request("stackTrace", json!({ "threadId": 1 }));
-        let st = s.response(9);
+        let st = s.response(11);
         assert_eq!(st["body"]["stackFrames"][0]["name"], "double", "{st}");
         assert_eq!(st["body"]["stackFrames"][0]["line"], 2);
         s.request("evaluate", json!({ "expression": "$n", "frameId": 0, "context": "hover" }));
-        assert_eq!(s.response(10)["body"]["result"], "1");
+        assert_eq!(s.response(12)["body"]["result"], "1");
         s.request("stepOut", json!({ "threadId": 1 }));
         s.wait_stopped(3);
         s.request("stackTrace", json!({ "threadId": 1 }));
-        assert_eq!(s.response(12)["body"]["stackFrames"][0]["name"], "{main}");
+        assert_eq!(s.response(14)["body"]["stackFrames"][0]["name"], "{main}");
 
         // The breakpoint again on the next turn of the loop, then to the end.
         s.request("continue", json!({ "threadId": 1 }));
@@ -767,14 +784,14 @@ mod tests {
         s.request("stepIn", json!({ "threadId": 1 }));
         s.wait_stopped(5);
         s.request("variables", json!({ "variablesReference": FRAME_REF }));
-        let vars = s.response(15)["body"]["variables"].clone();
+        let vars = s.response(17)["body"]["variables"].clone();
         let names: Vec<&str> = vars.as_array().unwrap().iter().map(|v| v["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["$n"], "{vars}");
         // A request right after resuming is answered at once, not at the next stop.
         s.request("setBreakpoints", json!({ "source": { "path": program.to_string_lossy() }, "breakpoints": [] }));
         s.request("continue", json!({ "threadId": 1 }));
         s.request("stackTrace", json!({ "threadId": 1 }));
-        let st = s.response(18);
+        let st = s.response(20);
         assert!(st["body"]["stackFrames"].as_array().is_none_or(|f| f.is_empty()) || st["success"] == false, "{st}");
         s.wait("terminated", |m| m["event"] == "terminated");
         let output: String = s

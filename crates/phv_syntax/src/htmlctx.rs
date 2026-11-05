@@ -530,6 +530,10 @@ pub struct HtmlTracker {
     attrs: Vec<String>,
     /// A value was inserted into the `content` of the current `<meta>` as text.
     meta_text: bool,
+    /// A way through a block reached the current tag without `name`,
+    /// `property` or `itemprop` (the attributes of the ways are merged, see
+    /// `end_block`): a `<meta>` `content` here may act, not describe.
+    maybe_undescribed: bool,
     /// Byte offset (in the chunk being fed) of the character being read.
     here: usize,
     /// The end of the last literal text when it may start a tag (`<`, `</`, or
@@ -565,6 +569,7 @@ impl Default for HtmlTracker {
             found: Vec::new(),
             attrs: Vec::new(),
             meta_text: false,
+            maybe_undescribed: false,
             here: 0,
             carry: String::new(),
         }
@@ -665,7 +670,8 @@ impl HtmlTracker {
                 if tag == "meta"
                     && name == "content"
                     && (self.attrs.iter().any(|a| a == "http-equiv")
-                        || !self.attrs.iter().any(|a| matches!(a.as_str(), "name" | "property" | "itemprop"))) =>
+                        || self.maybe_undescribed
+                        || !self.described()) =>
             {
                 EchoContext::MetaContent
             }
@@ -713,12 +719,34 @@ impl HtmlTracker {
     /// raw-text element or foreign content. A template must end here, so that
     /// joining its output with other `Html` values cannot move them into
     /// another context.
-    /// Whether the output is at exactly the same place as at `other`.
+    /// Whether the output is at exactly the same place as at `other`, with
+    /// the same attributes of the current tag.
     pub fn same_place(&self, other: &HtmlTracker) -> bool {
         self.state == other.state
             && self.pending == other.pending
             && self.foreign == other.foreign
             && self.carry == other.carry
+            && (!self.in_tag()
+                || self.attrs == other.attrs
+                    && self.meta_text == other.meta_text
+                    && self.maybe_undescribed == other.maybe_undescribed)
+    }
+
+    /// Inside a start or end tag, where its attributes matter.
+    fn in_tag(&self) -> bool {
+        matches!(
+            self.state,
+            State::Tag { .. }
+                | State::AttrName { .. }
+                | State::BeforeValue { .. }
+                | State::Quoted { .. }
+                | State::Unquoted { .. }
+        )
+    }
+
+    /// The current tag has `name`, `property` or `itemprop` (a `<meta>` that describes the page).
+    fn described(&self) -> bool {
+        self.attrs.iter().any(|a| matches!(a.as_str(), "name" | "property" | "itemprop"))
     }
 
     pub fn at_top_level(&self) -> bool {
@@ -777,7 +805,23 @@ impl HtmlTracker {
                 same
             }
         };
-        same && self.pending == entry.pending && self.foreign == entry.foreign && self.carry == entry.carry
+        let same = same && self.pending == entry.pending && self.foreign == entry.foreign && self.carry == entry.carry;
+        if same && self.in_tag() {
+            // The attributes of the current tag on either way: a `<meta>` is
+            // checked as acting (`http-equiv`, or no `name`) if one way makes
+            // it so (found by the 1.0 audit: a block that closed the tag and
+            // opened another `<meta name>` hid an `http-equiv` before it).
+            let undescribed =
+                self.maybe_undescribed || entry.maybe_undescribed || !self.described() || !entry.described();
+            for a in &entry.attrs {
+                if !self.attrs.contains(a) {
+                    self.attrs.push(a.clone());
+                }
+            }
+            self.meta_text |= entry.meta_text;
+            self.maybe_undescribed = undescribed;
+        }
+        same
     }
 
     fn end_tag(&mut self, tag: String, closing: bool) {
@@ -839,6 +883,7 @@ impl HtmlTracker {
                 }
                 self.attrs.clear();
                 self.meta_text = false;
+                self.maybe_undescribed = false;
                 self.state = State::Tag { name: tag, closing };
                 continue;
             }
@@ -1083,6 +1128,13 @@ impl HtmlTracker {
                                 url = Some(UrlState::Safe);
                             }
                         }
+                        // A list of URLs: each candidate of `srcset` (after `,`) and each
+                        // value of an animation's `values` (after `;`) starts a URL again.
+                        let next_url = (name == "srcset" && c == ',')
+                            || (name == "values" && c == ';' && ANIMATION_TAGS.contains(&tag.as_str()));
+                        if next_url && !matches!(url, Some(UrlState::Script)) {
+                            url = Some(UrlState::Undecided(vec![String::new()]));
+                        }
                         State::Quoted { tag, closing, name, quote, url }
                     }
                 }
@@ -1273,6 +1325,50 @@ mod tests {
         t.feed("<p><");
         t.feed("a href=\"");
         assert_eq!(t.context(), EchoContext::Url);
+    }
+
+    /// Found by the 1.0 audit: a block that closes a `<meta http-equiv>` and
+    /// opens a `<meta name>` must not make the `content` after it descriptive.
+    #[test]
+    fn blocks_keep_the_attributes_of_a_meta() {
+        let mut t = HtmlTracker::default();
+        t.feed("<meta http-equiv=\"refresh\" ");
+        let entry = t.clone();
+        t.feed("><meta name=\"x\" ");
+        assert!(t.end_block(&entry));
+        t.feed("content=\"");
+        assert_eq!(t.context(), EchoContext::MetaContent);
+        // The other way round: a way without `name` makes it acting too.
+        let mut t = HtmlTracker::default();
+        t.feed("<meta name=\"x\" ");
+        let entry = t.clone();
+        t.feed("><meta ");
+        assert!(t.end_block(&entry));
+        t.feed("content=\"");
+        assert_eq!(t.context(), EchoContext::MetaContent);
+        // A descriptive `<meta>` with a conditional attribute stays descriptive.
+        let mut t = HtmlTracker::default();
+        t.feed("<meta name=\"x\" ");
+        let entry = t.clone();
+        t.feed("lang=\"en\" ");
+        assert!(t.end_block(&entry));
+        t.feed("content=\"");
+        assert_eq!(t.context(), EchoContext::Attr);
+    }
+
+    /// Each URL of `srcset` and of an animation's `values` is checked.
+    #[test]
+    fn every_url_of_a_list_is_checked() {
+        for (text, ctx) in [
+            ("<img srcset=\"/a.png 1x, ", EchoContext::Url),
+            ("<img srcset=\"/a.png 1x, /b.png 2x", EchoContext::Attr),
+            ("<svg><animate attributeName=\"href\" values=\"/a;", EchoContext::Url),
+            ("<svg><animate attributeName=\"href\" values=\"/a;javascript:x", EchoContext::ScriptUrl),
+        ] {
+            let mut t = HtmlTracker::default();
+            t.feed(text);
+            assert_eq!(t.context(), ctx, "{text}");
+        }
     }
 
     #[test]

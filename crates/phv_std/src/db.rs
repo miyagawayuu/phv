@@ -77,6 +77,8 @@ struct Db {
     _dir: Option<crate::safefs::DirGuard>,
     /// How many `transaction()` calls are open (inner ones are savepoints).
     depth: std::cell::Cell<u32>,
+    /// The pages an in-memory database may use (0 for a file).
+    pages: usize,
 }
 
 /// The statements for `BEGIN` / `COMMIT` / `ROLLBACK` of `Database::transaction()`
@@ -210,19 +212,19 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
         check(vm)?;
         (c, Some(dir))
     };
-    c.busy_timeout(Duration::from_secs(5)).map_err(|e| db_error(vm, e))?;
-    use rusqlite::limits::Limit;
-    // Prevent `ATTACH 'other.db'` from reaching files outside the permissions.
-    c.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0).map_err(|e| db_error(vm, e))?;
-    // Single strings/blobs and statements are bounded (e.g. `zeroblob(1e9)`).
-    c.set_limit(Limit::SQLITE_LIMIT_LENGTH, 32 * 1024 * 1024).map_err(|e| db_error(vm, e))?;
-    c.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 1024 * 1024).map_err(|e| db_error(vm, e))?;
-    // A process-wide cap on SQLite's own memory, and per connection a small
-    // page cache. An in-memory database lives entirely in memory, so it is
-    // bounded by the script's memory limit.
-    c.execute_batch("PRAGMA hard_heap_limit = 536870912; PRAGMA cache_size = -2000").map_err(|e| db_error(vm, e))?;
+    harden(&c).map_err(|e| db_error(vm, e))?;
+    // The in-memory databases of a script share its memory limit (found by
+    // the 1.0 audit: each one had all of it, and SQLite's memory is not the VM's).
+    let mut pages = 0;
     if dir.is_none() {
-        let pages = vm.memory_limit().unwrap_or(128 << 20) / 4096;
+        let total = vm.memory_limit().unwrap_or(128 << 20) / 4096;
+        let used: usize = vm.resources.iter().flatten().filter_map(|r| r.downcast_ref::<Db>()).map(|d| d.pages).sum();
+        pages = total.saturating_sub(used);
+        if pages < 16 {
+            return Err(
+                vm.throw("DatabaseError", "the in-memory databases of this script already have its whole memory limit")
+            );
+        }
         c.execute_batch(&format!("PRAGMA page_size = 4096; PRAGMA max_page_count = {pages}"))
             .map_err(|e| db_error(vm, e))?;
     }
@@ -233,9 +235,66 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
     // SQLite runs one `LIKE` or `GLOB` as a single step, which the progress
     // handler cannot stop (a long text and pattern take minutes): these do.
     like_functions(&c, vm.deadline()).map_err(|e| db_error(vm, e))?;
+    // Last: the authorizer refuses the pragmas set above.
     c.authorizer(Some(sqlite_authorizer));
-    vm.resources.push(Some(Box::new(Db { conn: c, _dir: dir, depth: std::cell::Cell::new(0) })));
+    vm.resources.push(Some(Box::new(Db { conn: c, _dir: dir, depth: std::cell::Cell::new(0), pages })));
     Ok(Value::Int(vm.resources.len() as i64 - 1))
+}
+
+/// The settings of every SQLite connection, a script's or a migration's (the
+/// authorizer, `sqlite_authorizer`, is set after the caller's own pragmas).
+pub(crate) fn harden(c: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::limits::Limit;
+    c.busy_timeout(Duration::from_secs(5))?;
+    // Defensive mode: no writes to the schema or the shadow tables of virtual
+    // tables, which could corrupt the database file.
+    c.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    // Prevent `ATTACH 'other.db'` from reaching files outside the permissions.
+    c.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
+    // Single strings/blobs and statements are bounded (e.g. `zeroblob(1e9)`).
+    c.set_limit(Limit::SQLITE_LIMIT_LENGTH, 32 * 1024 * 1024)?;
+    c.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 1024 * 1024)?;
+    // A process-wide cap on SQLite's own memory, and per connection a small
+    // page cache. An in-memory database lives entirely in memory, so it is
+    // bounded by the script's memory limit.
+    c.execute_batch("PRAGMA hard_heap_limit = 536870912; PRAGMA cache_size = -2000")?;
+    Ok(())
+}
+
+/// Opens the SQLite file `rel` beneath `base` as a script does: no link or
+/// second hard link on the way or for the database and its journal files,
+/// before and after opening, and SQLite's later journals checked by `vfs`.
+/// The directory guard keeps the directories from being swapped meanwhile.
+pub(crate) fn open_file(
+    base: &std::path::Path,
+    rel: &std::path::Path,
+) -> Result<(Connection, crate::safefs::DirGuard), String> {
+    let (dir, name) = crate::safefs::open_parent(base, rel)
+        .map_err(|e| format!("{}: {}", rel.display(), crate::safefs::describe(&e)))?;
+    let check = || -> Result<(), String> {
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            let mut n = name.clone();
+            n.push(suffix);
+            dir.check_plain_or_missing(&n)
+                .map_err(|e| format!("{}{suffix}: {}", rel.display(), crate::safefs::describe(&e)))?;
+        }
+        Ok(())
+    };
+    check()?;
+    if !vfs::register() {
+        return Err("SQLite has no file system support".into());
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let c = Connection::open_with_flags_and_vfs(dir.path().join(&name), flags, vfs::NAME)
+        .map_err(|e| format!("{}: {e}", rel.display()))?;
+    check()?;
+    harden(&c).map_err(|e| e.to_string())?;
+    // Last: the authorizer refuses the pragmas set above.
+    c.authorizer(Some(sqlite_authorizer));
+    Ok((c, dir))
 }
 
 /// Refuses `ATTACH`/`DETACH` and pragmas that change process-wide state, touch
@@ -261,6 +320,10 @@ pub(crate) fn sqlite_authorizer(ctx: rusqlite::hooks::AuthContext<'_>) -> rusqli
                     "temp_store",
                     // It registers SQLite's own `like()` again, which the time limit cannot stop.
                     "case_sensitive_like",
+                    // These can corrupt a database or make SQLite trust what is in it.
+                    "schema_version",
+                    "cell_size_check",
+                    "trusted_schema",
                 ];
                 if blocked.contains(&name.as_str()) {
                     Authorization::Deny
@@ -582,6 +645,11 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let t = s(&a[0]);
             if !is_identifier(t) {
                 return Err(vm.throw("ValueError", format!("\"{t}\" is not a valid SQL identifier")));
+            }
+            // PHV's own tables (`phv_sessions`, `phv_migrations`) are not reached
+            // through a name from a request, like `phv:` keys in Redis.
+            if t.len() >= 4 && t[..4].eq_ignore_ascii_case("phv_") {
+                return Err(vm.throw("ValueError", format!("\"{t}\": names starting with `phv_` are PHV's own")));
             }
             Ok(Value::list(vec![Value::str(format!("{IDENT_START}{t}{IDENT_END}")), Value::list(Vec::new())]))
         },

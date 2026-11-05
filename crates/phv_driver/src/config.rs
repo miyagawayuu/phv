@@ -679,11 +679,26 @@ fn check_dir(kind: &str, d: &str) -> Result<(), String> {
             std::path::Component::CurDir => true,
             _ => false,
         });
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("[permissions].{kind}: \"{d}\" must be a directory inside the project (no `..`, not absolute)"))
+    if !ok {
+        return Err(format!(
+            "[permissions].{kind}: \"{d}\" must be a directory inside the project (no `..`, not absolute)"
+        ));
     }
+    // A Windows short name (`GIT~1`) names another directory than it spells:
+    // the checks on these names (no `.git`, no `.phv-cache`, not `public/`)
+    // compare the spelling (found by the 1.0 audit).
+    if d.contains('~') {
+        return Err(format!("[permissions].{kind}: \"{d}\" has a `~`; write the directory's full name"));
+    }
+    Ok(())
+}
+
+/// A Windows network share or device path (`\\host\share`, `//host/share`,
+/// `\\?\`, `\\.\`): opening one makes Windows contact the host with the
+/// user's credentials.
+fn network_path(p: &str) -> bool {
+    let mut c = p.chars();
+    matches!((c.next(), c.next()), (Some('\\' | '/'), Some('\\' | '/')))
 }
 
 /// `[project] phv`: the project needs a version of PHV that `req` (a semver
@@ -868,6 +883,13 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
     let tls = match (&file.server.tls_cert, &file.server.tls_key) {
         (None, None) => None,
         (Some(cert), Some(key)) if !cert.trim().is_empty() && !key.trim().is_empty() => {
+            for (what, p) in [("tls_cert", cert), ("tls_key", key)] {
+                if network_path(p) {
+                    return Err(format!(
+                        "[server].{what}: \"{p}\" is a network or device path; give a file on this machine"
+                    ));
+                }
+            }
             Some(Tls { cert: root.join(cert), key: root.join(key) })
         }
         (Some(_), Some(_)) => return Err("[server].tls_cert and tls_key must not be empty".into()),
@@ -947,6 +969,20 @@ mod tests {
         let r = load_config(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         r
+    }
+
+    /// Found by the 1.0 audit.
+    #[test]
+    fn paths_that_leave_the_machine_or_hide_a_name_are_refused() {
+        for p in ["//host/share/key.pem", "\\\\host\\share\\key.pem", "\\\\?\\C:\\key.pem"] {
+            let toml = format!("[server]\ntls_cert = \"certs/c.pem\"\ntls_key = '{p}'\n");
+            let e = load(&toml).err().unwrap_or_default();
+            assert!(e.contains("network or device path"), "{p}: {e}");
+        }
+        for d in ["GIT~1/hooks/", "data~1/"] {
+            let e = load(&format!("[permissions]\nwrite = [\"{d}\"]\n")).err().unwrap_or_default();
+            assert!(e.contains("has a `~`"), "{d}: {e}");
+        }
     }
 
     #[test]

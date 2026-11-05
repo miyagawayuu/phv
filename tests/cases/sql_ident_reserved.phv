@@ -1,0 +1,11 @@
+<?phv
+// Found by the 1.0 audit: a table name from a request could reach PHV's own
+// tables (the sessions in a database session store).
+foreach (["posts", "phv_sessions", "PHV_Migrations"] as $name) {
+    try {
+        $_q = sql_ident($name);
+        echo $name, ": accepted\n";
+    } catch (ValueError $e) {
+        echo $name, ": ", $e->getMessage(), "\n";
+    }
+}

@@ -177,7 +177,10 @@ fn origin_allowed(state: &State, req: &Request<Incoming>) -> bool {
     if !host.is_empty() && origin_host.eq_ignore_ascii_case(host) {
         return true;
     }
-    state.config.cors.as_ref().is_some_and(|c| c.allows(origin))
+    // A WebSocket always carries the visitor's cookies: another site may open
+    // one only when `[cors]` lists it by name with `credentials = true` (found
+    // by the 1.0 audit: `origins = ["*"]` let any site connect as the visitor).
+    origin != "null" && state.config.cors.as_ref().is_some_and(|c| !c.any && c.credentials && c.allows(origin))
 }
 
 /// The parts of the upgrade request, kept for the connection's later events.
@@ -326,8 +329,6 @@ impl Conn {
         ping.tick().await;
         let silent = SILENT.max(self.state.time_limit + PING_EVERY);
         let mut seen = Instant::now();
-        let limit = self.state.config.requests_per_minute;
-        let client = format!("ip:{}", self.ip);
         let mut running: Option<tokio::task::JoinHandle<EventResult>> = None;
         let mut close: Option<(CloseCode, &'static str)> = None;
         let mut stopping = false;
@@ -355,9 +356,14 @@ impl Conn {
                 m = stream.next(), if running.is_none() => match m {
                     Some(Ok(Message::Text(t))) => {
                         seen = Instant::now();
-                        if limit > 0 && !phv_std::ratelimit::hit(&client, limit, Duration::from_secs(60)) {
-                            close = Some((CloseCode::Policy, "too many messages"));
-                            break;
+                        // Counted like requests: the same key (IPv6 by /64) and store
+                        // (found by the 1.0 audit: messages had a key of their own).
+                        let ip = self.ip.parse::<std::net::IpAddr>().ok();
+                        if let Some(ip) = ip {
+                            if crate::rate_limited(&self.state, ip).await.is_some() {
+                                close = Some((CloseCode::Policy, "too many messages"));
+                                break;
+                            }
                         }
                         let ev = self.event(WsEvent::Message, t.to_string());
                         let (st, script, params, ip, origin) =

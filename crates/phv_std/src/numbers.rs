@@ -5,6 +5,7 @@ use super::{float, int, s};
 use base64::Engine;
 use phv_syntax::fmtspec::{parse_spec, Spec};
 use phv_vm::{BuiltinFn, Value, Vm, VmError};
+use std::fmt::Write;
 
 fn value_error(vm: &mut Vm, msg: impl Into<String>) -> VmError {
     vm.throw("ValueError", msg)
@@ -165,7 +166,15 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let digits = to_radix(n.unsigned_abs(), to);
             Ok(Value::str(if n < 0 { format!("-{digits}") } else { digits }))
         },
-        "bin2hex" => |_, a| Ok(Value::str(s(&a[0]).bytes().map(|b| format!("{b:02x}")).collect::<String>())),
+        "bin2hex" => |vm, a| {
+            let t = s(&a[0]);
+            vm.reserve(t.len().saturating_mul(2))?;
+            let mut out = String::with_capacity(t.len() * 2);
+            for b in t.bytes() {
+                let _ = write!(out, "{b:02x}");
+            }
+            Ok(Value::str(out))
+        },
         "hex2bin" => |vm, a| {
             let h = s(&a[0]);
             let bytes = (h.len().is_multiple_of(2) && h.bytes().all(|b| b.is_ascii_hexdigit()))

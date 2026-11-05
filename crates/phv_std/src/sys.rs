@@ -434,17 +434,32 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             vm.reserve(s(&a[0]).len().saturating_mul(3))?;
             Ok(Value::str(form_encode(s(&a[0]))))
         },
-        "rawurlencode" => |_, a| {
+        "rawurlencode" => |vm, a| {
             const SET: &percent_encoding::AsciiSet =
                 &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
+            // Each byte may become `%XX`: accounted before it is built.
+            vm.reserve(s(&a[0]).len().saturating_mul(3))?;
             Ok(Value::str(percent_encoding::utf8_percent_encode(s(&a[0]), SET).to_string()))
         },
         "urldecode" => |_, a| {
             let t = s(&a[0]).replace('+', " ");
             Ok(Value::str(percent_encoding::percent_decode_str(&t).decode_utf8_lossy().into_owned()))
         },
-        "http_build_query" => |_, a| {
+        "http_build_query" => |vm, a| {
             let Value::Map(m) = &a[0] else { return Ok(Value::str("")) };
+            // Keys and values may grow three times (`%XX`), plus `=` and `&`.
+            let size = m.iter().fold(0usize, |n, (k, v)| {
+                let k = match k {
+                    Key::Str(s) => s.len(),
+                    Key::Int(_) => 20,
+                };
+                let v = match v {
+                    Value::Str(s) | Value::Html(s) => s.len(),
+                    _ => 24,
+                };
+                n.saturating_add(k.saturating_add(v).saturating_mul(3)).saturating_add(2)
+            });
+            vm.reserve(size)?;
             let parts: Vec<String> = m
                 .iter()
                 .map(|(k, v)| {

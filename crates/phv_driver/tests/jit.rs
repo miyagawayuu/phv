@@ -400,3 +400,53 @@ try {
     );
     assert_eq!(out, "207 101 -1\na+b?\n1.5 -1 5\nKeyError: undefined map key \"y\"\n");
 }
+
+/// Found by the 1.0 audit: a function with only int locals calling one with a
+/// `?int` parameter (passed in the window) had no window of its own, and the
+/// call wrote into its caller's (an abort, or a caller's string emptied).
+#[test]
+fn calls_with_nullable_arguments_keep_their_windows() {
+    let src = r#"<?phv
+function orZero(?int $x): int {
+    return $x ?? 0;
+}
+function twice(int $a): int {
+    return orZero($a) * 2;
+}
+function maybe(int $a): ?int {
+    return $a > 0 ? $a : null;
+}
+function outer(string $s): string {
+    $t1 = $s . "1";
+    $t2 = $s . "2";
+    $n = twice(21) + (maybe(1) ?? 0);
+    return $t1 . "|" . $t2 . "|" . $n;
+}
+echo twice(21), " ", outer("s"), "\n";
+"#;
+    let out = run_both("nullable_calls", src, Limits::default(), &["orZero", "twice", "maybe", "outer"]);
+    assert_eq!(out, "42 s1|s2|43\n");
+}
+
+/// Found by the 1.0 audit: arguments kept for a rerun made a function that
+/// changes its list parameter copy the whole list (128 MB were not enough).
+#[test]
+fn a_list_parameter_changed_in_place_is_not_copied() {
+    let src = r#"<?phv
+function touch(list<int> $xs): int {
+    $xs[0] = 5;
+    return $xs[0] + count($xs);
+}
+function fill(int $n): int {
+    list<int> $xs = [];
+    while (count($xs) < $n) {
+        $xs[] = 1;
+    }
+    return count($xs);
+}
+echo touch(range(1, 5000000)), " ", fill(200000), "\n";
+"#;
+    let limits = Limits { max_memory: Some(128 << 20), max_time: Some(Duration::from_secs(10)), ..Limits::default() };
+    let out = run_both("param_in_place", src, limits, &["touch", "fill"]);
+    assert_eq!(out, "5000005 200000\n");
+}
