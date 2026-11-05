@@ -461,10 +461,14 @@ pub fn fmt(paths: Vec<PathBuf>, check: bool, width: Option<usize>) -> ExitCode {
                 continue;
             }
         };
-        let Ok(src) = std::fs::read_to_string(f) else {
-            eprintln!("error: cannot read {}", f.display());
-            errors += 1;
-            continue;
+        // A regular file of at most 8 MB, as for every source (found by the 1.0.0 audit).
+        let src = match phv_driver::read_source(f) {
+            Ok(src) => src,
+            Err(e) => {
+                eprintln!("error: cannot read {}: {e}", f.display());
+                errors += 1;
+                continue;
+            }
         };
         match phv_syntax::format::format_source_width(&src, width) {
             Ok(out) if out != src => {

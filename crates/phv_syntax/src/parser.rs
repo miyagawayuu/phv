@@ -325,10 +325,19 @@ impl Parser {
             ),
             InlineCode::ForeignCdata => {
                 let mut d = Diagnostic::error(
-                    "a CDATA section or comment in a `<script>` or `<style>` inside `<svg>` or `<math>`",
+                    "markup (a tag, comment or CDATA section) in a `<script>` or `<style>` inside `<svg>` or `<math>`",
                     span,
                 );
-                d.add_note("browsers read the text of these elements as markup there, so it could hide the end tag; move the script out of the SVG");
+                d.add_note("browsers read the text of these elements as markup there, so it could hide the end tag; move the script out of the SVG, or write `<` with spaces around it (`i < n`)");
+                self.diags.push(d);
+                return;
+            }
+            InlineCode::HiddenEndTag => {
+                let mut d = Diagnostic::error(
+                    "the end tag of a raw-text element (such as `</textarea>` or `</noscript>`) inside `<noscript>`, `<svg>` or `<math>`, in a comment, an attribute value or raw text",
+                    span,
+                );
+                d.add_note("where a browser reads that element's text as raw text, the end tag ends it there and what follows becomes markup; remove it, or write `&lt;/` in an attribute");
                 self.diags.push(d);
                 return;
             }
@@ -382,6 +391,12 @@ impl Parser {
             }
             if ends.is_empty() && *tok == Tok::RBrace {
                 let _ = self.error_here("unexpected `}`");
+                self.bump();
+                continue;
+            }
+            // An empty statement is passed over: it makes no statement (found by
+            // the 1.0.0 audit: a file of `;` took 400 bytes per byte).
+            if *tok == Tok::Semi {
                 self.bump();
                 continue;
             }
@@ -492,7 +507,8 @@ impl Parser {
                         crate::htmlctx::InlineCode::Handler(name) => name.len() as u32,
                         crate::htmlctx::InlineCode::ScriptUrl
                         | crate::htmlctx::InlineCode::MetaHttpEquiv
-                        | crate::htmlctx::InlineCode::ForeignCdata => 1,
+                        | crate::htmlctx::InlineCode::ForeignCdata
+                        | crate::htmlctx::InlineCode::HiddenEndTag => 1,
                     };
                     self.inline_code_warning(Span { start: pos, end: pos + len, ..start }, what);
                 }

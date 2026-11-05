@@ -111,6 +111,9 @@ pub enum EchoContext {
     Attr,
     /// The start of a quoted URL attribute (`href="<?= ?>"`).
     Url,
+    /// The start of a quoted URL attribute after a literal `&`: a value would
+    /// continue a character reference.
+    UrlReference,
     /// An unquoted attribute value.
     Unquoted,
     /// Inside a tag, between attributes.

@@ -205,6 +205,11 @@ fn encoders_and_sets_stay_within_the_memory_limit() {
         ("bin2hex", "strlen(bin2hex(str_repeat(\"!\", 8 << 20)))"),
         ("http_build_query", "strlen(http_build_query([\"a\" => str_repeat(\"!\", 8 << 20)]))"),
         ("json_set", "strlen(json_encode(set([str_repeat(\"\\x01\", 3 << 20), str_repeat(\"\\x02\", 3 << 20)])))"),
+        // Found by the 1.0.0 audit: these made several copies before the limit was checked.
+        ("encrypt", "strlen(encrypt(str_repeat(\"é\", 5 << 20), str_repeat(\"k\", 32)))"),
+        ("sign_token", "strlen(sign_token(str_repeat(\"é\", 5 << 20), str_repeat(\"k\", 32)))"),
+        ("decrypt", "strlen(decrypt(str_repeat(\"A\", 10 << 20), str_repeat(\"k\", 32)) ?? \"\")"),
+        ("verify_token", "strlen(verify_token(str_repeat(\"A\", 10 << 20) . \".x\", str_repeat(\"k\", 32)) ?? \"\")"),
     ] {
         assert_stops_at_limit(name, &format!("<?phv\necho {expr};\n"));
     }
@@ -220,6 +225,18 @@ fn copies_and_long_keys_stop_at_the_time_limit() {
             "long_key",
             "$k = str_repeat(\"k\", 8 << 20);\nmap<string, int> $m = [$k => 1];\n$n = 0;\n\
              while (true) { $n += $m[$k] + $m[$k] + $m[$k] + $m[$k] + $m[$k] + $m[$k] + $m[$k] + $m[$k]; }\n",
+        ),
+        // Found by the 1.0.0 audit: `==` on lists, building ranges and map
+        // literals with long keys were not timed.
+        (
+            "list_equal",
+            "$a = range(0, 999999);\n$b = range(0, 999999);\n$n = 0;\nwhile (true) { if ($a == $b) { $n++; } }\n",
+        ),
+        ("range", "$n = 0;\nwhile (true) { $r = 0..3000000; $n += count($r); }\n"),
+        (
+            "map_literal",
+            "$k = str_repeat(\"k\", 8 << 20);\n$n = 0;\n\
+             while (true) { $m = [$k => 1, $k => 2, $k => 3, $k => 4, $k => 5, $k => 6]; $n += count($m); }\n",
         ),
     ];
     for (name, body) in cases {

@@ -1895,6 +1895,8 @@ impl<'a, 'b> Translator<'a, 'b> {
                         self.spill(r, k(r));
                     }
                     self.call_regs(H::NewMap, &[d as i64, start as i64, n as i64]);
+                    // A long key may have passed the time limit.
+                    self.check_ctx();
                 }
                 Instr::SetPath(ref path) if matches!(path.base, PathBase::Local(r) if matches!(k(r), K::Map(..))) => {
                     let PathBase::Local(r) = path.base else { unreachable!("checked") };

@@ -104,6 +104,15 @@ fn kept_connections_carry_nothing_between_scripts() {
         None,
     );
     assert_eq!(out, "{\"c\":1,\"t\":2}");
+    // `execute()` of a statement that changes no row: 0, not the count of the
+    // previous script's last change (found by the 1.0.0 audit).
+    run_reused(&site, &format!("{OPEN}echo $db->execute(sql\"UPDATE t SET a = a + 1\");"), None);
+    let out = run_reused(
+        &site,
+        &format!("{OPEN}echo $db->execute(sql\"CREATE TABLE IF NOT EXISTS other (x INTEGER)\");"),
+        None,
+    );
+    assert_eq!(out, "0");
 
     // A temporary table: the connection is not kept, so the next script cannot see it.
     run_reused(

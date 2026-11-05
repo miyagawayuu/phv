@@ -97,12 +97,12 @@ error: values cannot be inserted into `srcdoc`
    |                     ^^
    = note: its value is parsed as a separate HTML document, where escaping does not apply; serve the content as its own page and use `src`
 
-error: a URL attribute cannot start with an unchecked value
+error: a value cannot follow `&` at the start of a URL attribute
   --> err_context.phv:20:20
    |
 20 | <a href="&#x20;<?= $q ?>">an entity is not the end of the scheme</a>
    |                    ^^
-   = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
+   = note: the browser would read `&` and the value as a character reference (`&` + `#x6a;` is `j`); remove the `&`, or pass the whole URL through `safe_url()`
 
 error: a URL attribute cannot start with an unchecked value
   --> err_context.phv:21:15
@@ -224,12 +224,12 @@ error: a URL attribute cannot start with an unchecked value
    |                                 ^^
    = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
 
-error: a URL attribute cannot start with an unchecked value
+error: a value cannot follow `&` at the start of a URL attribute
   --> err_context.phv:37:34
    |
 37 | <a href="<?= safe_url($q) ?>&<?= $q ?>">or after a safe URL and an entity</a>
    |                                  ^^
-   = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
+   = note: the browser would read `&` and the value as a character reference (`&` + `#x6a;` is `j`); remove the `&`, or pass the whole URL through `safe_url()`
 
 error: values cannot be inserted into the `content` of this `<meta>`
   --> err_context.phv:38:50

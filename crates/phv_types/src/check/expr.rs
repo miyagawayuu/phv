@@ -337,6 +337,11 @@ impl<'a> Checker<'a> {
             // Only values checked for this context: HTML escaping (`escape()`,
             // templates) does not stop `javascript:` URLs or script code.
             Url if numeric || h.ty == Type::SafeUrl => return,
+            UrlReference if numeric => return,
+            UrlReference => (
+                "a value cannot follow `&` at the start of a URL attribute",
+                "the browser would read `&` and the value as a character reference (`&` + `#x6a;` is `j`); remove the `&`, or pass the whole URL through `safe_url()`",
+            ),
             Url => (
                 "a URL attribute cannot start with an unchecked value",
                 "use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe",

@@ -1,3 +1,16 @@
+/// Every line written to stderr with `eprintln!` (errors and warnings, which
+/// may quote phv.toml, manifests or file names) shows control characters as
+/// U+FFFD: an escape sequence from a file cannot reach the terminal (found by
+/// the 1.0.0 audit). Coloured diagnostics go through `eprint!`.
+macro_rules! eprintln {
+    () => {
+        ::std::eprintln!()
+    };
+    ($($arg:tt)*) => {{
+        ::std::eprintln!("{}", phv_syntax::diag::printable_text(&::std::format!($($arg)*)))
+    }};
+}
+
 mod build;
 mod dap;
 mod db;
@@ -255,8 +268,37 @@ pub(crate) fn check_output_dirs(out: &Path) -> Result<(), String> {
         if let Some(link) = linked_component(&cwd, parent) {
             return Err(format!("{} is a link; refusing to write through it", link.display()));
         }
+        #[cfg(windows)]
+        if let Some(link) = windows_link_on_the_way(parent) {
+            return Err(format!("{} is reached through a link; refusing to write through it", link.display()));
+        }
     }
     Ok(())
+}
+
+/// On Windows a path can be spelled many ways (`\\?\C:\...`, `\\.\C:\...`, a
+/// share of this machine, `C:..\x`): the deepest existing directory of `dir`
+/// must be the very folder its spelling names, compared regardless of case
+/// (found by the 1.0.0 audit: those spellings went through a junction).
+#[cfg(windows)]
+fn windows_link_on_the_way(dir: &Path) -> Option<PathBuf> {
+    let full = std::path::absolute(dir).ok()?;
+    let plain = |p: &Path| {
+        let s = p.to_string_lossy().replace('/', "\\");
+        let s = s.strip_prefix(r"\\?\UNC\").map(|r| format!(r"\\{r}")).unwrap_or(s);
+        let s = s.strip_prefix(r"\\?\").or_else(|| s.strip_prefix(r"\\.\")).map(str::to_string).unwrap_or(s);
+        s.trim_end_matches('\\').to_lowercase()
+    };
+    let mut at = full.as_path();
+    loop {
+        if at.exists() {
+            // A link or junction on the way gives another final path (an 8.3
+            // short name in the spelling is refused too: write the long name).
+            let real = at.canonicalize().ok()?;
+            return (plain(at) != plain(&real)).then(|| at.to_path_buf());
+        }
+        at = at.parent()?;
+    }
 }
 
 /// The first component of `dir` that exists and is a link or a junction.
@@ -265,20 +307,43 @@ pub(crate) fn check_output_dirs(out: &Path) -> Result<(), String> {
 /// a link planted in a project is what is refused, while an absolute path the
 /// user wrote may go through the system's own links (`/var` on macOS).
 fn linked_component(base: &Path, dir: &Path) -> Option<PathBuf> {
-    let stripped;
-    let rel = if dir.is_absolute() {
-        stripped = strip_base(base, dir)?;
-        stripped.as_path()
-    } else {
-        dir
+    // `..` is resolved by name first; what is checked then starts where the
+    // path leaves the current directory's ancestors (found by the 1.0.0 audit:
+    // `../dist/app.exe`, or the same as an absolute path, went through a
+    // junction unchecked). A path that shares no directory with the current
+    // one (only its root) is the user's own choice, through the system's
+    // links (`/var` on macOS).
+    let (start, rel) = match strip_base(base, dir) {
+        Some(rel) if dir.is_absolute() => (base.to_path_buf(), rel),
+        _ if dir.is_absolute() => (PathBuf::new(), dir.to_path_buf()),
+        _ => (base.to_path_buf(), dir.to_path_buf()),
     };
-    let mut at = base.to_path_buf();
+    let mut full = start;
     for c in rel.components() {
-        if !matches!(c, std::path::Component::Normal(_)) {
-            // `..` leaves what can be checked; `.` changes nothing.
-            if matches!(c, std::path::Component::ParentDir) {
-                return None;
+        match c {
+            std::path::Component::ParentDir => {
+                full.pop();
             }
+            std::path::Component::CurDir => {}
+            c => full.push(c),
+        }
+    }
+    let same = |a: &std::path::Component, b: &std::path::Component| {
+        let (a, b) = (a.as_os_str().to_string_lossy(), b.as_os_str().to_string_lossy());
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(&b)
+        } else {
+            a == b
+        }
+    };
+    let common: PathBuf =
+        base.components().zip(full.components()).take_while(|(a, b)| same(a, b)).map(|(_, b)| b).collect();
+    if !common.components().any(|c| matches!(c, std::path::Component::Normal(_))) {
+        return None;
+    }
+    let mut at = common.clone();
+    for c in full.strip_prefix(&common).unwrap_or(Path::new("")).components() {
+        if !matches!(c, std::path::Component::Normal(_)) {
             continue;
         }
         at.push(c);
@@ -599,7 +664,7 @@ fn exec(cmd: Command) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     /// `phv doc` does not write through a planted link (the v0.9.0 audit).
     #[cfg(unix)]
@@ -612,6 +677,44 @@ mod tests {
         assert_eq!(super::linked_component(&dir, Path::new("doc/api")), Some(dir.join("doc")));
         assert_eq!(super::linked_component(&dir, &dir.join("doc/api")), Some(dir.join("doc")));
         assert_eq!(super::linked_component(&dir, Path::new("plain/api")), None);
+        // Through `..` from a directory below (found by the 1.0.0 audit).
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        assert_eq!(super::linked_component(&dir.join("src"), Path::new("../doc/api")), Some(dir.join("doc")));
+        assert_eq!(super::linked_component(&dir.join("src"), Path::new("./../src/../doc/api")), Some(dir.join("doc")));
+        assert_eq!(super::linked_component(&dir.join("src"), Path::new("../plain")), None);
+        // The same as an absolute path.
+        assert_eq!(super::linked_component(&dir.join("src"), &dir.join("doc/api")), Some(dir.join("doc")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On Windows every spelling of a path through a junction is refused
+    /// (found by the 1.0.0 audit: `\\?\`, `\\.\` and drive-relative forms).
+    #[cfg(windows)]
+    #[test]
+    fn output_directories_through_junctions_are_refused_however_spelled() {
+        let dir = std::env::temp_dir().join(format!("phv-junction-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        std::fs::create_dir_all(dir.join("plain")).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dir.join("dist"))
+            .arg(dir.join("outside"))
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if made {
+            let full = std::path::absolute(&dir).unwrap();
+            let spelled = full.to_string_lossy().into_owned();
+            for p in [
+                full.join("dist"),
+                PathBuf::from(format!(r"\\?\{spelled}\dist")),
+                PathBuf::from(format!(r"\\.\{spelled}\dist\sub")),
+            ] {
+                assert!(super::windows_link_on_the_way(&p).is_some(), "{}", p.display());
+            }
+            assert!(super::windows_link_on_the_way(&full.join("plain")).is_none());
+            assert!(super::windows_link_on_the_way(&full.join("plain").join("new")).is_none());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -105,6 +105,15 @@ function renderDoc(markdown, lang) {
       link({ href, title, tokens }) {
         const text = this.parser.parseInline(tokens);
         const target = docLinks[lang][href] ?? href;
+        // Only web and mail links, relative paths and anchors (found by the 1.0.0
+        // audit: a `javascript:` link in the docs became a link of the site).
+        // As browsers read it: without tabs and line breaks, and controls and
+        // spaces at either end (`java	script:` is `javascript:`).
+        const clean = target.replace(/[\t\n\r]/g, "").replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, "");
+        const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(clean);
+        if (scheme && !["http", "https", "mailto"].includes(scheme[1].toLowerCase())) {
+          return text;
+        }
         const external = /^https?:/.test(target);
         return `<a href="${escape(target)}"${title ? ` title="${escape(title)}"` : ""}${external ? ' rel="noopener"' : ""}>${text}</a>`;
       },

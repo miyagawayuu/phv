@@ -3,7 +3,7 @@
 //! The type signatures for these functions live in `phv_types::builtins`.
 
 use indexmap::IndexMap;
-use phv_vm::value::{compare, format_float, html_escape, values_equal};
+use phv_vm::value::{compare, format_float, html_escape};
 use phv_vm::{BuiltinFn, Key, Map, Value, Vm, VmError};
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -787,7 +787,8 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         "assert" => |vm, a| assert_impl(vm, matches!(a[0], Value::Bool(true)), "assertion failed".into()),
         "assert_msg" => |vm, a| assert_impl(vm, matches!(a[0], Value::Bool(true)), s(&a[1]).to_string()),
         "assert_eq" | "assert_eq_msg" => |vm, a| {
-            if values_equal(&a[0], &a[1]) {
+            // Timed and accounted as `==` (found by the 1.0.0 audit).
+            if vm.equal(&a[0], &a[1])? {
                 return Ok(Value::Null);
             }
             let mut msg = format!("expected {}, got {}", repr(vm, &a[0]), repr(vm, &a[1]));

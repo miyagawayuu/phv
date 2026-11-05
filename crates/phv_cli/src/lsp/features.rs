@@ -21,6 +21,8 @@ struct Place {
     end: u32,
 }
 
+use super::MAX_DOCUMENT;
+
 fn place(a: &Analysis, span: phv_syntax::Span) -> Option<Place> {
     let src = a.sources.get(span.file);
     let path = normalize(src.path.as_ref()?);
@@ -280,6 +282,7 @@ impl Server {
     }
 
     pub(super) fn prepare_rename(&self, path: &Path, line: u64, character: u64) -> Result<Value, String> {
+        self.renamable()?;
         let text = self.open.get(path).ok_or("the document is not open")?;
         let offset = offset_of(text, line, character);
         let a = self.analysis(path);
@@ -302,6 +305,7 @@ impl Server {
 
     /// The edits that rename what the cursor is on to `new_name`.
     pub(super) fn rename(&self, path: &Path, line: u64, character: u64, new_name: &str) -> Result<Value, String> {
+        self.renamable()?;
         let text = self.open.get(path).ok_or("the document is not open")?;
         let offset = offset_of(text, line, character);
         let a = self.analysis(path);
@@ -338,8 +342,17 @@ impl Server {
         Ok(json!({ "changes": changes }))
     }
 
+    /// A rename would miss the uses in an open document kept without its text
+    /// (one over 8 MB; found by the 1.0.0 audit).
+    fn renamable(&self) -> Result<(), String> {
+        match self.too_large.is_empty() {
+            true => Ok(()),
+            false => Err(format!("a document larger than {} MB is open; close it to rename", MAX_DOCUMENT >> 20)),
+        }
+    }
+
     pub(super) fn formatting(&self, path: &Path) -> Value {
-        let Some(text) = self.open.get(path) else { return Value::Null };
+        let Some(text) = self.open.get(path).filter(|_| !self.too_large.contains(path)) else { return Value::Null };
         if path.to_string_lossy().ends_with(".phv.html") {
             return Value::Null;
         }
@@ -392,7 +405,7 @@ impl Server {
     }
 
     pub(super) fn document_symbols(&self, path: &Path) -> Value {
-        let Some(text) = self.open.get(path) else { return Value::Null };
+        let Some(text) = self.open.get(path).filter(|_| !self.too_large.contains(path)) else { return Value::Null };
         let template = path.to_string_lossy().ends_with(".phv.html");
         let (module, _) = phv_syntax::parser::parse_module(text, 0, template);
         let file = source(path, text.clone());
@@ -434,7 +447,7 @@ impl Server {
 
     /// Quick fixes for the diagnostics in `range`.
     pub(super) fn code_actions(&self, path: &Path, range: &Value) -> Value {
-        let Some(text) = self.open.get(path) else { return json!([]) };
+        let Some(text) = self.open.get(path).filter(|_| !self.too_large.contains(path)) else { return json!([]) };
         let from = offset_of(
             text,
             range["start"]["line"].as_u64().unwrap_or(0),

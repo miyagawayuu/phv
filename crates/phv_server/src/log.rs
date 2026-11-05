@@ -8,8 +8,9 @@
 use std::io::Write;
 use std::sync::mpsc;
 
-/// Lines waiting to be written; a request waits for room past this.
-const QUEUE: usize = 16 * 1024;
+/// Lines waiting to be written; a request waits for room past this. Lines
+/// show at most `LOG_PATH_MAX` bytes of a path, so this holds a few MB.
+const QUEUE: usize = 4 * 1024;
 
 enum Msg {
     /// A line for stderr and, if there is one, for the access log.

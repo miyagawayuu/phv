@@ -223,8 +223,16 @@ pub fn flat_equal(a: &Value, b: &Value) -> Option<bool> {
     })
 }
 
-/// `values_equal`, telling `meter` how many bytes each string comparison
-/// covers; `None` when `meter` returns false (stop: the time limit passed).
+/// What `values_equal_metered` counts for each pair of values it queues (or
+/// records as seen): their room in its lists, generously.
+pub const PAIR_COST: usize = 32;
+
+/// `values_equal`, telling `meter` the work it does in bytes: each string
+/// compared, each pair of elements and map key looked at, and what its lists
+/// of pairs to compare will hold, before they grow (found by the 1.0.0 audit:
+/// only strings were counted, so `==` on large or differently shared lists ran
+/// past the time and memory limits). `None` when `meter` returns false (stop:
+/// a limit was passed).
 pub fn values_equal_metered(a: &Value, b: &Value, meter: &mut dyn FnMut(usize) -> bool) -> Option<bool> {
     let mut work: Vec<(&Value, &Value)> = vec![(a, b)];
     // Pairs of lists/maps already queued. Shared structure (`$a = [$a, $a]`)
@@ -253,6 +261,10 @@ pub fn values_equal_metered(a: &Value, b: &Value, meter: &mut dyn FnMut(usize) -
                     if x.len() != y.len() {
                         return Some(false);
                     }
+                    // The pairs queued, and the pair recorded as seen.
+                    if !meter(x.len().saturating_mul(PAIR_COST).saturating_add(PAIR_COST)) {
+                        return None;
+                    }
                     work.extend(x.iter().zip(y.iter()));
                 }
                 true
@@ -262,7 +274,16 @@ pub fn values_equal_metered(a: &Value, b: &Value, meter: &mut dyn FnMut(usize) -
                     if x.len() != y.len() {
                         return Some(false);
                     }
+                    if !meter(x.len().saturating_mul(PAIR_COST).saturating_add(PAIR_COST)) {
+                        return None;
+                    }
                     for (k, v) in x.iter() {
+                        // Looking a key up hashes it.
+                        if let Key::Str(s) = k {
+                            if s.len() >= 64 && !meter(s.len()) {
+                                return None;
+                            }
+                        }
                         match y.get(k) {
                             Some(w) => work.push((v, w)),
                             None => return Some(false),

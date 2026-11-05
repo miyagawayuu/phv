@@ -519,6 +519,8 @@ pub unsafe extern "C" fn phv_jit_range(ctx: *mut JitCtx, d: i64, from: i64, to: 
         return;
     }
     rt(ctx).top()[d as usize] = Value::list((from..to).map(Value::Int).collect());
+    // Up to 10,000,000 items in one step (found by the 1.0.0 audit).
+    long_op(ctx, count as usize * std::mem::size_of::<Value>());
 }
 
 /// `**` on ints, as the interpreter computes it.
@@ -555,6 +557,8 @@ pub unsafe extern "C" fn phv_jit_range_fn(ctx: *mut JitCtx, d: i64, from: i64, t
         return;
     }
     rt(ctx).top()[d as usize] = Value::list(crate::value::range_items(from, to));
+    // The interpreter checks the time after this builtin (found by the 1.0.0 audit).
+    long_op(ctx, count as usize * std::mem::size_of::<Value>());
 }
 
 /// `$xs[] = $v` with a number or boolean (`JIT_PUT_*`) on the list in slot
@@ -736,7 +740,9 @@ pub unsafe extern "C" fn phv_jit_str_eq(ctx: *mut JitCtx, a: i64, b: i64) -> i64
     let w = rt(ctx).top();
     let r = match (&w[a as usize], &w[b as usize]) {
         (Value::Str(x), Value::Str(y)) => Rc::ptr_eq(x, y) || x == y,
-        (x, y) => crate::value::values_equal(x, y),
+        // Only strings (and nullable ones) reach here; a list or map would not
+        // be compared without the limits of `Vm::equal`.
+        (x, y) => crate::value::flat_equal(x, y).unwrap_or(false),
     };
     long_op(ctx, str_len(&w[a as usize]));
     r as i64
@@ -790,6 +796,12 @@ pub unsafe extern "C" fn phv_jit_new_map(ctx: *mut JitCtx, d: i64, start: i64, n
     for i in 0..n as usize {
         let k = std::mem::take(&mut w[start as usize + 2 * i]);
         let v = std::mem::take(&mut w[start as usize + 2 * i + 1]);
+        // Each long key is hashed: timed as in the interpreter, and the literal
+        // stops once the time is up (found by the 1.0.0 audit).
+        long_key(ctx, crate::vm::str_len(&k));
+        if (*ctx).error != 0 {
+            return;
+        }
         m.insert(k.to_key(), v);
     }
     w[d as usize] = Value::map(m);

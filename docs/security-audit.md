@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates twelve audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, and §22 an assessment of the whole implementation before 1.0.0.
+This report consolidates thirteen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, and §23 an assessment of the whole implementation after the processing work.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23: 2026-11-06)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -1180,3 +1180,124 @@ and `two_host_fields_are_refused` (phv_server); `git_ignores_the_repository_it_r
 `sql_ident_reserved` in `tests/cases`; and `every_builtin_has_one_implementation` (phv_std), which found two builtins
 of one name while the WebSocket server was written. All tests pass on Windows, and on Linux and macOS in CI, with clippy
 (`-D warnings`) and rustfmt. `npm audit` finds nothing in the extension and the website, and `cargo audit` runs in CI.
+
+## 23. Thirteenth Assessment: the Whole Implementation (before 1.0.0, after the processing work)
+
+Date: 2026-11-06. Scope: everything at 852f79d, which adds to §22 the work that made processing faster (0218333):
+the page, path and static-file caches of a production server, the request log thread, SQLite connections kept
+between scripts, the HTTP client's keep-alive connections, the DNS cache, the worker pool of background operations,
+PostgreSQL's prepared statements and shared runtime, the process-wide regular expression cache, the parse cache, the
+language server's analysis cache, in-place `.=` on properties and elements, fused `==` branches, loops tested at their
+end, and the other changes of the VM, the JIT and the type checker. Every earlier fix was attacked again. Six reviewers
+each took one area (the web server; the standard library and its clients; the VM, the JIT and the type checker;
+templates and escaping; the tools, the editor and CI; and the debugger, migrations, WebSocket scripts, the website,
+the demo and the examples), attacked a release build locally and confirmed each finding with a PoC. Every finding was
+fixed, each reviewer ran its PoCs again against the fixed build and looked for ways around each fix, and what they
+found was fixed in turn (three rounds).
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| Critical | 0 | — |
+| High | 3 | Fixed |
+| Medium | 12 | Fixed |
+| Low | 13 | Fixed |
+| Info | 4 | Fixed |
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R16-1 | `==` on lists and maps was neither timed nor counted against the memory limit (only strings were): two structures that share their parts differently took 3.3 GB and 32 seconds in one `==` under 128 MB and 1 second; `assert_eq()` compared without any limit | Each pair of values compared and each pair queued are counted; a large step is reserved first, and the time and memory limits are checked as the comparison goes. `assert_eq()` compares as `==` does |
+| R16-2 | A static file asked for with `Range` (and gzip accepted) was read whole for each response, which held it until sent: 1,000 stalled HTTP/2 connections took 7.3 GB, and pages got 503 | A range is always streamed from the file; a file is read at once only when one copy serves many responses (a small file the server keeps, or text to compress whose copy can be kept) |
+| R16-3 | A kept HTTP client connection was used again although bytes had arrived on it while it was idle: a stray answer of the server was read by the next request, another visitor's, as its own | A kept connection is used again only if nothing arrived on it (nothing TLS has decrypted, nothing on the socket, no close), checked when it is kept and when it is taken |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R16-4 | The production path cache kept paths of up to 64 KB: 10,000 of them took 680 MB | Paths longer than 1 KB are not kept |
+| R16-5 | The request log's queue held whole paths and methods: with a slow stderr, 2 GB | Paths are cut to 2 KB and methods to 32 bytes in log lines; the queue holds 4,096 lines |
+| R16-6 | Static files were compressed again by each request that missed the gzip cache, each holding its own copy (uncounted): 1.7 GB on a cold cache; with the cache full, the same for files left out | One request compresses a version of a file and the others share its copy; a file whose compressed copy cannot be kept is sent as it is; the cache is no longer emptied when full |
+| R16-7 | `encrypt()`, `decrypt()`, `sign_token()` and `verify_token()` made several copies before the memory limit was checked: 705 MB under 128 MB (missed by R14-11 and R15-10) | The copies are reserved before they are made |
+| R16-8 | In a `<script>` or `<style>` inside `<svg>` or `<math>`, a tag or bogus comment holding `</script>` hid the end tag from the template check: a request value ran in the script that carries the CSP nonce | Any markup there is a compile error (as CDATA sections and comments were) |
+| R16-9 | The template check could be put out of step with browsers: `<noscript>` (raw text when scripting is on), a self-closed `<svg/>`, `</math>` inside `<svg>`, and `<foreignObject>`; an end tag in a comment then ended the element for the browser while the check read on (a `<meta>` redirect, a `javascript:` link) | `<svg>` and `<math>` are followed as browsers do (`<svg/>` opens nothing, an end tag closes only an open element of its name); inside `<noscript>`, `<svg>` and `<math>`, the end tag of a raw-text element in a comment or attribute value (and `</noscript` anywhere but in text) is an error, also when it is split across pieces of literal text, and a value that could complete one is refused, as is a block (`if`/`else`, a loop, `try`) that begins or ends inside one |
+| R16-10 | The process-wide parse cache was bounded by source text, not by the syntax trees, which are many times larger: the language server kept 6.7 GB after documents were closed | Each module's memory is measured as it is parsed; at most 64 MB is kept, sources over 1 MB are not kept, and an empty statement makes no statement |
+| R16-11 | Documents open in the editor skipped the 8 MB limit of sources: a 40 MB document took tens of GB | Text from the editor has the limit of files read from disk: a larger document is kept without its text, and while one is open nothing edits from it (formatting, code actions) and renames are refused |
+| R16-12 | `phv install` let a package's `.lfsconfig` make git-lfs (on by default in Git for Windows) contact any host over any transport, around R5-10 | git-lfs's filters are turned off, and a clone's own attributes keep every filter from a package's files |
+| R16-13 | Building a range (`a..b`, and `range()` in the JIT) was not timed: 20 seconds under 1 | The time limit is checked soon after |
+| R16-14 | `echo` in templates was not timed: a template's output is dropped after `render()`, so its buffer did not bound the escaping: 141 seconds under 1 | Each echo counts as long work by its size |
+| R16-15 | Map literals hashed long keys without a time check, around R15-12 (interpreter and JIT): 14.9 seconds under 1 | Each long key checks the limits, and the JIT's literal stops at once |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R16-16 | The path cache trusted a decision for a second: a junction put on the way in that time served a file outside `public/` | The file opened must be the one at the path found (its handle's final path) |
+| R16-17 | Two ways around R15-21: an absolute request target in HTTP/1.1, and `:authority` with user information, let scripts see another host | The authority of the request target replaces `host`; one with user information gets 400 |
+| R16-18 | A built site compressed a file again for each spelling of its path | Compressed copies are kept by the file's name |
+| R16-19 | A kept SQLite connection's `execute()` returned the previous script's count for a statement that changes no row | 0 when no row changed |
+| R16-20 | The HTTP client sent a GET again after an answer had come (refused as too large) | Sent again only when no byte of an answer came |
+| R16-21 | `safe_url()` after a literal `&` at the start of a URL made a character reference (`&` + `#x6a;avascript:`) | Only numbers may follow a `&` there |
+| R16-22 | Spaces after an attribute name were scanned ahead at each one: quadratic (an 8 MB file would take hours) | Passed in one step |
+| R16-23 | Escape sequences from `phv.toml`, package manifests and file names reached the terminal (R15-32 covered diagnostics only) | Every error line of the CLI shows control characters as U+FFFD |
+| R16-24 | Output paths with `..`, or absolute ones, skipped the link check (around R14-22) | Resolved by name first, then checked from where they leave the current directory's ancestors; on Windows the deepest existing directory must also be the very folder its spelling names (`\\?\`, `\\.\`, a share of this machine, `C:..\`) |
+| R16-25 | `phv fmt` read files of any size: 64 MB took 4.7 GB | Sources are read with the 8 MB limit |
+| R16-26 | A chain of exceptions in a deep recursion went past the memory limit (each keeps its trace's text) | No trace text is made past the limit |
+| R16-27 | `examples/site` rate-limited its guestbook by the full address (missed by R4-11) | `ip_group()` |
+| R16-28 | WARDOGS (an example) answered 500 to huge or negative scores from the game server | Numbers are bounded, and its bars clamped |
+
+### Info
+
+| # | Finding | Fix |
+|---|---|---|
+| R16-29 | A late MySQL `KILL QUERY` could reach the next script on the connection | A connection whose kill was sent is not used again |
+| R16-30 | WARDOGS printed escape sequences from the game server (names, error messages, C1 controls) | Control characters are dropped |
+| R16-31 | The website kept `javascript:` link targets in the docs (also written `java&#9;script:` or with a control before it) | Only web, mail, relative and anchor links are links |
+| R16-32 | A SQLite migration could end its transaction (`COMMIT;`), leaving part of a failing migration (and the demo's comment said nothing is shared) | `BEGIN`, `COMMIT` and `ROLLBACK` are refused in migrations; the comment is updated |
+
+### Residual Risks
+
+- An HTTP server that sends an answer nobody asked for, a few milliseconds after the real one, can have it read by the
+  next request on that kept connection when that request is already on its way: HTTP/1.1 does not tie answers to
+  requests. Checks when a connection is kept and taken leave only this window.
+- An upstream that acts on a `GET` and closes without answering gets the `GET` again (the usual retry on a closed kept
+  connection, for `GET`, `HEAD` and `OPTIONS` only).
+- An idle kept SQLite connection holds its file open for up to 30 seconds: a program outside PHV cannot rename or delete
+  it meanwhile on Windows.
+- `==` on structures that share parts differently may go to about twice the memory limit before it stops (the table of
+  compared pairs grows in one step).
+- Parsing takes memory many times a source's size (a file of 8 MB of list items takes about 1.5 GB while it is checked).
+- After a call, a function's registers keep its arguments: changing a list right after passing it copies it (timed and
+  counted). The JIT's stack budget is measured from the outermost native call.
+- In a watched state of a template (inside `<noscript>`, `<svg>` or `<math>`), a function called between `</` and the
+  rest of an end tag passes `phv check`; the page stops at run time before anything reaches the browser.
+- On Unix, `opened_at` compares the file opened with the path in two steps (Windows uses the handle).
+- §22's residual risks remain (SQLite's process-wide heap cap, local TLS paths, `publish()` within one process, the demo's
+  base image not pinned by digest, the cycle collector run by count).
+
+### Verification
+
+Every PoC was rerun against the fixed build: the list `==` loop stops at 1.03 seconds (16.5), the shared-structure
+`==` at 1.2 seconds and 168 MB (32 seconds, 3.3 GB), `assert_eq()` on it at 1.6 seconds (46.9); stalled range requests
+take 147 MB over HTTP/1.1 and 535 MB over HTTP/2 with pages answered (940 MB and 7.3 GB); a stray answer on a kept
+connection is no longer read by the next visitor; 9,900 long paths take 7.4 MB (680 MB); the log queue 7–28 MB (2 GB,
+517 MB with a long method); a cold gzip cache 64 MB (1.7 GB); the crypto builtins stop at the limit (705 MB); every
+SVG, `<noscript>` and split-piece template is refused, and a differential fuzz of 20,000 random pages against the
+previous release found only the intended differences; the language server keeps 1 MB after closing documents (6.7 GB), and with a 40 MB document open answers
+`workspace/symbol` and completion at once with 154 MB at most (12.4 seconds and 23.2 GB), formats nothing in it and
+refuses renames; output paths through a junction are refused in all fifteen spellings tried, while plain ones are
+written;
+`phv install` makes no connection for a package's `.lfsconfig`; ranges, template echoes and map literals stop at about
+1 second (20, 141 and 14.9); the junction swap gets 404; `execute()` on a kept connection gives 0; the migration with
+`COMMIT` leaves nothing; and the WARDOGS and website cases are handled. Regression tests:
+`markup_in_foreign_raw_text_is_refused`, `foreign_content_follows_the_open_elements`,
+`end_tags_hidden_in_comments_and_attributes_are_refused`, `spaces_after_an_attribute_name_are_read_in_linear_time`
+(phv_syntax); `list_equal`, `range`, `map_literal`, `encrypt`, `sign_token`, `decrypt` and `verify_token` in the limits
+tests, `kept_connections_carry_no_late_answer_and_answered_requests_are_not_repeated` and the kept-connection and
+`execute()` checks of `sqlite_pool` (phv_driver); `hosts_long_paths_and_ranges_in_production` (phv_server);
+`packages_cannot_select_filters`, the output link checks and `documents_over_the_limit_are_not_edited` (phv_cli); the migration test (phv_std); and
+`tests/cases/err_context` for `&` before a URL value. All tests pass on Windows, and on Linux and macOS in CI, with
+clippy (`-D warnings`) and rustfmt. `npm audit` finds nothing in the extension and the website, and `cargo audit` runs
+in CI.

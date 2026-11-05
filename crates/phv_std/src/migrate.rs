@@ -106,7 +106,13 @@ impl Conn {
         match self {
             Conn::Sqlite(c, _) => {
                 let tx = c.transaction().map_err(|e| e.to_string())?;
-                tx.execute_batch(sql).map_err(|e| e.to_string())?;
+                // The migration cannot end the transaction it runs in (`COMMIT;`
+                // in it would keep half of a failing migration; found by the
+                // 1.0.0 audit).
+                tx.authorizer(Some(migration_authorizer));
+                let ran = tx.execute_batch(sql).map_err(|e| e.to_string());
+                tx.authorizer(Some(crate::db::sqlite_authorizer));
+                ran?;
                 tx.execute(
                     "INSERT INTO phv_migrations (name, checksum, applied_at) VALUES (?1, ?2, ?3)",
                     [name, sum.as_str(), at.as_str()],
@@ -117,6 +123,15 @@ impl Conn {
             Conn::Server(c) => c.apply(name, &sum, sql, &at),
         }
     }
+}
+
+/// The settings of a script's connection, and no `BEGIN`, `COMMIT` or
+/// `ROLLBACK`: the transaction is the one the migration runs in.
+fn migration_authorizer(ctx: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization {
+    if matches!(ctx.action, rusqlite::hooks::AuthAction::Transaction { .. }) {
+        return rusqlite::hooks::Authorization::Deny;
+    }
+    crate::db::sqlite_authorizer(ctx)
 }
 
 /// What `status` reports for each file.
@@ -170,6 +185,12 @@ mod tests {
         assert!(states.iter().all(|(_, s)| *s == State::Applied) && gone.is_empty());
         // A failing migration leaves nothing behind.
         assert!(conn.apply("3_bad.sql", "INSERT INTO t VALUES (3); SELECT nope FROM missing;").is_err());
+        let Conn::Sqlite(c, _) = &conn else { unreachable!() };
+        let rows: i64 = c.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 2);
+        // Also one that tries to end its transaction early (found by the 1.0.0 audit).
+        let early = "INSERT INTO t VALUES (4); COMMIT; INSERT INTO t VALUES (5); SELECT nope FROM missing;";
+        assert!(conn.apply("4_commit.sql", early).is_err());
         let Conn::Sqlite(c, _) = &conn else { unreachable!() };
         let rows: i64 = c.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 2);

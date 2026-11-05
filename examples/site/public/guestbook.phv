@@ -18,7 +18,7 @@ if ($req->isPost()) {
         $errors[] = "Please write a message (up to 500 characters).";
     }
     // At most 5 entries per minute from one address (counted only when valid).
-    if ($errors->isEmpty() && !rate_limit("guestbook:" . $req->ip, 5, 60)) {
+    if ($errors->isEmpty() && !rate_limit("guestbook:" . ip_group($req->ip), 5, 60)) {
         $errors[] = "Too many messages; please wait a minute.";
     }
     if ($errors->isEmpty()) {

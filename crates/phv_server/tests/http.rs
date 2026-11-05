@@ -456,6 +456,42 @@ fn raw_bytes(addr: SocketAddr, raw: &str) -> (String, Vec<u8>) {
     (String::from_utf8_lossy(&buf[..at]).into_owned(), buf[at + 4..].to_vec())
 }
 
+/// Found by the 1.0.0 audit: the host scripts see is the request target's
+/// authority (an absolute target in HTTP/1.1), and one with user
+/// information is refused; a long path is answered (and not remembered);
+/// ranges of a file a client takes gzipped are read from the file.
+#[test]
+fn hosts_long_paths_and_ranges_in_production() {
+    let dir = std::env::temp_dir().join(format!("phv-host-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phv.toml", "");
+    write(&dir, "public/host.phv", "<?phv\nimport std.http.request;\necho request()->header(\"host\") ?? \"-\";\n");
+    let text: String = (0..60_000).map(|i| format!("{i:09}\n")).collect();
+    write(&dir, "public/big.txt", &text);
+    let addr = start_with(&dir, false);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let r = request(addr, "GET http://bank.example/host HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n");
+    assert_eq!((r.status, r.body.as_str()), (200, "bank.example"));
+    let r =
+        request(addr, "GET http://user@bank.example/host HTTP/1.1\r\nHost: bank.example\r\nConnection: close\r\n\r\n");
+    assert_eq!(r.status, 400);
+
+    let long = format!("/{}", "x".repeat(20_000));
+    for _ in 0..2 {
+        assert_eq!(get(addr, &long, "").status, 404);
+    }
+
+    // A range of a 600 KB text file, with gzip accepted: the bytes asked for.
+    let (head, body) = raw_bytes(
+        addr,
+        "GET /big.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=100000-100019\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    );
+    assert!(head.starts_with("HTTP/1.1 206"), "{head}");
+    assert_eq!(body, &text.as_bytes()[100_000..100_020]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Static files answer conditional and range requests; text is gzipped
 /// unless the response is personal; CORS; the access log; stopping.
 #[test]

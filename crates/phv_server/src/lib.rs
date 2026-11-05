@@ -144,6 +144,9 @@ struct State {
     embedded_tags: HashMap<String, String>,
     /// Compressed static files by `ETag`, and their total size.
     gz_cache: Mutex<(HashMap<String, Bytes>, usize)>,
+    /// A lock for each static file being compressed: one request compresses it,
+    /// the others wait and take the result from `gz_cache`.
+    gz_flight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// `phv serve --watch`: pages get a script that reloads them on changes.
     watch: bool,
     /// The last change stamp and when it was taken (every open tab asks each second).
@@ -197,6 +200,7 @@ impl State {
             found_cache: Mutex::new(HashMap::new()),
             embedded_tags: HashMap::new(),
             gz_cache: Mutex::new((HashMap::new(), 0)),
+            gz_flight: Mutex::new(HashMap::new()),
             watch: false,
             watch_stamp: tokio::sync::Mutex::new(None),
             hub: Mutex::new(ws::Hub::default()),
@@ -677,15 +681,23 @@ struct WsDone(WsCtx);
 
 /// HTTP/2 sends the host as `:authority` and may split the cookies into
 /// several fields: the server and scripts see them as HTTP/1.1 sends them.
-fn as_http1_headers(mut req: Request<Incoming>) -> Request<Incoming> {
-    if req.version() != hyper::Version::HTTP_2 {
-        return req;
-    }
-    // `:authority` is the host; a `host` field that says otherwise is
-    // replaced (found by the 1.0 audit: scripts saw the other one).
+fn as_http1_headers(mut req: Request<Incoming>) -> Result<Request<Incoming>, Box<Resp>> {
+    // The authority of the request target (HTTP/2's `:authority`, or an
+    // absolute target in HTTP/1.1) is the host: a `host` field that says
+    // otherwise is replaced (found by the 1.0 audit, and its ways around by
+    // the 1.0.0 one). One with user information (`user@host`) is refused.
     let authority = req.uri().authority().map(|a| a.as_str().to_string());
-    if let Some(v) = authority.filter(|a| !a.contains('@')).and_then(|a| HeaderValue::from_str(&a).ok()) {
+    if let Some(a) = authority {
+        let bad =
+            || Box::new(simple(StatusCode::BAD_REQUEST, "text/plain", "bad request: invalid request target".into()));
+        if a.contains('@') {
+            return Err(bad());
+        }
+        let v = HeaderValue::from_str(&a).map_err(|_| bad())?;
         req.headers_mut().insert(hyper::header::HOST, v);
+    }
+    if req.version() != hyper::Version::HTTP_2 {
+        return Ok(req);
     }
     let cookies: Vec<&[u8]> = req.headers().get_all(hyper::header::COOKIE).iter().map(|v| v.as_bytes()).collect();
     if cookies.len() > 1 {
@@ -694,11 +706,14 @@ fn as_http1_headers(mut req: Request<Incoming>) -> Request<Incoming> {
             req.headers_mut().insert(hyper::header::COOKIE, v);
         }
     }
-    req
+    Ok(req)
 }
 
 async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> Result<Resp, Infallible> {
-    let req = as_http1_headers(req);
+    let req = match as_http1_headers(req) {
+        Ok(req) => req,
+        Err(bad) => return Ok(*bad),
+    };
     // Two `Host` fields: the server and a proxy in front may read different ones.
     if req.headers().get_all(hyper::header::HOST).iter().count() > 1 {
         return Ok(simple(StatusCode::BAD_REQUEST, "text/plain", "bad request: more than one Host".into()));
@@ -923,7 +938,35 @@ async fn compress(state: &State, mut resp: Resp, gzip_ok: bool, credentialed: bo
         static_files::mark_gzip(resp.headers_mut());
         return resp;
     }
-    let Some(bytes) = resp.body_mut().take_bytes() else { return resp };
+    // One request compresses a version of a static file; the others wait for
+    // it and share its copy (found by the 1.0.0 audit: on a cold cache each
+    // response compressed and held a copy of its own).
+    let gate = tag.as_ref().map(|t| state.gz_flight.lock().unwrap().entry(t.clone()).or_default().clone());
+    let _compressing = match &gate {
+        Some(g) => Some(g.lock().await),
+        None => None,
+    };
+    if let Some(gz) = tag.as_ref().and_then(|t| state.gz_cache.lock().unwrap().0.get(t).cloned()) {
+        *resp.body_mut() = RespBody::full(gz);
+        static_files::mark_gzip(resp.headers_mut());
+        return resp;
+    }
+    let done = |state: &State| {
+        if let Some(t) = &tag {
+            state.gz_flight.lock().unwrap().remove(t);
+        }
+    };
+    let Some(bytes) = resp.body_mut().take_bytes() else {
+        done(state);
+        return resp;
+    };
+    // A static file is compressed only when the copy can be kept (one served
+    // from memory reaches here too; found by the 1.0.0 audit).
+    if is_static && !state.gz_room(bytes.len()) {
+        done(state);
+        *resp.body_mut() = RespBody::full(bytes);
+        return resp;
+    }
     let max = if is_static { MAX_STATIC_COMPRESS as usize } else { static_files::MAX_COMPRESS };
     let packed = if (1024..=max).contains(&bytes.len()) {
         let data = bytes.clone();
@@ -933,29 +976,64 @@ async fn compress(state: &State, mut resp: Resp, gzip_ok: bool, credentialed: bo
     };
     match packed {
         Some(gz) => {
-            let gz = Bytes::from(gz);
-            if let Some(t) = tag {
+            // A bounded cache, kept while there is room (emptying it would let a
+            // visitor make a new copy per response). A copy that is not kept
+            // counts as output, as a page's compressed output does.
+            let mut kept = None;
+            if let Some(t) = &tag {
                 let mut cache = state.gz_cache.lock().unwrap();
-                // A bounded cache: emptied when full (files change rarely).
-                if cache.1 + gz.len() > GZ_CACHE {
-                    *cache = (HashMap::new(), 0);
+                if cache.1 + gz.len() <= GZ_CACHE {
+                    let gz = Bytes::from(gz.clone());
+                    cache.1 += gz.len();
+                    if let Some(old) = cache.0.insert(t.clone(), gz.clone()) {
+                        cache.1 -= old.len();
+                    }
+                    kept = Some(gz);
                 }
-                cache.1 += gz.len();
-                cache.0.insert(t, gz.clone());
             }
-            // A page's compressed output counts like its output did.
-            *resp.body_mut() =
-                if is_static { RespBody::full(gz) } else { RespBody::counted(gz.to_vec(), &state.buffered) };
+            done(state);
+            match kept {
+                Some(gz) => *resp.body_mut() = RespBody::full(gz),
+                // A static file whose copy cannot be kept is sent as it is.
+                None if is_static => {
+                    *resp.body_mut() = RespBody::full(bytes);
+                    return resp;
+                }
+                None => *resp.body_mut() = RespBody::counted(gz, &state.buffered),
+            }
             static_files::mark_gzip(resp.headers_mut());
         }
-        None => *resp.body_mut() = RespBody::full(bytes),
+        None => {
+            done(state);
+            *resp.body_mut() = RespBody::full(bytes);
+        }
     }
     resp
+}
+
+/// The most bytes of a request path in a log line.
+const LOG_PATH_MAX: usize = 2048;
+
+/// `s` cut to at most `max` bytes (at a character boundary), marked with `...`.
+fn clip(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if s.len() <= max {
+        return s.into();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end]).into()
 }
 
 /// One line on stderr, and in the access log when phv.toml sets one.
 fn log_request(state: &State, ip: &str, method: &Method, path: &str, status: u16, start: Instant) {
     let ms = start.elapsed().as_secs_f64() * 1000.0;
+    // A path of a request may be 64 KB: lines show its start (found by the
+    // 1.0.0 audit: the queue of lines then held gigabytes for a slow stderr).
+    let path = clip(path, LOG_PATH_MAX);
+    // An extension method may be as long as a path (found by the 1.0.0 audit too).
+    let method = clip(method.as_str(), 32);
     let line = format!("{method} {path} {status} {ms:.1}ms\n");
     let format = state.config.access_log.as_ref().map(|(_, f)| f).filter(|_| state.log.has_file());
     let Some(format) = format else { return state.log.line(line, None) };
@@ -969,7 +1047,7 @@ fn log_request(state: &State, ip: &str, method: &Method, path: &str, status: u16
             let v = serde_json::json!({
                 "time": time,
                 "ip": ip,
-                "method": method.as_str(),
+                "method": &*method,
                 "path": path,
                 "status": status,
                 "ms": (ms * 10.0).round() / 10.0,
@@ -1219,7 +1297,10 @@ async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
                 return method_not_allowed();
             }
             let v = Validators { etag: tag, modified: None };
-            bytes_response(state, req.headers(), bytes, ct, &v, req.uri().path())
+            // Labelled by its name: `compress` keeps one copy per file however
+            // the path is spelled (found by the 1.0.0 audit).
+            let label = url_rel(req.uri().path()).unwrap_or_default();
+            bytes_response(state, req.headers(), bytes, ct, &v, &label)
         }
         Found::Target(Target::Static(p)) => {
             if !get {
@@ -1251,7 +1332,10 @@ async fn locate(state: &Arc<State>, url_path: &str, upgrade: bool) -> Found {
     if state.embedded.is_some() {
         return find(state, url_path, upgrade);
     }
-    let key = (!state.dev).then(|| format!("{}{url_path}", if upgrade { "ws " } else { "" }));
+    // Long paths are not remembered (found by the 1.0.0 audit: 10,000 paths of
+    // 64 KB each held 680 MB).
+    let key = (!state.dev && url_path.len() <= FOUND_KEY_MAX)
+        .then(|| format!("{}{url_path}", if upgrade { "ws " } else { "" }));
     if let Some(k) = &key {
         let known = state.found_cache.lock().unwrap().get(k).cloned();
         if let Some(e) = known {
@@ -1283,13 +1367,18 @@ fn method_not_allowed() -> Resp {
     simple(StatusCode::METHOD_NOT_ALLOWED, "text/plain", "method not allowed".into())
 }
 
-/// Static files at most this large are read at once (and kept in memory by
-/// a production server); larger ones are streamed as they are sent.
+/// Static files at most this large are kept in memory by a production server
+/// (one copy, shared by every response); others are streamed as they are sent.
 const STATIC_KEEP: u64 = 256 * 1024;
 
-/// The most bytes of static files a production server keeps in memory (the
-/// cache is emptied when full, as `gz_cache`).
+/// The most bytes of static files a production server keeps in memory. Files
+/// are kept while there is room (the cache is not emptied to make room: a
+/// visitor going through more files than fit would get a new copy of each per
+/// response); the others are streamed.
 const STATIC_KEEP_TOTAL: usize = 32 * 1024 * 1024;
+
+/// Request paths longer than this are not remembered by `locate`.
+const FOUND_KEY_MAX: usize = 1024;
 
 /// A small static file a production server keeps in memory. It is looked at
 /// again at most every `RECHECK`, as compiled pages are.
@@ -1316,14 +1405,20 @@ enum Opened {
 }
 
 /// Opens static file `p` (a blocking call): refused when it has another name
-/// too, read at once when it is small (or `whole` and at most
-/// `MAX_STATIC_COMPRESS`, to be gzipped).
-fn open_static(p: &Path, whole: bool) -> Opened {
+/// too, or when it is no longer the file at `p`; read at once when it has at
+/// most `read_up_to` bytes.
+fn open_static(p: &Path, read_up_to: u64) -> Opened {
     use std::io::Read;
     let Ok(file) = std::fs::File::open(p) else { return Opened::Missing };
     // A file with another name (a hard link) may be one kept outside
     // public/, such as the TLS key (found by the 1.0 audit).
     if phv_std::safefs::single_file(&file).is_err() {
+        return Opened::Missing;
+    }
+    // `p` was found earlier (up to a second earlier in production): a link or
+    // junction put on the way since then must not lead outside public/
+    // (found by the 1.0.0 audit).
+    if phv_std::safefs::opened_at(&file, p).is_err() {
         return Opened::Missing;
     }
     let (len, modified) = match file.metadata() {
@@ -1333,7 +1428,7 @@ fn open_static(p: &Path, whole: bool) -> Opened {
     if len > MAX_STATIC {
         return Opened::TooLarge;
     }
-    let data = if len <= STATIC_KEEP || (whole && len <= MAX_STATIC_COMPRESS) {
+    let data = if len <= read_up_to {
         let mut data = Vec::with_capacity(len as usize);
         if (&file).take(len).read_to_end(&mut data).is_err() || data.len() as u64 != len {
             return Opened::Missing;
@@ -1371,11 +1466,29 @@ fn bytes_response(
 }
 
 /// Sends static file `p`. Its checks and reads run in one blocking call.
+///
+/// A file is read at once only when one copy serves many responses: a small
+/// file a production server keeps, or a text file a client takes gzipped
+/// (compressed once per version, and counted as output). A range is always
+/// streamed from the file, so a response holds its buffer, never the file
+/// (found by the 1.0.0 audit: stalled range requests each held a whole file).
 async fn serve_static(state: &Arc<State>, req: &Request<Incoming>, p: PathBuf, gzip_ok: bool) -> Resp {
     let ct = content_type(&p).unwrap_or("application/octet-stream");
-    let whole = gzip_ok && static_files::compressible(ct);
+    let ranged = req.headers().contains_key(hyper::header::RANGE);
+    // Read at once to be compressed only when the copy can be kept (found by the
+    // 1.0.0 audit: with the cache full, each response held a copy of its own);
+    // a copy already kept is still sent (see `compress`).
+    let gzipped = !ranged && gzip_ok && static_files::compressible(ct) && state.gz_room(MAX_STATIC_COMPRESS as usize);
+    let keepable = !ranged && !state.dev && state.embedded.is_none() && state.static_room(STATIC_KEEP as usize);
+    let read_up_to = match (gzipped, keepable) {
+        (true, _) => MAX_STATIC_COMPRESS,
+        (false, true) => STATIC_KEEP,
+        (false, false) => 0,
+    };
     let q = p.clone();
-    let Ok(opened) = tokio::task::spawn_blocking(move || open_static(&q, whole)).await else { return not_found() };
+    let Ok(opened) = tokio::task::spawn_blocking(move || open_static(&q, read_up_to)).await else {
+        return not_found();
+    };
     let (file, len, modified, data) = match opened {
         Opened::File { file, len, modified, data } => (file, len, modified, data),
         Opened::TooLarge => {
@@ -1386,18 +1499,16 @@ async fn serve_static(state: &Arc<State>, req: &Request<Incoming>, p: PathBuf, g
     let v = Validators::of_file(len, modified);
     let label = p.to_string_lossy().into_owned();
     if let Some(data) = data {
-        let keep = !state.dev && state.embedded.is_none() && len <= STATIC_KEEP;
-        let bytes = if keep {
-            let bytes = Bytes::from(data);
-            if let Some(key) = url_rel(req.uri().path()) {
-                state.keep_static(
-                    key,
-                    StaticEntry { path: p, data: bytes.clone(), ct, v: v.clone(), checked: state.now_ms().into() },
-                );
+        let key = url_rel(req.uri().path()).filter(|_| keepable && len <= STATIC_KEEP);
+        let bytes = match key {
+            Some(key) if state.static_room(data.len()) => {
+                let bytes = Bytes::from(data);
+                let entry =
+                    StaticEntry { path: p, data: bytes.clone(), ct, v: v.clone(), checked: state.now_ms().into() };
+                state.keep_static(key, entry);
+                bytes
             }
-            bytes
-        } else {
-            body::counted_bytes(data, &state.buffered)
+            _ => body::counted_bytes(data, &state.buffered),
         };
         return bytes_response(state, req.headers(), bytes, ct, &v, &label);
     }
@@ -1457,7 +1568,7 @@ async fn cached_static(state: &Arc<State>, req: &Request<Incoming>) -> Option<Re
 /// same checks as when it was first sent).
 fn still_kept(state: &State, url_path: &str, e: &StaticEntry) -> bool {
     matches!(resolve(state, url_path), Some(Target::Static(p)) if p == e.path)
-        && matches!(open_static(&e.path, false), Opened::File { data: Some(d), .. } if d == e.data)
+        && matches!(open_static(&e.path, STATIC_KEEP), Opened::File { data: Some(d), .. } if d == e.data)
 }
 
 /// A 206 answer for bytes `a..=b` of `len`.
@@ -1527,16 +1638,25 @@ impl State {
         self.started.elapsed().as_millis() as u64
     }
 
-    /// Keeps a small static file in memory (see `cached_static`).
+    /// Whether `bytes` more of compressed static files fit in `gz_cache`.
+    fn gz_room(&self, bytes: usize) -> bool {
+        self.gz_cache.lock().unwrap().1 + bytes <= GZ_CACHE
+    }
+
+    /// Whether `bytes` more of static files fit in memory.
+    fn static_room(&self, bytes: usize) -> bool {
+        self.static_cache.lock().unwrap().1 + bytes <= STATIC_KEEP_TOTAL
+    }
+
+    /// Keeps a small static file in memory, if there is room (see `cached_static`).
     fn keep_static(&self, key: String, entry: StaticEntry) {
         let mut cache = self.static_cache.lock().unwrap();
-        if cache.1 + entry.data.len() > STATIC_KEEP_TOTAL {
-            *cache = (HashMap::new(), 0);
+        let old = cache.0.get(&key).map_or(0, |e| e.data.len());
+        if cache.1 - old + entry.data.len() > STATIC_KEEP_TOTAL {
+            return;
         }
-        cache.1 += entry.data.len();
-        if let Some(old) = cache.0.insert(key, Arc::new(entry)) {
-            cache.1 -= old.data.len();
-        }
+        cache.1 = cache.1 - old + entry.data.len();
+        cache.0.insert(key, Arc::new(entry));
     }
 
     fn cached(&self, script: &Path) -> Option<Arc<CachedPage>> {
@@ -2083,7 +2203,7 @@ impl State {
             Some(Target::Script(p, params)) => self.execute(&p, params, ip, parts, body, Page::Normal, None),
             // Static files get the server's checks and headers (read whole: the
             // test reads the body at once).
-            Some(Target::Static(p)) => match open_static(&p, true) {
+            Some(Target::Static(p)) => match open_static(&p, MAX_STATIC) {
                 Opened::File { mut file, len, modified, data } => {
                     let data = match data {
                         Some(d) => d,

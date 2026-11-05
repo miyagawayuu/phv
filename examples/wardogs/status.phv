@@ -49,7 +49,7 @@ function report(Snapshot $snap): string {
     }
     $out .= "\nScore" . ($st->scoreCap != null ? " (first to {$st->scoreCap})" : "") . "\n";
     foreach ($st->factions as $f) {
-        $filled = $top > 0 ? intdiv($f->score * 30, $top) : 0;
+        $filled = $top > 0 ? max(0, min(30, intdiv($f->score * 30, $top))) : 0;
         $out .= "  " . $f->name->padEnd(12, " ") . ((string)$f->score)->padStart(5, " ") . "  "
             . str_repeat("#", $filled) . str_repeat(".", 30 - $filled) . "\n";
     }

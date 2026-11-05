@@ -177,10 +177,14 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
     let f: BuiltinFn = match name {
         "encrypt" => |vm, a| {
             let k = key(vm, &a[1], "encrypt")?;
+            // The copies made on the way are reserved first (found by the 1.0.0
+            // audit: these four builtins held several times the memory limit).
+            vm.reserve(s(&a[0]).len().saturating_mul(4).saturating_add(256))?;
             Ok(Value::str(encrypt(s(&a[0]).as_bytes(), k)))
         },
         "decrypt" => |vm, a| {
             let k = key(vm, &a[1], "decrypt")?;
+            vm.reserve(s(&a[0]).len().saturating_mul(3).saturating_add(256))?;
             match decrypt(s(&a[0]), k) {
                 Some(b) => text(vm, b, "decrypt"),
                 None => Ok(Value::Null),
@@ -188,6 +192,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "sign_token" => |vm, a| {
             let k = key(vm, &a[1], "sign_token")?;
+            vm.reserve(s(&a[0]).len().saturating_mul(5).saturating_add(256))?;
             Ok(Value::str(sign(s(&a[0]).as_bytes(), k, 0)))
         },
         "sign_token_ttl" => |vm, a| {
@@ -199,10 +204,12 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let expires = now()
                 .checked_add(ttl)
                 .ok_or_else(|| vm.throw("ValueError", "sign_token(): the lifetime is too long"))?;
+            vm.reserve(s(&a[0]).len().saturating_mul(5).saturating_add(256))?;
             Ok(Value::str(sign(s(&a[0]).as_bytes(), k, expires)))
         },
         "verify_token" => |vm, a| {
             let k = key(vm, &a[1], "verify_token")?;
+            vm.reserve(s(&a[0]).len().saturating_mul(3).saturating_add(256))?;
             match verify(s(&a[0]), k, now()) {
                 Some(b) => text(vm, b, "verify_token"),
                 None => Ok(Value::Null),

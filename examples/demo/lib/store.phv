@@ -1,7 +1,8 @@
 import std.db.Database;
 
 // One SQLite file holds the message board and the click counter.
-// Each request opens it again: nothing is shared between requests.
+// Each request opens it (the server may hand it a connection it kept, which
+// carries nothing of the request that used it before).
 
 export class Message {
     public function __construct(

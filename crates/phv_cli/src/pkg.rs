@@ -161,6 +161,12 @@ fn git(args: &[&str], dir: Option<&Path>) -> Result<String, String> {
     // Links in a package are checked out as plain files holding the target's
     // name: a package cannot point at files outside itself.
     cmd.args(["-c", "core.symlinks=false"]);
+    // No filter runs on a package's files: git-lfs (on by default in Git for
+    // Windows) would read the package's `.lfsconfig` and contact any host it
+    // names, over any transport (found by the 1.0.0 audit).
+    cmd.args(["-c", "filter.lfs.process=", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.clean="]);
+    cmd.args(["-c", "filter.lfs.required=false"]);
+    cmd.env("GIT_LFS_SKIP_SMUDGE", "1");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     if let Some(d) = dir {
         cmd.arg("-C").arg(abs(d));
@@ -172,6 +178,17 @@ fn git(args: &[&str], dir: Option<&Path>) -> Result<String, String> {
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
+}
+
+/// Gives a fresh clone attributes that come before the package's own
+/// `.gitattributes`: no filter driver of the user's git configuration (such
+/// as git-lfs, which contacts hosts a package names) runs on its files
+/// (found by the 1.0.0 audit).
+fn no_filters(clone: &Path) -> Result<(), String> {
+    let info = clone.join(".git").join("info");
+    std::fs::create_dir_all(&info)
+        .and_then(|_| std::fs::write(info.join("attributes"), "* -filter -ident\n"))
+        .map_err(|e| format!("cannot prepare the checkout: {e}"))
 }
 
 /// `p` as an absolute path: git runs in a directory of its own.
@@ -386,6 +403,7 @@ impl Installer<'_> {
             std::fs::create_dir_all(&vendor).map_err(|e| e.to_string())?;
             let _ = std::fs::remove_dir_all(&tmp);
             git(&["clone", "--quiet", "--no-checkout", "--", &url, &abs(&tmp).to_string_lossy()], None)?;
+            no_filters(&tmp)?;
             let target = match (&c.commit, c.rev.as_deref()) {
                 (Some(commit), _) => commit.clone(),
                 (None, Some("HEAD") | None) => "origin/HEAD".into(),
@@ -524,7 +542,8 @@ fn resolve(ins: &mut Installer, root_deps: &BTreeMap<String, Dependency>) -> Res
                     if !p.is_dir() {
                         return Err(format!("{name}: directory {} does not exist", p.display()));
                     }
-                    println!("  {name}: using {}", p.display());
+                    let shown = phv_syntax::diag::printable_text(&format!("  {name}: using {}", p.display()));
+                    println!("{shown}");
                     (String::new(), p.clone())
                 }
                 _ => {
@@ -536,7 +555,7 @@ fn resolve(ins: &mut Installer, root_deps: &BTreeMap<String, Dependency>) -> Res
                         Some(v) => format!("v{v}"),
                         None => commit[..commit.len().min(12)].to_string(),
                     };
-                    println!("  {name}: {at}");
+                    println!("{}", phv_syntax::diag::printable_text(&format!("  {name}: {at}")));
                     (commit, ins.root.join("vendor").join(&name))
                 }
             };
@@ -611,6 +630,31 @@ mod tests {
         let path = a.0.clone();
         drop(a);
         assert!(!path.exists());
+    }
+
+    /// A package's `.gitattributes` cannot select a filter (git-lfs, or any
+    /// driver of the user's configuration).
+    #[test]
+    fn packages_cannot_select_filters() {
+        if git(&["--version"], None).is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("phv-filters-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, clone) = (dir.join("src"), dir.join("clone"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
+        std::fs::write(src.join("a.bin"), "x").unwrap();
+        let commit = ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"];
+        git(&["init", "-q"], Some(&src)).unwrap();
+        git(&["add", "."], Some(&src)).unwrap();
+        git(&commit, Some(&src)).unwrap();
+        let url = abs(&src).to_string_lossy().into_owned();
+        git(&["clone", "--quiet", "--no-checkout", "--", &url, &abs(&clone).to_string_lossy()], None).unwrap();
+        no_filters(&clone).unwrap();
+        let attr = git(&["check-attr", "filter", "--", "a.bin"], Some(&clone)).unwrap();
+        assert!(attr.ends_with("unset"), "{attr}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

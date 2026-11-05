@@ -214,6 +214,27 @@ pub fn single_file(f: &File) -> Result<(), FsError> {
     check_plain(f)
 }
 
+/// Whether `f`, opened by the canonical path `path`, is the file at that path:
+/// not reached through a link or junction put on the way after `path` was
+/// found (which would lead elsewhere).
+#[cfg(windows)]
+pub fn opened_at(f: &File, path: &Path) -> Result<(), FsError> {
+    imp::check_path(f, path)
+}
+
+#[cfg(unix)]
+pub fn opened_at(f: &File, path: &Path) -> Result<(), FsError> {
+    use std::os::unix::fs::MetadataExt;
+    if path.canonicalize()? != path {
+        return Err(FsError::Link);
+    }
+    let (opened, named) = (f.metadata()?, std::fs::metadata(path)?);
+    if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+        return Err(FsError::Link);
+    }
+    Ok(())
+}
+
 fn check_plain(f: &File) -> Result<(), FsError> {
     let meta = f.metadata()?;
     if !meta.is_file() {

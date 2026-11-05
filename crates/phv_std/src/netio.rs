@@ -91,6 +91,26 @@ impl Stream {
     pub(crate) fn set_deadline(&mut self, until: Instant) {
         self.socket().until = until;
     }
+
+    /// Whether nothing arrived on an idle connection: no byte waiting (also
+    /// none TLS has already decrypted) and no close. Only such a connection
+    /// may carry another request, or the next one would read what was sent
+    /// meanwhile as its answer. Checked without waiting.
+    pub(crate) fn quiet(&mut self) -> bool {
+        if let Stream::Tls(t) = self {
+            match t.conn.process_new_packets() {
+                Ok(state) if state.plaintext_bytes_to_read() == 0 && !state.peer_has_closed() => {}
+                _ => return false,
+            }
+        }
+        let tcp = &self.socket().tcp;
+        if tcp.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let r = tcp.peek(&mut [0u8; 1]);
+        let blocking = tcp.set_nonblocking(false).is_ok();
+        blocking && matches!(r, Err(e) if e.kind() == ErrorKind::WouldBlock)
+    }
 }
 
 impl Read for Stream {

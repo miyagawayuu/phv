@@ -1,0 +1,16 @@
+import std.net.HttpClient;
+
+// A late second answer on a kept connection is not read as the next one.
+$api = HttpClient::connect("api");
+echo $api->get("/late")->body, "\n";
+$t = microtime();
+while (microtime() - $t < 0.3) {
+}
+echo $api->get("/next")->body, "\n";
+// An answer refused as too large: the request is not sent again.
+echo $api->get("/warm")->body, "\n";
+try {
+    $api->get("/big");
+} catch (NetworkError $e) {
+    echo $e->getMessage(), "\n";
+}

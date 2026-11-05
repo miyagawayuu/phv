@@ -521,8 +521,10 @@ pub struct HtmlTracker {
     state: State,
     /// Text of a tag name being read after `<`.
     pending: Option<String>,
-    /// Depth of `<svg>` / `<math>` (foreign content has no RCDATA elements).
-    foreign: u32,
+    /// The open `<svg>` (true) and `<math>` (false) elements: foreign content,
+    /// which has no RCDATA elements. An end tag closes only an open element of
+    /// its name, and a self-closed one (`<svg/>`) opens nothing, as in browsers.
+    foreign: Vec<bool>,
     /// Byte offset (in the chunk being fed) of the attribute name or value being
     /// read, if it began in this chunk (else what is found is reported where
     /// it is decided).
@@ -544,6 +546,11 @@ pub struct HtmlTracker {
     /// decides, so it is read again in front of the next text, and no value
     /// may be inserted here (it would name the tag).
     carry: String,
+    /// The last characters of the last literal text (see `hidden_end_tag_start`).
+    tail: String,
+    /// Depth of `<noscript>` (outside foreign content). Browsers with scripting
+    /// on read its content as raw text, up to the first `</noscript`.
+    noscript: u32,
 }
 
 /// JavaScript written directly in template HTML, which a Content-Security-Policy
@@ -557,9 +564,14 @@ pub enum InlineCode {
     /// `http-equiv` after a value inserted into a `<meta>`'s `content` as text
     /// (an error: `http-equiv="refresh"` would redirect to it).
     MetaHttpEquiv,
-    /// `<![CDATA[` or `<!--` in a `<script>` or `<style>` in SVG or MathML (an
-    /// error: browsers read it as markup, which can hide the end tag).
+    /// Markup (a tag, comment or CDATA section) in a `<script>` or `<style>` in
+    /// SVG or MathML (an error: browsers read it as markup, which can hide the
+    /// end tag).
     ForeignCdata,
+    /// The end tag of a raw-text element (`</textarea`, `</noscript`...) in a
+    /// comment or an attribute value (an error: where a browser reads that
+    /// element's text differently, it ends there and what follows is markup).
+    HiddenEndTag,
 }
 
 impl Default for HtmlTracker {
@@ -567,7 +579,7 @@ impl Default for HtmlTracker {
         HtmlTracker {
             state: State::Text,
             pending: None,
-            foreign: 0,
+            foreign: Vec::new(),
             mark: None,
             found: Vec::new(),
             attrs: Vec::new(),
@@ -575,6 +587,8 @@ impl Default for HtmlTracker {
             maybe_undescribed: false,
             here: 0,
             carry: String::new(),
+            tail: String::new(),
+            noscript: 0,
         }
     }
 }
@@ -609,6 +623,25 @@ fn is_url_attr(tag: &str, name: &str) -> bool {
 /// Elements whose content is not parsed as markup, in HTML (not foreign) content.
 const RAW_TAGS: &[&str] =
     &["script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "plaintext"];
+
+/// Elements a browser may read as raw text where this tracker reads markup:
+/// `RAW_TAGS`, and `<noscript>` (raw text when scripting is on).
+fn hides_end_tag(name: &str) -> bool {
+    name == "noscript" || RAW_TAGS.contains(&name)
+}
+
+/// Whether `tail` (literal text) ends where a value could complete such an
+/// element's end tag: after `<`, or `</` and the start of its name.
+fn hidden_end_tag_start(tail: &str) -> bool {
+    if tail.ends_with('<') {
+        return true;
+    }
+    let lower = tail.to_ascii_lowercase();
+    let Some(at) = lower.rfind("</") else { return false };
+    let name = &lower[at + 2..];
+    name.bytes().all(|b| b.is_ascii_alphabetic())
+        && RAW_TAGS.iter().chain(std::iter::once(&"noscript")).any(|t| t.starts_with(name))
+}
 
 /// Decides a URL from the literal text at its start. Browsers strip leading
 /// spaces and controls and decode character references, so `&` leaves it
@@ -649,6 +682,13 @@ impl HtmlTracker {
         if self.pending.is_some() {
             return EchoContext::Tag;
         }
+        let in_comment_or_value =
+            matches!(self.state, State::Comment | State::Bogus | State::Quoted { .. } | State::Unquoted { .. });
+        let in_text = matches!(self.state, State::Text);
+        let watched = (in_comment_or_value && self.out_of_step_possible()) || (self.noscript > 0 && !in_text);
+        if watched && hidden_end_tag_start(&self.tail) {
+            return EchoContext::AfterMarkup;
+        }
         match &self.state {
             State::Text | State::Comment | State::Bogus => EchoContext::Text,
             State::Raw { tag, js, .. } if tag == "script" => {
@@ -687,6 +727,9 @@ impl HtmlTracker {
                     EchoContext::Srcdoc
                 } else {
                     match url {
+                        // After a literal `&`, a value would continue a character
+                        // reference (`&` + `#x6a;avascript:`; found by the 1.0.0 audit).
+                        Some(UrlState::Undecided(ps)) if ps.iter().any(|p| p == "&") => EchoContext::UrlReference,
                         Some(UrlState::Undecided(_)) => EchoContext::Url,
                         Some(UrlState::Script) => EchoContext::ScriptUrl,
                         _ => EchoContext::Attr,
@@ -728,6 +771,7 @@ impl HtmlTracker {
         self.state == other.state
             && self.pending == other.pending
             && self.foreign == other.foreign
+            && self.noscript == other.noscript
             && self.carry == other.carry
             && (!self.in_tag()
                 || self.attrs == other.attrs
@@ -753,7 +797,7 @@ impl HtmlTracker {
     }
 
     pub fn at_top_level(&self) -> bool {
-        self.state == State::Text && self.pending.is_none() && self.foreign == 0 && self.carry.is_empty()
+        self.state == State::Text && self.pending.is_none() && self.foreign.is_empty() && self.carry.is_empty()
     }
 
     /// After a block that may run zero or more times: true if it ended in the
@@ -808,7 +852,17 @@ impl HtmlTracker {
                 same
             }
         };
-        let same = same && self.pending == entry.pending && self.foreign == entry.foreign && self.carry == entry.carry;
+        // Where a hidden end tag is watched, a block may not begin or end inside
+        // one (`</` + `if {no} else {xy}` + `script>`: the ways are read one
+        // after the other, not as the page is written; found by the 1.0.0 audit).
+        let split =
+            self.out_of_step_possible() && (hidden_end_tag_start(&entry.tail) || hidden_end_tag_start(&self.tail));
+        let same = same
+            && !split
+            && self.pending == entry.pending
+            && self.foreign == entry.foreign
+            && self.noscript == entry.noscript
+            && self.carry == entry.carry;
         if same && self.in_tag() {
             // The attributes of the current tag on either way: a `<meta>` is
             // checked as acting (`http-equiv`, or no `name`) if one way makes
@@ -827,15 +881,82 @@ impl HtmlTracker {
         same
     }
 
-    fn end_tag(&mut self, tag: String, closing: bool) {
+    /// Where a browser may read raw text that this tracker reads as markup:
+    /// inside `<noscript>` (scripting on), and inside SVG or MathML (where
+    /// breakout elements and integration points such as `<foreignObject>`
+    /// return to HTML, whose raw-text elements this tracker does not follow
+    /// there). Found by the 1.0.0 audit.
+    fn out_of_step_possible(&self) -> bool {
+        self.noscript > 0 || !self.foreign.is_empty()
+    }
+
+    /// Whether the end tag `name` here could end an element for a browser
+    /// while this tracker reads on: a raw-text element's in a comment or an
+    /// attribute value where the two may disagree; and inside `<noscript>`,
+    /// `</noscript` anywhere but in text (where this tracker ends it too).
+    fn hides(&self, in_comment_or_value: bool, in_text: bool, name: &str) -> bool {
+        (in_comment_or_value && self.out_of_step_possible() && hides_end_tag(name))
+            || (self.noscript > 0 && !in_text && name == "noscript")
+    }
+
+    fn end_tag(&mut self, tag: String, closing: bool, self_closing: bool) {
         if std::mem::take(&mut self.meta_text) && tag == "meta" && self.attrs.iter().any(|a| a == "http-equiv") {
             self.found.push((self.here, InlineCode::MetaHttpEquiv));
         }
-        if matches!(tag.as_str(), "svg" | "math") {
-            self.foreign = if closing { self.foreign.saturating_sub(1) } else { self.foreign + 1 };
+        let svg = match tag.as_str() {
+            "svg" => Some(true),
+            "math" => Some(false),
+            _ => None,
+        };
+        if let Some(svg) = svg {
+            if closing {
+                // Browsers ignore `</math>` in `<svg>` (found by the 1.0.0 audit).
+                if let Some(at) = self.foreign.iter().rposition(|s| *s == svg) {
+                    self.foreign.truncate(at);
+                }
+            } else if !self_closing {
+                self.foreign.push(svg);
+            }
         }
-        let raw = if self.foreign > 0 { tag == "script" || tag == "style" } else { RAW_TAGS.contains(&tag.as_str()) };
+        // Browsers ignore `/>` on HTML elements: `<noscript/>` opens one.
+        if self.foreign.is_empty() && tag == "noscript" {
+            if closing {
+                self.noscript = self.noscript.saturating_sub(1);
+            } else {
+                self.noscript += 1;
+            }
+        }
+        let raw =
+            if !self.foreign.is_empty() { tag == "script" || tag == "style" } else { RAW_TAGS.contains(&tag.as_str()) };
         self.state = if !closing && raw { State::Raw { tag, escape: 0, js: Js::default() } } else { State::Text };
+    }
+
+    /// An end tag split between the last literal text and this one (by a
+    /// statement or an empty block between them: `<!--</` + `noscript>`) is
+    /// checked as one (found by the 1.0.0 audit).
+    fn check_across_pieces(&mut self, text: &str) {
+        if self.tail.is_empty() || !self.out_of_step_possible() {
+            return;
+        }
+        let in_comment_or_value =
+            matches!(self.state, State::Comment | State::Bogus | State::Quoted { .. } | State::Unquoted { .. });
+        let in_text = matches!(self.state, State::Text);
+        let head: String = text.chars().take(16).collect();
+        let joined = format!("{}{head}", self.tail).to_ascii_lowercase();
+        let split = self.tail.len();
+        for (at, _) in joined.match_indices("</") {
+            if at >= split {
+                break;
+            }
+            let rest = &joined[at + 2..];
+            let name: String = rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+            let after = rest[name.len()..].chars().next();
+            // Only one that reaches into this text: one within the last was checked then.
+            let crosses = at + 2 + name.len() >= split;
+            if crosses && is_delim(after.as_ref()) && self.hides(in_comment_or_value, in_text, &name) {
+                self.found.push((0, InlineCode::HiddenEndTag));
+            }
+        }
     }
 
     /// Advances over literal HTML. Returns the byte offsets just after the
@@ -857,6 +978,7 @@ impl HtmlTracker {
     }
 
     fn feed_text(&mut self, text: &str) -> Vec<usize> {
+        self.check_across_pieces(text);
         let chars: Vec<char> = text.chars().collect();
         let offsets: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
         // Whether `s` is at `i`, in any ASCII case (compared in place).
@@ -899,6 +1021,19 @@ impl HtmlTracker {
             }
             let state = std::mem::replace(&mut self.state, State::Text);
             let (from, in_script) = (i, matches!(&state, State::Raw { tag, .. } if tag == "script"));
+            let in_comment_or_value =
+                matches!(state, State::Comment | State::Bogus | State::Quoted { .. } | State::Unquoted { .. });
+            if c == '<' && chars.get(i + 1) == Some(&'/') && self.out_of_step_possible() {
+                let name: String = chars[i + 2..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect();
+                let in_text = matches!(state, State::Text);
+                if is_delim(chars.get(i + 2 + name.len())) && self.hides(in_comment_or_value, in_text, &name) {
+                    self.found.push((offsets[i], InlineCode::HiddenEndTag));
+                }
+            }
             self.state = match state {
                 State::Text => {
                     if c != '<' {
@@ -1000,11 +1135,6 @@ impl HtmlTracker {
                         self.carry = chars[i..].iter().collect();
                         i = chars.len() - 1;
                         State::Raw { tag, escape, js }
-                    } else if self.foreign > 0 && (starts(i, "<![CDATA[") || starts(i, "<!--")) {
-                        // In SVG and MathML a script's text is markup: a CDATA section or
-                        // comment can hide its end tag from browsers but not from here.
-                        self.found.push((offsets[i], InlineCode::ForeignCdata));
-                        State::Raw { tag, escape, js }
                     } else if c == '<' && starts(i, &end) && is_delim(chars.get(i + n)) {
                         if tag == "script" && escape == 2 {
                             i += n - 1;
@@ -1013,6 +1143,16 @@ impl HtmlTracker {
                             i += n - 1;
                             State::Tag { name: tag, closing: true }
                         }
+                    } else if !self.foreign.is_empty()
+                        && c == '<'
+                        && chars.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '!' | '/' | '?'))
+                    {
+                        // In SVG and MathML a script's text is markup: a tag, comment,
+                        // CDATA section or bogus comment can hide its end tag from
+                        // browsers but not from here (found by the 1.0 audit for CDATA
+                        // and comments, by the 1.0.0 one for tags and bogus comments).
+                        self.found.push((offsets[i], InlineCode::ForeignCdata));
+                        State::Raw { tag, escape, js }
                     } else if tag != "script" {
                         State::Raw { tag, escape, js }
                     } else if escape == 0 && starts(i, "<!--") {
@@ -1040,7 +1180,8 @@ impl HtmlTracker {
                 }
                 State::Tag { name, closing } => {
                     if c == '>' {
-                        self.end_tag(name, closing);
+                        let self_closing = i > 0 && chars[i - 1] == '/';
+                        self.end_tag(name, closing, self_closing);
                         i += 1;
                         continue;
                     } else if c.is_whitespace() || c == '/' {
@@ -1061,14 +1202,23 @@ impl HtmlTracker {
                         self.attrs.push(name.clone());
                         State::BeforeValue { tag, closing, name }
                     } else if c == '>' {
-                        self.end_tag(tag, closing);
+                        let self_closing = i > 0 && chars[i - 1] == '/';
+                        self.end_tag(tag, closing, self_closing);
                         i += 1;
                         continue;
                     } else if c.is_whitespace() || c == '/' {
                         // `name =value` is rare; a space ends a valueless attribute
-                        // unless `=` follows.
-                        let next = chars[i..].iter().find(|c| !c.is_whitespace());
-                        if next == Some(&'=') {
+                        // unless `=` follows. The spaces are passed at once (found by
+                        // the 1.0.0 audit: looking ahead at each one was quadratic).
+                        let mut j = i;
+                        while j < chars.len() && chars[j].is_whitespace() {
+                            j += 1;
+                        }
+                        if c.is_whitespace() && j > i + 1 {
+                            self.here = offsets[j - 1];
+                            i = j - 1;
+                        }
+                        if chars.get(j) == Some(&'=') && c.is_whitespace() {
                             State::AttrName { tag, closing, name }
                         } else {
                             self.attrs.push(name);
@@ -1087,7 +1237,7 @@ impl HtmlTracker {
                     } else if c.is_whitespace() {
                         State::BeforeValue { tag, closing, name }
                     } else if c == '>' {
-                        self.end_tag(tag, closing);
+                        self.end_tag(tag, closing, false);
                         i += 1;
                         continue;
                     } else {
@@ -1159,7 +1309,7 @@ impl HtmlTracker {
                     if c.is_whitespace() {
                         State::Tag { name: tag, closing }
                     } else if c == '>' {
-                        self.end_tag(tag, closing);
+                        self.end_tag(tag, closing, false);
                         i += 1;
                         continue;
                     } else {
@@ -1178,6 +1328,13 @@ impl HtmlTracker {
             }
             i += 1;
         }
+        // The end of the text so far, across pieces (a short piece keeps what came
+        // before it), for a value inserted after it (`hidden_end_tag_start`) and
+        // for an end tag split across pieces (`check_across_pieces`).
+        let mut tail = std::mem::take(&mut self.tail);
+        tail.extend(chars.iter());
+        let skip = tail.chars().count().saturating_sub(16);
+        self.tail = tail.chars().skip(skip).collect();
         scripts
     }
 }
@@ -1209,6 +1366,117 @@ mod tests {
         assert_eq!(ctx("<!-- <script> --><p>"), EchoContext::Text);
         assert_eq!(ctx("<input value='a' disabled>"), EchoContext::Text);
         assert_eq!(ctx("<p>1 < 2 and "), EchoContext::Text);
+    }
+
+    fn found(html: &str) -> Vec<InlineCode> {
+        let mut t = HtmlTracker::default();
+        t.feed(html);
+        t.take_inline_code().into_iter().map(|(_, c)| c).collect()
+    }
+
+    /// Found by the 1.0.0 audit: in SVG and MathML a script's text is markup,
+    /// so any tag, comment or bogus comment there could hide its end tag.
+    #[test]
+    fn markup_in_foreign_raw_text_is_refused() {
+        for html in [
+            "<svg><script><a title='</script>'></a>",
+            "<svg><script><!x </script >",
+            "<svg><script></ </script >",
+            "<svg><style><a title='</style>'></a>",
+            "<math><style><![CDATA[",
+            "<svg><script><!--",
+        ] {
+            assert!(found(html).contains(&InlineCode::ForeignCdata), "{html}");
+        }
+        // Its own end tag, and `<` that starts nothing, are fine.
+        assert!(found("<svg><script>if (a < b) {}</script></svg>").is_empty());
+    }
+
+    /// Found by the 1.0.0 audit: `<svg/>` opens nothing, and `</math>` does
+    /// not close an `<svg>` (browsers ignore it), so raw-text elements stay
+    /// the same for the tracker and the browser.
+    #[test]
+    fn foreign_content_follows_the_open_elements() {
+        assert_eq!(ctx("<svg/><textarea>"), EchoContext::Text);
+        let mut t = HtmlTracker::default();
+        t.feed("<svg/><textarea><!--</textarea><p>");
+        assert!(t.at_top_level(), "the textarea ended for the tracker as it does for the browser");
+        // In SVG, `</math>` is ignored: a `<script>` is still SVG's, whose text is markup.
+        assert!(found("<svg></math><script><![CDATA[//</script>]]>").contains(&InlineCode::ForeignCdata));
+    }
+
+    /// Found by the 1.0.0 audit: where a browser reads an element's text as raw
+    /// text (`<noscript>` with scripting on, `<xmp>` in `<foreignObject>`), its
+    /// end tag in a comment or attribute value ends it.
+    #[test]
+    fn end_tags_hidden_in_comments_and_attributes_are_refused() {
+        for html in [
+            "<noscript><!--</noscript><meta http-equiv=\"refresh\">-->",
+            "<svg><foreignObject><xmp><!--</xmp><a href=\"",
+            "<svg><p title=\"</textarea >\">",
+            "<math><!x </title>",
+            // Inside `<noscript>`, its end tag in raw text too (found again by the audit).
+            "<noscript><textarea></noscript><a href=\"",
+            "<noscript><title></NOSCRIPT ><meta>",
+        ] {
+            assert!(found(html).contains(&InlineCode::HiddenEndTag), "{html}");
+        }
+        // Where a browser reads the page as this tracker does, they are fine:
+        // a commented-out script, HTML in a `data-*` attribute.
+        assert!(found("<!-- <script src=\"/old.js\"></script> --><p data-x=\"<textarea></textarea>\">").is_empty());
+        assert!(found("<noscript><style>.js{display:none}</style><p title=\"</b>\"></noscript>").is_empty());
+        // A value right after the start of such an end tag could complete it.
+        assert_eq!(ctx("<noscript><!-- </noscr"), EchoContext::AfterMarkup);
+        assert_eq!(ctx("<svg><p title=\"</"), EchoContext::AfterMarkup);
+        assert_eq!(ctx("<noscript><!-- <"), EchoContext::AfterMarkup);
+        assert_eq!(ctx("<svg><p title=\"</b"), EchoContext::Attr);
+        assert_eq!(ctx("<!-- </noscr"), EchoContext::Text);
+        // Split between pieces of literal text (statements between them), also
+        // through short pieces.
+        for pieces in [
+            &["<noscript><!--</", "noscript><a href=\""][..],
+            &["<noscript><!--</nos", "cript>"],
+            &["<noscript><!--</", "no", "script>"],
+            &["<noscript><!--<", "/", "noscript>"],
+            &["<svg><foreignObject><xmp><!--</", "x", "mp>"],
+        ] {
+            let mut t = HtmlTracker::default();
+            let mut found = Vec::new();
+            for p in pieces {
+                t.feed(p);
+                found.extend(t.take_inline_code());
+            }
+            assert!(found.iter().any(|(_, c)| *c == InlineCode::HiddenEndTag), "{pieces:?}");
+        }
+        // A value after a short piece that continues the name.
+        let mut t = HtmlTracker::default();
+        t.feed("<noscript><!--</");
+        t.feed("n");
+        assert_eq!(t.context(), EchoContext::AfterMarkup);
+        // Neither can a block (each way is read after the other).
+        let parse = |src: &str| crate::parse_module(src, 0, true).1;
+        for src in [
+            "<noscript><!--</<?phv if ($b) { ?>no<?phv } else { ?>xy<?phv } ?>script>--></noscript>",
+            "<noscript><!--</no<?phv if ($b) { ?>script<?phv } ?>>--></noscript>",
+        ] {
+            assert!(parse(src).iter().any(|d| d.is_error()), "{src}");
+        }
+        assert!(parse("<noscript><!-- <?phv if ($b) { ?>a<?phv } ?> --></noscript>").iter().all(|d| !d.is_error()));
+        // `<noscript/>` opens a noscript (browsers ignore `/>` on HTML elements).
+        assert!(found("<noscript/><!--</noscript><a>").contains(&InlineCode::HiddenEndTag));
+        assert!(found("<noscript/><textarea></noscript>").contains(&InlineCode::HiddenEndTag));
+    }
+
+    /// Found by the 1.0.0 audit: spaces after an attribute name were looked
+    /// ahead of at each one (quadratic).
+    #[test]
+    fn spaces_after_an_attribute_name_are_read_in_linear_time() {
+        let start = std::time::Instant::now();
+        let html = format!("<a b{}=1><p>", " ".repeat(400_000));
+        assert_eq!(ctx(&html), EchoContext::Text);
+        let html = format!("<a b{}c=\"", " ".repeat(400_000));
+        assert_eq!(ctx(&html), EchoContext::Attr);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
     }
 
     /// The text of a long `<script>` or `<style>` is read in linear time (found
@@ -1446,9 +1714,9 @@ mod tests {
     #[test]
     fn decides_url_starts_from_literal_text() {
         assert_eq!(ctx("<a href=\" "), EchoContext::Url);
-        assert_eq!(ctx("<a href=\"&#x20;"), EchoContext::Url);
+        assert_eq!(ctx("<a href=\"&#x20;"), EchoContext::UrlReference);
         assert_eq!(ctx("<a href=\"j"), EchoContext::Url);
-        assert_eq!(ctx("<a href=\"&#106;"), EchoContext::Url);
+        assert_eq!(ctx("<a href=\"&#106;"), EchoContext::UrlReference);
         assert_eq!(ctx("<a href=\"https://example.com/?q="), EchoContext::Attr);
         assert_eq!(ctx("<a href=\"mailto:"), EchoContext::Attr);
         assert_eq!(ctx("<a href=\"#"), EchoContext::Attr);

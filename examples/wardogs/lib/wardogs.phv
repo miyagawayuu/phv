@@ -6,6 +6,7 @@
 // every field is read with a default instead of trusting the shape of the reply.
 
 import std.net.{HttpClient, HttpResponse};
+import std.regex.Regex;
 
 /** The RCON listener answered with an error, or with something that is not the expected JSON. */
 export class RconError extends RuntimeException {}
@@ -135,8 +136,8 @@ function describe_error(string $path, HttpResponse $res): string {
         if ($body is map) {
             $err = $body["error"] ?? null;
             if ($err is map) {
-                $message = $err["message"] ?? null;
-                if ($message is string && !$message->isEmpty()) {
+                $message = string_of($err["message"] ?? null);
+                if (!$message->isEmpty()) {
                     $text .= " ({$message})";
                 }
             }
@@ -254,15 +255,18 @@ export function format_clock(float $seconds): string {
     return "{$m}:{$s}";
 }
 
+// Text from the server is shown on terminals and pages: control characters
+// (an escape sequence could clear a terminal or set its clipboard) are dropped.
 function string_of(any $v): string {
     if ($v is string) {
-        return $v;
+        return new Regex("[\\x00-\\x1f\\x7f-\\x9f]")->replace($v, "");
     }
     return "";
 }
 
 function int_of(any $v): ?int {
-    if ($v is int) {
+    // Huge numbers would overflow the sums and percentages made from them.
+    if ($v is int && $v > -1000000000000000 && $v < 1000000000000000) {
         return $v;
     }
     // Out-of-range (or NaN) numbers from the server count as missing.

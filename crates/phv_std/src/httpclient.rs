@@ -56,22 +56,32 @@ fn pool_key(base: &Base) -> (String, u16, bool) {
     (base.host.to_ascii_lowercase(), base.port, base.tls)
 }
 
-/// An idle connection to `base`, if one was kept and is not too old.
+/// An idle connection to `base`, if one was kept, is not too old and has
+/// received nothing since its last response (found by the 1.0.0 audit: a
+/// response the server sent later was read by the next request, another
+/// visitor's, as its own).
 fn take(base: &Base) -> Option<Stream> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let Pool { idle, count } = &mut *pool;
-    let list = idle.get_mut(&pool_key(base))?;
-    while let Some((stream, since)) = list.pop() {
-        *count -= 1;
-        if since.elapsed() < KEEP_IDLE {
+    loop {
+        let (mut stream, since) = {
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let Pool { idle, count } = &mut *pool;
+            let kept = idle.get_mut(&pool_key(base))?.pop()?;
+            *count -= 1;
+            kept
+        };
+        if since.elapsed() < KEEP_IDLE && stream.quiet() {
             return Some(stream);
         }
     }
-    None
 }
 
-/// Keeps a connection whose last response ended cleanly, unless enough are kept.
-fn give(base: &Base, stream: Stream) {
+/// Keeps a connection whose last response ended cleanly, unless enough are
+/// kept or something more already came on it (a stray answer sent right
+/// after the real one would otherwise be read by the next request).
+fn give(base: &Base, mut stream: Stream) {
+    if !stream.quiet() {
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let Pool { idle, count } = &mut *pool;
     if *count >= KEEP_TOTAL {
@@ -485,25 +495,53 @@ fn exchange(base: &Base, req: &Request, until: Instant, limit: usize) -> Result<
         if let Some(mut stream) = take(base) {
             stream.set_deadline(until);
             // A kept connection may have been closed by the server: the request
-            // is sent again on a new one.
-            if let Ok((resp, keep)) = send(&mut stream, base, req, limit) {
-                if keep {
-                    give(base, stream);
+            // is sent again on a new one, but only when no byte of an answer
+            // came (found by the 1.0.0 audit: an answer refused as too large
+            // was asked for again).
+            let mut received = 0;
+            match send(&mut stream, base, req, limit, &mut received) {
+                Ok((resp, keep)) => {
+                    if keep {
+                        give(base, stream);
+                    }
+                    return Ok(resp);
                 }
-                return Ok(resp);
+                Err(e) if received > 0 => return Err(e),
+                Err(_) => {}
             }
         }
     }
     let mut stream = dial(&base.host, base.port, base.tls, until)?;
-    let (resp, keep) = send(&mut stream, base, req, limit)?;
+    let (resp, keep) = send(&mut stream, base, req, limit, &mut 0)?;
     if keep {
         give(base, stream);
     }
     Ok(resp)
 }
 
-/// Writes `req` on `stream` and reads the response (see `read_response`).
-fn send(stream: &mut Stream, base: &Base, req: &Request, limit: usize) -> Result<(Response, bool), String> {
+/// Counts the bytes read through it.
+struct Counting<'a> {
+    inner: &'a mut Stream,
+    read: &'a mut usize,
+}
+
+impl Read for Counting<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        *self.read += n;
+        Ok(n)
+    }
+}
+
+/// Writes `req` on `stream` and reads the response (see `read_response`),
+/// counting in `received` the bytes of it that came.
+fn send(
+    stream: &mut Stream,
+    base: &Base,
+    req: &Request,
+    limit: usize,
+    received: &mut usize,
+) -> Result<(Response, bool), String> {
     let mut head = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", req.method, req.target, base.authority);
     for (name, value) in &req.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
@@ -517,7 +555,7 @@ fn send(stream: &mut Stream, base: &Base, req: &Request, limit: usize) -> Result
     stream.write_all(head.as_bytes()).map_err(io)?;
     stream.write_all(&req.body).map_err(io)?;
     stream.flush().map_err(io)?;
-    read_response(stream, req.method == "HEAD", limit)
+    read_response(&mut Counting { inner: stream, read: received }, req.method == "HEAD", limit)
 }
 
 /// `__http_request(name, method, path, query, headers, body)`: sends a request

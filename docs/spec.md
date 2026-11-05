@@ -713,16 +713,20 @@ are output as is. `echo` and `<?= ?>` follow the same rules.
 HTML escaping protects only element content and **quoted** attribute values. `<?= ?>` and `echo` anywhere else
 are a compile error. Locations are determined according to the browser's parsing rules (WHATWG), including
 the content of `<textarea>`, `<title>`, and similar elements, `<!--` inside `<script>`, comments such as `<!-->` and `--!>`, the inside of `<svg>`
-(where a CDATA section or comment in a `<script>` or `<style>` is an error), markup inside `<noscript>` (checked as markup), a `<` written just
+and `<math>` (where any markup, such as a tag, comment or CDATA section, in a `<script>` or `<style>` is an error; a self-closed `<svg/>`
+opens nothing, and `</math>` does not close an `<svg>`), markup inside `<noscript>` (checked as markup), a `<` written just
 before a value or block (a value there would name a tag: an error),
-and text such as `</scripts>` that looks like an end tag but is not one.
+and text such as `</scripts>` that looks like an end tag but is not one. The end tag of an element whose text a browser may read as raw
+text (`</textarea>`, `</noscript>`, `</xmp>`...) inside a comment or an attribute value is an error, and so is a value right after `</`
+and the start of such a name there: where a browser reads the element differently (`<noscript>` with scripting on, `<foreignObject>`),
+that end tag would end it and turn what follows into markup.
 
 | Location | Example | Treatment |
 |---|---|---|
 | Element content, quoted attribute value | `<p><?= $s ?></p>`, `title="<?= $s ?>"` | Escaped and output. `Html` is output as it is, except that in an attribute value its `"` and `'` are written as `&quot;` and `&#039;`, so no `Html` can end the attribute |
 | Unquoted attribute value | `href=<?= $u ?>` | Error (add quotes) |
 | Inside a tag (between attributes) | `<div <?= $attrs ?>>` | Error |
-| Start of a URL attribute | `href="<?= $u ?>"`, `src="<?= $u ?>"` | Only `SafeUrl` (`safe_url($u)`) and numbers. If the preceding text contains `/` `?` `#` `:`, it is not the start (`href="/post?id=<?= $id ?>"` is allowed). `href="j<?= ?>"` or only a character reference such as `&#106;` still counts as the start, and so does the text after an inserted value (`safe_url("")` is empty): `href="<?= safe_url($a) ?><?= $b ?>"` is an error; check the whole URL with `safe_url($a . $b)` |
+| Start of a URL attribute | `href="<?= $u ?>"`, `src="<?= $u ?>"` | Only `SafeUrl` (`safe_url($u)`) and numbers. If the preceding text contains `/` `?` `#` `:`, it is not the start (`href="/post?id=<?= $id ?>"` is allowed). `href="j<?= ?>"` still counts as the start. After a `&` at the start (`href="&<?= ?>"`, `&#106;`) only numbers are allowed, `SafeUrl` included: the value would continue a character reference (`&` and `#x6a;avascript:` make `javascript:`). and so does the text after an inserted value (`safe_url("")` is empty): `href="<?= safe_url($a) ?><?= $b ?>"` is an error; check the whole URL with `safe_url($a . $b)` |
 | `javascript:` / `data:` URL | `href="javascript:go(<?= $v ?>)"` | Error (numbers are allowed) |
 | Inside `<script>` | `var x = <?= $v ?>;` | Only `SafeJs` (`json_html($v)`) and numbers, where an expression goes. Inside a JavaScript string, template literal, comment or regular expression (`` `<?= $v ?>` ``, `"<?= $v ?>"`), only numbers: a JSON value's quotes would end the string, and `${...}` in a template literal runs. Write `const s = <?= json_html($v) ?>;` |
 | `<style>`, `style="..."` | | Error (numbers are allowed) |
@@ -814,8 +818,9 @@ tls_key = "/etc/letsencrypt/live/example.com/privkey.pem"
   for the client, so one connection holds about what an HTTP/1.1 connection does. Request bodies count against the
   body budget from their first byte. A connection whose responses the client takes nothing of for 30 seconds is
   dropped, and one without a request for 30 seconds is closed (at most 10 seconds later). Requests share the
-  workers, the request limits and the rate limit with HTTP/1.1. A request with a `host` field other than its
-  `:authority`, or with two `Host` fields (HTTP/1.1), is answered with the `:authority` and 400 respectively.
+  workers, the request limits and the rate limit with HTTP/1.1. The authority of the request target (HTTP/2's
+  `:authority`, or an absolute target such as `GET http://example.com/ HTTP/1.1`) replaces the `host` field; one with
+  user information (`user@host`) and a request with two `Host` fields are answered with 400.
 - HTTP/2 without TLS is refused unless `[server] h2c = true`, for a reverse proxy that speaks it to the server
   (the client then sends HTTP/2 from its first bytes; HTTP/1.1 keeps working on the same port).
 - Scripts see an HTTP/2 request as an HTTP/1.1 one: `request()->header("host")` is the host the client asked for,
@@ -1314,8 +1319,9 @@ when the body is not JSON).
   public CAs. `tls = false` allows `http://` to such a host.
 - Connections are kept open between requests to the same host (at most 8 per host and 256 in all, closed after 30
   idle seconds): one is kept only when its response ended where its framing said (`Content-Length`, or a chunked body
-  with nothing after it) and the server did not ask to close it. Only `GET`, `HEAD` and `OPTIONS` requests take a kept
-  connection; one the server closed meanwhile is retried once on a new connection.
+  with nothing after it) and the server did not ask to close it, and it is used again only if nothing arrived on it
+  while it was idle. Only `GET`, `HEAD` and `OPTIONS` requests take a kept connection; one the server closed meanwhile
+  is retried once on a new connection, only when no byte of an answer came.
 - Each request waits at most until the script's time limit (30 seconds when it has none),
   whatever the server sends: the name lookup, every read and every write stop at that deadline, and at most 10
   interim (`1xx`) responses are skipped. The addresses a host name was looked up to are kept for 30 seconds (a
@@ -1960,7 +1966,8 @@ phv db migrate --db main                # a PostgreSQL / MySQL server of [databa
 - Files are named `<number>_<name>.sql` and applied in the order of their numbers, each once. The table
   `phv_migrations` records each applied file with a checksum of its text; `migrate` refuses to run when an applied
   file has changed since (put changes in a new file instead).
-- On SQLite and PostgreSQL a migration runs in a transaction with its record, so a failing one leaves nothing behind.
+- On SQLite and PostgreSQL a migration runs in a transaction with its record, so a failing one leaves nothing behind
+  (on SQLite, a migration cannot end that transaction: `BEGIN`, `COMMIT` and `ROLLBACK` in it are refused).
   MySQL commits each schema change at once, so a failing migration may be left half applied there.
 - `--dir` names another directory; the database is named with `--db` (from `[databases]`) or `--sqlite` (a file
   inside the project).
@@ -2066,7 +2073,7 @@ It then runs the type checker and shows the places that need manual work, such a
 | Scripts running at once (`serve`) | two per CPU, at least 8 (`[server] workers`) | waits up to 10 seconds, then 503 |
 | Output waiting to be sent (`serve`) | `workers` × `memory_limit_mb` | 503 |
 | Request body bytes past the first 64 KB, received or held (`serve`) | `workers` × 8 MB | waits up to 10 seconds, then 503 |
-| Source file (module, template, script) | 8 MB | Compile error |
+| Source file (module, template, script) | 8 MB | Compile error (`phv lsp`: a larger open document is not checked or formatted, and renames are refused while it is open) |
 | Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits) |
 | Variables and temporary values of one function | 65,534 | Compile error (split the function) |
 | Properties of one class (inherited ones included) | 65,535 | Compile error |

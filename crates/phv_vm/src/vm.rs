@@ -920,18 +920,31 @@ impl Vm {
         }
         let deadline = self.deadline;
         let mut since = 0usize;
-        let mut late = false;
+        let mut over: Option<VmError> = None;
         let r = crate::value::values_equal_metered(a, b, &mut |bytes| {
-            since += bytes;
+            since = since.saturating_add(bytes);
+            // A large step (a long list's pairs about to be queued) is reserved
+            // first; otherwise the limits are looked at every `EQUAL_STEP`.
+            if bytes >= EQUAL_STEP {
+                if let Err(e) = self.reserve(bytes) {
+                    over = Some(e);
+                    return false;
+                }
+            }
             if since >= EQUAL_STEP {
                 since = 0;
-                late = deadline.is_some_and(|d| Instant::now() > d);
+                if let Err(e) = self.check_memory() {
+                    over = Some(e);
+                } else if deadline.is_some_and(|d| Instant::now() > d) {
+                    over = self.check_limits().err();
+                }
             }
-            !late
+            over.is_none()
         });
-        match r {
-            Some(v) => Ok(v),
-            None => self.check_limits().map(|()| false),
+        match (r, over) {
+            (Some(v), _) => Ok(v),
+            (None, Some(e)) => Err(e),
+            (None, None) => self.check_limits().map(|()| false),
         }
     }
 
@@ -1208,6 +1221,12 @@ impl Vm {
         let cls = &self.prog.classes[o.class as usize];
         let Some(i) = cls.fields.iter().position(|f| f.name == "trace") else { return };
         if matches!(&o.fields[i], Value::Str(s) if s.is_empty()) {
+            // Many exceptions kept in a chain (`previous:`) each hold their
+            // text: past the memory limit, the trace is left out (found by the
+            // 1.0.0 audit; the next check stops the script).
+            if self.check_memory().is_err() {
+                return;
+            }
             let mut text = String::new();
             self.trace_lines(at, |func, file, line| {
                 if !text.is_empty() {
@@ -2102,6 +2121,9 @@ impl Vm {
                         for i in 0..*n as usize {
                             let k = std::mem::take(&mut self.regs[base + *start as usize + 2 * i]);
                             let v = std::mem::take(&mut self.regs[base + *start as usize + 2 * i + 1]);
+                            // Each long key is hashed: timed as a lookup is (found by
+                            // the 1.0.0 audit, a way around the 1.0 fix).
+                            tri!(self.long_key(str_len(&k)));
                             m.insert(k.to_key(), v);
                         }
                         reg!(*d) = Value::map(m);
@@ -2115,6 +2137,8 @@ impl Vm {
                         }
                         tri!(self.reserve(count as usize * std::mem::size_of::<Value>()));
                         reg!(*d) = Value::list((from..to).map(Value::Int).collect());
+                        // Up to 10,000,000 items in one step (found by the 1.0.0 audit).
+                        self.long_op(count as usize * std::mem::size_of::<Value>());
                     }
                     Instr::Index(d, b, k) => {
                         let v = match (&reg!(*b), &reg!(*k)) {
@@ -2300,6 +2324,10 @@ impl Vm {
                             }
                             _ => self.echo(&v),
                         }
+                        // Escaping a long value takes long; a template's output is
+                        // dropped after `render()`, so the buffer does not bound it
+                        // (found by the 1.0.0 audit).
+                        self.long_op(len);
                     }
                     Instr::EchoHtml(c) => {
                         if !self.guards.is_empty() {

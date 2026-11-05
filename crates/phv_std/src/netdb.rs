@@ -1376,6 +1376,22 @@ impl KillAt {
     }
 }
 
+impl KillAt {
+    /// Cancels the kill once the statement has ended. True when it was sent
+    /// (or is being sent) already: it could stop the next statement on the
+    /// connection, which is then not used again (found by the 1.0.0 audit).
+    fn disarm(mut self) -> bool {
+        let fired = match &self {
+            KillAt::Watched(key) => WATCHDOG.is_some_and(|dog| lock(&dog.due).remove(key).is_none()),
+            KillAt::Alone(stop) => stop.send(()).is_err(),
+            KillAt::None => false,
+        };
+        self = KillAt::None;
+        drop(self);
+        fired
+    }
+}
+
 impl Drop for KillAt {
     fn drop(&mut self) {
         match self {
@@ -1509,7 +1525,9 @@ fn my_query(vm: &mut Vm, c: &mut Pooled<MyConn>, q: &Value) -> R {
         }
         Ok(())
     })();
-    drop(kill);
+    if kill.disarm() {
+        c.broken = true;
+    }
     result.map_err(|e| my_error(vm, c, e))?;
     if let Some(e) = convert_error {
         // The rest of the result was not read: the connection is out of step.
@@ -1537,7 +1555,9 @@ fn my_execute(vm: &mut Vm, c: &mut Pooled<MyConn>, q: &Value) -> R {
     if unsupported && params.is_empty() && !text.contains(';') {
         r = c.get().conn.query_drop(&text);
     }
-    drop(kill);
+    if kill.disarm() {
+        c.broken = true;
+    }
     r.map_err(|e| my_error(vm, c, e))?;
     Ok(Value::Int(c.get().conn.affected_rows().try_into().unwrap_or(i64::MAX)))
 }
@@ -1866,7 +1886,9 @@ fn my_detached(
     let kill = KillAt::arm(&c.get().opts, id, Some(until + Duration::from_millis(TIMEOUT_MARGIN_MS)));
     if execute {
         let r = c.get().conn.exec_drop(text, params);
-        drop(kill);
+        if kill.disarm() {
+            c.broken = true;
+        }
         r.map_err(|e| error(&mut c, e))?;
         return Ok(Detached::Count(c.get().conn.affected_rows()));
     }
@@ -1902,7 +1924,9 @@ fn my_detached(
         }
         Ok(())
     })();
-    drop(kill);
+    if kill.disarm() {
+        c.broken = true;
+    }
     result.map_err(|e| error(&mut c, e))?;
     if let Some(e) = problem {
         // The rest of the result was not read: the connection is out of step.

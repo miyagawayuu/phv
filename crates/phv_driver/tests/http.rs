@@ -230,6 +230,54 @@ fn connections_are_kept_between_requests() {
     assert_eq!(accepted.load(Ordering::SeqCst), 2);
 }
 
+/// Found by the 1.0.0 audit: a kept connection on which bytes arrived while
+/// it was idle (a second, late response) is not used again, so no request
+/// reads another's answer; and a request whose answer came (and was refused
+/// as too large) is not sent again on a new connection.
+#[test]
+fn kept_connections_carry_no_late_answer_and_answered_requests_are_not_repeated() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let big_seen = Arc::new(AtomicUsize::new(0));
+    let seen = big_seen.clone();
+    std::thread::spawn(move || {
+        for (n, stream) in listener.incoming().enumerate() {
+            let Ok(mut s) = stream else { continue };
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                while let Some(r) = read_request(&mut s) {
+                    let path = r.target.clone();
+                    if path.ends_with("/late") {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlate");
+                        std::thread::sleep(Duration::from_millis(100));
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nFORGED");
+                        continue;
+                    }
+                    if path.ends_with("/big") {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 17000000\r\n\r\n");
+                        return;
+                    }
+                    let body = format!("{path} on {n}");
+                    let reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                    if s.write_all(reply.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let url = format!("http://{addr}/v1");
+    let out = run_script(&host(&url, None), "late_answers", Some(Duration::from_secs(30)));
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "late");
+    assert!(lines[1].starts_with("/v1/next on "), "{out}");
+    assert!(lines[2].starts_with("/v1/warm on "), "{out}");
+    assert!(lines[3].contains("larger than 16 MB"), "{out}");
+    assert_eq!(big_seen.load(Ordering::SeqCst), 1, "the request was sent again");
+}
+
 /// Waiting for an answer stops at the script's time limit, also when the
 /// server keeps sending a byte now and then.
 #[test]

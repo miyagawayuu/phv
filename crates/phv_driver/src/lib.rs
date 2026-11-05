@@ -207,7 +207,7 @@ impl CompileError {
         let mut out = String::new();
         for m in &self.messages {
             out.push_str("error: ");
-            out.push_str(m);
+            out.push_str(&phv_syntax::diag::printable_text(m));
             out.push('\n');
         }
         let mut diags = self.diags.clone();
@@ -368,23 +368,39 @@ type Parsed = (Arc<Module>, Arc<Vec<Diagnostic>>);
 static PARSED: std::sync::LazyLock<std::sync::Mutex<(HashMap<(u32, bool, [u8; 32]), Parsed>, usize)>> =
     std::sync::LazyLock::new(Default::default);
 
-/// The most source text whose parsed modules are kept (all forgotten at once
-/// when it would be passed).
-const PARSED_KEEP: usize = 16 << 20;
+/// The most memory the kept modules may take (all forgotten at once when it
+/// would be passed). What a module takes is measured as it is parsed: its
+/// syntax tree is many times its text (found by the 1.0.0 audit: bounding the
+/// text let the language server keep gigabytes).
+const PARSED_KEEP: usize = 64 << 20;
+
+/// Sources longer than this are parsed each time, never kept.
+const PARSED_TEXT_MAX: usize = 1 << 20;
 
 fn parsed(text: &str, file: u32, template: bool) -> Parsed {
+    let keep = text.len() <= PARSED_TEXT_MAX;
     let key = (file, template, sha256(text.as_bytes()));
-    if let Some(p) = PARSED.lock().unwrap_or_else(|e| e.into_inner()).0.get(&key) {
-        return p.clone();
+    if keep {
+        if let Some(p) = PARSED.lock().unwrap_or_else(|e| e.into_inner()).0.get(&key) {
+            return p.clone();
+        }
     }
+    let before = phv_vm::alloc::thread_allocated();
     let (module, diags) = parse_module(text, file, template);
     let p: Parsed = (Arc::new(module), Arc::new(diags));
+    // Without the counting allocator (a program that embeds this crate), a
+    // generous estimate.
+    let measured = (phv_vm::alloc::thread_allocated() - before).max(0) as usize;
+    let size = if measured > 0 { measured } else { text.len().saturating_mul(64) };
+    if !keep || size > PARSED_KEEP / 4 {
+        return p;
+    }
     let mut cache = PARSED.lock().unwrap_or_else(|e| e.into_inner());
-    if cache.1 + text.len() > PARSED_KEEP {
+    if cache.1 + size > PARSED_KEEP {
         *cache = Default::default();
     }
     if cache.0.insert(key, p.clone()).is_none() {
-        cache.1 += text.len();
+        cache.1 += size;
     }
     p
 }
@@ -464,8 +480,19 @@ impl Loader {
             self.diags.push(Diagnostic::error(format!("{what} {shown} resolves to a file outside the project"), span));
             return None;
         }
-        let overlaid = self.overlay.get(&canonical).cloned();
-        match overlaid.map(Ok).unwrap_or_else(|| read_source(&path)) {
+        // Text from the editor has the limit of files read from disk (found by
+        // the 1.0.0 audit: an open document of 40 MB was analysed).
+        let overlaid = self.overlay.get(&canonical).cloned().map(|t| {
+            if t.len() as u64 > MAX_SOURCE {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("larger than {} MB", MAX_SOURCE >> 20),
+                ))
+            } else {
+                Ok(t)
+            }
+        });
+        match overlaid.unwrap_or_else(|| read_source(&path)) {
             Ok(text) => {
                 let name = display_name(&self.root, &path);
                 Some(self.add(name, Some(path), text, kind))
@@ -748,8 +775,16 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
         }
     }
     loader.add("<std>/prelude.phv".into(), None, phv_std::PRELUDE.to_string(), ModuleKind::Prelude);
-    let overlaid = entry.canonicalize().ok().and_then(|c| loader.overlay.get(&c).cloned());
-    let text = match overlaid.map(Ok).unwrap_or_else(|| read_source(entry)) {
+    // The editor's text of the document has the limit of files read from disk
+    // (found by the 1.0.0 audit).
+    let overlaid = entry.canonicalize().ok().and_then(|c| loader.overlay.get(&c).cloned()).map(|t| {
+        if t.len() as u64 > MAX_SOURCE {
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("larger than {} MB", MAX_SOURCE >> 20)))
+        } else {
+            Ok(t)
+        }
+    });
+    let text = match overlaid.unwrap_or_else(|| read_source(entry)) {
         Ok(t) => t,
         Err(e) => {
             messages.push(format!("cannot read {}: {e}", entry.display()));

@@ -326,6 +326,10 @@ fn position(file: &SourceFile, offset: u32) -> Value {
     json!({ "line": line - 1, "character": character })
 }
 
+/// Open documents larger than source files may be (8 MB) are kept without
+/// their text (see `Server::admit`).
+pub(super) const MAX_DOCUMENT: usize = 8 << 20;
+
 /// How long an analysis of an open document is used for other requests,
 /// when no open document changed meanwhile (files changed on disk by another
 /// program are seen after this).
@@ -340,6 +344,9 @@ struct Server {
     canonical: HashMap<PathBuf, PathBuf>,
     /// Files we published diagnostics for, per entry document.
     reported: HashMap<PathBuf, HashSet<String>>,
+    /// Open documents larger than sources may be: kept without their text, so
+    /// no request reads them (found by the 1.0.0 audit).
+    too_large: HashSet<PathBuf>,
     /// Counts the changes to open documents: an analysis made before the last
     /// one is not used again.
     generation: u64,
@@ -355,8 +362,21 @@ impl Server {
             open: HashMap::new(),
             canonical: HashMap::new(),
             reported: HashMap::new(),
+            too_large: HashSet::new(),
             generation: 0,
             analyses: Default::default(),
+        }
+    }
+
+    /// The text kept for an open document: none for one larger than sources may
+    /// be (it is reported once, by `check`).
+    fn admit(&mut self, path: &Path, text: &str) -> String {
+        if text.len() > MAX_DOCUMENT {
+            self.too_large.insert(path.to_path_buf());
+            String::new()
+        } else {
+            self.too_large.remove(path);
+            text.to_string()
         }
     }
 
@@ -507,6 +527,21 @@ impl Server {
     }
 
     fn check(&mut self, path: &Path, out: &mut impl Write) {
+        if self.too_large.contains(path) {
+            let message = format!("this document is larger than {} MB and is not checked", MAX_DOCUMENT >> 20);
+            send(
+                out,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": { "uri": path_to_uri(path), "diagnostics": [{
+                        "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                        "severity": 1, "source": "phv", "message": message,
+                    }] },
+                }),
+            );
+            return;
+        }
         if path.to_string_lossy().ends_with(".phv.html") {
             return; // templates are checked through the pages that render them
         }
@@ -644,10 +679,11 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                     if let Some(p) =
                         doc_path(params).filter(|p| server.open.contains_key(p) || server.open.len() < MAX_OPEN)
                     {
-                        let text = params["textDocument"]["text"].as_str().unwrap_or("").to_string();
+                        let text = params["textDocument"]["text"].as_str().unwrap_or("");
                         if let Ok(c) = p.canonicalize() {
                             server.canonical.insert(p.clone(), c);
                         }
+                        let text = server.admit(&p, text);
                         server.open.insert(p.clone(), text);
                         server.changed();
                         if !changed.contains(&p) {
@@ -660,7 +696,8 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                         if let Some(text) =
                             params["contentChanges"].as_array().and_then(|c| c.last()).and_then(|c| c["text"].as_str())
                         {
-                            server.open.insert(p.clone(), text.to_string());
+                            let text = server.admit(&p, text);
+                            server.open.insert(p.clone(), text);
                         }
                         server.changed();
                         if !changed.contains(&p) {
@@ -671,6 +708,7 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                 "textDocument/didClose" => {
                     if let Some(p) = doc_path(params) {
                         server.open.remove(&p);
+                        server.too_large.remove(&p);
                         server.canonical.remove(&p);
                         server.reported.remove(&p);
                         server.changed();
@@ -1270,6 +1308,28 @@ mod tests {
         let found = server.workspace_symbols("");
         let names: Vec<&str> = found.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"make") && !names.contains(&"hidden"), "{names:?}");
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    /// An open document over 8 MB is kept without its text, and nothing edits
+    /// from that empty text (the 1.0.0 audit: formatting added a blank line).
+    #[test]
+    fn documents_over_the_limit_are_not_edited() {
+        let p = Project::new("oversized");
+        let (mut server, page, line, character) = p.open("page.phv", "<?phv\n$cou|nt = 1;\necho $count;\n");
+        let big = p.dir.join("big.phv");
+        let text = server.admit(&big, &format!("<?phv\n{}", "1;\n".repeat(3 << 20)));
+        assert!(text.is_empty());
+        server.open.insert(big.clone(), text);
+        let all = json!({ "start": { "line": 0, "character": 0 }, "end": { "line": 99, "character": 0 } });
+        assert_eq!(server.formatting(&big), Value::Null);
+        assert_eq!(server.code_actions(&big, &all), json!([]));
+        assert_eq!(server.document_symbols(&big), Value::Null);
+        // A rename anywhere would miss its uses there.
+        assert!(server.prepare_rename(&page, line, character).is_err());
+        assert!(server.rename(&page, line, character, "$n").is_err());
+        server.too_large.remove(&big);
+        assert!(server.rename(&page, line, character, "$n").is_ok());
         let _ = std::fs::remove_dir_all(&p.dir);
     }
 }

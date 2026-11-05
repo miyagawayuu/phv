@@ -142,6 +142,13 @@ fn printable(s: &str) -> String {
     s.chars().map(|c| if c.is_control() && c != '\t' { '\u{FFFD}' } else { c }).collect()
 }
 
+/// `printable`, keeping line breaks: for messages of several lines that may
+/// hold text from files (phv.toml, a package's manifest; found by the 1.0.0
+/// audit).
+pub fn printable_text(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() && c != '\t' && c != '\n' { '\u{FFFD}' } else { c }).collect()
+}
+
 #[cfg(test)]
 mod printable_tests {
     /// Found by the 1.0 audit: a source line with escape sequences reached

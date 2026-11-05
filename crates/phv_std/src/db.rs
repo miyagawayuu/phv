@@ -471,7 +471,12 @@ fn execute(vm: &mut Vm, a: &[Value]) -> R {
     let db = db_of(vm, &a[0])?;
     let bound: Vec<Param> = params.iter().map(Param).collect();
     let mut stmt = db.conn().prepare_cached(&text).map_err(|e| db.fail(vm, e))?;
+    let before = db.conn().total_changes();
     let n = stmt.execute(rusqlite::params_from_iter(bound.iter())).map_err(|e| db.fail(vm, e))?;
+    // A statement that changes no row (`CREATE TABLE`, `BEGIN`...) leaves
+    // SQLite's count of the last change as it was, which on a kept connection
+    // was another script's (found by the 1.0.0 audit): it changed 0 rows.
+    let n = if db.conn().total_changes() == before { 0 } else { n };
     Ok(Value::Int(n as i64))
 }
 

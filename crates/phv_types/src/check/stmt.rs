@@ -68,7 +68,10 @@ impl Checker<'_> {
                     let h = self.expr(e, None);
                     self.check_printable(&h, "echo");
                     self.check_html_context(&h, *ctx);
-                    if matches!(ctx, EchoContext::Attr | EchoContext::Url | EchoContext::MetaContent) {
+                    if matches!(
+                        ctx,
+                        EchoContext::Attr | EchoContext::Url | EchoContext::UrlReference | EchoContext::MetaContent
+                    ) {
                         out.push(HStmt::EchoAttr(h));
                     } else {
                         out.push(HStmt::Echo(h));
