@@ -199,21 +199,27 @@ published.
 
 | Benchmark | PHV (JIT) | PHV (interpreter) | CPython 3.13 |
 |---|---:|---:|---:|
-| `fib(30)` (recursive calls) | 6.7 ms | 80 ms | 100 ms |
-| 10 million loop iterations | 13 ms | 296 ms | 329 ms |
-| Concatenating 1 million characters | 20 ms | 28 ms | 65 ms |
-| Mandelbrot 300×300 (floats) | 4.0 ms | 249 ms | 196 ms |
-| Building 1 million strings from numbers | 633 ms | 677 ms | 342 ms |
-| map / filter / sum over 1 million elements | 179 ms | 179 ms | 87 ms |
-| 200,000 map updates | 39 ms | 46 ms | 34 ms |
-| Sieve of Eratosthenes up to 1 million (`list<bool>`) | 92 ms | 186 ms | 103 ms |
-| Building and summing a list of 1 million floats | 35 ms | 70 ms | 76 ms |
+| `fib(30)` (recursive calls) | 7.2 ms | 84 ms | 99 ms |
+| 10 million loop iterations | 14 ms | 286 ms | 348 ms |
+| Concatenating 1 million characters | 22 ms | 31 ms | 66 ms |
+| Mandelbrot 300×300 (floats) | 4.2 ms | 234 ms | 198 ms |
+| Building 1 million strings from numbers | 715 ms | 711 ms | 351 ms |
+| map / filter / sum over 1 million elements | 184 ms | 180 ms | 88 ms |
+| 200,000 map updates | 42 ms | 46 ms | 34 ms |
+| Sieve of Eratosthenes up to 1 million (`list<bool>`) | 89 ms | 155 ms | 107 ms |
+| Building and summing a list of 1 million floats | 34 ms | 75 ms | 76 ms |
+| Appending to a property with `.=` 200,000 times | 12 ms | 11 ms | 333 ms |
+| 1 million string comparisons (`==`) | 21 ms | 46 ms | 40 ms |
+| Escaping 200,000 strings for HTML | 89 ms | 86 ms | 93 ms |
+| Creating 1 million objects | 201 ms | 207 ms | 110 ms |
+| Throwing and catching 100,000 exceptions | 73 ms | 69 ms | 14 ms |
+| Sorting 200,000 elements with `sortBy` | 318 ms | 306 ms | 269 ms |
 
 The JIT compiles functions whose values are all `int`, `bool`, `float` or `string`, nullable ones, or lists and
 maps of them. Lists and maps are handled by the interpreter's own code, so the gain is in the loops around them.
 Code that relies on closures or objects runs in the interpreter and, as the table shows, can be slower than
-CPython (`PHV_JIT_EXPLAIN=1` shows why a function is not compiled); so is turning many numbers into strings, where formatting dominates (to be
-improved). Set `PHV_JIT=0` to turn the JIT off.
+CPython (`PHV_JIT_EXPLAIN=1` shows why a function is not compiled); so are turning many numbers into strings, where
+formatting dominates, and exceptions, which record where they were thrown (to be improved). Set `PHV_JIT=0` to turn the JIT off.
 
 ## License
 

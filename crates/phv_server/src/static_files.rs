@@ -21,6 +21,7 @@ const MIN_COMPRESS: usize = 1024;
 pub const MAX_COMPRESS: usize = 8 << 20;
 
 /// What identifies a version of a file.
+#[derive(Clone)]
 pub struct Validators {
     pub etag: String,
     pub modified: Option<SystemTime>,

@@ -97,12 +97,20 @@ fn session_key(id: &str) -> String {
     phv_std::sha256_hex(format!("phv-session:{id}").as_bytes())
 }
 
+/// A session's values as every store keeps them: a JSON object of strings.
+/// (Where its times are kept differs: in a session file's JSON, in columns of
+/// `phv_sessions` that its sweep sorts by, in the header of a Redis value
+/// that the store's scripts read.)
 fn values_json(values: &IndexMap<String, String>) -> String {
     serde_json::json!(values).to_string()
 }
 
 fn values_from_json(text: &str) -> Option<IndexMap<String, String>> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    values_of(&v)
+}
+
+fn values_of(v: &serde_json::Value) -> Option<IndexMap<String, String>> {
     v.as_object()?.iter().map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()
 }
 
@@ -210,6 +218,17 @@ struct Record {
     created: u64,
     last: u64,
     values: IndexMap<String, String>,
+}
+
+impl Record {
+    fn to_json(&self) -> String {
+        serde_json::json!({"created": self.created, "last": self.last, "values": self.values}).to_string()
+    }
+
+    fn from_json(text: &str) -> Option<Record> {
+        let v: serde_json::Value = serde_json::from_str(text).ok()?;
+        Some(Record { created: v["created"].as_u64()?, last: v["last"].as_u64()?, values: values_of(&v["values"])? })
+    }
 }
 
 struct FileStore {
@@ -358,18 +377,12 @@ impl FileStore {
         let (dir, name) = safefs::open_parent(&self.dir, Path::new(name)).ok()?;
         let mut text = String::new();
         dir.open(&name, false).ok()?.take(1 << 20).read_to_string(&mut text).ok()?;
-        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-        let values = v["values"]
-            .as_object()?
-            .iter()
-            .map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
-            .collect::<Option<IndexMap<_, _>>>()?;
-        Some(Record { created: v["created"].as_u64()?, last: v["last"].as_u64()?, values })
+        Record::from_json(&text)
     }
 
     /// Writes the file atomically: a temporary file renamed over the old one.
     fn write(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<()> {
-        let text = serde_json::json!({"created": r.created, "last": r.last, "values": r.values}).to_string();
+        let text = r.to_json();
         let name = Self::name(id, returned);
         let tmp = format!(".{name}.{}", phv_std::random_hex(8));
         let fail = |e: safefs::FsError| std::io::Error::other(format!("{e:?}"));

@@ -152,13 +152,13 @@ impl Drop for Value {
                 Value::Object(o) => {
                     if Rc::strong_count(o) == 1 {
                         if let Ok(mut ob) = o.try_borrow_mut() {
-                            out.append(&mut ob.fields);
+                            out.extend(ob.fields.drain(..).filter(holds_values));
                         }
                     }
                 }
                 Value::Closure(c) => {
                     if let Some(c) = Rc::get_mut(c) {
-                        out.append(&mut c.caps);
+                        out.extend(c.caps.drain(..).filter(holds_values));
                     }
                 }
                 _ => {}
@@ -199,6 +199,28 @@ pub const MAX_RANGE: i128 = 10_000_000;
 /// Iterative, so deeply nested values cannot overflow the stack.
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     values_equal_metered(a, b, &mut |_| true).unwrap_or(false)
+}
+
+/// `values_equal` of two values that hold no others (scalars, strings,
+/// objects and closures), without any allocation; None for lists, maps and
+/// sets, which need the full walk. Strings are compared whole: the caller
+/// times a long comparison.
+#[inline]
+pub fn flat_equal(a: &Value, b: &Value) -> Option<bool> {
+    Some(match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => (*x as f64) == *y,
+        (Value::Str(x), Value::Str(y)) | (Value::Html(x), Value::Html(y)) => Rc::ptr_eq(x, y) || x == y,
+        (Value::Object(x), Value::Object(y)) => Rc::ptr_eq(x, y),
+        (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),
+        (Value::List(_), Value::List(_)) | (Value::Map(_), Value::Map(_)) | (Value::Set(_), Value::Set(_)) => {
+            return None
+        }
+        _ => false,
+    })
 }
 
 /// `values_equal`, telling `meter` how many bytes each string comparison
@@ -328,30 +350,43 @@ fn trim_zeros(s: &str) -> &str {
     }
 }
 
-pub fn html_escape_into(s: &str, out: &mut String) {
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#039;"),
-            c => out.push(c),
+/// Appends `s` with each byte `entity` maps to replaced by that entity. The
+/// bytes in between are copied in runs; the bytes replaced are all ASCII, so
+/// a run never splits a character.
+#[inline]
+fn replace_bytes_into(s: &str, out: &mut String, entity: impl Fn(u8) -> Option<&'static str>) {
+    out.reserve(s.len());
+    let mut from = 0;
+    for (i, b) in s.bytes().enumerate() {
+        if let Some(e) = entity(b) {
+            out.push_str(&s[from..i]);
+            out.push_str(e);
+            from = i + 1;
         }
     }
+    out.push_str(&s[from..]);
+}
+
+pub fn html_escape_into(s: &str, out: &mut String) {
+    replace_bytes_into(s, out, |b| match b {
+        b'&' => Some("&amp;"),
+        b'<' => Some("&lt;"),
+        b'>' => Some("&gt;"),
+        b'"' => Some("&quot;"),
+        b'\'' => Some("&#039;"),
+        _ => None,
+    })
 }
 
 /// `Html` placed in a quoted attribute value: its quotes are encoded (the
 /// browser decodes them back), so it cannot end the attribute. Markup made
 /// by `escape()` has none; a template's output or a `json_html()` value may.
 pub fn attr_quotes_into(s: &str, out: &mut String) {
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#039;"),
-            c => out.push(c),
-        }
-    }
+    replace_bytes_into(s, out, |b| match b {
+        b'"' => Some("&quot;"),
+        b'\'' => Some("&#039;"),
+        _ => None,
+    })
 }
 
 pub fn html_escape(s: &str) -> String {

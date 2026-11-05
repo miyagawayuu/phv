@@ -6,13 +6,17 @@
 //! limit (a socket timeout alone limits each read, not the total). Name
 //! lookups, which the OS cannot cancel, are given up on at the deadline too
 //! (`with_deadline`).
+//!
+//! Looked-up addresses are kept for `DNS_TTL` (`resolve`), and lookups of the
+//! same name at the same time share one lookup. Failed lookups are not kept.
 
 use crate::netdb::{is_local_host, tls_init};
 use phv_vm::Vm;
+use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// A TCP connection whose reads and writes stop at `until`.
@@ -79,7 +83,7 @@ impl Stream {
         tls_init();
         let bare = host.trim_start_matches('[').trim_end_matches(']');
         let name = rustls::pki_types::ServerName::try_from(bare.to_string()).map_err(|_| "invalid host name")?;
-        let session = rustls::ClientConnection::new(TLS.clone(), name).map_err(|_| "the TLS connection failed")?;
+        let session = rustls::ClientConnection::new(tls_config(), name).map_err(|_| "the TLS connection failed")?;
         Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(session, socket))))
     }
 
@@ -112,6 +116,13 @@ impl Write for Stream {
             Stream::Tls(t) => t.flush(),
         }
     }
+}
+
+/// The TLS client settings of every connection PHV makes (HTTP, SMTP, Redis,
+/// WebSocket, PostgreSQL): the public CAs, safe protocol versions, no client
+/// certificate. One configuration, so TLS sessions are resumed across them.
+pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
+    TLS.clone()
 }
 
 static TLS: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
@@ -165,11 +176,13 @@ static PENDING: AtomicUsize = AtomicUsize::new(0);
 
 /// At most this much abandoned blocking work at once: a resolver that never
 /// answers then costs that many threads, not one per request.
-const MAX_PENDING: usize = 32;
+pub(crate) const MAX_PENDING: usize = 32;
 
-/// Runs `work` on its own thread and waits for it until `until`. The OS cannot
-/// cancel a name lookup, so on timeout the thread is left to finish on its own
-/// and its result is dropped.
+/// Runs `work` on a thread of the pool (`workers`) and waits for it until
+/// `until`. The OS cannot cancel a name lookup, so on timeout the work is left
+/// to finish on its own and its result is dropped. (Name lookups go through
+/// `resolve`, which counts them the same way.)
+#[cfg(test)]
 pub(crate) fn with_deadline<T: Send + 'static>(
     until: Instant,
     work: impl FnOnce() -> T + Send + 'static,
@@ -191,7 +204,7 @@ pub(crate) fn with_deadline_in<T: Send + 'static>(
         return Err("too many network connections are being set up".into());
     }
     let (send, recv) = std::sync::mpsc::sync_channel(1);
-    let spawned = std::thread::Builder::new().stack_size(256 << 10).spawn(move || {
+    let spawned = crate::workers::spawn(move || {
         let _ = send.send(work());
         pending.fetch_sub(1, Ordering::SeqCst);
     });
@@ -202,18 +215,141 @@ pub(crate) fn with_deadline_in<T: Send + 'static>(
     recv.recv_timeout(until.saturating_duration_since(Instant::now())).map_err(|_| "timed out".to_string())
 }
 
-/// The addresses of `host`, looked up before `until`.
+/// How long looked-up addresses are kept.
+const DNS_TTL: Duration = Duration::from_secs(30);
+/// Names kept at most (in practice, the hosts of phv.toml's services).
+const DNS_NAMES: usize = 1024;
+
+/// The addresses of a name, or why it has none.
+type Found = Result<Arc<[IpAddr]>, String>;
+
+/// A lookup in progress, which the callers that want the same name wait for.
+struct Flight {
+    found: Mutex<Option<Found>>,
+    done: Condvar,
+}
+
+enum Entry {
+    Known { addrs: Arc<[IpAddr]>, at: Instant },
+    Looking { flight: Arc<Flight>, since: Instant },
+}
+
+/// Looked-up names, with how long they are kept and the lookup that finds them.
+struct Names {
+    entries: Mutex<HashMap<String, Entry>>,
+    ttl: Duration,
+    lookup: fn(&str) -> std::io::Result<Vec<IpAddr>>,
+}
+
+fn system_lookup(name: &str) -> std::io::Result<Vec<IpAddr>> {
+    Ok((name, 0).to_socket_addrs()?.map(|a| a.ip()).collect())
+}
+
+static NAMES: LazyLock<Arc<Names>> =
+    LazyLock::new(|| Arc::new(Names { entries: Mutex::default(), ttl: DNS_TTL, lookup: system_lookup }));
+
+impl Names {
+    fn entries(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The addresses of `name`: kept ones while they are fresh, otherwise those
+    /// of a lookup (shared with every caller that wants the name meanwhile),
+    /// waited for until `until`.
+    fn find(self: &Arc<Self>, name: &str, until: Instant) -> Found {
+        let flight = {
+            let mut entries = self.entries();
+            match entries.get(name) {
+                Some(Entry::Known { addrs, at }) if at.elapsed() < self.ttl => return Ok(addrs.clone()),
+                // A lookup still running after a whole TTL is not waited for:
+                // a new one starts (each counts in `PENDING`, as before).
+                Some(Entry::Looking { flight, since }) if since.elapsed() < self.ttl => flight.clone(),
+                _ => {
+                    if entries.len() >= DNS_NAMES {
+                        let ttl = self.ttl;
+                        entries.retain(|_, e| match e {
+                            Entry::Known { at, .. } => at.elapsed() < ttl,
+                            Entry::Looking { since, .. } => since.elapsed() < ttl,
+                        });
+                        if entries.len() >= DNS_NAMES {
+                            entries.retain(|_, e| matches!(e, Entry::Looking { .. }));
+                        }
+                    }
+                    let flight = Arc::new(Flight { found: Mutex::new(None), done: Condvar::new() });
+                    entries.insert(name.to_string(), Entry::Looking { flight: flight.clone(), since: Instant::now() });
+                    drop(entries);
+                    self.start(name, flight.clone());
+                    flight
+                }
+            }
+        };
+        let mut found = flight.found.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(f) = &*found {
+                return f.clone();
+            }
+            let now = Instant::now();
+            if now >= until {
+                return Err("timed out".into());
+            }
+            found = flight.done.wait_timeout(found, until - now).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    /// Starts the lookup of `name` on the pool; its end fills `flight` (and
+    /// the entry, when the lookup found addresses).
+    fn start(self: &Arc<Self>, name: &str, flight: Arc<Flight>) {
+        let names = self.clone();
+        let owned = name.to_string();
+        let finish = move |found: Found| {
+            let mut entries = names.entries();
+            // Only the lookup the entry waits for replaces it; a failure is not kept.
+            if matches!(entries.get(&owned), Some(Entry::Looking { flight: f, .. }) if Arc::ptr_eq(f, &flight)) {
+                match &found {
+                    Ok(addrs) => entries.insert(owned, Entry::Known { addrs: addrs.clone(), at: Instant::now() }),
+                    Err(_) => entries.remove(&owned),
+                };
+            }
+            drop(entries);
+            *flight.found.lock().unwrap_or_else(|e| e.into_inner()) = Some(found);
+            flight.done.notify_all();
+        };
+        let (lookup, name) = (self.lookup, name.to_string());
+        // Counted and given up on like any blocking work (`with_deadline`).
+        if PENDING.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING {
+            PENDING.fetch_sub(1, Ordering::SeqCst);
+            return finish(Err("too many network connections are being set up".into()));
+        }
+        let job = std::sync::Arc::new(Mutex::new(Some(finish)));
+        let in_job = job.clone();
+        let spawned = crate::workers::spawn(move || {
+            let found = match lookup(&name) {
+                Ok(a) if !a.is_empty() => Ok(Arc::from(a)),
+                _ => Err("cannot resolve the host name".to_string()),
+            };
+            PENDING.fetch_sub(1, Ordering::SeqCst);
+            if let Some(finish) = in_job.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                finish(found);
+            }
+        });
+        if spawned.is_err() {
+            PENDING.fetch_sub(1, Ordering::SeqCst);
+            if let Some(finish) = job.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                finish(Err("cannot start the connection".into()));
+            }
+        }
+    }
+}
+
+/// The addresses of `host`, looked up before `until`, or kept from a lookup
+/// less than `DNS_TTL` ago.
 pub(crate) fn resolve(host: &str, port: u16, until: Instant) -> Result<Vec<SocketAddr>, String> {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = bare.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    let name = bare.to_string();
-    let addrs = with_deadline(until, move || (name.as_str(), port).to_socket_addrs().map(|a| a.collect::<Vec<_>>()))?;
-    match addrs {
-        Ok(a) if !a.is_empty() => Ok(a),
-        _ => Err("cannot resolve the host name".into()),
-    }
+    let addrs = NAMES.find(bare, until)?;
+    Ok(addrs.iter().map(|ip| SocketAddr::new(*ip, port)).collect())
 }
 
 /// Connects to `host:port` before `until`, then starts TLS when `tls` is set.
@@ -245,7 +381,7 @@ pub(crate) fn dial(host: &str, port: u16, tls: bool, until: Instant) -> Result<S
     }
     tls_init();
     let name = rustls::pki_types::ServerName::try_from(bare.to_string()).map_err(|_| "invalid host name")?;
-    let session = rustls::ClientConnection::new(TLS.clone(), name).map_err(|_| "the TLS connection failed")?;
+    let session = rustls::ClientConnection::new(tls_config(), name).map_err(|_| "the TLS connection failed")?;
     Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(session, socket))))
 }
 
@@ -347,5 +483,59 @@ mod tests {
         assert_eq!(with_deadline(Instant::now() + Duration::from_secs(1), || 7), Ok(7));
         GATE.store(true, Ordering::SeqCst);
         wait_until_idle(&OWN);
+    }
+
+    static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+
+    /// A slow lookup that counts its calls and finds 192.0.2.<calls>.
+    fn counted_lookup(_: &str) -> std::io::Result<Vec<IpAddr>> {
+        let n = LOOKUPS.fetch_add(1, Ordering::SeqCst) + 1;
+        std::thread::sleep(Duration::from_millis(100));
+        Ok(vec![IpAddr::from([192, 0, 2, n as u8])])
+    }
+
+    fn failing_lookup(_: &str) -> std::io::Result<Vec<IpAddr>> {
+        LOOKUPS.fetch_add(1, Ordering::SeqCst);
+        Err(Error::other("no such name"))
+    }
+
+    /// Looked-up addresses are kept for the TTL, then looked up again;
+    /// lookups of one name at the same time share one lookup; failures are
+    /// not kept.
+    #[test]
+    fn names_are_kept_for_their_ttl() {
+        let _slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        LOOKUPS.store(0, Ordering::SeqCst);
+        let ttl = Duration::from_millis(400);
+        let names = Arc::new(Names { entries: Mutex::default(), ttl, lookup: counted_lookup });
+        let until = || Instant::now() + Duration::from_secs(10);
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let names = names.clone();
+                std::thread::spawn(move || names.find("api.example", until()))
+            })
+            .collect();
+        for t in threads {
+            assert_eq!(&*t.join().unwrap().unwrap(), &[IpAddr::from([192, 0, 2, 1])]);
+        }
+        assert_eq!(LOOKUPS.load(Ordering::SeqCst), 1, "one lookup for eight callers");
+        assert_eq!(&*names.find("api.example", until()).unwrap(), &[IpAddr::from([192, 0, 2, 1])]);
+        assert_eq!(LOOKUPS.load(Ordering::SeqCst), 1, "kept");
+        std::thread::sleep(ttl + Duration::from_millis(50));
+        assert_eq!(&*names.find("api.example", until()).unwrap(), &[IpAddr::from([192, 0, 2, 2])]);
+        assert_eq!(LOOKUPS.load(Ordering::SeqCst), 2, "looked up again after the TTL");
+
+        // A caller whose deadline passes stops waiting; the lookup still fills the entry.
+        let other = names.find("slow.example", Instant::now() + Duration::from_millis(10));
+        assert_eq!(other, Err("timed out".to_string()));
+        assert_eq!(&*names.find("slow.example", until()).unwrap(), &[IpAddr::from([192, 0, 2, 3])]);
+
+        let failing = Arc::new(Names { entries: Mutex::default(), ttl, lookup: failing_lookup });
+        LOOKUPS.store(0, Ordering::SeqCst);
+        for _ in 0..2 {
+            assert_eq!(failing.find("nowhere.example", until()), Err("cannot resolve the host name".to_string()));
+        }
+        assert_eq!(LOOKUPS.load(Ordering::SeqCst), 2, "a failure is looked up again");
+        wait_until_idle(&PENDING);
     }
 }

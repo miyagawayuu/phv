@@ -32,6 +32,14 @@ mod timez;
 mod twofactor;
 mod web;
 mod websocket;
+mod workers;
+
+/// SQLite connections kept between scripts: idle ones, and opens served by
+/// one so far. For tests.
+#[doc(hidden)]
+pub fn sqlite_kept_stats() -> (usize, u64) {
+    db::kept_stats()
+}
 pub mod wsserver;
 
 pub use httpclient::{check_header_name, check_header_value, check_http_url};

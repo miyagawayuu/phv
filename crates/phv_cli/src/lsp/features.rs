@@ -258,7 +258,7 @@ impl Server {
     pub(super) fn references(&self, path: &Path, line: u64, character: u64, include_decl: bool) -> Value {
         let Some(text) = self.open.get(path) else { return Value::Null };
         let offset = offset_of(text, line, character);
-        let a = self.analyze_text(path, text.clone());
+        let a = self.analysis(path);
         let Some(target) = self.target(&a, offset) else { return json!([]) };
         // Each file is read once, however many references it has.
         let mut files: HashMap<PathBuf, Option<SourceFile>> = HashMap::new();
@@ -282,7 +282,7 @@ impl Server {
     pub(super) fn prepare_rename(&self, path: &Path, line: u64, character: u64) -> Result<Value, String> {
         let text = self.open.get(path).ok_or("the document is not open")?;
         let offset = offset_of(text, line, character);
-        let a = self.analyze_text(path, text.clone());
+        let a = self.analysis(path);
         let target = self.target(&a, offset).ok_or("nothing to rename here")?;
         if !target.in_project {
             return Err(format!("`{}` is defined in the standard library", target.name));
@@ -304,7 +304,7 @@ impl Server {
     pub(super) fn rename(&self, path: &Path, line: u64, character: u64, new_name: &str) -> Result<Value, String> {
         let text = self.open.get(path).ok_or("the document is not open")?;
         let offset = offset_of(text, line, character);
-        let a = self.analyze_text(path, text.clone());
+        let a = self.analysis(path);
         let target = self.target(&a, offset).ok_or("nothing to rename here")?;
         self.rename_target(path, &target, new_name)
     }
@@ -368,7 +368,7 @@ impl Server {
         }
         let name_start = before.len() - name_len;
         let name = &before[name_start..];
-        let a = self.analyze_text(path, text.clone());
+        let a = self.analysis(path);
         let (Some(ix), Some(file)) = (&a.index, a.entry_file) else { return Value::Null };
         let detail =
             ix.definition(file, name_start as u32).and_then(|d| ix.item_at_def(d)).map(|i| i.detail.clone()).or_else(
@@ -445,7 +445,7 @@ impl Server {
             range["end"]["line"].as_u64().unwrap_or(0),
             range["end"]["character"].as_u64().unwrap_or(0),
         );
-        let a = self.analyze_text(path, text.clone());
+        let a = self.analysis(path);
         let (Some(ix), Some(file)) = (&a.index, a.entry_file) else { return json!([]) };
         let src = a.sources.get(file);
         let uri = path_to_uri(path);
@@ -515,8 +515,10 @@ impl Server {
     }
 
     pub(super) fn semantic_tokens(&self, path: &Path) -> Value {
-        let Some(text) = self.open.get(path) else { return Value::Null };
-        let a = self.analyze_text(path, text.clone());
+        if !self.open.contains_key(path) {
+            return Value::Null;
+        }
+        let a = self.analysis(path);
         let (Some(ix), Some(file)) = (&a.index, a.entry_file) else { return json!({ "data": [] }) };
         let src = a.sources.get(file);
         // Every definition by its span, first one wins (as `item_at_def` finds it).
@@ -578,7 +580,7 @@ impl Server {
             range["end"]["line"].as_u64().unwrap_or(u64::MAX),
             range["end"]["character"].as_u64().unwrap_or(0),
         );
-        let a = self.analyze_text(path, text.clone());
+        let a = self.analysis(path);
         let (Some(ix), Some(file)) = (&a.index, a.entry_file) else { return json!([]) };
         let mut hints: Vec<(u32, &str)> = ix
             .scopes

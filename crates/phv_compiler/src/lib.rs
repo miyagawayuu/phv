@@ -57,7 +57,12 @@ pub fn compile_with(h: &HProgram, sources: &SourceMap, opts: Options) -> Result<
                 .collect(),
             vtable: c.vtable.clone(),
             supers: c.supers.clone(),
-            by_name: c.by_name.iter().map(|(n, f)| (pc.method_ids[n], *f)).collect(),
+            by_name: {
+                let mut by_name: Vec<(u32, u32)> = c.by_name.iter().map(|(n, f)| (pc.method_ids[n], *f)).collect();
+                by_name.sort_unstable();
+                by_name.dedup_by_key(|(n, _)| *n);
+                by_name
+            },
             cases: c.cases.iter().map(|(n, v)| (n.clone(), to_const(v))).collect(),
         })
         .collect();
@@ -75,6 +80,7 @@ pub fn compile_with(h: &HProgram, sources: &SourceMap, opts: Options) -> Result<
         method_names: pc.methods,
         files,
         exc_classes: h.exc_classes.clone(),
+        ..Default::default()
     })
 }
 
@@ -159,6 +165,10 @@ struct LoopCtx {
     continues: Vec<usize>,
     /// `tries.len()` when the loop started.
     tries: usize,
+    /// The register holding the collection a `foreach` walks: cleared when
+    /// the loop is left, so it does not keep the collection alive (or shared,
+    /// which would make the next change of it copy it whole).
+    iter: Option<Reg>,
 }
 
 /// An enclosing `try` statement while its body or catches are compiled.
@@ -330,7 +340,11 @@ impl<'a> FnC<'a> {
             | Instr::JumpIfNotLtI(_, _, t)
             | Instr::JumpIfNotLeI(_, _, t)
             | Instr::JumpIfNotLtIImm(_, _, t)
-            | Instr::JumpIfNotLeIImm(_, _, t) => *t = target,
+            | Instr::JumpIfNotLeIImm(_, _, t)
+            | Instr::JumpIfLtIImm(_, _, t)
+            | Instr::JumpIfLeIImm(_, _, t)
+            | Instr::JumpIfEq(_, _, t)
+            | Instr::JumpIfNotEq(_, _, t) => *t = target,
             Instr::IterNext { end, .. } => *end = target,
             Instr::TryBegin { catch, .. } => *catch = target,
             other => panic!("cannot patch {other:?}"),
@@ -633,14 +647,14 @@ impl<'a> FnC<'a> {
                         match &s {
                             Some((sr, sty)) => {
                                 let rc = self.operand(c);
-                                let t = self.alloc();
-                                let ins = match (sty, &c.ty) {
-                                    (Type::Int, Type::Int) => bin_instr(BinKind::EqI, t, *sr, rc),
-                                    (Type::Float, Type::Float) => Instr::EqF(t, *sr, rc),
-                                    _ => bin_instr(BinKind::Eq, t, *sr, rc),
-                                };
-                                self.emit(ins);
-                                jumps.push(self.emit(Instr::JumpIfTrue(t, 0)));
+                                if let (Type::Float, Type::Float) = (sty, &c.ty) {
+                                    let t = self.alloc();
+                                    self.emit(Instr::EqF(t, *sr, rc));
+                                    jumps.push(self.emit(Instr::JumpIfTrue(t, 0)));
+                                } else {
+                                    // `EqI` and `Eq` agree on ints.
+                                    jumps.push(self.emit(Instr::JumpIfEq(*sr, rc, 0)));
+                                }
                             }
                             None => {
                                 let rc = self.operand(c);
@@ -741,6 +755,12 @@ impl<'a> FnC<'a> {
                 let i = if *k == BinKind::LtI { Instr::JumpIfNotLtI(x, y, 0) } else { Instr::JumpIfNotLeI(x, y, 0) };
                 vec![self.emit(i)]
             }
+            HExprKind::Binary(k @ (BinKind::EqI | BinKind::Eq | BinKind::Ne), a, b, swap) if !float_pair(*k, a, b) => {
+                let (x, y) = self.eq_operands(a, b, *swap);
+                self.off = e.span.start;
+                let i = if *k == BinKind::Ne { Instr::JumpIfEq(x, y, 0) } else { Instr::JumpIfNotEq(x, y, 0) };
+                vec![self.emit(i)]
+            }
             _ => {
                 let r = self.operand(e);
                 vec![self.emit(Instr::JumpIfFalse(r, 0))]
@@ -767,6 +787,29 @@ impl<'a> FnC<'a> {
                 t
             }
             HExprKind::Unary(UnKind::Not, x) => self.cond_false(x),
+            HExprKind::Const(HConst::Bool(true)) => vec![self.emit(Instr::Jump(0))],
+            HExprKind::Binary(k @ (BinKind::LtI | BinKind::LeI), a, b, false) if small_int(b).is_some() => {
+                let ra = self.operand(a);
+                let n = small_int(b).unwrap();
+                self.off = e.span.start;
+                let i = if *k == BinKind::LtI { Instr::JumpIfLtIImm(ra, n, 0) } else { Instr::JumpIfLeIImm(ra, n, 0) };
+                vec![self.emit(i)]
+            }
+            HExprKind::Binary(k @ (BinKind::LtI | BinKind::LeI), a, b, swap) => {
+                let ra = self.operand(a);
+                let rb = self.operand(b);
+                let (x, y) = if *swap { (rb, ra) } else { (ra, rb) };
+                self.off = e.span.start;
+                // `x < y` is `!(y <= x)` and `x <= y` is `!(y < x)` for ints.
+                let i = if *k == BinKind::LtI { Instr::JumpIfNotLeI(y, x, 0) } else { Instr::JumpIfNotLtI(y, x, 0) };
+                vec![self.emit(i)]
+            }
+            HExprKind::Binary(k @ (BinKind::EqI | BinKind::Eq | BinKind::Ne), a, b, swap) if !float_pair(*k, a, b) => {
+                let (x, y) = self.eq_operands(a, b, *swap);
+                self.off = e.span.start;
+                let i = if *k == BinKind::Ne { Instr::JumpIfNotEq(x, y, 0) } else { Instr::JumpIfEq(x, y, 0) };
+                vec![self.emit(i)]
+            }
             _ => {
                 let r = self.operand(e);
                 vec![self.emit(Instr::JumpIfTrue(r, 0))]
@@ -774,6 +817,17 @@ impl<'a> FnC<'a> {
         };
         self.next = mark;
         out
+    }
+
+    /// The registers of the operands of `==` or `!=`, in the order they are compared.
+    fn eq_operands(&mut self, a: &HExpr, b: &HExpr, swap: bool) -> (Reg, Reg) {
+        let ra = self.operand(a);
+        let rb = self.operand(b);
+        if swap {
+            (rb, ra)
+        } else {
+            (ra, rb)
+        }
     }
 
     // ----- statements ----------------------------------------------------
@@ -927,6 +981,13 @@ impl<'a> FnC<'a> {
                 let cur = self.load_place(&base, &keys);
                 let rr = self.operand(rhs);
                 self.off = rhs.span.start;
+                if *kind == BinKind::Concat && !push {
+                    // Appended in place: a loop of `.=` on a property or an
+                    // element takes linear time, as on a variable.
+                    let path = Box::new(PathSet { base, keys, create, push, val: rr });
+                    self.emit(Instr::AppendPath { path, cur });
+                    return;
+                }
                 if *kind == BinKind::Concat {
                     let start = self.alloc_n(2);
                     self.emit(Instr::Move(start, cur));
@@ -968,7 +1029,12 @@ impl<'a> FnC<'a> {
             }
             HStmt::Loop { cond, body, step, do_while } => {
                 let top = self.here();
-                self.loops.push(LoopCtx { breaks: Vec::new(), continues: Vec::new(), tries: self.tries.len() });
+                self.loops.push(LoopCtx {
+                    breaks: Vec::new(),
+                    continues: Vec::new(),
+                    tries: self.tries.len(),
+                    iter: None,
+                });
                 if *do_while {
                     self.block(body);
                     let cont = self.here();
@@ -980,11 +1046,30 @@ impl<'a> FnC<'a> {
                     self.patch_all(lp.breaks, end);
                     self.patch_all(lp.continues, cont);
                 } else {
+                    // Rotated: the condition is tested once before the loop,
+                    // then at the end of each pass, by a jump back to the start
+                    // when it holds (one jump a pass instead of two).
+                    self.loops.pop();
                     let exits = cond.as_ref().map(|c| self.cond_false(c)).unwrap_or_default();
+                    let top = self.here();
+                    self.loops.push(LoopCtx {
+                        breaks: Vec::new(),
+                        continues: Vec::new(),
+                        tries: self.tries.len(),
+                        iter: None,
+                    });
                     self.block(body);
                     let cont = self.here();
                     self.block(step);
-                    self.emit(Instr::Jump(top));
+                    match cond {
+                        Some(c) => {
+                            let back = self.cond_true(c);
+                            self.patch_all(back, top);
+                        }
+                        None => {
+                            self.emit(Instr::Jump(top));
+                        }
+                    }
                     let end = self.here();
                     let lp = self.loops.pop().unwrap();
                     self.patch_all(exits, end);
@@ -997,17 +1082,27 @@ impl<'a> FnC<'a> {
                 self.expr_into(from, v);
                 let end_reg = self.alloc();
                 self.expr_into(to, end_reg);
-                let top = self.here();
                 let exit = if *inclusive {
                     self.emit(Instr::JumpIfNotLeI(v, end_reg, 0))
                 } else {
                     self.emit(Instr::JumpIfNotLtI(v, end_reg, 0))
                 };
-                self.loops.push(LoopCtx { breaks: Vec::new(), continues: Vec::new(), tries: self.tries.len() });
+                let top = self.here();
+                self.loops.push(LoopCtx {
+                    breaks: Vec::new(),
+                    continues: Vec::new(),
+                    tries: self.tries.len(),
+                    iter: None,
+                });
                 self.block(body);
                 let cont = self.here();
                 self.emit(Instr::IncI(v, 1));
-                self.emit(Instr::Jump(top));
+                // Rotated, as `while`: back while `v < end` (`!(end <= v)`), or `v <= end`.
+                if *inclusive {
+                    self.emit(Instr::JumpIfNotLtI(end_reg, v, top));
+                } else {
+                    self.emit(Instr::JumpIfNotLeI(end_reg, v, top));
+                }
                 let end = self.here();
                 let lp = self.loops.pop().unwrap();
                 self.patch(exit, end);
@@ -1023,7 +1118,12 @@ impl<'a> FnC<'a> {
                 let key = key.map(|k| self.reg(k)).unwrap_or(NO_REG);
                 let val = self.reg(*val);
                 let next = self.emit(Instr::IterNext { it, key, val, end: 0 });
-                self.loops.push(LoopCtx { breaks: Vec::new(), continues: Vec::new(), tries: self.tries.len() });
+                self.loops.push(LoopCtx {
+                    breaks: Vec::new(),
+                    continues: Vec::new(),
+                    tries: self.tries.len(),
+                    iter: Some(it),
+                });
                 self.block(body);
                 self.emit(Instr::Jump(top));
                 let end = self.here();
@@ -1031,12 +1131,18 @@ impl<'a> FnC<'a> {
                 self.patch(next, end);
                 self.patch_all(lp.breaks, end);
                 self.patch_all(lp.continues, top);
+                self.emit(Instr::Null(it));
             }
             HStmt::Break(level) | HStmt::Continue(level) => {
                 let is_break = matches!(s, HStmt::Break(_));
                 let idx = self.loops.len() - *level as usize;
                 let down_to = self.loops[idx].tries;
                 self.unwind_tries(down_to);
+                // The loops inside the one left or continued are left.
+                let inner: Vec<Reg> = self.loops[idx + 1..].iter().filter_map(|l| l.iter).collect();
+                for it in inner {
+                    self.emit(Instr::Null(it));
+                }
                 let j = self.emit(Instr::Jump(0));
                 if is_break {
                     self.loops[idx].breaks.push(j);

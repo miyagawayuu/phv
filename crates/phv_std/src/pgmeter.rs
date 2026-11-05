@@ -1,8 +1,8 @@
-//! PostgreSQL connections, driven by a small runtime of their own over a
-//! metered socket. Before each statement the script's deadline and the memory
-//! it has left are set on the meter; reads and writes stop at that deadline,
-//! and reading more bytes than the budget fails. The connection is then closed
-//! (and not reused).
+//! PostgreSQL connections, driven by a runtime shared by every connection of
+//! the process, over a metered socket. Before each statement the script's
+//! deadline and the memory it has left are set on the meter; reads and writes
+//! stop at that deadline, and reading more bytes than the budget fails. The
+//! connection is then closed (and not reused).
 //!
 //! This holds whatever the server does: a script that turns `statement_timeout`
 //! off, a statement that returns one huge row, a flood of notifications, or a
@@ -14,7 +14,7 @@ use postgres::types::ToSql;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -152,10 +152,30 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for MeteredStream<S> {
     }
 }
 
+/// The runtime every PostgreSQL connection of the process runs on. Its two
+/// threads only move bytes between the sockets and the clients (and drop
+/// notices); statements are run, and their rows read, on the thread that
+/// waits for them (`block_on`).
+static RUNTIME: LazyLock<Option<tokio::runtime::Runtime>> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("phv-postgres").enable_all().build().ok()
+});
+
+fn runtime() -> &'static tokio::runtime::Runtime {
+    RUNTIME.as_ref().expect("PostgreSQL runtime (PgClient::connect checks it)")
+}
+
 /// A PostgreSQL connection used from synchronous code.
 pub(crate) struct PgClient {
-    rt: tokio::runtime::Runtime,
     client: Client,
+    /// The task that drives the connection: stopped (and the socket closed)
+    /// when the client is dropped.
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PgClient {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
 }
 
 impl PgClient {
@@ -167,18 +187,15 @@ impl PgClient {
         timeout: Duration,
         meter: Meter,
     ) -> Result<PgClient, String> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| "cannot start the database connection".to_string())?;
+        let rt = RUNTIME.as_ref().ok_or_else(|| "cannot start the database connection".to_string())?;
         let until = std::time::Instant::now() + timeout;
-        let client = rt.block_on(async {
+        let (client, driver) = rt.block_on(async {
             match tokio::time::timeout(timeout, open(config, tls, meter, until)).await {
                 Ok(r) => r,
                 Err(_) => Err("timed out".to_string()),
             }
         })?;
-        Ok(PgClient { rt, client })
+        Ok(PgClient { client, driver })
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -186,29 +203,64 @@ impl PgClient {
     }
 
     pub(crate) fn is_valid(&self, timeout: Duration) -> bool {
-        self.rt
+        runtime()
             .block_on(async { matches!(tokio::time::timeout(timeout, self.client.simple_query("")).await, Ok(Ok(_))) })
     }
 
-    pub(crate) fn batch_execute(&self, text: &str) -> Result<(), Error> {
-        self.rt.block_on(self.client.batch_execute(text))
+    /// The client, for the futures given to `run`.
+    pub(crate) fn client(&self) -> &Client {
+        &self.client
     }
 
-    pub(crate) fn prepare(&self, text: &str) -> Result<Statement, Error> {
-        self.rt.block_on(self.client.prepare(text))
+    /// Waits for `op`. A `prelude` (a `SET` of PHV's own) is sent just before
+    /// it, in the same round trip, and runs first; its error, if any, is the
+    /// one returned.
+    pub(crate) fn run<T>(&self, prelude: Option<&str>, op: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
+        runtime().block_on(async {
+            match prelude {
+                None => op.await,
+                // `join` polls the prelude first, so it is sent first.
+                Some(sql) => {
+                    let (first, then) = futures_util::future::join(self.client.batch_execute(sql), op).await;
+                    first.and(then)
+                }
+            }
+        })
+    }
+
+    pub(crate) fn batch_execute(&self, text: &str) -> Result<(), Error> {
+        self.run(None, self.client.batch_execute(text))
     }
 
     pub(crate) fn execute(&self, text: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, Error> {
-        self.rt.block_on(self.client.execute(text, params))
+        self.run(None, self.client.execute(text, params))
     }
 
     pub(crate) fn query(&self, text: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, Error> {
-        self.rt.block_on(self.client.query(text, params))
+        self.run(None, self.client.query(text, params))
     }
 
-    /// Runs `stmt` and calls `each` for every row until it returns false.
+    /// Runs `text` as a simple query (which may hold several statements) and
+    /// returns the first column of the rows of its last statement.
+    pub(crate) fn simple_last_column(&self, text: &str) -> Result<Vec<String>, Error> {
+        use tokio_postgres::SimpleQueryMessage;
+        let messages = self.run(None, self.client.simple_query(text))?;
+        let (mut last, mut rows) = (Vec::new(), Vec::new());
+        for m in messages {
+            match m {
+                SimpleQueryMessage::Row(r) => rows.push(r.get(0).unwrap_or_default().to_string()),
+                SimpleQueryMessage::CommandComplete(_) => last = std::mem::take(&mut rows),
+                _ => {}
+            }
+        }
+        Ok(last)
+    }
+
+    /// Runs `stmt` (after `prelude`, see `run`) and calls `each` for every
+    /// row until it returns false.
     pub(crate) fn query_each<'a, I>(
         &self,
+        prelude: Option<&str>,
         stmt: &Statement,
         params: I,
         mut each: impl FnMut(Row) -> Result<bool, Error>,
@@ -217,7 +269,7 @@ impl PgClient {
         I: IntoIterator<Item = &'a dyn ToSql>,
         I::IntoIter: ExactSizeIterator,
     {
-        self.rt.block_on(async {
+        self.run(prelude, async {
             let rows = self.client.query_raw(stmt, params).await?;
             let mut rows = std::pin::pin!(rows);
             while let Some(row) = rows.next().await {
@@ -235,7 +287,7 @@ async fn open(
     tls: Option<tokio_postgres_rustls::MakeRustlsConnect>,
     meter: Meter,
     until: std::time::Instant,
-) -> Result<Client, String> {
+) -> Result<(Client, tokio::task::JoinHandle<()>), String> {
     use tokio_postgres::config::Host;
     let ports = config.get_ports();
     let mut last = "the URL names no host".to_string();
@@ -275,13 +327,11 @@ async fn open(
                 let connector = MakeTlsConnect::<MeteredStream<TcpStream>>::make_tls_connect(&mut make, name)
                     .map_err(|_| "invalid host name".to_string())?;
                 let (client, connection) = config.connect_raw(stream, connector).await.map_err(message)?;
-                tokio::spawn(drive(connection));
-                client
+                (client, tokio::spawn(drive(connection)))
             }
             None => {
                 let (client, connection) = config.connect_raw(stream, tokio_postgres::NoTls).await.map_err(message)?;
-                tokio::spawn(drive(connection));
-                client
+                (client, tokio::spawn(drive(connection)))
             }
         };
         return Ok(client);

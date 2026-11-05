@@ -326,15 +326,68 @@ fn position(file: &SourceFile, offset: u32) -> Value {
     json!({ "line": line - 1, "character": character })
 }
 
+/// How long an analysis of an open document is used for other requests,
+/// when no open document changed meanwhile (files changed on disk by another
+/// program are seen after this).
+const ANALYSIS_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// An analysis kept for later requests: the generation and time it was made.
+type Kept = (u64, std::time::Instant, std::rc::Rc<Analysis>);
+
 struct Server {
     open: HashMap<PathBuf, String>,
+    /// The canonical path of each open document, found when it was opened.
+    canonical: HashMap<PathBuf, PathBuf>,
     /// Files we published diagnostics for, per entry document.
     reported: HashMap<PathBuf, HashSet<String>>,
+    /// Counts the changes to open documents: an analysis made before the last
+    /// one is not used again.
+    generation: u64,
+    /// The last analysis (for the editor) of each open document, with the
+    /// generation and time it was made: the requests an editor sends after
+    /// an edit (tokens, hints, actions, hover...) share it.
+    analyses: std::cell::RefCell<HashMap<PathBuf, Kept>>,
 }
 
 impl Server {
+    fn new() -> Server {
+        Server {
+            open: HashMap::new(),
+            canonical: HashMap::new(),
+            reported: HashMap::new(),
+            generation: 0,
+            analyses: Default::default(),
+        }
+    }
+
+    /// Records that open documents changed (cached analyses are dropped).
+    fn changed(&mut self) {
+        self.generation += 1;
+        self.analyses.get_mut().clear();
+    }
+
     fn overlay(&self) -> HashMap<PathBuf, String> {
-        self.open.iter().filter_map(|(p, t)| p.canonicalize().ok().map(|c| (c, t.clone()))).collect()
+        self.open
+            .iter()
+            .filter_map(|(p, t)| {
+                let c = self.canonical.get(p).cloned().or_else(|| p.canonicalize().ok())?;
+                Some((c, t.clone()))
+            })
+            .collect()
+    }
+
+    /// The analysis of open document `path` as it is now (shared by the
+    /// requests that read it; see `analyses`).
+    fn analysis(&self, path: &Path) -> std::rc::Rc<Analysis> {
+        if let Some((generation, at, a)) = self.analyses.borrow().get(path) {
+            if *generation == self.generation && at.elapsed() < ANALYSIS_AGE {
+                return a.clone();
+            }
+        }
+        let text = self.open.get(path).cloned().unwrap_or_default();
+        let a = std::rc::Rc::new(self.analyze_text(path, text));
+        self.analyses.borrow_mut().insert(path.to_path_buf(), (self.generation, std::time::Instant::now(), a.clone()));
+        a
     }
 
     /// Analyzes `path` as if its text were `text`.
@@ -392,8 +445,8 @@ impl Server {
                 found
             }
             Want::Name => {
-                let a = self.analyze_text(path, text.clone());
-                let mut items = a.index.map(|ix| ix.globals).unwrap_or_default();
+                let a = self.analysis(path);
+                let mut items = a.index.as_ref().map(|ix| ix.globals.clone()).unwrap_or_default();
                 items.extend(KEYWORDS.iter().map(|k| Item {
                     name: k.to_string(),
                     kind: ItemKind::Keyword,
@@ -438,7 +491,7 @@ impl Server {
             return Value::Null;
         };
         let offset = offset_of(text, line, character);
-        let a = self.analyze_text(path, text.clone());
+        let a = self.analysis(path);
         let (Some(ix), Some(file)) = (&a.index, a.entry_file) else { return Value::Null };
         let Some(def) = ix.definition(file, offset) else { return Value::Null };
         let src = a.sources.get(def.file);
@@ -522,8 +575,7 @@ impl Server {
         let Some(text) = self.open.get(path).cloned() else {
             return Value::Null;
         };
-        let root = find_root(path);
-        let a = analyze(&root, path, self.overlay());
+        let a = self.analysis(path);
         let (Some(hir), Some(file)) = (&a.hir, a.entry_file) else { return Value::Null };
         let offset = offset_of(&text, line, character);
         match phv_types::query::type_at(hir, file, offset) {
@@ -575,7 +627,7 @@ fn doc_path(params: &Value) -> Option<PathBuf> {
 /// rest in the order they came (so requests see the newest text), then one check
 /// per document that changed, however many edits arrived during the last check.
 fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
-    let mut server = Server { open: HashMap::new(), reported: HashMap::new() };
+    let mut server = Server::new();
     let mut shutting_down = false;
     let mut cancelled: VecDeque<Value> = VecDeque::new();
     loop {
@@ -593,7 +645,11 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                         doc_path(params).filter(|p| server.open.contains_key(p) || server.open.len() < MAX_OPEN)
                     {
                         let text = params["textDocument"]["text"].as_str().unwrap_or("").to_string();
+                        if let Ok(c) = p.canonicalize() {
+                            server.canonical.insert(p.clone(), c);
+                        }
                         server.open.insert(p.clone(), text);
+                        server.changed();
                         if !changed.contains(&p) {
                             changed.push(p);
                         }
@@ -606,6 +662,7 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                         {
                             server.open.insert(p.clone(), text.to_string());
                         }
+                        server.changed();
                         if !changed.contains(&p) {
                             changed.push(p);
                         }
@@ -614,7 +671,9 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                 "textDocument/didClose" => {
                     if let Some(p) = doc_path(params) {
                         server.open.remove(&p);
+                        server.canonical.remove(&p);
                         server.reported.remove(&p);
+                        server.changed();
                         changed.retain(|c| *c != p);
                     }
                 }
@@ -820,7 +879,7 @@ mod tests {
             let line = before.matches('\n').count() as u64;
             let character = before[before.rfind('\n').map_or(0, |i| i + 1)..].encode_utf16().count() as u64;
             let path = self.dir.join(file);
-            let mut server = Server { open: HashMap::new(), reported: HashMap::new() };
+            let mut server = Server::new();
             server.open.insert(path.clone(), text);
             (server, path, line, character)
         }

@@ -191,6 +191,45 @@ fn requests() {
     golden("requests", &actual);
 }
 
+/// Connections are kept between requests to one host: a server that keeps
+/// them open sees one connection for the GETs and a new one for the POST
+/// (which takes no kept connection); the most recent one kept is used first,
+/// and one whose response asked to close is not used again.
+#[test]
+fn connections_are_kept_between_requests() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = accepted.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let conn = count.fetch_add(1, Ordering::SeqCst) + 1;
+            std::thread::spawn(move || {
+                while let Some(r) = read_request(&mut s) {
+                    let close = r.target.ends_with("/close");
+                    let body = format!("{} {} on connection {conn}", r.method, r.target);
+                    let extra = if close { "Connection: close\r\n" } else { "" };
+                    let reply = format!("HTTP/1.1 200 OK\r\n{extra}Content-Length: {}\r\n\r\n{body}", body.len());
+                    if s.write_all(reply.as_bytes()).is_err() || close {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let url = format!("http://{addr}/v1");
+    let out = run_script(&host(&url, None), "keepalive", Some(Duration::from_secs(30)));
+    assert_eq!(
+        out,
+        "GET /v1/n/0 on connection 1\nGET /v1/n/1 on connection 1\nGET /v1/n/2 on connection 1\n\
+         GET /v1/n/3 on connection 1\nGET /v1/n/4 on connection 1\nPOST /v1/p on connection 2\n\
+         GET /v1/n/9 on connection 2\nGET /v1/close on connection 2\nGET /v1/n/10 on connection 1\n"
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+}
+
 /// Waiting for an answer stops at the script's time limit, also when the
 /// server keeps sending a byte now and then.
 #[test]

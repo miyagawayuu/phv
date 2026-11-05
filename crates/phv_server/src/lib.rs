@@ -3,6 +3,7 @@
 //! compiled, immutable bytecode).
 
 mod body;
+mod log;
 mod multipart;
 mod routes;
 mod session;
@@ -109,7 +110,12 @@ struct State {
     /// Key for CSRF tokens; new on every start (open forms then need a reload).
     csrf_secret: Vec<u8>,
     csrf_cookie: &'static str,
-    cache: Mutex<HashMap<PathBuf, Arc<Compiled>>>,
+    /// Compiled pages, and a lock for each page being compiled (one thread
+    /// compiles it; the others wait for its result).
+    cache: Mutex<HashMap<PathBuf, Arc<CachedPage>>>,
+    compiling: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    /// When the server started (the clock of `CachedPage::checked`).
+    started: Instant,
     embedded: Option<Embedded>,
     /// Scripts running at once (`[server] workers`).
     workers: Arc<tokio::sync::Semaphore>,
@@ -125,8 +131,15 @@ struct State {
     /// Pages with parameters, and when `public/` was last scanned for them
     /// (again after a second in development mode, where files change).
     routes: Mutex<(Instant, Arc<routes::Table>)>,
-    /// `[server] access_log`: the open file.
-    access_log: Option<Mutex<std::fs::File>>,
+    /// Writes the line of each request (and the access log).
+    log: log::Logger,
+    /// `Content-Security-Policy` for responses without a nonce (made once).
+    csp_plain: Option<HeaderValue>,
+    /// Small static files a production server keeps in memory, by the path
+    /// they are asked for, and their total size.
+    static_cache: Mutex<(HashMap<String, Arc<StaticEntry>>, usize)>,
+    /// What request paths led to, for a production server (see `locate`).
+    found_cache: Mutex<HashMap<String, Arc<FoundEntry>>>,
     /// Tags of the static files of a built site, by path.
     embedded_tags: HashMap<String, String>,
     /// Compressed static files by `ETag`, and their total size.
@@ -147,6 +160,7 @@ impl State {
     fn new(root: PathBuf, dev: bool, time_limit: Duration, config: Config) -> State {
         let mut secret = vec![0u8; 32];
         getrandom::fill(&mut secret).expect("operating system random number generator failed");
+        let csp_plain = config.csp.header(None).and_then(|c| HeaderValue::from_str(&c).ok());
         State {
             public: root.join("public"),
             sessions: match config.session_db.as_ref().and_then(|n| config.host.databases.get(n)) {
@@ -173,9 +187,14 @@ impl State {
             dev,
             time_limit,
             cache: Mutex::new(HashMap::new()),
+            compiling: Mutex::new(HashMap::new()),
+            started: Instant::now(),
             embedded: None,
             routes: Mutex::new((Instant::now(), Arc::new(routes::Table::default()))),
-            access_log: None,
+            log: log::Logger::start(None),
+            csp_plain,
+            static_cache: Mutex::new((HashMap::new(), 0)),
+            found_cache: Mutex::new(HashMap::new()),
             embedded_tags: HashMap::new(),
             gz_cache: Mutex::new((HashMap::new(), 0)),
             watch: false,
@@ -327,7 +346,7 @@ fn serve_with(
     if let Some((path, _)) = &state.config.access_log {
         let file = open_access_log(&state.root, path)
             .map_err(|e| format!("cannot open the access log {}: {e}", path.display()))?;
-        state.access_log = Some(Mutex::new(file));
+        state.log = log::Logger::start(Some(file));
     }
     if let Some(e) = &embedded {
         state.embedded_tags = e.statics.iter().map(|(k, v)| (k.clone(), Validators::of_bytes(v).etag)).collect();
@@ -340,6 +359,7 @@ fn serve_with(
         None => None,
     };
     let state = Arc::new(state);
+    let log = state.log.clone();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // Scripts run on blocking threads; give them room for deep recursion.
@@ -417,6 +437,7 @@ fn serve_with(
     });
     // Scripts still running past the timeout are not waited for.
     rt.shutdown_timeout(Duration::from_millis(500));
+    log.flush();
     result
 }
 
@@ -468,7 +489,9 @@ macro_rules! drive {
 struct Activity {
     open: AtomicUsize,
     sending: AtomicUsize,
-    since: Mutex<Instant>,
+    /// When a request or response last ended: milliseconds since `born`.
+    since: AtomicU64,
+    born: Instant,
     written: Arc<AtomicU64>,
 }
 
@@ -477,16 +500,22 @@ impl Activity {
         Arc::new(Activity {
             open: AtomicUsize::new(0),
             sending: AtomicUsize::new(0),
-            since: Mutex::new(Instant::now()),
+            since: AtomicU64::new(0),
+            born: Instant::now(),
             written,
         })
+    }
+
+    fn touch(&self) {
+        self.since.store(self.born.elapsed().as_millis() as u64, Ordering::SeqCst);
     }
 
     fn idle_for(&self) -> Duration {
         if self.open.load(Ordering::SeqCst) > 0 || self.sending.load(Ordering::SeqCst) > 0 {
             return Duration::ZERO;
         }
-        self.since.lock().map(|t| t.elapsed()).unwrap_or_default()
+        let now = self.born.elapsed().as_millis() as u64;
+        Duration::from_millis(now.saturating_sub(self.since.load(Ordering::SeqCst)))
     }
 }
 
@@ -505,9 +534,7 @@ impl Sending {
 
 impl Drop for Sending {
     fn drop(&mut self) {
-        if let Ok(mut t) = self.activity.since.lock() {
-            *t = Instant::now();
-        }
+        self.activity.touch();
         self.activity.sending.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -550,32 +577,44 @@ impl OpenRequest {
 
 impl Drop for OpenRequest {
     fn drop(&mut self) {
-        if let Ok(mut t) = self.0.since.lock() {
-            *t = Instant::now();
-        }
+        self.0.touch();
         self.0.open.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
+/// The options of HTTP/1.1 connections, on a builder of either kind.
+macro_rules! h1_options {
+    ($b:expr) => {
+        $b.timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT).max_buf_size(CONN_BUFFER)
+    };
+}
+
+/// The options of HTTP/2 connections, on a builder of either kind.
+macro_rules! h2_options {
+    ($b:expr) => {
+        $b.timer(TokioTimer::new())
+            .max_concurrent_streams(H2_STREAMS)
+            .max_header_list_size(CONN_BUFFER as u32)
+            .initial_stream_window_size(H2_WINDOW)
+            .initial_connection_window_size(H2_WINDOW)
+            .adaptive_window(false)
+            .max_send_buf_size(H2_SEND_BUF)
+            .max_pending_accept_reset_streams(20)
+            .max_local_error_reset_streams(256)
+            .keep_alive_interval(Some(Duration::from_secs(30)))
+            .keep_alive_timeout(Duration::from_secs(20))
+    };
+}
+
 fn h1_builder() -> http1::Builder {
     let mut b = http1::Builder::new();
-    b.timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT).max_buf_size(CONN_BUFFER);
+    h1_options!(b);
     b
 }
 
 fn h2_builder() -> http2::Builder<TokioExecutor> {
     let mut b = http2::Builder::new(TokioExecutor::new());
-    b.timer(TokioTimer::new())
-        .max_concurrent_streams(H2_STREAMS)
-        .max_header_list_size(CONN_BUFFER as u32)
-        .initial_stream_window_size(H2_WINDOW)
-        .initial_connection_window_size(H2_WINDOW)
-        .adaptive_window(false)
-        .max_send_buf_size(H2_SEND_BUF)
-        .max_pending_accept_reset_streams(20)
-        .max_local_error_reset_streams(256)
-        .keep_alive_interval(Some(Duration::from_secs(30)))
-        .keep_alive_timeout(Duration::from_secs(20));
+    h2_options!(b);
     b
 }
 
@@ -624,19 +663,8 @@ where
         }
     });
     let mut b = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-    b.http1().timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT).max_buf_size(CONN_BUFFER);
-    b.http2()
-        .timer(TokioTimer::new())
-        .max_concurrent_streams(H2_STREAMS)
-        .max_header_list_size(CONN_BUFFER as u32)
-        .initial_stream_window_size(H2_WINDOW)
-        .initial_connection_window_size(H2_WINDOW)
-        .adaptive_window(false)
-        .max_send_buf_size(H2_SEND_BUF)
-        .max_pending_accept_reset_streams(20)
-        .max_local_error_reset_streams(256)
-        .keep_alive_interval(Some(Duration::from_secs(30)))
-        .keep_alive_timeout(Duration::from_secs(20));
+    h1_options!(b.http1());
+    h2_options!(b.http2());
     drive!(b.serve_connection_with_upgrades(TokioIo::new(io), service), closed, Some(activity))
 }
 
@@ -928,10 +956,11 @@ async fn compress(state: &State, mut resp: Resp, gzip_ok: bool, credentialed: bo
 /// One line on stderr, and in the access log when phv.toml sets one.
 fn log_request(state: &State, ip: &str, method: &Method, path: &str, status: u16, start: Instant) {
     let ms = start.elapsed().as_secs_f64() * 1000.0;
-    eprintln!("{method} {path} {status} {ms:.1}ms");
-    let (Some(file), Some((_, format))) = (&state.access_log, &state.config.access_log) else { return };
+    let line = format!("{method} {path} {status} {ms:.1}ms\n");
+    let format = state.config.access_log.as_ref().map(|(_, f)| f).filter(|_| state.log.has_file());
+    let Some(format) = format else { return state.log.line(line, None) };
     let time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let line = match format {
+    let access = match format {
         LogFormat::Text => {
             let path = path.replace('\\', "\\\\").replace('"', "\\\"");
             format!("{time} {ip} \"{method} {path}\" {status} {ms:.1}ms\n")
@@ -948,10 +977,7 @@ fn log_request(state: &State, ip: &str, method: &Method, path: &str, status: u16
             format!("{v}\n")
         }
     };
-    use std::io::Write;
-    if let Ok(mut f) = file.lock() {
-        let _ = f.write_all(line.as_bytes());
-    }
+    state.log.line(line, Some(access));
 }
 
 fn simple(status: StatusCode, content_type: &str, body: String) -> Resp {
@@ -992,11 +1018,14 @@ fn add_security_headers(state: &State, resp: &mut Resp) {
         set("strict-transport-security", "max-age=31536000");
     }
     // Pages set their own policy with a nonce; everything else gets one without.
-    if let Some(csp) = state.config.csp.header(None) {
-        set("content-security-policy", &csp);
+    if let Some(csp) = &state.csp_plain {
+        if !h.contains_key("content-security-policy") {
+            h.insert("content-security-policy", csp.clone());
+        }
     }
 }
 
+#[derive(Clone)]
 enum Target {
     /// A page, with the parameters of its path.
     Script(PathBuf, Vec<(String, String)>),
@@ -1012,27 +1041,12 @@ enum Target {
 /// `INDEX.PHV`, 8.3 short names (`INDEX~1.PHV`) and `index.phv::$DATA` all
 /// open `index.phv`.
 fn resolve(state: &State, url_path: &str) -> Option<Target> {
-    let decoded = percent_encoding::percent_decode_str(url_path).decode_utf8().ok()?;
-    if decoded.contains(['\0', '\\', ':']) {
-        return None;
-    }
-    let segments: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.iter().any(|s| s.starts_with('.') || s.starts_with('_')) {
-        return None;
-    }
-    let rel = segments.join("/");
+    let rel = url_rel(url_path)?;
+    let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
     if let Some(e) = &state.embedded {
-        return resolve_embedded(state, e, rel);
+        return resolve_embedded(state, e, &rel, &segments);
     }
-    let mut candidates = Vec::new();
-    if rel.is_empty() {
-        candidates.push("index.phv".to_string());
-    } else if rel.ends_with(".phv") {
-        candidates.push(rel.clone());
-    } else {
-        candidates.push(format!("{rel}.phv"));
-        candidates.push(format!("{rel}/index.phv"));
-    }
+    let candidates = page_candidates(&rel, ".phv");
     // The file `rel` names, only if its canonical path inside public/ is spelled exactly `rel`.
     let exact = |rel: &str| -> Option<PathBuf> {
         let c = state.public.join(rel).canonicalize().ok()?;
@@ -1065,20 +1079,9 @@ fn resolve(state: &State, url_path: &str) -> Option<Target> {
 /// The WebSocket script (`public/<path>.ws.phv`) for an upgrade request to
 /// `url_path`, with the parameters of its path; the same rules as `resolve`.
 fn resolve_ws(state: &State, url_path: &str) -> Option<(PathBuf, Vec<(String, String)>)> {
-    let decoded = percent_encoding::percent_decode_str(url_path).decode_utf8().ok()?;
-    if decoded.contains(['\0', '\\', ':']) {
-        return None;
-    }
-    let segments: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.iter().any(|s| s.starts_with('.') || s.starts_with('_')) {
-        return None;
-    }
-    let rel = segments.join("/");
-    let candidates = if rel.is_empty() {
-        vec!["index.ws.phv".to_string()]
-    } else {
-        vec![format!("{rel}.ws.phv"), format!("{rel}/index.ws.phv")]
-    };
+    let rel = url_rel(url_path)?;
+    let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    let candidates = page_candidates(&rel, ".ws.phv");
     if let Some(e) = &state.embedded {
         if let Some(c) = candidates.into_iter().find(|c| e.pages.contains_key(c)) {
             return Some((state.public.join(c), Vec::new()));
@@ -1095,6 +1098,34 @@ fn resolve_ws(state: &State, url_path: &str) -> Option<(PathBuf, Vec<(String, St
     match &state.embedded {
         Some(_) => Some((state.public.join(file), params)),
         None => state.special(file).map(|p| (p, params)),
+    }
+}
+
+/// The path of a request as a name under `public/`: decoded, with its
+/// segments joined by `/`. `None` when it could escape `public/` or names a
+/// hidden (`.x`) or private (`_x`) file.
+fn url_rel(url_path: &str) -> Option<String> {
+    let decoded = percent_encoding::percent_decode_str(url_path).decode_utf8().ok()?;
+    if decoded.contains(['\0', '\\', ':']) {
+        return None;
+    }
+    let segments: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.iter().any(|s| s.starts_with('.') || s.starts_with('_')) {
+        return None;
+    }
+    Some(segments.join("/"))
+}
+
+/// The files a path names, in the order they are tried: `index<ext>` for the
+/// root; the path itself when it is a page (`ext` `.phv`); else `<rel><ext>`
+/// and `<rel>/index<ext>`.
+fn page_candidates(rel: &str, ext: &str) -> Vec<String> {
+    if rel.is_empty() {
+        vec![format!("index{ext}")]
+    } else if ext == ".phv" && rel.ends_with(".phv") {
+        vec![rel.to_string()]
+    } else {
+        vec![format!("{rel}{ext}"), format!("{rel}/index{ext}")]
     }
 }
 
@@ -1137,99 +1168,296 @@ fn content_type(path: &Path) -> Option<&'static str> {
     })
 }
 
+/// What the path of a request leads to.
+#[derive(Clone)]
+enum Found {
+    /// The routes of `public/` conflict.
+    RouteError(String),
+    /// A WebSocket script, for an upgrade request.
+    Ws(PathBuf, Vec<(String, String)>),
+    Target(Target),
+    /// Nothing; the site's `_404.phv`, if it has one.
+    Nothing(Option<PathBuf>),
+}
+
+/// Finds what `url_path` leads to. It looks at files: it runs on a blocking
+/// thread (except for a built site, whose files are in memory).
+fn find(state: &State, url_path: &str, upgrade: bool) -> Found {
+    if let Err(e) = state.routes() {
+        return Found::RouteError(e);
+    }
+    if upgrade {
+        if let Some((script, params)) = resolve_ws(state, url_path) {
+            return Found::Ws(script, params);
+        }
+    }
+    match resolve(state, url_path) {
+        Some(t) => Found::Target(t),
+        None => Found::Nothing(state.special("_404.phv")),
+    }
+}
+
 async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
     let gzip_ok = state.config.compress && static_files::accepts_gzip(req.headers());
-    if let Err(e) = state.routes() {
-        eprintln!("error in the routes of public/: {e}");
-        return state.error_page("Route error", &e);
-    }
-    if ws::is_upgrade(&req) {
-        if let Some((script, params)) = resolve_ws(state, req.uri().path()) {
-            return ws::upgrade(state, script, params, ip, req).await;
+    let get = req.method() == Method::GET || req.method() == Method::HEAD;
+    if get {
+        if let Some(r) = cached_static(state, &req).await {
+            return r;
         }
     }
-    let target = resolve(state, req.uri().path());
-    match target {
-        None => match state.special("_404.phv") {
-            Some(page) => run_script(state, page, Vec::new(), ip, req, Page::NotFound).await,
-            None => not_found(),
-        },
-        Some(Target::Embedded(bytes, ct, tag)) => {
-            if req.method() != Method::GET && req.method() != Method::HEAD {
-                return simple(StatusCode::METHOD_NOT_ALLOWED, "text/plain", "method not allowed".into());
+    let found = locate(state, req.uri().path(), ws::is_upgrade(&req)).await;
+    match found {
+        Found::RouteError(e) => {
+            eprintln!("error in the routes of public/: {e}");
+            state.error_page("Route error", &e)
+        }
+        Found::Ws(script, params) => ws::upgrade(state, script, params, ip, req).await,
+        Found::Nothing(Some(page)) => run_script(state, page, Vec::new(), ip, req, Page::NotFound).await,
+        Found::Nothing(None) => not_found(),
+        Found::Target(Target::Embedded(bytes, ct, tag)) => {
+            if !get {
+                return method_not_allowed();
             }
             let v = Validators { etag: tag, modified: None };
-            let len = bytes.len() as u64;
-            let headers = req.headers();
-            let mut r = if v.not_modified(headers) {
-                let mut r = Response::new(RespBody::full(Bytes::new()));
-                *r.status_mut() = StatusCode::NOT_MODIFIED;
-                r
-            } else {
-                match static_files::range(headers, len).filter(|_| v.range_applies(headers)) {
-                    Some(Err(())) => return static_files::unsatisfiable(len),
-                    Some(Ok((a, b))) => partial(RespBody::full(bytes.slice(a as usize..=b as usize)), a, b, len),
-                    None => Response::new(RespBody::full(bytes)),
-                }
-            };
-            static_headers(state, &mut r, ct, &v, req.uri().path());
-            r
+            bytes_response(state, req.headers(), bytes, ct, &v, req.uri().path())
         }
-        Some(Target::Static(p)) => {
-            if req.method() != Method::GET && req.method() != Method::HEAD {
-                return simple(StatusCode::METHOD_NOT_ALLOWED, "text/plain", "method not allowed".into());
+        Found::Target(Target::Static(p)) => {
+            if !get {
+                return method_not_allowed();
             }
-            let Ok(mut file) = tokio::fs::File::open(&p).await else { return not_found() };
-            // A file with another name (a hard link) may be one kept outside
-            // public/, such as the TLS key (found by the 1.0 audit).
-            let file_std = file.into_std().await;
-            if phv_std::safefs::single_file(&file_std).is_err() {
-                return not_found();
-            }
-            file = tokio::fs::File::from_std(file_std);
-            let (len, modified) = match file.metadata().await {
-                Ok(m) if m.is_file() => (m.len(), m.modified().ok()),
-                _ => return not_found(),
-            };
-            if len > MAX_STATIC {
-                return simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "file too large to serve".into());
-            }
-            let ct = content_type(&p).unwrap_or("application/octet-stream");
-            let v = Validators::of_file(len, modified);
-            let headers = req.headers();
-            let mut r = if v.not_modified(headers) {
-                let mut r = Response::new(RespBody::full(Bytes::new()));
-                *r.status_mut() = StatusCode::NOT_MODIFIED;
-                r
-            } else {
-                match static_files::range(headers, len).filter(|_| v.range_applies(headers)) {
-                    Some(Err(())) => return static_files::unsatisfiable(len),
-                    Some(Ok((a, b))) => {
-                        use tokio::io::AsyncSeekExt;
-                        if file.seek(std::io::SeekFrom::Start(a)).await.is_err() {
-                            return not_found();
-                        }
-                        partial(RespBody::file(file, b - a + 1), a, b, len)
-                    }
-                    // Small text files a client takes gzipped are read whole, so `compress`
-                    // can gzip them (once per version); others are streamed: memory does
-                    // not grow with the file or the downloads.
-                    None if gzip_ok && len <= MAX_STATIC_COMPRESS && static_files::compressible(ct) => {
-                        use tokio::io::AsyncReadExt;
-                        let mut data = Vec::with_capacity(len as usize);
-                        if file.read_to_end(&mut data).await.is_err() {
-                            return not_found();
-                        }
-                        Response::new(RespBody::counted(data, &state.buffered))
-                    }
-                    None => Response::new(RespBody::file(file, len)),
-                }
-            };
-            static_headers(state, &mut r, ct, &v, &p.to_string_lossy());
-            r
+            serve_static(state, &req, p, gzip_ok).await
         }
-        Some(Target::Script(p, params)) => run_script(state, p, params, ip, req, Page::Normal).await,
+        Found::Target(Target::Script(p, params)) => run_script(state, p, params, ip, req, Page::Normal).await,
     }
+}
+
+/// The most request paths a production server remembers what they led to
+/// (forgotten all at once when full).
+const FOUND_KEEP: usize = 10_000;
+
+/// What a request path led to, and when that was last found: milliseconds
+/// since `State::started`.
+struct FoundEntry {
+    found: Found,
+    checked: AtomicU64,
+}
+
+/// `find`, run on a blocking thread. A production server remembers what a
+/// path leads to and looks again at most every `RECHECK` (a request that
+/// finds the answer due looks, the others take the last one meanwhile), as it
+/// does for the files of compiled pages: looking at files is slow (and
+/// serializes requests on Windows). A development server looks every time.
+async fn locate(state: &Arc<State>, url_path: &str, upgrade: bool) -> Found {
+    if state.embedded.is_some() {
+        return find(state, url_path, upgrade);
+    }
+    let key = (!state.dev).then(|| format!("{}{url_path}", if upgrade { "ws " } else { "" }));
+    if let Some(k) = &key {
+        let known = state.found_cache.lock().unwrap().get(k).cloned();
+        if let Some(e) = known {
+            let (now, last) = (state.now_ms(), e.checked.load(Ordering::Relaxed));
+            let due = now.saturating_sub(last) >= RECHECK.as_millis() as u64;
+            if !due || e.checked.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+                return e.found.clone();
+            }
+        }
+    }
+    let (st, path) = (state.clone(), url_path.to_string());
+    let found = match tokio::task::spawn_blocking(move || find(&st, &path, upgrade)).await {
+        Ok(found) => found,
+        Err(_) => return Found::RouteError("the request could not be routed".into()),
+    };
+    if let Some(k) = key {
+        if !matches!(found, Found::RouteError(_)) {
+            let mut cache = state.found_cache.lock().unwrap();
+            if cache.len() >= FOUND_KEEP {
+                cache.clear();
+            }
+            cache.insert(k, Arc::new(FoundEntry { found: found.clone(), checked: state.now_ms().into() }));
+        }
+    }
+    found
+}
+
+fn method_not_allowed() -> Resp {
+    simple(StatusCode::METHOD_NOT_ALLOWED, "text/plain", "method not allowed".into())
+}
+
+/// Static files at most this large are read at once (and kept in memory by
+/// a production server); larger ones are streamed as they are sent.
+const STATIC_KEEP: u64 = 256 * 1024;
+
+/// The most bytes of static files a production server keeps in memory (the
+/// cache is emptied when full, as `gz_cache`).
+const STATIC_KEEP_TOTAL: usize = 32 * 1024 * 1024;
+
+/// A small static file a production server keeps in memory. It is looked at
+/// again at most every `RECHECK`, as compiled pages are.
+struct StaticEntry {
+    path: PathBuf,
+    data: Bytes,
+    ct: &'static str,
+    v: Validators,
+    /// When it was last looked at: milliseconds since `State::started`.
+    checked: AtomicU64,
+}
+
+/// A static file opened to be sent.
+enum Opened {
+    File {
+        file: std::fs::File,
+        len: u64,
+        modified: Option<std::time::SystemTime>,
+        /// The whole content, when it was read at once.
+        data: Option<Vec<u8>>,
+    },
+    TooLarge,
+    Missing,
+}
+
+/// Opens static file `p` (a blocking call): refused when it has another name
+/// too, read at once when it is small (or `whole` and at most
+/// `MAX_STATIC_COMPRESS`, to be gzipped).
+fn open_static(p: &Path, whole: bool) -> Opened {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(p) else { return Opened::Missing };
+    // A file with another name (a hard link) may be one kept outside
+    // public/, such as the TLS key (found by the 1.0 audit).
+    if phv_std::safefs::single_file(&file).is_err() {
+        return Opened::Missing;
+    }
+    let (len, modified) = match file.metadata() {
+        Ok(m) if m.is_file() => (m.len(), m.modified().ok()),
+        _ => return Opened::Missing,
+    };
+    if len > MAX_STATIC {
+        return Opened::TooLarge;
+    }
+    let data = if len <= STATIC_KEEP || (whole && len <= MAX_STATIC_COMPRESS) {
+        let mut data = Vec::with_capacity(len as usize);
+        if (&file).take(len).read_to_end(&mut data).is_err() || data.len() as u64 != len {
+            return Opened::Missing;
+        }
+        Some(data)
+    } else {
+        None
+    };
+    Opened::File { file, len, modified, data }
+}
+
+/// A static file in memory, or the part of it a `Range` asks for (or 304).
+fn bytes_response(
+    state: &State,
+    headers: &hyper::HeaderMap,
+    bytes: Bytes,
+    ct: &'static str,
+    v: &Validators,
+    label: &str,
+) -> Resp {
+    let len = bytes.len() as u64;
+    let mut r = if v.not_modified(headers) {
+        let mut r = Response::new(RespBody::full(Bytes::new()));
+        *r.status_mut() = StatusCode::NOT_MODIFIED;
+        r
+    } else {
+        match static_files::range(headers, len).filter(|_| v.range_applies(headers)) {
+            Some(Err(())) => return static_files::unsatisfiable(len),
+            Some(Ok((a, b))) => partial(RespBody::full(bytes.slice(a as usize..=b as usize)), a, b, len),
+            None => Response::new(RespBody::full(bytes)),
+        }
+    };
+    static_headers(state, &mut r, ct, v, label);
+    r
+}
+
+/// Sends static file `p`. Its checks and reads run in one blocking call.
+async fn serve_static(state: &Arc<State>, req: &Request<Incoming>, p: PathBuf, gzip_ok: bool) -> Resp {
+    let ct = content_type(&p).unwrap_or("application/octet-stream");
+    let whole = gzip_ok && static_files::compressible(ct);
+    let q = p.clone();
+    let Ok(opened) = tokio::task::spawn_blocking(move || open_static(&q, whole)).await else { return not_found() };
+    let (file, len, modified, data) = match opened {
+        Opened::File { file, len, modified, data } => (file, len, modified, data),
+        Opened::TooLarge => {
+            return simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "file too large to serve".into())
+        }
+        Opened::Missing => return not_found(),
+    };
+    let v = Validators::of_file(len, modified);
+    let label = p.to_string_lossy().into_owned();
+    if let Some(data) = data {
+        let keep = !state.dev && state.embedded.is_none() && len <= STATIC_KEEP;
+        let bytes = if keep {
+            let bytes = Bytes::from(data);
+            if let Some(key) = url_rel(req.uri().path()) {
+                state.keep_static(
+                    key,
+                    StaticEntry { path: p, data: bytes.clone(), ct, v: v.clone(), checked: state.now_ms().into() },
+                );
+            }
+            bytes
+        } else {
+            body::counted_bytes(data, &state.buffered)
+        };
+        return bytes_response(state, req.headers(), bytes, ct, &v, &label);
+    }
+    // Large files are streamed: memory does not grow with the file or the downloads.
+    let mut file = tokio::fs::File::from_std(file);
+    let headers = req.headers();
+    let mut r = if v.not_modified(headers) {
+        let mut r = Response::new(RespBody::full(Bytes::new()));
+        *r.status_mut() = StatusCode::NOT_MODIFIED;
+        r
+    } else {
+        match static_files::range(headers, len).filter(|_| v.range_applies(headers)) {
+            Some(Err(())) => return static_files::unsatisfiable(len),
+            Some(Ok((a, b))) => {
+                use tokio::io::AsyncSeekExt;
+                if file.seek(std::io::SeekFrom::Start(a)).await.is_err() {
+                    return not_found();
+                }
+                partial(RespBody::file(file, b - a + 1), a, b, len)
+            }
+            None => Response::new(RespBody::file(file, len)),
+        }
+    };
+    static_headers(state, &mut r, ct, &v, &label);
+    r
+}
+
+/// A static file a production server keeps in memory, when it is still the
+/// one the path names: looked at again (in a blocking call) when it was last
+/// looked at more than `RECHECK` ago.
+async fn cached_static(state: &Arc<State>, req: &Request<Incoming>) -> Option<Resp> {
+    if state.dev || state.embedded.is_some() {
+        return None;
+    }
+    let key = url_rel(req.uri().path())?;
+    let entry = state.static_cache.lock().unwrap().0.get(&key).cloned()?;
+    let (now, last) = (state.now_ms(), entry.checked.load(Ordering::Relaxed));
+    if now.saturating_sub(last) >= RECHECK.as_millis() as u64
+        && entry.checked.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    {
+        let (st, path, e) = (state.clone(), req.uri().path().to_string(), entry.clone());
+        let same = tokio::task::spawn_blocking(move || still_kept(&st, &path, &e)).await.unwrap_or(false);
+        if !same {
+            let mut cache = state.static_cache.lock().unwrap();
+            if cache.0.get(&key).is_some_and(|e| Arc::ptr_eq(e, &entry)) {
+                cache.0.remove(&key);
+                cache.1 -= entry.data.len();
+            }
+            return None;
+        }
+    }
+    let label = entry.path.to_string_lossy();
+    Some(bytes_response(state, req.headers(), entry.data.clone(), entry.ct, &entry.v, &label))
+}
+
+/// Whether the path still names the kept file, with the same content (the
+/// same checks as when it was first sent).
+fn still_kept(state: &State, url_path: &str, e: &StaticEntry) -> bool {
+    matches!(resolve(state, url_path), Some(Target::Static(p)) if p == e.path)
+        && matches!(open_static(&e.path, false), Opened::File { data: Some(d), .. } if d == e.data)
 }
 
 /// A 206 answer for bytes `a..=b` of `len`.
@@ -1263,32 +1491,83 @@ enum Page {
 
 /// `resolve` for a built site: its pages are known by their paths under
 /// `public/`, which `State::compiled` looks up again.
-fn resolve_embedded(state: &State, e: &Embedded, rel: String) -> Option<Target> {
-    let candidates = if rel.is_empty() {
-        vec!["index.phv".to_string()]
-    } else if rel.ends_with(".phv") {
-        vec![rel.clone()]
-    } else {
-        vec![format!("{rel}.phv"), format!("{rel}/index.phv")]
-    };
+fn resolve_embedded(state: &State, e: &Embedded, rel: &str, segments: &[&str]) -> Option<Target> {
+    let candidates = page_candidates(rel, ".phv");
     if let Some(page) = candidates.into_iter().find(|c| e.pages.contains_key(c) && !routes::is_ws(c)) {
         return Some(Target::Script(state.public.join(page), Vec::new()));
     }
-    let Some(bytes) = e.statics.get(&rel) else {
+    let Some(bytes) = e.statics.get(rel) else {
         let table = state.routes().ok()?;
-        let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
-        let (file, params) = table.find(&segments)?;
+        let (file, params) = table.find(segments)?;
         return Some(Target::Script(state.public.join(file), params));
     };
     let lower = rel.to_ascii_lowercase();
     if lower.ends_with(".phv") || lower.ends_with(".phv.html") {
         return None;
     }
-    let tag = state.embedded_tags.get(&rel).cloned().unwrap_or_else(|| Validators::of_bytes(bytes).etag);
-    Some(Target::Embedded(bytes.clone(), content_type(Path::new(&rel))?, tag))
+    let tag = state.embedded_tags.get(rel).cloned().unwrap_or_else(|| Validators::of_bytes(bytes).etag);
+    Some(Target::Embedded(bytes.clone(), content_type(Path::new(rel))?, tag))
 }
 
+/// A compiled page in the cache.
+struct CachedPage {
+    compiled: Arc<Compiled>,
+    /// When its files were last checked: milliseconds since `State::started`.
+    checked: AtomicU64,
+}
+
+/// How often a production server looks at the files of a page it compiled.
+/// A development server looks at every request: a page saved and reloaded at
+/// once shows the change.
+const RECHECK: Duration = Duration::from_secs(1);
+
 impl State {
+    /// Milliseconds since the server started (the clock of the caches).
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Keeps a small static file in memory (see `cached_static`).
+    fn keep_static(&self, key: String, entry: StaticEntry) {
+        let mut cache = self.static_cache.lock().unwrap();
+        if cache.1 + entry.data.len() > STATIC_KEEP_TOTAL {
+            *cache = (HashMap::new(), 0);
+        }
+        cache.1 += entry.data.len();
+        if let Some(old) = cache.0.insert(key, Arc::new(entry)) {
+            cache.1 -= old.data.len();
+        }
+    }
+
+    fn cached(&self, script: &Path) -> Option<Arc<CachedPage>> {
+        self.cache.lock().unwrap().get(script).cloned()
+    }
+
+    /// Whether a cached page was built from the files as they are. The files
+    /// are looked at without holding the cache's lock.
+    fn still_fresh(&self, page: &Arc<CachedPage>, script: &Path) -> bool {
+        if !self.dev {
+            let now = self.now_ms();
+            let last = page.checked.load(Ordering::Relaxed);
+            if now.saturating_sub(last) < RECHECK.as_millis() as u64 {
+                return true;
+            }
+            // One request looks; the others use the page meanwhile.
+            if page.checked.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+                return true;
+            }
+        }
+        if !page.compiled.is_stale() {
+            return true;
+        }
+        // Changed: the next requests wait for the page to be compiled again.
+        let mut cache = self.cache.lock().unwrap();
+        if cache.get(script).is_some_and(|p| Arc::ptr_eq(p, page)) {
+            cache.remove(script);
+        }
+        false
+    }
+
     /// Compiles a page, reusing the cached bytecode until a source file changes.
     /// Pages of a built site are compiled already.
     fn compiled(&self, script: &Path) -> Result<Arc<Compiled>, String> {
@@ -1297,9 +1576,17 @@ impl State {
             let rel = rel.to_string_lossy().replace('\\', "/");
             return e.pages.get(&rel).cloned().ok_or_else(|| format!("no page {rel} in this site"));
         }
-        if let Some(c) = self.cache.lock().unwrap().get(script) {
-            if !c.is_stale() {
-                return Ok(c.clone());
+        if let Some(page) = self.cached(script) {
+            if self.still_fresh(&page, script) {
+                return Ok(page.compiled.clone());
+            }
+        }
+        // One request compiles the page; the others wait and take its result.
+        let gate = self.compiling.lock().unwrap().entry(script.to_path_buf()).or_default().clone();
+        let _compiling = gate.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(page) = self.cached(script) {
+            if self.still_fresh(&page, script) {
+                return Ok(page.compiled.clone());
             }
         }
         let mut c = compile_cached(&self.root, script).map_err(|e| e.render(false))?;
@@ -1308,7 +1595,8 @@ impl State {
         if !c.warnings.is_empty() {
             eprint!("{}", c.warnings);
         }
-        self.cache.lock().unwrap().insert(script.to_path_buf(), c.clone());
+        let checked = AtomicU64::new(self.now_ms());
+        self.cache.lock().unwrap().insert(script.to_path_buf(), Arc::new(CachedPage { compiled: c.clone(), checked }));
         Ok(c)
     }
 
@@ -1793,19 +2081,33 @@ impl State {
                 None => not_found(),
             },
             Some(Target::Script(p, params)) => self.execute(&p, params, ip, parts, body, Page::Normal, None),
-            Some(Target::Static(p)) => match std::fs::read(&p) {
-                Ok(data) => {
-                    let mut r = Response::new(RespBody::full(data));
+            // Static files get the server's checks and headers (read whole: the
+            // test reads the body at once).
+            Some(Target::Static(p)) => match open_static(&p, true) {
+                Opened::File { mut file, len, modified, data } => {
+                    let data = match data {
+                        Some(d) => d,
+                        None => {
+                            use std::io::Read;
+                            let mut d = Vec::new();
+                            if (&mut file).take(len).read_to_end(&mut d).is_err() {
+                                return not_found();
+                            }
+                            d
+                        }
+                    };
                     let ct = content_type(&p).unwrap_or("application/octet-stream");
-                    r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ct));
-                    r
+                    let v = Validators::of_file(len, modified);
+                    bytes_response(self, &parts.headers, Bytes::from(data), ct, &v, &p.to_string_lossy())
                 }
-                Err(_) => not_found(),
+                Opened::TooLarge => {
+                    simple(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "file too large to serve".into())
+                }
+                Opened::Missing => not_found(),
             },
-            Some(Target::Embedded(bytes, ct, _)) => {
-                let mut r = Response::new(RespBody::full(bytes));
-                r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ct));
-                r
+            Some(Target::Embedded(bytes, ct, tag)) => {
+                let v = Validators { etag: tag, modified: None };
+                bytes_response(self, &parts.headers, bytes, ct, &v, parts.uri.path())
             }
         }
     }

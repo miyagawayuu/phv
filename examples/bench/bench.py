@@ -1,4 +1,6 @@
 # Same benchmarks as bench.phv, for comparison: python examples/bench/bench.py
+import functools
+import html
 import time
 
 
@@ -87,6 +89,63 @@ def list_sum(n):
     return t
 
 
+class Builder:
+    def __init__(self):
+        self.text = ""
+
+
+def prop_append(n):
+    b = Builder()
+    for _ in range(n):
+        b.text += "x"
+    return len(b.text)
+
+
+def string_equals(n):
+    words = ["alpha", "beta", "gamma", "delta"]
+    hits = 0
+    for i in range(n):
+        if words[i % 4] == "gamma":
+            hits += 1
+    return hits
+
+
+def html_escape_loop(n):
+    total = 0
+    for i in range(n):
+        total += len(html.escape(f'Tom & Jerry <b>said</b> "hello" to {i} friends today'))
+    return total
+
+
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+def new_objects(n):
+    total = 0
+    for i in range(n):
+        p = Point(i, 1)
+        total += p.y
+    return total
+
+
+def throw_catch(n):
+    caught = 0
+    for _ in range(n):
+        try:
+            raise RuntimeError("failed")
+        except RuntimeError:
+            caught += 1
+    return caught
+
+
+def sort_by(n):
+    xs = [(i * 7919) % n for i in range(n)]
+    return sorted(xs, key=functools.cmp_to_key(lambda a, b: (b > a) - (b < a)))[0]
+
+
 def ms(start):
     return f"{(time.perf_counter() - start) * 1000:,.1f} ms"
 
@@ -126,3 +185,27 @@ print(f"sieve 1M ({r} primes): {ms(t)}")
 t = time.perf_counter()
 r = list_sum(1_000_000)
 print(f"list of 1M floats ({r}): {ms(t)}")
+
+t = time.perf_counter()
+r = prop_append(200_000)
+print(f"property .= 200k ({r}): {ms(t)}")
+
+t = time.perf_counter()
+r = string_equals(1_000_000)
+print(f"string == 1M ({r}): {ms(t)}")
+
+t = time.perf_counter()
+r = html_escape_loop(200_000)
+print(f"escape() 200k ({r}): {ms(t)}")
+
+t = time.perf_counter()
+r = new_objects(1_000_000)
+print(f"new 1M ({r}): {ms(t)}")
+
+t = time.perf_counter()
+r = throw_catch(100_000)
+print(f"throw/catch 100k ({r}): {ms(t)}")
+
+t = time.perf_counter()
+r = sort_by(200_000)
+print(f"sortBy 200k ({r}): {ms(t)}")

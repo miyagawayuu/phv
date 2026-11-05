@@ -140,6 +140,13 @@ impl DirGuard {
         }
     }
 
+    /// The identity of the plain file `name` (a regular file with one link,
+    /// reached by its own name, not a link), or None when there is none. Read
+    /// without opening the file's contents.
+    pub fn plain_file_id(&self, name: &OsStr) -> Result<Option<FileId>, FsError> {
+        imp::plain_file_id(self, name)
+    }
+
     pub fn remove(&self, name: &OsStr) -> Result<(), FsError> {
         if !self.exists(name)? {
             return Err(FsError::Io(io::ErrorKind::NotFound.into()));
@@ -183,6 +190,11 @@ impl DirGuard {
         imp::rename(self, name, to, to_name)
     }
 }
+
+/// Which file an entry is (device and inode, or volume and file index): the
+/// same identity means the same file, whatever its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileId(u64, u64);
 
 /// Why a path was refused, for messages.
 pub fn describe(e: &FsError) -> String {
@@ -345,6 +357,27 @@ mod imp {
             return Err(FsError::Link);
         }
         Ok(true)
+    }
+
+    pub fn plain_file_id(g: &DirGuard, name: &OsStr) -> Result<Option<super::FileId>, FsError> {
+        let c = cstr(name)?;
+        // SAFETY: `st` is plain data filled by fstatat; the result is checked.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::fstatat(g.dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+        if r != 0 {
+            let e = io::Error::last_os_error();
+            return if e.kind() == io::ErrorKind::NotFound { Ok(None) } else { Err(FsError::Io(e)) };
+        }
+        match st.st_mode & libc::S_IFMT {
+            libc::S_IFLNK => return Err(FsError::Link),
+            libc::S_IFREG => {}
+            _ => return Err(FsError::NotFile),
+        }
+        if st.st_nlink != 1 {
+            return Err(FsError::HardLink);
+        }
+        #[allow(clippy::unnecessary_cast)] // the types differ between platforms
+        Ok(Some(super::FileId(st.st_dev as u64, st.st_ino as u64)))
     }
 
     pub fn remove(g: &DirGuard, name: &OsStr) -> Result<(), FsError> {
@@ -589,6 +622,36 @@ mod imp {
             Err(FsError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    pub fn plain_file_id(g: &DirGuard, name: &OsStr) -> Result<Option<super::FileId>, FsError> {
+        let f = match open_entry(g, name) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(FsError::Io(e)),
+        };
+        let attrs = f.metadata()?.file_attributes();
+        if attrs & ATTR_REPARSE_POINT != 0 {
+            return Err(FsError::Link);
+        }
+        if attrs & ATTR_DIRECTORY != 0 {
+            return Err(FsError::NotFile);
+        }
+        match check_real_name(&f, name) {
+            Ok(()) => {}
+            Err(FsError::Io(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        // SAFETY: `info` is plain data filled by the call; the handle is open.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) } == 0 {
+            return Err(FsError::Io(io::Error::last_os_error()));
+        }
+        if info.nNumberOfLinks != 1 {
+            return Err(FsError::HardLink);
+        }
+        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        Ok(Some(super::FileId(u64::from(info.dwVolumeSerialNumber), index)))
     }
 
     pub fn remove(g: &DirGuard, name: &OsStr) -> Result<(), FsError> {

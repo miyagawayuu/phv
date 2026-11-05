@@ -24,7 +24,7 @@ use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
 use phv_vm::bytecode::{Const, Function, Instr, NativeSig, PathBase, Program, Reg, Scalar, ValKind, NO_REG};
 use phv_vm::jit::*;
 use phv_vm::{JitEntry, JitTable};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 const I64: Type = types::I64;
 const F64: Type = types::F64;
@@ -303,9 +303,10 @@ const MAX_INSTRUCTIONS: usize = 16_384;
 /// Checks `f` for native compilation: every register, jump target, constant
 /// and callee is in range, every instruction is supported, and every operand
 /// has the kind the instruction needs on every path that reaches it (found by
-/// a forward data flow analysis). Callees must be in `ok`. Bytecode can come
-/// from the on-disk cache, and the JIT must never trust it blindly.
-fn well_formed(prog: &Program, f: &Function, ok: &HashSet<u32>) -> Option<Checked> {
+/// a forward data flow analysis). Callees must be `ok` (indexed by function
+/// id). Bytecode can come from the on-disk cache, and the JIT must never
+/// trust it blindly.
+fn well_formed(prog: &Program, f: &Function, ok: &[bool]) -> Option<Checked> {
     let sig = f.native.as_ref()?;
     let regs = f.num_regs as usize;
     let n = f.code.len();
@@ -338,10 +339,8 @@ fn well_formed(prog: &Program, f: &Function, ok: &HashSet<u32>) -> Option<Checke
         let targets = match flow {
             Flow::Next => [Some(i + 1), None],
             Flow::Jump(t) => [Some(t as usize), None],
-            // Only `Jump` checks the clock when it goes back: the compiler's
-            // loops branch forward and jump back, and other bytecode could
-            // loop without ever checking the time limit.
-            Flow::Branch(t) if t as usize <= i => return None,
+            // A branch back (a loop's test at its end) counts toward the
+            // time limit's check like `Jump` (see `Translator::edge`).
             Flow::Branch(t) => [Some(i + 1), Some(t as usize)],
             Flow::Stop => [None, None],
         };
@@ -392,14 +391,7 @@ fn explain(f: &Function, i: usize, st: &[K]) {
 
 /// Checks one instruction against the register kinds before it and updates
 /// them; None when it cannot be compiled.
-fn step(
-    prog: &Program,
-    sig: &NativeSig,
-    ok: &HashSet<u32>,
-    ins: &Instr,
-    st: &mut [K],
-    strings: &mut bool,
-) -> Option<Flow> {
+fn step(prog: &Program, sig: &NativeSig, ok: &[bool], ins: &Instr, st: &mut [K], strings: &mut bool) -> Option<Flow> {
     use Instr::*;
     match *ins {
         Int(d, _) => set(st, d, K::Int)?,
@@ -494,6 +486,10 @@ fn step(
             for i in 0..n {
                 kind(st, start.checked_add(i)?)?;
             }
+            // The operands are moved out (they are temporaries).
+            for i in 0..n {
+                set(st, start + i, K::Undef)?;
+            }
             set(st, d, K::Str)?;
         }
         AppendStr(d, s) => {
@@ -543,12 +539,30 @@ fn step(
             need(st, b, K::Int)?;
             return Some(Flow::Branch(t));
         }
-        JumpIfNotLtIImm(a, _, t) | JumpIfNotLeIImm(a, _, t) => {
+        JumpIfNotLtIImm(a, _, t) | JumpIfNotLeIImm(a, _, t) | JumpIfLtIImm(a, _, t) | JumpIfLeIImm(a, _, t) => {
             need(st, a, K::Int)?;
             return Some(Flow::Branch(t));
         }
+        JumpIfEq(a, b, t) | JumpIfNotEq(a, b, t) => {
+            eq_mode(kind(st, a)?, kind(st, b)?)?;
+            return Some(Flow::Branch(t));
+        }
+        // `.=` on an element of a string list or map in a variable.
+        AppendPath { ref path, cur } => {
+            let PathBase::Local(r) = path.base else { return None };
+            let [k] = path.keys.as_slice() else { return None };
+            match kind(st, r)? {
+                K::List(E::Str) => need(st, *k, K::Int)?,
+                K::Map(ke, E::Str) => need_key(st, *k, ke)?,
+                _ => return None,
+            }
+            need(st, cur, K::Str)?;
+            kind(st, path.val)?;
+            // The element read is taken back.
+            set(st, cur, K::Undef)?;
+        }
         Call { dst, func, args, argc } => {
-            if !ok.contains(&func) {
+            if !ok.get(func as usize).copied().unwrap_or(false) {
                 return None;
             }
             let callee = prog.funcs.get(func as usize)?.native.as_ref()?;
@@ -721,18 +735,51 @@ fn step(
 }
 
 /// Functions that can be compiled: well formed, with calls only to other
-/// compilable functions.
+/// compilable functions. Each function is checked once, then again only
+/// when a function it calls is found not to be compilable (removing one can
+/// only make its callers fail), so the work grows with the size of the
+/// program, not with its size times the length of its call chains.
 fn eligible(prog: &Program) -> HashMap<u32, Checked> {
-    let mut ok: HashSet<u32> =
-        prog.funcs.iter().enumerate().filter(|(_, f)| f.native.is_some()).map(|(i, _)| i as u32).collect();
-    loop {
-        let checked: HashMap<u32, Checked> =
-            ok.iter().filter_map(|&f| well_formed(prog, &prog.funcs[f as usize], &ok).map(|c| (f, c))).collect();
-        if checked.len() == ok.len() {
-            return checked;
+    let n = prog.funcs.len();
+    let mut ok: Vec<bool> = prog.funcs.iter().map(|f| f.native.is_some()).collect();
+    // Who calls each function (each caller once per callee).
+    let mut callers: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for (i, f) in prog.funcs.iter().enumerate().filter(|(i, _)| ok[*i]) {
+        for ins in &f.code {
+            if let Instr::Call { func, .. } = *ins {
+                if let Some(c) = callers.get_mut(func as usize) {
+                    if c.last() != Some(&(i as u32)) {
+                        c.push(i as u32);
+                    }
+                }
+            }
         }
-        ok = checked.into_keys().collect();
     }
+    let mut queued = ok.clone();
+    let mut work: Vec<u32> = (0..n as u32).filter(|&i| ok[i as usize]).rev().collect();
+    let mut checked: HashMap<u32, Checked> = HashMap::new();
+    while let Some(f) = work.pop() {
+        queued[f as usize] = false;
+        if !ok[f as usize] {
+            continue;
+        }
+        match well_formed(prog, &prog.funcs[f as usize], &ok) {
+            Some(c) => {
+                checked.insert(f, c);
+            }
+            None => {
+                ok[f as usize] = false;
+                checked.remove(&f);
+                for &c in &callers[f as usize] {
+                    if ok[c as usize] && !queued[c as usize] {
+                        queued[c as usize] = true;
+                        work.push(c);
+                    }
+                }
+            }
+        }
+    }
+    checked
 }
 
 /// The machine type of a value of kind `k` (strings are in the window; their
@@ -789,11 +836,13 @@ enum H {
     Entry,
     Has,
     NewMap,
+    AppendKey,
+    StrEq,
 }
 
 /// Name, address, number of i64 arguments after `ctx` (None: `(f64, f64) -> f64`)
 /// and whether it returns an i64, in the order of `H`.
-fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 29] {
+fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 31] {
     [
         ("phv_jit_tick", phv_jit_tick as *const u8, Some(0), true),
         ("phv_jit_enter", phv_jit_enter as *const u8, Some(3), true),
@@ -824,6 +873,8 @@ fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 29] {
         ("phv_jit_entry", phv_jit_entry as *const u8, Some(5), true),
         ("phv_jit_has", phv_jit_has as *const u8, Some(2), true),
         ("phv_jit_new_map", phv_jit_new_map as *const u8, Some(3), false),
+        ("phv_jit_append_key", phv_jit_append_key as *const u8, Some(4), false),
+        ("phv_jit_str_eq", phv_jit_str_eq as *const u8, Some(2), true),
     ]
 }
 
@@ -833,7 +884,7 @@ fn writes_args(f: &Function) -> bool {
     let param = |r: Reg| (r as usize) < f.num_params as usize;
     f.code.iter().any(|ins| match ins {
         Instr::AppendStr(d, _) => param(*d),
-        Instr::SetPath(p) => matches!(p.base, PathBase::Local(r) if param(r)),
+        Instr::SetPath(p) | Instr::AppendPath { path: p, .. } => matches!(p.base, PathBase::Local(r) if param(r)),
         _ => false,
     })
 }
@@ -976,6 +1027,9 @@ struct Translator<'a, 'b> {
     /// Per register: 1 when it holds `null` (a nullable scalar), else 0.
     nvars: Vec<Variable>,
     blocks: Vec<Block>,
+    /// Branches back to an instruction (a loop's test at its end): the block
+    /// each goes through, which counts the budget, and the target's block.
+    back_edges: Vec<(Block, Block)>,
     ctx: Value,
 }
 
@@ -1001,6 +1055,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             fvars: Vec::new(),
             nvars: Vec::new(),
             blocks: Vec::new(),
+            back_edges: Vec::new(),
             ctx: Value::from_u32(0),
         }
     }
@@ -1253,9 +1308,54 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.fail_if(is_zero, code);
     }
 
+    /// `a == b` (of kinds `ka` and `kb`, checked by `eq_mode`) as 0 or 1.
+    fn eq_flag(&mut self, a: Reg, b: Reg, ka: K, kb: K) -> Value {
+        match eq_mode(ka, kb) {
+            Some(EqMode::Plain) if ka == K::Str => self.call_regs(H::StrEq, &[a as i64, b as i64]).unwrap(),
+            Some(EqMode::Plain) => {
+                let (x, y) = (self.get(a), self.get(b));
+                let c = self.b.ins().icmp(IntCC::Equal, x, y);
+                self.bool_val(c)
+            }
+            Some(EqMode::BothNull) => self.iconst(1),
+            Some(EqMode::NullTest(true)) => self.is_null(a, ka),
+            Some(EqMode::NullTest(false)) => self.is_null(b, kb),
+            Some(EqMode::Opt(e)) => {
+                // Both null, or neither and the same value.
+                let (na, nb) = (self.is_null(a, ka), self.is_null(b, kb));
+                let same_null = self.b.ins().icmp(IntCC::Equal, na, nb);
+                let same_value = if e == E::Float {
+                    let (x, y) = (self.getf(a), self.getf(b));
+                    self.b.ins().fcmp(FloatCC::Equal, x, y)
+                } else {
+                    let (x, y) = (self.get(a), self.get(b));
+                    self.b.ins().icmp(IntCC::Equal, x, y)
+                };
+                let same_value = self.bool_val(same_value);
+                let either = self.b.ins().bor(na, same_value);
+                let same_null = self.bool_val(same_null);
+                self.b.ins().band(same_null, either)
+            }
+            None => unreachable!("checked"),
+        }
+    }
+
     fn jump(&mut self, target: u32) {
         let blk = self.blocks[target as usize];
         self.b.ins().jump(blk, &[]);
+    }
+
+    /// The block a branch of instruction `from` to `t` goes to: the target's,
+    /// or for a branch back, one that first counts the budget (filled at the
+    /// end of `translate`), as `Jump` does.
+    fn edge(&mut self, from: usize, t: u32) -> Block {
+        let blk = self.blocks[t as usize];
+        if t as usize > from {
+            return blk;
+        }
+        let through = self.b.create_block();
+        self.back_edges.push((through, blk));
+        through
     }
 
     fn translate(mut self) {
@@ -1386,35 +1486,21 @@ impl<'a, 'b> Translator<'a, 'b> {
                 Instr::JumpIfNull(r, t) | Instr::JumpIfNotNull(r, t) => {
                     let null = self.is_null(r, k(r));
                     let (yes, no) = if matches!(ins, Instr::JumpIfNull(..)) { (t, next) } else { (next, t) };
-                    let (yes, no) = (self.blocks[yes as usize], self.blocks[no as usize]);
+                    let (yes, no) = (self.edge(i, yes), self.edge(i, no));
                     self.b.ins().brif(null, yes, &[], no, &[]);
                     continue;
                 }
-                Instr::Eq(d, a, b) | Instr::Ne(d, a, b) if eq_mode(k(a), k(b)) != Some(EqMode::Plain) => {
-                    let eq = match eq_mode(k(a), k(b)) {
-                        Some(EqMode::BothNull) => self.iconst(1),
-                        Some(EqMode::NullTest(true)) => self.is_null(a, k(a)),
-                        Some(EqMode::NullTest(false)) => self.is_null(b, k(b)),
-                        Some(EqMode::Opt(e)) => {
-                            // Both null, or neither and the same value.
-                            let (na, nb) = (self.is_null(a, k(a)), self.is_null(b, k(b)));
-                            let same_null = self.b.ins().icmp(IntCC::Equal, na, nb);
-                            let same_value = if e == E::Float {
-                                let (x, y) = (self.getf(a), self.getf(b));
-                                self.b.ins().fcmp(FloatCC::Equal, x, y)
-                            } else {
-                                let (x, y) = (self.get(a), self.get(b));
-                                self.b.ins().icmp(IntCC::Equal, x, y)
-                            };
-                            let same_value = self.bool_val(same_value);
-                            let either = self.b.ins().bor(na, same_value);
-                            let same_null = self.bool_val(same_null);
-                            self.b.ins().band(same_null, either)
-                        }
-                        _ => unreachable!("checked"),
-                    };
+                Instr::Eq(d, a, b) | Instr::Ne(d, a, b) => {
+                    let eq = self.eq_flag(a, b, k(a), k(b));
                     let r = if matches!(ins, Instr::Ne(..)) { self.b.ins().bxor_imm_s(eq, 1) } else { eq };
                     self.set(d, r);
+                }
+                Instr::JumpIfEq(a, b, t) | Instr::JumpIfNotEq(a, b, t) => {
+                    let eq = self.eq_flag(a, b, k(a), k(b));
+                    let (yes, no) = if matches!(ins, Instr::JumpIfEq(..)) { (t, next) } else { (next, t) };
+                    let (yes, no) = (self.edge(i, yes), self.edge(i, no));
+                    self.b.ins().brif(eq, yes, &[], no, &[]);
+                    continue;
                 }
                 Instr::AddI(d, a, b) | Instr::SubI(d, a, b) => {
                     let (x, y) = (self.get(a), self.get(b));
@@ -1490,21 +1576,13 @@ impl<'a, 'b> Translator<'a, 'b> {
                     let r = self.b.ins().bxor_imm_s(x, 1);
                     self.set(d, r);
                 }
-                Instr::Eq(d, a, b)
-                | Instr::Ne(d, a, b)
-                | Instr::Lt(d, a, b)
-                | Instr::Le(d, a, b)
-                | Instr::Cmp(d, a, b)
-                    if k(a).strip() == K::Str =>
-                {
+                Instr::Lt(d, a, b) | Instr::Le(d, a, b) | Instr::Cmp(d, a, b) if k(a).strip() == K::Str => {
                     // Compare the strings (-1, 0 or 1), then that with 0.
                     let c = self.call_regs(H::StrCmp, &[a as i64, b as i64]).unwrap();
                     let r = match ins {
                         Instr::Cmp(..) => c,
                         _ => {
                             let cc = match ins {
-                                Instr::Eq(..) => IntCC::Equal,
-                                Instr::Ne(..) => IntCC::NotEqual,
                                 Instr::Lt(..) => IntCC::SignedLessThan,
                                 _ => IntCC::SignedLessThanOrEqual,
                             };
@@ -1515,15 +1593,12 @@ impl<'a, 'b> Translator<'a, 'b> {
                     self.set(d, r);
                 }
                 Instr::EqI(d, a, b)
-                | Instr::Eq(d, a, b)
-                | Instr::Ne(d, a, b)
                 | Instr::LtI(d, a, b)
                 | Instr::Lt(d, a, b)
                 | Instr::LeI(d, a, b)
                 | Instr::Le(d, a, b) => {
                     let cc = match ins {
-                        Instr::EqI(..) | Instr::Eq(..) => IntCC::Equal,
-                        Instr::Ne(..) => IntCC::NotEqual,
+                        Instr::EqI(..) => IntCC::Equal,
                         Instr::LtI(..) | Instr::Lt(..) => IntCC::SignedLessThan,
                         _ => IntCC::SignedLessThanOrEqual,
                     };
@@ -1679,7 +1754,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 Instr::JumpIfFalse(r, t) | Instr::JumpIfTrue(r, t) => {
                     let c = self.get(r);
                     let (yes, no) = if matches!(ins, Instr::JumpIfTrue(..)) { (t, next) } else { (next, t) };
-                    let (yes, no) = (self.blocks[yes as usize], self.blocks[no as usize]);
+                    let (yes, no) = (self.edge(i, yes), self.edge(i, no));
                     self.b.ins().brif(c, yes, &[], no, &[]);
                     continue;
                 }
@@ -1691,19 +1766,25 @@ impl<'a, 'b> Translator<'a, 'b> {
                         IntCC::SignedLessThanOrEqual
                     };
                     let c = self.b.ins().icmp(cc, x, y);
-                    let (yes, no) = (self.blocks[next as usize], self.blocks[t as usize]);
+                    let (yes, no) = (self.edge(i, next), self.edge(i, t));
                     self.b.ins().brif(c, yes, &[], no, &[]);
                     continue;
                 }
-                Instr::JumpIfNotLtIImm(a, n, t) | Instr::JumpIfNotLeIImm(a, n, t) => {
+                Instr::JumpIfNotLtIImm(a, n, t)
+                | Instr::JumpIfNotLeIImm(a, n, t)
+                | Instr::JumpIfLtIImm(a, n, t)
+                | Instr::JumpIfLeIImm(a, n, t) => {
                     let x = self.get(a);
-                    let cc = if matches!(ins, Instr::JumpIfNotLtIImm(..)) {
+                    let cc = if matches!(ins, Instr::JumpIfNotLtIImm(..) | Instr::JumpIfLtIImm(..)) {
                         IntCC::SignedLessThan
                     } else {
                         IntCC::SignedLessThanOrEqual
                     };
                     let c = self.b.ins().icmp_imm_s(cc, x, n as i64);
-                    let (yes, no) = (self.blocks[next as usize], self.blocks[t as usize]);
+                    // The `Not` forms jump when the comparison fails.
+                    let jumps_when = matches!(ins, Instr::JumpIfLtIImm(..) | Instr::JumpIfLeIImm(..));
+                    let (yes, no) = if jumps_when { (t, next) } else { (next, t) };
+                    let (yes, no) = (self.edge(i, yes), self.edge(i, no));
                     self.b.ins().brif(c, yes, &[], no, &[]);
                     continue;
                 }
@@ -1849,8 +1930,18 @@ impl<'a, 'b> Translator<'a, 'b> {
                     self.call(H::SetIndex, &[rv, idx, pv, vv]);
                     self.check_ctx();
                 }
+                Instr::AppendPath { ref path, cur } => {
+                    let PathBase::Local(r) = path.base else { unreachable!("checked") };
+                    let key = path.keys[0];
+                    self.spill(key, k(key));
+                    self.spill(path.val, k(path.val));
+                    self.call_regs(H::AppendKey, &[r as i64, key as i64, cur as i64, path.val as i64]);
+                    self.check_ctx();
+                }
                 Instr::IterInit(it, src) => {
-                    self.call_regs(H::Move, &[it as i64, src as i64]);
+                    if it != src {
+                        self.call_regs(H::Move, &[it as i64, src as i64]);
+                    }
                     let z = self.iconst(0);
                     self.set(it + 1, z);
                     // The loop's own copy of the list does not change: its
@@ -1866,7 +1957,8 @@ impl<'a, 'b> Translator<'a, 'b> {
                     let idx = self.get(it + 1);
                     let done = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx, len);
                     let cont = self.b.create_block();
-                    self.b.ins().brif(done, self.blocks[end as usize], &[], cont, &[]);
+                    let end = self.edge(i, end);
+                    self.b.ins().brif(done, end, &[], cont, &[]);
                     self.b.switch_to_block(cont);
                     for (r, part, e) in [(key, 0, ke), (val, 1, ve)] {
                         if r == NO_REG || e == E::Empty {
@@ -1894,7 +1986,8 @@ impl<'a, 'b> Translator<'a, 'b> {
                     let idx = self.get(it + 1);
                     let done = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx, len);
                     let cont = self.b.create_block();
-                    self.b.ins().brif(done, self.blocks[end as usize], &[], cont, &[]);
+                    let end = self.edge(i, end);
+                    self.b.ins().brif(done, end, &[], cont, &[]);
                     self.b.switch_to_block(cont);
                     if key != NO_REG {
                         self.set(key, idx);
@@ -1915,6 +2008,11 @@ impl<'a, 'b> Translator<'a, 'b> {
             }
             // `well_formed` checked that the last instruction returns.
             self.jump(next);
+        }
+        for (through, blk) in std::mem::take(&mut self.back_edges) {
+            self.b.switch_to_block(through);
+            self.tick();
+            self.b.ins().jump(blk, &[]);
         }
     }
 }
@@ -1938,8 +2036,7 @@ mod tests {
     }
 
     fn accepts(prog: &Program) -> bool {
-        let all: HashSet<u32> = (0..prog.funcs.len() as u32).collect();
-        well_formed(prog, &prog.funcs[0], &all).is_some()
+        well_formed(prog, &prog.funcs[0], &vec![true; prog.funcs.len()]).is_some()
     }
 
     fn one(f: Function) -> bool {
@@ -2075,9 +2172,11 @@ mod tests {
         assert!(!one(func(vec![ValKind::Bool, S], S, 2, vec![JumpIfFalse(0, 2), Ret(1), RetNull])));
         // HTML concatenation and builtins other than strlen
         assert!(!one(func(vec![S], S, 2, vec![Concat(1, 0, 1, true), Ret(1)])));
-        // `Concat` of no registers, and a branch back (which would not check the clock).
+        // `Concat` of no registers.
         assert!(!one(func(vec![S], S, 2, vec![Concat(1, 9, 0, false), Ret(1)])));
-        assert!(!one(func(vec![I], ValKind::Void, 1, vec![JumpIfNotLtIImm(0, 5, 0), RetNull])));
+        // A branch back is compiled: it counts toward the time limit's check
+        // as `Jump` does (a loop's test at its end).
+        assert!(one(func(vec![I], ValKind::Void, 1, vec![JumpIfNotLtIImm(0, 5, 0), RetNull])));
         let prog = Program {
             funcs: vec![func(vec![S], I, 2, vec![CallBuiltin { dst: 1, id: 0, args: 0, argc: 1 }, Ret(1)])],
             builtin_names: vec!["strtoupper".into()],
@@ -2095,7 +2194,28 @@ mod tests {
         let callee = func(vec![I], I, 1, vec![Ret(0)]);
         let caller = func(vec![I], I, 2, vec![Call { dst: 1, func: 1, args: 0, argc: 1 }, Ret(1)]);
         let prog = Program { funcs: vec![caller, callee], ..Default::default() };
-        assert!(well_formed(&prog, &prog.funcs[0], &HashSet::from([0])).is_none());
+        assert!(well_formed(&prog, &prog.funcs[0], &[true, false]).is_none());
+    }
+
+    /// A long chain of calls whose last function cannot be compiled: one
+    /// function drops out per pass of a fixpoint over all of them (quadratic),
+    /// and once each with the worklist.
+    #[test]
+    fn eligibility_of_long_call_chains_takes_linear_time() {
+        let n = 20_000u32;
+        let mut funcs: Vec<Function> = (0..n - 1)
+            .map(|i| func(vec![I], I, 2, vec![Call { dst: 1, func: i + 1, args: 0, argc: 1 }, Ret(1)]))
+            .collect();
+        funcs.push(func(vec![I], I, 1, vec![Echo(0), Ret(0)]));
+        let prog = Program { funcs, ..Default::default() };
+        let start = std::time::Instant::now();
+        assert!(eligible(&prog).is_empty());
+        assert!(start.elapsed() < std::time::Duration::from_secs(10), "took {:?}", start.elapsed());
+        // Without the last one, the whole chain is compiled.
+        let mut prog = prog;
+        prog.funcs.pop();
+        prog.funcs.push(func(vec![I], I, 1, vec![Ret(0)]));
+        assert_eq!(eligible(&prog).len(), n as usize);
     }
 
     #[test]

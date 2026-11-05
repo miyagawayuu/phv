@@ -113,6 +113,7 @@ fn postgres() {
     check(&host, "postgres_types");
     check(&host, "postgres_types_after");
     check_async(&url, "postgres_async");
+    check_async(&url, "postgres_kept");
     check_migrations(&host, "SELECT nope FROM missing_table");
 }
 

@@ -760,10 +760,13 @@ phv serve examples/site --port 8080
   exactly (`INDEX.PHV`, Windows short names, and `::$DATA` do not open the file).
 - Each request runs in a new VM (a new heap). Only the compiled bytecode is shared.
 - When a file is saved, it is recompiled on the next request (the modification times of all the files it depends on are checked).
+  A production server (`--prod`) looks at the files at most once a second: what a request path leads to, the files a
+  compiled page was built from, and the small static files it keeps in memory. A change shows within a second. A
+  development server looks at every request.
 - Limits: execution time 30 seconds (`--time-limit`), memory 128 MB (`[security] memory_limit_mb`), body 8 MB, receiving headers 10 seconds,
   receiving the body 30 seconds, 1024 concurrent connections, 1000 query and form fields. A connection is closed when the
   client accepts no data for 30 seconds. Static files (and `response()->file()`) are sent from disk as they are read,
-  so they do not take memory.
+  so they do not take memory; a production server keeps static files of up to 256 KB in memory, 32 MB in all.
 - At most `[server] workers` scripts run at once (default: two per CPU, at least 8); a request waits up to 10 seconds
   for one. A request that cannot get one in time, or that arrives while the output waiting to be sent to clients is
   more than the workers could produce (`workers` × `memory_limit_mb`), gets `503 Service Unavailable` with
@@ -1090,6 +1093,14 @@ only its own changes are undone, and nothing is committed until the outermost on
 - `LIKE` and `GLOB` stop at the script's time limit like the rest of a query; `instr()`, `replace()` and `trim(X, Y)`
   search in linear time. `PRAGMA case_sensitive_like` is refused (it would bring back SQLite's own `LIKE`).
 - SQL errors raise `DatabaseError`.
+- A connection to a database file is kept for the next script that opens the same file (up to 30 seconds idle;
+  `:memory:` databases are never kept), so pages that open the database on every request do not reopen the file.
+  Each open checks the path as before: no link on the way, the journal files missing or plain files, and the
+  database a plain file with one link that is the very file the kept connection has open (otherwise a new connection
+  is opened). The new script gets its own time limit, and `lastInsertId()`, `changes()` and `total_changes()` start
+  from zero. When a script is done, an open transaction is rolled back; a connection is closed instead of kept after a
+  failed statement, after any `PRAGMA`, or when a temporary table, view, index or trigger exists. `unlink()` and
+  `rename()` close the idle connections of the file first.
 
 #### PostgreSQL and MySQL
 
@@ -1125,6 +1136,11 @@ The methods are the same as for SQLite (`query`, `first`, `execute`, `transactio
   statements; MySQL `COM_RESET_CONNECTION`, the active role and the database of the URL). Connecting to the same name
   twice in one script gives the same connection. When every connection is in use, `connect()` waits up to the
   script's time limit (30 seconds at most) and then raises `DatabaseError`.
+- A PostgreSQL connection keeps the 64 statements it ran last prepared (SQLite: the statements of the script's
+  connection), so a statement run again skips that step. Only `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `WITH` and
+  `VALUES` are kept; any other statement (`ALTER TABLE`, `DEALLOCATE`, `SET`, ...) drops them. A kept statement is
+  prepared again when its table changed (also by another connection); inside a transaction only the statements
+  prepared in that transaction are used.
 - A statement running past the script's time limit is stopped: by the server (PostgreSQL `statement_timeout`,
   MySQL `max_execution_time`, which applies to `SELECT`) and, also when a script changes those settings, on the client
   side (PostgreSQL connections stop reading at the deadline; MySQL statements are stopped with `KILL QUERY`). A result
@@ -1296,9 +1312,15 @@ when the body is not JSON).
   is returned with its `Location` header.
 - **TLS (`https://`) is required for every host except `localhost`**, with the server certificate checked against the
   public CAs. `tls = false` allows `http://` to such a host.
-- Each request uses its own connection and waits at most until the script's time limit (30 seconds when it has none),
+- Connections are kept open between requests to the same host (at most 8 per host and 256 in all, closed after 30
+  idle seconds): one is kept only when its response ended where its framing said (`Content-Length`, or a chunked body
+  with nothing after it) and the server did not ask to close it. Only `GET`, `HEAD` and `OPTIONS` requests take a kept
+  connection; one the server closed meanwhile is retried once on a new connection.
+- Each request waits at most until the script's time limit (30 seconds when it has none),
   whatever the server sends: the name lookup, every read and every write stop at that deadline, and at most 10
-  interim (`1xx`) responses are skipped. Request and response bodies are at most 16 MB. The body is read as UTF-8 text.
+  interim (`1xx`) responses are skipped. The addresses a host name was looked up to are kept for 30 seconds (a
+  failed lookup is not kept), and requests for the same name at the same time share one lookup. Request and response
+  bodies are at most 16 MB. The body is read as UTF-8 text.
 - Connection failures and network errors raise `NetworkError`, naming the service but never its URL, host or headers
   (errors are described in fixed words, such as "the server's TLS certificate is not valid"). An
   unset `url_env` or `headers_env` variable is reported when a request is sent, so `phv check` works without the
@@ -1384,7 +1406,8 @@ pattern, and usually much less.
 - An invalid pattern throws `ValueError`. Patterns are at most 64 KB, 2 MB once compiled, and 1,000 groups; a pattern
   whose groups would need more than 16 MB to search (states × groups) is refused too.
 - Results count toward the memory limit as they are built.
-- Each thread keeps the patterns it used last compiled: at most 64 of them and 32 MB.
+- The server process keeps the patterns used last compiled, for every request: at most 64 of them and 32 MB (the
+  least recently used go first).
 
 In `match()`, group 0 is the whole match and a group that took no part is `""`.
 
@@ -1456,6 +1479,8 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
   outside the script's transaction; give `pool_size` room for them. With SQLite the statement runs right away.
 - Work that was started and never awaited is still waited for when the script ends (until its time limit at most):
   a request cannot leave work running after it, holding a thread and a connection.
+- The work runs on threads the server process shares between requests: a thread is started when none is free (up to
+  1,024 operations at once in the process) and ends after a few seconds without work.
 - `new Future(fn(): T => ...)` defers any work: it runs once, when the future is first awaited. Deferred work that is
   never awaited does not run.
 
@@ -1522,7 +1547,8 @@ rate_limit_reset("login:" . ip_group(request()->ip));
   `[security] rate_limit_store`. `rate_limit()`, `rate_limit_reset()` and `requests_per_minute` then count on that
   server, in keys starting with `phv:ratelimit:` that expire with their window. If the server cannot be reached,
   `rate_limit()` returns `false` (a limit that cannot be counted refuses), `rate_limit_reset()` throws
-  `DatabaseError`, and `requests_per_minute` counts in the process; each failure is logged.
+  `DatabaseError`, and `requests_per_minute` counts in the process; each failure is logged. After such a failure the
+  server is not asked again for 5 seconds: meanwhile every call fails the same way at once, without waiting for it.
 - The same key is counted separately for each window length (you can apply both 5 per minute and 50 per day). When there are more than 100,000 keys,
   keys that have not reached their limit are discarded first, so using a large number of keys does not release keys that are currently limited.
 - `requests_per_minute` counts IPv6 addresses grouped by /64. Do the same in keys: `ip_group($ip)` returns the /64 of

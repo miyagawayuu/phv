@@ -2,13 +2,19 @@
 //! interpolated values as bound parameters, so SQL injection cannot happen.
 //! At runtime an `Sql` value is the list `[query text, list of parameters]`.
 
+use crate::safefs::{DirGuard, FileId};
 use crate::{int, s};
 use indexmap::IndexMap;
 use phv_vm::{BuiltinFn, Key, Value, Vm, VmError};
 use rusqlite::types::{ToSqlOutput, Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OpenFlags};
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 mod vfs;
 
@@ -73,12 +79,265 @@ fn to_sql(v: &Value) -> SqlValue {
 /// An open database. The directory guard keeps the database's directory
 /// pinned (see `safefs`) while SQLite uses files in it by name.
 struct Db {
-    conn: Connection,
+    /// Always there while the script holds it (taken when it is dropped).
+    conn: Option<Connection>,
     _dir: Option<crate::safefs::DirGuard>,
     /// How many `transaction()` calls are open (inner ones are savepoints).
     depth: std::cell::Cell<u32>,
     /// The pages an in-memory database may use (0 for a file).
     pages: usize,
+    /// For a database file: the pool the connection goes back to.
+    pooled: Option<Lease>,
+}
+
+impl Db {
+    fn conn(&self) -> &Connection {
+        self.conn.as_ref().expect("an open database has its connection")
+    }
+
+    /// The error of a failed statement; the connection is then not reused.
+    fn fail(&self, vm: &Vm, e: rusqlite::Error) -> VmError {
+        if let Some(lease) = &self.pooled {
+            lease.tainted.store(true, Ordering::SeqCst);
+        }
+        db_error(vm, e)
+    }
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        if let (Some(c), Some(lease)) = (self.conn.take(), self.pooled.take()) {
+            give_back(c, lease);
+        }
+    }
+}
+
+// ----- Connections to database files, kept between scripts --------------------
+//
+// Opening a database file costs several opens of the file (the link checks,
+// then SQLite's own), which the OS serializes when many requests open the same
+// file. So a connection to a file goes back to a pool when its script is done
+// with it, and the next script that opens the same file takes it again:
+//
+// - At every open, `resolve_path` checks and pins the directories, the journal
+//   names (`-journal`, `-wal`, `-shm`) must be missing or plain files, and the
+//   database's name must still be a plain file with one link and the very
+//   file the kept connection has open (its identity). Otherwise the
+//   connection is not used. Files SQLite opens later are checked by `vfs`.
+// - The script's own settings are installed every time: the progress handler
+//   with its deadline, `LIKE`/`GLOB` with its deadline, the counters
+//   (`changes()`, `total_changes()`, `last_insert_rowid()`) and the
+//   authorizer.
+// - When the script is done, an open transaction is rolled back. The
+//   connection is closed instead of kept after a failed statement, any
+//   `PRAGMA` (the session settings it may change), or when a temporary table,
+//   view, index or trigger exists; also when the rollback fails. Its cached
+//   statements and page cache are dropped.
+// - An idle connection is closed after `KEPT_IDLE`, and when a script deletes
+//   or renames its file. `:memory:` databases are never kept.
+
+/// Idle connections kept per database file, and in all.
+const KEPT_PER_FILE: usize = 64;
+const KEPT_ALL: usize = 256;
+/// An idle connection is closed after this long.
+const KEPT_IDLE: Duration = Duration::from_secs(30);
+
+/// A connection a script holds: the file it is for, and whether it may be kept.
+struct Lease {
+    key: PathBuf,
+    id: FileId,
+    tainted: Arc<AtomicBool>,
+}
+
+struct Idle {
+    conn: Connection,
+    id: FileId,
+    since: Instant,
+}
+
+static KEPT: LazyLock<Mutex<HashMap<PathBuf, Vec<Idle>>>> = LazyLock::new(Default::default);
+/// Opens served by a kept connection (for tests).
+static REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Idle connections kept, and opens served by one so far (for tests).
+pub fn kept_stats() -> (usize, u64) {
+    (kept().values().map(Vec::len).sum(), REUSED.load(Ordering::SeqCst))
+}
+static SWEEPING: AtomicBool = AtomicBool::new(false);
+
+fn kept() -> MutexGuard<'static, HashMap<PathBuf, Vec<Idle>>> {
+    KEPT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An idle connection to the file `key` whose identity is `id`. Connections
+/// to another file of that name, or idle for too long, are closed.
+fn take(key: &Path, id: FileId) -> Option<Connection> {
+    let mut closing = Vec::new();
+    let found = {
+        let mut map = kept();
+        let list = map.get_mut(key)?;
+        let mut found = None;
+        while let Some(idle) = list.pop() {
+            if idle.id == id && idle.since.elapsed() < KEPT_IDLE {
+                REUSED.fetch_add(1, Ordering::SeqCst);
+                found = Some(idle.conn);
+                break;
+            }
+            closing.push(idle);
+        }
+        if list.is_empty() {
+            map.remove(key);
+        }
+        found
+    };
+    // Closed outside the lock: closing a file can take a while.
+    drop(closing);
+    found
+}
+
+/// Takes back a connection a script is done with, if it can be reused.
+fn give_back(c: Connection, lease: Lease) {
+    let Some(c) = reusable(c, &lease.tainted) else { return };
+    let idle = Idle { conn: c, id: lease.id, since: Instant::now() };
+    let refused = {
+        let mut map = kept();
+        let all: usize = map.values().map(Vec::len).sum();
+        let list = map.entry(lease.key).or_default();
+        if list.len() < KEPT_PER_FILE && all < KEPT_ALL {
+            list.push(idle);
+            None
+        } else {
+            Some(idle)
+        }
+    };
+    drop(refused);
+    sweep_later();
+}
+
+/// Rolls back what the script left and checks the connection can be kept.
+fn reusable(c: Connection, tainted: &AtomicBool) -> Option<Connection> {
+    // Statements run here must not stop at the script's deadline.
+    c.progress_handler(0, None::<fn() -> bool>);
+    if tainted.load(Ordering::SeqCst) {
+        return None;
+    }
+    if !c.is_autocommit() && c.execute_batch("ROLLBACK").is_err() {
+        return None;
+    }
+    let temp: i64 = c.query_row("SELECT count(*) FROM sqlite_temp_master", [], |r| r.get(0)).ok()?;
+    if temp != 0 || !c.is_autocommit() || tainted.load(Ordering::SeqCst) {
+        return None;
+    }
+    // The cached statements were allocated by the script (and counted
+    // against its memory); the page cache is SQLite's memory.
+    c.flush_prepared_statement_cache();
+    c.release_memory().ok()?;
+    Some(c)
+}
+
+/// Closes the idle connections of the file `name` in `dir` (before a script
+/// deletes or renames it: on Windows an open file cannot be).
+pub(crate) fn release(dir: &DirGuard, name: &std::ffi::OsStr) {
+    let key = dir.path().join(name);
+    let closing = kept().remove(&key);
+    drop(closing);
+}
+
+/// Closes idle connections once they are idle for `KEPT_IDLE`, on a thread
+/// that runs while any are kept.
+fn sweep_later() {
+    if SWEEPING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let started = std::thread::Builder::new().name("phv-sqlite-idle".into()).spawn(|| loop {
+        std::thread::sleep(KEPT_IDLE / 2);
+        let closing: Vec<Idle> = {
+            let mut map = kept();
+            let mut out = Vec::new();
+            for list in map.values_mut() {
+                let (old, fresh): (Vec<Idle>, Vec<Idle>) =
+                    std::mem::take(list).into_iter().partition(|i| i.since.elapsed() >= KEPT_IDLE);
+                *list = fresh;
+                out.extend(old);
+            }
+            map.retain(|_, l| !l.is_empty());
+            if map.is_empty() {
+                SWEEPING.store(false, Ordering::SeqCst);
+                drop(map);
+                drop(out);
+                return;
+            }
+            out
+        };
+        drop(closing);
+    });
+    if started.is_err() {
+        SWEEPING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Installs what belongs to the script on a connection, new or kept: the
+/// progress handler and `LIKE`/`GLOB` with its deadline, counters that start
+/// from zero, and the authorizer (which notes, in `tainted`, statements after
+/// which the connection is not kept).
+fn for_script(c: &Connection, vm: &Vm, tainted: Option<Arc<AtomicBool>>) -> rusqlite::Result<()> {
+    // Queries stop when the script's time limit is reached.
+    match vm.deadline() {
+        Some(deadline) => c.progress_handler(10_000, Some(move || Instant::now() > deadline)),
+        None => c.progress_handler(0, None::<fn() -> bool>),
+    }
+    // SQLite runs one `LIKE` or `GLOB` as a single step, which the progress
+    // handler cannot stop (a long text and pattern take minutes): these do.
+    like_functions(c, vm.deadline())?;
+    counters(c)?;
+    // Last: the authorizer refuses the pragmas set before.
+    match tainted {
+        None => c.authorizer(Some(sqlite_authorizer)),
+        Some(tainted) => c.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+            use rusqlite::hooks::AuthAction;
+            // A pragma may change the session; temporary objects stay in it.
+            if matches!(
+                ctx.action,
+                AuthAction::Pragma { .. }
+                    | AuthAction::CreateTempIndex { .. }
+                    | AuthAction::CreateTempTable { .. }
+                    | AuthAction::CreateTempTrigger { .. }
+                    | AuthAction::CreateTempView { .. }
+            ) {
+                tainted.store(true, Ordering::SeqCst);
+            }
+            sqlite_authorizer(ctx)
+        })),
+    }
+    Ok(())
+}
+
+/// `last_insert_rowid()`, `changes()` and `total_changes()` count this
+/// script's statements only, as on a new connection.
+fn counters(c: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    // SAFETY: the handle is the open connection's; the functions below are
+    // owned by the connection, so it is open whenever they run.
+    let db = unsafe { c.handle() };
+    unsafe { rusqlite::ffi::sqlite3_set_last_insert_rowid(db, 0) };
+    let base = c.total_changes();
+    let db = db as usize;
+    let flags = FunctionFlags::SQLITE_UTF8;
+    c.create_scalar_function("total_changes", 0, flags, move |_| {
+        // SAFETY: see above.
+        let total = unsafe { rusqlite::ffi::sqlite3_total_changes64(db as *mut rusqlite::ffi::sqlite3) } as u64;
+        Ok(total.saturating_sub(base) as i64)
+    })?;
+    c.create_scalar_function("changes", 0, flags, move |_| {
+        // SAFETY: see above.
+        let db = db as *mut rusqlite::ffi::sqlite3;
+        // Until this script changes a row, the last change was another script's.
+        if (unsafe { rusqlite::ffi::sqlite3_total_changes64(db) } as u64) == base {
+            return Ok(0);
+        }
+        Ok(unsafe { rusqlite::ffi::sqlite3_changes64(db) })
+    })?;
+    Ok(())
 }
 
 /// The statements for `BEGIN` / `COMMIT` / `ROLLBACK` of `Database::transaction()`
@@ -100,12 +359,11 @@ fn is_sqlite(vm: &Vm, h: &Value) -> bool {
     vm.resources.get(int(h) as usize).and_then(|r| r.as_ref()).is_some_and(|b| b.is::<Db>())
 }
 
-fn conn<'v>(vm: &'v Vm, h: &Value) -> Result<&'v Connection, VmError> {
+fn db_of<'v>(vm: &'v Vm, h: &Value) -> Result<&'v Db, VmError> {
     vm.resources
         .get(int(h) as usize)
         .and_then(|r| r.as_ref())
         .and_then(|b| b.downcast_ref::<Db>())
-        .map(|d| &d.conn)
         .ok_or_else(|| vm.throw("DatabaseError", "the database connection is closed"))
 }
 
@@ -131,22 +389,58 @@ impl rusqlite::ToSql for Param<'_> {
     }
 }
 
+/// The rows of a query result as values, built the same way by every SQL
+/// client: the column names made once, a map per row, and the script's memory
+/// limit checked after each row (the next rows are not read once it is
+/// passed). What each client bounds before a row gets here differs with
+/// where the data is: SQLite's values are reserved before they are copied out
+/// of SQLite's memory; PostgreSQL's and MySQL's are bounded as they are read
+/// from the network (a byte budget and `max_allowed_packet`).
+pub(crate) struct ResultRows {
+    names: Vec<Rc<String>>,
+    rows: Vec<Value>,
+}
+
+impl ResultRows {
+    pub(crate) fn new(names: impl IntoIterator<Item = String>) -> ResultRows {
+        ResultRows { names: names.into_iter().map(Rc::new).collect(), rows: Vec::new() }
+    }
+
+    /// Adds a row (its values in the order of the columns); an error once the
+    /// memory limit is passed.
+    pub(crate) fn push(&mut self, vm: &Vm, values: impl IntoIterator<Item = Value>) -> Result<(), VmError> {
+        let mut m = IndexMap::with_capacity(self.names.len());
+        for (n, v) in self.names.iter().zip(values) {
+            m.insert(Key::Str(n.clone()), v);
+        }
+        self.rows.push(Value::map(m));
+        vm.check_memory()
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        Value::list(self.rows)
+    }
+}
+
 fn query(vm: &mut Vm, a: &[Value]) -> R {
     if !is_sqlite(vm, &a[0]) {
         return crate::netdb::query(vm, a);
     }
     let (text, params) = parts(&a[1]);
     let text = render_sql(text, Dialect::Sqlite);
-    let c = conn(vm, &a[0])?;
-    let mut stmt = c.prepare(&text).map_err(|e| db_error(vm, e))?;
-    let names: Vec<Rc<String>> = stmt.column_names().iter().map(|n| Rc::new(n.to_string())).collect();
+    let db = db_of(vm, &a[0])?;
+    // Kept prepared for the next run of the same text (`prepare_cached`).
+    let mut stmt = db.conn().prepare_cached(&text).map_err(|e| db.fail(vm, e))?;
     let bound: Vec<Param> = params.iter().map(Param).collect();
-    let mut rows = stmt.query(rusqlite::params_from_iter(bound.iter())).map_err(|e| db_error(vm, e))?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| db_error(vm, e))? {
-        let mut m = IndexMap::with_capacity(names.len());
-        for (i, n) in names.iter().enumerate() {
-            let v = match row.get_ref(i).map_err(|e| db_error(vm, e))? {
+    let mut rows = stmt.query(rusqlite::params_from_iter(bound.iter())).map_err(|e| db.fail(vm, e))?;
+    // Made once the first row is there: a kept statement is prepared again
+    // by its first step when the schema changed, and its columns with it.
+    let mut out: Option<ResultRows> = None;
+    while let Some(row) = rows.next().map_err(|e| db.fail(vm, e))? {
+        let out = out.get_or_insert_with(|| ResultRows::new(row.as_ref().column_names().iter().map(|n| n.to_string())));
+        let mut values = Vec::with_capacity(out.names.len());
+        for i in 0..out.names.len() {
+            let v = match row.get_ref(i).map_err(|e| db.fail(vm, e))? {
                 ValueRef::Null => Value::Null,
                 ValueRef::Integer(i) => Value::Int(i),
                 ValueRef::Real(f) => Value::Float(f),
@@ -161,12 +455,11 @@ fn query(vm: &mut Vm, a: &[Value]) -> R {
                     Value::str(String::from_utf8_lossy(b).into_owned())
                 }
             };
-            m.insert(Key::Str(n.clone()), v);
+            values.push(v);
         }
-        out.push(Value::map(m));
-        vm.check_memory()?;
+        out.push(vm, values)?;
     }
-    Ok(Value::list(out))
+    Ok(out.map_or_else(|| Value::list(Vec::new()), ResultRows::into_value))
 }
 
 fn execute(vm: &mut Vm, a: &[Value]) -> R {
@@ -175,71 +468,123 @@ fn execute(vm: &mut Vm, a: &[Value]) -> R {
     }
     let (text, params) = parts(&a[1]);
     let text = render_sql(text, Dialect::Sqlite);
-    let c = conn(vm, &a[0])?;
+    let db = db_of(vm, &a[0])?;
     let bound: Vec<Param> = params.iter().map(Param).collect();
-    let n = c.execute(&text, rusqlite::params_from_iter(bound.iter())).map_err(|e| db_error(vm, e))?;
+    let mut stmt = db.conn().prepare_cached(&text).map_err(|e| db.fail(vm, e))?;
+    let n = stmt.execute(rusqlite::params_from_iter(bound.iter())).map_err(|e| db.fail(vm, e))?;
     Ok(Value::Int(n as i64))
 }
 
 fn open(vm: &mut Vm, a: &[Value]) -> R {
     let rel = s(&a[0]).to_string();
-    let (c, dir) = if rel == ":memory:" {
-        (Connection::open_in_memory().map_err(|e| db_error(vm, e))?, None)
-    } else {
-        let (dir, name) = crate::sys::resolve_path(vm, &rel, true)?;
-        // SQLite opens the database and its journal files by name, so each must
-        // be missing or a plain file (no link, no second hard link) before and
-        // after opening. The directory itself cannot change meanwhile. Files
-        // SQLite opens later (a journal per transaction) are checked by `vfs`.
-        let check = |vm: &Vm| -> Result<(), VmError> {
-            for suffix in ["", "-journal", "-wal", "-shm"] {
-                let mut n = name.clone();
-                n.push(suffix);
-                dir.check_plain_or_missing(&n).map_err(|e| crate::sys::fs_error(vm, &rel, "", e))?;
-            }
-            Ok(())
-        };
-        check(vm)?;
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        if !vfs::register() {
-            return Err(vm.throw("DatabaseError", "SQLite has no file system support"));
+    if rel == ":memory:" {
+        return open_memory(vm);
+    }
+    let (dir, name) = crate::sys::resolve_path(vm, &rel, true)?;
+    let file_error = |vm: &Vm, e| crate::sys::fs_error(vm, &rel, "", e);
+    // A kept connection is used only for the very file the name holds now,
+    // checked as before an open (see "Connections to database files").
+    check_journals(&dir, &name).map_err(|e| file_error(vm, e))?;
+    let now = dir.plain_file_id(&name).map_err(|e| file_error(vm, e))?;
+    let key = dir.path().join(&name);
+    let (c, id) = match now.and_then(|id| take(&key, id).map(|c| (c, id))) {
+        Some(kept) => kept,
+        None => {
+            let (c, id) = open_in(&dir, &name).map_err(|e| match e {
+                OpenError::File(_, e) => file_error(vm, e),
+                OpenError::NoFileSystem => vm.throw("DatabaseError", NO_FILE_SYSTEM),
+                OpenError::Sqlite(e) => db_error(vm, e),
+            })?;
+            harden(&c).map_err(|e| db_error(vm, e))?;
+            (c, id)
         }
-        let c = Connection::open_with_flags_and_vfs(dir.path().join(&name), flags, vfs::NAME)
-            .map_err(|e| db_error(vm, e))?;
-        check(vm)?;
-        (c, Some(dir))
     };
+    let tainted = Arc::new(AtomicBool::new(false));
+    for_script(&c, vm, Some(tainted.clone())).map_err(|e| db_error(vm, e))?;
+    let lease = Lease { key, id, tainted };
+    let db = Db { conn: Some(c), _dir: Some(dir), depth: Cell::new(0), pages: 0, pooled: Some(lease) };
+    vm.resources.push(Some(Box::new(db)));
+    Ok(Value::Int(vm.resources.len() as i64 - 1))
+}
+
+/// `Database::open(":memory:")`: a database of the script's own, never kept.
+fn open_memory(vm: &mut Vm) -> R {
+    let c = Connection::open_in_memory().map_err(|e| db_error(vm, e))?;
     harden(&c).map_err(|e| db_error(vm, e))?;
     // The in-memory databases of a script share its memory limit (found by
     // the 1.0 audit: each one had all of it, and SQLite's memory is not the VM's).
-    let mut pages = 0;
-    if dir.is_none() {
-        let total = vm.memory_limit().unwrap_or(128 << 20) / 4096;
-        let used: usize = vm.resources.iter().flatten().filter_map(|r| r.downcast_ref::<Db>()).map(|d| d.pages).sum();
-        pages = total.saturating_sub(used);
-        if pages < 16 {
-            return Err(
-                vm.throw("DatabaseError", "the in-memory databases of this script already have its whole memory limit")
-            );
-        }
-        c.execute_batch(&format!("PRAGMA page_size = 4096; PRAGMA max_page_count = {pages}"))
-            .map_err(|e| db_error(vm, e))?;
+    let total = vm.memory_limit().unwrap_or(128 << 20) / 4096;
+    let used: usize = vm.resources.iter().flatten().filter_map(|r| r.downcast_ref::<Db>()).map(|d| d.pages).sum();
+    let pages = total.saturating_sub(used);
+    if pages < 16 {
+        return Err(
+            vm.throw("DatabaseError", "the in-memory databases of this script already have its whole memory limit")
+        );
     }
-    // Queries stop when the script's time limit is reached.
-    if let Some(deadline) = vm.deadline() {
-        c.progress_handler(10_000, Some(move || std::time::Instant::now() > deadline));
-    }
-    // SQLite runs one `LIKE` or `GLOB` as a single step, which the progress
-    // handler cannot stop (a long text and pattern take minutes): these do.
-    like_functions(&c, vm.deadline()).map_err(|e| db_error(vm, e))?;
-    // Last: the authorizer refuses the pragmas set above.
-    c.authorizer(Some(sqlite_authorizer));
-    vm.resources.push(Some(Box::new(Db { conn: c, _dir: dir, depth: std::cell::Cell::new(0), pages })));
+    c.execute_batch(&format!("PRAGMA page_size = 4096; PRAGMA max_page_count = {pages}"))
+        .map_err(|e| db_error(vm, e))?;
+    for_script(&c, vm, None).map_err(|e| db_error(vm, e))?;
+    vm.resources.push(Some(Box::new(Db { conn: Some(c), _dir: None, depth: Cell::new(0), pages, pooled: None })));
     Ok(Value::Int(vm.resources.len() as i64 - 1))
 }
+
+/// The journal files of the database `name` must be missing or plain files.
+fn check_journals(dir: &DirGuard, name: &std::ffi::OsStr) -> Result<(), crate::safefs::FsError> {
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut n = name.to_os_string();
+        n.push(suffix);
+        dir.check_plain_or_missing(&n)?;
+    }
+    Ok(())
+}
+
+const NO_FILE_SYSTEM: &str = "SQLite has no file system support";
+
+/// Why `open_in` failed.
+enum OpenError {
+    /// The database or one of its journals (the suffix) is not a plain file.
+    File(&'static str, crate::safefs::FsError),
+    NoFileSystem,
+    Sqlite(rusqlite::Error),
+}
+
+/// Opens the SQLite file `name` in `dir`, for a script (`open`) or a
+/// migration (`open_file`). SQLite opens the database and its journal files
+/// by name, so each must be missing or a plain file (no link, no second hard
+/// link) before and after opening. The directory itself cannot change
+/// meanwhile. Files SQLite opens later (a journal per transaction) are
+/// checked by `vfs`.
+fn open_in(dir: &DirGuard, name: &std::ffi::OsStr) -> Result<(Connection, FileId), OpenError> {
+    let check = || -> Result<(), OpenError> {
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            let mut n = name.to_os_string();
+            n.push(suffix);
+            dir.check_plain_or_missing(&n).map_err(|e| OpenError::File(suffix, e))?;
+        }
+        Ok(())
+    };
+    check()?;
+    let before = dir.plain_file_id(name).map_err(|e| OpenError::File("", e))?;
+    if !vfs::register() {
+        return Err(OpenError::NoFileSystem);
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let c = Connection::open_with_flags_and_vfs(dir.path().join(name), flags, vfs::NAME).map_err(OpenError::Sqlite)?;
+    check()?;
+    // The file SQLite opened is the one checked (the name was not replaced meanwhile).
+    let gone = || OpenError::File("", crate::safefs::FsError::Io(std::io::ErrorKind::NotFound.into()));
+    let id = dir.plain_file_id(name).map_err(|e| OpenError::File("", e))?.ok_or_else(gone)?;
+    if before.is_some_and(|b| b != id) {
+        return Err(OpenError::File("", crate::safefs::FsError::BadName));
+    }
+    Ok((c, id))
+}
+
+/// Whether the process-wide cap on SQLite's memory is set (see `harden`).
+static HEAP_LIMIT_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The settings of every SQLite connection, a script's or a migration's (the
 /// authorizer, `sqlite_authorizer`, is set after the caller's own pragmas).
@@ -254,10 +599,15 @@ pub(crate) fn harden(c: &Connection) -> rusqlite::Result<()> {
     // Single strings/blobs and statements are bounded (e.g. `zeroblob(1e9)`).
     c.set_limit(Limit::SQLITE_LIMIT_LENGTH, 32 * 1024 * 1024)?;
     c.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 1024 * 1024)?;
-    // A process-wide cap on SQLite's own memory, and per connection a small
-    // page cache. An in-memory database lives entirely in memory, so it is
-    // bounded by the script's memory limit.
-    c.execute_batch("PRAGMA hard_heap_limit = 536870912; PRAGMA cache_size = -2000")?;
+    // A process-wide cap on SQLite's own memory (set by the first connection;
+    // no connection can change it, see `sqlite_authorizer`), and per
+    // connection a small page cache. An in-memory database lives entirely in
+    // memory, so it is bounded by the script's memory limit.
+    if !HEAP_LIMIT_SET.load(std::sync::atomic::Ordering::Acquire) {
+        c.execute_batch("PRAGMA hard_heap_limit = 536870912")?;
+        HEAP_LIMIT_SET.store(true, std::sync::atomic::Ordering::Release);
+    }
+    c.execute_batch("PRAGMA cache_size = -2000")?;
     Ok(())
 }
 
@@ -271,26 +621,11 @@ pub(crate) fn open_file(
 ) -> Result<(Connection, crate::safefs::DirGuard), String> {
     let (dir, name) = crate::safefs::open_parent(base, rel)
         .map_err(|e| format!("{}: {}", rel.display(), crate::safefs::describe(&e)))?;
-    let check = || -> Result<(), String> {
-        for suffix in ["", "-journal", "-wal", "-shm"] {
-            let mut n = name.clone();
-            n.push(suffix);
-            dir.check_plain_or_missing(&n)
-                .map_err(|e| format!("{}{suffix}: {}", rel.display(), crate::safefs::describe(&e)))?;
-        }
-        Ok(())
-    };
-    check()?;
-    if !vfs::register() {
-        return Err("SQLite has no file system support".into());
-    }
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-        | OpenFlags::SQLITE_OPEN_CREATE
-        | OpenFlags::SQLITE_OPEN_NO_MUTEX
-        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    let c = Connection::open_with_flags_and_vfs(dir.path().join(&name), flags, vfs::NAME)
-        .map_err(|e| format!("{}: {e}", rel.display()))?;
-    check()?;
+    let (c, _) = open_in(&dir, &name).map_err(|e| match e {
+        OpenError::File(suffix, e) => format!("{}{suffix}: {}", rel.display(), crate::safefs::describe(&e)),
+        OpenError::NoFileSystem => NO_FILE_SYSTEM.to_string(),
+        OpenError::Sqlite(e) => format!("{}: {e}", rel.display()),
+    })?;
     harden(&c).map_err(|e| e.to_string())?;
     // Last: the authorizer refuses the pragmas set above.
     c.authorizer(Some(sqlite_authorizer));
@@ -602,7 +937,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             if !is_sqlite(vm, &a[0]) {
                 return crate::netdb::last_insert_id(vm, a);
             }
-            Ok(Value::Int(conn(vm, &a[0])?.last_insert_rowid()))
+            Ok(Value::Int(db_of(vm, &a[0])?.conn().last_insert_rowid()))
         },
         "__db_raw" => |vm, a| {
             // Only BEGIN / COMMIT / ROLLBACK, used by Database::transaction().
@@ -613,18 +948,13 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             if !is_sqlite(vm, &a[0]) {
                 return crate::netdb::raw(vm, a);
             }
-            let db = vm
-                .resources
-                .get(int(&a[0]) as usize)
-                .and_then(|r| r.as_ref())
-                .and_then(|b| b.downcast_ref::<Db>())
-                .ok_or_else(|| vm.throw("DatabaseError", "the database connection is closed"))?;
+            let db = db_of(vm, &a[0])?;
             let (sqls, depth) = transaction_sql(cmd, db.depth.get());
             if cmd == "ROLLBACK" {
                 db.depth.set(depth);
             }
             for sql in &sqls {
-                db.conn.execute_batch(sql).map_err(|e| db_error(vm, e))?;
+                db.conn().execute_batch(sql).map_err(|e| db.fail(vm, e))?;
             }
             db.depth.set(depth);
             Ok(Value::Null)

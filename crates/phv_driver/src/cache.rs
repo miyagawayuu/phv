@@ -24,8 +24,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::UNIX_EPOCH;
 
+/// A cache file. It is written from a borrowed program (`P` = `&Program`):
+/// the same bytes, without copying the program first.
 #[derive(Serialize, Deserialize)]
-struct Entry {
+struct Entry<P = Program> {
     stamp: String,
     /// Canonical paths of the entry script and the project root.
     entry: String,
@@ -36,7 +38,7 @@ struct Entry {
     marked_tests: Vec<(u32, Option<String>)>,
     #[serde(default)]
     test_hooks: Vec<(u32, bool)>,
-    program: Program,
+    program: P,
 }
 
 /// Cache files larger than this are not read.
@@ -161,7 +163,7 @@ fn load(root: &Path, entry: &Path, key: &[u8; 32], stamp: &str) -> Option<Compil
 }
 
 /// Best effort: a temporary file in `.phv-cache/`, then renamed into place.
-fn store(root: &Path, entry: &Path, key: &[u8; 32], e: &Entry) -> Option<()> {
+fn store(root: &Path, entry: &Path, key: &[u8; 32], e: &Entry<&Program>) -> Option<()> {
     let body = postcard::to_allocvec(e).ok()?;
     let dir_path = root.join(".phv-cache");
     match std::fs::symlink_metadata(&dir_path) {
@@ -203,7 +205,7 @@ pub fn compile_cached(root: &Path, entry: &Path) -> Result<Compiled, CompileErro
             entry_file: c.entry_file,
             marked_tests: c.marked_tests.clone(),
             test_hooks: c.test_hooks.clone(),
-            program: clone_program(&c.program),
+            program: c.program.as_ref(),
         };
         store(root, entry, key, &e);
     }

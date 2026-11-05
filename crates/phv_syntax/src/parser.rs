@@ -187,12 +187,14 @@ impl Parser {
         }
     }
 
-    fn advance(&mut self) -> Token {
-        let t = self.toks[self.pos.min(self.toks.len() - 1)].clone();
+    /// Moves past the current token, giving its span (the token is not
+    /// copied: callers that need its text read it with `peek` first).
+    fn bump(&mut self) -> Span {
+        let span = self.toks[self.pos.min(self.toks.len() - 1)].span;
         if self.pos < self.toks.len() - 1 {
             self.pos += 1;
         }
-        t
+        span
     }
 
     fn at(&self, tok: &Tok) -> bool {
@@ -201,7 +203,7 @@ impl Parser {
 
     fn eat(&mut self, tok: &Tok) -> bool {
         if self.at(tok) {
-            self.advance();
+            self.bump();
             true
         } else {
             false
@@ -218,7 +220,7 @@ impl Parser {
 
     fn expect(&mut self, tok: Tok) -> PResult<Span> {
         if self.at(&tok) {
-            Ok(self.advance().span)
+            Ok(self.bump())
         } else {
             let found = self.peek().describe();
             Err(self.error_here(format!("expected {}, found {found}", tok.describe())))
@@ -228,7 +230,7 @@ impl Parser {
     fn expect_ident(&mut self, what: &str) -> PResult<(String, Span)> {
         match self.peek().clone() {
             Tok::Ident(name) => {
-                let span = self.advance().span;
+                let span = self.bump();
                 Ok((name, span))
             }
             other => Err(self.error_here(format!("expected {what}, found {}", other.describe()))),
@@ -238,7 +240,7 @@ impl Parser {
     fn expect_var(&mut self) -> PResult<(String, Span)> {
         match self.peek().clone() {
             Tok::Var(name) => {
-                let span = self.advance().span;
+                let span = self.bump();
                 Ok((name, span))
             }
             other => Err(self.error_here(format!("expected a variable, found {}", other.describe()))),
@@ -249,7 +251,7 @@ impl Parser {
     fn semi(&mut self) -> PResult<()> {
         match self.peek() {
             Tok::Semi => {
-                self.advance();
+                self.bump();
                 Ok(())
             }
             Tok::CloseTag | Tok::Eof => Ok(()),
@@ -266,13 +268,13 @@ impl Parser {
     /// Skips ahead to a likely statement boundary after a syntax error.
     fn recover(&mut self, start: usize) {
         if self.pos == start {
-            self.advance();
+            self.bump();
         }
         loop {
             match self.peek() {
                 Tok::Eof | Tok::RBrace | Tok::CloseTag | Tok::InlineHtml(_) => return,
                 Tok::Semi => {
-                    self.advance();
+                    self.bump();
                     return;
                 }
                 Tok::Function
@@ -290,7 +292,7 @@ impl Parser {
                 | Tok::Export
                 | Tok::Hash => return,
                 _ => {
-                    self.advance();
+                    self.bump();
                 }
             }
         }
@@ -375,12 +377,12 @@ impl Parser {
                 break;
             }
             if *tok == Tok::CloseTag {
-                self.advance();
+                self.bump();
                 continue;
             }
             if ends.is_empty() && *tok == Tok::RBrace {
                 let _ = self.error_here("unexpected `}`");
-                self.advance();
+                self.bump();
                 continue;
             }
             let start = self.pos;
@@ -482,7 +484,7 @@ impl Parser {
         let start = self.span();
         let kind = match self.peek().clone() {
             Tok::InlineHtml(text) => {
-                self.advance();
+                self.bump();
                 let scripts = self.html.feed(&text);
                 for (at, what) in self.html.take_inline_code() {
                     let pos = start.start + at as u32;
@@ -497,7 +499,7 @@ impl Parser {
                 StmtKind::InlineHtml(text, scripts)
             }
             Tok::EchoOpen => {
-                self.advance();
+                self.bump();
                 let ctx = self.html.context();
                 self.html.inserted();
                 let exprs = self.expr_list()?;
@@ -508,7 +510,7 @@ impl Parser {
                 StmtKind::HtmlEcho(exprs, ctx)
             }
             Tok::Echo => {
-                self.advance();
+                self.bump();
                 // `echo` between pieces of HTML lands in the same context as `<?= ?>`.
                 let ctx = self.html.context();
                 let exprs = self.expr_list()?;
@@ -522,7 +524,7 @@ impl Parser {
             }
             Tok::If => return self.if_stmt(),
             Tok::While => {
-                self.advance();
+                self.bump();
                 let cond = self.paren_expr()?;
                 let body = self.exit_target(Exit::Loop, |p| {
                     if p.eat(&Tok::Colon) {
@@ -537,7 +539,7 @@ impl Parser {
                 StmtKind::While { cond, body }
             }
             Tok::Do => {
-                self.advance();
+                self.bump();
                 let body = self.exit_target(Exit::Loop, |p| p.stmt_or_block())?;
                 self.expect(Tok::While)?;
                 let cond = self.paren_expr()?;
@@ -548,7 +550,7 @@ impl Parser {
             Tok::Foreach => return self.foreach_stmt(),
             Tok::Try => return self.try_stmt(),
             Tok::Return => {
-                let span = self.advance().span;
+                let span = self.bump();
                 self.check_exit(0, false, span);
                 let value =
                     if matches!(self.peek(), Tok::Semi | Tok::CloseTag | Tok::Eof) { None } else { Some(self.expr()?) };
@@ -557,10 +559,10 @@ impl Parser {
             }
             Tok::Break | Tok::Continue => {
                 let is_break = self.at(&Tok::Break);
-                let span = self.advance().span;
+                let span = self.bump();
                 let mut level = 1;
                 if let Tok::Int(n) = *self.peek() {
-                    self.advance();
+                    self.bump();
                     level = n.max(1) as u32;
                 }
                 self.check_exit(level, false, span);
@@ -572,7 +574,7 @@ impl Parser {
                 }
             }
             Tok::Throw => {
-                let span = self.advance().span;
+                let span = self.bump();
                 self.check_exit(0, true, span);
                 let e = self.expr()?;
                 self.semi()?;
@@ -580,7 +582,7 @@ impl Parser {
             }
             Tok::LBrace => StmtKind::Block(self.block()?),
             Tok::Semi => {
-                self.advance();
+                self.bump();
                 StmtKind::Block(Vec::new())
             }
             Tok::Hash => {
@@ -609,7 +611,7 @@ impl Parser {
                 StmtKind::TypeAlias(self.type_alias(false)?)
             }
             Tok::Export => {
-                self.advance();
+                self.bump();
                 match self.peek() {
                     Tok::Function => StmtKind::Function(self.function_decl(true, Visibility::Public, false)?),
                     Tok::Class | Tok::Interface | Tok::Enum | Tok::Abstract | Tok::Final => {
@@ -624,7 +626,7 @@ impl Parser {
             }
             Tok::Import => StmtKind::Import(self.import_decl()?),
             Tok::Ident(ref name) if name == "params" && self.is_template && *self.peek_at(1) == Tok::LParen => {
-                self.advance();
+                self.bump();
                 let params = self.params()?;
                 self.semi()?;
                 StmtKind::Params(params)
@@ -645,19 +647,19 @@ impl Parser {
         }
         if matches!(self.peek(), Tok::PlusPlus | Tok::MinusMinus) {
             let inc = self.at(&Tok::PlusPlus);
-            self.advance();
+            self.bump();
             let target = self.expr()?;
             return Ok(StmtKind::IncDec { target, inc });
         }
         let e = self.expr()?;
         if let Some(op) = assign_op(self.peek()) {
-            self.advance();
+            self.bump();
             let value = self.expr()?;
             return Ok(StmtKind::Assign { target: e, op, value });
         }
         if matches!(self.peek(), Tok::PlusPlus | Tok::MinusMinus) {
             let inc = self.at(&Tok::PlusPlus);
-            self.advance();
+            self.bump();
             return Ok(StmtKind::IncDec { target: e, inc });
         }
         Ok(StmtKind::Expr(e))
@@ -677,8 +679,8 @@ impl Parser {
         let saved_splits = self.splits.len();
         if let Ok(ty) = self.ty() {
             if let (Tok::Var(name), Tok::Eq) = (self.peek().clone(), self.peek_at(1).clone()) {
-                let name_span = self.advance().span;
-                self.advance();
+                let name_span = self.bump();
+                self.bump();
                 let value = self.expr()?;
                 return Ok(Some(StmtKind::TypedDecl { ty, name, name_span, value }));
             }
@@ -699,7 +701,7 @@ impl Parser {
     }
 
     fn if_stmt(&mut self) -> PResult<Stmt> {
-        let start = self.advance().span;
+        let start = self.bump();
         let cond = self.paren_expr()?;
         let mut elifs = Vec::new();
         let mut els = None;
@@ -729,8 +731,8 @@ impl Parser {
                     let c = self.paren_expr()?;
                     elifs.push((c, self.stmt_or_block()?));
                 } else if self.at(&Tok::Else) && *self.peek_at(1) == Tok::If {
-                    self.advance();
-                    self.advance();
+                    self.bump();
+                    self.bump();
                     let c = self.paren_expr()?;
                     elifs.push((c, self.stmt_or_block()?));
                 } else if self.eat(&Tok::Else) {
@@ -746,7 +748,7 @@ impl Parser {
     }
 
     fn for_stmt(&mut self) -> PResult<Stmt> {
-        let start = self.advance().span;
+        let start = self.bump();
         self.expect(Tok::LParen)?;
         let mut init = Vec::new();
         while !self.at(&Tok::Semi) {
@@ -785,7 +787,7 @@ impl Parser {
     }
 
     fn foreach_stmt(&mut self) -> PResult<Stmt> {
-        let start = self.advance().span;
+        let start = self.bump();
         self.expect(Tok::LParen)?;
         let subject = self.expr()?;
         self.expect(Tok::As)?;
@@ -837,18 +839,18 @@ impl Parser {
     }
 
     fn try_stmt(&mut self) -> PResult<Stmt> {
-        let start = self.advance().span;
+        let start = self.bump();
         let body = self.exit_target(Exit::Try, |p| p.block())?;
         let mut catches = Vec::new();
         while self.at(&Tok::Catch) {
-            let cstart = self.advance().span;
+            let cstart = self.bump();
             self.expect(Tok::LParen)?;
             let mut classes = vec![self.expect_ident("an exception class")?];
             while self.eat(&Tok::Pipe) {
                 classes.push(self.expect_ident("an exception class")?);
             }
             let var = match self.peek().clone() {
-                Tok::Var(name) => Some((name, self.advance().span)),
+                Tok::Var(name) => Some((name, self.bump())),
                 _ => None,
             };
             self.expect(Tok::RParen)?;
@@ -878,7 +880,7 @@ impl Parser {
                     Tok::Readonly => readonly = true,
                     _ => break,
                 }
-                self.advance();
+                self.bump();
             }
             let promote =
                 if vis.is_some() || readonly { Some((vis.unwrap_or(Visibility::Public), readonly)) } else { None };
@@ -942,7 +944,7 @@ impl Parser {
             } else {
                 is_final = true;
             }
-            self.advance();
+            self.bump();
         }
         if is_final && kind == ClassKind::Abstract {
             self.diags.push(
@@ -966,7 +968,7 @@ impl Parser {
                 return Err(self.error_here(format!("expected `class`, `interface` or `enum`, found {found}")));
             }
         }
-        self.advance();
+        self.bump();
         let (name, name_span) = self.expect_ident("a type name")?;
         let (type_params, type_bounds) = self.bounded_type_params()?;
         let mut backing = None;
@@ -1020,7 +1022,7 @@ impl Parser {
             }
             if self.at(&Tok::Case) {
                 let r: PResult<()> = (|| {
-                    self.advance();
+                    self.bump();
                     let (cname, _) = self.expect_ident("a case name")?;
                     let value = if self.eat(&Tok::Eq) { Some(self.expr()?) } else { None };
                     self.expect(Tok::Semi)?;
@@ -1048,7 +1050,7 @@ impl Parser {
                     Tok::Final => is_final = true,
                     _ => break,
                 }
-                self.advance();
+                self.bump();
             }
             if is_final && !self.at(&Tok::Function) {
                 self.diags.push(Diagnostic::error("only classes and methods can be `final`", mstart));
@@ -1143,7 +1145,7 @@ impl Parser {
 
     fn type_alias(&mut self, exported: bool) -> PResult<TypeAliasDecl> {
         let start = self.span();
-        self.advance();
+        self.bump();
         let (name, name_span) = self.expect_ident("a type name")?;
         let type_params = self.type_params()?;
         self.expect(Tok::Eq)?;
@@ -1226,15 +1228,15 @@ impl Parser {
         let start = self.span();
         let kind = match self.peek().clone() {
             Tok::Question => {
-                self.advance();
+                self.bump();
                 TypeExprKind::Nullable(Box::new(self.ty_atom()?))
             }
             Tok::Null => {
-                self.advance();
+                self.bump();
                 TypeExprKind::Named("null".into(), Vec::new())
             }
             Tok::Fn => {
-                self.advance();
+                self.bump();
                 self.expect(Tok::LParen)?;
                 let mut params = Vec::new();
                 while !self.at(&Tok::RParen) {
@@ -1249,13 +1251,13 @@ impl Parser {
                 TypeExprKind::Func(params, Box::new(ret))
             }
             Tok::LParen => {
-                self.advance();
+                self.bump();
                 let t = self.ty()?;
                 self.expect(Tok::RParen)?;
                 return Ok(t);
             }
             Tok::Ident(name) => {
-                self.advance();
+                self.bump();
                 let mut args = Vec::new();
                 if self.eat(&Tok::Lt) {
                     loop {
@@ -1278,7 +1280,7 @@ impl Parser {
     fn attributes(&mut self) -> PResult<Vec<Attribute>> {
         let mut attrs = Vec::new();
         while self.at(&Tok::Hash) {
-            self.advance();
+            self.bump();
             self.expect(Tok::LBracket)?;
             loop {
                 let start = self.span();
@@ -1386,7 +1388,7 @@ impl Parser {
             chain += 1;
             let tok = self.peek().clone();
             if tok == Tok::Question && min_bp <= 1 {
-                self.advance();
+                self.bump();
                 let then = self.expr_bp(0)?;
                 self.expect(Tok::Colon)?;
                 let els = self.expr_bp(1)?;
@@ -1395,14 +1397,14 @@ impl Parser {
                 continue;
             }
             if matches!(tok, Tok::Is | Tok::Instanceof) && min_bp <= BP_IS {
-                self.advance();
+                self.bump();
                 let ty = self.ty()?;
                 let span = lhs.span.to(ty.span);
                 lhs = Expr { kind: ExprKind::Is(Box::new(lhs), ty), span };
                 continue;
             }
             if matches!(tok, Tok::DotDot | Tok::DotDotEq) && min_bp <= 18 {
-                self.advance();
+                self.bump();
                 let rhs = self.expr_bp(19)?;
                 let span = lhs.span.to(rhs.span);
                 let kind = ExprKind::Range { from: Box::new(lhs), to: Box::new(rhs), inclusive: tok == Tok::DotDotEq };
@@ -1422,7 +1424,7 @@ impl Parser {
                         .note("`==` and `!=` are always strict: values of different types are never equal"),
                 );
             }
-            self.advance();
+            self.bump();
             let rhs = self.expr_bp(rbp)?;
             let span = lhs.span.to(rhs.span);
             lhs = Expr { kind: ExprKind::Binary(op, Box::new(lhs), Box::new(rhs)), span };
@@ -1443,15 +1445,15 @@ impl Parser {
         let un = |op, e: Expr| ExprKind::Unary(op, Box::new(e));
         let kind = match self.peek().clone() {
             Tok::Bang => {
-                self.advance();
+                self.bump();
                 un(UnOp::Not, self.expr_bp(BP_UNARY)?)
             }
             Tok::Tilde => {
-                self.advance();
+                self.bump();
                 un(UnOp::BitNot, self.expr_bp(BP_UNARY)?)
             }
             Tok::Minus => {
-                self.advance();
+                self.bump();
                 let operand = self.expr_bp(BP_UNARY)?;
                 match operand.kind {
                     ExprKind::Int(v) => ExprKind::Int(v.wrapping_neg()),
@@ -1460,7 +1462,7 @@ impl Parser {
                 }
             }
             Tok::Plus => {
-                self.advance();
+                self.bump();
                 return self.expr_bp(BP_UNARY);
             }
             Tok::LParen => {
@@ -1476,16 +1478,16 @@ impl Parser {
                 };
                 match cast {
                     Some(c) => {
-                        self.advance();
-                        self.advance();
-                        self.advance();
+                        self.bump();
+                        self.bump();
+                        self.bump();
                         ExprKind::Cast(c, Box::new(self.expr_bp(BP_UNARY)?))
                     }
                     None => return self.postfix(),
                 }
             }
             Tok::Throw => {
-                self.advance();
+                self.bump();
                 ExprKind::Throw(Box::new(self.expr_bp(0)?))
             }
             _ => return self.postfix(),
@@ -1530,7 +1532,7 @@ impl Parser {
                     e = Expr { kind: ExprKind::Call { callee: Box::new(e), args }, span };
                 }
                 Tok::LBracket => {
-                    self.advance();
+                    self.bump();
                     let index = if self.at(&Tok::RBracket) { None } else { Some(Box::new(self.expr()?)) };
                     self.expect(Tok::RBracket)?;
                     let span = e.span.to(self.prev_span());
@@ -1538,7 +1540,7 @@ impl Parser {
                 }
                 Tok::Arrow | Tok::NullsafeArrow => {
                     let nullsafe = self.at(&Tok::NullsafeArrow);
-                    self.advance();
+                    self.bump();
                     let (name, name_span) = self.member_name()?;
                     if self.at_func_ref() {
                         let span = e.span.to(name_span);
@@ -1563,7 +1565,7 @@ impl Parser {
                     };
                     let class = class.clone();
                     let class_span = e.span;
-                    self.advance();
+                    self.bump();
                     let (name, name_span) = self.member_name()?;
                     if !self.at(&Tok::LParen) {
                         let span = e.span.to(self.prev_span());
@@ -1590,7 +1592,7 @@ impl Parser {
     fn member_name(&mut self) -> PResult<(String, Span)> {
         let t = self.peek().clone();
         match t {
-            Tok::Ident(name) => Ok((name, self.advance().span)),
+            Tok::Ident(name) => Ok((name, self.bump())),
             Tok::Default
             | Tok::Match
             | Tok::Is
@@ -1613,7 +1615,7 @@ impl Parser {
             | Tok::Abstract
             | Tok::Final
             | Tok::Implements => {
-                let span = self.advance().span;
+                let span = self.bump();
                 let text = t.describe().trim_matches('`').to_string();
                 Ok((text, span))
             }
@@ -1627,8 +1629,8 @@ impl Parser {
         while !self.at(&Tok::RParen) {
             let name = match (self.peek().clone(), self.peek_at(1)) {
                 (Tok::Ident(n), Tok::Colon) => {
-                    let span = self.advance().span;
-                    self.advance();
+                    let span = self.bump();
+                    self.bump();
                     Some((n, span))
                 }
                 _ => None,
@@ -1648,7 +1650,7 @@ impl Parser {
         if !self.at(&Tok::Ellipsis) {
             return self.expr();
         }
-        let start = self.advance().span;
+        let start = self.bump();
         let inner = self.expr()?;
         let span = start.to(inner.span);
         Ok(Expr { kind: ExprKind::Spread(Box::new(inner)), span })
@@ -1661,7 +1663,7 @@ impl Parser {
 
     fn func_ref(&mut self, call: Expr) -> Expr {
         for _ in 0..3 {
-            self.advance();
+            self.bump();
         }
         let span = call.span.to(self.prev_span());
         Expr { kind: ExprKind::FuncRef(Box::new(call)), span }
@@ -1671,23 +1673,23 @@ impl Parser {
         let start = self.span();
         let kind = match self.peek().clone() {
             Tok::Var(name) => {
-                self.advance();
+                self.bump();
                 ExprKind::Var(name)
             }
             Tok::Int(v) => {
-                self.advance();
+                self.bump();
                 ExprKind::Int(v)
             }
             Tok::Float(v) => {
-                self.advance();
+                self.bump();
                 ExprKind::Float(v)
             }
             Tok::Str(s) => {
-                self.advance();
+                self.bump();
                 ExprKind::Str(s)
             }
             Tok::Interp(parts) => {
-                self.advance();
+                self.bump();
                 let mut out = Vec::new();
                 for part in parts {
                     match part {
@@ -1701,23 +1703,23 @@ impl Parser {
                 ExprKind::Interp(out)
             }
             Tok::True => {
-                self.advance();
+                self.bump();
                 ExprKind::Bool(true)
             }
             Tok::False => {
-                self.advance();
+                self.bump();
                 ExprKind::Bool(false)
             }
             Tok::Null => {
-                self.advance();
+                self.bump();
                 ExprKind::Null
             }
             Tok::Ident(name) => {
-                self.advance();
+                self.bump();
                 ExprKind::Name(name)
             }
             Tok::LParen => {
-                self.advance();
+                self.bump();
                 let e = self.expr()?;
                 self.expect(Tok::RParen)?;
                 let span = start.to(self.prev_span());
@@ -1730,7 +1732,7 @@ impl Parser {
                 return Ok(Expr { kind, span });
             }
             Tok::Sql(parts) => {
-                self.advance();
+                self.bump();
                 let mut out = Vec::new();
                 for part in parts {
                     match part {
@@ -1745,14 +1747,14 @@ impl Parser {
             }
             Tok::LBracket => self.array_literal()?,
             Tok::New => {
-                self.advance();
+                self.bump();
                 let (class, class_span) = self.expect_ident("a class name")?;
                 let type_args = self.type_args()?;
                 let args = if self.at(&Tok::LParen) { self.args()? } else { Vec::new() };
                 ExprKind::New { class, class_span, type_args, args }
             }
             Tok::Fn => {
-                self.advance();
+                self.bump();
                 let params = self.params()?;
                 let ret = if self.eat(&Tok::Colon) { Some(self.ty_atom()?) } else { None };
                 self.expect(Tok::FatArrow)?;
@@ -1766,7 +1768,7 @@ impl Parser {
                 }))
             }
             Tok::Function => {
-                self.advance();
+                self.bump();
                 let params = self.params()?;
                 let mut uses = Vec::new();
                 if self.eat(&Tok::Use) {

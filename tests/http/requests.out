@@ -2,7 +2,7 @@
 repeated header: a, b
 method: "GET"
 target: "/v1/echo?city=T%C5%8Dky%C5%8D%20%26%20%C5%8Csaka&n=3"
-headers: ["accept-encoding: identity","authorization: Bearer test-key","connection: close","host: HOST","user-agent: phv/VERSION","x-site: phv-test"]
+headers: ["accept-encoding: identity","authorization: Bearer test-key","host: HOST","user-agent: phv/VERSION","x-site: phv-test"]
 request: ["POST","/v1/echo","{\"name\":\"Ann\",\"tags\":[\"a\",\"b\"]}"]
   headers: ["content-type: application/json","x-site: phv-test"]
 request: ["POST","/v1/echo","q=a+b&x=1%262"]

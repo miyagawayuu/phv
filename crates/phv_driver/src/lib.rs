@@ -112,8 +112,42 @@ pub struct Dep {
     len: u64,
     /// SHA-256 of the content that was compiled; None if the file was missing.
     hash: Option<[u8; 32]>,
-    /// When the record was made (seconds since the epoch).
-    recorded: u64,
+    /// When the content was last known to be the recorded one (seconds since
+    /// the epoch): when it was read, then whenever a check hashes it again.
+    recorded: Recorded,
+}
+
+/// `Dep::recorded`, moved forward by checks that hash the file (a check of a
+/// shared, compiled program).
+#[derive(Debug, Default)]
+struct Recorded(std::sync::atomic::AtomicU64);
+
+impl Recorded {
+    fn get(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Clone for Recorded {
+    fn clone(&self) -> Recorded {
+        Recorded(self.get().into())
+    }
+}
+
+impl serde::Serialize for Recorded {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(self.get())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Recorded {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Recorded, D::Error> {
+        u64::deserialize(d).map(|v| Recorded(v.into()))
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn stat(p: &Path) -> Option<(Option<(u64, u32)>, u64)> {
@@ -131,8 +165,7 @@ impl Dep {
     /// Records `path` with the content that was actually read (`None`: missing).
     fn new(path: &Path, content: Option<&[u8]>) -> Dep {
         let (mtime, len) = stat(path).unwrap_or((None, 0));
-        let recorded = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        Dep { path: path.to_path_buf(), mtime, len, hash: content.map(sha256), recorded }
+        Dep { path: path.to_path_buf(), mtime, len, hash: content.map(sha256), recorded: Recorded(now_secs().into()) }
     }
 
     /// Whether the file still has the recorded content. A different time or size
@@ -140,16 +173,25 @@ impl Dep {
     /// close to when it was read (the "racy" case: it may have changed again
     /// within the clock's resolution); otherwise, or when `thorough`, the
     /// content is hashed and compared.
+    ///
+    /// A racy file whose content is found unchanged when its time is no longer
+    /// recent is recorded as known then: a later change would give it another
+    /// time, so it is not hashed again at every check.
     pub fn is_fresh(&self, thorough: bool) -> bool {
         let Some((mtime, len)) = stat(&self.path) else { return self.hash.is_none() };
         if self.hash.is_none() || mtime != self.mtime || len != self.len {
             return false;
         }
-        let racy = mtime.is_none_or(|(s, _)| s + 2 >= self.recorded);
+        let racy = mtime.is_none_or(|(s, _)| s + 2 >= self.recorded.get());
         if !thorough && !racy {
             return true;
         }
-        std::fs::read(&self.path).is_ok_and(|bytes| Some(sha256(&bytes)) == self.hash)
+        let checked = now_secs();
+        let same = std::fs::read(&self.path).is_ok_and(|bytes| Some(sha256(&bytes)) == self.hash);
+        if same && stat(&self.path) == Some((mtime, len)) {
+            self.recorded.0.fetch_max(checked, std::sync::atomic::Ordering::Relaxed);
+        }
+        same
     }
 }
 
@@ -314,6 +356,39 @@ fn safe_relative(p: &str) -> bool {
     !p.is_empty() && path.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
+/// A parsed module and the diagnostics of parsing it.
+type Parsed = (Arc<Module>, Arc<Vec<Diagnostic>>);
+
+/// Modules parsed in this process, by file id, kind and content, and the
+/// bytes of their text: a module loaded again with the same text and id (std
+/// and unchanged files, in the language server, `phv test` and a server
+/// compiling its pages) is not parsed again. Spans hold the file id, so it is
+/// part of the key.
+#[allow(clippy::type_complexity)]
+static PARSED: std::sync::LazyLock<std::sync::Mutex<(HashMap<(u32, bool, [u8; 32]), Parsed>, usize)>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The most source text whose parsed modules are kept (all forgotten at once
+/// when it would be passed).
+const PARSED_KEEP: usize = 16 << 20;
+
+fn parsed(text: &str, file: u32, template: bool) -> Parsed {
+    let key = (file, template, sha256(text.as_bytes()));
+    if let Some(p) = PARSED.lock().unwrap_or_else(|e| e.into_inner()).0.get(&key) {
+        return p.clone();
+    }
+    let (module, diags) = parse_module(text, file, template);
+    let p: Parsed = (Arc::new(module), Arc::new(diags));
+    let mut cache = PARSED.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.1 + text.len() > PARSED_KEEP {
+        *cache = Default::default();
+    }
+    if cache.0.insert(key, p.clone()).is_none() {
+        cache.1 += text.len();
+    }
+    p
+}
+
 struct Loader {
     root: PathBuf,
     /// Canonical directories sources may be loaded from: the project and packages.
@@ -331,7 +406,7 @@ struct Loader {
     /// Unsaved editor buffers (for the language server), by canonical path.
     overlay: HashMap<PathBuf, String>,
     sources: SourceMap,
-    modules: Vec<(Module, ModuleKind, String)>,
+    modules: Vec<(Arc<Module>, ModuleKind, String)>,
     diags: Vec<Diagnostic>,
     imports: HashMap<String, usize>,
     templates: HashMap<String, usize>,
@@ -345,8 +420,8 @@ impl Loader {
             self.deps.push(Dep::new(p, Some(text.as_bytes())));
         }
         let file = self.sources.add(name.clone(), path.clone(), text);
-        let (module, mut diags) = parse_module(&self.sources.get(file).text, file, kind == ModuleKind::Template);
-        self.diags.append(&mut diags);
+        let (module, diags) = parsed(&self.sources.get(file).text, file, kind == ModuleKind::Template);
+        self.diags.extend(diags.iter().cloned());
         self.modules.push((module, kind, name));
         let idx = self.modules.len() - 1;
         let owner = path.as_ref().and_then(|p| {
@@ -992,6 +1067,27 @@ fn call_caught(vm: &mut Vm, func: u32) -> Option<RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file saved just before it was read is hashed at each check ("racy"),
+    /// until a check finds it unchanged once its time is no longer recent.
+    #[test]
+    fn racy_files_are_hashed_until_they_settle() {
+        let tmp = std::env::temp_dir().join(format!("phv-racy-{}.phv", std::process::id()));
+        std::fs::write(&tmp, "echo 1;").unwrap();
+        let old = SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&tmp).unwrap().set_modified(old).unwrap();
+        let dep = Dep::new(&tmp, Some(b"echo 1;"));
+        // As if it had been read in the second it was saved.
+        let mtime = dep.mtime.unwrap().0;
+        dep.recorded.0.store(mtime, std::sync::atomic::Ordering::Relaxed);
+        assert!(dep.is_fresh(false));
+        assert!(dep.recorded.get() > mtime + 2, "the check records that the content was known later");
+        // A change of the same size and time is still seen while it is racy.
+        let racy = Dep::new(&tmp, Some(b"echo 2;"));
+        racy.recorded.0.store(mtime, std::sync::atomic::Ordering::Relaxed);
+        assert!(!racy.is_fresh(false));
+        let _ = std::fs::remove_file(&tmp);
+    }
 
     #[test]
     fn find_root_from_relative_paths() {

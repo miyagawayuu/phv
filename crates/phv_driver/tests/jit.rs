@@ -98,6 +98,61 @@ echo spin("x", 1.5);
     assert_eq!(out, "start\nFatal error: maximum execution time of 0.2 seconds exceeded");
 }
 
+/// Loops test their condition at the end, jumping back while it holds: a loop
+/// whose condition never fails stops at the time limit, natively and in the
+/// interpreter, whatever the form of its test.
+#[test]
+fn loops_tested_at_their_end_stop_at_the_time_limit() {
+    let limits = Limits { max_time: Some(Duration::from_millis(200)), ..Limits::default() };
+    for (name, cond) in
+        [("lt", "$i < 10"), ("imm", "$i <= $n"), ("eq", "$i == 0"), ("bool", "!$done"), ("or", "$i < 0 || $n > 0")]
+    {
+        let src = format!(
+            "<?phv
+function spin(int $n): int {{
+    $i = 0;
+    $done = false;
+    while ({cond}) {{
+        $i = $i * 1;
+        $done = $i > 5;
+    }}
+    return $i;
+}}
+echo \"start\n\";
+echo spin(5);
+"
+        );
+        let out = run_both(name, &src, limits, &["spin"]);
+        assert_eq!(
+            out,
+            "start
+Fatal error: maximum execution time of 0.2 seconds exceeded",
+            "{name}"
+        );
+    }
+    // A `for` over a range, and one that ends: the same results.
+    let src = "<?phv
+function sum(int $n): int {
+    $t = 0;
+    for ($i = 0; $i < $n; $i++) {
+        $t = $t + $i;
+    }
+    foreach (1..$n as $j) {
+        $t = $t + $j;
+    }
+    for ($k = 0; $k <= 3; $k++) {
+        if ($k == 2) {
+            continue;
+        }
+        $t = $t + 100;
+    }
+    return $t;
+}
+echo sum(0), \" \", sum(10);
+";
+    assert_eq!(run_both("sum", src, Limits::default(), &["sum"]), "300 390");
+}
+
 /// Comparing or joining long strings takes long for one instruction: the
 /// time limit is checked soon after, not thousands of instructions later.
 #[test]
@@ -133,6 +188,48 @@ echo same($a, $b, 1000000), join($a, 1000000);
         // Two runs (with and without the JIT), each stopping near the limit.
         assert!(start.elapsed() < Duration::from_secs(4), "{f} took {:?}", start.elapsed());
     }
+}
+
+/// `.=` on an element of a string list or map, and `==` / `!=` in conditions
+/// (one instruction that compares and branches) are compiled natively.
+#[test]
+fn element_appends_and_equality_branches_are_compiled() {
+    let src = r#"<?phv
+function tally(list<string> $words): string {
+    map<string, string> $seen = [];
+    list<string> $marks = ["", ""];
+    foreach ($words as $w) {
+        if ($w == "skip") {
+            continue;
+        }
+        if (!$seen->has($w)) {
+            $seen[$w] = "";
+        }
+        $seen[$w] .= "*";
+        $marks[$w == "a" ? 0 : 1] .= $w;
+    }
+    $out = "";
+    foreach ($seen as $k => $v) {
+        $out .= $k . $v . " ";
+    }
+    return $out . $marks[0] . "|" . $marks[1];
+}
+function count_eq(?int $x, int $n): int {
+    $c = 0;
+    for ($i = 0; $i < $n; $i++) {
+        if ($x != null && $x == $i % 3) {
+            $c++;
+        }
+        if ($i % 2 != 0) {
+            $c += 10;
+        }
+    }
+    return $c;
+}
+echo tally(["a", "b", "skip", "a", "c"]), "\n", count_eq(1, 9), " ", count_eq(null, 4);
+"#;
+    let out = run_both("element_appends", src, Limits::default(), &["tally", "count_eq"]);
+    assert_eq!(out, "a** b* c* aa|bc\n43 20");
 }
 
 #[test]

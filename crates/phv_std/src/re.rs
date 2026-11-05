@@ -13,14 +13,15 @@
 //! - Patterns are at most 64 KB, 2 MB once compiled, with at most 1000 groups
 //!   and 16 MB for the table a search for groups uses (states × groups).
 //!
-//! Compiled patterns are kept per thread, up to 64 of them and 32 MB counted
-//! generously, so a `Regex` used in a loop or on every request is compiled once.
+//! Compiled patterns are kept for the whole process, up to 64 of them and
+//! 32 MB counted generously (the least recently used go first), so a `Regex`
+//! used in a loop or on every request is compiled once.
 
 use super::s;
 use phv_vm::{BuiltinFn, Value, Vm, VmError};
 use regex::{Regex, RegexBuilder};
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Instant;
 
 /// Longest pattern accepted.
@@ -33,7 +34,7 @@ const DFA_LIMIT: usize = 512 << 10;
 /// the memory a search for them may need.
 const MAX_GROUPS: usize = 1000;
 const MAX_GROUPS_BYTES: usize = 16 << 20;
-/// Compiled patterns kept per thread, and the memory they may hold.
+/// Compiled patterns kept in the process, and the memory they may hold.
 const CACHE: usize = 64;
 const CACHE_BYTES: usize = 32 << 20;
 /// Steps of the slowest search (one NFA state for one byte of text) assumed
@@ -54,18 +55,54 @@ struct Compiled {
     groups_bytes: usize,
 }
 
-#[derive(Default)]
-struct Cache {
-    patterns: HashMap<String, Compiled>,
+/// A kept pattern: what it counts against `CACHE_BYTES`, and when it was last used.
+struct Entry {
+    compiled: Compiled,
     bytes: usize,
+    used: u64,
 }
 
-thread_local! {
-    static COMPILED: RefCell<Cache> = RefCell::new(Cache::default());
+#[derive(Default)]
+struct Cache {
+    patterns: HashMap<String, Entry>,
+    bytes: usize,
+    /// Counts uses, to find the least recently used pattern.
+    clock: u64,
+}
+
+impl Cache {
+    fn get(&mut self, pattern: &str) -> Option<Compiled> {
+        self.clock += 1;
+        let e = self.patterns.get_mut(pattern)?;
+        e.used = self.clock;
+        Some(e.compiled.clone())
+    }
+
+    /// Keeps `compiled`, dropping the least recently used patterns to make room.
+    fn put(&mut self, pattern: &str, compiled: &Compiled, bytes: usize) {
+        if bytes > CACHE_BYTES / 4 || self.patterns.contains_key(pattern) {
+            return;
+        }
+        while !self.patterns.is_empty() && (self.patterns.len() >= CACHE || self.bytes + bytes > CACHE_BYTES) {
+            let oldest = self.patterns.iter().min_by_key(|(_, e)| e.used).map(|(k, _)| k.clone());
+            if let Some(e) = oldest.and_then(|k| self.patterns.remove(&k)) {
+                self.bytes -= e.bytes;
+            }
+        }
+        self.clock += 1;
+        self.bytes += bytes;
+        self.patterns.insert(pattern.to_string(), Entry { compiled: compiled.clone(), bytes, used: self.clock });
+    }
+}
+
+static COMPILED: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
+
+fn cache() -> MutexGuard<'static, Cache> {
+    COMPILED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn compile(pattern: &str) -> Result<Compiled, String> {
-    if let Some(c) = COMPILED.with(|c| c.borrow().patterns.get(pattern).cloned()) {
+    if let Some(c) = cache().get(pattern) {
         return Ok(c);
     }
     if pattern.len() > MAX_PATTERN {
@@ -91,18 +128,7 @@ fn compile(pattern: &str) -> Result<Compiled, String> {
     // The forward and reverse NFAs, the search caches, both lazy DFAs and the groups' table.
     let bytes = nfa.memory_usage() * 3 + DFA_LIMIT * 2 + (256 << 10) + groups_bytes;
     let compiled = Compiled { regex, states, groups_bytes };
-    COMPILED.with(|c| {
-        let mut c = c.borrow_mut();
-        if bytes > CACHE_BYTES / 4 {
-            return;
-        }
-        if c.patterns.len() >= CACHE || c.bytes + bytes > CACHE_BYTES {
-            c.patterns.clear();
-            c.bytes = 0;
-        }
-        c.bytes += bytes;
-        c.patterns.insert(pattern.to_string(), compiled.clone());
-    });
+    cache().put(pattern, &compiled, bytes);
     Ok(compiled)
 }
 
@@ -256,13 +282,20 @@ mod tests {
         assert!(compile(&"()".repeat(MAX_GROUPS + 1)).is_err());
         assert!(compile(&"()".repeat(MAX_GROUPS)).is_err(), "too many groups for its size");
         assert!(compile(&"(a)".repeat(100)).is_ok());
+        let kept = compile("kept-pattern").unwrap();
         for i in 0..CACHE * 2 {
             compile(&format!("x{i}")).unwrap();
+            // Used all along, so never the least recently used.
+            assert!(compile("kept-pattern").unwrap().regex.as_str() == kept.regex.as_str());
         }
-        COMPILED.with(|c| {
-            let c = c.borrow();
+        {
+            let c = cache();
             assert!(c.patterns.len() <= CACHE && c.bytes <= CACHE_BYTES);
-        });
+            assert!(c.patterns.contains_key("kept-pattern"));
+            assert_eq!(c.bytes, c.patterns.values().map(|e| e.bytes).sum::<usize>());
+        }
+        // Shared by every thread: a pattern compiled here is found on another.
+        std::thread::spawn(|| assert!(cache().patterns.contains_key("kept-pattern"))).join().unwrap();
         // The worst case of a search is counted in NFA states.
         assert!(compile(r"(?-u)(\w{1,100}){20}b").unwrap().states > 1000);
         assert!(compile(r"(?i)hello\s+world").unwrap().states < 100);

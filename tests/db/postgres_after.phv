@@ -6,3 +6,6 @@ echo "temp table: ", $db->first(sql"SELECT to_regclass('pg_temp.phv_temp')::text
 echo "application_name: ", $db->first(sql"SELECT current_setting('application_name') AS a")?->string("a") ?? "", "\n";
 echo "uncommitted rows: ", count($db->query(sql"SELECT id FROM phv_items WHERE name = 'uncommitted'")), "\n";
 $db->execute(sql"DROP TABLE phv_items");
+echo "prepared statements: ", $db->first(sql"SELECT count(*)::int AS n FROM pg_prepared_statements WHERE from_sql")?->int("n") ?? -1, "\n";
+echo "same connection: ", $db->first(sql"SELECT (pid = pg_backend_pid())::text AS same FROM phv_pid")?->string("same") ?? "", "\n";
+$db->execute(sql"DROP TABLE phv_pid");

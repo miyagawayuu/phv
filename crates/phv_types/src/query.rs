@@ -157,7 +157,8 @@ impl<'a> Finder<'a> {
 /// The innermost expression at `offset` in `file`: its span and type.
 pub fn type_at(prog: &HProgram, file: u32, offset: u32) -> Option<(Span, String)> {
     let mut f = Finder { file, offset, best: None };
-    for func in &prog.funcs {
+    // Only the functions of that file (std and other modules have none of its expressions).
+    for func in prog.funcs.iter().filter(|func| func.file == file) {
         f.stmts(&func.body);
     }
     let names: Vec<String> = prog.classes.iter().map(|c| c.name.clone()).collect();

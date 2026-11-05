@@ -1,9 +1,10 @@
 //! Work started by the `*Async` methods of std.net and std.db, and waited for
 //! with `await()` (std.async).
 //!
-//! The work runs on its own thread, so the script goes on meanwhile. Values
-//! cannot leave the script's thread, so the work returns plain data (an HTTP
-//! response, rows, a Redis reply), which becomes values when it is awaited.
+//! The work runs on a thread of the process's worker pool (`workers`), so the
+//! script goes on meanwhile. Values cannot leave the script's thread, so the
+//! work returns plain data (an HTTP response, rows, a Redis reply), which
+//! becomes values when it is awaited.
 //! Memory used by the work is not counted by the allocator of the script's
 //! thread: each kind of work has a byte budget instead, taken from the memory
 //! left to the script when it starts.
@@ -21,8 +22,8 @@ use std::time::{Duration, Instant};
 /// Work one script may have running at once.
 const MAX_PER_SCRIPT: usize = 16;
 
-/// Work running in the whole process (each holds a thread).
-const MAX_RUNNING: usize = 1024;
+/// Work running in the whole process (each holds a thread of the pool).
+pub(crate) const MAX_RUNNING: usize = 1024;
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
 
 /// What background work produced, in data that can cross threads.
@@ -55,7 +56,7 @@ impl Drop for Task {
     }
 }
 
-/// Runs `work` on its own thread and returns the handle `await()` takes.
+/// Runs `work` on a thread of the pool and returns the handle `await()` takes.
 /// The work must end by `until` on its own; waiting stops there too.
 /// `pool` names the database (and the size of its pool) the work takes a
 /// connection from: a script may use at most half of a pool at once.
@@ -94,9 +95,10 @@ pub(crate) fn start(
         return Err(vm.throw("RuntimeException", "the server is running too many background operations"));
     }
     let (tx, rx) = mpsc::sync_channel(1);
-    let spawned = std::thread::Builder::new().name("phv-async".into()).spawn(move || {
+    let spawned = crate::workers::spawn(move || {
+        // Counted until the work ends, even if it panics.
+        let _running = Running;
         let _ = tx.send(work());
-        RUNNING.fetch_sub(1, Ordering::SeqCst);
     });
     if spawned.is_err() {
         RUNNING.fetch_sub(1, Ordering::SeqCst);
@@ -104,6 +106,15 @@ pub(crate) fn start(
     }
     vm.resources.push(Some(Box::new(Task::Running { rx, until, pool: pool.map(|p| p.0) })));
     Ok(Value::Int(vm.resources.len() as i64 - 1))
+}
+
+/// One unit of `RUNNING`, given back when dropped.
+struct Running;
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        RUNNING.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A handle for work that is already done (a SQLite statement, which runs in

@@ -4,6 +4,10 @@ pub type ClassId = u32;
 pub type FuncId = u32;
 pub type LocalId = u32;
 
+/// The name of a type parameter: shared, so types that mention it are copied
+/// without copying the name.
+pub type Name = std::sync::Arc<str>;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Type {
     Int,
@@ -36,7 +40,7 @@ pub enum Type {
     /// user type parameter while a call is being inferred.
     Generic(u8),
     /// A user type parameter inside its generic function (opaque).
-    Param(String),
+    Param(Name),
     /// A parameterized SQL query built with `sql"..."`.
     Sql,
     /// "Not known yet" inside an expected type, e.g. a closure's return type.

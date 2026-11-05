@@ -124,7 +124,7 @@ struct ClassInfo<'a> {
     kind: ClassKind,
     module: usize,
     /// `class Box<T>`: the names of its type parameters.
-    type_params: Vec<String>,
+    type_params: Vec<Name>,
     /// The type arguments each ancestor and interface is used with, in terms of
     /// this class's own type parameters (`class A<T> extends B<list<T>>` maps
     /// `B` to `[list<T>]`). Only generic supers are listed.
@@ -175,7 +175,7 @@ struct ParamInfo {
 struct FuncInfo<'a> {
     name: String,
     /// Names of the function's type parameters (`function f<T>(...)`).
-    type_params: Vec<String>,
+    type_params: Vec<Name>,
     is_abstract: bool,
     params: Vec<ParamInfo>,
     ret: Type,
@@ -201,13 +201,13 @@ pub(crate) struct Checker<'a> {
     funcs: Vec<FuncInfo<'a>>,
     hfuncs: Vec<Option<HFunc>>,
     scopes: Vec<Scope>,
-    builtins: HashMap<&'static str, Vec<ParsedBuiltin>>,
+    builtins: &'static HashMap<&'static str, Vec<ParsedBuiltin>>,
     ctx: Vec<FnCtx>,
     module: usize,
     template_funcs: HashMap<usize, FuncId>,
     main: Option<FuncId>,
     /// Type parameters in scope while resolving or checking a generic function.
-    type_params: Vec<String>,
+    type_params: Vec<Name>,
     /// Only built for editors (`check_for_editor`).
     index: Option<EditorIndex>,
     /// Members copied into subclasses so far (see `MAX_INHERITED_MEMBERS`).
@@ -223,13 +223,16 @@ pub(crate) struct Checker<'a> {
     hooks: Vec<(FuncId, bool)>,
     /// Names each module has looked up in its own scope (`(module, name)`),
     /// to tell which imports are used. Lookups take `&self`, hence the cell.
-    used_names: RefCell<HashSet<(usize, String)>>,
+    /// The names each module used (only the project's modules are recorded).
+    used_names: RefCell<HashMap<usize, HashSet<String>>>,
+    /// The index of the prelude module, if the program has one.
+    prelude_module: Option<usize>,
     aliases: Vec<AliasInfo<'a>>,
     /// Bounds of type parameters (`<T: Shape>`) of functions and classes that have any.
     func_bounds: HashMap<FuncId, Vec<Option<Type>>>,
     class_bounds: HashMap<ClassId, Vec<Option<Type>>>,
     /// The bounds of the type parameters in scope, by name.
-    pub(crate) bounds: HashMap<String, Type>,
+    pub(crate) bounds: HashMap<Name, Type>,
     /// Aliases being resolved inside each other right now.
     alias_depth: usize,
     /// Resolving the type of an alias (whose class arguments are checked where it is used).
@@ -319,14 +322,22 @@ fn sig_type(t: &TypeExpr) -> Type {
     }
 }
 
-impl<'a> Checker<'a> {
-    fn new(input: &'a CheckInput<'a>) -> Checker<'a> {
+/// The signatures of the builtins, parsed once per process.
+fn parsed_builtins() -> &'static HashMap<&'static str, Vec<ParsedBuiltin>> {
+    static PARSED: std::sync::OnceLock<HashMap<&'static str, Vec<ParsedBuiltin>>> = std::sync::OnceLock::new();
+    PARSED.get_or_init(|| {
         let mut builtins: HashMap<_, Vec<ParsedBuiltin>> = HashMap::new();
         for sig in BUILTINS {
             let t = parse_type_str(sig.sig).unwrap_or_else(|| panic!("bad builtin signature: {}", sig.sig));
             let Type::Func(params, ret) = sig_type(&t) else { panic!("builtin signature must be a function type") };
             builtins.entry(sig.name).or_default().push(ParsedBuiltin { sig, params, ret: *ret });
         }
+        builtins
+    })
+}
+
+impl<'a> Checker<'a> {
+    fn new(input: &'a CheckInput<'a>) -> Checker<'a> {
         Checker {
             input,
             diags: Vec::new(),
@@ -335,7 +346,7 @@ impl<'a> Checker<'a> {
             funcs: Vec::new(),
             hfuncs: Vec::new(),
             scopes: (0..input.modules.len()).map(|_| Scope::default()).collect(),
-            builtins,
+            builtins: parsed_builtins(),
             ctx: Vec::new(),
             module: 0,
             template_funcs: HashMap::new(),
@@ -349,7 +360,8 @@ impl<'a> Checker<'a> {
             deprecated_fields: HashMap::new(),
             tests: Vec::new(),
             hooks: Vec::new(),
-            used_names: RefCell::new(HashSet::new()),
+            used_names: RefCell::new(HashMap::new()),
+            prelude_module: input.modules.iter().position(|m| m.kind == ModuleKind::Prelude),
             aliases: Vec::new(),
             func_bounds: HashMap::new(),
             class_bounds: HashMap::new(),
@@ -465,7 +477,7 @@ impl<'a> Checker<'a> {
                         || self.scopes[mi].classes.contains_key(name)
                         || self.scopes[mi].consts.contains_key(name)
                         || self.scopes[mi].aliases.contains_key(name);
-                    if known && !used.contains(&(mi, name.to_string())) {
+                    if known && !used.get(&mi).is_some_and(|u| u.contains(name)) {
                         self.diags.push(
                             Diagnostic::warning(format!("`{name}` is imported but never used"), span)
                                 .note("remove it from the `import`")
@@ -525,10 +537,14 @@ impl<'a> Checker<'a> {
 
     /// Records that the current module used `name` from its own scope.
     fn note_used(&self, name: &str) {
-        let key = (self.module, name.to_string());
+        if self.input.modules.get(self.module).is_some_and(|m| matches!(m.kind, ModuleKind::Std | ModuleKind::Prelude))
+        {
+            return;
+        }
         let mut used = self.used_names.borrow_mut();
-        if !used.contains(&key) {
-            used.insert(key);
+        let names = used.entry(self.module).or_default();
+        if !names.contains(name) {
+            names.insert(name.to_string());
         }
     }
 
@@ -658,7 +674,7 @@ impl<'a> Checker<'a> {
     fn build_index(&mut self) -> EditorIndex {
         let mut ix = self.index.take().unwrap_or_default();
         ix.class_names = self.class_names.clone();
-        ix.type_params = self.classes.iter().map(|c| c.type_params.clone()).collect();
+        ix.type_params = self.classes.iter().map(|c| c.type_params.iter().map(|n| n.to_string()).collect()).collect();
         ix.supers = self.classes.iter().map(|c| c.supers.iter().copied().collect()).collect();
         for (fid, f) in self.funcs.iter().enumerate() {
             let kind = match f.kind {
@@ -817,7 +833,7 @@ impl<'a> Checker<'a> {
     }
 
     fn prelude(&self) -> Option<usize> {
-        self.input.modules.iter().position(|m| m.kind == ModuleKind::Prelude)
+        self.prelude_module
     }
 
     pub(crate) fn lookup_class(&self, name: &str) -> Option<ClassId> {
@@ -887,7 +903,7 @@ impl<'a> Checker<'a> {
     pub(crate) fn check_bounds(
         &mut self,
         what: &str,
-        names: &[String],
+        names: &[Name],
         bounds: &[Option<Type>],
         args: &[Type],
         span: Span,
@@ -906,7 +922,7 @@ impl<'a> Checker<'a> {
             let msg = format!(
                 "`{}` does not satisfy the bound `{}: {}` of {what}",
                 self.tn(actual),
-                names.get(i).map_or("?", |n| n.as_str()),
+                names.get(i).map_or("?", |n| &**n),
                 self.tn(&want)
             );
             self.error(msg, span);
@@ -949,7 +965,7 @@ impl<'a> Checker<'a> {
 
     /// Puts the bounds of a class's type parameters (when `class` is given) and
     /// of a function's own in scope.
-    fn set_bounds(&mut self, class: Option<ClassId>, func: &[String], func_bounds: &[Option<Type>]) {
+    fn set_bounds(&mut self, class: Option<ClassId>, func: &[Name], func_bounds: &[Option<Type>]) {
         self.bounds.clear();
         if let Some(c) = class {
             if let Some(bs) = self.class_bounds.get(&c) {
@@ -992,7 +1008,7 @@ impl<'a> Checker<'a> {
         }
         self.aliases[a].resolving = true;
         self.alias_depth += 1;
-        let params = decl.type_params.iter().map(|(n, _)| n.clone()).collect();
+        let params = decl.type_params.iter().map(|(n, _)| Name::from(n.as_str())).collect();
         let module = std::mem::replace(&mut self.module, self.aliases[a].module);
         let outer = std::mem::replace(&mut self.type_params, params);
         // An alias's parameters have no bounds: classes it applies to them are
@@ -1026,14 +1042,11 @@ impl<'a> Checker<'a> {
         self.prelude().and_then(|p| self.scopes[p].funcs.get(name).copied())
     }
 
-    pub(crate) fn builtin_overloads(&self, name: &str, recv: Option<Recv>) -> Option<Vec<&ParsedBuiltin>> {
+    pub(crate) fn builtin_overloads(&self, name: &str, recv: Option<Recv>) -> Option<Vec<&'static ParsedBuiltin>> {
         let internal_ok = matches!(self.module_kind(), ModuleKind::Std | ModuleKind::Prelude);
-        let list: Vec<&ParsedBuiltin> = self
-            .builtins
-            .get(name)?
-            .iter()
-            .filter(|b| b.sig.recv == recv && (internal_ok || !b.sig.internal))
-            .collect();
+        let builtins: &'static HashMap<&'static str, Vec<ParsedBuiltin>> = self.builtins;
+        let list: Vec<&'static ParsedBuiltin> =
+            builtins.get(name)?.iter().filter(|b| b.sig.recv == recv && (internal_ok || !b.sig.internal)).collect();
         if list.is_empty() {
             None
         } else {
@@ -1159,7 +1172,7 @@ impl<'a> Checker<'a> {
 
     /// The member types of `owner` substituted for a value of type `c<args>`,
     /// as `(name, type)` pairs for `invoke_with`.
-    pub(crate) fn receiver_args(&self, c: ClassId, args: &[Type], owner: ClassId) -> Vec<(String, Type)> {
+    pub(crate) fn receiver_args(&self, c: ClassId, args: &[Type], owner: ClassId) -> Vec<(Name, Type)> {
         let tps = self.classes[owner as usize].type_params.clone();
         if tps.is_empty() {
             return Vec::new();
@@ -1201,11 +1214,12 @@ impl<'a> Checker<'a> {
         match &t.kind {
             TypeExprKind::Named(n, args) => {
                 let simple = |ty: Type| (ty, 0usize);
-                if self.type_params.iter().any(|p| p == n) {
+                // The parameter's own name is shared by the types that mention it.
+                if let Some(p) = self.type_params.iter().find(|p| &***p == n.as_str()).cloned() {
                     if !args.is_empty() {
                         self.error(format!("type parameter `{n}` does not take type arguments"), t.span);
                     }
-                    return Type::Param(n.clone());
+                    return Type::Param(p);
                 }
                 let (ty, arity) = match n.as_str() {
                     "Sql" => simple(Type::Sql),
@@ -1285,7 +1299,8 @@ impl<'a> Checker<'a> {
                             if self.aliases[a].ty.is_none() {
                                 self.resolve_alias(a);
                             }
-                            let params: Vec<String> = decl.type_params.iter().map(|(n, _)| n.clone()).collect();
+                            let params: Vec<Name> =
+                                decl.type_params.iter().map(|(n, _)| Name::from(n.as_str())).collect();
                             if args.len() != params.len() {
                                 let msg = match params.len() {
                                     0 => format!("`{other}` does not take type arguments"),
@@ -1609,7 +1624,7 @@ impl<'a> Checker<'a> {
                         }
                         let fid = self.add_func(FuncInfo {
                             name: d.name.clone(),
-                            type_params: d.type_params.iter().map(|(n, _)| n.clone()).collect(),
+                            type_params: d.type_params.iter().map(|(n, _)| Name::from(n.as_str())).collect(),
                             is_abstract: false,
                             params: Vec::new(),
                             ret: Type::Void,
@@ -1661,7 +1676,7 @@ impl<'a> Checker<'a> {
                             decl: Some(d),
                             kind: d.kind,
                             module: mi,
-                            type_params: d.type_params.iter().map(|(n, _)| n.clone()).collect(),
+                            type_params: d.type_params.iter().map(|(n, _)| Name::from(n.as_str())).collect(),
                             super_args: HashMap::new(),
                             parent: None,
                             ifaces: Vec::new(),
@@ -2211,9 +2226,9 @@ impl<'a> Checker<'a> {
             }
             let mut own_ctor = false;
             for m in &decl.methods {
-                let type_params: Vec<String> = m.type_params.iter().map(|(n, _)| n.clone()).collect();
+                let type_params: Vec<Name> = m.type_params.iter().map(|(n, _)| Name::from(n.as_str())).collect();
                 for (n, s) in &m.type_params {
-                    if class_tps.contains(n) {
+                    if class_tps.iter().any(|c| &**c == n.as_str()) {
                         self.error(format!("type parameter `{n}` is already a type parameter of `{class_name}`"), *s);
                     }
                 }
@@ -2814,8 +2829,22 @@ impl<'a> Checker<'a> {
 }
 
 /// Replaces the type parameters `names` (as `Type::Param`) in `t` by `args`.
-pub(crate) fn subst_params(t: &Type, names: &[String], args: &[Type]) -> Type {
-    if names.is_empty() {
+/// Whether a type names a type parameter: `subst_params` and `instantiate`
+/// give any other type back as it is, without building it again.
+pub(crate) fn has_param(t: &Type) -> bool {
+    match t {
+        Type::Param(_) => true,
+        Type::List(x) | Type::Set(x) => has_param(x),
+        Type::Map(k, v) => has_param(k) || has_param(v),
+        Type::Func(ps, r) => ps.iter().any(has_param) || has_param(r),
+        Type::Union(ms) => ms.iter().any(has_param),
+        Type::Class(_, xs) => xs.iter().any(has_param),
+        _ => false,
+    }
+}
+
+pub(crate) fn subst_params(t: &Type, names: &[Name], args: &[Type]) -> Type {
+    if names.is_empty() || !has_param(t) {
         return t.clone();
     }
     match t {
@@ -2874,7 +2903,7 @@ fn param_uses(t: &Type, name: &str) -> usize {
     let mut stack = vec![t];
     while let Some(t) = stack.pop() {
         match t {
-            Type::Param(p) if p == name => n += 1,
+            Type::Param(p) if &**p == name => n += 1,
             Type::List(e) | Type::Set(e) => stack.push(e),
             Type::Map(k, v) => stack.extend([&**k, &**v]),
             Type::Func(ps, r) => {

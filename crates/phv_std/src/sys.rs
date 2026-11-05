@@ -519,6 +519,8 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         "unlink" => |vm, a| {
             let rel = s(&a[0]).to_string();
             let (dir, name) = resolve_path(vm, &rel, true)?;
+            // Idle SQLite connections keep the file open (see `db`).
+            crate::db::release(&dir, &name);
             dir.remove(&name).map_err(|e| match e {
                 FsError::Io(e) => io_error(vm, "cannot delete", &rel, e),
                 e => fs_error(vm, &rel, "", e),
@@ -587,6 +589,8 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let (from, to) = (s(&a[0]).to_string(), s(&a[1]).to_string());
             let (fdir, fname) = resolve_path(vm, &from, true)?;
             let (tdir, tname) = resolve_path(vm, &to, true)?;
+            crate::db::release(&fdir, &fname);
+            crate::db::release(&tdir, &tname);
             fdir.rename_to(&fname, &tdir, &tname).map_err(|e| match e {
                 FsError::Io(e) => io_error(vm, "cannot rename", &from, e),
                 // The check that failed may be of either name.

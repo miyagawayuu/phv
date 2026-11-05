@@ -1,0 +1,11 @@
+import std.net.HttpClient;
+
+// Requests to one host share a connection; a POST does not take a kept one.
+$api = HttpClient::connect("api");
+for ($i = 0; $i < 5; $i++) {
+    echo $api->get("/n/{$i}")->body, "\n";
+}
+echo $api->post("/p", "x")->body, "\n";
+echo $api->get("/n/9")->body, "\n";
+echo $api->get("/close")->body, "\n";
+echo $api->get("/n/10")->body, "\n";

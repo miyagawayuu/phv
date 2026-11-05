@@ -11,8 +11,10 @@
 use crate::bytecode::Program;
 use crate::value::{compare, Value};
 use crate::vm::{
-    const_value, copy_cost, key_repr, op_append, op_concat, op_to_str, path_assign, str_len, MemLimit, BUDGET, LONG_OP,
+    const_value, copy_cost, key_repr, op_append, op_concat, op_to_str, path_append, path_assign, str_len, MemLimit,
+    PathError, BUDGET, LONG_OP,
 };
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -109,12 +111,16 @@ pub struct JitRt {
 }
 
 impl JitRt {
-    /// Prepares a call from the interpreter with these arguments.
-    pub(crate) fn start(&mut self, args: Vec<Value>) {
-        match self.windows.first_mut() {
-            Some(w) => *w = args,
-            None => self.windows.push(args),
+    /// Prepares a call from the interpreter with these arguments, moved out
+    /// of the interpreter's registers into the first window (whose memory is
+    /// reused from call to call).
+    pub(crate) fn start(&mut self, args: &mut [Value]) {
+        if self.windows.is_empty() {
+            self.windows.push(Vec::new());
         }
+        let w = &mut self.windows[0];
+        w.clear();
+        w.extend(args.iter_mut().map(std::mem::take));
         self.used = 1;
     }
 
@@ -368,7 +374,9 @@ pub unsafe extern "C" fn phv_jit_strlen(ctx: *mut JitCtx, r: i64, chars: i64) ->
     if mem(ctx).check().is_err() {
         return -JIT_ERR_MEMORY;
     }
-    if (*(*ctx).limits).deadline.is_some_and(|d| Instant::now() > d) {
+    // `strlen` takes constant time: like the interpreter (`CHEAP_BUILTINS`),
+    // the clock is read at the next loop step or call instead.
+    if chars != 0 && (*(*ctx).limits).deadline.is_some_and(|d| Instant::now() > d) {
         return -JIT_ERR_TIME;
     }
     n
@@ -686,6 +694,52 @@ pub unsafe extern "C" fn phv_jit_set_key(ctx: *mut JitCtx, r: i64, k: i64, val: 
     if let Err((class, msg)) = path_assign(&mut w[r as usize], &key, &[], false, v) {
         throw(ctx, class, msg);
     }
+}
+
+/// `AppendPath` on the list or map in slot `r` with the key in slot `k`:
+/// `cur` holds the element read before the string in slot `val` was made
+/// (see `path_append`). Copies are accounted first, as for `phv_jit_set_key`.
+///
+/// # Safety
+/// See `rt` and `mem`.
+pub unsafe extern "C" fn phv_jit_append_key(ctx: *mut JitCtx, r: i64, k: i64, cur: i64, val: i64) {
+    let mem = mem(ctx);
+    let w = rt(ctx).top();
+    if !matches!(w[r as usize], Value::List(_) | Value::Map(_)) {
+        wrong_value(ctx);
+        return;
+    }
+    let key = [w[k as usize].clone()];
+    long_key(ctx, str_len(&key[0]));
+    let cost = copy_cost(&w[r as usize], &key, false);
+    if cost > 0 {
+        if mem.reserve(cost).is_err() {
+            (*ctx).error = JIT_ERR_MEMORY;
+            return;
+        }
+        long_op(ctx, cost);
+    }
+    let cur = std::mem::take(&mut w[cur as usize]);
+    let src = w[val as usize].clone();
+    match path_append(&mut w[r as usize], &key, &[], cur, &src, mem) {
+        Ok(work) => long_op(ctx, work),
+        Err(PathError::Memory(_)) => (*ctx).error = JIT_ERR_MEMORY,
+        Err(PathError::Throw(class, msg)) => throw(ctx, class, msg),
+    }
+}
+
+/// `==` of the values in slots `a` and `b` (strings), as 0 or 1.
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_str_eq(ctx: *mut JitCtx, a: i64, b: i64) -> i64 {
+    let w = rt(ctx).top();
+    let r = match (&w[a as usize], &w[b as usize]) {
+        (Value::Str(x), Value::Str(y)) => Rc::ptr_eq(x, y) || x == y,
+        (x, y) => crate::value::values_equal(x, y),
+    };
+    long_op(ctx, str_len(&w[a as usize]));
+    r as i64
 }
 
 /// Entry `i` of the map in slot `m` (a `foreach` step): its key (`part` 0) or

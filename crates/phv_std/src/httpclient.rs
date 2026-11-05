@@ -4,16 +4,19 @@
 //! stay in the configuration, so they never appear in code or messages, and
 //! scripts cannot send requests to any other host.
 //!
-//! Each request uses its own HTTP/1.1 connection (`Connection: close`).
-//! Redirects are not followed: a 3xx response is returned to the script.
+//! Requests use HTTP/1.1 connections that are kept open between requests to
+//! the same host (see `Pool`). Redirects are not followed: a 3xx response is
+//! returned to the script.
 
-use crate::netio::{check_plain, describe, dial, until};
+use crate::netio::{check_plain, describe, dial, until, Stream};
 use crate::{map, s};
 use indexmap::IndexMap;
 use phv_vm::{Key, Value, Vm, VmError};
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::rc::Rc;
-use std::time::Duration;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 type R = Result<Value, VmError>;
 
@@ -28,6 +31,66 @@ const MAX_HEADERS: usize = 100;
 const MAX_INTERIM: usize = 10;
 
 const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+
+/// Idle connections kept per host, in all, and for how long.
+const KEEP_PER_HOST: usize = 8;
+const KEEP_TOTAL: usize = 256;
+const KEEP_IDLE: Duration = Duration::from_secs(30);
+
+/// Connections whose last response ended exactly where its framing said
+/// (`Content-Length`, or a chunked body with nothing after it), kept for the
+/// next request to the same host, port and scheme: the TCP and TLS handshakes
+/// are not made again. The connection goes to the address the host name was
+/// looked up to when it was made, as any connection to that host would.
+/// Only requests without side effects (`GET`, `HEAD`, `OPTIONS`) take one: a
+/// kept connection the server has closed meanwhile is retried once on a new
+/// one, which only such a request may be.
+struct Pool {
+    idle: HashMap<(String, u16, bool), Vec<(Stream, Instant)>>,
+    count: usize,
+}
+
+static POOL: LazyLock<Mutex<Pool>> = LazyLock::new(|| Mutex::new(Pool { idle: HashMap::new(), count: 0 }));
+
+fn pool_key(base: &Base) -> (String, u16, bool) {
+    (base.host.to_ascii_lowercase(), base.port, base.tls)
+}
+
+/// An idle connection to `base`, if one was kept and is not too old.
+fn take(base: &Base) -> Option<Stream> {
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let Pool { idle, count } = &mut *pool;
+    let list = idle.get_mut(&pool_key(base))?;
+    while let Some((stream, since)) = list.pop() {
+        *count -= 1;
+        if since.elapsed() < KEEP_IDLE {
+            return Some(stream);
+        }
+    }
+    None
+}
+
+/// Keeps a connection whose last response ended cleanly, unless enough are kept.
+fn give(base: &Base, stream: Stream) {
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let Pool { idle, count } = &mut *pool;
+    if *count >= KEEP_TOTAL {
+        // Old connections of every host are dropped first.
+        for list in idle.values_mut() {
+            let before = list.len();
+            list.retain(|(_, since)| since.elapsed() < KEEP_IDLE);
+            *count -= before - list.len();
+        }
+        if *count >= KEEP_TOTAL {
+            return;
+        }
+    }
+    let list = idle.entry(pool_key(base)).or_default();
+    if list.len() < KEEP_PER_HOST {
+        list.push((stream, Instant::now()));
+        *count += 1;
+    }
+}
 
 /// Headers that describe the connection or the message framing: set by PHV only.
 const RESERVED: &[&str] = &[
@@ -243,14 +306,17 @@ fn parse_length(v: &str) -> Option<usize> {
     v.parse().ok()
 }
 
-/// Reads a response whose body is at most `limit` bytes.
-fn read_response(stream: &mut impl Read, head_only: bool, limit: usize) -> Result<Response, String> {
+/// Reads a response whose body is at most `limit` bytes, and whether the
+/// connection may carry another request: an HTTP/1.1 response the server did
+/// not ask to close, whose end was where its framing said, with no byte
+/// after it.
+fn read_response(stream: &mut impl Read, head_only: bool, limit: usize) -> Result<(Response, bool), String> {
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 16 << 10];
     let mut interim = 0;
     loop {
         // Interim (1xx) responses are skipped.
-        let (status, headers, used) = loop {
+        let (status, headers, used, http11) = loop {
             let mut slots = [httparse::EMPTY_HEADER; MAX_HEADERS];
             let mut parsed = httparse::Response::new(&mut slots);
             match parsed.parse(&buf) {
@@ -261,7 +327,7 @@ fn read_response(stream: &mut impl Read, head_only: bool, limit: usize) -> Resul
                         .iter()
                         .map(|h| (h.name.to_ascii_lowercase(), String::from_utf8_lossy(h.value).trim().to_string()))
                         .collect();
-                    break (status, headers, used);
+                    break (status, headers, used, parsed.version == Some(1));
                 }
                 Ok(httparse::Status::Partial) => {
                     if buf.len() > MAX_HEAD {
@@ -287,10 +353,18 @@ fn read_response(stream: &mut impl Read, head_only: bool, limit: usize) -> Resul
         }
         let header = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
         let no_body = head_only || status == 204 || status == 304;
+        let keep = http11
+            && !headers
+                .iter()
+                .any(|(n, v)| n == "connection" && v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")));
+        let mut clean = false;
         let body = if no_body {
+            clean = buf.is_empty();
             Vec::new()
         } else if header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
-            read_chunked(stream, buf, &mut chunk, limit)?
+            let (body, ended) = read_chunked(stream, buf, &mut chunk, limit)?;
+            clean = ended;
+            body
         } else if let Some(len) = header("content-length") {
             // Repeated Content-Length headers must agree.
             let lengths: Vec<&str> =
@@ -310,6 +384,7 @@ fn read_response(stream: &mut impl Read, head_only: bool, limit: usize) -> Resul
                 }
                 buf.extend_from_slice(&chunk[..n]);
             }
+            clean = buf.len() == len;
             buf.truncate(len);
             buf
         } else {
@@ -324,7 +399,7 @@ fn read_response(stream: &mut impl Read, head_only: bool, limit: usize) -> Resul
                 buf.extend_from_slice(&chunk[..n]);
             }
         };
-        return Ok(Response { status, headers, body });
+        return Ok((Response { status, headers, body }, keep && clean));
     }
 }
 
@@ -348,7 +423,14 @@ fn read_some(stream: &mut impl Read, chunk: &mut [u8]) -> Result<usize, String> 
     }
 }
 
-fn read_chunked(stream: &mut impl Read, mut buf: Vec<u8>, chunk: &mut [u8], limit: usize) -> Result<Vec<u8>, String> {
+/// A chunked body, and whether it ended cleanly: the last chunk, no trailer
+/// and nothing after it (already received; the connection is not waited on).
+fn read_chunked(
+    stream: &mut impl Read,
+    mut buf: Vec<u8>,
+    chunk: &mut [u8],
+    limit: usize,
+) -> Result<(Vec<u8>, bool), String> {
     let mut body = Vec::new();
     let mut fill = |buf: &mut Vec<u8>| -> Result<(), String> {
         let n = read_some(stream, chunk)?;
@@ -378,8 +460,8 @@ fn read_chunked(stream: &mut impl Read, mut buf: Vec<u8>, chunk: &mut [u8], limi
         let size = usize::from_str_radix(size_text, 16).map_err(|_| invalid)?;
         buf.drain(..line_end + 2);
         if size == 0 {
-            // Trailers are ignored.
-            return Ok(body);
+            // Trailers are ignored (the connection is then not kept).
+            return Ok((body, buf.as_slice() == b"\r\n"));
         }
         if size > limit - body.len() {
             return Err(too_large(limit));
@@ -395,9 +477,33 @@ fn read_chunked(stream: &mut impl Read, mut buf: Vec<u8>, chunk: &mut [u8], limi
     }
 }
 
-/// Sends `req` to `base` and reads the answer.
-fn exchange(base: &Base, req: &Request, until: std::time::Instant, limit: usize) -> Result<Response, String> {
+/// Sends `req` to `base` and reads the answer, on a kept connection when the
+/// request has no side effects and one is idle (see `Pool`).
+fn exchange(base: &Base, req: &Request, until: Instant, limit: usize) -> Result<Response, String> {
+    let safe = matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS");
+    if safe {
+        if let Some(mut stream) = take(base) {
+            stream.set_deadline(until);
+            // A kept connection may have been closed by the server: the request
+            // is sent again on a new one.
+            if let Ok((resp, keep)) = send(&mut stream, base, req, limit) {
+                if keep {
+                    give(base, stream);
+                }
+                return Ok(resp);
+            }
+        }
+    }
     let mut stream = dial(&base.host, base.port, base.tls, until)?;
+    let (resp, keep) = send(&mut stream, base, req, limit)?;
+    if keep {
+        give(base, stream);
+    }
+    Ok(resp)
+}
+
+/// Writes `req` on `stream` and reads the response (see `read_response`).
+fn send(stream: &mut Stream, base: &Base, req: &Request, limit: usize) -> Result<(Response, bool), String> {
     let mut head = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", req.method, req.target, base.authority);
     for (name, value) in &req.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
@@ -406,12 +512,12 @@ fn exchange(base: &Base, req: &Request, until: std::time::Instant, limit: usize)
     if sends_body {
         head.push_str(&format!("Content-Length: {}\r\n", req.body.len()));
     }
-    head.push_str("Connection: close\r\n\r\n");
+    head.push_str("\r\n");
     let io = |e: std::io::Error| describe(&e);
     stream.write_all(head.as_bytes()).map_err(io)?;
     stream.write_all(&req.body).map_err(io)?;
     stream.flush().map_err(io)?;
-    read_response(&mut stream, req.method == "HEAD", limit)
+    read_response(stream, req.method == "HEAD", limit)
 }
 
 /// `__http_request(name, method, path, query, headers, body)`: sends a request
@@ -609,14 +715,30 @@ mod tests {
     #[test]
     fn reads_chunked_and_sized_bodies() {
         let raw = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-A: 1\r\n\r\n5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\n";
-        let r = read_response(&mut &raw[..], false, MAX_BODY).unwrap();
+        let (r, keep) = read_response(&mut &raw[..], false, MAX_BODY).unwrap();
         assert_eq!((r.status, r.body.as_slice()), (200, &b"hello world"[..]));
         assert!(r.headers.contains(&("x-a".into(), "1".into())));
+        assert!(keep, "a chunked body that ended cleanly");
+        // Bytes past the stated length: the connection is not kept.
         let raw = b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nabcdef";
-        let r = read_response(&mut &raw[..], false, MAX_BODY).unwrap();
-        assert_eq!((r.status, r.body.as_slice()), (404, &b"abc"[..]));
+        let (r, keep) = read_response(&mut &raw[..], false, MAX_BODY).unwrap();
+        assert_eq!((r.status, r.body.as_slice(), keep), (404, &b"abc"[..], false));
         let raw = b"HTTP/1.1 200 OK\r\n\r\nuntil the end";
-        assert_eq!(read_response(&mut &raw[..], false, MAX_BODY).unwrap().body, b"until the end");
+        let (r, keep) = read_response(&mut &raw[..], false, MAX_BODY).unwrap();
+        assert_eq!((r.body.as_slice(), keep), (&b"until the end"[..], false));
+        // Kept: an exact length; not kept: HTTP/1.0, `Connection: close`, a
+        // trailer, and bytes after a response without a body.
+        for (raw, kept) in [
+            (&b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"[..], true),
+            (b"HTTP/1.1 204 No Content\r\n\r\n", true),
+            (b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok", false),
+            (b"HTTP/1.1 200 OK\r\nConnection: keep-alive, Close\r\nContent-Length: 2\r\n\r\nok", false),
+            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nX-T: 1\r\n\r\n", false),
+            (b"HTTP/1.1 204 No Content\r\n\r\nHTTP/1.1 200 OK\r\n", false),
+        ] {
+            let got = read_response(&mut &raw[..], false, MAX_BODY).unwrap().1;
+            assert_eq!(got, kept, "{}", String::from_utf8_lossy(raw));
+        }
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort";
         assert!(read_response(&mut &raw[..], false, MAX_BODY).is_err());
         let raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1);

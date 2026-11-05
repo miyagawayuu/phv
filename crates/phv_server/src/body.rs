@@ -43,6 +43,13 @@ impl Drop for Counted {
     }
 }
 
+/// `data` as bytes whose size counts in `total` until the last copy (or
+/// slice) of them is dropped.
+pub fn counted_bytes(data: Vec<u8>, total: &Arc<AtomicUsize>) -> Bytes {
+    total.fetch_add(data.len(), Ordering::Relaxed);
+    Bytes::from_owner(Counted { data, total: total.clone() })
+}
+
 impl RespBody {
     pub fn full(bytes: impl Into<Bytes>) -> RespBody {
         RespBody::Full(Some(bytes.into()))
@@ -50,8 +57,7 @@ impl RespBody {
 
     /// A body whose size counts in `total` until it has been sent.
     pub fn counted(data: Vec<u8>, total: &Arc<AtomicUsize>) -> RespBody {
-        total.fetch_add(data.len(), Ordering::Relaxed);
-        RespBody::full(Bytes::from_owner(Counted { data, total: total.clone() }))
+        RespBody::full(counted_bytes(data, total))
     }
 
     /// The bytes of a body held in memory (taken out of it), to replace them.

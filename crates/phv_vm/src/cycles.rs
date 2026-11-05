@@ -17,11 +17,42 @@
 //! borrowed at the moment, is treated as held from outside and is not looked
 //! into, so a value can be kept too long but is never freed while in use.
 
-use crate::value::{Closure, Map, Object, Value};
+use crate::value::{Closure, Key, Map, Object, Value};
 use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::{Rc, Weak};
 
+/// Hashes the addresses the collector indexes values by. They are not
+/// chosen by scripts, so a fast multiplicative hash is enough.
+#[derive(Default)]
+struct AddrHasher(u64);
+
+impl Hasher for AddrHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn finish(&self) -> u64 {
+        // The low bits of an address are always zero (alignment); fold the
+        // high bits, which the multiplication mixed, into them.
+        self.0 ^ (self.0 >> 29)
+    }
+}
+
+type AddrMap = HashMap<usize, usize, BuildHasherDefault<AddrHasher>>;
+
+#[derive(Clone, Copy)]
 enum Node<'a> {
     Object(&'a Object),
     List(&'a [Value]),
@@ -39,14 +70,31 @@ struct Entry<'a> {
     internal: usize,
 }
 
-/// The values inside `node` that can take part in a cycle.
-fn children<'a>(node: &Node<'a>) -> Box<dyn Iterator<Item = &'a Value> + 'a> {
+/// The values inside a node that can take part in a cycle.
+enum Children<'a> {
+    Slice(std::slice::Iter<'a, Value>),
+    Map(indexmap::map::Values<'a, Key, Value>),
+}
+
+impl<'a> Iterator for Children<'a> {
+    type Item = &'a Value;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a Value> {
+        match self {
+            Children::Slice(i) => i.next(),
+            Children::Map(i) => i.next(),
+        }
+    }
+}
+
+fn children<'a>(node: &Node<'a>) -> Children<'a> {
     match *node {
-        Node::Object(o) => Box::new(o.fields.iter()),
-        Node::List(l) => Box::new(l.iter()),
-        Node::Map(m) => Box::new(m.values()),
-        Node::Closure(c) => Box::new(c.caps.iter()),
-        Node::Opaque => Box::new(std::iter::empty()),
+        Node::Object(o) => Children::Slice(o.fields.iter()),
+        Node::List(l) => Children::Slice(l.iter()),
+        Node::Map(m) => Children::Map(m.values()),
+        Node::Closure(c) => Children::Slice(c.caps.iter()),
+        Node::Opaque => Children::Slice([].iter()),
     }
 }
 
@@ -91,7 +139,7 @@ pub(crate) fn collect(objects: &mut Vec<Weak<RefCell<Object>>>) -> Collected {
         // right now is opaque.
         let guards: Vec<Option<Ref<'_, Object>>> = live.iter().map(|o| o.try_borrow().ok()).collect();
         let mut entries: Vec<Entry<'_>> = Vec::with_capacity(live.len());
-        let mut index: HashMap<usize, usize> = HashMap::with_capacity(live.len());
+        let mut index: AddrMap = AddrMap::with_capacity_and_hasher(live.len(), Default::default());
         for (o, g) in live.iter().zip(&guards) {
             index.insert(Rc::as_ptr(o) as *const u8 as usize, entries.len());
             let node = match g {

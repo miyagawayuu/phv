@@ -151,8 +151,11 @@ impl Js {
                 forks.push(other);
             }
         }
-        self.readings.extend(forks);
-        self.settle();
+        // One reading that did not fork stays one: nothing to merge.
+        if !forks.is_empty() || self.readings.len() > 1 {
+            self.readings.extend(forks);
+            self.settle();
+        }
     }
 
     /// A value was inserted (a number, unless every reading is code).
@@ -856,9 +859,16 @@ impl HtmlTracker {
     fn feed_text(&mut self, text: &str) -> Vec<usize> {
         let chars: Vec<char> = text.chars().collect();
         let offsets: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+        // Whether `s` is at `i`, in any ASCII case (compared in place).
         let starts = |i: usize, s: &str| -> bool {
-            let n = s.chars().count();
-            i + n <= chars.len() && chars[i..i + n].iter().collect::<String>().eq_ignore_ascii_case(s)
+            let mut k = i;
+            for want in s.chars() {
+                match chars.get(k) {
+                    Some(c) if c.eq_ignore_ascii_case(&want) => k += 1,
+                    _ => return false,
+                }
+            }
+            true
         };
         let mut scripts = Vec::new();
         let mut i = 0;
@@ -968,17 +978,24 @@ impl HtmlTracker {
                     }
                 }
                 State::Raw { tag, escape, js } => {
-                    let end = format!("</{tag}");
+                    // The end tag, looked for only at a `<`.
+                    let end = if c == '<' { format!("</{tag}") } else { String::new() };
                     let n = end.len();
-                    let rest: String = chars[i..].iter().collect::<String>().to_ascii_lowercase();
+                    // The rest of the text matters only when it is shorter than what
+                    // it could be the start of (found by the 1.0.0 review: it was
+                    // copied at every character, quadratic in the element's length).
+                    let left = chars.len() - i;
+                    let short = left <= n.max("<script".len());
+                    let rest: String =
+                        if short { chars[i..].iter().collect::<String>().to_ascii_lowercase() } else { String::new() };
                     // In a script, the starts of `<!--`, `<script` and `-->` too: they change
                     // its escape state.
-                    let partial = |s: &str| rest.len() < s.len() && s.starts_with(&rest);
+                    let partial = |s: &str| short && rest.len() < s.len() && s.starts_with(&rest);
                     let script_start = tag == "script"
                         && ((escape == 0 && partial("<!--"))
                             || (escape == 1 && partial("<script"))
                             || (escape > 0 && (partial("-->") || rest == "-")));
-                    if script_start || (c == '<' && rest.len() <= n && end.starts_with(&rest)) {
+                    if script_start || (c == '<' && short && rest.len() <= n && end.starts_with(&rest)) {
                         // `</tex` + a value or block: it might end the element.
                         self.carry = chars[i..].iter().collect();
                         i = chars.len() - 1;
@@ -988,7 +1005,7 @@ impl HtmlTracker {
                         // comment can hide its end tag from browsers but not from here.
                         self.found.push((offsets[i], InlineCode::ForeignCdata));
                         State::Raw { tag, escape, js }
-                    } else if starts(i, &end) && is_delim(chars.get(i + n)) {
+                    } else if c == '<' && starts(i, &end) && is_delim(chars.get(i + n)) {
                         if tag == "script" && escape == 2 {
                             i += n - 1;
                             State::Raw { tag, escape: 1, js }
@@ -1192,6 +1209,18 @@ mod tests {
         assert_eq!(ctx("<!-- <script> --><p>"), EchoContext::Text);
         assert_eq!(ctx("<input value='a' disabled>"), EchoContext::Text);
         assert_eq!(ctx("<p>1 < 2 and "), EchoContext::Text);
+    }
+
+    /// The text of a long `<script>` or `<style>` is read in linear time (found
+    /// by the 1.0.0 review: the rest of the text was copied at every character).
+    #[test]
+    fn long_raw_text_is_read_in_linear_time() {
+        let body = "var a = 1; // < </scrip\n".repeat(40_000);
+        let start = std::time::Instant::now();
+        assert_eq!(ctx(&format!("<script>{body}</script><p>")), EchoContext::Text);
+        assert_eq!(ctx(&format!("<style>{}</style><p>", "p{color:red}\n".repeat(80_000))), EchoContext::Text);
+        assert_eq!(ctx(&format!("<script>{body}var x = ")), EchoContext::Script);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
     }
 
     #[test]

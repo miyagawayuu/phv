@@ -354,6 +354,51 @@ fn start_with(dir: &Path, dev: bool) -> SocketAddr {
     addr
 }
 
+/// A production server remembers compiled pages, what paths lead to and small
+/// static files, and looks at the files again at most once a second: changes
+/// show within a second, and a static file that became a hard link to a file
+/// outside `public/` is no longer served.
+#[test]
+fn production_servers_see_changes_within_a_second() {
+    let dir = std::env::temp_dir().join(format!("phv-prod-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phv.toml", "");
+    write(&dir, "public/index.phv", "<?phv\necho \"one\";\n");
+    write(&dir, "public/site.css", "a{}");
+    write(&dir, "key.pem", "SECRET");
+    let addr = start_with(&dir, false);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(get(addr, "/", "").body, "one");
+    assert_eq!(get(addr, "/site.css", "").body, "a{}");
+    assert_eq!(get(addr, "/new", "").status, 404);
+    // Asked again at once: answered from memory.
+    assert_eq!(get(addr, "/site.css", "").body, "a{}");
+
+    write(&dir, "public/index.phv", "<?phv\necho \"second\";\n");
+    write(&dir, "public/site.css", "b{color:red}");
+    write(&dir, "public/new.phv", "<?phv\necho \"new\";\n");
+    std::thread::sleep(Duration::from_millis(1300));
+    // The first request after a second looks at the files; the next ones see the change.
+    for _ in 0..2 {
+        let _ = (get(addr, "/", ""), get(addr, "/site.css", ""), get(addr, "/new", ""));
+    }
+    assert_eq!(get(addr, "/", "").body, "second");
+    assert_eq!(get(addr, "/site.css", "").body, "b{color:red}");
+    assert_eq!(get(addr, "/new", "").body, "new");
+
+    std::fs::remove_file(dir.join("public/site.css")).unwrap();
+    if std::fs::hard_link(dir.join("key.pem"), dir.join("public/site.css")).is_ok() {
+        std::thread::sleep(Duration::from_millis(1300));
+        for _ in 0..2 {
+            let _ = get(addr, "/site.css", "");
+        }
+        let r = get(addr, "/site.css", "");
+        assert_eq!(r.status, 404, "{}", r.body);
+        assert!(!r.body.contains("SECRET"));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Routes with parameters, middleware that answers or passes values on, and
 /// the site's own error pages.
 #[test]

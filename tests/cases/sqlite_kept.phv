@@ -1,0 +1,23 @@
+<?phv
+// Statements are kept prepared between runs of the same text: the rows still
+// follow changes to the schema (v1.0).
+import std.db.Database;
+$db = Database::open(":memory:");
+$db->execute(sql"CREATE TABLE t (a INTEGER, b TEXT)");
+foreach (1..3 as $i) {
+    $b = "b" . $i;
+    $db->execute(sql"INSERT INTO t (a, b) VALUES ({$i}, {$b})");
+}
+function show(Database $db): void {
+    foreach ($db->query(sql"SELECT * FROM t ORDER BY a") as $row) {
+        echo json_encode($row->toMap()), "\n";
+    }
+}
+show($db);
+$db->execute(sql"ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'new'");
+show($db);
+$db->execute(sql"DROP TABLE t");
+$db->execute(sql"CREATE TABLE t (a INTEGER, z REAL)");
+$db->execute(sql"INSERT INTO t (a, z) VALUES (9, 1.5)");
+show($db);
+echo "empty: ", count($db->query(sql"SELECT * FROM t WHERE a > 100")), "\n";

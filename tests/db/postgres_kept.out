@@ -1,0 +1,10 @@
+first: {"a":1}
+again: {"a":1}
+after ALTER: {"a":1,"b":"x"}
+after DEALLOCATE ALL: {"a":1,"b":"x"}
+dealloc: 1
+after a DEALLOCATE in a function: {"a":1,"b":"x"}
+after another connection's ALTER: {"a":1,"b":"x","c":7}
+in a transaction, after another ALTER: {"a":1,"c":7}
+again in it: {"a":1,"c":7}
+after BEGIN, after another ALTER: {"a":1,"c":7,"d":4}

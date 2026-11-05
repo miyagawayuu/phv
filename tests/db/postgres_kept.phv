@@ -1,0 +1,44 @@
+// Run by crates/phv_driver/tests/databases.rs: statements a connection keeps
+// prepared still give the right rows after the table changes or the statements
+// are deallocated, in a transaction or not.
+import std.db.Database;
+import std.async.{await};
+
+function show(Database $db, string $when): void {
+    echo $when, ": ", json_encode($db->query(sql"SELECT * FROM phv_kept")[0]->toMap()), "\n";
+}
+
+$db = Database::connect("main");
+$db->execute(sql"DROP TABLE IF EXISTS phv_kept");
+$db->execute(sql"CREATE TABLE phv_kept (a int)");
+$db->execute(sql"INSERT INTO phv_kept (a) VALUES (1)");
+$db->execute(sql"CREATE OR REPLACE FUNCTION phv_kept_dealloc() RETURNS int LANGUAGE plpgsql
+    AS 'BEGIN EXECUTE ''DEALLOCATE ALL''; RETURN 1; END'");
+show($db, "first");
+show($db, "again");
+
+// Changed or deallocated by this script.
+$db->execute(sql"ALTER TABLE phv_kept ADD COLUMN b text DEFAULT 'x'");
+show($db, "after ALTER");
+$db->execute(sql"DEALLOCATE ALL");
+show($db, "after DEALLOCATE ALL");
+
+// Deallocated where PHV cannot see it, in a function (created above).
+echo "dealloc: ", $db->first(sql"SELECT phv_kept_dealloc() AS d")?->int("d") ?? 0, "\n";
+show($db, "after a DEALLOCATE in a function");
+
+// Changed by another connection: outside a transaction, then inside one.
+await($db->executeAsync(sql"ALTER TABLE phv_kept ADD COLUMN c int DEFAULT 7"));
+show($db, "after another connection's ALTER");
+await($db->executeAsync(sql"ALTER TABLE phv_kept DROP COLUMN b"));
+$db->transaction(function () use ($db): void {
+    show($db, "in a transaction, after another ALTER");
+    show($db, "again in it");
+});
+$db->execute(sql"BEGIN");
+await($db->executeAsync(sql"ALTER TABLE phv_kept ADD COLUMN d int DEFAULT 4"));
+show($db, "after BEGIN, after another ALTER");
+$db->execute(sql"COMMIT");
+
+$db->execute(sql"DROP TABLE phv_kept");
+$db->execute(sql"DROP FUNCTION phv_kept_dealloc()");

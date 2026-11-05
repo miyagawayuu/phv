@@ -30,3 +30,4 @@ error: error deserializing column 0: PHV cannot read values of type interval; ca
 error: PostgreSQL has no last insert id; use `INSERT ... RETURNING id` with first()
 cast: 1 day
 shared: 1
+aborted: division by zero

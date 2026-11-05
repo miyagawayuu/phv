@@ -231,6 +231,8 @@ pub fn test(paths: Vec<PathBuf>, opts: TestOptions) -> ExitCode {
     let start = Instant::now();
     let mut sites: std::collections::HashMap<PathBuf, Option<std::sync::Arc<dyn phv_vm::Site>>> =
         std::collections::HashMap::new();
+    // phv.toml of each project, read once however many test files it has.
+    let mut configs: std::collections::HashMap<PathBuf, phv_driver::Config> = std::collections::HashMap::new();
     for file in files {
         let root = find_root(&file);
         let shown = file.display().to_string();
@@ -268,7 +270,9 @@ pub fn test(paths: Vec<PathBuf>, opts: TestOptions) -> ExitCode {
         if tests.is_empty() {
             say("  (no test_* or #[Test] functions)".into());
         }
-        let config = load_config(&root).unwrap_or_else(|_| phv_driver::Config::default_for(&root));
+        let config = configs
+            .entry(root.clone())
+            .or_insert_with(|| load_config(&root).unwrap_or_else(|_| phv_driver::Config::default_for(&root)));
         // A project with public/ gets its site, for `std.testing`.
         let mut host = (*config.host).clone();
         if root.join("public").is_dir() {

@@ -1,3 +1,5 @@
 temp table: gone
 application_name: 
 uncommitted rows: 0
+prepared statements: 0
+same connection: true

@@ -83,7 +83,10 @@ fn in_nullsafe_chain(e: &Expr) -> bool {
 
 /// Replaces type parameters (a function's own, and a class's while it is
 /// created) with inference variables.
-pub(super) fn instantiate(t: &Type, tps: &[String]) -> Type {
+pub(super) fn instantiate(t: &Type, tps: &[Name]) -> Type {
+    if !super::has_param(t) {
+        return t.clone();
+    }
     match t {
         Type::Param(n) => match tps.iter().position(|p| p == n) {
             Some(i) => Type::Generic(i as u8),
@@ -1308,15 +1311,17 @@ impl<'a> Checker<'a> {
     pub(crate) fn invoke_with(
         &mut self,
         fid: FuncId,
-        fixed: &[(String, Type)],
-        infer: &[String],
+        fixed: &[(Name, Type)],
+        infer: &[Name],
         args: &[Arg],
         span: Span,
     ) -> (Vec<HExpr>, Type, Vec<Type>) {
-        let reason = self.deprecated_funcs.get(&fid).cloned();
-        let what = format!("`{}`", self.funcs[fid as usize].name);
         let owner = self.funcs[fid as usize].class;
-        self.warn_deprecated(what, reason, owner, span);
+        // The warning's text is made only for a deprecated function.
+        if let Some(reason) = self.deprecated_funcs.get(&fid).cloned() {
+            let what = format!("`{}`", self.funcs[fid as usize].name);
+            self.warn_deprecated(what, Some(reason), owner, span);
+        }
         let info = &self.funcs[fid as usize];
         let (mut params, mut ret, fname) = (info.params.clone(), info.ret.clone(), info.name.clone());
         // The parameters to infer become variables first: the receiver's type
@@ -1332,7 +1337,7 @@ impl<'a> Checker<'a> {
             ret = instantiate(&ret, &tps);
         }
         if !fixed.is_empty() {
-            let (names, tys): (Vec<String>, Vec<Type>) = fixed.iter().cloned().unzip();
+            let (names, tys): (Vec<Name>, Vec<Type>) = fixed.iter().cloned().unzip();
             // Through a receiver whose type arguments are not known (`is Box`),
             // parameters accept nothing that needs them, and results are `any`.
             for p in params.iter_mut() {
@@ -1350,7 +1355,7 @@ impl<'a> Checker<'a> {
         if let Some(c) = owner.filter(|_| infer.is_empty() && !fixed.is_empty()) {
             if self.funcs[fid as usize].kind == FuncKind::Ctor {
                 if let Some(cb) = self.class_bounds.get(&c).cloned() {
-                    let (names, tys): (Vec<String>, Vec<Type>) = fixed.iter().cloned().unzip();
+                    let (names, tys): (Vec<Name>, Vec<Type>) = fixed.iter().cloned().unzip();
                     self.check_bounds(&format!("`{}`", self.class_names[c as usize]), &names, &cb, &tys, span);
                 }
             }
@@ -1363,7 +1368,7 @@ impl<'a> Checker<'a> {
             let bounds: Vec<Option<Type>> = if fixed.is_empty() {
                 bounds
             } else {
-                let (names, tys): (Vec<String>, Vec<Type>) = fixed.iter().cloned().unzip();
+                let (names, tys): (Vec<Name>, Vec<Type>) = fixed.iter().cloned().unzip();
                 bounds.into_iter().map(|t| t.map(|t| super::subst_params(&t, &names, &tys))).collect()
             };
             self.check_bounds(&format!("`{fname}`"), &tps, &bounds, &actual, span);
@@ -1760,9 +1765,10 @@ impl<'a> Checker<'a> {
         args: &[Arg],
         span: Span,
     ) -> HExpr {
-        let overloads: Vec<(Vec<Type>, Type, &'static str)> = self
+        // Borrowed from the signatures parsed once per process.
+        let overloads: Vec<(&'static [Type], &'static Type, &'static str)> = self
             .builtin_overloads(name, recv_kind)
-            .map(|v| v.iter().map(|b| (b.params.clone(), b.ret.clone(), b.sig.imp)).collect())
+            .map(|v| v.iter().map(|b| (b.params.as_slice(), &b.ret, b.sig.imp)).collect())
             .unwrap_or_default();
         for a in args {
             if let Some((_, nspan)) = &a.name {
@@ -1771,7 +1777,7 @@ impl<'a> Checker<'a> {
         }
         let offset = recv.is_some() as usize;
         let nargs = args.len() + offset;
-        let cands: Vec<&(Vec<Type>, Type, &str)> = overloads.iter().filter(|o| o.0.len() == nargs).collect();
+        let cands: Vec<&(&[Type], &Type, &str)> = overloads.iter().filter(|o| o.0.len() == nargs).collect();
         let display = if recv.is_some() { format!("->{name}()") } else { format!("{name}()") };
         if cands.is_empty() {
             let mut counts: Vec<usize> = overloads.iter().map(|o| o.0.len() - offset).collect();
@@ -1786,7 +1792,7 @@ impl<'a> Checker<'a> {
             return err(span);
         }
         if cands.len() == 1 {
-            let (params, ret, imp) = cands[0].clone();
+            let (params, ret, imp) = *cands[0];
             let mut b: Bindings = Default::default();
             let mut out = Vec::new();
             if let Some(r) = recv {
@@ -1808,7 +1814,7 @@ impl<'a> Checker<'a> {
                 let h = if target.has_unknown() { h } else { self.coerce(h, &target) };
                 out.push(h);
             }
-            let ret = subst(&ret, &b);
+            let ret = subst(ret, &b);
             let ret = if ret.has_unknown() { Type::Error } else { ret };
             if out.iter().any(|h| matches!(h.ty, Type::Func(..))) {
                 self.clear_prop_facts();
@@ -1855,7 +1861,7 @@ impl<'a> Checker<'a> {
         let types: Vec<String> = hargs.iter().map(|h| self.tn(&h.ty)).collect();
         let msg = format!("no version of `{display}` accepts ({})", types.join(", "));
         let sigs: Vec<String> =
-            cands.iter().map(|(p, r, _)| self.tn(&Type::Func(p.clone(), Box::new(r.clone())))).collect();
+            cands.iter().map(|(p, r, _)| self.tn(&Type::Func(p.to_vec(), Box::new((*r).clone())))).collect();
         self.error(msg, span).add_note(format!("available: {}", sigs.join(", ")));
         err(span)
     }
@@ -2604,7 +2610,7 @@ impl<'a> Checker<'a> {
         span: Span,
     ) -> Option<(Vec<Type>, Option<HExpr>)> {
         let wrap = "write a closure instead, e.g. `fn(string $s): string => ...`";
-        let user = |this: &mut Self, fid: FuncId, fixed: &[(String, Type)]| -> Option<Vec<Type>> {
+        let user = |this: &mut Self, fid: FuncId, fixed: &[(Name, Type)]| -> Option<Vec<Type>> {
             let info = &this.funcs[fid as usize];
             let name = info.name.clone();
             if !info.type_params.is_empty() {
@@ -2615,7 +2621,7 @@ impl<'a> Checker<'a> {
                 this.error(format!("`{name}` is variadic and cannot be used as a value"), span).add_note(wrap);
                 return None;
             }
-            let (names, tys): (Vec<String>, Vec<Type>) = fixed.iter().cloned().unzip();
+            let (names, tys): (Vec<Name>, Vec<Type>) = fixed.iter().cloned().unzip();
             Some(info.params.iter().map(|p| super::subst_params(&p.ty, &names, &tys).resolve_open(false)).collect())
         };
         match &call.kind {

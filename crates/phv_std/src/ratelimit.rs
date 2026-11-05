@@ -178,6 +178,27 @@ mod tests {
         assert!(!hit("test:flood-victim", 1, day), "still limited after the flood");
     }
 
+    /// A store that cannot be reached is not asked again for a few seconds:
+    /// the next hits fail at once, with the same error.
+    #[test]
+    fn an_unreachable_store_is_not_waited_for_again() {
+        let spec =
+            phv_vm::DatabaseSpec { url: Some("redis://127.0.0.1:1".into()), url_env: None, tls: None, pool_size: 2 };
+        let host = phv_vm::Host {
+            databases: std::collections::BTreeMap::from([("limits".to_string(), spec)]),
+            rate_limit_store: Some("limits".into()),
+            ..phv_vm::Host::default()
+        };
+        let until = || Instant::now() + Duration::from_secs(5);
+        let first = hit_shared(&host, "test:down", 3, Duration::from_secs(60), until()).unwrap_err();
+        let start = Instant::now();
+        for _ in 0..20 {
+            assert_eq!(hit_shared(&host, "test:down", 3, Duration::from_secs(60), until()).unwrap_err(), first);
+        }
+        assert_eq!(reset_shared(&host, "test:down", until()).unwrap_err(), first);
+        assert!(start.elapsed() < Duration::from_millis(500), "took {:?}", start.elapsed());
+    }
+
     #[test]
     fn groups_ipv6_by_prefix() {
         let a: std::net::IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();

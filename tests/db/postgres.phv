@@ -100,8 +100,17 @@ echo "cast: ", $db->first(sql"SELECT interval '1 day'::text AS i")?->string("i")
 $again = Database::connect("main");
 echo "shared: ", $again->first(sql"SELECT 1 AS one")?->int("one") ?? 0, "\n";
 
-// State left for the next script: it must not see it.
+// State left for the next script: it must not see it (on the same connection).
+$db->execute(sql"DROP TABLE IF EXISTS phv_pid");
+$db->execute(sql"CREATE TABLE phv_pid AS SELECT pg_backend_pid() AS pid");
 $db->execute(sql"CREATE TEMP TABLE phv_temp (x int)");
 $db->execute(sql"SET application_name = 'leaked'");
 $db->execute(sql"BEGIN");
 $db->execute(sql"INSERT INTO phv_items (name) VALUES ('uncommitted')");
+$db->execute(sql"PREPARE phv_leak AS SELECT 1");
+// A failed statement leaves the transaction aborted.
+try {
+    $db->execute(sql"SELECT 1 / 0");
+} catch (DatabaseError $e) {
+    echo "aborted: ", $e->message, "\n";
+}

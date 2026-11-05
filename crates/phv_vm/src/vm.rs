@@ -9,6 +9,7 @@ pub use crate::jit::{JitCtx, JitEntry, JitLimits, JitTable};
 use crate::value::*;
 use indexmap::IndexMap;
 use std::cell::RefCell;
+use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,7 +24,25 @@ pub struct TraceLine {
 
 pub struct Exc {
     pub value: Value,
+    /// Where the exception was first thrown, innermost call first. Filled in
+    /// when it leaves the outermost call (`Vm::call_function`); until then
+    /// only `at` is kept.
     pub trace: Vec<TraceLine>,
+    at: Option<Box<ThrownAt>>,
+}
+
+impl Exc {
+    /// An exception carrying `value`, not thrown yet.
+    pub fn new(value: Value) -> Exc {
+        Exc { value, trace: Vec::new(), at: None }
+    }
+}
+
+/// The calls on the stack where an exception was first thrown: `(function,
+/// pc)` of each call kept, innermost first, and how many calls there were.
+struct ThrownAt {
+    calls: Vec<(u32, u32)>,
+    depth: usize,
 }
 
 pub enum VmError {
@@ -335,6 +354,12 @@ impl std::fmt::Debug for HttpSpec {
 
 const MAX_NATIVE_DEPTH: u32 = 200;
 
+/// Exception traces keep this many innermost and outermost calls.
+const TRACE_ENDS: usize = 50;
+
+/// `==` checks the time limit every this many bytes compared.
+const EQUAL_STEP: usize = 16 << 20;
+
 pub(crate) const BUDGET: u32 = 10_000;
 
 /// Gives the record of objects room for as many again as it holds (at least
@@ -456,6 +481,11 @@ const GUARDED_OUTPUT: &str = "a function wrote output inside a `<script>`, an at
 
 pub struct Vm {
     pub prog: Arc<Program>,
+    /// `prog` again, for `dispatch`: a callback from a builtin (`sortBy`,
+    /// `map` ...) enters it once per call, and counting this reference is
+    /// cheaper than an atomic count of the `Arc`.
+    #[allow(clippy::redundant_allocation)]
+    code: Rc<Arc<Program>>,
     builtins: Arc<[BuiltinFn]>,
     regs: Vec<Value>,
     frames: Vec<Frame>,
@@ -488,8 +518,16 @@ pub struct Vm {
     pub rng: u64,
     native_depth: u32,
     argbuf: Vec<Value>,
-    /// Enum cases are singletons within one VM (one request).
-    enum_cache: std::collections::HashMap<(u32, u32), Value>,
+    /// The keys of a path assignment (`SetPath`, `AppendPath`), kept for reuse.
+    keybuf: Vec<Value>,
+    /// The arguments of a native call that may have to run again in the
+    /// interpreter (see `call_jit`), kept for reuse.
+    jit_rerun: Vec<Value>,
+    /// Enum cases are singletons within one VM (one request): per class, per case.
+    enum_cache: Vec<Vec<Option<Value>>>,
+    /// Per class: the default values of its fields, made once and copied
+    /// into each new object.
+    field_defaults: RefCell<Vec<Option<Vec<Value>>>>,
     /// `phv dap`: called before each statement (see `DebugHook`).
     pub debug: Option<Box<dyn DebugHook>>,
     /// `phv run --profile`: calls and time per function (the JIT is not used then).
@@ -597,11 +635,16 @@ pub(crate) fn op_concat(
         mem.reserve(need)?;
     }
     let mut s = String::with_capacity(size);
-    for p in parts {
-        match p {
+    // The operands are temporaries the compiler made for this instruction:
+    // the strings are moved out, so that they do not stay shared.
+    for p in &mut regs[start as usize..start as usize + n as usize] {
+        match &*p {
             // An `Html` result never contains unescaped plain strings.
             Value::Str(x) if html => html_escape_into(x, &mut s),
             v => v.append_to(&mut s),
+        }
+        if matches!(p, Value::Str(_) | Value::Html(_)) {
+            *p = Value::Null;
         }
     }
     let big = s.len() > 1 << 20;
@@ -628,17 +671,23 @@ pub(crate) fn str_len(v: &Value) -> usize {
 /// Returns the bytes it went over (appended, and copied when the string was shared).
 pub(crate) fn op_append(regs: &mut [Value], mem: MemLimit, d: Reg, s: Reg) -> Result<usize, usize> {
     let src = regs[s as usize].clone();
-    let grow = match &src {
+    append_value(&mut regs[d as usize], &src, mem)
+}
+
+/// `$target .= $src` on a string, in place when it is not shared (see `op_append`).
+#[inline]
+fn append_value(target: &mut Value, src: &Value, mem: MemLimit) -> Result<usize, usize> {
+    let grow = match src {
         Value::Str(x) | Value::Html(x) => x.len(),
         _ => 24,
     };
-    let (cur, shared) = match &regs[d as usize] {
+    let (cur, shared) = match &*target {
         Value::Str(x) => (x.capacity(), Rc::strong_count(x) > 1),
         _ => (0, false),
     };
     // A string also held elsewhere is copied first (found by the 1.0 audit:
     // `$t = $s; $s .= "x";` copied 20 MB untimed and unaccounted).
-    let copied = if shared { str_len(&regs[d as usize]) } else { 0 };
+    let copied = if shared { str_len(target) } else { 0 };
     if copied > 0 {
         mem.reserve(copied.saturating_add(grow))?;
     }
@@ -646,7 +695,7 @@ pub(crate) fn op_append(regs: &mut [Value], mem: MemLimit, d: Reg, s: Reg) -> Re
         // The string may double its buffer.
         mem.reserve(grow.max(cur) * 2)?;
     }
-    let len = match &mut regs[d as usize] {
+    let len = match target {
         Value::Str(rc) => {
             let s = Rc::make_mut(rc);
             src.append_to(s);
@@ -658,6 +707,88 @@ pub(crate) fn op_append(regs: &mut [Value], mem: MemLimit, d: Reg, s: Reg) -> Re
         mem.check()?;
     }
     Ok(grow + copied)
+}
+
+/// Why a path assignment failed: the memory limit (holding the limit), or an
+/// exception (`IndexError`, `KeyError`) with its class and message.
+pub(crate) enum PathError {
+    Memory(usize),
+    Throw(&'static str, String),
+}
+
+impl From<(&'static str, String)> for PathError {
+    fn from((class, msg): (&'static str, String)) -> PathError {
+        PathError::Throw(class, msg)
+    }
+}
+
+/// `cur . src`, as `Concat` makes it.
+fn concat_pair(cur: Value, src: &Value, mem: MemLimit) -> Result<Value, usize> {
+    let mut pair = [cur, src.clone()];
+    op_concat(&mut pair, mem, 0, 0, 2, false)?;
+    Ok(std::mem::take(&mut pair[0]))
+}
+
+/// `AppendPath` on `target` (a variable or a property) with the values of its
+/// keys: `src` is appended to the string at the end of the path in place,
+/// when it is still `cur` (the value read before `src` was evaluated);
+/// otherwise the element becomes `cur . src`, as the assignment of that
+/// would make it. Returns the bytes gone over (see `Vm::long_op`).
+pub(crate) fn path_append(
+    target: &mut Value,
+    keys: &[Value],
+    create: &[Option<Const>],
+    cur: Value,
+    src: &Value,
+    mem: MemLimit,
+) -> Result<usize, PathError> {
+    let slot = match keys.split_last() {
+        None => target,
+        Some((last, inner)) => {
+            let mut c = target;
+            for (i, k) in inner.iter().enumerate() {
+                c = index_mut(c, k, create.get(i).and_then(|c| c.as_ref()))?;
+            }
+            match c {
+                Value::List(l) => {
+                    let len = l.len();
+                    let i = match last {
+                        Value::Int(i) => *i,
+                        v => bad("int", v),
+                    };
+                    match usize::try_from(i).ok().filter(|i| *i < len) {
+                        Some(i) => &mut Rc::make_mut(l)[i],
+                        None => {
+                            return Err(("IndexError", format!("list index {i} is out of range (length {len})")).into())
+                        }
+                    }
+                }
+                Value::Map(m) => match Rc::make_mut(m).entry(last.to_key()) {
+                    indexmap::map::Entry::Occupied(e) => e.into_mut(),
+                    // Removed while `src` was evaluated: set again.
+                    indexmap::map::Entry::Vacant(e) => {
+                        let v = concat_pair(cur, src, mem).map_err(PathError::Memory)?;
+                        let n = str_len(&v);
+                        e.insert(v);
+                        return Ok(n);
+                    }
+                },
+                v => bad("list or map", v),
+            }
+        }
+    };
+    match (&*slot, &cur) {
+        (Value::Str(a), Value::Str(b)) if Rc::ptr_eq(a, b) => {
+            drop(cur);
+            append_value(slot, src, mem).map_err(PathError::Memory)
+        }
+        _ => {
+            let v = concat_pair(cur, src, mem).map_err(PathError::Memory)?;
+            let n = str_len(&v);
+            *slot = v;
+            Ok(n)
+        }
+    }
 }
 
 /// Ordering of two floats for `<`, `<=` and `<=>`, like `compare` (NaN compares equal).
@@ -678,6 +809,23 @@ pub fn const_value(c: &Const) -> Value {
     }
 }
 
+/// `values_equal(&const_value(c), v)`, without making the constant's value.
+fn const_equal(c: &Const, v: &Value) -> bool {
+    match (c, v) {
+        (Const::Null, Value::Null) => true,
+        (Const::Bool(x), Value::Bool(y)) => x == y,
+        (Const::Int(x), Value::Int(y)) => x == y,
+        (Const::Int(x), Value::Float(y)) => (*x as f64) == *y,
+        (Const::Float(x), Value::Float(y)) => x == y,
+        (Const::Float(x), Value::Int(y)) => *x == (*y as f64),
+        (Const::Str(x), Value::Str(y)) => x.as_str() == y.as_str(),
+        (Const::EmptyList, Value::List(l)) => l.is_empty(),
+        (Const::EmptyMap, Value::Map(m)) => m.is_empty(),
+        (Const::EmptySet, Value::Set(s)) => s.is_empty(),
+        _ => false,
+    }
+}
+
 impl Vm {
     pub fn new(prog: Arc<Program>, builtins: Arc<[BuiltinFn]>, html_output: bool, limits: Limits) -> Vm {
         use std::hash::{BuildHasher, Hasher};
@@ -686,6 +834,7 @@ impl Vm {
         let seed = h.finish() | 1;
         let nconsts = prog.consts.len();
         Vm {
+            code: Rc::new(Arc::clone(&prog)),
             prog,
             builtins,
             regs: Vec::with_capacity(256),
@@ -709,7 +858,10 @@ impl Vm {
             rng: seed,
             native_depth: 0,
             argbuf: Vec::new(),
-            enum_cache: std::collections::HashMap::new(),
+            keybuf: Vec::new(),
+            jit_rerun: Vec::new(),
+            enum_cache: Vec::new(),
+            field_defaults: RefCell::new(Vec::new()),
             objects: RefCell::new(Vec::new()),
             gc_next: std::cell::Cell::new(GC_FIRST),
             gc_due: std::cell::Cell::new(false),
@@ -748,10 +900,8 @@ impl Vm {
     /// Calls a closure value from Rust.
     pub fn call_value(&mut self, callee: &Value, args: &[Value]) -> Result<Value, VmError> {
         match callee {
-            Value::Closure(c) => {
-                let c = c.clone();
-                self.call_inner(c.func, &c.caps, args)
-            }
+            // `callee` is not in the VM, so its captures need no copy of the closure.
+            Value::Closure(c) => self.call_inner(c.func, &c.caps, args),
             v => bad("closure", v),
         }
     }
@@ -759,12 +909,21 @@ impl Vm {
     /// `==` of two values: comparing large strings or lists can take long in one
     /// step, so the time limit is checked every 16 MB compared.
     pub fn equal(&self, a: &Value, b: &Value) -> Result<bool, VmError> {
+        // Scalars and strings shorter than one timed step are compared at
+        // once; lists, maps, sets and longer strings take the metered walk.
+        let long = matches!((a, b), (Value::Str(x), Value::Str(y)) | (Value::Html(x), Value::Html(y))
+            if x.len().min(y.len()) + 1 >= EQUAL_STEP);
+        if !long {
+            if let Some(r) = crate::value::flat_equal(a, b) {
+                return Ok(r);
+            }
+        }
         let deadline = self.deadline;
         let mut since = 0usize;
         let mut late = false;
         let r = crate::value::values_equal_metered(a, b, &mut |bytes| {
             since += bytes;
-            if since >= 16 << 20 {
+            if since >= EQUAL_STEP {
                 since = 0;
                 late = deadline.is_some_and(|d| Instant::now() > d);
             }
@@ -795,8 +954,12 @@ impl Vm {
         }
         self.frames.push(Frame { func, pc: 0, base, ret: 0, stop: true });
         self.native_depth += 1;
-        let r = self.exec();
+        let mut r = self.exec();
         self.native_depth -= 1;
+        if let (Err(VmError::Exception(e)), true) = (&mut r, self.frames.is_empty()) {
+            // Leaving the outermost call: the trace is read now.
+            self.fill_trace(e);
+        }
         r
     }
 
@@ -839,13 +1002,13 @@ impl Vm {
             return VmError::Fatal(format!("{class}: {}", msg.into()));
         };
         let cls = &self.prog.classes[cid as usize];
-        let mut fields: Vec<Value> = cls.fields.iter().map(|f| const_value(&f.default)).collect();
+        let mut fields = self.new_fields(cid);
         if let Some(i) = cls.fields.iter().position(|f| f.name == "message") {
             fields[i] = Value::str(msg);
         }
         let obj = Rc::new(RefCell::new(Object { class: cid, fields }));
         self.track(&obj);
-        VmError::Exception(Box::new(Exc { value: Value::Object(obj), trace: Vec::new() }))
+        VmError::Exception(Box::new(Exc::new(Value::Object(obj))))
     }
 
     /// `ClassName: message` for an exception value, then `(caused by ...)` for
@@ -937,14 +1100,28 @@ impl Vm {
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
 
+    /// The fields of a new object of `class`, with their default values.
+    pub fn new_fields(&self, class: u32) -> Vec<Value> {
+        let mut defaults = self.field_defaults.borrow_mut();
+        if defaults.is_empty() {
+            defaults.resize(self.prog.classes.len(), None);
+        }
+        defaults[class as usize]
+            .get_or_insert_with(|| {
+                self.prog.classes[class as usize].fields.iter().map(|f| const_value(&f.default)).collect()
+            })
+            .clone()
+    }
+
     /// The singleton object for case `idx` of enum `class`.
     pub fn enum_case(&mut self, class: u32, idx: u32) -> Value {
-        if let Some(v) = self.enum_cache.get(&(class, idx)) {
+        let (c, i) = (class as usize, idx as usize);
+        if let Some(Some(v)) = self.enum_cache.get(c).and_then(|cases| cases.get(i)) {
             return v.clone();
         }
-        let cls = &self.prog.classes[class as usize];
-        let (name, value) = &cls.cases[idx as usize];
-        let mut fields: Vec<Value> = cls.fields.iter().map(|f| const_value(&f.default)).collect();
+        let cls = &self.prog.classes[c];
+        let (name, value) = &cls.cases[i];
+        let mut fields = self.new_fields(class);
         if let Some(i) = cls.fields.iter().position(|f| f.name == "name") {
             fields[i] = Value::str(name.as_str());
         }
@@ -952,7 +1129,14 @@ impl Vm {
             fields[i] = const_value(value);
         }
         let v = Value::Object(Rc::new(RefCell::new(Object { class, fields })));
-        self.enum_cache.insert((class, idx), v.clone());
+        if self.enum_cache.len() <= c {
+            self.enum_cache.resize(self.prog.classes.len().max(c + 1), Vec::new());
+        }
+        let cases = &mut self.enum_cache[c];
+        if cases.len() <= i {
+            cases.resize(self.prog.classes[c].cases.len().max(i + 1), None);
+        }
+        cases[i] = Some(v.clone());
         v
     }
 
@@ -965,55 +1149,73 @@ impl Vm {
         v
     }
 
-    fn trace(&self) -> Vec<TraceLine> {
-        // At most the 50 innermost and 50 outermost calls, with names of at most
-        // 200 characters: a deep recursion with long names would otherwise build
-        // hundreds of MB for one exception.
-        const ENDS: usize = 50;
-        let short = |s: &str| -> String {
-            match s.char_indices().nth(200) {
-                Some((i, _)) => format!("{}...", &s[..i]),
-                None => s.to_string(),
-            }
-        };
+    /// The calls on the stack now (see `ThrownAt`). At most the 50 innermost
+    /// and 50 outermost are kept: a deep recursion would otherwise build
+    /// hundreds of MB for one exception.
+    fn thrown_at(&self) -> ThrownAt {
         let n = self.frames.len();
-        let mut lines: Vec<TraceLine> = self
+        let calls = self
             .frames
             .iter()
             .rev()
             .enumerate()
-            .filter(|(i, _)| *i < ENDS || *i >= n.saturating_sub(ENDS))
-            .map(|(_, f)| {
-                let func = &self.prog.funcs[f.func as usize];
-                let file = &self.prog.files[func.file as usize];
-                let off = func.offsets.get((f.pc as usize).saturating_sub(1)).copied().unwrap_or(0);
-                let line = match file.line_starts.binary_search(&off) {
-                    Ok(i) => i,
-                    Err(i) => i.saturating_sub(1),
-                } + 1;
-                TraceLine { func: short(&func.name), file: short(&file.name), line }
-            })
+            .filter(|(i, _)| *i < TRACE_ENDS || *i >= n.saturating_sub(TRACE_ENDS))
+            .map(|(_, f)| (f.func, f.pc))
             .collect();
-        if n > 2 * ENDS {
-            let skipped = n - 2 * ENDS;
-            lines.insert(
-                ENDS,
-                TraceLine { func: format!("... {skipped} more calls ..."), file: String::new(), line: 0 },
-            );
+        ThrownAt { calls, depth: n }
+    }
+
+    /// Calls `line` with the function, file and line of each call of `at`
+    /// (names of at most 200 characters), and a line for the calls left out.
+    fn trace_lines(&self, at: &ThrownAt, mut line: impl FnMut(&str, &str, usize)) {
+        fn short(s: &str) -> std::borrow::Cow<'_, str> {
+            match s.char_indices().nth(200) {
+                Some((i, _)) => format!("{}...", &s[..i]).into(),
+                None => s.into(),
+            }
         }
-        lines
+        for (k, &(f, pc)) in at.calls.iter().enumerate() {
+            if k == TRACE_ENDS && at.depth > 2 * TRACE_ENDS {
+                line(&format!("... {} more calls ...", at.depth - 2 * TRACE_ENDS), "", 0);
+            }
+            let func = &self.prog.funcs[f as usize];
+            let file = &self.prog.files[func.file as usize];
+            let off = func.offsets.get((pc as usize).saturating_sub(1)).copied().unwrap_or(0);
+            let n = match file.line_starts.binary_search(&off) {
+                Ok(i) => i,
+                Err(i) => i.saturating_sub(1),
+            } + 1;
+            line(&short(&func.name), &short(&file.name), n);
+        }
+    }
+
+    /// Fills in `e.trace` from where it was first thrown.
+    fn fill_trace(&self, e: &mut Exc) {
+        if let Some(at) = &e.at {
+            let mut lines = Vec::with_capacity(at.calls.len() + 1);
+            self.trace_lines(at, |func, file, line| {
+                lines.push(TraceLine { func: func.to_string(), file: file.to_string(), line })
+            });
+            e.trace = lines;
+        }
     }
 
     /// Stores where an exception was first thrown in its `trace` field, which
     /// `getTraceAsString()` returns. A rethrown exception keeps the first one.
     fn record_trace(&self, e: &Exc) {
-        let Value::Object(o) = &e.value else { return };
+        let (Value::Object(o), Some(at)) = (&e.value, &e.at) else { return };
         let mut o = o.borrow_mut();
         let cls = &self.prog.classes[o.class as usize];
         let Some(i) = cls.fields.iter().position(|f| f.name == "trace") else { return };
         if matches!(&o.fields[i], Value::Str(s) if s.is_empty()) {
-            let lines: Vec<String> = e.trace.iter().map(|t| format!("at {} ({}:{})", t.func, t.file, t.line)).collect();
-            o.fields[i] = Value::str(lines.join("\n"));
+            let mut text = String::new();
+            self.trace_lines(at, |func, file, line| {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                let _ = write!(text, "at {func} ({file}:{line})");
+            });
+            o.fields[i] = Value::str(text);
         }
     }
 
@@ -1045,21 +1247,27 @@ impl Vm {
         Ok(())
     }
 
-    /// Runs natively compiled function `func` with arguments `args`. When the
-    /// native code runs out of stack, gives the arguments back (`Err`) so the
-    /// interpreter runs the call: compiled functions have no side effects (only
-    /// arithmetic, strings and calls to other compiled functions), so running
-    /// it again gives the same result.
-    fn call_jit(&mut self, entry: JitEntry, func: u32, args: Vec<Value>) -> Result<Result<Value, Vec<Value>>, VmError> {
-        let prog = Arc::clone(&self.prog);
-        let sig =
-            prog.funcs[func as usize].native.as_ref().expect("JIT entry for a function without a native signature");
+    /// Runs natively compiled function `func` (whose native signature is
+    /// `sig`) with the `argc` arguments in the registers from `start`, which
+    /// it moves out as an interpreted call does. When the native code runs
+    /// out of stack, puts the arguments back and returns None, so that the
+    /// interpreter runs the call: compiled functions have no side effects
+    /// (only arithmetic, strings and calls to other compiled functions), so
+    /// running it again gives the same result.
+    fn call_jit(
+        &mut self,
+        entry: JitEntry,
+        func: u32,
+        sig: &NativeSig,
+        start: usize,
+        argc: usize,
+    ) -> Result<Option<Value>, VmError> {
         // The JIT compiles at most 16 parameters.
         let mut raw = [0i64; 16];
-        if args.len() != sig.params.len() {
-            panic!("phv vm: native call with {} arguments for {} parameters", args.len(), sig.params.len());
+        if argc != sig.params.len() {
+            panic!("phv vm: native call with {argc} arguments for {} parameters", sig.params.len());
         }
-        for (i, (a, k)) in args.iter().zip(&sig.params).enumerate() {
+        for (i, (a, k)) in self.regs[start..start + argc].iter().zip(&sig.params).enumerate() {
             raw[i] = match (k, a) {
                 (ValKind::Int, Value::Int(n)) => *n,
                 (ValKind::Bool, Value::Bool(b)) => *b as i64,
@@ -1076,11 +1284,21 @@ impl Vm {
         rt.consts = std::mem::take(&mut self.consts);
         // Strings and lists are moved into the native call's window: kept for
         // a rerun, unless the function changes them in place (found by the 1.0
-        // audit: the kept copy made that change copy a whole list).
-        let writes = self.jit.as_ref().is_some_and(|j| j.writes_args.get(func as usize).copied().unwrap_or(true));
-        let strings = (sig.params.iter().any(|p| p.boxed()) && !writes).then(|| args.clone());
+        // audit: the kept copy made that change copy a whole list). Numbers
+        // are passed in `raw` and stay in their registers.
         let boxed_args = sig.params.iter().any(|p| p.boxed());
-        rt.start(args);
+        let writes = self.jit.as_ref().is_some_and(|j| j.writes_args.get(func as usize).copied().unwrap_or(true));
+        let kept = boxed_args && !writes;
+        let args = &mut self.regs[start..start + argc];
+        if kept {
+            self.jit_rerun.clear();
+            self.jit_rerun.extend(args.iter().cloned());
+        }
+        if boxed_args {
+            rt.start(args);
+        } else {
+            rt.start(&mut []);
+        }
         // Native code nested in this call (through the interpreter) shares the
         // outermost call's stack limit.
         let outermost = self.jit_stack_limit == 0;
@@ -1109,25 +1327,25 @@ impl Vm {
         self.consts = std::mem::take(&mut rt.consts);
         self.jit_rt = rt;
         self.budget = ctx.budget.clamp(1, BUDGET as i64) as u32;
-        match ctx.error {
+        let error = ctx.error;
+        // The kept arguments are dropped now, so that they do not keep the
+        // values shared; only a rerun takes them back.
+        let rerun = if error == JIT_ERR_STACK && kept {
+            for (r, v) in self.regs[start..start + argc].iter_mut().zip(self.jit_rerun.drain(..)) {
+                *r = v;
+            }
+            true
+        } else {
+            self.jit_rerun.clear();
+            false
+        };
+        match error {
             0 => {}
-            JIT_ERR_STACK if boxed_args && strings.is_none() => {
+            JIT_ERR_STACK if boxed_args && !rerun => {
                 return Err(VmError::Fatal("maximum call stack depth exceeded".into()));
             }
-            JIT_ERR_STACK => {
-                let args = strings.unwrap_or_else(|| {
-                    sig.params
-                        .iter()
-                        .zip(raw)
-                        .map(|(k, r)| match k {
-                            ValKind::Bool => Value::Bool(r != 0),
-                            ValKind::Float => Value::Float(f64::from_bits(r as u64)),
-                            _ => Value::Int(r),
-                        })
-                        .collect()
-                });
-                return Ok(Err(args));
-            }
+            // The arguments are in their registers again (numbers were never moved).
+            JIT_ERR_STACK => return Ok(None),
             JIT_ERR_OVERFLOW => return Err(self.throw("ArithmeticError", "integer overflow")),
             JIT_ERR_DIV_ZERO => return Err(self.throw("DivisionByZeroError", "modulo by zero")),
             JIT_ERR_FDIV_ZERO => return Err(self.throw("DivisionByZeroError", "division by zero")),
@@ -1147,7 +1365,7 @@ impl Vm {
                 return Err(VmError::Fatal(format!("maximum execution time of {secs} seconds exceeded")));
             }
         }
-        Ok(Ok(match sig.ret {
+        Ok(Some(match sig.ret {
             ValKind::Int => Value::Int(r),
             ValKind::Bool => Value::Bool(r != 0),
             ValKind::Float => Value::Float(f64::from_bits(r as u64)),
@@ -1251,8 +1469,8 @@ impl Vm {
             match self.dispatch() {
                 Ok(v) => return Ok(v),
                 Err(VmError::Exception(mut e)) => {
-                    if e.trace.is_empty() {
-                        e.trace = self.trace();
+                    if e.at.is_none() {
+                        e.at = Some(Box::new(self.thrown_at()));
                         self.record_trace(&e);
                     }
                     match self.handlers.last() {
@@ -1297,15 +1515,42 @@ impl Vm {
         self.regs.truncate(base);
     }
 
+    /// The values of the keys of `p`, in the reused key buffer (give it back
+    /// with `put_keys`).
+    fn take_keys(&mut self, base: usize, p: &PathSet) -> Vec<Value> {
+        let mut keys = std::mem::take(&mut self.keybuf);
+        keys.clear();
+        keys.extend(p.keys.iter().map(|k| self.regs[base + *k as usize].clone()));
+        keys
+    }
+
+    fn put_keys(&mut self, mut keys: Vec<Value>) {
+        keys.clear();
+        self.keybuf = keys;
+    }
+
     fn set_path(&mut self, base: usize, p: &PathSet) -> Result<(), VmError> {
-        let keys: Vec<Value> = p.keys.iter().map(|k| self.regs[base + *k as usize].clone()).collect();
-        let val = self.regs[base + p.val as usize].clone();
-        // A shared list or map on the way is copied whole, and a full list grows:
-        // accounted (and timed) before it happens.
+        let keys = self.take_keys(base, p);
+        let r = self.set_path_with(base, p, &keys);
+        self.put_keys(keys);
+        r
+    }
+
+    fn append_path(&mut self, base: usize, p: &PathSet, cur: Reg) -> Result<(), VmError> {
+        let keys = self.take_keys(base, p);
+        let r = self.append_path_with(base, p, cur, &keys);
+        self.put_keys(keys);
+        r
+    }
+
+    /// The bytes copying shared lists and maps on the way to the element at
+    /// `keys` of the place of `p` may allocate: accounted (and timed) before
+    /// it happens.
+    fn reserve_path(&mut self, base: usize, p: &PathSet, keys: &[Value], push: bool) -> Result<(), VmError> {
         let cost = match p.base {
-            PathBase::Local(r) => copy_cost(&self.regs[base + r as usize], &keys, p.push),
+            PathBase::Local(r) => copy_cost(&self.regs[base + r as usize], keys, push),
             PathBase::Prop(o, slot) => match &self.regs[base + o as usize] {
-                Value::Object(o) => copy_cost(&o.borrow().fields[slot as usize], &keys, p.push),
+                Value::Object(o) => copy_cost(&o.borrow().fields[slot as usize], keys, push),
                 _ => 0,
             },
         };
@@ -1313,15 +1558,49 @@ impl Vm {
             self.reserve(cost)?;
             self.long_op(cost);
         }
+        Ok(())
+    }
+
+    fn append_path_with(&mut self, base: usize, p: &PathSet, cur: Reg, keys: &[Value]) -> Result<(), VmError> {
+        self.reserve_path(base, p, keys, false)?;
+        let cur = std::mem::take(&mut self.regs[base + cur as usize]);
+        let src = self.regs[base + p.val as usize].clone();
+        let mem = self.mem();
         let r = match p.base {
-            PathBase::Local(r) => path_assign(&mut self.regs[base + r as usize], &keys, &p.create, p.push, val),
+            PathBase::Local(r) => path_append(&mut self.regs[base + r as usize], keys, &p.create, cur, &src, mem),
             PathBase::Prop(o, slot) => {
                 let obj = match &self.regs[base + o as usize] {
                     Value::Object(o) => o.clone(),
                     v => bad("object", v),
                 };
                 let mut ob = obj.borrow_mut();
-                path_assign(&mut ob.fields[slot as usize], &keys, &p.create, p.push, val)
+                path_append(&mut ob.fields[slot as usize], keys, &p.create, cur, &src, mem)
+            }
+        };
+        self.long_key(keys.iter().map(str_len).sum())?;
+        match r {
+            Ok(work) => {
+                self.long_op(work);
+                Ok(())
+            }
+            Err(PathError::Memory(limit)) => Err(memory_error(limit)),
+            Err(PathError::Throw(class, msg)) => Err(self.throw(class, msg)),
+        }
+    }
+
+    fn set_path_with(&mut self, base: usize, p: &PathSet, keys: &[Value]) -> Result<(), VmError> {
+        let val = self.regs[base + p.val as usize].clone();
+        // A shared list or map on the way is copied whole, and a full list grows.
+        self.reserve_path(base, p, keys, p.push)?;
+        let r = match p.base {
+            PathBase::Local(r) => path_assign(&mut self.regs[base + r as usize], keys, &p.create, p.push, val),
+            PathBase::Prop(o, slot) => {
+                let obj = match &self.regs[base + o as usize] {
+                    Value::Object(o) => o.clone(),
+                    v => bad("object", v),
+                };
+                let mut ob = obj.borrow_mut();
+                path_assign(&mut ob.fields[slot as usize], keys, &p.create, p.push, val)
             }
         };
         // Hashing long string keys takes time (found by the 1.0 audit).
@@ -1330,7 +1609,8 @@ impl Vm {
     }
 
     fn dispatch(&mut self) -> Result<Value, VmError> {
-        let prog = Arc::clone(&self.prog);
+        let code = Rc::clone(&self.code);
+        let prog: &Program = &code;
         'frame: loop {
             let fi = self.frames.len() - 1;
             let (fid, mut pc, base) = {
@@ -1355,6 +1635,17 @@ impl Vm {
                         }
                     }
                 };
+            }
+            // A jump; one back (a loop's next pass, also by a test at its end)
+            // counts toward the time limit's check.
+            macro_rules! branch {
+                ($t:expr) => {{
+                    let t = $t as usize;
+                    if t < pc {
+                        tri!(self.tick());
+                    }
+                    pc = t;
+                }};
             }
             macro_rules! int {
                 ($r:expr) => {
@@ -1420,7 +1711,11 @@ impl Vm {
                     let fr = self.frames.pop().unwrap();
                     // The callee's registers are left as they are: the next
                     // call overwrites them, and the type checker guarantees
-                    // registers are written before they are read.
+                    // registers are written before they are read. (Clearing
+                    // them here made `fib(30)` in the interpreter 1.6 times
+                    // as slow; the values that matter are emptied where they
+                    // are used: arguments are moved, `Concat` empties its
+                    // operands and a `foreach` its copy of the collection.)
                     if fr.stop {
                         return Ok(v);
                     }
@@ -1603,51 +1898,72 @@ impl Vm {
                     }
 
                     Instr::Jump(t) => {
-                        if (*t as usize) < pc {
-                            tri!(self.tick());
-                        }
-                        pc = *t as usize;
+                        branch!(*t);
                     }
                     Instr::JumpIfFalse(r, t) => {
                         if matches!(reg!(*r), Value::Bool(false)) {
-                            pc = *t as usize;
+                            branch!(*t);
                         }
                     }
                     Instr::JumpIfTrue(r, t) => {
                         if matches!(reg!(*r), Value::Bool(true)) {
-                            pc = *t as usize;
+                            branch!(*t);
                         }
                     }
                     Instr::JumpIfNull(r, t) => {
                         if matches!(reg!(*r), Value::Null) {
-                            pc = *t as usize;
+                            branch!(*t);
                         }
                     }
                     Instr::JumpIfNotNull(r, t) => {
                         if !matches!(reg!(*r), Value::Null) {
-                            pc = *t as usize;
+                            branch!(*t);
                         }
                     }
                     Instr::JumpIfNotLtI(a, b, t) => {
                         if int!(*a) >= int!(*b) {
-                            pc = *t as usize;
+                            branch!(*t);
                         }
                     }
                     Instr::JumpIfNotLeI(a, b, t) => {
                         if int!(*a) > int!(*b) {
-                            pc = *t as usize;
+                            branch!(*t);
                         }
                     }
                     Instr::JumpIfNotLtIImm(a, n, t) => {
                         if int!(*a) >= *n as i64 {
-                            pc = *t as usize;
+                            branch!(*t);
                         }
                     }
                     Instr::JumpIfNotLeIImm(a, n, t) => {
                         if int!(*a) > *n as i64 {
-                            pc = *t as usize;
+                            branch!(*t);
                         }
                     }
+                    Instr::JumpIfLtIImm(a, n, t) => {
+                        if int!(*a) < *n as i64 {
+                            branch!(*t);
+                        }
+                    }
+                    Instr::JumpIfLeIImm(a, n, t) => {
+                        if int!(*a) <= *n as i64 {
+                            branch!(*t);
+                        }
+                    }
+                    Instr::JumpIfEq(a, b, t) | Instr::JumpIfNotEq(a, b, t) => {
+                        let eq = match (&reg!(*a), &reg!(*b)) {
+                            (Value::Int(x), Value::Int(y)) => x == y,
+                            _ => {
+                                let eq = tri!(self.equal(&reg!(*a), &reg!(*b)));
+                                self.long_op(str_len(&reg!(*a)));
+                                eq
+                            }
+                        };
+                        if eq == matches!(ins, Instr::JumpIfEq(..)) {
+                            branch!(*t);
+                        }
+                    }
+                    Instr::AppendPath { path, cur } => tri!(self.append_path(base, path, *cur)),
 
                     Instr::Call { dst, func: callee, args, argc } => {
                         let mut entry =
@@ -1658,24 +1974,20 @@ impl Vm {
                             None => {}
                         }
                         if let Some(entry) = entry {
-                            // Arguments are moved, as into an interpreted call.
-                            let start = base + *args as usize;
-                            let argv: Vec<Value> =
-                                self.regs[start..start + *argc as usize].iter_mut().map(std::mem::take).collect();
+                            let sig = prog.funcs[*callee as usize]
+                                .native
+                                .as_ref()
+                                .expect("JIT entry for a function without a native signature");
                             self.frames[fi].pc = pc as u32;
-                            match tri!(self.call_jit(entry, *callee, argv)) {
-                                Ok(v) => {
+                            let start = base + *args as usize;
+                            match tri!(self.call_jit(entry, *callee, sig, start, *argc as usize)) {
+                                Some(v) => {
                                     reg!(*dst) = v;
                                     continue;
                                 }
                                 // Out of native stack: the interpreter runs this call,
                                 // and the calls it makes, with the arguments put back.
-                                Err(argv) => {
-                                    for (i, v) in argv.into_iter().enumerate() {
-                                        self.regs[start + i] = v;
-                                    }
-                                    self.jit_paused = Some(self.frames.len());
-                                }
+                                None => self.jit_paused = Some(self.frames.len()),
                             }
                         }
                         call!(*callee, *dst, *args, *argc, &[])
@@ -1708,15 +2020,19 @@ impl Vm {
                         self.argbuf = buf;
                         let v = tri!(r);
                         reg!(*dst) = v;
-                        tri!(self.after_builtin());
+                        if prog.builtin_is_cheap(*id) {
+                            tri!(self.check_memory());
+                        } else {
+                            tri!(self.after_builtin());
+                        }
                     }
                     Instr::CallNamed { dst, name, args, argc } => {
                         let class = match &reg!(*args) {
                             Value::Object(o) => o.borrow().class,
                             v => bad("object", v),
                         };
-                        let callee = match prog.classes[class as usize].by_name.get(name) {
-                            Some(f) => *f,
+                        let callee = match prog.classes[class as usize].method(*name) {
+                            Some(f) => f,
                             None => {
                                 let msg = format!(
                                     "{} has no method {}",
@@ -1752,8 +2068,7 @@ impl Vm {
                     }
 
                     Instr::NewObject(d, class) => {
-                        let fields =
-                            prog.classes[*class as usize].fields.iter().map(|f| const_value(&f.default)).collect();
+                        let fields = self.new_fields(*class);
                         let o = Rc::new(RefCell::new(Object { class: *class, fields }));
                         self.track(&o);
                         if self.gc_due.get() {
@@ -1838,8 +2153,10 @@ impl Vm {
                     Instr::SetPath(p) => tri!(self.set_path(base, p)),
 
                     Instr::IterInit(it, src) => {
-                        let v = reg!(*src).clone();
-                        reg!(*it) = v;
+                        if it != src {
+                            let v = reg!(*src).clone();
+                            reg!(*it) = v;
+                        }
                         reg!(*it + 1) = Value::Int(0);
                     }
                     Instr::IterNext { it, key, val, end } => {
@@ -1864,7 +2181,7 @@ impl Vm {
 
                     Instr::Throw(r) => {
                         let value = reg!(*r).clone();
-                        tri!(Err(VmError::Exception(Box::new(Exc { value, trace: Vec::new() }))))
+                        tri!(Err(VmError::Exception(Box::new(Exc::new(value)))))
                     }
                     Instr::TryBegin { catch, exc } => {
                         let out_depth = self.out.len();
@@ -1926,7 +2243,7 @@ impl Vm {
                     Instr::EnumFrom { dst, class, val, try_ } => {
                         let wanted = reg!(*val).clone();
                         let cls = &prog.classes[*class as usize];
-                        let found = cls.cases.iter().position(|(_, c)| values_equal(&const_value(c), &wanted));
+                        let found = cls.cases.iter().position(|(_, c)| const_equal(c, &wanted));
                         let v = match found {
                             Some(i) => self.enum_case(*class, i as u32),
                             None if *try_ => Value::Null,
@@ -2021,11 +2338,16 @@ impl Vm {
 fn inert_js(v: &Value) -> bool {
     match v {
         Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => true,
-        Value::Html(s) => s.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '"' | '\\' | '[' | ']' | '{' | '}' | ':' | ',' | '.' | '-' | '+')
-                || (!c.is_ascii() && !c.is_whitespace() && c != '\u{feff}')
-        }),
+        Value::Html(s) => {
+            // The ASCII bytes are checked one by one, the other characters
+            // (rare in such text) only when there are any.
+            let ascii_ok = |b: u8| {
+                b.is_ascii_alphanumeric()
+                    || matches!(b, b'"' | b'\\' | b'[' | b']' | b'{' | b'}' | b':' | b',' | b'.' | b'-' | b'+')
+            };
+            s.bytes().all(|b| !b.is_ascii() || ascii_ok(b))
+                && (s.is_ascii() || s.chars().all(|c| c.is_ascii() || (!c.is_whitespace() && c != '\u{feff}')))
+        }
         _ => false,
     }
 }
@@ -2130,17 +2452,11 @@ fn index_mut<'v>(v: &'v mut Value, k: &Value, create: Option<&Const>) -> Result<
                 None => Err(("IndexError", format!("list index {i} is out of range (length {len})"))),
             }
         }
-        Value::Map(m) => {
-            let m = Rc::make_mut(m);
-            let key = k.to_key();
-            if let (false, Some(c)) = (m.contains_key(&key), create) {
-                m.insert(key.clone(), const_value(c));
-            }
-            match m.get_mut(&key) {
-                Some(v) => Ok(v),
-                None => Err(("KeyError", format!("undefined map key {}", key_repr(k)))),
-            }
-        }
+        Value::Map(m) => match (Rc::make_mut(m).entry(k.to_key()), create) {
+            (indexmap::map::Entry::Occupied(e), _) => Ok(e.into_mut()),
+            (indexmap::map::Entry::Vacant(e), Some(c)) => Ok(e.insert(const_value(c))),
+            (indexmap::map::Entry::Vacant(_), None) => Err(("KeyError", format!("undefined map key {}", key_repr(k)))),
+        },
         v => bad("list or map", v),
     }
 }

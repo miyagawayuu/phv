@@ -118,6 +118,10 @@ pub enum Instr {
     JumpIfNotLeI(Reg, Reg, u32),
     JumpIfNotLtIImm(Reg, i32, u32),
     JumpIfNotLeIImm(Reg, i32, u32),
+    /// Jumps when the int is less than (or at most) the constant: the test at
+    /// the end of a loop, which jumps back to its start.
+    JumpIfLtIImm(Reg, i32, u32),
+    JumpIfLeIImm(Reg, i32, u32),
 
     Call {
         dst: Reg,
@@ -214,6 +218,18 @@ pub enum Instr {
     /// functions called until `EndGuard` is refused (a runtime error).
     GuardOutput,
     EndGuard,
+
+    /// `$o->p .= x`, `$a[k] .= x` and `$o->p[k] .= x`: `cur` holds the value
+    /// read from the place before `x` (`path.val`) was evaluated. When the
+    /// place still holds that string, `x` is appended to it in place;
+    /// otherwise (`x` changed the place) the place gets `cur . x`.
+    AppendPath {
+        path: Box<PathSet>,
+        cur: Reg,
+    },
+    /// Jumps when the two registers are equal (`==`), or are not.
+    JumpIfEq(Reg, Reg, u32),
+    JumpIfNotEq(Reg, Reg, u32),
 }
 
 /// Kinds of values a natively compiled function takes and returns.
@@ -289,9 +305,17 @@ pub struct Class {
     pub vtable: Vec<u32>,
     /// Sorted: the class, its ancestors and its interfaces.
     pub supers: Vec<u32>,
-    /// Method name id to function, for interface calls.
-    pub by_name: HashMap<u32, u32>,
+    /// Method name id to function, for interface calls, sorted by name id.
+    pub by_name: Vec<(u32, u32)>,
     pub cases: Vec<(String, Const)>,
+}
+
+impl Class {
+    /// The function of interned method name `name`, for interface calls.
+    #[inline]
+    pub fn method(&self, name: u32) -> Option<u32> {
+        self.by_name.binary_search_by_key(&name, |&(n, _)| n).ok().map(|i| self.by_name[i].1)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -312,9 +336,63 @@ pub struct Program {
     pub files: Vec<FileInfo>,
     /// Built-in exception classes the VM throws itself (`DivisionByZeroError`, ...).
     pub exc_classes: HashMap<String, u32>,
+    /// Per builtin id: it takes constant time (see `CHEAP_BUILTINS`); filled
+    /// on first use.
+    #[serde(skip)]
+    pub cheap_builtins: std::sync::OnceLock<Vec<bool>>,
 }
 
+/// Builtins of the standard library that take constant time and allocate
+/// nothing (they read a length, a number or one element): the interpreter
+/// does not read the clock after them. The clock is still read at the next
+/// loop step or call, as after any instruction; every other builtin is
+/// timed as soon as it returns, since one call can take long.
+pub const CHEAP_BUILTINS: &[&str] = &[
+    "strlen",
+    "str_is_empty",
+    "list_len",
+    "list_is_empty",
+    "list_first",
+    "list_last",
+    "map_len",
+    "map_is_empty",
+    "set_len",
+    "set_is_empty",
+    "abs_float",
+    "min_int",
+    "max_int",
+    "min_float",
+    "max_float",
+    "floor",
+    "ceil",
+    "round",
+    "sqrt",
+    "fmod",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "exp",
+    "log",
+    "log_base",
+    "log10",
+    "log2",
+    "hypot",
+];
+
 impl Program {
+    /// Whether builtin `id` is one of `CHEAP_BUILTINS`.
+    #[inline]
+    pub fn builtin_is_cheap(&self, id: u32) -> bool {
+        let cheap = self
+            .cheap_builtins
+            .get_or_init(|| self.builtin_names.iter().map(|n| CHEAP_BUILTINS.contains(&n.as_str())).collect());
+        cheap.get(id as usize).copied().unwrap_or(false)
+    }
+
     pub fn is_subclass(&self, class: u32, target: u32) -> bool {
         class == target || self.classes[class as usize].supers.binary_search(&target).is_ok()
     }
