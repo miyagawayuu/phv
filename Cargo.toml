@@ -21,8 +21,8 @@ phv_jit = { path = "crates/phv_jit" }
 
 indexmap = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2"] }
 http-body-util = "0.1"
 bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "fs", "sync", "signal"] }
@@ -50,6 +50,8 @@ tokio-postgres = "0.7.18"
 futures-util = { version = "0.3", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1.0.10"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = "1.15"
 regex = "1"
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "nfa-thompson"] }
 url = "2"

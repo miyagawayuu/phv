@@ -24,6 +24,11 @@ serde_json.workspace = true
 flate2.workspace = true
 httpdate.workspace = true
 chrono.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
 
 [dev-dependencies]
 flate2.workspace = true
+hyper = { workspace = true, features = ["client"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

@@ -766,7 +766,7 @@ phv serve examples/site --port 8080
   インターネットに公開するサイトは、それを制限するリバースプロキシの後ろで動かすとよい。
 - 既定で付けるヘッダー: `X-Content-Type-Options: nosniff`、`X-Frame-Options: SAMEORIGIN`、
   `Referrer-Policy: strict-origin-when-cross-origin`、Content-Security-Policy(下の「Content-Security-Policy」)。
-  `secure_cookies = true` なら HSTS。セッションや Cookie を使うレスポンスと、CSRF トークンを含むレスポンス
+  `secure_cookies = true` なら HSTS(HTTPS では常に)。セッションや Cookie を使うレスポンスと、CSRF トークンを含むレスポンス
   (`csrf_field()`、`csrf_token()`)には `Cache-Control: private, no-store`。
   `Server` / `X-Powered-By` のようなバージョン情報は出さない。スクリプトは `Content-Length` などの通信用ヘッダーを設定できない。
 - 開発モードではコンパイルエラーと実行時エラーの詳細をブラウザに表示する。開発モードが既定になるのは
@@ -774,6 +774,30 @@ phv serve examples/site --port 8080
   リバースプロキシの後ろでは `--prod` を付ける**こと。付けないと訪問者に詳細が見える(起動時に注意を表示する)。
 - Ctrl-C か SIGTERM(`docker stop`)でサーバーは穏やかに止まる: 新しい接続を受け付けるのをやめ、実行中のリクエストが
   終わるのを最大 `[server] shutdown_timeout` 秒(既定 30)待つ。
+
+### HTTPS と HTTP/2
+
+```toml
+[server]
+tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
+tls_key = "/etc/letsencrypt/live/example.com/privkey.pem"
+```
+
+- `tls_cert` と `tls_key`(PEM ファイル。相対パスはプロジェクトからのパス)を書くと、`phv serve` は HTTPS だけで
+  待ち受ける。HTTP/2 か HTTP/1.1 かは、クライアントがハンドシェイクのときに選ぶ(ALPN)。TLS 1.2 と 1.3 を、rustls の
+  安全な既定の暗号スイートで使う。0-RTT は使わない。
+- ファイルはサーバーの起動時に読む。証明書と組にならない鍵、PEM でないファイル、`public/` の中のファイルは、エラーで
+  起動を止める(メッセージにはファイル名だけを出し、中身は出さない)。その後は 1 分に 1 度ファイルを確かめ、更新された
+  証明書(certbot など)は再起動しなくても使う。読み込めない証明書はそのことを表示し、前の証明書を使い続ける。
+- HTTPS のときは `secure_cookies` が有効になる: セッションの Cookie に `Secure` を付け、`Strict-Transport-Security` を送る。
+- クライアントは TLS のハンドシェイクを 10 秒以内に終えなければならない。
+- HTTP/2 の接続: 1 つの接続で同時に開けるリクエストは 64 個、リクエストヘッダーは 64 KB まで。サーバーが読む前に
+  クライアントが送れるのは 64 KB まで(リクエストごとと接続全体のそれぞれ)なので、1 つの接続がためる量は HTTP/1.1 と
+  変わらない。30 秒リクエストのない接続は閉じる。ワーカー、リクエストの上限、レート制限は HTTP/1.1 と共通。
+- TLS なしの HTTP/2 は、`[server] h2c = true` のときだけ受け付ける。HTTP/2 でサーバーに接続してくるリバースプロキシ向け
+  (クライアントは最初のバイトから HTTP/2 を送る。同じポートで HTTP/1.1 もそのまま使える)。
+- スクリプトからは、HTTP/2 のリクエストも HTTP/1.1 と同じに見える: `request()->header("host")` はクライアントが
+  指定したホストで、いくつかのフィールドに分けて送られた Cookie はまとめて読める。
 
 ### パラメータ付きのルート
 
@@ -1479,6 +1503,9 @@ compress = true         # テキストのレスポンスを gzip で圧縮(既�
 access_log = "logs/access.log"   # アクセスログをこのファイルにも追記
 access_log_format = "json"       # "text"(既定)か "json"
 shutdown_timeout = 30   # サーバーを止めるとき、実行中のリクエストに与える秒数
+tls_cert = "certs/fullchain.pem"   # HTTPS と HTTP/2 で待ち受ける(「HTTPS と HTTP/2」を参照)
+tls_key = "certs/privkey.pem"
+h2c = false             # TLS なしの HTTP/2 も受け付ける(HTTP/2 で接続してくるプロキシ向け)
 
 [cors]
 origins = ["https://app.example.com"]

@@ -18,6 +18,9 @@
 //! access_log = "logs/access.log"  # also write the access log to this file
 //! access_log_format = "json"      # "text" (default) or "json", one request per line
 //! shutdown_timeout = 30   # seconds to finish running requests on Ctrl-C / SIGTERM
+//! tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"  # serve HTTPS (and HTTP/2)
+//! tls_key = "/etc/letsencrypt/live/example.com/privkey.pem"
+//! h2c = false             # also accept HTTP/2 without TLS (behind a proxy that speaks it)
 //!
 //! [cors]
 //! origins = ["https://app.example.com"]  # or ["*"]
@@ -278,6 +281,12 @@ struct ServerSection {
     access_log_format: Option<String>,
     /// Seconds running requests get to finish when the server is stopped.
     shutdown_timeout: Option<u64>,
+    /// The certificate chain (PEM) for HTTPS; relative to the project.
+    tls_cert: Option<String>,
+    /// The private key (PEM) of `tls_cert`.
+    tls_key: Option<String>,
+    /// Accept HTTP/2 without TLS ("prior knowledge"), for a proxy in front.
+    h2c: Option<bool>,
 }
 
 /// `[cors]`: which other sites may call this one from a browser.
@@ -573,6 +582,17 @@ pub struct Config {
     pub access_log: Option<(PathBuf, LogFormat)>,
     pub shutdown_timeout: u64,
     pub cors: Option<Cors>,
+    /// HTTPS: the certificate chain and the private key (PEM files).
+    pub tls: Option<Tls>,
+    /// HTTP/2 without TLS is accepted too.
+    pub h2c: bool,
+}
+
+/// `[server] tls_cert` / `tls_key`, resolved against the project root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tls {
+    pub cert: PathBuf,
+    pub key: PathBuf,
 }
 
 impl Config {
@@ -596,6 +616,8 @@ impl Config {
             access_log: None,
             shutdown_timeout: 30,
             cors: None,
+            tls: None,
+            h2c: false,
         }
     }
 }
@@ -826,6 +848,14 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
             Some((root.join(f), format))
         }
     };
+    let tls = match (&file.server.tls_cert, &file.server.tls_key) {
+        (None, None) => None,
+        (Some(cert), Some(key)) if !cert.trim().is_empty() && !key.trim().is_empty() => {
+            Some(Tls { cert: root.join(cert), key: root.join(key) })
+        }
+        (Some(_), Some(_)) => return Err("[server].tls_cert and tls_key must not be empty".into()),
+        _ => return Err("[server]: give both tls_cert and tls_key, or neither".into()),
+    };
     let cors = file.cors.map(cors_config).transpose()?;
     let permissions =
         Permissions { read: file.permissions.read, write: file.permissions.write, env: file.permissions.env };
@@ -865,7 +895,8 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
             args: Vec::new(),
         }),
         csrf: file.security.csrf,
-        secure_cookies: file.security.secure_cookies,
+        // Served over HTTPS: cookies are `Secure` and HSTS is sent.
+        secure_cookies: file.security.secure_cookies || tls.is_some(),
         session_ttl: file.security.session_ttl,
         memory_limit_mb: file.security.memory_limit_mb,
         workers: file.server.workers.unwrap_or_else(default_workers),
@@ -880,6 +911,8 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
         access_log,
         shutdown_timeout,
         cors,
+        tls,
+        h2c: file.server.h2c.unwrap_or(false),
     })
 }
 

@@ -7,16 +7,17 @@ mod multipart;
 mod routes;
 mod session;
 mod static_files;
+mod tls;
 
 use body::{RespBody, StallGuard};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue, CONTENT_TYPE};
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use phv_driver::config::LogFormat;
 use phv_driver::{compile_cached, load_config, run, Compiled, Config, RunOptions};
 use phv_vm::value::html_escape;
@@ -59,6 +60,14 @@ const GZ_CACHE: usize = 32 << 20;
 /// A connection's read and write buffers (hyper's default is about 400 KB):
 /// a client that stops reading holds at most this much (and a file's 64 KB).
 const CONN_BUFFER: usize = 64 * 1024;
+/// Requests one HTTP/2 connection may have open at once.
+const H2_STREAMS: u32 = 64;
+/// HTTP/2 flow control: what a client may send before the server reads it,
+/// on each stream and on the whole connection (as `CONN_BUFFER` for HTTP/1).
+const H2_WINDOW: u32 = 64 * 1024;
+/// An HTTP/2 connection without a request for this long is closed (as an
+/// idle HTTP/1 connection is by `HEADER_TIMEOUT`).
+const H2_IDLE: Duration = Duration::from_secs(30);
 
 /// A site built with `phv build`: its pages and static files, by their paths
 /// under `public/`, and its phv.toml. Directories the project reads and writes
@@ -298,6 +307,10 @@ fn serve_with(
     state.embedded = embedded;
     let table = state.scan_routes()?;
     state.routes = Mutex::new((Instant::now(), Arc::new(table)));
+    let acceptor = match &state.config.tls {
+        Some(t) => Some(tls::acceptor(t, &state.public)?),
+        None => None,
+    };
     let state = Arc::new(state);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -309,7 +322,8 @@ fn serve_with(
         let mut stop: Stop = stop.unwrap_or_else(|| Box::pin(os_shutdown()));
         let listener = TcpListener::from_std(listener).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
         let mode = if state.dev { "development" } else { "production" };
-        eprintln!("PHV server ({mode} mode) listening on http://{addr}");
+        let scheme = if acceptor.is_some() { "https" } else { "http" };
+        eprintln!("PHV server ({mode} mode) listening on {scheme}://{addr}");
         if state.dev && !addr.ip().is_loopback() {
             eprintln!("warning: development mode shows error details to every visitor; use --prod");
         }
@@ -336,21 +350,23 @@ fn serve_with(
                 _ = &mut stop => break,
             };
             let state = state.clone();
-            let mut closed = closed.clone();
+            let closed = closed.clone();
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                let service = service_fn(move |req| handle(state.clone(), peer, req));
-                let conn = http1::Builder::new()
-                    .timer(TokioTimer::new())
-                    .header_read_timeout(HEADER_TIMEOUT)
-                    .max_buf_size(CONN_BUFFER)
-                    .serve_connection(TokioIo::new(StallGuard::new(stream, WRITE_STALL)), service);
-                tokio::pin!(conn);
-                tokio::select! {
-                    _ = conn.as_mut() => {}
-                    _ = closed.changed() => {
-                        conn.as_mut().graceful_shutdown();
-                        let _ = conn.await;
+                let io = StallGuard::new(stream, WRITE_STALL);
+                match acceptor {
+                    Some(acceptor) => {
+                        // A client that does not finish the handshake in time is dropped.
+                        if let Ok(Ok(io)) = tokio::time::timeout(HEADER_TIMEOUT, acceptor.accept(io)).await {
+                            if io.get_ref().1.alpn_protocol() == Some(b"h2") {
+                                serve_h2(state, peer, io, closed).await;
+                            } else {
+                                serve_h1(state, peer, io, closed).await;
+                            }
+                        }
                     }
+                    None if state.config.h2c => serve_auto(state, peer, io, closed).await,
+                    None => serve_h1(state, peer, io, closed).await,
                 }
                 drop(permit);
             });
@@ -373,9 +389,182 @@ fn serve_with(
     result
 }
 
+/// Runs connection `$conn` until it ends, or until the server stops (then
+/// it finishes the requests it has). With `$idle`, an HTTP/2 connection that
+/// has had no request for `H2_IDLE` is closed the same way.
+macro_rules! drive {
+    ($conn:expr, $closed:expr, $idle:expr) => {{
+        let conn = $conn;
+        tokio::pin!(conn);
+        let idle: Option<Arc<Activity>> = $idle;
+        let mut closed = $closed;
+        loop {
+            tokio::select! {
+                _ = conn.as_mut() => break,
+                _ = closed.changed() => {
+                    conn.as_mut().graceful_shutdown();
+                    let _ = conn.await;
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)), if idle.is_some() => {
+                    if idle.as_ref().is_some_and(|a| a.idle_for() >= H2_IDLE) {
+                        conn.as_mut().graceful_shutdown();
+                        let _ = conn.await;
+                        break;
+                    }
+                }
+            }
+        }
+    }};
+}
+
+/// Requests in progress on one connection, and when the last one ended.
+struct Activity {
+    open: AtomicUsize,
+    since: Mutex<Instant>,
+}
+
+impl Activity {
+    fn new() -> Arc<Activity> {
+        Arc::new(Activity { open: AtomicUsize::new(0), since: Mutex::new(Instant::now()) })
+    }
+
+    fn idle_for(&self) -> Duration {
+        if self.open.load(Ordering::SeqCst) > 0 {
+            return Duration::ZERO;
+        }
+        self.since.lock().map(|t| t.elapsed()).unwrap_or_default()
+    }
+}
+
+/// Counts a request as open while its handler runs.
+struct OpenRequest(Arc<Activity>);
+
+impl OpenRequest {
+    fn new(a: &Arc<Activity>) -> OpenRequest {
+        a.open.fetch_add(1, Ordering::SeqCst);
+        OpenRequest(a.clone())
+    }
+}
+
+impl Drop for OpenRequest {
+    fn drop(&mut self) {
+        if let Ok(mut t) = self.0.since.lock() {
+            *t = Instant::now();
+        }
+        self.0.open.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn h1_builder() -> http1::Builder {
+    let mut b = http1::Builder::new();
+    b.timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT).max_buf_size(CONN_BUFFER);
+    b
+}
+
+fn h2_builder() -> http2::Builder<TokioExecutor> {
+    let mut b = http2::Builder::new(TokioExecutor::new());
+    b.timer(TokioTimer::new())
+        .max_concurrent_streams(H2_STREAMS)
+        .max_header_list_size(CONN_BUFFER as u32)
+        .initial_stream_window_size(H2_WINDOW)
+        .initial_connection_window_size(H2_WINDOW)
+        .adaptive_window(false)
+        .max_send_buf_size(CONN_BUFFER)
+        .max_pending_accept_reset_streams(20)
+        .max_local_error_reset_streams(256)
+        .keep_alive_interval(Some(Duration::from_secs(30)))
+        .keep_alive_timeout(Duration::from_secs(20));
+    b
+}
+
+type Closed = tokio::sync::watch::Receiver<bool>;
+
+async fn serve_h1<I>(state: Arc<State>, peer: SocketAddr, io: I, closed: Closed)
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |req| handle(state.clone(), peer, req));
+    drive!(h1_builder().serve_connection(TokioIo::new(io), service), closed, None)
+}
+
+async fn serve_h2<I>(state: Arc<State>, peer: SocketAddr, io: I, closed: Closed)
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let activity = Activity::new();
+    let a = activity.clone();
+    let service = service_fn(move |req| {
+        let open = OpenRequest::new(&a);
+        let state = state.clone();
+        async move {
+            let r = handle(state, peer, req).await;
+            drop(open);
+            r
+        }
+    });
+    drive!(h2_builder().serve_connection(TokioIo::new(io), service), closed, Some(activity))
+}
+
+/// `[server] h2c`: HTTP/1.1, or HTTP/2 when the client starts with its preface.
+async fn serve_auto<I>(state: Arc<State>, peer: SocketAddr, io: I, closed: Closed)
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let activity = Activity::new();
+    let a = activity.clone();
+    let service = service_fn(move |req| {
+        let open = OpenRequest::new(&a);
+        let state = state.clone();
+        async move {
+            let r = handle(state, peer, req).await;
+            drop(open);
+            r
+        }
+    });
+    let mut b = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    b.http1().timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT).max_buf_size(CONN_BUFFER);
+    b.http2()
+        .timer(TokioTimer::new())
+        .max_concurrent_streams(H2_STREAMS)
+        .max_header_list_size(CONN_BUFFER as u32)
+        .initial_stream_window_size(H2_WINDOW)
+        .initial_connection_window_size(H2_WINDOW)
+        .adaptive_window(false)
+        .max_send_buf_size(CONN_BUFFER)
+        .max_pending_accept_reset_streams(20)
+        .max_local_error_reset_streams(256)
+        .keep_alive_interval(Some(Duration::from_secs(30)))
+        .keep_alive_timeout(Duration::from_secs(20));
+    drive!(b.serve_connection(TokioIo::new(io), service), closed, Some(activity))
+}
+
 type Resp = Response<RespBody>;
 
+/// HTTP/2 sends the host as `:authority` and may split the cookies into
+/// several fields: the server and scripts see them as HTTP/1.1 sends them.
+fn as_http1_headers(mut req: Request<Incoming>) -> Request<Incoming> {
+    if req.version() != hyper::Version::HTTP_2 {
+        return req;
+    }
+    if !req.headers().contains_key(hyper::header::HOST) {
+        let authority = req.uri().authority().map(|a| a.as_str().to_string());
+        if let Some(v) = authority.filter(|a| !a.contains('@')).and_then(|a| HeaderValue::from_str(&a).ok()) {
+            req.headers_mut().insert(hyper::header::HOST, v);
+        }
+    }
+    let cookies: Vec<&[u8]> = req.headers().get_all(hyper::header::COOKIE).iter().map(|v| v.as_bytes()).collect();
+    if cookies.len() > 1 {
+        let joined = cookies.join(&b"; "[..]);
+        if let Ok(v) = HeaderValue::from_bytes(&joined) {
+            req.headers_mut().insert(hyper::header::COOKIE, v);
+        }
+    }
+    req
+}
+
 async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> Result<Resp, Infallible> {
+    let req = as_http1_headers(req);
     let start = Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();

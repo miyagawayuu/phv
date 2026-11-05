@@ -779,7 +779,7 @@ phv serve examples/site --port 8080
   limited per address (at most 1,024 in all): a site open to the internet should run behind a reverse proxy that limits them.
 - Headers sent by default: `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`,
   `Referrer-Policy: strict-origin-when-cross-origin`, and Content-Security-Policy (see "Content-Security-Policy" below).
-  HSTS if `secure_cookies = true`. `Cache-Control: private, no-store` on responses that use sessions or cookies, or
+  HSTS if `secure_cookies = true` (always over HTTPS). `Cache-Control: private, no-store` on responses that use sessions or cookies, or
   that carry a CSRF token (`csrf_field()`, `csrf_token()`).
   Version information such as `Server` / `X-Powered-By` is not sent. Scripts cannot set transport headers such as `Content-Length`.
 - In development mode, the details of compile errors and runtime errors are shown in the browser. Development mode is the default only
@@ -787,6 +787,32 @@ phv serve examples/site --port 8080
   reaches the server on `127.0.0.1`, use `--prod`**: otherwise visitors see the details (the server prints a note at startup).
 - Ctrl-C or SIGTERM (`docker stop`) stops the server gracefully: it stops accepting connections and lets running requests
   finish, for at most `[server] shutdown_timeout` seconds (default 30).
+
+### HTTPS and HTTP/2
+
+```toml
+[server]
+tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
+tls_key = "/etc/letsencrypt/live/example.com/privkey.pem"
+```
+
+- With `tls_cert` and `tls_key` (PEM files; a relative path is relative to the project), `phv serve` speaks HTTPS
+  only. Clients choose HTTP/2 or HTTP/1.1 during the handshake (ALPN). TLS 1.2 and 1.3 are offered, with the safe
+  default cipher suites of rustls; 0-RTT is not.
+- The files are read when the server starts: a key that does not belong to the certificate, a file that is not
+  PEM, or a file inside `public/` stops it with an error (which names the file, never its contents). After that
+  they are looked at once a minute: a renewed certificate (certbot and the like) is used without a restart, and
+  one that cannot be loaded is reported and the previous one kept.
+- Over HTTPS, `secure_cookies` is on: the session cookie is `Secure`, and `Strict-Transport-Security` is sent.
+- A client must finish the TLS handshake within 10 seconds.
+- HTTP/2 connections: at most 64 requests open at once on one connection, 64 KB of request headers, and 64 KB a
+  client may send before the server reads it (on each request and on the connection), so one connection holds no
+  more than an HTTP/1.1 connection does. A connection without a request for 30 seconds is closed. Requests share
+  the workers, the request limits and the rate limit with HTTP/1.1.
+- HTTP/2 without TLS is refused unless `[server] h2c = true`, for a reverse proxy that speaks it to the server
+  (the client then sends HTTP/2 from its first bytes; HTTP/1.1 keeps working on the same port).
+- Scripts see an HTTP/2 request as an HTTP/1.1 one: `request()->header("host")` is the host the client asked for,
+  and cookies sent in several fields are read together.
 
 ### Routes with parameters
 
@@ -1507,6 +1533,9 @@ compress = true         # gzip text responses (default)
 access_log = "logs/access.log"   # also append the access log to this file
 access_log_format = "json"       # "text" (default) or "json"
 shutdown_timeout = 30   # seconds running requests get when the server stops
+tls_cert = "certs/fullchain.pem"   # serve HTTPS and HTTP/2 (see "HTTPS and HTTP/2")
+tls_key = "certs/privkey.pem"
+h2c = false             # also accept HTTP/2 without TLS, from a proxy that speaks it
 
 [cors]
 origins = ["https://app.example.com"]
