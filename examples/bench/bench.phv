@@ -127,7 +127,9 @@ function string_equals(int $n): int {
 function html_escape_loop(int $n): int {
     $total = 0;
     for ($i = 0; $i < $n; $i++) {
-        $total += strlen((string) escape("Tom & Jerry <b>said</b> \"hello\" to {$i} friends today"));
+        $total += strlen(
+            (string) escape("Tom & Jerry <b>said</b> \"hello\" to {$i} friends today"),
+        );
     }
     return $total;
 }

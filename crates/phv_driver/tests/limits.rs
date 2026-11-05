@@ -136,7 +136,9 @@ echo strlen((new Regex("a"))->replaceWith(str_repeat("a", 100), fn(list<string> 
 
 #[test]
 fn a_regular_expression_search_that_could_outlast_the_time_limit_is_refused() {
-    let limits = Limits { max_time: Some(Duration::from_secs(2)), ..Limits::default() };
+    // Compiling the pattern counts toward the limit: in a debug build on a
+    // busy runner it took up to 2 seconds, so the limit leaves room for it.
+    let limits = Limits { max_time: Some(Duration::from_secs(4)), ..Limits::default() };
     // About 4,000 states: searching 300,000 bytes could take 10 seconds.
     let src = r#"<?phv
 import std.regex.Regex;
@@ -151,7 +153,7 @@ echo $r->test(str_repeat("a", 1000)) ? "match" : "small texts are searched", "\n
     let start = Instant::now();
     let (out, _) = run_limited("regex_time", src, limits);
     // Compiling counts too (slow on a busy runner); the search alone would take 10 s.
-    assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+    assert!(start.elapsed() < Duration::from_secs(8), "took {:?}", start.elapsed());
     assert_eq!(
         out,
         "the regular expression is too large to search 300000 bytes of text in the time left (use a smaller pattern or a shorter text)\nsmall texts are searched\n"
