@@ -214,6 +214,13 @@ pub fn single_file(f: &File) -> Result<(), FsError> {
     check_plain(f)
 }
 
+/// `path` with each 8.3 short name (`RUNNER~1`) written out in full, and no
+/// link followed: `None` if part of it does not exist.
+#[cfg(windows)]
+pub fn long_name(path: &Path) -> Option<PathBuf> {
+    imp::long_name(path)
+}
+
 /// Whether `f`, opened by the canonical path `path`, is the file at that path:
 /// not reached through a link or junction put on the way after `path` was
 /// found (which would lead elsewhere).
@@ -480,12 +487,13 @@ mod imp {
     use std::ffi::OsStr;
     use std::fs::{File, OpenOptions};
     use std::io;
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
     use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
+        GetFileInformationByHandle, GetFinalPathNameByHandleW, GetLongPathNameW, BY_HANDLE_FILE_INFORMATION,
     };
 
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -516,6 +524,23 @@ mod imp {
             return Err(FsError::NoDir);
         }
         Ok(f)
+    }
+
+    pub fn long_name(path: &Path) -> Option<PathBuf> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut buf = vec![0u16; 512];
+        loop {
+            // SAFETY: `wide` ends with NUL; the buffer pointer and length are valid.
+            let n = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+            if n == 0 {
+                return None;
+            }
+            if n < buf.len() {
+                buf.truncate(n);
+                return Some(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
+            }
+            buf.resize(n + 1, 0);
+        }
     }
 
     /// The path of an open handle, in the same form as `canonicalize` (`\\?\C:\...`).

@@ -292,10 +292,13 @@ fn windows_link_on_the_way(dir: &Path) -> Option<PathBuf> {
     let mut at = full.as_path();
     loop {
         if at.exists() {
-            // A link or junction on the way gives another final path (an 8.3
-            // short name in the spelling is refused too: write the long name).
+            // A link or junction on the way gives another final path. Short
+            // 8.3 names (`C:\Users\RUNNER~1`) are written out first: they
+            // name the same folder.
             let real = at.canonicalize().ok()?;
-            return (plain(at) != plain(&real)).then(|| at.to_path_buf());
+            // A spelling the call cannot write out is compared as it is.
+            let long = phv_std::safefs::long_name(at).unwrap_or_else(|| at.to_path_buf());
+            return (plain(&long) != plain(&real)).then(|| at.to_path_buf());
         }
         at = at.parent()?;
     }
@@ -664,7 +667,7 @@ fn exec(cmd: Command) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     /// `phv doc` does not write through a planted link (the v0.9.0 audit).
     #[cfg(unix)]
@@ -703,6 +706,7 @@ mod tests {
             .output()
             .is_ok_and(|o| o.status.success());
         if made {
+            use std::path::PathBuf;
             let full = std::path::absolute(&dir).unwrap();
             let spelled = full.to_string_lossy().into_owned();
             for p in [
@@ -714,6 +718,22 @@ mod tests {
             }
             assert!(super::windows_link_on_the_way(&full.join("plain")).is_none());
             assert!(super::windows_link_on_the_way(&full.join("plain").join("new")).is_none());
+            // A short 8.3 name of a plain folder names that folder (the CI
+            // runner's temporary directory is `C:\Users\RUNNER~1\...`).
+            let long = full.join("a folder with a long name");
+            std::fs::create_dir_all(&long).unwrap();
+            use std::os::windows::process::CommandExt as _;
+            let short = std::process::Command::new("cmd")
+                .raw_arg(r#"/C for %I in ("a folder with a long name") do @echo %~sI"#)
+                .current_dir(&full)
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| s.contains('~'));
+            if let Some(short) = short {
+                assert!(super::windows_link_on_the_way(Path::new(&short)).is_none(), "{short}");
+                assert!(super::windows_link_on_the_way(&Path::new(&short).join("new")).is_none(), "{short}");
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
