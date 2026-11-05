@@ -1624,6 +1624,7 @@ dependencies = [
  "chrono",
  "flate2",
  "form_urlencoded",
+ "futures-util",
  "getrandom 0.3.4",
  "http-body-util",
  "httpdate",
@@ -1641,6 +1642,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
+ "tungstenite",
 ]
 
 [[package]]
@@ -2396,6 +2399,18 @@ checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
  "rustls",
  "tokio",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite",
 ]
 
 [[package]]

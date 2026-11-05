@@ -7,8 +7,18 @@ use phv_syntax::Span;
 use std::path::{Path, PathBuf};
 
 /// The standard library's modules written in PHV.
-const STD_MODULES: &[&str] =
-    &["std.http", "std.db", "std.net", "std.async", "std.validate", "std.mail", "std.testing", "std.regex", "std.time"];
+const STD_MODULES: &[&str] = &[
+    "std.http",
+    "std.db",
+    "std.net",
+    "std.async",
+    "std.validate",
+    "std.mail",
+    "std.testing",
+    "std.regex",
+    "std.time",
+    "std.ws",
+];
 
 /// Files documented at most (the rest of a huge tree is left out).
 const MAX_FILES: usize = 2000;

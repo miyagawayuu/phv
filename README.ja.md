@@ -162,9 +162,9 @@ error: a URL attribute cannot start with an unchecked value
 | `phv_compiler` | HIR → レジスタ型バイトコード |
 | `phv_vm` | 値、バイトコード形式、インタプリタ、実行時の上限 |
 | `phv_jit` | int/bool/float/string を扱う関数を Cranelift でネイティブコードにする |
-| `phv_std` | 組み込み関数(文字列・JSON・日付・暗号・ファイル・SQLite・PostgreSQL・MySQL・Redis・WebSocket・HTTP クライアント・裏で動く処理・セッション)と、PHV で書かれた prelude・`std.http`・`std.db`・`std.net`・`std.async`・`std.validate`・`std.mail`・`std.regex`・`std.time`・`std.testing`。マイグレーション |
+| `phv_std` | 組み込み関数(文字列・JSON・日付・暗号・ファイル・SQLite・PostgreSQL・MySQL・Redis・WebSocket・HTTP クライアント・裏で動く処理・セッション)と、PHV で書かれた prelude・`std.http`・`std.db`・`std.net`・`std.async`・`std.validate`・`std.mail`・`std.regex`・`std.time`・`std.ws`・`std.testing`。マイグレーション |
 | `phv_driver` | モジュールとテンプレートの読み込み、`phv.toml`、バイトコードキャッシュ、実行 |
-| `phv_server` | Web サーバー(hyper + tokio)、ルーティング、セッション、CSRF、アップロード |
+| `phv_server` | Web サーバー(hyper + tokio、HTTPS と HTTP/2)、ルーティング、セッション、CSRF、アップロード、WebSocket サーバー |
 | `phv_cli` | `phv` コマンド(run / check / serve / test / fmt / lsp / install / migrate) |
 
 ## テスト

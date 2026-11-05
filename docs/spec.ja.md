@@ -1140,6 +1140,55 @@ $redis->rpush("jobs", "a");  $redis->lpop("jobs");  $redis->lrange("jobs", 0, -1
 リモートのサーバーには `rediss://` の URL が必要です(または `tls = false`)。エラーは `DatabaseError`。
 各コマンドが待つのはスクリプトの制限時間までで、スクリプトに残っているメモリより大きい応答は拒否します。
 
+### WebSocket サーバー (std.ws)
+
+`public/chat.ws.phv` というファイルが `/chat` への WebSocket 接続に答える(`public/rooms/[room].ws.phv` はパラメータ
+`room` 付きで `/rooms/blue` に答える)。ページではないので、`/chat` への普通のリクエストでは実行されない。
+
+```phv
+<?phv
+// public/chat.ws.phv
+import std.ws.{socket, publish, WsEvent};
+import std.http.{request, response};
+
+$ws = socket();
+if ($ws->event == WsEvent::Open) {
+    $name = request()->query("name") ?? "";
+    if ($name == "") {
+        response()->status(403);           // 接続を断る
+    } else {
+        $ws->set("name", $name);           // 次のイベントのために残す
+        $ws->join("lobby");
+    }
+} elseif ($ws->event == WsEvent::Message) {
+    publish("lobby", ($ws->get("name") ?? "?") . ": " . $ws->message());
+} else {
+    publish("lobby", ($ws->get("name") ?? "?") . " left");
+}
+```
+
+- スクリプトは、ページがリクエストごとに実行されるのと同じく、接続の**イベント**ごとに 1 回実行される:
+  `WsEvent::Open`(アップグレードのリクエストの一部として実行する。ミドルウェアが動き、`request()` と `session()` が使え、
+  200 以外のステータスにするとそのレスポンスで接続を断る)、テキストメッセージごとの `WsEvent::Message`
+  (`$ws->message()`)、`WsEvent::Close`。どの実行にもページと同じ時間とメモリの上限があり、ワーカーを使う。イベントの
+  あいだ、接続は VM もワーカーも持たない。1 つの接続のメッセージは 1 つずつ順に処理する。
+- 実行のあいだに残るのは、接続が `$ws->set($key, $value)` で残した値(`get()` で読む。合計 64 KB まで)と、参加した
+  トピックだけ。`$ws->id` はランダムな ID で、1 つの接続のすべてのイベントで同じ。
+- `$ws->send($text)` はこの接続に送る。`publish($topic, $text)` は、このサーバープロセスで `$topic` に参加した
+  すべての接続に送る(`$ws->join()`、`$ws->leave()`。1 つの接続につき 64 トピックまで)。`publish()` はどのページからも
+  使える(たとえばフォームを保存したあと)。メッセージはスクリプトが終わってから送る。出力(`echo`)は捨てる。
+  `$ws->close($code, $reason)` で接続を閉じる(コードは 1000 か 3000〜4999)。
+- ブラウザはページのオリジンを送る。別のサイトからの接続は、`[cors] origins` がそのサイトを許していなければ 403 で
+  断るので、別のサイトが訪問者の Cookie 付きで接続を開くことはできない。
+- 上限: 同時接続 1,024(超えると 503)、テキストメッセージは 64 KB まで(超えるものとバイナリのメッセージは接続を
+  閉じる)、1 つの接続に送るのを待つメッセージは 1 MB まで(読まないクライアントは切断する)、1 回の実行で送る・
+  publish するメッセージは 1,000 個まで、送るメッセージ 1 つは 1 MB まで。サーバーは 30 秒ごとに ping を送り、75 秒
+  何も届かない接続は閉じる。`[security] requests_per_minute` があれば、メッセージ 1 つを 1 リクエストと数え、上限を
+  超えた接続は閉じる。
+- スクリプトのエラーは接続をコード 1011 で閉じる。サーバーを止めるときは 1001 で閉じる。
+- `publish()` が届くのは 1 つのサーバープロセスの接続だけ。WebSocket は HTTP/1.1(と HTTPS)で使う。HTTP/2 の
+  クライアントは HTTP/1.1 に切り替えて接続する。
+
 ### WebSocket (std.net)
 
 WebSocket のサーバーはデータベースと同じく `phv.toml` で名前を付けます。スクリプトは名前だけを使うので、パスワードを含む
@@ -1970,8 +2019,8 @@ phv migrate legacy/page.php      # page.phv を書き出す
   (実装済み)。
   このリリースからの ARM の Linux 向けビルド、静的リンクの Linux 向けビルド、Docker イメージ(`ghcr.io/miyagawayuu/phv`)、
   Homebrew と Scoop も実装済み。
-- **1.0 速度と安定性**: 実行中の循環参照の解放、JIT の対象拡大、HTTP/2、TLS、WebSocket サーバー、`Set` 型、
-  言語仕様の安定化。
+- **1.0 速度と安定性**: 実行中の循環参照の解放(済)、JIT の対象拡大、HTTP/2 と TLS(済)、WebSocket サーバー(済)、
+  `Set` 型(済)、言語仕様の安定化。
 
 設計方針(§1)に反するため、意図して入れないものもある: `eval`、可変変数、static プロパティとグローバル変数、
 参照(`&$x`)、真偽値への暗黙の変換、`===`、`@`、`goto`、`__get` などのマジックメソッド、`extract` / `compact`、

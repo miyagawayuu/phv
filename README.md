@@ -168,9 +168,9 @@ error: a URL attribute cannot start with an unchecked value
 | `phv_compiler` | HIR → register bytecode |
 | `phv_vm` | Values, bytecode format, interpreter, runtime limits |
 | `phv_jit` | Native code for functions that use int/bool/float/string values (Cranelift) |
-| `phv_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, PostgreSQL, MySQL, Redis, WebSocket, HTTP client, background work, sessions) and the prelude, `std.http`, `std.db`, `std.net`, `std.async`, `std.validate`, `std.mail`, `std.regex`, `std.time` and `std.testing` written in PHV; migrations |
+| `phv_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, PostgreSQL, MySQL, Redis, WebSocket, HTTP client, background work, sessions) and the prelude, `std.http`, `std.db`, `std.net`, `std.async`, `std.validate`, `std.mail`, `std.regex`, `std.time`, `std.ws` and `std.testing` written in PHV; migrations |
 | `phv_driver` | Loading modules and templates, `phv.toml`, bytecode cache, running programs |
-| `phv_server` | Web server (hyper + tokio), routing, sessions, CSRF, uploads |
+| `phv_server` | Web server (hyper + tokio, HTTPS and HTTP/2), routing, sessions, CSRF, uploads, WebSocket server |
 | `phv_cli` | The `phv` command (run / check / serve / test / fmt / lsp / install / migrate) |
 
 ## Tests

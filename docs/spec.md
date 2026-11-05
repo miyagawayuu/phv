@@ -1160,6 +1160,55 @@ memory left to the script is refused. Only these commands can be sent: commands 
 `EVAL` are not available. Keys starting with `phv:` belong to PHV (sessions and rate limits kept in Redis) and raise
 `ValueError`. A remote server needs a `rediss://` URL (or `tls = false`). Errors raise `DatabaseError`.
 
+### WebSocket server (std.ws)
+
+A file `public/chat.ws.phv` answers WebSocket connections to `/chat` (`public/rooms/[room].ws.phv` answers
+`/rooms/blue`, with the parameter `room`). It is not a page: a normal request to `/chat` does not run it.
+
+```phv
+<?phv
+// public/chat.ws.phv
+import std.ws.{socket, publish, WsEvent};
+import std.http.{request, response};
+
+$ws = socket();
+if ($ws->event == WsEvent::Open) {
+    $name = request()->query("name") ?? "";
+    if ($name == "") {
+        response()->status(403);           // refuses the connection
+    } else {
+        $ws->set("name", $name);           // kept for the next events
+        $ws->join("lobby");
+    }
+} elseif ($ws->event == WsEvent::Message) {
+    publish("lobby", ($ws->get("name") ?? "?") . ": " . $ws->message());
+} else {
+    publish("lobby", ($ws->get("name") ?? "?") . " left");
+}
+```
+
+- The script runs once for each **event** of a connection, like a page for a request: `WsEvent::Open` (as part of
+  the upgrade request: middleware runs, `request()` and `session()` work, and a status other than 200 refuses the
+  connection with that response), `WsEvent::Message` for each text message (`$ws->message()`), and `WsEvent::Close`.
+  Each run has the time and memory limits of a page and takes a worker; between events a connection holds no VM
+  and no worker. The messages of one connection are handled one at a time, in order.
+- Nothing is kept between runs except what the connection keeps with `$ws->set($key, $value)` (read with `get()`,
+  64 KB in all) and the topics it joined. `$ws->id` is a random id, the same for all the events of a connection.
+- `$ws->send($text)` sends to this connection; `publish($topic, $text)` to every connection of this server process
+  that joined `$topic` (`$ws->join()`, `$ws->leave()`; 64 topics per connection). Any page may call `publish()`,
+  for example after a form is saved. Messages are sent after the script ends; output (`echo`) is discarded.
+  `$ws->close($code, $reason)` closes the connection (code 1000 or 3000–4999).
+- Browsers send the page's origin: a connection from another site is refused (403) unless `[cors] origins` allows
+  that site, so another site cannot open a connection with the visitor's cookies.
+- Limits: 1,024 connections at once (more get 503), text messages of at most 64 KB (larger ones and binary
+  messages close the connection), 1 MB of messages waiting for one connection (a client that does not read is
+  disconnected), 1,000 messages sent or published per run, and 1 MB per message sent. The server sends a ping every
+  30 seconds and closes a connection it has not heard from for 75 seconds. With `[security] requests_per_minute`,
+  each message counts as a request; a connection over the limit is closed.
+- A script error closes the connection with code 1011. When the server stops, connections are closed with 1001.
+- `publish()` reaches the connections of one server process. WebSockets are served over HTTP/1.1 (and HTTPS);
+  HTTP/2 clients fall back to it.
+
 ### WebSocket (std.net)
 
 WebSocket servers are named in `phv.toml` like database servers. Scripts only use the name, so a URL with a
@@ -2008,8 +2057,8 @@ Planned, in this order. Each release is audited before it is published, as befor
   reports and coverage, `phv doc` and a reference of the standard library, a debugger (`phv dap`), `phv run
   --profile`, a tutorial, and builds for Linux on ARM, static Linux builds and a Docker image
   (`ghcr.io/miyagawayuu/phv`), Homebrew and Scoop from this release on (done).
-- **1.0, speed and stability**: freeing reference cycles while a script runs, a JIT that covers more code, HTTP/2,
-  TLS and a WebSocket server, a `Set` type, and a stable language specification.
+- **1.0, speed and stability**: freeing reference cycles while a script runs (done), a JIT that covers more code,
+  HTTP/2 and TLS (done), a WebSocket server (done), a `Set` type (done), and a stable language specification.
 
 Some features are left out on purpose, because they work against the design principles (§1): `eval`, variable
 variables, static properties and global variables, references (`&$x`), truthiness, `===`, `@`, `goto`, magic

@@ -1,0 +1,87 @@
+// std.ws — WebSocket connections served by `phv serve`.
+//
+// A file `public/chat.ws.phv` answers WebSocket connections to `/chat`. It runs
+// once for each event: when a connection opens, for each text message, and when
+// it closes. Nothing is kept between runs except the connection's values
+// (`get()` / `set()`) and the topics it joined.
+//
+//   import std.ws.{socket, publish, WsEvent};
+//   $ws = socket();
+//   if ($ws->event == WsEvent::Open) {
+//       $ws->join("lobby");
+//   } elseif ($ws->event == WsEvent::Message) {
+//       publish("lobby", $ws->message());
+//   }
+
+export enum WsEvent {
+    /** The connection is being opened. A status other than 200 refuses it. */
+    case Open;
+    /** A text message arrived (`message()`). */
+    case Message;
+    /** The connection was closed. Messages sent now are not delivered. */
+    case Close;
+}
+
+export class Socket {
+    public function __construct(
+        public readonly WsEvent $event,
+        /** The connection's id: random, the same for all its events. */
+        public readonly string $id,
+    ) {}
+
+    /** The text message received (empty for Open and Close). */
+    public function message(): string {
+        return __sock_message();
+    }
+
+    /** A value kept for this connection, or null. */
+    public function get(string $key): ?string {
+        return __sock_get($key);
+    }
+
+    /** Keeps a value for the next events of this connection (64 KB in all). */
+    public function set(string $key, string $value): void {
+        __sock_set($key, $value);
+    }
+
+    public function remove(string $key): void {
+        __sock_remove($key);
+    }
+
+    /** Sends a text message to this connection. */
+    public function send(string $text): void {
+        __sock_send($text);
+    }
+
+    /** Receives the messages published to `topic` from now on. */
+    public function join(string $topic): void {
+        __sock_join($topic);
+    }
+
+    public function leave(string $topic): void {
+        __sock_leave($topic);
+    }
+
+    /** Closes the connection after the messages sent before. */
+    public function close(int $code = 1000, string $reason = ""): void {
+        __sock_close($code, $reason);
+    }
+}
+
+/** The connection this script runs for. Only in `public/*.ws.phv`. */
+export function socket(): Socket {
+    $e = match (__sock_event()) {
+        0 => WsEvent::Open,
+        1 => WsEvent::Message,
+        default => WsEvent::Close,
+    };
+    return new Socket($e, __sock_id());
+}
+
+/**
+ * Sends `text` to every connection that joined `topic` (in this server
+ * process), after the script ends. Any page may publish.
+ */
+export function publish(string $topic, string $text): void {
+    __sock_publish($topic, $text);
+}

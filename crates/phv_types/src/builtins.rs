@@ -281,6 +281,18 @@ pub static BUILTINS: &[BuiltinSig] = &[
     m(Set, "all", "fn(set<T>, fn(T): bool): bool", "set_all"),
     // std.http internals
     internal("__req_method", "fn(): string"),
+    // std.ws internals
+    internal("__sock_event", "fn(): int"),
+    internal("__sock_id", "fn(): string"),
+    internal("__sock_message", "fn(): string"),
+    internal("__sock_get", "fn(string): ?string"),
+    internal("__sock_set", "fn(string, string): void"),
+    internal("__sock_remove", "fn(string): void"),
+    internal("__sock_send", "fn(string): void"),
+    internal("__sock_join", "fn(string): void"),
+    internal("__sock_leave", "fn(string): void"),
+    internal("__sock_close", "fn(int, string): void"),
+    internal("__sock_publish", "fn(string, string): void"),
     internal("__req_path", "fn(): string"),
     internal("__req_ip", "fn(): string"),
     internal("__is_local_path", "fn(string): bool"),

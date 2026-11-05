@@ -27,6 +27,9 @@ chrono.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
+tokio-tungstenite.workspace = true
+tungstenite.workspace = true
+futures-util = { workspace = true, features = ["sink"] }
 
 [dev-dependencies]
 flate2.workspace = true

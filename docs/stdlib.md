@@ -9,6 +9,7 @@
 - [std.testing](#stdtesting)
 - [std.regex](#stdregex)
 - [std.time](#stdtime)
+- [std.ws](#stdws)
 
 ## std.http
 
@@ -589,4 +590,69 @@ class DateTime
 - `public function isBefore(DateTime $other): bool`
 - `public function isAfter(DateTime $other): bool`
 - `public function equals(DateTime $other): bool` — The same instant (in any zone).
+
+
+## std.ws
+
+std.ws — WebSocket connections served by `phv serve`.
+
+A file `public/chat.ws.phv` answers WebSocket connections to `/chat`. It runs
+once for each event: when a connection opens, for each text message, and when
+it closes. Nothing is kept between runs except the connection's values
+(`get()` / `set()`) and the topics it joined.
+
+```phv
+import std.ws.{socket, publish, WsEvent};
+$ws = socket();
+if ($ws->event == WsEvent::Open) {
+$ws->join("lobby");
+} elseif ($ws->event == WsEvent::Message) {
+publish("lobby", $ws->message());
+}
+```
+
+### enum WsEvent
+
+```phv
+enum WsEvent
+```
+
+- `case Open` — The connection is being opened. A status other than 200 refuses it.
+- `case Message` — A text message arrived (`message()`).
+- `case Close` — The connection was closed. Messages sent now are not delivered.
+
+### class Socket
+
+```phv
+class Socket
+```
+
+- `public readonly WsEvent $event`
+- `public readonly string $id` — The connection's id: random, the same for all its events.
+- `public function __construct(public readonly WsEvent $event, public readonly string $id)`
+- `public function message(): string` — The text message received (empty for Open and Close).
+- `public function get(string $key): ?string` — A value kept for this connection, or null.
+- `public function set(string $key, string $value): void` — Keeps a value for the next events of this connection (64 KB in all).
+- `public function remove(string $key): void`
+- `public function send(string $text): void` — Sends a text message to this connection.
+- `public function join(string $topic): void` — Receives the messages published to `topic` from now on.
+- `public function leave(string $topic): void`
+- `public function close(int $code = 1000, string $reason = ""): void` — Closes the connection after the messages sent before.
+
+### function socket
+
+```phv
+function socket(): Socket
+```
+
+The connection this script runs for. Only in `public/*.ws.phv`.
+
+### function publish
+
+```phv
+function publish(string $topic, string $text): void
+```
+
+Sends `text` to every connection that joined `topic` (in this server
+process), after the script ends. Any page may publish.
 

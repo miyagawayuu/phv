@@ -35,10 +35,17 @@ struct Route {
     file: String,
 }
 
-/// The pages of a site that have parameters, most specific first.
+/// The pages of a site that have parameters, most specific first, and the
+/// WebSocket scripts (`*.ws.phv`) that have them.
 #[derive(Debug, Default)]
 pub struct Table {
     routes: Vec<Route>,
+    ws: Vec<Route>,
+}
+
+/// A WebSocket script: `chat.ws.phv`.
+pub fn is_ws(file: &str) -> bool {
+    file.to_ascii_lowercase().ends_with(".ws.phv")
 }
 
 /// Directories deep and pages many that a site may have (a scan of `public/`
@@ -51,7 +58,8 @@ impl Table {
     /// only those with a `[` in their path are routes with parameters.
     pub fn from_pages<'a>(pages: impl Iterator<Item = &'a str>) -> Result<Table, String> {
         let mut routes = Vec::new();
-        let mut shapes: HashMap<Vec<String>, String> = HashMap::new();
+        let mut ws = Vec::new();
+        let mut shapes: HashMap<(bool, Vec<String>), String> = HashMap::new();
         for file in pages {
             if !file.contains('[') {
                 continue;
@@ -66,18 +74,25 @@ impl Table {
                     Seg::Rest(_) => "**".into(),
                 })
                 .collect();
-            if let Some(other) = shapes.insert(shape, file.to_string()) {
+            if let Some(other) = shapes.insert((is_ws(file), shape), file.to_string()) {
                 return Err(format!("public/{other} and public/{file} would answer the same paths"));
             }
-            routes.push(Route { segs, file: file.to_string() });
+            let route = Route { segs, file: file.to_string() };
+            if is_ws(file) {
+                ws.push(route);
+            } else {
+                routes.push(route);
+            }
         }
-        routes.sort_by(|a, b| {
-            let ka: Vec<u8> = a.segs.iter().map(Seg::rank).collect();
-            let kb: Vec<u8> = b.segs.iter().map(Seg::rank).collect();
-            // At the first difference the more specific kind wins; then the longer route.
-            ka.iter().zip(&kb).find(|(x, y)| x != y).map_or(kb.len().cmp(&ka.len()), |(x, y)| x.cmp(y))
-        });
-        Ok(Table { routes })
+        for list in [&mut routes, &mut ws] {
+            list.sort_by(|a, b| {
+                let ka: Vec<u8> = a.segs.iter().map(Seg::rank).collect();
+                let kb: Vec<u8> = b.segs.iter().map(Seg::rank).collect();
+                // At the first difference the more specific kind wins; then the longer route.
+                ka.iter().zip(&kb).find(|(x, y)| x != y).map_or(kb.len().cmp(&ka.len()), |(x, y)| x.cmp(y))
+            });
+        }
+        Ok(Table { routes, ws })
     }
 
     /// Scans `public/` for pages with parameters. Hidden (`.x`) and private
@@ -90,34 +105,44 @@ impl Table {
 
     /// The page for a path (its segments, decoded) and its parameters.
     pub fn find(&self, segments: &[&str]) -> Option<(&str, Vec<(String, String)>)> {
-        'routes: for r in &self.routes {
-            let mut params = Vec::new();
-            for (i, seg) in r.segs.iter().enumerate() {
-                match seg {
-                    Seg::Rest(name) => {
-                        if i >= segments.len() {
-                            continue 'routes;
-                        }
-                        params.push((name.clone(), segments[i..].join("/")));
-                        return Some((&r.file, params));
-                    }
-                    _ if i >= segments.len() => continue 'routes,
-                    Seg::Lit(l) if l != segments[i] => continue 'routes,
-                    Seg::Lit(_) => {}
-                    Seg::Param(name) => params.push((name.clone(), segments[i].to_string())),
-                }
-            }
-            if r.segs.len() == segments.len() {
-                return Some((&r.file, params));
-            }
-        }
-        None
+        find_in(&self.routes, segments)
+    }
+
+    /// The WebSocket script for a path, and its parameters.
+    pub fn find_ws(&self, segments: &[&str]) -> Option<(&str, Vec<(String, String)>)> {
+        find_in(&self.ws, segments)
     }
 }
 
-/// `posts/[id].phv` → `posts`, `[id]`; `index.phv` names its directory.
+fn find_in<'t>(routes: &'t [Route], segments: &[&str]) -> Option<(&'t str, Vec<(String, String)>)> {
+    'routes: for r in routes {
+        let mut params = Vec::new();
+        for (i, seg) in r.segs.iter().enumerate() {
+            match seg {
+                Seg::Rest(name) => {
+                    if i >= segments.len() {
+                        continue 'routes;
+                    }
+                    params.push((name.clone(), segments[i..].join("/")));
+                    return Some((&r.file, params));
+                }
+                _ if i >= segments.len() => continue 'routes,
+                Seg::Lit(l) if l != segments[i] => continue 'routes,
+                Seg::Lit(_) => {}
+                Seg::Param(name) => params.push((name.clone(), segments[i].to_string())),
+            }
+        }
+        if r.segs.len() == segments.len() {
+            return Some((&r.file, params));
+        }
+    }
+    None
+}
+
+/// `posts/[id].phv` → `posts`, `[id]`; `index.phv` names its directory
+/// (`rooms/[id].ws.phv` the same way).
 fn parse(file: &str) -> Result<Vec<Seg>, String> {
-    let stem = file.strip_suffix(".phv").unwrap_or(file);
+    let stem = if is_ws(file) { &file[..file.len() - 7] } else { file.strip_suffix(".phv").unwrap_or(file) };
     let mut parts: Vec<&str> = stem.split('/').collect();
     if parts.last() == Some(&"index") {
         parts.pop();

@@ -8,6 +8,7 @@ mod routes;
 mod session;
 mod static_files;
 mod tls;
+mod ws;
 
 use body::{RespBody, StallGuard};
 use bytes::Bytes;
@@ -21,7 +22,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use phv_driver::config::LogFormat;
 use phv_driver::{compile_cached, load_config, run, Compiled, Config, RunOptions};
 use phv_vm::value::html_escape;
-use phv_vm::{HttpCtx, Limits};
+use phv_vm::{HttpCtx, Limits, WsCtx};
 use static_files::Validators;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -127,6 +128,12 @@ struct State {
     watch: bool,
     /// The last change stamp and when it was taken (every open tab asks each second).
     watch_stamp: tokio::sync::Mutex<Option<(Instant, String)>>,
+    /// WebSocket connections and the topics they joined.
+    hub: Mutex<ws::Hub>,
+    /// A slot for each WebSocket connection that may be open.
+    ws_slots: Arc<tokio::sync::Semaphore>,
+    /// Set when the server stops: WebSocket connections are closed.
+    ws_closing: tokio::sync::watch::Sender<bool>,
 }
 
 impl State {
@@ -166,6 +173,9 @@ impl State {
             gz_cache: Mutex::new((HashMap::new(), 0)),
             watch: false,
             watch_stamp: tokio::sync::Mutex::new(None),
+            hub: Mutex::new(ws::Hub::default()),
+            ws_slots: Arc::new(tokio::sync::Semaphore::new(ws::MAX_WEBSOCKETS)),
+            ws_closing: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -376,6 +386,7 @@ fn serve_with(
         let wait = Duration::from_secs(state.config.shutdown_timeout);
         eprintln!("Stopping: letting running requests finish (at most {} s)", wait.as_secs());
         let _ = closing.send(true);
+        let _ = state.ws_closing.send(true);
         let all = slots.acquire_many(MAX_CONNECTIONS as u32);
         if tokio::time::timeout(wait, all).await.is_err() {
             eprintln!("Stopped with requests still running");
@@ -485,7 +496,7 @@ where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let service = service_fn(move |req| handle(state.clone(), peer, req));
-    drive!(h1_builder().serve_connection(TokioIo::new(io), service), closed, None)
+    drive!(h1_builder().serve_connection(TokioIo::new(io), service).with_upgrades(), closed, None)
 }
 
 async fn serve_h2<I>(state: Arc<State>, peer: SocketAddr, io: I, closed: Closed)
@@ -536,10 +547,15 @@ where
         .max_local_error_reset_streams(256)
         .keep_alive_interval(Some(Duration::from_secs(30)))
         .keep_alive_timeout(Duration::from_secs(20));
-    drive!(b.serve_connection(TokioIo::new(io), service), closed, Some(activity))
+    drive!(b.serve_connection_with_upgrades(TokioIo::new(io), service), closed, Some(activity))
 }
 
 type Resp = Response<RespBody>;
+
+/// What a WebSocket event's script left: the connection's kept values (a
+/// response extension, read by `ws.rs`).
+#[derive(Clone)]
+struct WsDone(WsCtx);
 
 /// HTTP/2 sends the host as `:authority` and may split the cookies into
 /// several fields: the server and scripts see them as HTTP/1.1 sends them.
@@ -927,7 +943,8 @@ fn resolve(state: &State, url_path: &str) -> Option<Target> {
     let name_of = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     for c in candidates {
         if let Some(p) = exact(&c) {
-            if !name_of(&p).ends_with(".phv.html") {
+            let n = name_of(&p);
+            if !n.ends_with(".phv.html") && !n.ends_with(".ws.phv") {
                 return Some(Target::Script(p, Vec::new()));
             }
         }
@@ -943,6 +960,42 @@ fn resolve(state: &State, url_path: &str) -> Option<Target> {
     let table = state.routes().ok()?;
     let (file, params) = table.find(&segments)?;
     exact(file).map(|p| Target::Script(p, params))
+}
+
+/// The WebSocket script (`public/<path>.ws.phv`) for an upgrade request to
+/// `url_path`, with the parameters of its path; the same rules as `resolve`.
+fn resolve_ws(state: &State, url_path: &str) -> Option<(PathBuf, Vec<(String, String)>)> {
+    let decoded = percent_encoding::percent_decode_str(url_path).decode_utf8().ok()?;
+    if decoded.contains(['\0', '\\', ':']) {
+        return None;
+    }
+    let segments: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.iter().any(|s| s.starts_with('.') || s.starts_with('_')) {
+        return None;
+    }
+    let rel = segments.join("/");
+    let candidates = if rel.is_empty() {
+        vec!["index.ws.phv".to_string()]
+    } else {
+        vec![format!("{rel}.ws.phv"), format!("{rel}/index.ws.phv")]
+    };
+    if let Some(e) = &state.embedded {
+        if let Some(c) = candidates.into_iter().find(|c| e.pages.contains_key(c)) {
+            return Some((state.public.join(c), Vec::new()));
+        }
+    } else {
+        for c in candidates {
+            if let Some(p) = state.special(&c) {
+                return Some((p, Vec::new()));
+            }
+        }
+    }
+    let table = state.routes().ok()?;
+    let (file, params) = table.find_ws(&segments)?;
+    match &state.embedded {
+        Some(_) => Some((state.public.join(file), params)),
+        None => state.special(file).map(|p| (p, params)),
+    }
 }
 
 /// Checks the pages with parameters under `public/` (`phv build` refuses a
@@ -989,6 +1042,11 @@ async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
     if let Err(e) = state.routes() {
         eprintln!("error in the routes of public/: {e}");
         return state.error_page("Route error", &e);
+    }
+    if ws::is_upgrade(&req) {
+        if let Some((script, params)) = resolve_ws(state, req.uri().path()) {
+            return ws::upgrade(state, script, params, ip, req).await;
+        }
     }
     let target = resolve(state, req.uri().path());
     match target {
@@ -1091,6 +1149,9 @@ enum Page {
     Normal,
     NotFound,
     Error,
+    /// A message or the closing of a WebSocket connection (its opening is
+    /// `Normal`: middleware runs for it).
+    Event,
 }
 
 /// `resolve` for a built site: its pages are known by their paths under
@@ -1103,7 +1164,7 @@ fn resolve_embedded(state: &State, e: &Embedded, rel: String) -> Option<Target> 
     } else {
         vec![format!("{rel}.phv"), format!("{rel}/index.phv")]
     };
-    if let Some(page) = candidates.into_iter().find(|c| e.pages.contains_key(c)) {
+    if let Some(page) = candidates.into_iter().find(|c| e.pages.contains_key(c) && !routes::is_ws(c)) {
         return Some(Target::Script(state.public.join(page), Vec::new()));
     }
     let Some(bytes) = e.statics.get(&rel) else {
@@ -1158,6 +1219,9 @@ impl State {
 
     /// Parses the request, checks CSRF, runs the page and builds the response.
     /// Runs on a blocking thread: everything here may take CPU time.
+    // The request's parts, and what kind of run it is (a page, an error page,
+    // a WebSocket event with its connection).
+    #[allow(clippy::too_many_arguments)]
     fn execute(
         &self,
         script: &Path,
@@ -1166,6 +1230,7 @@ impl State {
         parts: hyper::http::request::Parts,
         body: Bytes,
         kind: Page,
+        ws: Option<WsCtx>,
     ) -> Resp {
         let headers: Vec<(String, String)> = parts
             .headers
@@ -1235,6 +1300,8 @@ impl State {
 
         let had_session = session.id.is_some();
         let mut ctx = HttpCtx {
+            ws,
+            can_publish: true,
             method: parts.method.as_str().to_string(),
             path: percent_encoding::percent_decode_str(parts.uri.path()).decode_utf8_lossy().into_owned(),
             query,
@@ -1249,7 +1316,7 @@ impl State {
             body: if raw_body { String::from_utf8_lossy(&body).into_owned() } else { String::new() },
             params,
             status: match kind {
-                Page::Normal => 200,
+                Page::Normal | Page::Event => 200,
                 Page::NotFound => 404,
                 Page::Error => 500,
             },
@@ -1339,6 +1406,18 @@ impl State {
     /// The response for what a script did: status, headers, cookies and body.
     fn respond(&self, outcome: phv_driver::RunOutcome, had_session: bool) -> Resp {
         let mut http = outcome.http;
+        // What the script published, and asked of its WebSocket connection.
+        let publishes = std::mem::take(&mut http.publishes);
+        let ws = http.ws.take();
+        if !publishes.is_empty() || ws.is_some() {
+            let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(w) = &ws {
+                hub.apply(w);
+            }
+            for (topic, text) in &publishes {
+                hub.publish(topic, text);
+            }
+        }
         let csp = self.config.csp.page_header(http.csp_nonce.as_deref());
         let flags = if self.config.secure_cookies { "; Secure" } else { "" };
         let session = std::mem::take(&mut http.session);
@@ -1405,6 +1484,9 @@ impl State {
         }
         if personal {
             r.extensions_mut().insert(static_files::Personal);
+        }
+        if let Some(w) = ws {
+            r.extensions_mut().insert(WsDone(w));
         }
         r
     }
@@ -1514,7 +1596,7 @@ async fn run_script(
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _reserved = reserved;
-        st.execute(&script, params, ip, parts, body, kind)
+        st.execute(&script, params, ip, parts, body, kind, None)
     })
     .await
     {
@@ -1593,10 +1675,10 @@ impl State {
         }
         match resolve(self, parts.uri.path()) {
             None => match self.special("_404.phv") {
-                Some(page) => self.execute(&page, Vec::new(), ip, parts, body, Page::NotFound),
+                Some(page) => self.execute(&page, Vec::new(), ip, parts, body, Page::NotFound, None),
                 None => not_found(),
             },
-            Some(Target::Script(p, params)) => self.execute(&p, params, ip, parts, body, Page::Normal),
+            Some(Target::Script(p, params)) => self.execute(&p, params, ip, parts, body, Page::Normal, None),
             Some(Target::Static(p)) => match std::fs::read(&p) {
                 Ok(data) => {
                     let mut r = Response::new(RespBody::full(data));

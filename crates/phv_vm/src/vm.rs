@@ -93,6 +93,41 @@ pub struct HttpCtx {
     pub params: Vec<(String, String)>,
     /// Values middleware passes on to the page (`locals()`).
     pub locals: Vec<(String, String)>,
+    /// The WebSocket event this script handles (`public/*.ws.phv`), if any.
+    pub ws: Option<WsCtx>,
+    /// Messages for the WebSocket connections that joined a topic (`publish()`),
+    /// delivered by the server after the script ends.
+    pub publishes: Vec<(String, String)>,
+    /// `publish()` can be used: the script runs in `phv serve`.
+    pub can_publish: bool,
+}
+
+/// What happened on a WebSocket connection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WsEvent {
+    /// The connection is being opened: the script may refuse it.
+    #[default]
+    Open,
+    Message,
+    Close,
+}
+
+/// One event of a WebSocket connection, and what the script asked for.
+#[derive(Clone, Debug, Default)]
+pub struct WsCtx {
+    pub event: WsEvent,
+    /// The connection's id (random, the same for all its events).
+    pub id: String,
+    /// The text message received (for `Message`).
+    pub message: String,
+    /// Values kept for the connection from one event to the next.
+    pub state: indexmap::IndexMap<String, String>,
+    /// Messages to send to this connection.
+    pub sends: Vec<String>,
+    pub joins: Vec<String>,
+    pub leaves: Vec<String>,
+    /// Close the connection with this code and reason.
+    pub close: Option<(u16, String)>,
 }
 
 impl Default for HttpCtx {
@@ -118,6 +153,9 @@ impl Default for HttpCtx {
             personalized: false,
             params: Vec::new(),
             locals: Vec::new(),
+            ws: None,
+            publishes: Vec::new(),
+            can_publish: false,
         }
     }
 }

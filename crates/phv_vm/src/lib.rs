@@ -12,5 +12,5 @@ pub use value::{Key, KeySet, Map, Value};
 pub use vm::{
     BuiltinFn, DatabaseSpec, Exc, Host, HttpCtx, HttpSpec, JitCtx, JitEntry, JitLimits, JitTable, Limits, MailSpec,
     OutBuf, Permissions, SessionData, Site, SiteRequest, SiteResponse, TraceLine, UploadedFile, Vm, VmError,
-    WebSocketSpec,
+    WebSocketSpec, WsCtx, WsEvent,
 };

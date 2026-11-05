@@ -32,6 +32,7 @@ mod timez;
 mod twofactor;
 mod web;
 mod websocket;
+pub mod wsserver;
 
 pub use httpclient::{check_header_name, check_header_value, check_http_url};
 pub use netdb::{
@@ -59,6 +60,7 @@ pub fn std_module(name: &str) -> Option<&'static str> {
         "std.mail" => Some(include_str!("phv/mail.phv")),
         "std.regex" => Some(include_str!("phv/regex.phv")),
         "std.time" => Some(include_str!("phv/time.phv")),
+        "std.ws" => Some(include_str!("phv/ws.phv")),
         _ => None,
     }
 }
@@ -735,23 +737,29 @@ pub fn is_local_path(p: &str) -> bool {
     p.starts_with('/') && !p.starts_with("//") && !p.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\')
 }
 
+/// The modules that implement builtins, each looked up by name.
+const PROVIDERS: &[fn(&str) -> Option<BuiltinFn>] = &[
+    core_lookup,
+    web::lookup,
+    sys::lookup,
+    db::lookup,
+    twofactor::lookup,
+    websocket::lookup,
+    httpclient::lookup,
+    asyncio::lookup,
+    collections::lookup,
+    sets::lookup,
+    wsserver::lookup,
+    numbers::lookup,
+    re::lookup,
+    textio::lookup,
+    timez::lookup,
+    jsonas::lookup,
+    crypt::lookup,
+];
+
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
-    core_lookup(name)
-        .or_else(|| web::lookup(name))
-        .or_else(|| sys::lookup(name))
-        .or_else(|| db::lookup(name))
-        .or_else(|| twofactor::lookup(name))
-        .or_else(|| websocket::lookup(name))
-        .or_else(|| httpclient::lookup(name))
-        .or_else(|| asyncio::lookup(name))
-        .or_else(|| collections::lookup(name))
-        .or_else(|| sets::lookup(name))
-        .or_else(|| numbers::lookup(name))
-        .or_else(|| re::lookup(name))
-        .or_else(|| textio::lookup(name))
-        .or_else(|| timez::lookup(name))
-        .or_else(|| jsonas::lookup(name))
-        .or_else(|| crypt::lookup(name))
+    PROVIDERS.iter().find_map(|p| p(name))
 }
 
 fn core_lookup(name: &str) -> Option<BuiltinFn> {
@@ -1235,6 +1243,15 @@ mod tests {
     fn every_signature_has_an_implementation() {
         for sig in phv_types_sigs() {
             assert!(lookup(sig).is_some(), "builtin `{sig}` has a signature but no implementation");
+        }
+    }
+
+    /// Two modules implementing one name: the first would shadow the other.
+    #[test]
+    fn every_builtin_has_one_implementation() {
+        for sig in phv_types_sigs() {
+            let n = PROVIDERS.iter().filter(|p| p(sig).is_some()).count();
+            assert!(n <= 1, "builtin `{sig}` is implemented by {n} modules");
         }
     }
 
