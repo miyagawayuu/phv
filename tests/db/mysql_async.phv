@@ -10,9 +10,9 @@ $counts = await_all([
     $db->executeAsync(sql"INSERT INTO phv_async (n) VALUES (2)"),
 ]);
 echo "inserted: ", $counts[0] + $counts[1], "\n";
-// Two statements of one second each, at the same time.
-$a = $db->queryAsync(sql"SELECT SLEEP(1), 1 AS one");
-$b = $db->queryAsync(sql"SELECT SLEEP(1), 2 AS two");
+// Two statements of three seconds each, at the same time.
+$a = $db->queryAsync(sql"SELECT SLEEP(3), 1 AS one");
+$b = $db->queryAsync(sql"SELECT SLEEP(3), 2 AS two");
 echo "one: ", (await($a)[0]->int("one") ?? 0), ", two: ", (await($b)[0]->int("two") ?? 0), "\n";
 $rows = await($db->queryAsync(sql"SELECT n FROM phv_async ORDER BY n"));
 echo "rows: ", $rows->map(fn($r) => (string)($r->int("n") ?? 0))->join(","), "\n";

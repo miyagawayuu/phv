@@ -80,14 +80,16 @@ fn check_memory_limit(host: &Arc<Host>, name: &str) {
 }
 
 /// Statements started with `*Async` take connections of their own, so the
-/// pool has room for them; the two one-second statements run at the same time.
+/// pool has room for them; the two three-second statements run at the same time
+/// (one after the other they would take 6 seconds; the rest leaves room for a
+/// slow runner to set up its connections).
 fn check_async(url: &str, name: &str) {
     let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 8 };
     let host =
         Arc::new(Host { root: root(), databases: BTreeMap::from([("main".to_string(), spec)]), ..Host::default() });
     let start = std::time::Instant::now();
     check(&host, name);
-    assert!(start.elapsed() < Duration::from_millis(1800), "{name} took {:?}", start.elapsed());
+    assert!(start.elapsed() < Duration::from_millis(5000), "{name} took {:?}", start.elapsed());
 }
 
 fn server(var: &str) -> Option<String> {
