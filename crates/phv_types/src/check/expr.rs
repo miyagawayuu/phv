@@ -24,7 +24,7 @@ fn unify(param: &Type, actual: &Type, b: &mut Bindings) {
                 *slot = Some(t.clone());
             }
         }
-        (Type::List(p), Type::List(a)) => unify(p, a, b),
+        (Type::List(p), Type::List(a)) | (Type::Set(p), Type::Set(a)) => unify(p, a, b),
         (Type::Map(pk, pv), Type::Map(ak, av)) => {
             unify(pk, ak, b);
             unify(pv, av, b);
@@ -62,6 +62,7 @@ fn subst(t: &Type, b: &Bindings) -> Type {
             None => Type::Error,
         },
         Type::List(x) => Type::list(subst(x, b)),
+        Type::Set(x) => Type::set(subst(x, b)),
         Type::Map(k, v) => Type::map(subst(k, b), subst(v, b)),
         Type::Func(ps, r) => Type::Func(ps.iter().map(|p| subst(p, b)).collect(), Box::new(subst(r, b))),
         Type::Union(ms) => Type::union(ms.iter().map(|m| subst(m, b)).collect()),
@@ -89,6 +90,7 @@ pub(super) fn instantiate(t: &Type, tps: &[String]) -> Type {
             None => t.clone(),
         },
         Type::List(x) => Type::list(instantiate(x, tps)),
+        Type::Set(x) => Type::set(instantiate(x, tps)),
         Type::Map(k, v) => Type::map(instantiate(k, tps), instantiate(v, tps)),
         Type::Func(ps, r) => {
             Type::Func(ps.iter().map(|p| instantiate(p, tps)).collect(), Box::new(instantiate(r, tps)))
@@ -145,7 +147,7 @@ impl<'a> Checker<'a> {
                         .upcast(*a, aa, *b)
                         .is_some_and(|up| up.len() == ba.len() && up.iter().zip(ba).all(|(x, y)| self.same(x, y)))
             }
-            (Type::List(a), Type::List(b)) => self.same(a, b),
+            (Type::List(a), Type::List(b)) | (Type::Set(a), Type::Set(b)) => self.same(a, b),
             (Type::Map(k1, v1), Type::Map(k2, v2)) => self.same(k1, k2) && self.same(v1, v2),
             (Type::Func(p1, r1), Type::Func(p2, r2)) => {
                 p1.len() == p2.len()
@@ -402,7 +404,7 @@ impl<'a> Checker<'a> {
         let note = match ty {
             Type::Str => "PHV has no truthiness: write `$s != \"\"` or `!$s->isEmpty()`",
             Type::Int | Type::Float => "PHV has no truthiness: write `$n != 0`",
-            Type::List(_) | Type::Map(..) => "PHV has no truthiness: write `!$xs->isEmpty()`",
+            Type::List(_) | Type::Map(..) | Type::Set(_) => "PHV has no truthiness: write `!$xs->isEmpty()`",
             _ => "PHV has no truthiness: compare explicitly, e.g. `$x != null`",
         };
         e.add_note(note);
@@ -565,6 +567,7 @@ impl<'a> Checker<'a> {
             "Html" => TestKind::Html,
             "list" => TestKind::List,
             "map" => TestKind::Map,
+            "set" => TestKind::Set,
             other => match self.class_ref(other, ty.span) {
                 Some(c) => TestKind::Class(c),
                 None => {
@@ -585,6 +588,7 @@ impl<'a> Checker<'a> {
             | (TestKind::Html, Type::Html | Type::SafeUrl | Type::SafeJs)
             | (TestKind::List, Type::List(_))
             | (TestKind::Map, Type::Map(..))
+            | (TestKind::Set, Type::Set(_))
             | (TestKind::Func, Type::Func(..)) => true,
             (TestKind::Class(target), Type::Class(c, _)) => self.is_subclass(*c, target),
             // `Sql` values are lists at runtime.
@@ -609,6 +613,7 @@ impl<'a> Checker<'a> {
             TestKind::Html => Type::Html,
             TestKind::List => Type::list(Type::Any),
             TestKind::Map => Type::map(Type::Any, Type::Any),
+            TestKind::Set => Type::set(Type::Any),
             TestKind::Func => Type::Any,
             TestKind::Class(c) => self.any_args(c),
         }
@@ -864,6 +869,11 @@ impl<'a> Checker<'a> {
     }
 
     fn list_lit(&mut self, items: &[Expr], expect: Option<&Type>, span: Span) -> HExpr {
+        // `[1, 2]` where a `set<int>` is expected is a set of its items.
+        if let Some(Type::Set(t)) = expect.map(|t| t.without_null()).filter(|t| !t.has_unknown()) {
+            let items = self.list_lit(items, Some(&Type::list((*t).clone())), span);
+            return HExpr { kind: HExprKind::CallBuiltin("set_from_list".into(), vec![items]), ty: Type::Set(t), span };
+        }
         if items.iter().any(|i| matches!(i.kind, ExprKind::Spread(_))) {
             return self.spread_list(items, expect, span);
         }
@@ -1129,7 +1139,9 @@ impl<'a> Checker<'a> {
                     || (x.is_numeric() && y.is_numeric())
                     || match (x, y) {
                         (Type::Class(p, _), Type::Class(q, _)) => self.is_subclass(*p, *q) || self.is_subclass(*q, *p),
-                        (Type::List(_), Type::List(_)) | (Type::Map(..), Type::Map(..)) => self.assignable_exact(x, y),
+                        (Type::List(_), Type::List(_))
+                        | (Type::Map(..), Type::Map(..))
+                        | (Type::Set(_), Type::Set(_)) => self.assignable_exact(x, y),
                         _ => false,
                     }
             })
@@ -1566,7 +1578,7 @@ impl<'a> Checker<'a> {
     }
 
     /// The description of a type for `__json_as`: `i f s b a`, `?X`, `lX`,
-    /// `msX` / `miX` (map with string or int keys), `eN` / `nN` (enum N, by
+    /// `ti` / `ts` (set of int or string), `msX` / `miX` (map with string or int keys), `eN` / `nN` (enum N, by
     /// value or, for a pure enum, by case name), `cN` (class N, whose public
     /// properties are listed in `defs` as `name:X`, `name!:X` when required, or
     /// `name=K:X` when a constructor parameter gives the default `defaults[K]`).
@@ -1586,6 +1598,7 @@ impl<'a> Checker<'a> {
                 format!("?{}", self.json_shape(&t.without_null(), defs, defaults)?)
             }
             Type::List(e) => format!("l{}", self.json_shape(e, defs, defaults)?),
+            Type::Set(e) => format!("t{}", if **e == Type::Int { "i" } else { "s" }),
             Type::Map(k, v) => {
                 let key = if **k == Type::Int { "i" } else { "s" };
                 format!("m{key}{}", self.json_shape(v, defs, defaults)?)
@@ -1869,6 +1882,7 @@ impl<'a> Checker<'a> {
             Type::Str => Some(Recv::Str),
             Type::List(_) => Some(Recv::List),
             Type::Map(..) => Some(Recv::Map),
+            Type::Set(_) => Some(Recv::Set),
             _ => None,
         };
         if let Some(kind) = recv_kind {
@@ -2019,6 +2033,7 @@ impl<'a> Checker<'a> {
                             let create = match &*vt {
                                 Type::List(_) => Some(HConst::EmptyList),
                                 Type::Map(..) => Some(HConst::EmptyMap),
+                                Type::Set(_) => Some(HConst::EmptySet),
                                 _ => None,
                             };
                             p.path.push(HPathElem::Index(hk, create));
@@ -2026,6 +2041,17 @@ impl<'a> Checker<'a> {
                         }
                         None => {
                             self.error("cannot append to a map with `[]`; give a key: `$m[$key] = $value`", e.span);
+                            None
+                        }
+                    },
+                    // `$s[] = $x` adds `$x` to the set.
+                    Type::Set(t) => match index {
+                        None => {
+                            p.path.push(HPathElem::Push);
+                            Some((p, *t))
+                        }
+                        Some(_) => {
+                            self.error("a set has no keys; add an element with `$s[] = $value`", e.span);
                             None
                         }
                     },
@@ -2066,6 +2092,10 @@ impl<'a> Checker<'a> {
             Type::Map(kt, vt) => {
                 let hk = self.key_to(k, &kt);
                 mk(hb, hk, *vt)
+            }
+            Type::Set(_) => {
+                self.error("a set cannot be indexed", span).add_note("use `$s->has($value)`");
+                err(span)
             }
             Type::Error => err(span),
             Type::Str => {
@@ -2653,7 +2683,7 @@ impl<'a> Checker<'a> {
                         Some((user(self, m.func, &fixed)?, Some(h)))
                     }
                     Type::Error => None,
-                    t @ (Type::Str | Type::List(_) | Type::Map(..)) => {
+                    t @ (Type::Str | Type::List(_) | Type::Map(..) | Type::Set(_)) => {
                         let msg = format!("methods of `{}` cannot be used with `(...)`", self.tn(&t));
                         self.error(msg, span).add_note(wrap);
                         None

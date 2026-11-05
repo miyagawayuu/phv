@@ -25,6 +25,8 @@ pub enum Type {
     Error,
     List(Box<Type>),
     Map(Box<Type>, Box<Type>),
+    /// `set<T>`: distinct `int` or `string` values.
+    Set(Box<Type>),
     /// A class or interface with its type arguments (empty unless it is generic).
     Class(ClassId, Vec<Type>),
     Func(Vec<Type>, Box<Type>),
@@ -63,6 +65,10 @@ impl Type {
 
     pub fn map(k: Type, v: Type) -> Type {
         Type::Map(Box::new(k), Box::new(v))
+    }
+
+    pub fn set(t: Type) -> Type {
+        Type::Set(Box::new(t))
     }
 
     pub fn union(members: Vec<Type>) -> Type {
@@ -132,7 +138,7 @@ impl Type {
     pub fn is_open(&self) -> bool {
         match self {
             Type::Unknown => true,
-            Type::List(t) => t.is_open(),
+            Type::List(t) | Type::Set(t) => t.is_open(),
             Type::Map(k, v) => k.is_open() || v.is_open(),
             Type::Func(ps, r) => ps.iter().any(|p| p.is_open()) || r.is_open(),
             Type::Union(ms) => ms.iter().any(|m| m.is_open()),
@@ -153,6 +159,7 @@ impl Type {
             Type::Unknown if read => Type::Any,
             Type::Unknown => Type::Never,
             Type::List(t) => Type::list(t.resolve_open(read)),
+            Type::Set(t) => Type::set(t.resolve_open(read)),
             Type::Map(k, v) => Type::map(k.resolve_open(read), v.resolve_open(read)),
             // A closure's parameters receive values: the other way round.
             Type::Func(ps, r) => {
@@ -166,7 +173,7 @@ impl Type {
     pub fn has_unknown(&self) -> bool {
         match self {
             Type::Infer | Type::Generic(_) => true,
-            Type::List(t) => t.has_unknown(),
+            Type::List(t) | Type::Set(t) => t.has_unknown(),
             Type::Map(k, v) => k.has_unknown() || v.has_unknown(),
             Type::Func(ps, r) => ps.iter().any(|p| p.has_unknown()) || r.has_unknown(),
             Type::Union(ms) => ms.iter().any(|m| m.has_unknown()),
@@ -202,6 +209,7 @@ impl fmt::Display for TypeDisplay<'_> {
             Type::Unknown => write!(f, "?"),
             Type::Error => write!(f, "{{unknown}}"),
             Type::List(t) => write!(f, "list<{}>", t.display(self.names)),
+            Type::Set(t) => write!(f, "set<{}>", t.display(self.names)),
             Type::Map(k, v) => write!(f, "map<{}, {}>", k.display(self.names), v.display(self.names)),
             Type::Class(c, args) => {
                 write!(f, "{}", self.names.get(*c as usize).map(|s| s.as_str()).unwrap_or("?"))?;

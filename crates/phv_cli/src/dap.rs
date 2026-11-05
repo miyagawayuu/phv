@@ -182,6 +182,7 @@ impl Hook {
         let openable = match v {
             Value::List(l) => !l.is_empty(),
             Value::Map(m) => !m.is_empty(),
+            Value::Set(s) => !s.is_empty(),
             Value::Object(_) => true,
             _ => false,
         };
@@ -283,6 +284,11 @@ impl Hook {
                     out.push(self.variable(format!("[{key}]"), x));
                 }
             }
+            Value::Set(s) => {
+                for (i, k) in s.iter().take(MAX_CHILDREN).enumerate() {
+                    out.push(self.variable(format!("[{i}]"), &k.to_value()));
+                }
+            }
             Value::Object(o) => {
                 let o = o.borrow();
                 let fields: Vec<(String, Value)> = self.prog.classes[o.class as usize]
@@ -326,6 +332,7 @@ fn show(prog: &Program, v: &Value) -> String {
         Value::Html(s) => format!("Html({})", quoted_prefix(s)),
         Value::List(l) => format!("list({})", l.len()),
         Value::Map(m) => format!("map({})", m.len()),
+        Value::Set(s) => format!("set({})", s.len()),
         Value::Object(o) => {
             let o = o.borrow();
             let class = &prog.classes[o.class as usize];

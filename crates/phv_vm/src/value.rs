@@ -1,10 +1,13 @@
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt::Write;
 use std::rc::Rc;
 
 pub type Map = IndexMap<Key, Value>;
+
+/// The elements of a `set<T>` (`int` or `string`), in the order they were added.
+pub type KeySet = IndexSet<Key>;
 
 /// A runtime value. Scalars are stored inline; strings, lists and maps are
 /// reference-counted and copied on write, so they behave as values (like PHP
@@ -21,6 +24,7 @@ pub enum Value {
     Html(Rc<String>),
     List(Rc<Vec<Value>>),
     Map(Rc<Map>),
+    Set(Rc<KeySet>),
     Object(Rc<RefCell<Object>>),
     Closure(Rc<Closure>),
 }
@@ -60,6 +64,10 @@ impl Value {
         Value::Map(Rc::new(m))
     }
 
+    pub fn set(s: KeySet) -> Value {
+        Value::Set(Rc::new(s))
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Null => "null",
@@ -70,6 +78,7 @@ impl Value {
             Value::Html(_) => "Html",
             Value::List(_) => "list",
             Value::Map(_) => "map",
+            Value::Set(_) => "set",
             Value::Object(_) => "object",
             Value::Closure(_) => "closure",
         }
@@ -209,6 +218,27 @@ pub fn values_equal_metered(a: &Value, b: &Value, meter: &mut dyn FnMut(usize) -
                         match y.get(k) {
                             Some(w) => work.push((v, w)),
                             None => return Some(false),
+                        }
+                    }
+                }
+                true
+            }
+            // Sets are equal when they have the same elements, in any order.
+            (Value::Set(x), Value::Set(y)) => {
+                if !Rc::ptr_eq(x, y) {
+                    if x.len() != y.len() {
+                        return Some(false);
+                    }
+                    for k in x.iter() {
+                        let bytes = match k {
+                            Key::Int(_) => 8,
+                            Key::Str(s) => s.len() + 1,
+                        };
+                        if !meter(bytes) {
+                            return None;
+                        }
+                        if !y.contains(k) {
+                            return Some(false);
                         }
                     }
                 }

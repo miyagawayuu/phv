@@ -23,9 +23,19 @@ enum Shape {
     Any,
     Opt(Box<Shape>),
     List(Box<Shape>),
-    Map { int_keys: bool, value: Box<Shape> },
+    /// `set<int>` (`int_items`) or `set<string>`: an array of distinct items.
+    Set {
+        int_items: bool,
+    },
+    Map {
+        int_keys: bool,
+        value: Box<Shape>,
+    },
     Class(u32),
-    Enum { class: u32, by_name: bool },
+    Enum {
+        class: u32,
+        by_name: bool,
+    },
 }
 
 enum Missing {
@@ -51,6 +61,7 @@ fn shape(d: &mut std::str::Chars) -> Option<Shape> {
         'a' => Shape::Any,
         '?' => Shape::Opt(Box::new(shape(d)?)),
         'l' => Shape::List(Box::new(shape(d)?)),
+        't' => Shape::Set { int_items: d.next()? == 'i' },
         'm' => {
             let int_keys = d.next()? == 'i';
             Shape::Map { int_keys, value: Box::new(shape(d)?) }
@@ -151,6 +162,25 @@ impl Builder<'_> {
                 Ok(Value::list(out))
             }
             (Shape::List(_), v) => Err(self.expected(vm, "an array", v)),
+            (Shape::Set { int_items }, Value::List(items)) => {
+                let len = self.path.len();
+                let mut out = phv_vm::KeySet::with_capacity(items.len());
+                for (i, x) in items.iter().enumerate() {
+                    let key = match (int_items, x) {
+                        (true, Value::Int(n)) => Key::Int(*n),
+                        (false, Value::Str(s)) => Key::Str(s.clone()),
+                        _ => {
+                            self.path.push_str(&format!("[{i}]"));
+                            let want = if *int_items { "an integer" } else { "a string" };
+                            return Err(self.expected(vm, want, x));
+                        }
+                    };
+                    out.insert(key);
+                }
+                self.path.truncate(len);
+                Ok(Value::set(out))
+            }
+            (Shape::Set { .. }, v) => Err(self.expected(vm, "an array", v)),
             (Shape::Map { int_keys, value }, Value::Map(m)) => {
                 let len = self.path.len();
                 let mut out = Map::with_capacity(m.len());

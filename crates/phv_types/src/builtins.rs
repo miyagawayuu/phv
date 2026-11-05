@@ -10,6 +10,7 @@ pub enum Recv {
     Str,
     List,
     Map,
+    Set,
 }
 
 pub struct BuiltinSig {
@@ -33,12 +34,15 @@ const fn internal(name: &'static str, sig: &'static str) -> BuiltinSig {
     BuiltinSig { name, recv: None, sig, imp: name, internal: true }
 }
 
-use Recv::{List, Map, Str};
+use Recv::{List, Map, Set, Str};
 
 pub static BUILTINS: &[BuiltinSig] = &[
     // Global functions (PHP-style names).
     f("count", "fn(list<T>): int", "list_len"),
     f("count", "fn(map<K, V>): int", "map_len"),
+    f("count", "fn(set<T>): int", "set_len"),
+    f("set", "fn(list<int>): set<int>", "set_from_list"),
+    f("set", "fn(list<string>): set<string>", "set_from_list"),
     f("strlen", "fn(string): int", "strlen"),
     f("implode", "fn(string, list<string>): string", "implode"),
     f("explode", "fn(string, string): list<string>", "explode"),
@@ -261,6 +265,20 @@ pub static BUILTINS: &[BuiltinSig] = &[
     m(Map, "sortedByValue", "fn(map<K, int>): map<K, int>", "map_sorted_by_value"),
     m(Map, "sortedByValue", "fn(map<K, float>): map<K, float>", "map_sorted_by_value"),
     m(Map, "sortedByValue", "fn(map<K, string>): map<K, string>", "map_sorted_by_value"),
+    // set methods
+    m(Set, "len", "fn(set<T>): int", "set_len"),
+    m(Set, "isEmpty", "fn(set<T>): bool", "set_is_empty"),
+    m(Set, "has", "fn(set<T>, T): bool", "set_has"),
+    m(Set, "add", "fn(set<T>, T): set<T>", "set_add"),
+    m(Set, "remove", "fn(set<T>, T): set<T>", "set_remove"),
+    m(Set, "union", "fn(set<T>, set<T>): set<T>", "set_union"),
+    m(Set, "intersect", "fn(set<T>, set<T>): set<T>", "set_intersect"),
+    m(Set, "diff", "fn(set<T>, set<T>): set<T>", "set_diff"),
+    m(Set, "isSubsetOf", "fn(set<T>, set<T>): bool", "set_is_subset"),
+    m(Set, "toList", "fn(set<T>): list<T>", "set_to_list"),
+    m(Set, "filter", "fn(set<T>, fn(T): bool): set<T>", "set_filter"),
+    m(Set, "any", "fn(set<T>, fn(T): bool): bool", "set_any"),
+    m(Set, "all", "fn(set<T>, fn(T): bool): bool", "set_all"),
     // std.http internals
     internal("__req_method", "fn(): string"),
     internal("__req_path", "fn(): string"),

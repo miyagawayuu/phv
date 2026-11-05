@@ -17,6 +17,7 @@ pub enum Const {
     Str(String),
     EmptyList,
     EmptyMap,
+    EmptySet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +30,7 @@ pub enum TypeTag {
     Html,
     List,
     Map,
+    Set,
     Closure,
     Object,
 }

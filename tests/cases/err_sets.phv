@@ -1,0 +1,10 @@
+<?phv
+set<float> $f = [];
+$s = set(["a"]);
+echo $s[0];
+$s["k"] = "v";
+$t = set([1.5]);
+echo $s->has(1) ? "y" : "n";
+if ($s) {
+    echo "yes";
+}

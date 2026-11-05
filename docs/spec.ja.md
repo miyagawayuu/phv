@@ -81,12 +81,13 @@ PHV は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋
 | `any` | どんな値でも入る。使う前に `is` で絞り込む必要がある |
 | `list<T>` | 要素の型が `T` の配列(0 から始まる連番) |
 | `map<K, V>` | 挿入順を保つ連想配列。`K` は `int` か `string` |
+| `set<T>` | 重複しない値の集まり。加えた順を保つ。`T` は `int` か `string` |
 | `?T` | `T` または `null`(`T|null` と同じ) |
 | `A|B` | ユニオン型 |
 | `fn(A, B): R` | 関数(クロージャ)の型 |
 | クラス名 | オブジェクトの型。`self` はそのクラス自身 |
 
-PHP の `array` は `list<T>` と `map<K, V>` に分かれています。`mixed` は `any` です。
+PHP の `array` は `list<T>` と `map<K, V>` に分かれています。重複しない値の集まりには `set<T>` を使います。`mixed` は `any` です。
 
 ### 型エイリアス
 
@@ -1511,7 +1512,8 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 
 | 関数 | 説明 |
 |---|---|
-| `count(list\|map): int` | 要素数 |
+| `count(list\|map\|set): int` | 要素数 |
+| `set(list<int>): set<int>` / `set(list<string>): set<string>` | list の要素から重複を除いた set(最初に現れた順) |
 | `strlen(string): int` | バイト数(文字数は `->len()`) |
 | `implode(string $sep, list<string>): string` / `explode(string $sep, string): list<string>` | 結合 / 分割 |
 | `str_repeat`, `str_contains`, `str_starts_with`, `str_ends_with`, `str_replace(search, replace, subject)` | PHP と同じ |
@@ -1587,6 +1589,22 @@ format("[{:>6}] [{:<6}] [{:*^7}] [{:05}] [{:x}] [{:08b}] {{braces}}", "r", "l", 
 string。同じ値は順序を保つ)
 
 追加・更新は `$m[$k] = $v;`。存在しないキーの読み取り `$m[$k]` は `KeyError`、`$m[$k] ?? $default` は例外にならない。
+
+### set のメソッド
+
+`len()`、`isEmpty()`、`has($v)`、`add($v)`、`remove($v)`、`union($other)`、`intersect($other)`、`diff($other)`、
+`isSubsetOf($other): bool`、`toList(): list<T>`、`filter(fn($x) => bool)`、`any(...)`、`all(...)`
+
+```phv
+$tags = set(["php", "web", "php"]);   // 要素 2 個の set<string>
+set<int> $seen = [];                  // set を期待する場所の `[...]` は set になる
+$seen[] = 42;                         // その場で追加する。すでにある要素を加えても何も起きない
+foreach ($tags as $tag) { ... }       // 要素を加えた順
+```
+
+メソッドは新しい set を返し、呼び出した set はそのまま。2 つの set は、要素が同じなら順序に関係なく `==`。set は
+添字で読めない(`$s[0]` はエラー。`has()` を使う)。`json_encode()` は set を配列として書き、`json_decode_as()` は配列を
+`set<int>` / `set<string>` に読み込む。`$x is set` で set かどうかを確かめられる。
 
 PHP の関数名で書いたときは、エラーメッセージで代わりの書き方を案内する
 (例: `strpos` → `->indexOf()`、`isset` → `??`、`var_dump` → `dump()`、`eval` → 使えない)。

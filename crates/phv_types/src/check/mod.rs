@@ -309,6 +309,7 @@ fn sig_type(t: &TypeExpr) -> Type {
             ("V", []) => Type::Generic(3),
             ("W", []) => Type::Generic(4),
             ("list", [a]) => Type::list(sig_type(a)),
+            ("set", [a]) => Type::set(sig_type(a)),
             ("map", [k, v]) => Type::map(sig_type(k), sig_type(v)),
             _ => panic!("bad builtin signature type `{n}`"),
         },
@@ -785,6 +786,7 @@ impl<'a> Checker<'a> {
         ix.string_methods = self.builtin_items(Some(Recv::Str));
         ix.list_methods = self.builtin_items(Some(Recv::List));
         ix.map_methods = self.builtin_items(Some(Recv::Map));
+        ix.set_methods = self.builtin_items(Some(Recv::Set));
         ix
     }
 
@@ -925,7 +927,7 @@ impl<'a> Checker<'a> {
         let mut stack = vec![t.clone()];
         while let Some(t) = stack.pop() {
             match t {
-                Type::List(e) => stack.push(*e),
+                Type::List(e) | Type::Set(e) => stack.push(*e),
                 Type::Map(k, v) => stack.extend([*k, *v]),
                 Type::Func(ps, r) => {
                     stack.extend(ps);
@@ -1225,6 +1227,18 @@ impl<'a> Checker<'a> {
                         let inner = self.resolve_type(&args[0], self_class);
                         return Type::list(inner);
                     }
+                    "set" => {
+                        if args.len() != 1 {
+                            self.error("`set` takes one type argument, e.g. `set<string>`", t.span);
+                            return Type::Error;
+                        }
+                        let e = self.resolve_type(&args[0], self_class);
+                        if !matches!(e, Type::Int | Type::Str | Type::Error) {
+                            let msg = format!("set elements must be `int` or `string`, not `{}`", self.tn(&e));
+                            self.error(msg, args[0].span);
+                        }
+                        return Type::set(e);
+                    }
                     "map" => {
                         if args.len() != 2 {
                             self.error("`map` takes two type arguments, e.g. `map<string, int>`", t.span);
@@ -1365,7 +1379,7 @@ impl<'a> Checker<'a> {
         };
         let ok = match (&c, ty.without_null()) {
             (HConst::EmptyList, Type::List(_)) => true,
-            (HConst::EmptyList, Type::Map(..)) => true,
+            (HConst::EmptyList, Type::Map(..) | Type::Set(_)) => true,
             (HConst::EmptyMap, Type::Map(..)) => true,
             _ => self.assignable(&cty, ty),
         };
@@ -1377,6 +1391,10 @@ impl<'a> Checker<'a> {
         // `[]` with a map type is an empty map.
         if c == HConst::EmptyList && matches!(ty.without_null(), Type::Map(..)) {
             return Some(HConst::EmptyMap);
+        }
+        // ... and with a set type an empty set.
+        if c == HConst::EmptyList && matches!(ty.without_null(), Type::Set(_)) {
+            return Some(HConst::EmptySet);
         }
         Some(c)
     }
@@ -1708,6 +1726,7 @@ impl<'a> Checker<'a> {
                                 | "any"
                                 | "list"
                                 | "map"
+                                | "set"
                                 | "self"
                                 | "Html"
                                 | "Sql"
@@ -2805,6 +2824,7 @@ pub(crate) fn subst_params(t: &Type, names: &[String], args: &[Type]) -> Type {
             None => t.clone(),
         },
         Type::List(x) => Type::list(subst_params(x, names, args)),
+        Type::Set(x) => Type::set(subst_params(x, names, args)),
         Type::Map(k, v) => Type::map(subst_params(k, names, args), subst_params(v, names, args)),
         Type::Func(ps, r) => Type::Func(
             ps.iter().map(|p| subst_params(p, names, args)).collect(),
@@ -2834,7 +2854,7 @@ fn type_size(t: &Type, limit: usize) -> usize {
             break;
         }
         match t {
-            Type::List(e) => stack.push(e),
+            Type::List(e) | Type::Set(e) => stack.push(e),
             Type::Map(k, v) => stack.extend([&**k, &**v]),
             Type::Func(ps, r) => {
                 stack.extend(ps.iter());
@@ -2855,7 +2875,7 @@ fn param_uses(t: &Type, name: &str) -> usize {
     while let Some(t) = stack.pop() {
         match t {
             Type::Param(p) if p == name => n += 1,
-            Type::List(e) => stack.push(e),
+            Type::List(e) | Type::Set(e) => stack.push(e),
             Type::Map(k, v) => stack.extend([&**k, &**v]),
             Type::Func(ps, r) => {
                 stack.extend(ps.iter());
@@ -2878,6 +2898,7 @@ fn const_type(c: &HConst) -> Type {
         HConst::Str(_) => Type::Str,
         HConst::EmptyList => Type::list(Type::Error),
         HConst::EmptyMap => Type::map(Type::Error, Type::Error),
+        HConst::EmptySet => Type::set(Type::Error),
     }
 }
 

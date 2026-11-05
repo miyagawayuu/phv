@@ -1,0 +1,66 @@
+<?phv
+class Tags {
+    public set<string> $names = [];
+}
+
+function ids(): set<int> {
+    return [3, 1, 3, 2];
+}
+
+$s = set(["b", "a", "b", "c"]);
+echo count($s), " ", $s->len(), " ", $s->isEmpty() ? "empty" : "not empty", "\n";
+echo $s->has("a") ? "has a" : "no a", " ", $s->has("z") ? "has z" : "no z", "\n";
+echo implode(",", $s->toList()), "\n";
+
+$t = $s->add("d")->remove("b");
+echo implode(",", $t->toList()), " | ", implode(",", $s->toList()), "\n";
+
+$u = set(["c", "x"]);
+echo implode(",", $s->union($u)->toList()), "\n";
+echo implode(",", $s->intersect($u)->toList()), "\n";
+echo implode(",", $s->diff($u)->toList()), "\n";
+echo set(["a"])->isSubsetOf($s) ? "subset" : "not subset", "\n";
+
+// Sets are equal when they have the same elements, in any order.
+echo set(["a", "b"]) == set(["b", "a"]) ? "equal" : "different", "\n";
+echo set([1, 2]) == set([1, 2, 3]) ? "equal" : "different", "\n";
+
+// Adding in place, also through a property and a map.
+$n = ids();
+$n[] = 5;
+$n[] = 1;
+foreach ($n as $i => $v) {
+    echo "$i:$v ";
+}
+echo "\n";
+
+$tags = new Tags();
+$tags->names[] = "php";
+$tags->names[] = "phv";
+$tags->names[] = "php";
+echo implode(",", $tags->names->toList()), "\n";
+
+map<string, set<int>> $byUser = [];
+$byUser["ann"][] = 1;
+$byUser["ann"][] = 2;
+$byUser["ann"][] = 1;
+echo count($byUser["ann"]), "\n";
+
+// Values: changing a copy leaves the original alone.
+$copy = $n;
+$copy[] = 99;
+echo count($n), " ", count($copy), "\n";
+
+echo $n->filter(fn(int $x): bool => $x > 1)->toList()->join(","), "\n";
+echo $n->any(fn(int $x): bool => $x > 4) ? "any" : "none", " ", $n->all(fn(int $x): bool => $x > 0) ? "all" : "not all", "\n";
+
+echo json_encode(set(["x", "y"])), " ", json_encode(set([2, 1])), "\n";
+set<int> $back = json_decode_as("[4, 4, 5]");
+echo count($back), " ", $back->has(5) ? "5" : "-", "\n";
+
+any $some = $s;
+if ($some is set) {
+    echo "a set of ", count($some), "\n";
+}
+set<string> $empty = [];
+echo $empty->isEmpty() ? "empty" : "not empty", "\n";

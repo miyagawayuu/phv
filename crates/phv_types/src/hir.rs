@@ -15,6 +15,7 @@ pub enum HConst {
     Str(std::rc::Rc<str>),
     EmptyList,
     EmptyMap,
+    EmptySet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +66,7 @@ pub enum TestKind {
     Html,
     List,
     Map,
+    Set,
     Func,
     Class(ClassId),
 }

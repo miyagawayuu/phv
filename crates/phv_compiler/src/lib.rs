@@ -99,6 +99,7 @@ fn to_const(c: &HConst) -> Const {
         HConst::Str(s) => Const::Str(s.to_string()),
         HConst::EmptyList => Const::EmptyList,
         HConst::EmptyMap => Const::EmptyMap,
+        HConst::EmptySet => Const::EmptySet,
     }
 }
 
@@ -691,6 +692,7 @@ impl<'a> FnC<'a> {
                     TestKind::Html => Instr::IsType(dst, r, TypeTag::Html),
                     TestKind::List => Instr::IsType(dst, r, TypeTag::List),
                     TestKind::Map => Instr::IsType(dst, r, TypeTag::Map),
+                    TestKind::Set => Instr::IsType(dst, r, TypeTag::Set),
                     TestKind::Func => Instr::IsType(dst, r, TypeTag::Closure),
                 });
             }

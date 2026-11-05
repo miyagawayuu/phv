@@ -458,7 +458,7 @@ impl Checker<'_> {
         }
         let hs = self.expr(subject, None);
         let (kt, vt) = match &hs.ty {
-            Type::List(t) => (Type::Int, (**t).clone()),
+            Type::List(t) | Type::Set(t) => (Type::Int, (**t).clone()),
             Type::Map(k, v) => ((**k).clone(), (**v).clone()),
             Type::Error => (Type::Error, Type::Error),
             t => {

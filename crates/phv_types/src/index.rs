@@ -77,6 +77,7 @@ pub struct EditorIndex {
     pub string_methods: Vec<Item>,
     pub list_methods: Vec<Item>,
     pub map_methods: Vec<Item>,
+    pub set_methods: Vec<Item>,
     /// Every function, method, class and module constant of the program (all
     /// modules), for what a definition is (semantic tokens, signatures).
     pub defs: Vec<Item>,
@@ -226,6 +227,7 @@ impl EditorIndex {
                 Type::Str if !is_static => self.string_methods.clone(),
                 Type::List(_) if !is_static => self.list_methods.clone(),
                 Type::Map(..) if !is_static => self.map_methods.clone(),
+                Type::Set(_) if !is_static => self.set_methods.clone(),
                 Type::Class(c, args) if !args.is_empty() => {
                     let names = self.type_params.get(*c as usize).cloned().unwrap_or_default();
                     let values: Vec<String> = args.iter().map(|a| a.display(&self.class_names).to_string()).collect();

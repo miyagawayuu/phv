@@ -81,12 +81,13 @@ It is not compatible with existing PHP code, but it aims to be something PHP pro
 | `any` | Holds any value. Must be narrowed with `is` before use |
 | `list<T>` | An array whose elements have type `T` (sequential indexes starting at 0) |
 | `map<K, V>` | An associative array that preserves insertion order. `K` is `int` or `string` |
+| `set<T>` | Distinct values in the order they were added. `T` is `int` or `string` |
 | `?T` | `T` or `null` (same as `T|null`) |
 | `A|B` | Union type |
 | `fn(A, B): R` | Function (closure) type |
 | Class name | The type of an object. `self` is the class itself |
 
-PHP's `array` is split into `list<T>` and `map<K, V>`. `mixed` is `any`.
+PHP's `array` is split into `list<T>` and `map<K, V>`, and `set<T>` holds distinct values. `mixed` is `any`.
 
 ### Type aliases
 
@@ -1539,7 +1540,8 @@ create files at the root of a drive), in the shared temporary directory, and on 
 
 | Function | Description |
 |---|---|
-| `count(list\|map): int` | Number of elements |
+| `count(list\|map\|set): int` | Number of elements |
+| `set(list<int>): set<int>` / `set(list<string>): set<string>` | The distinct elements of a list, in their first order |
 | `strlen(string): int` | Number of bytes (use `->len()` for the number of characters) |
 | `implode(string $sep, list<string>): string` / `explode(string $sep, string): list<string>` | Join / split |
 | `str_repeat`, `str_contains`, `str_starts_with`, `str_ends_with`, `str_replace(search, replace, subject)` | Same as PHP |
@@ -1617,6 +1619,22 @@ Append an element with `$xs[] = $v;` and update one with `$xs[$i] = $v;` (an ind
 string values; equal values keep their order)
 
 Add or update with `$m[$k] = $v;`. Reading a missing key with `$m[$k]` raises `KeyError`; `$m[$k] ?? $default` does not throw.
+
+### set methods
+
+`len()`, `isEmpty()`, `has($v)`, `add($v)`, `remove($v)`, `union($other)`, `intersect($other)`, `diff($other)`,
+`isSubsetOf($other): bool`, `toList(): list<T>`, `filter(fn($x) => bool)`, `any(...)`, `all(...)`
+
+```phv
+$tags = set(["php", "web", "php"]);   // set<string> with 2 elements
+set<int> $seen = [];                  // `[...]` where a set is expected is a set
+$seen[] = 42;                         // adds in place; adding an element already there does nothing
+foreach ($tags as $tag) { ... }       // in the order the elements were added
+```
+
+Methods return new sets and leave the set they are called on as it is. Two sets are `==` when they have the same
+elements, in any order. A set cannot be indexed (`$s[0]` is an error; use `has()`). `json_encode()` writes a set as
+an array, and `json_decode_as()` reads an array into a `set<int>` or `set<string>`. `$x is set` checks for a set.
 
 When code uses a PHP function name, the error message suggests the alternative
 (for example, `strpos` → `->indexOf()`, `isset` → `??`, `var_dump` → `dump()`, `eval` → not available).

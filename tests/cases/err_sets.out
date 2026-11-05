@@ -1,0 +1,41 @@
+error: set elements must be `int` or `string`, not `float`
+ --> err_sets.phv:2:5
+  |
+2 | set<float> $f = [];
+  |     ^^^^^
+
+error: a set cannot be indexed
+ --> err_sets.phv:4:6
+  |
+4 | echo $s[0];
+  |      ^^^^^
+  = note: use `$s->has($value)`
+
+error: a set has no keys; add an element with `$s[] = $value`
+ --> err_sets.phv:5:1
+  |
+5 | $s["k"] = "v";
+  | ^^^^^^^
+
+error: no version of `set()` accepts (list<float>)
+ --> err_sets.phv:6:6
+  |
+6 | $t = set([1.5]);
+  |      ^^^^^^^^^^
+  = note: available: fn(list<int>): set<int>, fn(list<string>): set<string>
+
+error: expected `string`, found `int`
+ --> err_sets.phv:7:14
+  |
+7 | echo $s->has(1) ? "y" : "n";
+  |              ^
+  = note: use `(string)$value` or string interpolation
+
+error: condition must be a `bool`, found `set<string>`
+ --> err_sets.phv:8:5
+  |
+8 | if ($s) {
+  |     ^^
+  = note: PHV has no truthiness: write `!$xs->isEmpty()`
+
+6 errors found

@@ -202,7 +202,7 @@
       ]
     },
     "types": {
-      "match": "\\b(int|float|string|bool|void|never|any|list|map|Html|SafeUrl|SafeJs|Sql)\\b",
+      "match": "\\b(int|float|string|bool|void|never|any|list|map|set|Html|SafeUrl|SafeJs|Sql)\\b",
       "name": "support.type.phv"
     },
     "constants": {

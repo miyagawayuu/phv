@@ -617,6 +617,7 @@ pub fn const_value(c: &Const) -> Value {
         Const::Str(s) => Value::str(s.as_str()),
         Const::EmptyList => Value::list(Vec::new()),
         Const::EmptyMap => Value::map(IndexMap::new()),
+        Const::EmptySet => Value::set(crate::value::KeySet::new()),
     }
 }
 
@@ -1760,6 +1761,7 @@ impl Vm {
                         let item = match &reg!(*it) {
                             Value::List(l) => l.get(idx).map(|v| (Value::Int(idx as i64), v.clone())),
                             Value::Map(m) => m.get_index(idx).map(|(k, v)| (k.to_value(), v.clone())),
+                            Value::Set(s) => s.get_index(idx).map(|k| (Value::Int(idx as i64), k.to_value())),
                             v => bad("list or map", v),
                         };
                         match item {
@@ -1815,6 +1817,7 @@ impl Vm {
                                 | (TypeTag::Html, Value::Html(_))
                                 | (TypeTag::List, Value::List(_))
                                 | (TypeTag::Map, Value::Map(_))
+                                | (TypeTag::Set, Value::Set(_))
                                 | (TypeTag::Closure, Value::Closure(_))
                                 | (TypeTag::Object, Value::Object(_))
                         );
@@ -1975,6 +1978,17 @@ fn copy_cost(target: &Value, keys: &[Value], push: bool) -> usize {
                     _ => None,
                 }
             }
+            // `$set[] = $x`: a set is always the last step.
+            Value::Set(s) => {
+                let item = std::mem::size_of::<crate::value::Key>() + 8;
+                if Rc::strong_count(s) > 1 {
+                    cost = cost.saturating_add(s.len().saturating_mul(item));
+                }
+                if depth == n && s.len() == s.capacity() {
+                    cost = cost.saturating_add(s.len().max(4).saturating_mul(item));
+                }
+                None
+            }
             _ => None,
         };
         match next {
@@ -2008,6 +2022,9 @@ fn path_assign(
         }
         (Value::Map(m), Some(k)) => {
             Rc::make_mut(m).insert(k.to_key(), val);
+        }
+        (Value::Set(s), None) => {
+            Rc::make_mut(s).insert(val.to_key());
         }
         (v, _) => bad("list or map", v),
     }

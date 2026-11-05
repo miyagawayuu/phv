@@ -25,6 +25,7 @@ pub mod ratelimit;
 mod re;
 mod redisclient;
 pub mod safefs;
+mod sets;
 mod sys;
 mod textio;
 mod timez;
@@ -284,6 +285,20 @@ fn json_to(vm: &Vm, v: &Value, out: &mut String, depth: usize, pretty: bool) -> 
             }
             close(out, l.len(), ']');
         }
+        // A set is a JSON array of its elements.
+        Value::Set(s) => {
+            out.push('[');
+            for (i, k) in s.iter().enumerate() {
+                sep(out, i);
+                match k {
+                    Key::Str(s) => json_string(s, out),
+                    Key::Int(n) => {
+                        let _ = write!(out, "{n}");
+                    }
+                }
+            }
+            close(out, s.len(), ']');
+        }
         Value::Map(m) => {
             out.push('{');
             for (i, (k, x)) in m.iter().enumerate() {
@@ -426,6 +441,20 @@ fn dump_value(vm: &Vm, v: &Value, out: &mut String, indent: usize) -> Result<(),
                 out.push_str(&pad);
                 out.push_str("  ");
                 dump_value(vm, x, out, indent + 1)?;
+            }
+            let _ = writeln!(out, "{pad}}}");
+        }
+        Value::Set(s) => {
+            let _ = writeln!(out, "set({}) {{", s.len());
+            for k in s.iter() {
+                match k {
+                    Key::Int(n) => {
+                        let _ = writeln!(out, "{pad}  int({n})");
+                    }
+                    Key::Str(s) => {
+                        let _ = writeln!(out, "{pad}  string({}) \"{s}\"", s.len());
+                    }
+                }
             }
             let _ = writeln!(out, "{pad}}}");
         }
@@ -716,6 +745,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         .or_else(|| httpclient::lookup(name))
         .or_else(|| asyncio::lookup(name))
         .or_else(|| collections::lookup(name))
+        .or_else(|| sets::lookup(name))
         .or_else(|| numbers::lookup(name))
         .or_else(|| re::lookup(name))
         .or_else(|| textio::lookup(name))
