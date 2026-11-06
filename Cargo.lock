@@ -1556,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "phv_cli"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "phv_compiler"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "phv_syntax",
  "phv_types",
@@ -1586,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "phv_driver"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "getrandom 0.3.4",
  "hmac 0.12.1",
@@ -1608,7 +1608,7 @@ dependencies = [
 
 [[package]]
 name = "phv_jit"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -1620,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "phv_server"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -1650,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "phv_std"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1688,18 +1688,18 @@ dependencies = [
 
 [[package]]
 name = "phv_syntax"
-version = "1.1.0"
+version = "1.1.1"
 
 [[package]]
 name = "phv_types"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "phv_syntax",
 ]
 
 [[package]]
 name = "phv_vm"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "indexmap",
  "libc",
