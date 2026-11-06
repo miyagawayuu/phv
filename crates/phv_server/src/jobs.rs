@@ -111,7 +111,7 @@ fn work(state: &State, store: &Store, stop: &AtomicBool, running: &AtomicUsize) 
             Ok(None) => {
                 running.fetch_sub(1, Ordering::SeqCst);
                 state.metrics.health.ok(StoreKind::Jobs);
-                phv_std::jobs::wait_for_jobs(POLL);
+                store.wait_for_jobs(POLL);
             }
             Err(e) => {
                 running.fetch_sub(1, Ordering::SeqCst);

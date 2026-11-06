@@ -50,29 +50,31 @@ pub fn job_name(name: &str) -> bool {
 
 // ----- Wake-ups ----------------------------------------------------------------
 
-/// Counts jobs added in this process: runners waiting for work wake up at once
-/// (jobs added by other processes are found when they look again).
-static ADDED: LazyLock<(Mutex<u64>, Condvar)> = LazyLock::new(|| (Mutex::new(0), Condvar::new()));
+/// Jobs added in this process so far (for `/metrics`).
+static ADDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn added() {
-    let (m, c) = &*ADDED;
+/// Per store: jobs added to it in this process, so its runners waiting for
+/// work wake up at once (jobs added by other processes are found when they
+/// look again). One job wakes one runner of its store (found by the 1.1
+/// audit: every runner woke and asked the store for each job added).
+type Wake = std::sync::Arc<(Mutex<u64>, Condvar)>;
+static WAKE: LazyLock<Mutex<HashMap<String, Wake>>> = LazyLock::new(Default::default);
+
+fn wake_of(store: &Store) -> Wake {
+    lock(&WAKE).entry(store.wake_key()).or_default().clone()
+}
+
+fn added(store: &Store) {
+    ADDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let w = wake_of(store);
+    let (m, c) = &*w;
     *lock(m) += 1;
-    // One job, one runner (found by the 1.1 audit: every runner woke and
-    // asked the store for each job added).
     c.notify_one();
 }
 
 /// Jobs added in this process so far (for `/metrics`).
 pub fn added_count() -> u64 {
-    *lock(&ADDED.0)
-}
-
-/// Waits up to `wait` for a job to be added in this process.
-pub fn wait_for_jobs(wait: Duration) {
-    let (m, c) = &*ADDED;
-    let g = lock(m);
-    let seen = *g;
-    let _ = c.wait_timeout_while(g, wait, |n| *n == seen);
+    ADDED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // ----- The memory store --------------------------------------------------------
@@ -163,6 +165,23 @@ pub enum Store {
 }
 
 impl Store {
+    /// Which store this is, for its runners' wake-ups.
+    fn wake_key(&self) -> String {
+        match self {
+            Store::Memory(key) => format!("memory\0{key}"),
+            Store::Db(spec, ns) => format!("{}\0{}", spec.url.as_deref().unwrap_or(""), ns.as_deref().unwrap_or("")),
+        }
+    }
+
+    /// Waits up to `wait` for a job to be added to this store in this process.
+    pub fn wait_for_jobs(&self, wait: Duration) {
+        let w = wake_of(self);
+        let (m, c) = &*w;
+        let g = lock(m);
+        let seen = *g;
+        let _ = c.wait_timeout_while(g, wait, |n| *n == seen);
+    }
+
     /// The store of `[jobs]`, if the project has one.
     pub fn of(host: &Host) -> Option<Store> {
         let j = host.jobs.as_ref()?;
@@ -237,7 +256,7 @@ impl Store {
             }
         };
         if r.is_some() {
-            added();
+            added(self);
         }
         Ok(r)
     }
@@ -378,7 +397,7 @@ impl Store {
             }
         };
         if r {
-            added();
+            added(self);
         }
         Ok(r)
     }
@@ -438,7 +457,7 @@ fn add(vm: &mut Vm, a: &[Value]) -> R {
         }
         match netdb::job_add_in_transaction(vm, db_name, (&id, &name, &payload), run_at, uniq.as_deref(), MAX_JOBS) {
             Some(Ok(Some(()))) => {
-                added();
+                added(&store);
                 return Ok(Value::str(id));
             }
             Some(Ok(None)) => return Ok(Value::Null),
