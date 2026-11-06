@@ -2359,8 +2359,9 @@ phv = "^1.2"   # PHV 1.2.0 以降の 1.x
   Homebrew と Scoop も実装済み。
 - **1.0 速度と安定性**(実装済み): 実行中の循環参照の解放、list・map・null 許容型を扱う JIT、HTTPS と HTTP/2、
   WebSocket サーバー、`Set` 型、§18 の互換性の規則。
-- **1.1 Web サービス**: サイトのサーバープロセスが共有する秘密鍵(`[security] secret_env`)、サーバープロセスをまたぐ
-  `publish()`(`[server] publish_store`)、管理用ポートのヘルスチェックと Prometheus のメトリクス(`[admin]`)、
+- **1.1 Web サービス**(完了): サイトのサーバープロセスが共有する秘密鍵(`[security] secret_env`)、サーバープロセスを
+  またぐ `publish()`(`[server] publish_store`)、共有の保存先でのサイトごとの名前空間(`[security] store_namespace`)、
+  管理用ポートのヘルスチェックと Prometheus のメトリクス(`[admin]`)、
   リクエスト ID とトレースコンテキスト、バックグラウンドジョブとスケジュール(`std.jobs`、`[jobs]`、`[[schedule]]`、
   `phv jobs`)、Server-Sent Events、数値の文字列化・例外・オブジェクト生成の高速化。
 - **1.2**: OAuth 2.0 と OpenID Connect によるサインイン、RS256・ES256・EdDSA で署名した JSON Web Token(JWKS を含む)、

@@ -2414,10 +2414,11 @@ Planned, in this order. Each release is audited before it is published, as befor
   (`ghcr.io/miyagawayuu/phv`), Homebrew and Scoop from this release on (done).
 - **1.0, speed and stability** (done): freeing reference cycles while a script runs, a JIT that covers lists, maps
   and nullable values, HTTPS and HTTP/2, a WebSocket server, a `Set` type, and the compatibility rules of §18.
-- **1.1, web services**: a secret shared by a site's server processes (`[security] secret_env`), `publish()` across
-  server processes (`[server] publish_store`), health checks and Prometheus metrics on an admin port (`[admin]`),
-  request ids and trace context, background jobs and schedules (`std.jobs`, `[jobs]`, `[[schedule]]`, `phv jobs`),
-  Server-Sent Events, and faster number formatting, exceptions and object creation.
+- **1.1, web services** (done): a secret shared by a site's server processes (`[security] secret_env`), `publish()`
+  across server processes (`[server] publish_store`), a namespace for each site in shared stores
+  (`[security] store_namespace`), health checks and Prometheus metrics on an admin port (`[admin]`), request ids and
+  trace context, background jobs and schedules (`std.jobs`, `[jobs]`, `[[schedule]]`, `phv jobs`), Server-Sent
+  Events, and faster number formatting, exceptions and object creation.
 - **1.2**: sign-in with OAuth 2.0 and OpenID Connect, JSON Web Tokens signed with RS256, ES256 and EdDSA (with JWKS),
   streaming responses, and exporting traces (OpenTelemetry).
 - **Later**, in minor releases: the JIT for closures and objects, and more of the standard library. Generators
