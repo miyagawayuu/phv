@@ -302,12 +302,13 @@ fn builtins_over_long_values_stop_at_the_time_limit() {
 /// (here `null`) with every int and string kept.
 #[test]
 fn unique_compares_only_what_it_cannot_hash() {
-    let src = "<?phv\nlist<?int> $a = [];\nfor ($i = 0; $i < 1000000; $i++) { $a[] = $i; }\nfor ($i = 0; $i < 3000; $i++) { $a[] = null; }\necho $a->unique()->len();\n";
-    let limits = Limits { max_time: Some(Duration::from_secs(5)), max_memory: Some(256 << 20), ..Limits::default() };
-    let start = Instant::now();
+    // Compared with every value kept, the 20,000 nulls would take 20 billion
+    // comparisons: far past the limit on any machine. Without that, building
+    // the list is all the time it takes.
+    let src = "<?phv\nlist<?int> $a = [];\nfor ($i = 0; $i < 1000000; $i++) { $a[] = $i; }\nfor ($i = 0; $i < 20000; $i++) { $a[] = null; }\necho $a->unique()->len();\n";
+    let limits = Limits { max_time: Some(Duration::from_secs(10)), max_memory: Some(256 << 20), ..Limits::default() };
     let (out, _) = run_limited("unique_nulls", src, limits);
     assert_eq!(out, "1000001");
-    assert!(start.elapsed() < Duration::from_secs(3), "took {:?}", start.elapsed());
 }
 
 /// Found by the 1.1 audit: `E::cases()` of a huge enum was one untimed step.
