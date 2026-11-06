@@ -12,11 +12,16 @@ updates:
     groups:
       actions:
         patterns: ["*"]
-  # The demo's base image, pinned by digest in examples/demo/Dockerfile.
+  # The demo's base image, pinned by digest in examples/demo/Dockerfile. It
+  # stays on the Ubuntu release the release binary is built on (24.04): only
+  # new digests of it are proposed.
   - package-ecosystem: docker
     directory: /examples/demo
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: ubuntu
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
   # wrangler, installed by the website workflow's deploy job from this lockfile.
   - package-ecosystem: npm
     directory: /.github/deploy
