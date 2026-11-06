@@ -283,7 +283,10 @@ fn sweep_later() {
         // Closed outside the lock: closing a file can take a while.
         drop(closing);
         let Some(next) = next else { return };
-        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        // At most a second at a time: the connection it slept for may have
+        // been taken since, and the kept time changed (by tests), so the
+        // next one is looked for again.
+        std::thread::sleep(next.saturating_duration_since(Instant::now()).min(Duration::from_secs(1)));
     });
     if started.is_err() {
         SWEEPING.store(false, Ordering::SeqCst);

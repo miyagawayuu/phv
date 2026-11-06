@@ -423,6 +423,8 @@ fn static_files_are_opened_without_following_links() {
     std::fs::remove_file(dir.join("public/f.css")).unwrap();
     let made = std::process::Command::new("mkfifo").arg(dir.join("public/f.css")).status().is_ok_and(|s| s.success());
     if made {
+        // A production server answers from the copy it keeps for a second.
+        std::thread::sleep(Duration::from_millis(1300));
         for _ in 0..3 {
             assert_eq!(get(addr, "/f.css", "").status, 404);
         }
