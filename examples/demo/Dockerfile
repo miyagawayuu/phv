@@ -3,7 +3,7 @@
 
 # The release binary is built on Ubuntu 24.04, so it needs its glibc. The
 # image is pinned by digest (Dependabot keeps it current).
-FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS fetch
+FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS fetch
 ARG PHV_VERSION=1.1.0
 # The archive's SHA-256, written here when the version is set (from the
 # SHA256SUMS checked before the release was published), so a release asset
@@ -20,7 +20,7 @@ RUN name="phv-${PHV_VERSION}-x86_64-unknown-linux-gnu" \
  && tar xzf "$name.tar.gz" \
  && install -m 755 "$name/phv" /usr/local/bin/phv
 
-FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
 COPY --from=fetch /usr/local/bin/phv /usr/local/bin/phv
 RUN useradd --system --create-home --home-dir /home/phv phv
 WORKDIR /app
