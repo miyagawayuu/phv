@@ -42,18 +42,23 @@ The language server needs the `phv` executable. Download it from the
 [releases](https://github.com/miyagawayuu/phv/releases) or build it with `cargo build --release`, and put it on
 your `PATH` (or set `phv.path`). Highlighting works without it.
 
+The extension starts `phv` by its full path, never by the bare name (on Windows a bare name is looked for in the
+workspace folder first, so a cloned folder could run its own `phv.exe`). It looks in the absolute folders of
+`PATH` that are outside every workspace folder; on Windows it starts `phv.exe` or `phv.com`, not `.cmd` or `.bat`
+files. A relative `phv.path` or `PATH` entry is not used. If nothing is found, a message says so.
+
 ## Settings
 
 | Setting | Default | |
 |---|---|---|
-| `phv.path` | `phv` | The `phv` executable. Only a user setting: a workspace's `.vscode/settings.json` cannot change which program runs. |
+| `phv.path` | `phv` | The `phv` executable: a full path, or a name looked for in `PATH`. Only a user setting: a workspace's `.vscode/settings.json` cannot change which program runs. |
 | `phv.lsp.enabled` | `true` | Start the language server. |
 
 ## Building the extension
 
 ```bash
 npm install
-npm test          # checks the grammars
+npm test          # checks the grammars and how phv is found
 npx vsce package  # writes phv-language-<version>.vsix
 code --install-extension phv-language-1.1.1.vsix
 ```

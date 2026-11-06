@@ -23,7 +23,9 @@ export abstract class Verifier {
      * `exp` and `nbf` are checked, with `$leeway` seconds (0 to 300) for clocks that
      * differ. With `$issuer`, `iss` must be it; with `$audience`, `aud` must be it or
      * a list that holds it. Without `$audience`, a token that has `aud` is refused:
-     * it was made for someone else.
+     * it was made for someone else. One token can be written in more than one way
+     * that verifies (an ES256 signature has two forms), so to refuse a token used
+     * twice, remember its `jti` claim, not the token's text.
      */
     public function verify(
         string $token,
@@ -106,7 +108,9 @@ export final class KeySet extends Verifier {
      * the whole server, fetched again when they are older than their
      * `Cache-Control: max-age` (an hour without one) and when a token names a key
      * id the set does not have (at most every 30 seconds). Throws NetworkError when
-     * it cannot be fetched and none is kept.
+     * it cannot be fetched and none is kept; it is then tried again at most every
+     * 10 seconds. Sets are kept per service, so services that share a URL and
+     * differ in their headers get their own sets.
      */
     public static function fetch(string $service, string $path): KeySet {
         return new KeySet(__jwt_set_fetch($service, $path));

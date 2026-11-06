@@ -79,7 +79,7 @@ class Response
 - `public function redirectExternal(string $url, int $code = 302): void` — Redirects to an absolute http(s) URL on another site.
 - `public function file(string $path, string $type = ""): void` — Sends a file instead of the page output, for example an uploaded image kept in `data/`. The path needs [permissions].read or write. Without `$type` the Content-Type comes from the extension; HTML, SVG and unknown files are sent as `application/octet-stream`.
 - `public function json(any $value): void` — Sends `$value` as JSON.
-- `public function flush(): bool` — Sends the status, the headers and what the page has written so far, and keeps the response open: what it writes later is sent at the next flush() or when the page ends. Afterwards the status, headers, cookies and session can no longer change. Returns false once the visitor has gone away: stop the work then. Outside `phv serve` (scripts, `phv test`) it keeps the output and returns true.
+- `public function flush(): bool` — Sends the status, the headers and what the page has written so far, and keeps the response open: what it writes later is sent at the next flush() or when the page ends. Afterwards the status, headers, cookies and session can no longer change. Returns false once the visitor has gone away (or has taken nothing for 10 seconds): stop the work then. Outside `phv serve` (scripts, `phv test`) it keeps the output and returns true.
 
 ### class Session
 
@@ -768,7 +768,7 @@ abstract class Verifier
 
 Something that verifies tokens: a `JwtKey` or a `KeySet`.
 
-- `public function verify(string $token, ?string $issuer = null, ?string $audience = null, int $leeway = 0): ?map<string, any>` — The claims of `$token` if one of the keys signed it and it is valid now, or null. `exp` and `nbf` are checked, with `$leeway` seconds (0 to 300) for clocks that differ. With `$issuer`, `iss` must be it; with `$audience`, `aud` must be it or a list that holds it. Without `$audience`, a token that has `aud` is refused: it was made for someone else.
+- `public function verify(string $token, ?string $issuer = null, ?string $audience = null, int $leeway = 0): ?map<string, any>` — The claims of `$token` if one of the keys signed it and it is valid now, or null. `exp` and `nbf` are checked, with `$leeway` seconds (0 to 300) for clocks that differ. With `$issuer`, `iss` must be it; with `$audience`, `aud` must be it or a list that holds it. Without `$audience`, a token that has `aud` is refused: it was made for someone else. One token can be written in more than one way that verifies (an ES256 signature has two forms), so to refuse a token used twice, remember its `jti` claim, not the token's text.
 
 ### class JwtKey
 
@@ -797,7 +797,7 @@ Several keys, such as the JWKS an identity provider publishes.
 
 - `public static function of(list<JwtKey> $keys): KeySet` — The keys given (to accept tokens signed by an old key while a new one takes over).
 - `public static function fromJson(string $jwks): KeySet` — The signing keys of a JWKS document; keys of other kinds are skipped.
-- `public static function fetch(string $service, string $path): KeySet` — The JWKS at `$path` of the HTTP service `[http.<name>]`. Key sets are kept for the whole server, fetched again when they are older than their `Cache-Control: max-age` (an hour without one) and when a token names a key id the set does not have (at most every 30 seconds). Throws NetworkError when it cannot be fetched and none is kept.
+- `public static function fetch(string $service, string $path): KeySet` — The JWKS at `$path` of the HTTP service `[http.<name>]`. Key sets are kept for the whole server, fetched again when they are older than their `Cache-Control: max-age` (an hour without one) and when a token names a key id the set does not have (at most every 30 seconds). Throws NetworkError when it cannot be fetched and none is kept; it is then tried again at most every 10 seconds. Sets are kept per service, so services that share a URL and differ in their headers get their own sets.
 - `public function toJson(): string` — The public keys as a JWKS document, to publish (secrets are left out).
 
 
@@ -858,7 +858,7 @@ A finished sign-in.
 - `public readonly ?string $refreshToken`
 - `public readonly ?int $expiresIn` — Seconds the access token lasts, if the provider said.
 - `public readonly ?string $scope` — The scopes granted, if the provider said (space-separated).
-- `public readonly ?string $idToken` — The ID token (OpenID Connect), already verified.
+- `public readonly ?string $idToken` — The ID token (OpenID Connect), already verified. Null without OpenID Connect: an ID token that was not verified is not passed on.
 - `public readonly map<string, any> $claims` — The claims of the ID token; empty without OpenID Connect.
 - `public function __construct(public readonly string $provider, public readonly string $accessToken, public readonly ?string $refreshToken, public readonly ?int $expiresIn, public readonly ?string $scope, public readonly ?string $idToken, public readonly map<string, any> $claims)`
 - `public function subject(): ?string` — The visitor's id at the provider (`sub`): stable, unlike the e-mail address. Null without OpenID Connect.
@@ -876,5 +876,5 @@ A sign-in provider named `[oauth.<name>]` in phv.toml.
 - `public static function provider(string $name): OAuth`
 - `public function authorizationUrl(map<string, string> $params = []): string` — The provider's URL that starts a sign-in, with extra parameters such as `["prompt" => "select_account"]` or `["login_hint" => $email]` (the ones of the flow itself are set by PHV). Each call starts a new sign-in in the session.
 - `public function redirect(map<string, string> $params = []): void` — Sends the visitor to the provider (a 302 response).
-- `public function callback(): SignIn` — Finishes the sign-in on the redirect URI: checks the answer, exchanges the code for tokens and verifies the ID token. Throws OAuthError when the sign-in failed, NetworkError when the provider cannot be reached. Call `session()->regenerate()` before you store who signed in.
+- `public function callback(): SignIn` — Finishes the sign-in on the redirect URI: checks the answer, exchanges the code for tokens and verifies the ID token. Throws OAuthError when the sign-in failed, NetworkError when the provider cannot be reached. Call `session()->regenerate()` before you store who signed in. It must come before `response()->flush()` (the sign-in is kept in the session); after it, it throws ValueError.
 

@@ -149,10 +149,17 @@ pub enum EchoContext {
     /// name): `Html` inserted there may not hold its end tag, and functions
     /// called there may not write output.
     RawText(&'static str),
-    /// A comment (`true`: a bogus comment such as `<!x ...>`, which ends at
-    /// the first `>`): `Html` inserted there may not end it, and functions
-    /// called there may not write output.
-    Comment(bool),
+    /// A comment: `Html` inserted there may not end it, and functions called
+    /// there may not write output.
+    Comment {
+        /// A bogus comment such as `<!x ...>` (or a CDATA section in SVG or
+        /// MathML), which ends at the first `>`.
+        bogus: bool,
+        /// Inside `<noscript>`, `<svg>` or `<math>`, where a browser may read
+        /// raw text here: `Html` may not hold the end tag of a raw-text
+        /// element either.
+        watched: bool,
+    },
 }
 
 #[derive(Debug, Clone)]

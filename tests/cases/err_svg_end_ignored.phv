@@ -1,0 +1,15 @@
+<?phv
+// Browsers ignore `</svg>` (and `</math>`) while an HTML element opened inside
+// a `<foreignObject>` (or `<desc>`, `<title>`, a MathML text element) is open,
+// and read on as SVG, where a `<script>`'s text is markup (found by the 1.2
+// audit: the script below got the nonce and ran the value). An HTML element
+// right inside SVG ends it for browsers. Every line is an error.
+$v = "x";
+?>
+<svg><foreignObject><div></svg></div></foreignObject><script><a x="</script>"></a> <?= $v ?></script></svg>
+<math><mtext><b></math></b></mtext></math>
+<svg><desc><p>a</desc></svg></p>
+<svg><p>a</p></svg>
+<svg><g></p></g></svg>
+<math><annotation-xml encoding="text/html"><div>a</div></annotation-xml></math>
+<svg><foreignObject><div><svg></div></svg></foreignObject></svg>

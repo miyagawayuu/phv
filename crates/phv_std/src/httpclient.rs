@@ -181,6 +181,23 @@ pub fn check_oauth_url(url: &str, tls: Option<bool>) -> Result<(), String> {
     check_plain(&base.host, base.tls, tls, "https://")
 }
 
+/// Checks an endpoint that an OpenID Connect provider's discovery document
+/// names: as `check_oauth_url`, and it uses TLS when the issuer does, and is
+/// on this machine only when the issuer is. (TLS is not needed on this
+/// machine, so a remote provider could otherwise have the code and the client
+/// secret sent in plain text to a port of its choosing here.)
+pub(crate) fn check_discovered_url(issuer: &str, url: &str, tls: Option<bool>) -> Result<(), String> {
+    check_oauth_url(url, tls)?;
+    let (issuer, endpoint) = (parse_base(issuer)?, parse_base(url)?);
+    if issuer.tls && !endpoint.tls {
+        return Err("the issuer uses https://, so its endpoints must too".into());
+    }
+    if crate::netdb::is_local_host(&endpoint.host) && !crate::netdb::is_local_host(&issuer.host) {
+        return Err("the endpoint is on this machine but the issuer is not".into());
+    }
+    Ok(())
+}
+
 fn is_token(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
@@ -221,6 +238,40 @@ fn query_keys(query: &str) -> Vec<String> {
             percent_encoding::percent_decode_str(&key).decode_utf8_lossy().into_owned()
         })
         .collect()
+}
+
+/// The names a server may read the query parameter `key` as, lower-cased
+/// (ASP.NET compares names without case). PHP drops leading spaces and what
+/// follows a NUL, and reads `.` and a space as `_`; it reads `name[...]` as
+/// `name` (an array that replaces a plain value of that name, as Rack does),
+/// and a `[` with no `]` after it as `_`, since PHP 8 with the `.`, spaces and
+/// `[` after it too (found by the 1.2.0 audit: `account.id` and `account id`
+/// replaced a fixed `account_id`).
+fn query_names(key: &str) -> Vec<String> {
+    let mangle = |s: &str| s.replace([' ', '.'], "_");
+    let mut out = vec![key.to_string()];
+    let php = key.split('\0').next().unwrap_or("").trim_start_matches(' ');
+    match php.find('[') {
+        None => out.push(mangle(php)),
+        Some(i) if php[i + 1..].contains(']') => out.push(mangle(&php[..i])),
+        Some(i) => {
+            out.push(format!("{}_{}", mangle(&php[..i]), php[i + 1..].replace([' ', '.', '['], "_")));
+            out.push(format!("{}_{}", mangle(&php[..i]), &php[i + 1..]));
+        }
+    }
+    out.iter_mut().for_each(|n| n.make_ascii_lowercase());
+    out
+}
+
+/// The fixed query parameter of the base URL (keys `fixed`, see `query_keys`)
+/// that the script's parameter `key` would replace at the server, if any. It
+/// is compared as the server may read it (`query_names`), also once more
+/// percent-decoded, for servers that decode twice.
+fn replaces_fixed<'f>(key: &str, fixed: &'f [String]) -> Option<&'f String> {
+    let decoded = percent_encoding::percent_decode_str(key).decode_utf8_lossy();
+    let mut names = query_names(key);
+    names.extend(query_names(&decoded));
+    fixed.iter().find(|f| query_names(f).iter().any(|n| names.contains(n)))
 }
 
 /// Checks the path a script asks for and returns it ready to send (characters
@@ -691,10 +742,19 @@ fn prepare(vm: &mut Vm, a: &[Value]) -> Result<(Base, Request, String), VmError>
         return Err(fail(vm, e));
     }
     let pairs = str_pairs(&a[3]);
-    // The base URL's query may hold a key; the script cannot add a second value for it.
+    // The base URL's query may hold a key; the script cannot add a second value
+    // for it, also under a name the server reads as the same (`query_names`).
     let fixed = query_keys(&base.query);
-    if let Some((k, _)) = pairs.iter().find(|(k, _)| fixed.contains(k)) {
-        let msg = format!("the query parameter \"{}\" comes from phv.toml and cannot be replaced", k.escape_debug());
+    if let Some((k, f)) = pairs.iter().find_map(|(k, _)| replaces_fixed(k, &fixed).map(|f| (k, f))) {
+        let msg = if k == f {
+            format!("the query parameter \"{}\" comes from phv.toml and cannot be replaced", k.escape_debug())
+        } else {
+            format!(
+                "the query parameter \"{}\" would be read as \"{}\", which comes from phv.toml and cannot be replaced",
+                k.escape_debug(),
+                f.escape_debug()
+            )
+        };
         return Err(vm.throw("ValueError", msg));
     }
     let query = encode_query(&pairs);
@@ -796,8 +856,9 @@ impl ClientSpan {
         if !trace.sampled {
             return None;
         }
+        let method = phv_vm::Span::method(&req.method);
         let mut attributes = vec![
-            ("http.request.method", phv_vm::SpanValue::Str(req.method.clone())),
+            ("http.request.method", phv_vm::SpanValue::Str(method.into())),
             (
                 "server.address",
                 phv_vm::SpanValue::Str(base.host.trim_start_matches('[').trim_end_matches(']').to_string()),
@@ -813,7 +874,7 @@ impl ClientSpan {
                 trace_id: trace.trace_id.clone(),
                 span_id,
                 parent_id: Some(trace.span_id.clone()),
-                name: req.method.clone(),
+                name: if method == "_OTHER" { "HTTP".into() } else { method.into() },
                 kind: phv_vm::SpanKind::Client,
                 start: now,
                 end: now,
@@ -936,6 +997,43 @@ mod tests {
         assert!(check_header_value("X", "a\tb").is_ok());
         assert!(same_header("X-Api-Key", "x_api_KEY") && !same_header("X-Api-Key", "X-Api-Keys"));
         assert_eq!(query_keys("key=x&a+b=1&c"), ["key", "a b", "c"]);
+    }
+
+    /// A fixed query parameter cannot be replaced under a name the server
+    /// reads as the same (found by the 1.2.0 audit: PHP read `account.id`
+    /// and `account id` as `account_id`).
+    #[test]
+    fn fixed_query_parameters_cannot_be_replaced_under_another_spelling() {
+        let fixed = query_keys("account_id=site1&v=2");
+        for same in [
+            "account_id",
+            "account.id",
+            "account id",
+            "account[id",
+            " account_id",
+            "account_id\0x",
+            "account_id[]",
+            "account_id[a]",
+            "account.id[x]",
+            "Account_ID",
+            "account%5Fid",
+            "account%2eid",
+            "account%20id",
+        ] {
+            assert_eq!(replaces_fixed(same, &fixed).map(String::as_str), Some("account_id"), "{same:?}");
+        }
+        assert_eq!(replaces_fixed("V", &fixed).map(String::as_str), Some("v"));
+        // PHP 8 reads what follows an unclosed `[` with `.` and `[` as `_`.
+        let fixed = query_keys("a_b_c=1");
+        for same in ["a[b.c", "a.b[c", "a[b[c", "a b.c"] {
+            assert!(replaces_fixed(same, &fixed).is_some(), "{same:?}");
+        }
+        // A fixed key written with a dot is read by PHP with `_`.
+        assert!(replaces_fixed("a_b", &query_keys("a.b=1")).is_some());
+        let fixed = query_keys("account_id=site1");
+        for other in ["account_ids", "accountid", "account-id", "id", "x[account_id]", "account", "account_id2[x]"] {
+            assert_eq!(replaces_fixed(other, &fixed), None, "{other:?}");
+        }
     }
 
     #[test]

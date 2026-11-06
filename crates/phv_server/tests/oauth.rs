@@ -33,6 +33,8 @@ struct Provider {
     /// The code_challenge and nonce of the last authorization request, by state.
     started: HashMap<String, (String, String)>,
     token_requests: usize,
+    /// The token_type of the token responses.
+    token_type: &'static str,
 }
 
 fn new_key() -> EcdsaKeyPair {
@@ -172,8 +174,9 @@ fn provider(state: Arc<Mutex<Provider>>, listener: TcpListener) {
                     );
                     let key = if p.mode == Mode::OtherKey { &p.other } else { &p.key };
                     let token = id_token(key, "k1", &claims);
+                    let token_type = p.token_type;
                     let doc = format!(
-                        r#"{{"access_token":"at-1","token_type":"Bearer","expires_in":3600,"id_token":"{token}"}}"#
+                        r#"{{"access_token":"at-1","token_type":"{token_type}","expires_in":3600,"id_token":"{token}"}}"#
                     );
                     reply(&mut s, "200 OK", &doc);
                 }
@@ -199,6 +202,31 @@ try {
 }
 "#;
 
+/// A callback after the response was flushed (its session is not saved).
+const CALLBACK_AFTER_FLUSH: &str = r#"<?phv
+import std.http.response;
+import std.oauth.OAuth;
+echo "start\n";
+response()->flush();
+try {
+    $s = OAuth::provider("idp")->callback();
+    echo "ok sub=", $s->subject() ?? "-";
+} catch (Exception $e) {
+    echo "refused: ", $e->getMessage();
+}
+"#;
+
+/// A provider without OpenID Connect: its ID token is not verified.
+const CALLBACK_PLAIN: &str = r#"<?phv
+import std.oauth.{OAuth, OAuthError};
+try {
+    $s = OAuth::provider("plain")->callback();
+    echo "ok access=", $s->accessToken, " id=", $s->idToken ?? "null", " claims=", count($s->claims);
+} catch (OAuthError $e) {
+    echo "error ", $e->error, ": ", $e->getMessage();
+}
+"#;
+
 /// The site and the provider; returns the site's address and the provider's state.
 fn start() -> (SocketAddr, Arc<Mutex<Provider>>, PathBuf) {
     let idp = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -210,12 +238,14 @@ fn start() -> (SocketAddr, Arc<Mutex<Provider>>, PathBuf) {
         mode: Mode::Good,
         started: HashMap::new(),
         token_requests: 0,
+        token_type: "Bearer",
     }));
     provider(state.clone(), idp);
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let dir = std::env::temp_dir().join(format!("phv-oauth-{}", std::process::id()));
+    // Each test has its own site (they run at once).
+    let dir = std::env::temp_dir().join(format!("phv-oauth-{}-{}", std::process::id(), addr.port()));
     let _ = std::fs::remove_dir_all(&dir);
     std::env::set_var("PHV_TEST_OAUTH_SECRET", "s3cret");
     write(
@@ -223,7 +253,9 @@ fn start() -> (SocketAddr, Arc<Mutex<Provider>>, PathBuf) {
         "phv.toml",
         &format!(
             "[oauth.idp]\nissuer = \"{issuer}\"\nclient_id = \"site\"\nclient_secret_env = \"PHV_TEST_OAUTH_SECRET\"\n\
-             redirect_uri = \"http://{addr}/cb\"\nscopes = [\"openid\", \"email\"]\n"
+             redirect_uri = \"http://{addr}/cb\"\nscopes = [\"openid\", \"email\"]\n\
+             [oauth.plain]\nauthorize_url = \"{issuer}/auth\"\ntoken_url = \"{issuer}/token\"\nclient_id = \"site\"\n\
+             client_secret_env = \"PHV_TEST_OAUTH_SECRET\"\nredirect_uri = \"http://{addr}/cbp\"\n"
         ),
     );
     write(
@@ -232,6 +264,9 @@ fn start() -> (SocketAddr, Arc<Mutex<Provider>>, PathBuf) {
         "<?phv\nimport std.oauth.OAuth;\nOAuth::provider(\"idp\")->redirect([\"prompt\" => \"login\"]);\n",
     );
     write(&dir, "public/cb.phv", CALLBACK);
+    write(&dir, "public/cbflush.phv", CALLBACK_AFTER_FLUSH);
+    write(&dir, "public/loginp.phv", "<?phv\nimport std.oauth.OAuth;\nOAuth::provider(\"plain\")->redirect();\n");
+    write(&dir, "public/cbp.phv", CALLBACK_PLAIN);
     let opts = ServeOptions {
         root: dir.clone(),
         host: "127.0.0.1".into(),
@@ -263,7 +298,16 @@ fn get(addr: SocketAddr, path: &str, cookie: Option<&str>) -> (u16, Vec<(String,
 
 /// Starts a sign-in: the session cookie and the authorization request's parameters.
 fn login(addr: SocketAddr, p: &Arc<Mutex<Provider>>, cookie: Option<&str>) -> (String, HashMap<String, String>) {
-    let (status, headers, _) = get(addr, "/login", cookie);
+    login_at(addr, p, cookie, "/login")
+}
+
+fn login_at(
+    addr: SocketAddr,
+    p: &Arc<Mutex<Provider>>,
+    cookie: Option<&str>,
+    page: &str,
+) -> (String, HashMap<String, String>) {
+    let (status, headers, _) = get(addr, page, cookie);
     assert_eq!(status, 302);
     let location = headers.iter().find(|(n, _)| n == "location").map(|(_, v)| v.clone()).unwrap();
     let issuer = p.lock().unwrap().issuer.clone();
@@ -276,7 +320,8 @@ fn login(addr: SocketAddr, p: &Arc<Mutex<Provider>>, cookie: Option<&str>) -> (S
         .or_else(|| cookie.map(str::to_string))
         .expect("a session cookie");
     let state = params["state"].clone();
-    p.lock().unwrap().started.insert(state, (params["code_challenge"].clone(), params["nonce"].clone()));
+    let nonce = params.get("nonce").cloned().unwrap_or_default();
+    p.lock().unwrap().started.insert(state, (params["code_challenge"].clone(), nonce));
     (session, params)
 }
 
@@ -345,5 +390,60 @@ fn openid_connect_sign_in() {
         let (_, _, body) = get(addr, &format!("/cb?code=code-{state}&state={state}"), Some(&cookie));
         assert!(body.starts_with("ok sub=user-1"), "{body}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// After `response()->flush()` the session is not saved, so a callback there
+/// could not use up its state: it is refused before the code is exchanged.
+/// Found by the 16th assessment: the callback could be replayed for 10 minutes.
+#[test]
+fn callback_after_flush_is_refused() {
+    let (addr, p, dir) = start();
+    let (cookie, params) = login(addr, &p, None);
+    let state = params["state"].clone();
+    let query = format!("?code=code-{state}&state={state}");
+    for _ in 0..2 {
+        let (_, _, body) = get(addr, &format!("/cbflush{query}"), Some(&cookie));
+        assert!(body.contains("refused: OAuth::callback() must come before response()"), "{body}");
+    }
+    assert_eq!(p.lock().unwrap().token_requests, 0, "no code was exchanged");
+    // The sign-in is still there for a callback that can finish it, once.
+    let (_, _, body) = get(addr, &format!("/cb{query}"), Some(&cookie));
+    assert!(body.starts_with("ok sub=user-1"), "{body}");
+    let (_, _, body) = get(addr, &format!("/cb{query}"), Some(&cookie));
+    assert!(body.starts_with("error invalid_state"), "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The token response and the answer on the redirect URI are checked as they
+/// should be: the access token is a Bearer token, `iss` comes before the error
+/// it names, and without OpenID Connect no unverified ID token is passed on.
+#[test]
+fn token_responses_and_answers_are_checked() {
+    let (addr, p, dir) = start();
+    let finish = |page: &str, login_page: &str| {
+        let (cookie, params) = login_at(addr, &p, None, login_page);
+        let state = params["state"].clone();
+        get(addr, &format!("{page}?code=code-{state}&state={state}"), Some(&cookie)).2
+    };
+
+    p.lock().unwrap().token_type = "mac";
+    let body = finish("/cb", "/login");
+    assert!(body.starts_with("error unsupported_token_type"), "{body}");
+    p.lock().unwrap().token_type = "bearer";
+    let body = finish("/cb", "/login");
+    assert!(body.starts_with("ok sub=user-1"), "case does not matter: {body}");
+
+    // Another provider's error answer is refused as such, not shown as this provider's.
+    let (cookie, params) = login(addr, &p, None);
+    let state = params["state"].clone();
+    let other = "iss=https%3A%2F%2Fother.example";
+    let (_, _, body) =
+        get(addr, &format!("/cb?error=access_denied&error_description=x&state={state}&{other}"), Some(&cookie));
+    assert!(body.starts_with("error invalid_issuer"), "{body}");
+
+    // OAuth 2.0 without OpenID Connect: the ID token in the response is not verified, so it is not passed on.
+    let body = finish("/cbp", "/loginp");
+    assert_eq!(body, "ok access=at-1 id=null claims=0");
     let _ = std::fs::remove_dir_all(&dir);
 }

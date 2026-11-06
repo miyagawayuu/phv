@@ -107,6 +107,9 @@ impl Compiled {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Dep {
     pub path: PathBuf,
+    /// The project's root: only the part of `path` below it, and where its
+    /// links lead, is looked at for links to another machine (see `stat`).
+    root: PathBuf,
     /// Modification time (seconds, nanoseconds) and size, for a quick check.
     mtime: Option<(u64, u32)>,
     len: u64,
@@ -150,10 +153,14 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn stat(p: &Path) -> Option<(Option<(u64, u32)>, u64)> {
-    // A file that has become a link to another machine is not followed: it
-    // counts as missing, so the program is loaded (and refused) again.
-    if final_link_to_another_machine(p) {
+fn stat(root: &Path, p: &Path) -> Option<(Option<(u64, u32)>, u64)> {
+    // A file that has become a link to another machine, or that is now reached
+    // through one (a directory on the way became a link to a share), is not
+    // followed: it counts as missing, so the program is loaded (and refused)
+    // again. Found by the 16th assessment: only the last component was looked
+    // at, so after a directory became such a link the server contacted the
+    // host at each check.
+    if phv_std::safefs::on_another_machine_below(root, p) {
         return None;
     }
     let m = std::fs::metadata(p).ok()?;
@@ -168,9 +175,17 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 
 impl Dep {
     /// Records `path` with the content that was actually read (`None`: missing).
-    fn new(path: &Path, content: Option<&[u8]>) -> Dep {
-        let (mtime, len) = stat(path).unwrap_or((None, 0));
-        Dep { path: path.to_path_buf(), mtime, len, hash: content.map(sha256), recorded: Recorded(now_secs().into()) }
+    /// Records `path` of the project in `root`.
+    fn new(root: &Path, path: &Path, content: Option<&[u8]>) -> Dep {
+        let (mtime, len) = stat(root, path).unwrap_or((None, 0));
+        Dep {
+            path: path.to_path_buf(),
+            root: root.to_path_buf(),
+            mtime,
+            len,
+            hash: content.map(sha256),
+            recorded: Recorded(now_secs().into()),
+        }
     }
 
     /// Whether the file still has the recorded content. A different time or size
@@ -183,7 +198,7 @@ impl Dep {
     /// recent is recorded as known then: a later change would give it another
     /// time, so it is not hashed again at every check.
     pub fn is_fresh(&self, thorough: bool) -> bool {
-        let Some((mtime, len)) = stat(&self.path) else { return self.hash.is_none() };
+        let Some((mtime, len)) = stat(&self.root, &self.path) else { return self.hash.is_none() };
         if self.hash.is_none() || mtime != self.mtime || len != self.len {
             return false;
         }
@@ -193,7 +208,7 @@ impl Dep {
         }
         let checked = now_secs();
         let same = std::fs::read(&self.path).is_ok_and(|bytes| Some(sha256(&bytes)) == self.hash);
-        if same && stat(&self.path) == Some((mtime, len)) {
+        if same && stat(&self.root, &self.path) == Some((mtime, len)) {
             self.recorded.0.fetch_max(checked, std::sync::atomic::Ordering::Relaxed);
         }
         same
@@ -524,7 +539,7 @@ impl Loader {
         span: Option<Span>,
     ) -> usize {
         if let Some(p) = &path {
-            self.deps.push(Dep::new(p, Some(text.as_bytes())));
+            self.deps.push(Dep::new(&self.root, p, Some(text.as_bytes())));
         }
         self.text += text.len();
         let file = self.sources.add(name.clone(), path.clone(), text);
@@ -917,13 +932,13 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
     };
     let toml = root.join("phv.toml");
     // Bounded like every source file (a huge phv.toml would be read whole on each keystroke).
-    loader.deps.push(Dep::new(&toml, read_source(&toml).ok().as_ref().map(|t| t.as_bytes())));
+    loader.deps.push(Dep::new(root, &toml, read_source(&toml).ok().as_ref().map(|t| t.as_bytes())));
     // The packages' own [dependencies] decide what their modules may import.
     let mut manifests: Vec<PathBuf> = loader.packages.values().map(|d| d.join("phv.toml")).collect();
     manifests.sort();
     for m in manifests {
         if let Ok(text) = read_source(&m) {
-            loader.deps.push(Dep::new(&m, Some(text.as_bytes())));
+            loader.deps.push(Dep::new(root, &m, Some(text.as_bytes())));
         }
     }
     loader.add("<std>/prelude.phv".into(), None, phv_std::PRELUDE.to_string(), ModuleKind::Prelude, None);
@@ -1304,17 +1319,59 @@ mod tests {
         std::fs::write(&tmp, "echo 1;").unwrap();
         let old = SystemTime::now() - std::time::Duration::from_secs(60);
         std::fs::File::options().write(true).open(&tmp).unwrap().set_modified(old).unwrap();
-        let dep = Dep::new(&tmp, Some(b"echo 1;"));
+        let dep = Dep::new(tmp.parent().unwrap(), &tmp, Some(b"echo 1;"));
         // As if it had been read in the second it was saved.
         let mtime = dep.mtime.unwrap().0;
         dep.recorded.0.store(mtime, std::sync::atomic::Ordering::Relaxed);
         assert!(dep.is_fresh(false));
         assert!(dep.recorded.get() > mtime + 2, "the check records that the content was known later");
         // A change of the same size and time is still seen while it is racy.
-        let racy = Dep::new(&tmp, Some(b"echo 2;"));
+        let racy = Dep::new(tmp.parent().unwrap(), &tmp, Some(b"echo 2;"));
         racy.recorded.0.store(mtime, std::sync::atomic::Ordering::Relaxed);
         assert!(!racy.is_fresh(false));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Found by the 16th assessment: the freshness check looked only at the
+    /// file itself, so after `lib/` became a directory link to a share it read
+    /// the file's time and size over the network at each check (and a running
+    /// server kept the page as fresh). Making a link needs Developer Mode or
+    /// the privilege: skipped without.
+    #[cfg(windows)]
+    #[test]
+    fn freshness_checks_do_not_go_through_a_directory_link_to_another_machine() {
+        let root = std::env::temp_dir().join(format!("phv-fresh-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        let file = root.join("lib").join("m.phv");
+        std::fs::write(&file, "echo 1;").unwrap();
+        let dep = Dep::new(&root, &file, Some(b"echo 1;"));
+        assert!(dep.is_fresh(true));
+        std::fs::rename(root.join("lib"), root.join("libreal")).unwrap();
+        // This machine by a share's name (when its administrative share is
+        // there, the old check read the file through it), and a host that
+        // does not exist.
+        let real = root.join("libreal").to_string_lossy().into_owned();
+        let local = format!(r"\\localhost\{}$\{}", &real[..1], &real[3..]);
+        for target in [local.as_str(), r"\\phv-test.invalid\share\lib", r"\\?\UNC\phv-test.invalid\share\lib"] {
+            let _ = std::fs::remove_dir(root.join("lib"));
+            if std::os::windows::fs::symlink_dir(target, root.join("lib")).is_err() {
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+            let start = std::time::Instant::now();
+            assert_eq!(stat(&root, &file), None, "{target}");
+            assert!(!dep.is_fresh(false), "{target}");
+            assert!(!dep.is_fresh(true), "{target}");
+            assert!(start.elapsed() < std::time::Duration::from_secs(2), "{target}: {:?}", start.elapsed());
+        }
+        // A link that stays on this machine is followed as before.
+        let _ = std::fs::remove_dir(root.join("lib"));
+        std::os::windows::fs::symlink_dir(root.join("libreal"), root.join("lib")).unwrap();
+        assert!(stat(&root, &file).is_some());
+        assert!(dep.is_fresh(true));
+        let _ = std::fs::remove_dir(root.join("lib"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -136,6 +136,19 @@ fn requests_and_their_calls_are_exported_as_spans() {
     let second = tp(&calls[1].0);
     assert!(second.starts_with(&format!("00-{other}-")) && second.ends_with("-00"), "{second}");
 
+    // A request may name any method: its span says `_OTHER` (found by the 1.2
+    // audit: 63 KB method names went into the span's name and attributes).
+    let odd = "11112222333344445555666677778888";
+    let method = "X".repeat(40_000);
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    write!(
+        s,
+        "{method} /call HTTP/1.1\r\nHost: test\r\ntraceparent: 00-{odd}-{caller}-01\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let _ = s.read_to_string(&mut String::new());
+
     // Stopping the server sends what is queued.
     stop_tx.send(()).unwrap();
     server.join().unwrap().unwrap();
@@ -156,6 +169,11 @@ fn requests_and_their_calls_are_exported_as_spans() {
             v["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap().clone()
         })
         .collect();
+    let (odd_spans, spans): (Vec<_>, Vec<_>) = spans.into_iter().partition(|s| s["traceId"] == odd);
+    let odd_server = odd_spans.iter().find(|s| s["kind"] == 2).expect("a server span");
+    assert_eq!(odd_server["name"], "HTTP /call");
+    let odd_all = serde_json::to_string(&odd_spans).unwrap();
+    assert!(odd_all.contains("\"_OTHER\"") && !odd_all.contains("XXXX"), "{odd_all}");
     assert_eq!(spans.len(), 2, "the unsampled request is not recorded: {spans:?}");
     let server = spans.iter().find(|s| s["kind"] == 2).expect("a server span");
     let client = spans.iter().find(|s| s["kind"] == 3).expect("a client span");

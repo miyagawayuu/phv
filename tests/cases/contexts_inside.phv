@@ -3,6 +3,9 @@
 // `<svg>` and the text of a `<textarea>` or `<title>` (what browsers would read
 // in another way there is refused: see err_context_noscript_partial.phv,
 // err_html_in_svg.phv, err_html_in_textarea.phv and err_output_in_svg.phv).
+// So do HTML closed inside a `<foreignObject>`, CDATA sections, `<select>`
+// and loops in comments (see err_svg_end_ignored.phv, err_svg_cdata.phv,
+// err_select_raw_text.phv and err_loop_comment_start.phv).
 function label(): string { return "x < y"; }
 ?>
 <noscript><?= render("views/noscript_ok.phv.html", msg: "Turn on JavaScript") ?></noscript>
@@ -12,3 +15,8 @@ function label(): string { return "x < y"; }
 <svg><?phv foreach ([1, 2] as $i) { ?><circle r="<?= $i ?>"/><?phv } ?></svg>
 <noscript><?phv foreach ([1] as $i) { ?><p><?= label() ?></p><?phv } ?></noscript>
 <!--</b<?= "x" ?> --><!--</ <?= "noscript" ?> -->
+<svg><foreignObject><div><p>a</p><br><b><?= label() ?></b><svg><circle r="1"/></svg></div></foreignObject><title>t</title><path d="M0 0"/></svg>
+<math><mi>x</mi><mtext><b>t</b></mtext><annotation-xml encoding="image/svg+xml"><svg><circle r="1"/></svg></annotation-xml></math>
+<svg><![CDATA[ a <?= label() ?> ]]]></svg>
+<select><option><?= label() ?></option><script>var s = 1;</script></select>
+<!-- <?phv foreach ([1, 2] as $i) { ?> > <?= $i ?><?phv } ?> -->

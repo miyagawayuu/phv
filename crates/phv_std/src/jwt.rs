@@ -203,11 +203,16 @@ fn rsa_public(der: &[u8]) -> Option<Public> {
 }
 
 /// RSA public keys of 2048 to 8192 bits (as `RSA_PKCS1_2048_8192_SHA256`
-/// verifies), with an exponent of at most 33 bits.
+/// verifies), with an exponent of at most 33 bits. A modulus of zero (no
+/// bytes once leading zeros are dropped) is refused like any other short one.
 fn rsa_checked(n: Vec<u8>, e: Vec<u8>) -> Option<Public> {
     let n: Vec<u8> = n.into_iter().skip_while(|&x| x == 0).collect();
     let e: Vec<u8> = e.into_iter().skip_while(|&x| x == 0).collect();
-    let bits = n.len() * 8 - n.first().map_or(8, |b| b.leading_zeros() as usize);
+    // The first byte is not zero, so it has at most 7 leading zero bits.
+    let bits = match n.first() {
+        Some(b) => n.len().saturating_mul(8).saturating_sub(b.leading_zeros() as usize),
+        None => 0,
+    };
     if !(2048..=8192).contains(&bits) || e.is_empty() || e.len() > 5 {
         return None;
     }
@@ -444,12 +449,22 @@ pub(crate) fn from_jwk(m: &Map) -> Result<JwtKey, String> {
     Ok(JwtKey { alg, kid, public, private: None })
 }
 
-/// The usable keys of a JWKS document; keys of other kinds are skipped.
-pub(crate) fn from_jwks(text: &str) -> Result<Vec<Arc<JwtKey>>, String> {
+/// The usable keys of a JWKS document; keys of other kinds are skipped. With
+/// a script's `vm`, the document is decoded within its memory and time limits
+/// (the outer error); the inner error says why the document is not a key set.
+pub(crate) fn from_jwks(vm: Option<&Vm>, text: &str) -> Result<Result<Vec<Arc<JwtKey>>, String>, VmError> {
     if text.len() > MAX_JWKS {
-        return Err(format!("the key set is larger than {} KB", MAX_JWKS >> 10));
+        return Ok(Err(format!("the key set is larger than {} KB", MAX_JWKS >> 10)));
     }
-    let doc = crate::web::json_decode(text).map_err(|e| format!("the key set is not JSON: {e}"))?;
+    let doc = match vm {
+        Some(vm) => crate::web::json_decode_in(vm, text)?,
+        None => crate::web::json_decode(text),
+    };
+    Ok(jwks_keys(doc))
+}
+
+fn jwks_keys(doc: Result<Value, String>) -> Result<Vec<Arc<JwtKey>>, String> {
+    let doc = doc.map_err(|e| format!("the key set is not JSON: {e}"))?;
     let Value::Map(doc) = &doc else { return Err("the key set is not a JSON object".into()) };
     let Some(Value::List(keys)) = doc.get(&Key::Str(Rc::new("keys".into()))) else {
         return Err("the key set has no \"keys\" list".into());
@@ -636,7 +651,8 @@ struct Cached {
     forced: Option<Instant>,
 }
 
-/// Key sets by URL, the most recently used last. Each set is fetched again
+/// Key sets by `cache_key` (the URL, and a service's name and headers), the
+/// most recently used last. Each set is fetched again
 /// once it is older than its `Cache-Control: max-age` (1 minute to a day; an
 /// hour without one), or when a token names a key id it lacks (at most every
 /// 30 seconds, so tokens with made-up ids cannot make the server fetch it
@@ -658,17 +674,80 @@ fn max_age(resp: &Response) -> Duration {
     Duration::from_secs(secs.clamp(60, 86_400))
 }
 
+/// Recent failures to fetch a document that could not be used at all (a key
+/// set or a discovery document with no copy kept), by cache key: while one
+/// is recent, the next request fails at once with the same error instead of
+/// waiting for the provider again, so a provider that is down does not hold
+/// every request until its timeout. A document is tried again at most every
+/// `RETRY_FAILED`.
+pub(crate) struct Failures(Mutex<Vec<(String, Instant, String)>>);
+pub(crate) const RETRY_FAILED: Duration = Duration::from_secs(10);
+const FAILURES_KEPT: usize = 64;
+
+impl Failures {
+    pub(crate) const fn new() -> Failures {
+        Failures(Mutex::new(Vec::new()))
+    }
+
+    /// The error of a failure of `key` less than `RETRY_FAILED` ago.
+    pub(crate) fn recent(&self, key: &str) -> Option<String> {
+        let list = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        list.iter().find(|(k, at, _)| k == key && at.elapsed() < RETRY_FAILED).map(|(_, _, e)| e.clone())
+    }
+
+    pub(crate) fn note(&self, key: &str, error: &str) {
+        let mut list = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|(k, at, _)| k != key && at.elapsed() < RETRY_FAILED);
+        if list.len() >= FAILURES_KEPT {
+            list.remove(0);
+        }
+        list.push((key.to_string(), Instant::now(), error.to_string()));
+    }
+
+    pub(crate) fn clear(&self, key: &str) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, _, _)| k != key);
+    }
+}
+
+static FAILED: Failures = Failures::new();
+
+/// What a key set is kept under. A service's sets are told apart by the
+/// service's name and configured headers as well as the URL: two services
+/// may share a URL and differ only in a header (a tenant, a credential) that
+/// makes the server answer with another set.
+fn cache_key(vm: &mut Vm, source: &Source) -> Result<String, VmError> {
+    Ok(match source {
+        Source::Service { name, path } => {
+            // A service's URL may come from the environment: it is known once the request is built.
+            let url = httpclient::service_url(vm, name, path)?;
+            let mut headers = String::new();
+            for (h, v) in vm.host.http.get(name).map(|spec| spec.headers.as_slice()).unwrap_or_default() {
+                let v = v.as_deref().unwrap_or("");
+                headers.push_str(&format!("{}:{h}{}:{v}", h.len(), v.len()));
+            }
+            // Credentials are not kept in the key itself.
+            format!("service {} {} {url}", crate::sha256_hex(name.as_bytes()), crate::sha256_hex(headers.as_bytes()))
+        }
+        Source::Url { url, .. } => format!("url {url}"),
+    })
+}
+
 /// The keys of `source`: kept ones while they are fresh (unless `refresh`),
 /// otherwise fetched. `refresh` asks again only if the last try is 30
 /// seconds old. Errors are NetworkError messages.
 pub(crate) fn remote_keys(vm: &mut Vm, source: &Source, refresh: bool) -> Result<Arc<[Arc<JwtKey>]>, VmError> {
-    // A service's URL may come from the environment: it is known once the request is built.
-    let url = match source {
-        Source::Service { name, path } => httpclient::service_url(vm, name, path)?,
-        Source::Url { url, .. } => url.clone(),
-    };
+    let url = cache_key(vm, source)?;
     if let Some(keys) = kept(&url, refresh) {
         return Ok(keys);
+    }
+    let what = match source {
+        Source::Service { name, .. } => format!("HTTP service \"{name}\""),
+        Source::Url { .. } => "the provider".to_string(),
+    };
+    if let Some(e) = FAILED.recent(&url) {
+        let secs = RETRY_FAILED.as_secs();
+        let msg = format!("{what}: cannot read the key set: {e} (it is tried again at most every {secs} seconds)");
+        return Err(vm.throw("NetworkError", msg));
     }
     let forced = mark_tried(&url, refresh);
     let result = match source {
@@ -679,18 +758,15 @@ pub(crate) fn remote_keys(vm: &mut Vm, source: &Source, refresh: bool) -> Result
         }
     };
     vm.check_limits()?;
-    let what = match source {
-        Source::Service { name, .. } => format!("HTTP service \"{name}\""),
-        Source::Url { .. } => "the provider".to_string(),
+    // Decoded within the script's limits before anything is kept.
+    let parsed = match result {
+        Ok(resp) if resp.status() != 200 => Err(format!("the key set answered {}", resp.status())),
+        Ok(resp) => match std::str::from_utf8(resp.body()) {
+            Ok(text) => from_jwks(Some(vm), text)?.map(|keys| (keys, max_age(&resp))),
+            Err(_) => Err("the key set is not UTF-8".to_string()),
+        },
+        Err(e) => Err(e),
     };
-    let parsed = result.and_then(|resp| {
-        if resp.status() != 200 {
-            return Err(format!("the key set answered {}", resp.status()));
-        }
-        let age = max_age(&resp);
-        let text = std::str::from_utf8(resp.body()).map_err(|_| "the key set is not UTF-8".to_string())?;
-        Ok((from_jwks(text)?, age))
-    });
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let i = cache.iter().position(|(u, _)| *u == url);
     match parsed {
@@ -704,6 +780,7 @@ pub(crate) fn remote_keys(vm: &mut Vm, source: &Source, refresh: bool) -> Result
             if cache.len() >= CACHE_SETS {
                 cache.remove(0);
             }
+            FAILED.clear(&url);
             cache.push((url, entry));
             Ok(keys)
         }
@@ -711,6 +788,7 @@ pub(crate) fn remote_keys(vm: &mut Vm, source: &Source, refresh: bool) -> Result
             Some(c) if c.fetched.elapsed() < STALE_FOR => Ok(c.keys.clone()),
             _ => {
                 drop(cache);
+                FAILED.note(&url, &e);
                 Err(vm.throw("NetworkError", format!("{what}: cannot read the key set: {e}")))
             }
         },
@@ -903,7 +981,7 @@ pub(crate) fn lookup(name: &str) -> Option<phv_vm::BuiltinFn> {
             }
             add(vm, Keys { keys, remote: None })
         },
-        "__jwt_set_json" => |vm, a| match from_jwks(s(&a[0])) {
+        "__jwt_set_json" => |vm, a| match from_jwks(Some(vm), s(&a[0]))? {
             Ok(keys) => add(vm, Keys { keys, remote: None }),
             Err(e) => Err(vm.throw("ValueError", format!("KeySet::fromJson(): {e}"))),
         },
@@ -1019,7 +1097,7 @@ mod tests {
             ec.public_jwk().unwrap(),
             ed.public_jwk().unwrap()
         );
-        let keys = from_jwks(&doc).unwrap();
+        let keys = from_jwks(None, &doc).unwrap_or_else(|_| panic!("no limits")).unwrap();
         assert_eq!(keys.len(), 2, "oct and P-384 are skipped");
         assert_eq!(keys[0].kid.as_deref(), Some("ec1"));
         assert!(!keys[0].can_sign());
@@ -1074,5 +1152,30 @@ mod tests {
         assert!(spki(&[]).is_none());
         assert!(from_pem("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----", None).is_err());
         assert!(from_secret(b"short", None).is_err());
+    }
+
+    /// An RSA key whose modulus is zero (found by the 16th assessment: the bit
+    /// count underflowed, an uncatchable internal error) is refused like any
+    /// other short key, and a key set skips it.
+    #[test]
+    fn rsa_keys_with_a_zero_modulus_are_refused() {
+        assert!(rsa_checked(vec![], vec![1, 0, 1]).is_none());
+        assert!(rsa_checked(vec![0, 0, 0], vec![1, 0, 1]).is_none());
+        assert!(rsa_checked(vec![0x80; 256], vec![]).is_none(), "no exponent");
+        assert!(rsa_checked(vec![0x80; 256], vec![1, 0, 1]).is_some(), "2048 bits");
+        assert!(rsa_checked(vec![0x7f; 256], vec![1, 0, 1]).is_none(), "2047 bits");
+        // RSAPublicKey { modulus 0, publicExponent 65537 }, in PEM.
+        let pem = "-----BEGIN RSA PUBLIC KEY-----\nMAgCAQACAwEAAQ==\n-----END RSA PUBLIC KEY-----\n";
+        assert!(from_pem(pem, None).is_err());
+        for n in ["", "AA", "AAAA"] {
+            let jwk = format!(r#"{{"kty":"RSA","n":"{n}","e":"AQAB"}}"#);
+            let Ok(v) = crate::web::json_decode(&jwk) else { panic!("not JSON") };
+            let Value::Map(m) = &v else { panic!("not a map") };
+            assert!(from_jwk(m).is_err(), "n = {n:?}");
+        }
+        let ec = ec_key();
+        let doc = format!(r#"{{"keys":[{},{{"kty":"RSA","n":"AA","e":"AQAB"}}]}}"#, ec.public_jwk().unwrap());
+        let keys = from_jwks(None, &doc).unwrap_or_else(|_| panic!("no limits")).unwrap();
+        assert_eq!(keys.len(), 1, "the zero key is skipped");
     }
 }

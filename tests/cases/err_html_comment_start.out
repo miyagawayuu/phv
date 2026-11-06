@@ -1,0 +1,5 @@
+<!-- path: - plain text
+ -->
+<!-- path: -
+--- runtime error ---
+Fatal error: `Html` inserted into a comment starts with `>`, `!>`, `->` or `-!>`, which would end it after a value ending with `--` (or `-`, `--!`) and turn the rest into markup; insert a string (it is escaped) instead

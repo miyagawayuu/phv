@@ -151,7 +151,7 @@
           "type": "string",
           "default": "phv",
           "scope": "machine",
-          "description": "The phv executable used for the language server and the debugger. A user setting only: a workspace cannot change which program runs."
+          "description": "The phv executable used for the language server and the debugger: a full path, or a name looked for in the absolute PATH folders outside the workspace. A user setting only: a workspace cannot change which program runs."
         },
         "phv.lsp.enabled": {
           "type": "boolean",
@@ -162,7 +162,7 @@
     }
   },
   "scripts": {
-    "test": "node test/grammar.test.js",
+    "test": "node test/grammar.test.js && node test/phv-path.test.js",
     "package": "vsce package"
   },
   "dependencies": {

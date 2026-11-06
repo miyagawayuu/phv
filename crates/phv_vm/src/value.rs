@@ -546,10 +546,15 @@ pub fn html_escape_into(s: &str, out: &mut String) {
 /// `Html` placed in a quoted attribute value: its quotes are encoded (the
 /// browser decodes them back), so it cannot end the attribute. Markup made
 /// by `escape()` has none; a template's output or a `json_html()` value may.
+/// So are `<` and `>`, which give the same value: a `</noscript>` or
+/// `</title>` in it cannot end an element that a browser reads around the
+/// attribute as raw text (found by the 1.2 audit).
 pub fn attr_quotes_into(s: &str, out: &mut String) {
     replace_bytes_into(s, out, |b| match b {
         b'"' => Some("&quot;"),
         b'\'' => Some("&#039;"),
+        b'<' => Some("&lt;"),
+        b'>' => Some("&gt;"),
         _ => None,
     })
 }

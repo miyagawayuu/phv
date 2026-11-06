@@ -1,0 +1,64 @@
+error: this loop's body starts with `>`, `!>`, `->` or `-!>` in a comment, and may follow a value at its end
+  --> err_loop_comment_start.phv:10:32
+   |
+10 | <!-- <?phv foreach ($xs as $x) { ?>> <a href=<?= $x ?><?phv } ?> -->x</a>
+   |                                ^
+   = note: on the next run, a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; start the body with a space
+
+error: this loop's body starts with `>`, `!>`, `->` or `-!>` in a comment, and may follow a value at its end
+  --> err_loop_comment_start.phv:11:31
+   |
+11 | <!-- <?phv foreach ($xs as $x): ?>-> <?= $x ?><?phv endforeach; ?> -->
+   |                               ^
+   = note: on the next run, a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; start the body with a space
+
+error: this loop's body starts with `>`, `!>`, `->` or `-!>` in a comment, and may follow a value at its end
+  --> err_loop_comment_start.phv:12:39
+   |
+12 | <!-- <?phv for ($i = 0; $i < 2; $i++) { ?>!> <?= $xs[$i] ?><?phv } ?> -->
+   |                                       ^
+   = note: on the next run, a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; start the body with a space
+
+error: this loop's body starts with `>`, `!>`, `->` or `-!>` in a comment, and may follow a value at its end
+  --> err_loop_comment_start.phv:13:35
+   |
+13 | <!-- <?phv $i = 0; while ($i < 2) { ?>-!> <?= $xs[$i] ?><?phv $i++; } ?> -->
+   |                                   ^
+   = note: on the next run, a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; start the body with a space
+
+error: this loop's body starts with `>`, `!>`, `->` or `-!>` in a comment, and may follow a value at its end
+  --> err_loop_comment_start.phv:14:15
+   |
+14 | <!-- <?phv do { ?>> <?= $xs[0] ?><?phv } while (false); ?> -->
+   |               ^
+   = note: on the next run, a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; start the body with a space
+
+error: this loop's body starts with `>`, `!>`, `->` or `-!>` in a comment, and may follow a value at its end
+  --> err_loop_comment_start.phv:15:32
+   |
+15 | <!-- <?phv foreach ($xs as $x) { if ($c) { ?>><?phv } ?> <?= $x ?><?phv } ?> -->
+   |                                ^
+   = note: on the next run, a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; start the body with a space
+
+error: this loop's body starts with `>`, `!>`, `->` or `-!>` in a comment, and may follow a value at its end
+  --> err_loop_comment_start.phv:16:32
+   |
+16 | <!-- <?phv foreach ($xs as $x) { ?>> <?= $x ?><?phv if ($c) { continue; } ?> . <?phv } ?> -->
+   |                                ^
+   = note: on the next run, a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; start the body with a space
+
+error: text right after a value in a comment starts with `>`, `!>`, `->` or `-!>`
+  --> err_loop_comment_start.phv:17:86
+   |
+17 | <!-- <?phv foreach ($xs as $x) { ?> <?= $x ?><?phv if ($c) { break; } ?> . <?phv } ?>> -->
+   |                                                                                      ^
+   = note: a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; put a space after the value
+
+error: text right after a value in a comment starts with `>`, `!>`, `->` or `-!>`
+  --> err_loop_comment_start.phv:18:40
+   |
+18 | <!-- <?= $xs[0] ?>!<?phv $c = false; ?>> -->
+   |                                        ^
+   = note: a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; put a space after the value
+
+9 errors found

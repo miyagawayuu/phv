@@ -76,6 +76,138 @@ enum State {
         /// Where the script's JavaScript has reached (`<script>` only).
         js: Js,
     },
+    /// `<![CDATA[` inside SVG or MathML, up to `]]>`. Where a browser's current
+    /// element is HTML it is a bogus comment that ends at the first `>`, so
+    /// that must be the `>` of `]]>` (`brackets`: how many `]` just came).
+    Cdata {
+        brackets: u8,
+    },
+}
+
+/// The namespace of an element open inside SVG or MathML.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Ns {
+    Html,
+    Svg,
+    Math,
+}
+
+/// An element open inside the outermost `<svg>` or `<math>` (see `HtmlTracker::open`).
+#[derive(Clone, Debug, PartialEq)]
+struct Open {
+    name: String,
+    ns: Ns,
+}
+
+impl Open {
+    /// SVG's HTML integration points: their content is HTML.
+    fn html_point(&self) -> bool {
+        self.ns == Ns::Svg && matches!(self.name.as_str(), "foreignobject" | "desc" | "title")
+    }
+
+    /// MathML's text integration points: their content is HTML but for
+    /// `<mglyph>` and `<malignmark>`.
+    fn text_point(&self) -> bool {
+        self.ns == Ns::Math && matches!(self.name.as_str(), "mi" | "mo" | "mn" | "ms" | "mtext")
+    }
+}
+
+/// Start tags that end SVG and MathML content where they are not in an
+/// integration point: browsers close the foreign elements and read them as
+/// HTML. (`<font>` only with `color`, `face` or `size`; it is counted always.)
+const BREAKOUT_TAGS: &[&str] = &[
+    "b",
+    "big",
+    "blockquote",
+    "body",
+    "br",
+    "center",
+    "code",
+    "dd",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "embed",
+    "font",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "hr",
+    "i",
+    "img",
+    "li",
+    "listing",
+    "menu",
+    "meta",
+    "nobr",
+    "ol",
+    "p",
+    "pre",
+    "ruby",
+    "s",
+    "small",
+    "span",
+    "strike",
+    "strong",
+    "sub",
+    "sup",
+    "table",
+    "tt",
+    "u",
+    "ul",
+    "var",
+];
+
+/// The most elements followed inside SVG or MathML (see `HtmlTracker::open`).
+const MAX_OPEN: usize = 4096;
+
+/// HTML elements that stay open after their start tag in no browser.
+const VOID_TAGS: &[&str] = &[
+    "area", "base", "basefont", "bgsound", "br", "col", "embed", "frame", "hr", "image", "img", "input", "keygen",
+    "link", "meta", "param", "source", "track", "wbr",
+];
+
+/// Raw-text elements that older browsers' `<select>` parsing ignores (its
+/// content is then read as markup), while this tracker and newer browsers
+/// read raw text (found by the 1.2 audit).
+const IGNORED_IN_SELECT: &[&str] = &["title", "style", "xmp", "iframe", "noembed", "noframes", "plaintext"];
+
+/// Text right after a value in a comment that would end it if the value ended
+/// with `--`, `--!` or `-`; and the starts of these (`""` too) that later
+/// text may complete.
+const COMMENT_ENDS_AFTER_VALUE: [&str; 4] = [">", "!>", "->", "-!>"];
+const COMMENT_END_STARTS: [&str; 4] = ["", "-", "!", "-!"];
+
+/// Reads `text` after each start in `starts` (bits of `COMMENT_END_STARTS`):
+/// whether it completes one of `COMMENT_ENDS_AFTER_VALUE`, and the starts
+/// that remain after it (for a short text).
+fn comment_end_after(starts: u8, text: &str) -> (bool, u8) {
+    let head: String = text.chars().take(4).collect();
+    let (mut ends, mut left) = (false, 0);
+    for (k, start) in COMMENT_END_STARTS.iter().enumerate() {
+        if starts & (1 << k) == 0 {
+            continue;
+        }
+        let s = format!("{start}{head}");
+        if COMMENT_ENDS_AFTER_VALUE.iter().any(|e| s.starts_with(e)) {
+            ends = true;
+        } else if let Some(j) = COMMENT_END_STARTS.iter().position(|p| *p == s) {
+            left |= 1 << j;
+        }
+    }
+    (ends, left)
+}
+
+/// Where a loop's body begins (see `HtmlTracker::begin_loop`).
+#[derive(Clone, Copy, Debug)]
+pub struct LoopHead {
+    head: u8,
+    ends: bool,
 }
 
 /// Where inside a script's JavaScript the text has reached. Values are safe
@@ -521,10 +653,19 @@ pub struct HtmlTracker {
     state: State,
     /// Text of a tag name being read after `<`.
     pending: Option<String>,
-    /// The open `<svg>` (true) and `<math>` (false) elements: foreign content,
-    /// which has no RCDATA elements. An end tag closes only an open element of
-    /// its name, and a self-closed one (`<svg/>`) opens nothing, as in browsers.
-    foreign: Vec<bool>,
+    /// The elements open inside the outermost `<svg>` or `<math>` (itself
+    /// included; empty outside): foreign content, which has no RCDATA
+    /// elements. They are followed as browsers build them, so that an end tag
+    /// closes what it closes for a browser: `</svg>` is ignored while an HTML
+    /// element opened inside a `<foreignObject>` is open (found by the 1.2
+    /// audit), and a self-closed element (`<svg/>`) opens nothing. What this
+    /// does not follow (an HTML element right inside SVG, which ends it) is
+    /// refused.
+    open: Vec<Open>,
+    /// `MAX_OPEN` was reached (reported once).
+    too_deep: bool,
+    /// A `<select>` is open (see `IGNORED_IN_SELECT`).
+    select: bool,
     /// Byte offset (in the chunk being fed) of the attribute name or value being
     /// read, if it began in this chunk (else what is found is reported where
     /// it is decided).
@@ -551,10 +692,19 @@ pub struct HtmlTracker {
     /// Depth of `<noscript>` (outside foreign content). Browsers with scripting
     /// on read its content as raw text, up to the first `</noscript`.
     noscript: u32,
-    /// A value was inserted into a comment and no literal text came after it
-    /// yet: the value may end with `-`, `--` or `--!`, so the text that follows
-    /// may not complete `-->` or `--!>` with it (see `feed`).
-    after_comment_value: bool,
+    /// A value was inserted into a comment and the literal text after it is
+    /// at most the start of `COMMENT_ENDS_AFTER_VALUE` (bits of
+    /// `COMMENT_END_STARTS`; 0 for none): the value may end with `-`, `--` or
+    /// `--!`, so the text that follows may not complete `-->` or `--!>` with
+    /// it (see `feed`).
+    after_comment_value: u8,
+    /// Nothing was written since the start of the body of the loop being
+    /// read but (at most) the start of `COMMENT_ENDS_AFTER_VALUE` (bits of
+    /// `COMMENT_END_STARTS`): the body may follow its own end.
+    loop_head: u8,
+    /// Text at the start of that loop's body completed one of
+    /// `COMMENT_ENDS_AFTER_VALUE` (see `end_loop`).
+    head_ends_comment: bool,
 }
 
 /// JavaScript written directly in template HTML, which a Content-Security-Policy
@@ -580,6 +730,17 @@ pub enum InlineCode {
     /// `-!>` (an error: a value ending with `--`, `--!` or `-` would end the
     /// comment there, where this tracker reads on).
     CommentEnd,
+    /// Elements in SVG or MathML that browsers do not close (or open) as
+    /// they are written, such as `</svg>` while a `<div>` opened inside its
+    /// `<foreignObject>` is still open (an error: what follows would be read
+    /// as SVG where this tracker reads HTML). The message says which.
+    ForeignStructure(String),
+    /// `>` inside a CDATA section in SVG or MathML that is not the end of
+    /// `]]>` (an error: where it is a bogus comment, it ends there).
+    CdataEnd,
+    /// A raw-text element such as `<title>` or `<style>` inside `<select>`
+    /// (an error: older browsers ignore it there and read its text as markup).
+    RawTextInSelect(String),
 }
 
 impl Default for HtmlTracker {
@@ -587,7 +748,9 @@ impl Default for HtmlTracker {
         HtmlTracker {
             state: State::Text,
             pending: None,
-            foreign: Vec::new(),
+            open: Vec::new(),
+            too_deep: false,
+            select: false,
             mark: None,
             found: Vec::new(),
             attrs: Vec::new(),
@@ -597,7 +760,9 @@ impl Default for HtmlTracker {
             carry: String::new(),
             tail: String::new(),
             noscript: 0,
-            after_comment_value: false,
+            after_comment_value: 0,
+            loop_head: 0,
+            head_ends_comment: false,
         }
     }
 }
@@ -690,6 +855,9 @@ fn decide_url(prefix: &str) -> Option<UrlState> {
     None
 }
 
+/// The start of a CDATA section (in SVG and MathML).
+const CDATA: &str = "<![CDATA[";
+
 fn is_delim(c: Option<&char>) -> bool {
     matches!(c, Some(c) if c.is_ascii_whitespace() || *c == '/' || *c == '>')
 }
@@ -707,8 +875,7 @@ impl HtmlTracker {
     /// and the start of a raw-text element's name (inside `<noscript>`,
     /// `<svg>` or `<math>`) or of `noscript` (anywhere).
     pub fn watched_end_tag_start(&self) -> bool {
-        let in_comment_or_value =
-            matches!(self.state, State::Comment | State::Bogus | State::Quoted { .. } | State::Unquoted { .. });
+        let in_comment_or_value = self.in_comment_or_value();
         let in_text = matches!(self.state, State::Text);
         let watched = (in_comment_or_value && self.out_of_step_possible()) || (self.noscript > 0 && !in_text);
         (watched && hidden_end_tag_start(&self.tail)) || (!in_text && hidden_noscript_start(&self.tail))
@@ -725,14 +892,18 @@ impl HtmlTracker {
         if self.watched_end_tag_start() {
             return EchoContext::AfterMarkup;
         }
+        // Where a browser may read raw text here, inserted `Html` may not end
+        // it (see `out_of_step_possible`; found by the 1.2 audit).
+        let watched = self.out_of_step_possible();
         match &self.state {
             // In a comment, inserted `Html` may not end it (found by the 1.1.1 audit).
-            State::Comment => EchoContext::Comment(false),
-            State::Bogus => EchoContext::Comment(true),
+            State::Comment => EchoContext::Comment { bogus: false, watched },
+            // A CDATA section may be a bogus comment for a browser (see `State::Cdata`).
+            State::Bogus | State::Cdata { .. } => EchoContext::Comment { bogus: true, watched },
             // Inside SVG or MathML, browsers read inserted markup in foreign
             // content, where this tracker read it (in its own template or
             // function) as HTML (found by the 1.1.1 audit).
-            State::Text if !self.foreign.is_empty() => EchoContext::ForeignText,
+            State::Text if self.in_foreign() => EchoContext::ForeignText,
             State::Text => EchoContext::Text,
             State::Raw { tag, js, .. } if tag == "script" => {
                 if js.in_code() {
@@ -807,9 +978,50 @@ impl HtmlTracker {
                 js.inserted();
             }
         }
-        if self.state == State::Comment {
-            self.after_comment_value = true;
+        // A value is the first thing after `]` it follows.
+        if let State::Cdata { brackets } = &mut self.state {
+            *brackets = 0;
         }
+        self.after_comment_value = if self.state == State::Comment { 1 } else { 0 };
+        self.loop_head = 0;
+    }
+
+    /// The start of a loop's body: it may follow the end of the body (or a
+    /// `continue`), so text at its start that would end a comment after a
+    /// value is remembered (see `end_loop`; found by the 1.2 audit).
+    pub fn begin_loop(&mut self) -> LoopHead {
+        let outer = LoopHead { head: self.loop_head, ends: self.head_ends_comment };
+        self.loop_head = if self.state == State::Comment { 1 | self.loop_head } else { 0 };
+        self.head_ends_comment = false;
+        outer
+    }
+
+    /// The end of a loop's body (after `end_block`): true if the body starts
+    /// with what would end a comment after a value (`>`, `!>`, `->`, `-!>`)
+    /// and may follow a value, at its end or at a `continue` (`continued`:
+    /// `after_comment_value` there). `broke` is that at a `break`: what
+    /// follows the loop may follow it.
+    pub fn end_loop(&mut self, outer: LoopHead, continued: u8, broke: u8) -> bool {
+        let repeats_after_value = self.head_ends_comment && (self.after_comment_value | continued) != 0;
+        // A loop at the start of another one is at the start of that one too.
+        let inner = self.head_ends_comment;
+        self.head_ends_comment = outer.ends || (outer.head != 0 && inner);
+        self.loop_head = if outer.head != 0 { outer.head | self.loop_head } else { 0 };
+        self.after_comment_value |= broke;
+        repeats_after_value
+    }
+
+    /// Where the HTML may follow a value written anywhere before (`finally`,
+    /// which runs after a `break` or `continue` in the `try` block).
+    pub fn after_any_value(&mut self) {
+        if self.state == State::Comment {
+            self.after_comment_value |= 1;
+        }
+    }
+
+    /// `after_comment_value` (for a `break` or `continue` here).
+    pub fn after_value(&self) -> u8 {
+        self.after_comment_value
     }
 
     /// True between elements of an HTML document: not inside a tag, comment,
@@ -821,7 +1033,8 @@ impl HtmlTracker {
     pub fn same_place(&self, other: &HtmlTracker) -> bool {
         self.state == other.state
             && self.pending == other.pending
-            && self.foreign == other.foreign
+            && self.open == other.open
+            && self.select == other.select
             && self.noscript == other.noscript
             && self.carry == other.carry
             && (!self.in_tag()
@@ -848,7 +1061,20 @@ impl HtmlTracker {
     }
 
     pub fn at_top_level(&self) -> bool {
-        self.state == State::Text && self.pending.is_none() && self.foreign.is_empty() && self.carry.is_empty()
+        self.state == State::Text && self.pending.is_none() && !self.in_foreign() && self.carry.is_empty()
+    }
+
+    /// Inside SVG or MathML (see `open`).
+    fn in_foreign(&self) -> bool {
+        !self.open.is_empty()
+    }
+
+    /// In a comment (or CDATA section) or an attribute value.
+    fn in_comment_or_value(&self) -> bool {
+        matches!(
+            self.state,
+            State::Comment | State::Bogus | State::Cdata { .. } | State::Quoted { .. } | State::Unquoted { .. }
+        )
     }
 
     /// After a block that may run zero or more times: true if it ended in the
@@ -913,11 +1139,16 @@ impl HtmlTracker {
         let same = same
             && !split
             && self.pending == entry.pending
-            && self.foreign == entry.foreign
+            && self.open == entry.open
             && self.noscript == entry.noscript
             && self.carry == entry.carry;
-        // A value may or may not be the last thing written before what follows.
+        // A `<select>` may be open after either way. A value may or may not be
+        // the last thing written before what follows, and the block may have
+        // written nothing at the start of a loop.
+        self.select |= entry.select;
         self.after_comment_value |= entry.after_comment_value;
+        self.loop_head |= entry.loop_head;
+        self.head_ends_comment |= entry.head_ends_comment;
         if same && self.in_tag() {
             // The attributes of the current tag on either way: a `<meta>` is
             // checked as acting (`http-equiv`, or no `name`) if one way makes
@@ -942,7 +1173,7 @@ impl HtmlTracker {
     /// return to HTML, whose raw-text elements this tracker does not follow
     /// there). Found by the 1.0.0 audit.
     fn out_of_step_possible(&self) -> bool {
-        self.noscript > 0 || !self.foreign.is_empty()
+        self.noscript > 0 || self.in_foreign()
     }
 
     /// Whether the end tag `name` here could end an element for a browser
@@ -964,32 +1195,144 @@ impl HtmlTracker {
         if std::mem::take(&mut self.meta_text) && tag == "meta" && self.attrs.iter().any(|a| a == "http-equiv") {
             self.found.push((self.here, InlineCode::MetaHttpEquiv));
         }
-        let svg = match tag.as_str() {
-            "svg" => Some(true),
-            "math" => Some(false),
-            _ => None,
-        };
-        if let Some(svg) = svg {
-            if closing {
-                // Browsers ignore `</math>` in `<svg>` (found by the 1.0.0 audit).
-                if let Some(at) = self.foreign.iter().rposition(|s| *s == svg) {
-                    self.foreign.truncate(at);
-                }
-            } else if !self_closing {
-                self.foreign.push(svg);
-            }
+        if closing {
+            self.foreign_end(&tag);
+        } else {
+            self.foreign_start(&tag, self_closing);
         }
         // Browsers ignore `/>` on HTML elements: `<noscript/>` opens one.
-        if self.foreign.is_empty() && tag == "noscript" {
+        if !self.in_foreign() && tag == "noscript" {
             if closing {
                 self.noscript = self.noscript.saturating_sub(1);
             } else {
                 self.noscript += 1;
             }
         }
-        let raw =
-            if !self.foreign.is_empty() { tag == "script" || tag == "style" } else { RAW_TAGS.contains(&tag.as_str()) };
+        if tag == "select" {
+            self.select = !closing;
+        } else if self.select && !closing && IGNORED_IN_SELECT.contains(&tag.as_str()) {
+            self.found.push((self.here, InlineCode::RawTextInSelect(tag.clone())));
+        }
+        let raw = if self.in_foreign() { tag == "script" || tag == "style" } else { RAW_TAGS.contains(&tag.as_str()) };
         self.state = if !closing && raw { State::Raw { tag, escape: 0, js: Js::default() } } else { State::Text };
+    }
+
+    fn foreign_error(&mut self, msg: String) {
+        self.found.push((self.here, InlineCode::ForeignStructure(msg)));
+    }
+
+    /// A start tag, in `open` (see there).
+    fn foreign_start(&mut self, tag: &str, self_closing: bool) {
+        let Some(top) = self.open.last().cloned() else {
+            if !self_closing && matches!(tag, "svg" | "math") {
+                let ns = if tag == "svg" { Ns::Svg } else { Ns::Math };
+                self.open.push(Open { name: tag.to_string(), ns });
+            }
+            return;
+        };
+        // Blocks copy and compare the open elements: their number is bounded
+        // (far above what SVG uses; unclosed elements such as `<path>` without
+        // `/>` nest).
+        if self.open.len() >= MAX_OPEN {
+            if !std::mem::replace(&mut self.too_deep, true) {
+                self.foreign_error(format!(
+                    "more than {MAX_OPEN} elements open inside `<svg>` or `<math>` (close them, e.g. `<path ... />`)"
+                ));
+            }
+            return;
+        }
+        // Whether browsers read the tag as HTML here (in an integration point).
+        let html = if top.ns == Ns::Html || top.html_point() {
+            true
+        } else if top.text_point() {
+            !matches!(tag, "mglyph" | "malignmark")
+        } else if top.ns == Ns::Math && top.name == "annotation-xml" {
+            // Its content is HTML or MathML depending on its `encoding`, which
+            // is not followed here; `<svg>` is SVG either way.
+            if tag != "svg" {
+                self.foreign_error(format!(
+                    "the element `<{tag}>` inside MathML `<annotation-xml>`, which browsers read as HTML or as \
+                     MathML depending on its `encoding`"
+                ));
+            }
+            true
+        } else {
+            false
+        };
+        let ns = top.ns;
+        if html {
+            match tag {
+                "svg" | "math" if self_closing => {}
+                "svg" => self.open.push(Open { name: tag.to_string(), ns: Ns::Svg }),
+                "math" => self.open.push(Open { name: tag.to_string(), ns: Ns::Math }),
+                // Browsers ignore `/>` on HTML elements.
+                t if VOID_TAGS.contains(&t) => {}
+                _ => self.open.push(Open { name: tag.to_string(), ns: Ns::Html }),
+            }
+        } else if BREAKOUT_TAGS.contains(&tag) {
+            self.foreign_error(format!(
+                "the HTML element `<{tag}>` directly inside `<svg>` or `<math>`, where browsers end the SVG or \
+                 MathML before it"
+            ));
+            // Read on as if it were in a `<foreignObject>` (the template is refused anyway).
+            if !VOID_TAGS.contains(&tag) {
+                self.open.push(Open { name: tag.to_string(), ns: Ns::Html });
+            }
+        } else if !self_closing {
+            self.open.push(Open { name: tag.to_string(), ns });
+        }
+    }
+
+    /// An end tag, in `open` (see there).
+    fn foreign_end(&mut self, tag: &str) {
+        let Some(top) = self.open.last().cloned() else { return };
+        if top.ns == Ns::Html {
+            // Browsers close an HTML element at its end tag; other end tags
+            // here (that browsers may or may not act on) leave it open, so a
+            // later `</svg>` is refused.
+            if top.name == tag {
+                self.open.pop();
+            } else if matches!(tag, "svg" | "math") {
+                self.foreign_error(format!(
+                    "`</{tag}>` while the HTML element `<{}>` opened inside SVG or MathML is still open, where \
+                     browsers ignore it",
+                    top.name
+                ));
+                // Read on as if it closed (the template is refused anyway).
+                if let Some(at) = self.open.iter().rposition(|n| n.ns != Ns::Html && n.name == tag) {
+                    self.open.truncate(at);
+                }
+            }
+            return;
+        }
+        if matches!(tag, "p" | "br") && !top.html_point() && !top.text_point() {
+            self.foreign_error(format!(
+                "`</{tag}>` directly inside `<svg>` or `<math>`, where browsers end the SVG or MathML before it"
+            ));
+            return;
+        }
+        // Browsers close the innermost SVG or MathML element of that name
+        // above the current HTML element (`</math>` in `<svg>` closes nothing;
+        // found by the 1.0.0 audit).
+        for at in (0..self.open.len()).rev() {
+            if self.open[at].ns == Ns::Html {
+                break;
+            }
+            if self.open[at].name == tag {
+                self.open.truncate(at);
+                return;
+            }
+        }
+        // An HTML element of that name around it: browsers may close it, with
+        // the SVG or MathML inside it.
+        if let Some(at) = self.open.iter().rposition(|n| n.ns == Ns::Html && n.name == tag) {
+            self.foreign_error(format!(
+                "`</{tag}>` inside SVG or MathML that an HTML element `<{tag}>` around it is open for, where \
+                 browsers may close that element and the SVG or MathML inside it"
+            ));
+            // Read on as if it closed (the template is refused anyway).
+            self.open.truncate(at);
+        }
     }
 
     /// An end tag split between the last literal text and this one (by a
@@ -999,8 +1342,7 @@ impl HtmlTracker {
         if self.tail.is_empty() {
             return;
         }
-        let in_comment_or_value =
-            matches!(self.state, State::Comment | State::Bogus | State::Quoted { .. } | State::Unquoted { .. });
+        let in_comment_or_value = self.in_comment_or_value();
         let in_text = matches!(self.state, State::Text);
         let head: String = text.chars().take(16).collect();
         let joined = format!("{}{head}", self.tail).to_ascii_lowercase();
@@ -1026,12 +1368,19 @@ impl HtmlTracker {
         // After a value in a comment, text that a value ending with `-`, `--` or
         // `--!` would make `-->` or `--!>` (found by the 1.1.1 audit: `<!-- `,
         // a value `--`, then `>` ended the comment for browsers, not here).
-        if std::mem::take(&mut self.after_comment_value)
-            && self.state == State::Comment
-            && [">", "!>", "->", "-!>"].iter().any(|h| text.starts_with(h))
-        {
+        // Also across pieces: `-` or `!`, a statement, then `>` (found by the 1.2
+        // audit).
+        let comment = self.state == State::Comment;
+        let (ends, after) = comment_end_after(if comment { self.after_comment_value } else { 0 }, text);
+        self.after_comment_value = after;
+        if ends {
             self.found.push((0, InlineCode::CommentEnd));
         }
+        // The same at the start of a loop's body, which may follow a value at
+        // its end (see `end_loop`; found by the 1.2 audit).
+        let (head_ends, head) = comment_end_after(if comment { self.loop_head } else { 0 }, text);
+        self.loop_head = head;
+        self.head_ends_comment |= head_ends && !ends;
         if self.carry.is_empty() {
             return self.feed_text(text);
         }
@@ -1096,8 +1445,10 @@ impl HtmlTracker {
             }
             let state = std::mem::replace(&mut self.state, State::Text);
             let (from, in_script) = (i, matches!(&state, State::Raw { tag, .. } if tag == "script"));
-            let in_comment_or_value =
-                matches!(state, State::Comment | State::Bogus | State::Quoted { .. } | State::Unquoted { .. });
+            let in_comment_or_value = matches!(
+                state,
+                State::Comment | State::Bogus | State::Cdata { .. } | State::Quoted { .. } | State::Unquoted { .. }
+            );
             if c == '<' && chars.get(i + 1) == Some(&'/') {
                 let name: String = chars[i + 2..]
                     .iter()
@@ -1150,6 +1501,25 @@ impl HtmlTracker {
                                 i = chars.len() - 1;
                                 State::Text
                             }
+                            // In SVG and MathML, `<![CDATA[` (in this case only)
+                            // starts a CDATA section (found by the 1.2 audit), so
+                            // its start is read again with what follows too.
+                            Some('!')
+                                if self.in_foreign()
+                                    && chars.len() - i < CDATA.len()
+                                    && CDATA.starts_with(&chars[i..].iter().collect::<String>()) =>
+                            {
+                                self.carry = chars[i..].iter().collect();
+                                i = chars.len() - 1;
+                                State::Text
+                            }
+                            Some('!')
+                                if self.in_foreign()
+                                    && chars[i..].iter().copied().take(CDATA.len()).eq(CDATA.chars()) =>
+                            {
+                                i += CDATA.len() - 1;
+                                State::Cdata { brackets: 0 }
+                            }
                             Some('/') => match chars.get(i + 2) {
                                 Some(n) if n.is_ascii_alphabetic() => {
                                     self.pending = Some("/".into());
@@ -1188,6 +1558,15 @@ impl HtmlTracker {
                         State::Bogus
                     }
                 }
+                State::Cdata { brackets } => match c {
+                    ']' => State::Cdata { brackets: (brackets + 1).min(2) },
+                    '>' if brackets == 2 => State::Text,
+                    '>' => {
+                        self.found.push((offsets[i], InlineCode::CdataEnd));
+                        State::Text
+                    }
+                    _ => State::Cdata { brackets: 0 },
+                },
                 State::Raw { tag, escape, js } => {
                     // The end tag, looked for only at a `<`.
                     let end = if c == '<' { format!("</{tag}") } else { String::new() };
@@ -1219,7 +1598,7 @@ impl HtmlTracker {
                             i += n - 1;
                             State::Tag { name: tag, closing: true }
                         }
-                    } else if !self.foreign.is_empty()
+                    } else if self.in_foreign()
                         && c == '<'
                         && chars.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '!' | '/' | '?'))
                     {
@@ -1504,7 +1883,7 @@ mod tests {
         for html in [
             "<noscript><!--</noscript><meta http-equiv=\"refresh\">-->",
             "<svg><foreignObject><xmp><!--</xmp><a href=\"",
-            "<svg><p title=\"</textarea >\">",
+            "<svg><a title=\"</textarea >\">",
             "<math><!x </title>",
             // Inside `<noscript>`, its end tag in raw text too (found again by the audit).
             "<noscript><textarea></noscript><a href=\"",
@@ -1518,12 +1897,12 @@ mod tests {
         assert!(found("<noscript><style>.js{display:none}</style><p title=\"</b>\"></noscript>").is_empty());
         // A value right after the start of such an end tag could complete it.
         assert_eq!(ctx("<noscript><!-- </noscr"), EchoContext::AfterMarkup);
-        assert_eq!(ctx("<svg><p title=\"</"), EchoContext::AfterMarkup);
+        assert_eq!(ctx("<svg><a title=\"</"), EchoContext::AfterMarkup);
         assert_eq!(ctx("<noscript><!-- <"), EchoContext::AfterMarkup);
-        assert_eq!(ctx("<svg><p title=\"</b"), EchoContext::Attr);
+        assert_eq!(ctx("<svg><a title=\"</b"), EchoContext::Attr);
         // Outside them, only `</noscript` is watched (see `hides_noscript_outside_one`).
         assert_eq!(ctx("<!-- </noscr"), EchoContext::AfterMarkup);
-        assert_eq!(ctx("<!-- </scr"), EchoContext::Comment(false));
+        assert_eq!(ctx("<!-- </scr"), EchoContext::Comment { bogus: false, watched: false });
         // Split between pieces of literal text (statements between them), also
         // through short pieces.
         for pieces in [
@@ -1571,7 +1950,7 @@ mod tests {
             "<noscript><!--<<?phv f(); ?>--></noscript>",
             "<noscript><!--</nos<?phv $x = 1; ?>--></noscript>",
             "<noscript><textarea></<?phv f(); ?></textarea></noscript>",
-            "<svg><p title=\"</<?phv f(); ?>\"></p></svg>",
+            "<svg><a title=\"</<?phv f(); ?>\"></a></svg>",
             "<svg><!--</<?phv f(); ?>--></svg>",
             "<math><!--</<?phv f(); ?>--></math>",
             "<math><mi title='</ti<?phv f(); ?>'></mi></math>",
@@ -1591,7 +1970,7 @@ mod tests {
             "<p><!--</b<?phv f(); ?>--></p>",
             "<noscript><!--</b <?phv f(); ?>--></noscript>",
             "<noscript><!-- <?phv f(); ?> --></noscript>",
-            "<svg><p title=\"</b<?phv f(); ?>\"></p></svg>",
+            "<svg><a title=\"</b<?phv f(); ?>\"></a></svg>",
             "<noscript><p>a <?phv f(); ?></p></noscript>",
         ] {
             assert!(parse(src).iter().all(|d| !d.is_error()), "{src}");
@@ -1635,7 +2014,7 @@ mod tests {
         ] {
             assert!(found(html).is_empty(), "{html}");
         }
-        assert_eq!(ctx("<!--</scr"), EchoContext::Comment(false));
+        assert_eq!(ctx("<!--</scr"), EchoContext::Comment { bogus: false, watched: false });
         assert_eq!(ctx("<p title=\"a < "), EchoContext::Attr);
     }
 
@@ -1677,8 +2056,8 @@ mod tests {
         for src in ["<!-- <?= $v ?> --> <p>", "<!-- <?= $v ?>--> <p>", "<!-- a <?= $v ?> - <?= $w ?> -->"] {
             assert_eq!(errors(src), 0, "{src}");
         }
-        assert_eq!(ctx("<!-- a "), EchoContext::Comment(false));
-        assert_eq!(ctx("<!x a "), EchoContext::Comment(true));
+        assert_eq!(ctx("<!-- a "), EchoContext::Comment { bogus: false, watched: false });
+        assert_eq!(ctx("<!x a "), EchoContext::Comment { bogus: true, watched: false });
         assert_eq!(ctx("<!-- a-"), EchoContext::AfterMarkup);
     }
 
@@ -2012,5 +2391,161 @@ mod tests {
         // `<script` inside a textarea is text, not a tag.
         let mut t = HtmlTracker::default();
         assert!(t.feed("<textarea><script></textarea>").is_empty());
+    }
+
+    fn structure_errors(html: &str) -> usize {
+        found(html).iter().filter(|c| matches!(c, InlineCode::ForeignStructure(_))).count()
+    }
+
+    /// Found by the 1.2 audit: browsers ignore `</svg>` while an HTML element
+    /// opened inside a `<foreignObject>` is open, and read on as SVG (a
+    /// `<script>` there is SVG's, whose text is markup), where this tracker
+    /// left the SVG.
+    #[test]
+    fn svg_end_tags_that_browsers_ignore_are_refused() {
+        for html in [
+            "<svg><foreignObject><div></svg></div></foreignObject><script>",
+            "<svg><desc><i></svg></i></desc>",
+            "<svg><title><b></svg>",
+            "<math><mtext><b></math></b></mtext>",
+            "<math><mi><span></math>",
+            // Unclosed: browsers close a `<p>` before a `<div>`, but not before `</svg>`.
+            "<svg><foreignObject><p>a</foreignObject></svg>",
+            // HTML elements right inside SVG or MathML end it for browsers.
+            "<svg><p>a</p></svg>",
+            "<svg><g><font>a</font></g></svg>",
+            "<math><b>",
+            "<svg></p>",
+            "<svg><g></br></g></svg>",
+            // `<annotation-xml>` holds HTML or MathML depending on `encoding`.
+            "<math><annotation-xml encoding=\"text/html\"><p>a</p></annotation-xml></math>",
+            // An end tag that closes an HTML element around nested SVG.
+            "<svg><foreignObject><div><svg></div></svg></foreignObject></svg>",
+        ] {
+            assert_eq!(structure_errors(html), 1, "{html}");
+        }
+        // What browsers read as written: closed HTML in integration points,
+        // SVG and MathML elements, nested SVG and void elements.
+        for html in [
+            "<svg><foreignObject><div><p>a</p><br><img src=x><b>b</b></div></foreignObject></svg>",
+            "<svg><title>Icon <b>x</b></title><path d=\"M0 0\"/><g><rect/></g></svg>",
+            "<svg><foreignObject><svg><circle r=\"1\"/></svg></foreignObject></svg>",
+            "<math><mi>x</mi><mtext><b>t</b><mglyph></mglyph></mtext></math>",
+            "<math><annotation-xml encoding=\"image/svg+xml\"><svg></svg></annotation-xml></math>",
+            "<svg></math><g></g></svg>",
+            "<svg><foreignObject></p></foreignObject></svg>",
+        ] {
+            assert_eq!(structure_errors(html), 0, "{html}");
+            let mut t = HtmlTracker::default();
+            t.feed(html);
+            assert!(t.at_top_level(), "{html}");
+        }
+        // A block must leave the same elements open.
+        let parse = |src: &str| crate::parse_module(src, 0, true).1;
+        assert!(parse("<svg><foreignObject><?phv if ($c) { ?><div><?phv } ?></foreignObject></svg>")
+            .iter()
+            .any(|d| d.is_error()));
+        // The elements followed are bounded (reported once), so blocks inside
+        // deep SVG are read in linear time.
+        let deep = format!("<svg>{}", "<g>".repeat(MAX_OPEN + 1000));
+        assert_eq!(structure_errors(&deep), 1);
+        let src = format!("<svg>{}{}</svg>", "<g>".repeat(MAX_OPEN), "<?phv if ($c) { ?>x<?phv } ?>".repeat(2000));
+        let start = std::time::Instant::now();
+        assert!(parse(&src).len() <= 1);
+        assert!(start.elapsed() < std::time::Duration::from_secs(20), "{:?}", start.elapsed());
+    }
+
+    /// Found by the 1.2 audit: `<![CDATA[` in SVG or MathML was read as a bogus
+    /// comment ending at `>`, where browsers read a CDATA section to `]]>`.
+    #[test]
+    fn cdata_sections_in_foreign_content_are_read_to_their_end() {
+        for html in [
+            "<svg><![CDATA[ ><a x=\"]]><a href=",
+            "<math><![CDATA[ a > b ]]>",
+            "<svg><foreignObject><div><![CDATA[ > ]]>",
+        ] {
+            assert!(found(html).contains(&InlineCode::CdataEnd), "{html}");
+        }
+        let mut t = HtmlTracker::default();
+        t.feed("<svg><![CDATA[ <a x=\"");
+        assert_eq!(t.context(), EchoContext::Comment { bogus: true, watched: true });
+        t.feed(" ]]]><a title=\"");
+        assert_eq!(t.context(), EchoContext::Attr);
+        assert!(t.take_inline_code().is_empty());
+        // A value before `>` cannot make `]]>`.
+        let mut t = HtmlTracker::default();
+        t.feed("<svg><![CDATA[ ]]");
+        t.inserted();
+        t.feed(">");
+        assert!(t.take_inline_code().contains(&(0, InlineCode::CdataEnd)));
+        // Its start split by a value or statement is read as one; outside SVG
+        // and MathML (and in another case) it is a bogus comment.
+        assert_eq!(ctx("<svg><![CDA"), EchoContext::AfterMarkup);
+        let mut t = HtmlTracker::default();
+        t.feed("<svg><![CDA");
+        t.feed("TA[ > ]]>");
+        assert!(t.take_inline_code().iter().any(|(_, c)| *c == InlineCode::CdataEnd));
+        assert_eq!(ctx("<![CDATA[ a > <p title=\""), EchoContext::Attr);
+        assert_eq!(ctx("<svg><![cdata[ a > <a title=\""), EchoContext::Attr);
+    }
+
+    /// Found by the 1.2 audit: a loop's body that starts with `>` in a comment
+    /// follows a value at its end on the next run (`--` + `>` ends the comment).
+    #[test]
+    fn loop_bodies_cannot_end_a_comment_after_their_own_values() {
+        let parse = |src: &str| crate::parse_module(src, 0, true).1;
+        let errors = |src: &str| parse(src).iter().filter(|d| d.is_error()).count();
+        for src in [
+            "<!-- <?phv foreach ($xs as $x) { ?>> <a href=<?= $x ?><?phv } ?> -->",
+            "<!-- <?phv foreach ($xs as $x): ?>-> <?= $x ?><?phv endforeach; ?> -->",
+            "<!-- <?phv for ($i = 0; $i < 2; $i++) { ?>!> <?= $i ?><?phv } ?> -->",
+            "<!-- <?phv while ($c) { ?>-!> <?= $v ?><?phv } ?> -->",
+            "<!-- <?phv do { ?>> <?= $v ?><?phv } while ($c); ?> -->",
+            // At the start through a block, or split by a statement.
+            "<!-- <?phv foreach ($xs as $x) { if ($c) { ?>><?phv } ?> <?= $x ?><?phv } ?> -->",
+            "<!-- <?phv foreach ($xs as $x) { ?>-<?phv f(); ?>> <?= $x ?><?phv } ?> -->",
+            // Nested: the inner loop is at the start of the outer one.
+            "<!-- <?phv foreach ($xs as $x) { foreach ($xs as $y) { ?>> <?phv } ?> <?= $x ?><?phv } ?> -->",
+            // A `continue` right after a value, and a `break` before the text after the loop.
+            "<!-- <?phv foreach ($xs as $x) { ?>> <?= $x ?><?phv if ($c) { continue; } ?> . <?phv } ?> -->",
+            "<!-- <?phv foreach ($xs as $x) { ?> <?= $x ?><?phv if ($c) { break; } ?> . <?phv } ?>> -->",
+            // `finally` may follow a value before a `break` in its `try` block.
+            "<!-- <?phv try { ?> <?= $v ?><?phv } finally { ?>> <?phv } ?> -->",
+            // Statements between a value and `!` + `>`.
+            "<!-- <?= $v ?>!<?phv f(); ?>> -->",
+        ] {
+            assert!(errors(src) > 0, "{src}");
+        }
+        for src in [
+            "<!-- <?phv foreach ($xs as $x) { ?> > <?= $x ?><?phv } ?> -->",
+            "<!-- <?phv foreach ($xs as $x) { ?>> <?= $x ?> <?phv } ?> -->",
+            "<!-- <?phv foreach ($xs as $x) { ?>> <?phv } ?> -->",
+            "<!-- <?phv foreach ($xs as $x) { ?><?= $x ?>, <?phv } ?> -->",
+            "<?phv foreach ($xs as $x) { ?>> <?= $x ?><?phv } ?>",
+        ] {
+            assert_eq!(errors(src), 0, "{src}");
+        }
+    }
+
+    /// Found by the 1.2 audit: older browsers ignore raw-text elements such as
+    /// `<title>` in `<select>` and read their text as markup.
+    #[test]
+    fn raw_text_elements_inside_select_are_refused() {
+        for html in ["<select><title>", "<select><option>a<style>", "<SELECT><option><xmp>", "<select><plaintext>"] {
+            assert!(found(html).iter().any(|c| matches!(c, InlineCode::RawTextInSelect(_))), "{html}");
+        }
+        for html in [
+            "<select><option>a</option><script>var a = 1;</script></select>",
+            "<select></select><title>t</title><style>p {}</style>",
+            "<select><textarea></textarea></select>",
+        ] {
+            assert!(found(html).is_empty(), "{html}");
+        }
+        // A `<select>` opened in a block may be open after it.
+        let parse = |src: &str| crate::parse_module(src, 0, true).1;
+        assert!(parse("<?phv if ($c) { ?><select><?phv } ?><title>t</title>").iter().any(|d| d.is_error()));
+        assert!(parse("<?phv if ($c) { ?><select><?phv } ?><option>o</option></select><title>t</title>")
+            .iter()
+            .all(|d| !d.is_error()));
     }
 }

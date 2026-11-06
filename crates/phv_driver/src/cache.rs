@@ -183,7 +183,9 @@ fn load(root: &Path, entry: &Path, key: &[u8; 32], stamp: &str) -> Option<Compil
 
 /// Best effort: a temporary file in `.phv-cache/`, then renamed into place.
 fn store(root: &Path, entry: &Path, key: &[u8; 32], e: &Entry<&Program>) -> Option<()> {
-    let body = postcard::to_allocvec(e).ok()?;
+    // An entry `load` would not read is not written (found by the 1.2.0 audit: a
+    // 1 GB entry was written at every run); encoding stops past the size.
+    let body = postcard::to_io(e, Limited(Vec::new(), MAX_ENTRY)).ok()?.0;
     let dir_path = root.join(".phv-cache");
     match std::fs::symlink_metadata(&dir_path) {
         Ok(m) if !m.is_dir() || m.file_type().is_symlink() => return None,
@@ -204,6 +206,23 @@ fn store(root: &Path, entry: &Path, key: &[u8; 32], e: &Entry<&Program>) -> Opti
         let _ = std::fs::remove_file(&from);
     }
     Some(())
+}
+
+/// A buffer that refuses to grow past a number of bytes.
+struct Limited(Vec<u8>, u64);
+
+impl Write for Limited {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if (self.0.len() + buf.len()) as u64 > self.1 {
+            return Err(std::io::Error::other("cache entry too large"));
+        }
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Like `compile`, but reuses (and refreshes) the on-disk cache.
@@ -238,4 +257,18 @@ pub fn compile_cached(root: &Path, entry: &Path) -> Result<Compiled, CompileErro
 pub(crate) fn clone_program(p: &Program) -> Program {
     // Program is serializable but not Clone; round-trip through the encoder.
     postcard::from_bytes(&postcard::to_allocvec(p).expect("encode")).expect("decode")
+}
+
+#[cfg(test)]
+mod tests {
+    /// An entry larger than `load` reads is not encoded whole (the 1.2.0 audit:
+    /// a 1 GB entry was written at every run, and never read).
+    #[test]
+    fn entries_past_the_size_are_not_encoded() {
+        let big = vec![7u8; 5000];
+        assert!(postcard::to_io(&big, super::Limited(Vec::new(), 4096)).is_err());
+        let small = vec![7u8; 4000];
+        let out = postcard::to_io(&small, super::Limited(Vec::new(), 4096)).unwrap();
+        assert_eq!(out.0, postcard::to_allocvec(&small).unwrap());
+    }
 }

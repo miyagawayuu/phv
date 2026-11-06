@@ -1,0 +1,22 @@
+error: `<title>` inside `<select>`
+ --> err_select_raw_text.phv:8:15
+  |
+8 | <select><title><option x='</title>' title="<?= $v ?>">o</option></select>
+  |               ^
+  = note: older browsers ignore it there and read its text as markup, where this template is checked as its text; close the `<select>` first
+
+error: `<style>` inside `<select>`
+ --> err_select_raw_text.phv:9:33
+  |
+9 | <select><option>a</option><style>.a {}</style></select>
+  |                                 ^
+  = note: older browsers ignore it there and read its text as markup, where this template is checked as its text; close the `<select>` first
+
+error: `<xmp>` inside `<select>`
+  --> err_select_raw_text.phv:10:13
+   |
+10 | <select><xmp>a</xmp></select>
+   |             ^
+   = note: older browsers ignore it there and read its text as markup, where this template is checked as its text; close the `<select>` first
+
+3 errors found

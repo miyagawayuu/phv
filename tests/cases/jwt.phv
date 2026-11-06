@@ -202,6 +202,22 @@ foreach (['{"kty":"oct","k":"AAAA"}', '{"kty":"EC","crv":"P-384","x":"AA","y":"A
         echo "ValueError: ", $e->getMessage(), "\n";
     }
 }
+// An RSA key whose modulus is zero is refused like other short keys (it used to
+// stop the script with an internal error), and a key set skips it.
+foreach (['{"kty":"RSA","n":"","e":"AQAB"}', '{"kty":"RSA","n":"AA","e":"AQAB"}'] as $bad) {
+    try {
+        JwtKey::fromJwk($bad);
+    } catch (ValueError $e) {
+        echo "ValueError: ", $e->getMessage(), "\n";
+    }
+}
+try {
+    JwtKey::fromPem("-----BEGIN RSA PUBLIC KEY-----\nMAgCAQACAwEAAQ==\n-----END RSA PUBLIC KEY-----\n");
+} catch (ValueError $e) {
+    echo "ValueError: ", $e->getMessage(), "\n";
+}
+$withZero = KeySet::fromJson('{"keys":[' . $ec->publicJwk() . ',{"kty":"RSA","n":"AA","e":"AQAB"}]}');
+echo "zero key skipped: ", field($withZero->verify($ec->sign(["sub" => "7"])), "sub"), "\n";
 try {
     JwtKey::secret("short");
 } catch (ValueError $e) {

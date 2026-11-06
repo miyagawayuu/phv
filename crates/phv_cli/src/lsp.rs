@@ -335,13 +335,27 @@ pub(super) const MAX_DOCUMENT: usize = 8 << 20;
 /// program are seen after this).
 const ANALYSIS_AGE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// An analysis kept for later requests: the generation and time it was made.
-type Kept = (u64, std::time::Instant, std::rc::Rc<Analysis>);
+/// An analysis kept for later requests.
+struct Kept {
+    /// The generation and time it was made.
+    generation: u64,
+    made: std::time::Instant,
+    /// When it was last used (a count of uses, see `Server::uses`).
+    used: u64,
+    /// Its tokens and bytes of source (all its files together).
+    tokens: usize,
+    bytes: usize,
+    analysis: std::rc::Rc<Analysis>,
+}
 
-/// The analysis of a program with more tokens than this (all its files
-/// together, see `phv_driver::MAX_PROGRAM_TOKENS`) is not kept for later
-/// requests; the examples of the repository have about 30,000.
+/// The analyses kept, of all open documents together, have at most this many
+/// tokens (see `phv_driver::MAX_PROGRAM_TOKENS`) and bytes of source; the least
+/// recently used is dropped first. So the analysis of a program with more is
+/// not kept for later requests; the examples of the repository have about
+/// 30,000 tokens (found by the 15th assessment for one program, and by the
+/// 16th for many open documents: 20 pages held 1,066 MB).
 const KEEP_TOKENS: usize = 250_000;
+const KEEP_BYTES: usize = 16 << 20;
 
 /// The canonical path of open document `p`. A document behind a link to
 /// another machine is not resolved (that would contact the host; found by the
@@ -367,8 +381,11 @@ struct Server {
     generation: u64,
     /// The last analysis (for the editor) of each open document, with the
     /// generation and time it was made: the requests an editor sends after
-    /// an edit (tokens, hints, actions, hover...) share it.
+    /// an edit (tokens, hints, actions, hover...) share it. Within
+    /// `KEEP_TOKENS` and `KEEP_BYTES` in all.
     analyses: std::cell::RefCell<HashMap<PathBuf, Kept>>,
+    /// Counts the uses of kept analyses (the least recently used is dropped).
+    uses: std::cell::Cell<u64>,
 }
 
 impl Server {
@@ -380,6 +397,7 @@ impl Server {
             too_large: HashSet::new(),
             generation: 0,
             analyses: Default::default(),
+            uses: Default::default(),
         }
     }
 
@@ -414,20 +432,52 @@ impl Server {
     /// The analysis of open document `path` as it is now (shared by the
     /// requests that read it; see `analyses`).
     fn analysis(&self, path: &Path) -> std::rc::Rc<Analysis> {
-        if let Some((generation, at, a)) = self.analyses.borrow().get(path) {
-            if *generation == self.generation && at.elapsed() < ANALYSIS_AGE {
-                return a.clone();
+        let use_ = self.uses.get() + 1;
+        self.uses.set(use_);
+        {
+            let mut analyses = self.analyses.borrow_mut();
+            // An analysis that is too old, or from before a change, is dropped (not
+            // only passed over).
+            analyses.retain(|_, k| k.generation == self.generation && k.made.elapsed() < ANALYSIS_AGE);
+            if let Some(k) = analyses.get_mut(path) {
+                k.used = use_;
+                return k.analysis.clone();
             }
         }
         let text = self.open.get(path).cloned().unwrap_or_default();
         let a = std::rc::Rc::new(self.analyze_text(path, text));
-        // The analysis of a large program is not kept after the requests that
-        // need it (found by the 15th assessment: 1.95 GB held between edits).
-        if a.tokens <= KEEP_TOKENS {
-            let kept = (self.generation, std::time::Instant::now(), a.clone());
-            self.analyses.borrow_mut().insert(path.to_path_buf(), kept);
-        }
+        self.keep(path, &a, use_);
         a
+    }
+
+    /// Keeps analysis `a` of `path` for the next requests, dropping the least
+    /// recently used ones to stay within `KEEP_TOKENS` and `KEEP_BYTES`. The
+    /// analysis of a larger program is not kept after the requests that need
+    /// it (found by the 15th assessment: 1.95 GB held between edits).
+    fn keep(&self, path: &Path, a: &std::rc::Rc<Analysis>, used: u64) {
+        let bytes: usize = a.sources.files.iter().map(|f| f.text.len()).sum();
+        let mut analyses = self.analyses.borrow_mut();
+        analyses.remove(path);
+        if a.tokens > KEEP_TOKENS || bytes > KEEP_BYTES {
+            return;
+        }
+        loop {
+            let (tokens, all) = analyses.values().fold((a.tokens, bytes), |(t, b), k| (t + k.tokens, b + k.bytes));
+            if tokens <= KEEP_TOKENS && all <= KEEP_BYTES {
+                break;
+            }
+            let Some(oldest) = analyses.iter().min_by_key(|(_, k)| k.used).map(|(p, _)| p.clone()) else { break };
+            analyses.remove(&oldest);
+        }
+        let kept = Kept {
+            generation: self.generation,
+            made: std::time::Instant::now(),
+            used,
+            tokens: a.tokens,
+            bytes,
+            analysis: a.clone(),
+        };
+        analyses.insert(path.to_path_buf(), kept);
     }
 
     /// Analyzes `path` as if its text were `text`.
@@ -1407,6 +1457,55 @@ mod tests {
         server.changed();
         let _ = server.analysis(&path);
         assert_eq!(server.analyses.borrow().len(), 1);
+    }
+
+    /// Found by the 16th assessment: each open document's analysis was kept
+    /// (within the budget of one program each), so 20 pages held 1,066 MB.
+    /// The kept analyses have one budget in all, and old ones are dropped.
+    #[test]
+    fn kept_analyses_have_one_budget_and_old_ones_are_dropped() {
+        use phv_vm::alloc::thread_allocated;
+        let p = Project::new("kept-budget");
+        let body = "$a=$a+1;".repeat(10_000);
+        let module = format!("<?phv\nexport function big(): int {{ $a = 0; {body} return $a; }}\n");
+        std::fs::write(p.dir.join("lib/big.phv"), module).unwrap();
+        let (mut server, _, _, _) = p.open("page.phv", "|");
+        let pages: Vec<PathBuf> = (0..12)
+            .map(|i| {
+                let path = p.dir.join(format!("page{i}.phv"));
+                let text = format!("<?phv\nimport lib.big.{{big}};\necho big() + {i};\n");
+                std::fs::write(&path, &text).unwrap();
+                server.open.insert(path.clone(), text);
+                path
+            })
+            .collect();
+        let base = thread_allocated();
+        let a = server.analysis(&pages[0]);
+        assert!(a.diags.is_empty(), "{:?} {:?}", a.diags.iter().map(|d| &d.message).collect::<Vec<_>>(), a.messages);
+        assert!(a.tokens > 50_000, "{}", a.tokens);
+        drop(a);
+        let one = thread_allocated() - base;
+        for page in &pages[1..] {
+            let _ = server.analysis(page);
+        }
+        let held = thread_allocated() - base;
+        {
+            let kept = server.analyses.borrow();
+            let tokens: usize = kept.values().map(|k| k.tokens).sum();
+            assert!(tokens <= KEEP_TOKENS, "{tokens} tokens kept");
+            assert!(kept.len() < pages.len() / 2, "{} kept", kept.len());
+            // The most recently used is kept.
+            assert!(kept.contains_key(pages.last().unwrap()));
+        }
+        // Before, all 12 were kept.
+        assert!(held < one * 6, "held {} MB, one analysis {} MB", held >> 20, one >> 20);
+        // An analysis older than ANALYSIS_AGE is dropped, not only passed over.
+        for k in server.analyses.get_mut().values_mut() {
+            k.made = k.made.checked_sub(ANALYSIS_AGE).unwrap_or(k.made);
+        }
+        let _ = server.analysis(&pages[0]);
+        assert_eq!(server.analyses.borrow().len(), 1);
+        let _ = std::fs::remove_dir_all(&p.dir);
     }
 
     /// Found by the 15th assessment: an open document was resolved (which

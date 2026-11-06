@@ -31,11 +31,49 @@ pub enum RespBody {
     /// A page's output sent while it runs (`response()->flush()`). When the
     /// sender is dropped the body ends, or fails if `aborted` was set first
     /// (the page failed or stopped): the client sees a cut response, not a
-    /// complete one.
+    /// complete one. Each chunk is handed over in slices, as `Full` is.
     Chunks {
         rx: tokio::sync::mpsc::Receiver<Bytes>,
         aborted: Arc<std::sync::atomic::AtomicBool>,
+        /// What is left of the chunk being sent.
+        rest: Bytes,
+        progress: Arc<Progress>,
     },
+}
+
+/// When the connection last asked a streamed body for more (it had sent what
+/// it had): a page waits for a client that keeps doing so, not for one that
+/// stopped reading.
+pub struct Progress {
+    start: Instant,
+    /// Milliseconds after `start`.
+    at: std::sync::atomic::AtomicU64,
+}
+
+impl Progress {
+    pub fn new() -> Arc<Progress> {
+        Arc::new(Progress { start: Instant::now(), at: std::sync::atomic::AtomicU64::new(0) })
+    }
+
+    fn mark(&self) {
+        self.at.store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// The last time the connection asked for more.
+    pub fn last(&self) -> Instant {
+        self.start + Duration::from_millis(self.at.load(Ordering::Relaxed))
+    }
+}
+
+impl RespBody {
+    /// The body of a page that sends its output while it runs.
+    pub fn chunks(
+        rx: tokio::sync::mpsc::Receiver<Bytes>,
+        aborted: Arc<std::sync::atomic::AtomicBool>,
+        progress: Arc<Progress>,
+    ) -> RespBody {
+        RespBody::Chunks { rx, aborted, rest: Bytes::new(), progress }
+    }
 }
 
 /// Output counted in a server-wide total until the last copy of its bytes is
@@ -214,14 +252,27 @@ impl Body for RespBody {
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             },
-            RespBody::Chunks { rx, aborted } => match rx.poll_recv(cx) {
-                Poll::Ready(Some(b)) => Poll::Ready(Some(Ok(Frame::data(b)))),
-                Poll::Ready(None) if aborted.load(Ordering::Acquire) => {
-                    Poll::Ready(Some(Err(io::Error::new(io::ErrorKind::Interrupted, "the page stopped"))))
+            RespBody::Chunks { rx, aborted, rest, progress } => {
+                progress.mark();
+                while rest.is_empty() {
+                    match rx.poll_recv(cx) {
+                        Poll::Ready(Some(b)) => *rest = b,
+                        Poll::Ready(None) if aborted.load(Ordering::Acquire) => {
+                            return Poll::Ready(Some(Err(io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "the page stopped",
+                            ))))
+                        }
+                        Poll::Ready(None) => return Poll::Ready(None),
+                        Poll::Pending => return Poll::Pending,
+                    }
                 }
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            },
+                // Slices of at most `FRAME`, so the chunk stays counted (in the output
+                // total) until it is written, not handed whole to the connection and
+                // the system's buffers (found by the 1.2 audit).
+                let part = rest.split_to(rest.len().min(FRAME));
+                Poll::Ready(Some(Ok(Frame::data(part))))
+            }
         }
     }
 
@@ -348,6 +399,34 @@ mod tests {
         assert_eq!(total.load(Ordering::Relaxed), 200_000);
         parts.clear();
         assert_eq!(total.load(Ordering::Relaxed), 0);
+    }
+
+    /// A streamed page's chunks are handed over in slices too, and each chunk
+    /// stays counted until its last slice is dropped (found by the 1.2 audit:
+    /// they were handed over whole, so the system's buffers took them uncounted).
+    #[test]
+    fn streamed_chunks_are_sent_in_counted_slices() {
+        use std::task::Waker;
+        let total = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let progress = Progress::new();
+        let mut body = RespBody::chunks(rx, Default::default(), progress.clone());
+        tx.try_send(counted_bytes(vec![b'x'; 150_000], &total)).unwrap();
+        tx.try_send(counted_bytes(vec![b'y'; 10], &total)).unwrap();
+        drop(tx);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut parts = Vec::new();
+        while let Poll::Ready(Some(Ok(f))) = Pin::new(&mut body).poll_frame(&mut cx) {
+            parts.push(f.into_data().unwrap());
+        }
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [65536, 65536, 18928, 10]);
+        assert_eq!(total.load(Ordering::Relaxed), 150_010);
+        parts.remove(0);
+        parts.remove(0);
+        assert_eq!(total.load(Ordering::Relaxed), 150_010);
+        parts.remove(0);
+        assert_eq!(total.load(Ordering::Relaxed), 10);
+        assert!(progress.last().elapsed() < Duration::from_secs(5));
     }
 
     #[test]

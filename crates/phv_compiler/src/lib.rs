@@ -33,6 +33,7 @@ pub fn compile_with(h: &HProgram, sources: &SourceMap, opts: Options) -> Result<
         call_counts: opts.call_counts,
         consts: Vec::new(),
         str_consts: HashMap::new(),
+        shared_strs: HashMap::new(),
         builtins: Vec::new(),
         builtin_ids: HashMap::new(),
         methods: Vec::new(),
@@ -120,6 +121,11 @@ struct ProgCtx {
     call_counts: bool,
     consts: Vec<Const>,
     str_consts: HashMap<String, u32>,
+    /// The pool index of each shared string of the program (by address and
+    /// length), so a long constant used many times is hashed once, not at each
+    /// use (found by the 1.2.0 audit: 100,000 uses of a 1 MiB constant took 21 s).
+    /// The program, which holds the strings, outlives this.
+    shared_strs: HashMap<(usize, usize), u32>,
     builtins: Vec<String>,
     builtin_ids: HashMap<String, u32>,
     methods: Vec<String>,
@@ -134,6 +140,16 @@ impl ProgCtx {
         let i = self.consts.len() as u32;
         self.consts.push(Const::Str(s.to_string()));
         self.str_consts.insert(s.to_string(), i);
+        i
+    }
+
+    fn shared_str_const(&mut self, s: &std::rc::Rc<str>) -> u32 {
+        let key = (s.as_ptr() as usize, s.len());
+        if let Some(&i) = self.shared_strs.get(&key) {
+            return i;
+        }
+        let i = self.str_const(s);
+        self.shared_strs.insert(key, i);
         i
     }
 
@@ -439,7 +455,7 @@ impl<'a> FnC<'a> {
             HConst::Int(i) => self.emit(Instr::Int(dst, *i)),
             // Looked up in the pool without copying the text first.
             HConst::Str(s) => {
-                let idx = self.pc.str_const(s);
+                let idx = self.pc.shared_str_const(s);
                 self.emit(Instr::Const(dst, idx))
             }
             other => {

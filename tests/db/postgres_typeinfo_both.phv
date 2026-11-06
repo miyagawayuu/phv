@@ -1,0 +1,10 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: the first lookup of a type on
+// the connection, then the statements the client prepared to look types up
+// deallocated, in the same run.
+import std.db.Database;
+
+$db = Database::connect("main");
+echo $db->first(sql"SELECT 'x'::phv_ti_a::text AS v, 'x'::phv_ti_a AS t")?->string("v") ?? "?", "\n";
+$n = $db->first(sql"SELECT phv_ti_poison('%pg_catalog.pg_%') AS n")?->int("n") ?? 0;
+echo $n > 0 ? "deallocated" : "none", "\n";

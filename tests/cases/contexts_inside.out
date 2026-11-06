@@ -10,3 +10,8 @@
 <svg><circle r="1"/><circle r="2"/></svg>
 <noscript><p>x < y</p></noscript>
 <!--</bx --><!--</ noscript -->
+<svg><foreignObject><div><p>a</p><br><b>x < y</b><svg><circle r="1"/></svg></div></foreignObject><title>t</title><path d="M0 0"/></svg>
+<math><mi>x</mi><mtext><b>t</b></mtext><annotation-xml encoding="image/svg+xml"><svg><circle r="1"/></svg></annotation-xml></math>
+<svg><![CDATA[ a x < y ]]]></svg>
+<select><option>x < y</option><script>var s = 1;</script></select>
+<!--  > 1 > 2 -->

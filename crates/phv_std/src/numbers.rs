@@ -37,8 +37,14 @@ fn parse_radix(vm: &mut Vm, text: &str, radix: u32, what: &str) -> Result<i64, V
         Some(d) => (true, d),
         None => (false, t),
     };
-    let n = u64::from_str_radix(digits, radix)
-        .map_err(|_| value_error(vm, format!("{what}: `{t}` is not a base-{radix} number")))?;
+    let n = u64::from_str_radix(digits, radix).map_err(|_| {
+        // At most 64 characters of the text are quoted (it may be long).
+        let shown = match t.char_indices().nth(64) {
+            Some((i, _)) => format!("{}...", &t[..i]),
+            None => t.to_string(),
+        };
+        value_error(vm, format!("{what}: `{shown}` is not a base-{radix} number"))
+    })?;
     let n = i64::try_from(n)
         .map_err(|_| vm.throw("ArithmeticError", format!("{what}: the number is too large for int")))?;
     Ok(if neg { -n } else { n })

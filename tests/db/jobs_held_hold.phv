@@ -1,0 +1,24 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: a transaction that adds a job
+// with the key "f1" and holds it five seconds, then rolls back (so the key is
+// never taken for good).
+import std.db.Database;
+import std.jobs.enqueue;
+
+$db = Database::connect("main");
+enqueue("k", "setup");
+$db->execute(sql"DELETE FROM phv_jobs_f4f4f4f4f4f4f4f4");
+$pg = ($db->first(sql"SELECT version() AS v")?->string("v") ?? "")->startsWith("PostgreSQL");
+try {
+    $db->transaction(function () use ($db, $pg): void {
+        enqueue("k", "held", key: "f1");
+        if ($pg) {
+            $db->query(sql"SELECT pg_sleep(5)");
+        } else {
+            $db->query(sql"SELECT SLEEP(5)");
+        }
+        throw new RuntimeException("rolled back");
+    });
+} catch (RuntimeException $e) {
+    echo $e->getMessage();
+}

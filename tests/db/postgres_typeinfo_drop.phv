@@ -1,0 +1,10 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: removes what
+// postgres_typeinfo.phv made.
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->execute(sql"DROP FUNCTION IF EXISTS phv_ti_poison(text)");
+$db->execute(sql"DROP TYPE IF EXISTS phv_ti_a");
+$db->execute(sql"DROP TYPE IF EXISTS phv_ti_b");
+echo "done\n";

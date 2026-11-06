@@ -438,6 +438,37 @@ pub fn test(paths: Vec<PathBuf>, opts: TestOptions) -> ExitCode {
     }
 }
 
+/// Writes the formatted text of `path` through the handle it checked: a file
+/// with another name (a hard link) is left as it is, as writing it would change
+/// that other file too (found by the 16th assessment).
+fn write_formatted(path: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().write(true).open(path).map_err(|e| e.to_string())?;
+    phv_std::safefs::single_file(&f).map_err(|e| format!("{}; it is left as it is", phv_std::safefs::describe(&e)))?;
+    f.set_len(0).and_then(|_| f.write_all(text.as_bytes())).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn fmt_leaves_files_with_other_names_alone() {
+    let dir = std::env::temp_dir().join(format!("phv-fmt-links-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let messy = "<?phv\nif (true) {\necho 1;\n}\n";
+    std::fs::write(dir.join("a.phv"), messy).unwrap();
+    std::fs::hard_link(dir.join("a.phv"), dir.join("other.txt")).unwrap();
+    let e = write_formatted(&dir.join("a.phv"), "<?phv\necho 1;\n").unwrap_err();
+    assert!(e.contains("hard link"), "{e}");
+    let _ = fmt(vec![dir.join("a.phv")], false, None);
+    assert_eq!(std::fs::read_to_string(dir.join("other.txt")).unwrap(), messy);
+    assert_eq!(std::fs::read_to_string(dir.join("a.phv")).unwrap(), messy);
+    // A file with one name is formatted.
+    std::fs::remove_file(dir.join("other.txt")).unwrap();
+    let _ = fmt(vec![dir.join("a.phv")], false, None);
+    assert_ne!(std::fs::read_to_string(dir.join("a.phv")).unwrap(), messy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 pub fn fmt(paths: Vec<PathBuf>, check: bool, width: Option<usize>) -> ExitCode {
     let paths = if paths.is_empty() { vec![PathBuf::from(".")] } else { paths };
     let files = collect(&paths, &|p| {
@@ -472,13 +503,14 @@ pub fn fmt(paths: Vec<PathBuf>, check: bool, width: Option<usize>) -> ExitCode {
         };
         match phv_syntax::format::format_source_width(&src, width) {
             Ok(out) if out != src => {
-                changed += 1;
                 if check {
+                    changed += 1;
                     println!("would reformat {}", f.display());
-                } else if let Err(e) = std::fs::write(f, out) {
+                } else if let Err(e) = write_formatted(f, &out) {
                     eprintln!("error: cannot write {}: {e}", f.display());
                     errors += 1;
                 } else {
+                    changed += 1;
                     println!("formatted {}", f.display());
                 }
             }

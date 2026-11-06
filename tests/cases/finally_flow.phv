@@ -1,0 +1,53 @@
+<?phv
+// What a `try` and its `finally` both leave known after it.
+class A {
+    public ?A $p = null;
+    public int $v = 7;
+    public function __construct() {}
+}
+
+function f(?A $x, bool $b): int {
+    try {
+        $n = 1;
+        if ($x == null) {
+            return 0;
+        }
+    } finally {
+        if ($b) {
+            $n = 2;
+        }
+        $m = 10;
+    }
+    // `$n` is still assigned, `$x` still not null, and `$m` assigned by the `finally`.
+    return $n + $m + $x->v;
+}
+
+function g(A $a): int {
+    if ($a->p == null) {
+        return 0;
+    }
+    try {
+        $k = 1;
+    } finally {
+        $k = 2;
+    }
+    // The `finally` called nothing, so `$a->p` is still known.
+    return $a->p->v + $k;
+}
+
+function h(?A $x): int {
+    $n = 0;
+    do {
+        $line = $n;
+        $n++;
+        if ($x == null) {
+            continue;
+        }
+        $n = $n + $x->v;
+    } while ($line < 3);
+    return $n;
+}
+
+$a = new A();
+$a->p = new A();
+echo f(new A(), true), " ", f(null, false), " ", g($a), " ", h(null), " ", h(new A()), "\n";

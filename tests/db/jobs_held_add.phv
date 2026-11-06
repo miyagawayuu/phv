@@ -1,0 +1,10 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: adds a job with the key "f1"
+// outside any transaction, while jobs_held_hold.phv holds that key.
+import std.jobs.enqueue;
+
+try {
+    echo enqueue("k", "waited", key: "f1") == null ? "taken" : "added";
+} catch (DatabaseError $e) {
+    echo "error: ", $e->getMessage();
+}

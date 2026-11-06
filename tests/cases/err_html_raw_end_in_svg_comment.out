@@ -1,0 +1,5 @@
+<svg><!-- plain text
+ --></svg>
+<svg><!-- 
+--- runtime error ---
+Fatal error: `Html` inserted into a comment holds the end tag `</title`, which would end a `<title>` that browsers may read around it as raw text, and turn the rest into markup; insert a string (it is escaped) instead

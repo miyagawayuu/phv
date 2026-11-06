@@ -1,0 +1,12 @@
+<?phv
+// In SVG and MathML, `<![CDATA[` starts a CDATA section that ends at `]]>`;
+// where a browser's current element is HTML, it is a bogus comment that ends
+// at the first `>`. A `>` before `]]>` is an error (found by the 1.2 audit:
+// browsers read the link below as markup with an unquoted value, this tracker
+// read a comment). Every line is an error.
+$v = "x";
+?>
+<svg><![CDATA[ ><a x="]]><a href="<?= safe_url($v) ?>">"></a></svg>
+<math><![CDATA[ a > b ]]></math>
+<svg><![CDATA[ ]]<?= $v ?>> ]]></svg>
+<svg><![CDA<?phv if ($v != "") { ?>TA[ ><?phv } ?> ]]></svg>

@@ -1,0 +1,10 @@
+<?phv
+// Older browsers' `<select>` parsing ignores raw-text elements such as
+// `<title>` and `<style>` and reads their text as markup, where this template
+// is checked as their text (found by the 1.2 audit: the value below would be
+// an unquoted attribute there). Every line is an error.
+$v = "x autofocus";
+?>
+<select><title><option x='</title>' title="<?= $v ?>">o</option></select>
+<select><option>a</option><style>.a {}</style></select>
+<select><xmp>a</xmp></select>

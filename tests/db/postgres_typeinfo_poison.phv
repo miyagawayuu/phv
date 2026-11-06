@@ -1,0 +1,9 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: deallocates only the
+// statements the client prepared to look types up (their text reads the
+// catalog), leaving the others.
+import std.db.Database;
+
+$db = Database::connect("main");
+$n = $db->first(sql"SELECT phv_ti_poison('%pg_catalog.pg_%') AS n")?->int("n") ?? 0;
+echo $n > 0 ? "deallocated" : "none", "\n";

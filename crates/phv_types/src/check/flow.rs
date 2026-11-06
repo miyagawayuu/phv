@@ -50,6 +50,42 @@ impl Flow {
             dead: false,
         }
     }
+
+    /// What is known after a `try` that completed normally (`result`) and then
+    /// ran its `finally`. `fin` is the flow at the end of the `finally`, which was
+    /// checked from a weaker start (the paths where an exception escaped too),
+    /// so what it knows also holds here. What the `try` knew still holds too,
+    /// except for the variables the `finally` assigns (`written`), and for the
+    /// property narrowings when it calls anything or assigns a property
+    /// (`calls`): those are taken from `fin` (found by the 1.2.0 audit: they
+    /// used to be kept from before the `finally`).
+    pub fn after_finally(mut result: Flow, fin: &Flow, written: &HashSet<LocalId>, calls: bool) -> Flow {
+        if fin.dead {
+            result.dead = true;
+        }
+        if result.dead {
+            return result;
+        }
+        for &id in written {
+            // Nothing unassigns a variable, so what the `try` assigned stays assigned.
+            if fin.is_assigned(id) {
+                result.mark(id);
+            }
+            match fin.narrowed.get(&id) {
+                Some(t) => {
+                    result.narrowed.insert(id, t.clone());
+                }
+                None => {
+                    result.narrowed.remove(&id);
+                }
+            }
+            result.prop_narrowed.remove_range((id, 0), (id, u32::MAX));
+        }
+        if calls {
+            result.prop_narrowed = fin.prop_narrowed.clone();
+        }
+        result
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -64,6 +100,16 @@ pub(crate) type Facts = Vec<(FactKey, Type)>;
 pub(crate) struct Saved {
     entries: Vec<(FactKey, Option<Type>)>,
     gen: u64,
+}
+
+/// Where the `continue`s of one loop go (see `FnCtx::continues`).
+pub(crate) struct ContinueTo {
+    /// The paths that reached a `continue` so far, joined.
+    pub flow: Flow,
+    /// The flow at the loop's start, after what the loop changes was forgotten.
+    pub entry: Flow,
+    /// `FnCtx::finally_depth` at the loop's start.
+    pub finally_depth: u32,
 }
 
 pub(crate) struct FnCtx {
@@ -84,6 +130,12 @@ pub(crate) struct FnCtx {
     /// (inner local, outer local)
     pub captures: Vec<(LocalId, LocalId)>,
     pub loop_depth: u32,
+    /// One for each loop being checked, innermost last: what is known where a
+    /// `continue` goes to it (the `for` step or the `do`-`while` condition).
+    pub continues: Vec<ContinueTo>,
+    /// How many `try` blocks with a `finally` enclose this point (in their
+    /// body or a `catch`).
+    pub finally_depth: u32,
     /// Incremented whenever property narrowings are cleared (by a call).
     pub prop_gen: u64,
     temps: u32,
@@ -104,6 +156,8 @@ impl FnCtx {
             auto_capture: false,
             captures: Vec::new(),
             loop_depth: 0,
+            continues: Vec::new(),
+            finally_depth: 0,
             prop_gen: 0,
             temps: 0,
         }

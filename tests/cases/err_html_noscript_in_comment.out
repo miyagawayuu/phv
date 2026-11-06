@@ -1,0 +1,5 @@
+<div title="&lt;noscript&gt;&lt;img src=&quot;/px.gif&quot; alt=&quot;pixel&quot;&gt;&lt;/noscript&gt;
+">x</div>
+<noscript><p>Turn on JavaScript.</p><!-- 
+--- runtime error ---
+Fatal error: `Html` inserted into a comment holds the end tag `</noscript`, which would end a `<noscript>` that browsers may read around it as raw text, and turn the rest into markup; insert a string (it is escaped) instead

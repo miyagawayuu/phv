@@ -1,0 +1,42 @@
+error: class `Vault` has no property `$label`
+  --> err_finally_flow.phv:32:16
+   |
+32 |     return $x->label;
+   |                ^^^^^
+
+error: expected `A`, found `null`
+  --> err_finally_flow.phv:43:12
+   |
+43 |     return $x;
+   |            ^^
+   = note: the value might be null: check `!= null` first, or give a fallback with `??`
+
+error: cannot read `->v` on `?A` because it might be null
+  --> err_finally_flow.phv:55:12
+   |
+55 |     return $a->p->v;
+   |            ^^^^^
+   = note: check `!= null` first, or use `?->`
+
+error: cannot read `->v` on `?A` because it might be null
+  --> err_finally_flow.phv:65:14
+   |
+65 |     } while ($x->v > 100);
+   |              ^^
+   = note: check `!= null` first, or use `?->`
+
+error: cannot read `->v` on `?A` because it might be null
+  --> err_finally_flow.phv:71:36
+   |
+71 |     for ($i = 0; $i < 2; $n = $n + $x->v) {
+   |                                    ^^
+   = note: check `!= null` first, or use `?->`
+
+error: cannot read `->v` on `?A` because it might be null
+  --> err_finally_flow.phv:92:14
+   |
+92 |     } while ($x->v > 100);
+   |              ^^
+   = note: check `!= null` first, or use `?->`
+
+6 errors found

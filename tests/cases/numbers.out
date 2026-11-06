@@ -9,3 +9,4 @@ Ann has 1,234,567 points (98.3%)
 [     r] [l     ] [***c***] [-0042] [ff] [00000101] [{literal}]
 no placeholders|1.5
 hexdec(): `xyz` is not a base-16 number
+base_convert(): `zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz...` is not a base-10 number

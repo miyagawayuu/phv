@@ -12,10 +12,11 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+mod cost;
 mod mem;
 mod vfs;
 
@@ -92,11 +93,81 @@ struct Db {
     pages: usize,
     /// For a database file: the pool the connection goes back to.
     pooled: Option<Lease>,
+    /// Counts the calls of the authorizer, which SQLite makes while it
+    /// compiles a statement (see `statement`).
+    compiles: Arc<AtomicU64>,
 }
 
 impl Db {
     fn conn(&self) -> &Connection {
         self.conn.as_ref().expect("an open database has its connection")
+    }
+
+    /// The script's statement `text`, prepared (or kept from before), and
+    /// weighed when it was compiled (`cost`): one that could read long values
+    /// too many times between two looks at the deadline is refused.
+    ///
+    /// Statements are compiled with up to `PREPARE_OPS` steps and weighed;
+    /// while one runs, SQLite may compile only programs of `RUN_OPS` steps: a
+    /// statement whose schema changed meanwhile (another connection changed a
+    /// view it reads, say) is compiled again by `sqlite3_step` without being
+    /// weighed, so it may not be large (`query` and `execute` then prepare and
+    /// weigh it again).
+    fn statement(&self, vm: &Vm, text: &str) -> Result<rusqlite::CachedStatement<'_>, VmError> {
+        use rusqlite::limits::Limit;
+        let c = self.conn();
+        let _ = c.set_limit(Limit::SQLITE_LIMIT_VDBE_OP, PREPARE_OPS);
+        let before = self.compiles.load(Ordering::SeqCst);
+        let prepared = c.prepare_cached(text).and_then(|st| {
+            if self.compiles.load(Ordering::SeqCst) == before || st.is_explain() != 0 {
+                return Ok(Ok(st));
+            }
+            // Not kept unless it passes: the next prepare of the text compiles
+            // (and weighs) it again.
+            match cost::weigh(c, text) {
+                Ok(weight) if weight <= cost::MAX_WEIGHT => Ok(Ok(st)),
+                Ok(weight) => {
+                    st.discard();
+                    Ok(Err(weight))
+                }
+                Err(e) => {
+                    st.discard();
+                    Err(e)
+                }
+            }
+        });
+        let _ = c.set_limit(Limit::SQLITE_LIMIT_VDBE_OP, RUN_OPS);
+        let prepared = prepared.map_err(|e| {
+            // SQLite reports a program over `PREPARE_OPS` as out of memory.
+            let too_long = matches!(&e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::OutOfMemory)
+                && !mem::Budget::refused()
+                && !mem::Budget::late();
+            if too_long {
+                let msg = "this statement has more than 43,008 steps (out of memory): split it into smaller statements";
+                return vm.throw("DatabaseError", msg);
+            }
+            self.fail(vm, e)
+        })?;
+        match prepared {
+            Ok(st) => Ok(st),
+            Err(weight) => Err(vm.throw(
+                "DatabaseError",
+                format!(
+                    "this statement could read long values {weight} times over without looking at the time limit (at most {}): split it into smaller statements",
+                    cost::MAX_WEIGHT
+                ),
+            )),
+        }
+    }
+
+    /// Whether `e`, from running a statement during which SQLite compiled
+    /// something (the authorizer count moved from `before`), is SQLite
+    /// refusing to compile it again with more than `RUN_OPS` steps.
+    fn refused_recompile(&self, e: &rusqlite::Error, before: u64) -> bool {
+        matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::OutOfMemory)
+            && !mem::Budget::refused()
+            && !mem::Budget::late()
+            && self.compiles.load(Ordering::SeqCst) != before
     }
 
     /// The error of a failed statement; the connection is then not reused.
@@ -350,26 +421,54 @@ fn sweep_later() {
     }
 }
 
+/// The VDBE steps between two looks at the deadline (SQLite's progress
+/// handler). One step may be a function call on a value of many MB, so the
+/// steps between looks must be few (found by the 1.2.0 audit: with 10,000, a
+/// query calling `trim()` on 30 MB values ran 468 s under a 1 s limit). The
+/// work in a step is bounded in bytes too: SQLite's allocations look at the
+/// deadline every MB (`mem`), and PHV's own functions look at it on each
+/// call (`like_functions`).
+const PROGRESS_STEPS: std::ffi::c_int = 100;
+
+/// The most steps of a script's statement (`SQLITE_LIMIT_VDBE_OP`; SQLite
+/// grows a program by doubling, so the largest is 43,008). Expanding a view
+/// or `WITH` table many times over makes a long program from a short text
+/// (found by the 1.2.0 audit); the statements of real programs have tens or
+/// hundreds of steps, and `IN` with 10,000 values 30,000.
+const PREPARE_OPS: std::ffi::c_int = 65_536;
+
+/// The most steps of a program SQLite compiles while a statement runs (the
+/// statement itself when its schema changed, and statements of SQLite's own,
+/// as for `VACUUM` or a full-text index); the largest is 168 steps.
+const RUN_OPS: std::ffi::c_int = 200;
+
 /// Installs what belongs to the script on a connection, new or kept: the
 /// progress handler and `LIKE`/`GLOB` with its deadline, counters that start
-/// from zero, and the authorizer (which notes, in `tainted`, statements after
-/// which the connection is not kept).
-fn for_script(c: &Connection, vm: &Vm, tainted: Option<Arc<AtomicBool>>) -> rusqlite::Result<()> {
+/// from zero, the size of programs, and the authorizer (which counts the
+/// compiles in `compiles` and notes, in `tainted`, statements after which the
+/// connection is not kept).
+fn for_script(
+    c: &Connection,
+    vm: &Vm,
+    tainted: Option<Arc<AtomicBool>>,
+    compiles: Arc<AtomicU64>,
+) -> rusqlite::Result<()> {
     // Queries stop when the script's time limit is reached.
     match vm.deadline() {
-        Some(deadline) => c.progress_handler(10_000, Some(move || Instant::now() > deadline)),
+        Some(deadline) => c.progress_handler(PROGRESS_STEPS, Some(move || Instant::now() > deadline)),
         None => c.progress_handler(0, None::<fn() -> bool>),
     }
     // SQLite runs one `LIKE` or `GLOB` as a single step, which the progress
     // handler cannot stop (a long text and pattern take minutes): these do.
     like_functions(c, vm.deadline())?;
     counters(c)?;
+    c.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VDBE_OP, RUN_OPS)?;
     // Last: the authorizer refuses the pragmas set before.
-    match tainted {
-        None => c.authorizer(Some(sqlite_authorizer)),
-        Some(tainted) => c.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
-            use rusqlite::hooks::AuthAction;
-            // A pragma may change the session; temporary objects stay in it.
+    c.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+        use rusqlite::hooks::AuthAction;
+        compiles.fetch_add(1, Ordering::SeqCst);
+        // A pragma may change the session; temporary objects stay in it.
+        if let Some(tainted) = &tainted {
             if matches!(
                 ctx.action,
                 AuthAction::Pragma { .. }
@@ -380,9 +479,9 @@ fn for_script(c: &Connection, vm: &Vm, tainted: Option<Arc<AtomicBool>>) -> rusq
             ) {
                 tainted.store(true, Ordering::SeqCst);
             }
-            sqlite_authorizer(ctx)
-        })),
-    }
+        }
+        sqlite_authorizer(ctx)
+    }));
     Ok(())
 }
 
@@ -444,6 +543,10 @@ fn db_of<'v>(vm: &'v Vm, h: &Value) -> Result<&'v Db, VmError> {
 fn db_error(vm: &Vm, e: rusqlite::Error) -> VmError {
     // SQLite was refused memory past the script's limit (see `mem`).
     let no_memory = matches!(&e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::OutOfMemory);
+    // SQLite was refused memory because the time limit had passed.
+    if no_memory && mem::Budget::late() {
+        return VmError::Fatal("database query stopped: the time limit was reached".into());
+    }
     if no_memory && mem::Budget::refused() {
         return vm.reserve(usize::MAX).err().unwrap_or_else(|| vm.throw("DatabaseError", e.to_string()));
     }
@@ -509,37 +612,59 @@ fn query(vm: &mut Vm, a: &[Value]) -> R {
     let text = render_sql(text, Dialect::Sqlite);
     let _budget = mem::Budget::enter(vm);
     let db = db_of(vm, &a[0])?;
-    // Kept prepared for the next run of the same text (`prepare_cached`).
-    let mut stmt = db.conn().prepare_cached(&text).map_err(|e| db.fail(vm, e))?;
     let bound: Vec<Param> = params.iter().map(Param).collect();
-    let mut rows = stmt.query(rusqlite::params_from_iter(bound.iter())).map_err(|e| db.fail(vm, e))?;
-    // Made once the first row is there: a kept statement is prepared again
-    // by its first step when the schema changed, and its columns with it.
-    let mut out: Option<ResultRows> = None;
-    while let Some(row) = rows.next().map_err(|e| db.fail(vm, e))? {
-        let out = out.get_or_insert_with(|| ResultRows::new(row.as_ref().column_names().iter().map(|n| n.to_string())));
-        let mut values = Vec::with_capacity(out.names.len());
-        for i in 0..out.names.len() {
-            let v = match row.get_ref(i).map_err(|e| db.fail(vm, e))? {
-                ValueRef::Null => Value::Null,
-                ValueRef::Integer(i) => Value::Int(i),
-                ValueRef::Real(f) => Value::Float(f),
-                // A value is accounted before it is copied: a row may hold 32 MB, and
-                // invalid UTF-8 in a blob grows up to three times.
-                ValueRef::Text(t) => {
-                    vm.reserve(t.len())?;
-                    Value::str(String::from_utf8_lossy(t).into_owned())
+    let mut again = true;
+    'run: loop {
+        // Kept prepared for the next run of the same text (`prepare_cached`).
+        let mut stmt = db.statement(vm, &text)?;
+        let before = db.compiles.load(Ordering::SeqCst);
+        let mut rows = stmt.query(rusqlite::params_from_iter(bound.iter())).map_err(|e| db.fail(vm, e))?;
+        // Made once the first row is there: a kept statement is prepared again
+        // by its first step when the schema changed, and its columns with it.
+        let mut out: Option<ResultRows> = None;
+        loop {
+            let row = match rows.next() {
+                Ok(Some(row)) => row,
+                Ok(None) => break,
+                // Compiled again too large by its first step (see `Db::statement`):
+                // prepared and weighed once more.
+                Err(e) if again && out.is_none() && db.refused_recompile(&e, before) => {
+                    again = false;
+                    drop(rows);
+                    stmt.discard();
+                    continue 'run;
                 }
-                ValueRef::Blob(b) => {
-                    vm.reserve(b.len().saturating_mul(3))?;
-                    Value::str(String::from_utf8_lossy(b).into_owned())
-                }
+                Err(e) => return Err(db.fail(vm, e)),
             };
-            values.push(v);
+            let out =
+                out.get_or_insert_with(|| ResultRows::new(row.as_ref().column_names().iter().map(|n| n.to_string())));
+            let mut values = Vec::with_capacity(out.names.len());
+            for i in 0..out.names.len() {
+                let v = match row.get_ref(i).map_err(|e| db.fail(vm, e))? {
+                    ValueRef::Null => Value::Null,
+                    ValueRef::Integer(i) => Value::Int(i),
+                    ValueRef::Real(f) => Value::Float(f),
+                    // A value is accounted before it is copied: a row may hold 16 MB, and
+                    // invalid UTF-8 in a blob grows up to three times.
+                    ValueRef::Text(t) => {
+                        vm.reserve(t.len())?;
+                        Value::str(String::from_utf8_lossy(t).into_owned())
+                    }
+                    ValueRef::Blob(b) => {
+                        vm.reserve(b.len().saturating_mul(3))?;
+                        Value::str(String::from_utf8_lossy(b).into_owned())
+                    }
+                };
+                values.push(v);
+            }
+            out.push(vm, values)?;
+            // A row ends a run of SQLite's program: the deadline is looked at.
+            if vm.deadline().is_some_and(|d| Instant::now() > d) {
+                return Err(VmError::Fatal("database query stopped: the time limit was reached".into()));
+            }
         }
-        out.push(vm, values)?;
+        return Ok(out.map_or_else(|| Value::list(Vec::new()), ResultRows::into_value));
     }
-    Ok(out.map_or_else(|| Value::list(Vec::new()), ResultRows::into_value))
 }
 
 fn execute(vm: &mut Vm, a: &[Value]) -> R {
@@ -551,9 +676,22 @@ fn execute(vm: &mut Vm, a: &[Value]) -> R {
     let _budget = mem::Budget::enter(vm);
     let db = db_of(vm, &a[0])?;
     let bound: Vec<Param> = params.iter().map(Param).collect();
-    let mut stmt = db.conn().prepare_cached(&text).map_err(|e| db.fail(vm, e))?;
     let before = db.conn().total_changes();
-    let n = stmt.execute(rusqlite::params_from_iter(bound.iter())).map_err(|e| db.fail(vm, e))?;
+    let mut again = true;
+    let n = loop {
+        let mut stmt = db.statement(vm, &text)?;
+        let compiles = db.compiles.load(Ordering::SeqCst);
+        match stmt.execute(rusqlite::params_from_iter(bound.iter())) {
+            Ok(n) => break n,
+            // Compiled again too large by its first step (see `Db::statement`):
+            // prepared and weighed once more.
+            Err(e) if again && db.refused_recompile(&e, compiles) => {
+                again = false;
+                stmt.discard();
+            }
+            Err(e) => return Err(db.fail(vm, e)),
+        }
+    };
     // A statement that changes no row (`CREATE TABLE`, `BEGIN`...) leaves
     // SQLite's count of the last change as it was, which on a kept connection
     // was another script's (found by the 1.0.0 audit): it changed 0 rows.
@@ -603,10 +741,11 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
     let tainted = Arc::new(AtomicBool::new(false));
     // A kept connection's memory counts from here (its `Idle` was dropped):
     // a failure below closes it on this thread.
-    for_script(&c, vm, Some(tainted.clone())).map_err(|e| db_error(vm, e))?;
+    let compiles = Arc::new(AtomicU64::new(0));
+    for_script(&c, vm, Some(tainted.clone()), compiles.clone()).map_err(|e| db_error(vm, e))?;
     drop(budget);
     let lease = Lease { key, id, tainted, base };
-    let db = Db { conn: Some(c), _dir: Some(dir), depth: Cell::new(0), pages: 0, pooled: Some(lease) };
+    let db = Db { conn: Some(c), _dir: Some(dir), depth: Cell::new(0), pages: 0, pooled: Some(lease), compiles };
     vm.resources.push(Some(Box::new(db)));
     Ok(Value::Int(vm.resources.len() as i64 - 1))
 }
@@ -642,8 +781,10 @@ fn open_memory(vm: &mut Vm, _budget: mem::Budget) -> R {
     }
     c.execute_batch(&format!("PRAGMA page_size = 4096; PRAGMA max_page_count = {pages}"))
         .map_err(|e| db_error(vm, e))?;
-    for_script(&c, vm, None).map_err(|e| db_error(vm, e))?;
-    vm.resources.push(Some(Box::new(Db { conn: Some(c), _dir: None, depth: Cell::new(0), pages, pooled: None })));
+    let compiles = Arc::new(AtomicU64::new(0));
+    for_script(&c, vm, None, compiles.clone()).map_err(|e| db_error(vm, e))?;
+    let db = Db { conn: Some(c), _dir: None, depth: Cell::new(0), pages, pooled: None, compiles };
+    vm.resources.push(Some(Box::new(db)));
     Ok(Value::Int(vm.resources.len() as i64 - 1))
 }
 
@@ -716,7 +857,7 @@ pub(crate) fn harden(c: &Connection) -> rusqlite::Result<()> {
     // Prevent `ATTACH 'other.db'` from reaching files outside the permissions.
     c.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
     // Single strings/blobs and statements are bounded (e.g. `zeroblob(1e9)`).
-    c.set_limit(Limit::SQLITE_LIMIT_LENGTH, 32 * 1024 * 1024)?;
+    c.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_TEXT as i32)?;
     c.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 1024 * 1024)?;
     // A process-wide cap on SQLite's own memory (set by the first connection;
     // no connection can change it, see `sqlite_authorizer`), and per
@@ -912,20 +1053,55 @@ fn wild_match(text: &str, pat: &[Pat], fold: bool, deadline: Option<std::time::I
     Some(p == pat.len())
 }
 
+/// The error of a function of ours when the script's time limit has passed
+/// (`db_error` reports it as the time limit).
+fn too_late(deadline: Option<Instant>) -> rusqlite::Result<()> {
+    match deadline {
+        Some(d) if Instant::now() > d => Err(rusqlite::Error::UserFunctionError("the time limit was reached".into())),
+        _ => Ok(()),
+    }
+}
+
+/// Refuses `bytes` that a function of ours is about to allocate when they
+/// would take the script past its memory limit, as SQLite's own allocations
+/// are (`mem`; `db_error` reports it as the memory limit).
+fn room(bytes: usize) -> rusqlite::Result<()> {
+    if mem::room(bytes) {
+        return Ok(());
+    }
+    Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOMEM), None))
+}
+
 /// Replaces SQLite's `like()` (two and three arguments) and `glob()` with
 /// versions that stop when the script's time limit passes.
+///
+/// SQLite does not call its progress handler while a function runs, nor
+/// between the functions of one row, so each of these looks at the deadline
+/// when it is called and, where its work can be long, as it goes. Their
+/// arguments are read in place, and what they allocate is counted against
+/// the script's memory limit before it is (found by the 1.2.0 audit: copies
+/// of 32 MB values passed the limit).
 fn like_functions(c: &Connection, deadline: Option<std::time::Instant>) -> rusqlite::Result<()> {
     use rusqlite::functions::{Context, FunctionFlags};
+    use std::borrow::Cow;
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
-    fn text(ctx: &Context, i: usize) -> rusqlite::Result<Option<String>> {
+    fn text<'c>(ctx: &'c Context, i: usize) -> rusqlite::Result<Option<Cow<'c, str>>> {
         Ok(match ctx.get_raw(i) {
             ValueRef::Null => None,
-            ValueRef::Text(t) | ValueRef::Blob(t) => Some(String::from_utf8_lossy(t).into_owned()),
-            ValueRef::Integer(i) => Some(i.to_string()),
-            ValueRef::Real(f) => Some(real_text(f)),
+            ValueRef::Text(t) | ValueRef::Blob(t) => match std::str::from_utf8(t) {
+                Ok(t) => Some(Cow::Borrowed(t)),
+                Err(_) => {
+                    // An invalid byte becomes U+FFFD (three bytes).
+                    room(t.len().saturating_mul(3))?;
+                    Some(Cow::Owned(String::from_utf8_lossy(t).into_owned()))
+                }
+            },
+            ValueRef::Integer(i) => Some(Cow::Owned(i.to_string())),
+            ValueRef::Real(f) => Some(Cow::Owned(real_text(f))),
         })
     }
     let run = move |ctx: &Context, glob: bool| -> rusqlite::Result<Option<bool>> {
+        too_late(deadline)?;
         let (Some(p), Some(t)) = (text(ctx, 0)?, text(ctx, 1)?) else { return Ok(None) };
         if p.len() > MAX_PATTERN {
             return Err(rusqlite::Error::UserFunctionError("LIKE or GLOB pattern too complex".into()));
@@ -959,43 +1135,92 @@ fn like_functions(c: &Connection, deadline: Option<std::time::Instant>) -> rusql
 
     // SQLite's `instr()`, `replace()` and `trim(X, Y)` search naively (text × pattern
     // in one step, minutes on long values): these search in linear time.
-    let text_arg = |ctx: &Context, i: usize| -> rusqlite::Result<Option<String>> { text(ctx, i) };
     c.create_scalar_function("instr", 2, flags, move |ctx| {
-        let (Some(h), Some(n)) = (text_arg(ctx, 0)?, text_arg(ctx, 1)?) else { return Ok(None) };
-        Ok(Some(h.find(n.as_str()).map_or(0, |b| h[..b].chars().count() as i64 + 1)))
+        too_late(deadline)?;
+        let (Some(h), Some(n)) = (text(ctx, 0)?, text(ctx, 1)?) else { return Ok(None) };
+        Ok(Some(h.find(&*n).map_or(0, |b| h[..b].chars().count() as i64 + 1)))
     })?;
     c.create_scalar_function("replace", 3, flags, move |ctx| {
-        let (Some(x), Some(y), Some(z)) = (text_arg(ctx, 0)?, text_arg(ctx, 1)?, text_arg(ctx, 2)?) else {
+        too_late(deadline)?;
+        let (Some(x), Some(y), Some(z)) = (text(ctx, 0)?, text(ctx, 1)?, text(ctx, 2)?) else {
             return Ok(None);
         };
         if y.is_empty() {
-            return Ok(Some(x));
+            room(x.len())?;
+            return Ok(Some(x.into_owned()));
         }
-        let grows = z.len().saturating_sub(y.len());
-        if grows > 0 && x.len().saturating_add(x.matches(y.as_str()).count().saturating_mul(grows)) > MAX_TEXT {
+        let found = x.matches(&*y).count();
+        let len = (x.len() - found * y.len()).saturating_add(found.saturating_mul(z.len()));
+        if len > MAX_TEXT {
             return Err(rusqlite::Error::UserFunctionError("string or blob too big".into()));
         }
-        Ok(Some(x.replace(y.as_str(), &z)))
+        room(len)?;
+        Ok(Some(x.replace(&*y, &z)))
     })?;
     for (name, left, right) in [("trim", true, true), ("ltrim", true, false), ("rtrim", false, true)] {
         c.create_scalar_function(name, 2, flags, move |ctx| {
-            let (Some(x), Some(y)) = (text_arg(ctx, 0)?, text_arg(ctx, 1)?) else { return Ok(None) };
-            let set: std::collections::HashSet<char> = y.chars().collect();
-            let mut t = x.as_str();
+            too_late(deadline)?;
+            let (Some(x), Some(y)) = (text(ctx, 0)?, text(ctx, 1)?) else { return Ok(None) };
+            let set = CharSet::of(&y, deadline)?;
+            let mut t = &*x;
             if left {
-                t = t.trim_start_matches(|c| set.contains(&c));
+                t = t.trim_start_matches(|c| set.has(c));
             }
             if right {
-                t = t.trim_end_matches(|c| set.contains(&c));
+                t = t.trim_end_matches(|c| set.has(c));
             }
+            room(t.len())?;
             Ok(Some(t.to_string()))
         })?;
     }
     Ok(())
 }
 
-/// The longest text or blob SQLite allows here (`SQLITE_LIMIT_LENGTH`).
-const MAX_TEXT: usize = 32 * 1024 * 1024;
+/// The characters of `trim(X, Y)`'s `Y`: a bit for each character, so
+/// making it and looking a character up take the same short time whatever
+/// the characters are.
+struct CharSet {
+    ascii: [bool; 128],
+    /// The others, made only when `Y` has one: a bit for every code point
+    /// (136 KB).
+    other: Vec<u64>,
+}
+
+impl CharSet {
+    fn of(y: &str, deadline: Option<Instant>) -> rusqlite::Result<CharSet> {
+        let mut set = CharSet { ascii: [false; 128], other: Vec::new() };
+        for (i, c) in y.chars().enumerate() {
+            if i % (1 << 20) == (1 << 20) - 1 {
+                too_late(deadline)?;
+            }
+            let c = c as usize;
+            if c < 128 {
+                set.ascii[c] = true;
+                continue;
+            }
+            if set.other.is_empty() {
+                let words = (char::MAX as usize >> 6) + 1;
+                room(words * 8)?;
+                set.other = vec![0; words];
+            }
+            set.other[c >> 6] |= 1 << (c & 63);
+        }
+        Ok(set)
+    }
+
+    fn has(&self, c: char) -> bool {
+        let c = c as usize;
+        if c < 128 {
+            return self.ascii[c];
+        }
+        self.other.get(c >> 6).is_some_and(|w| w & (1 << (c & 63)) != 0)
+    }
+}
+
+/// The longest text or blob SQLite allows here (`SQLITE_LIMIT_LENGTH`): the
+/// time some steps take grows with it (see `cost`). Twice the largest request
+/// body (8 MB).
+const MAX_TEXT: usize = 16 * 1024 * 1024;
 
 /// A real number as SQLite writes it as text (`%!.15g`: `1.0`, `0.3`, `1.0e+20`).
 fn real_text(f: f64) -> String {

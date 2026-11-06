@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub use netdb::{JobCap, JobEnd as End, JobInfo as Info, JobRow as Row, JOB_MAX_DEAD, JOB_MAX_KEPT};
+pub use netdb::{JobCap, JobEnd as End, JobInfo as Info, JobRow as Row, JOB_KEY_WAITERS, JOB_MAX_DEAD, JOB_MAX_KEPT};
 
 /// The largest payload of a job.
 pub const MAX_PAYLOAD: usize = 64 * 1024;
@@ -216,12 +216,31 @@ impl Store {
         uniq: Option<&str>,
         deadline: Option<std::time::Instant>,
     ) -> Result<Option<String>, String> {
+        self.add_by(name, payload, delay_secs, uniq, deadline, netdb::JobAdder::Script)
+    }
+
+    /// Adds the run of a schedule (`[[schedule]]`) under its key: on
+    /// connections of the store that scripts never use (see `JobAdder`).
+    pub fn add_scheduled(&self, name: &str, key: &str) -> Result<Option<String>, String> {
+        self.add_by(name, "", 0, Some(key), None, netdb::JobAdder::Schedule)
+    }
+
+    fn add_by(
+        &self,
+        name: &str,
+        payload: &str,
+        delay_secs: i64,
+        uniq: Option<&str>,
+        deadline: Option<std::time::Instant>,
+        adder: netdb::JobAdder,
+    ) -> Result<Option<String>, String> {
         let id = crate::random_hex(16);
         let now = now_ms();
         let run_at = now + delay_secs * 1000;
         let r = match self {
             Store::Db(spec, ns) => {
-                netdb::job_add(spec, ns.as_deref(), (&id, name, payload), run_at, uniq, DB_CAP, deadline)?.map(|()| id)
+                let job = (id.as_str(), name, payload);
+                netdb::job_add_by(spec, ns.as_deref(), job, run_at, uniq, DB_CAP, deadline, adder)?.map(|()| id)
             }
             Store::Memory(key) => {
                 let mut all = lock(&MEMORY);

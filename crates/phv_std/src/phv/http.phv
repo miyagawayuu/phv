@@ -177,7 +177,8 @@ export class Response {
      * Sends the status, the headers and what the page has written so far, and keeps
      * the response open: what it writes later is sent at the next flush() or when the
      * page ends. Afterwards the status, headers, cookies and session can no longer
-     * change. Returns false once the visitor has gone away: stop the work then.
+     * change. Returns false once the visitor has gone away (or has taken nothing for
+     * 10 seconds): stop the work then.
      * Outside `phv serve` (scripts, `phv test`) it keeps the output and returns true.
      */
     public function flush(): bool {

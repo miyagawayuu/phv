@@ -1,0 +1,9 @@
+<?phv
+// Inside `<svg>` or `<math>` (or `<noscript>`), `Html` inserted into a comment
+// may not hold the end tag of any raw-text element: HTML that the template
+// does not follow there may have opened one around it, such as a `<title>`
+// after an element that ends the SVG (found by the 1.2 audit). The page stops.
+?>
+<svg><!-- <?= render("views/plain.phv.html") ?> --></svg>
+<svg><!-- <?= render("views/svg_bar.phv.html", n: 1) ?> --></svg>
+not reached

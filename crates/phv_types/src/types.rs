@@ -187,17 +187,31 @@ impl Type {
     }
 
     pub fn display<'a>(&'a self, class_names: &'a [String]) -> TypeDisplay<'a> {
-        TypeDisplay { ty: self, names: class_names }
+        TypeDisplay { ty: self, names: class_names, depth: 0 }
     }
 }
+
+/// Types nested deeper than this are shown as `...` (an inferred type may be
+/// thousands of levels deep, and each level is a call here).
+const MAX_DISPLAY_DEPTH: u32 = 64;
 
 pub struct TypeDisplay<'a> {
     ty: &'a Type,
     names: &'a [String],
+    depth: u32,
+}
+
+impl<'a> TypeDisplay<'a> {
+    fn sub(&self, ty: &'a Type) -> TypeDisplay<'a> {
+        TypeDisplay { ty, names: self.names, depth: self.depth + 1 }
+    }
 }
 
 impl fmt::Display for TypeDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.depth >= MAX_DISPLAY_DEPTH {
+            return write!(f, "...");
+        }
         match self.ty {
             Type::Int => write!(f, "int"),
             Type::Float => write!(f, "float"),
@@ -212,9 +226,9 @@ impl fmt::Display for TypeDisplay<'_> {
             Type::Any => write!(f, "any"),
             Type::Unknown => write!(f, "?"),
             Type::Error => write!(f, "{{unknown}}"),
-            Type::List(t) => write!(f, "list<{}>", t.display(self.names)),
-            Type::Set(t) => write!(f, "set<{}>", t.display(self.names)),
-            Type::Map(k, v) => write!(f, "map<{}, {}>", k.display(self.names), v.display(self.names)),
+            Type::List(t) => write!(f, "list<{}>", self.sub(t)),
+            Type::Set(t) => write!(f, "set<{}>", self.sub(t)),
+            Type::Map(k, v) => write!(f, "map<{}, {}>", self.sub(k), self.sub(v)),
             Type::Class(c, args) => {
                 write!(f, "{}", self.names.get(*c as usize).map(|s| s.as_str()).unwrap_or("?"))?;
                 if !args.is_empty() {
@@ -223,7 +237,7 @@ impl fmt::Display for TypeDisplay<'_> {
                         if i > 0 {
                             write!(f, ", ")?;
                         }
-                        write!(f, "{}", a.display(self.names))?;
+                        write!(f, "{}", self.sub(a))?;
                     }
                     write!(f, ">")?;
                 }
@@ -235,24 +249,24 @@ impl fmt::Display for TypeDisplay<'_> {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", p.display(self.names))?;
+                    write!(f, "{}", self.sub(p))?;
                 }
-                write!(f, "): {}", r.display(self.names))
+                write!(f, "): {}", self.sub(r))
             }
             Type::Union(ms) => {
                 let non_null: Vec<&Type> = ms.iter().filter(|m| **m != Type::Null).collect();
                 if non_null.len() == 1 && ms.len() == 2 {
                     let inner = non_null[0];
                     if matches!(inner, Type::Func(..)) {
-                        return write!(f, "?({})", inner.display(self.names));
+                        return write!(f, "?({})", self.sub(inner));
                     }
-                    return write!(f, "?{}", inner.display(self.names));
+                    return write!(f, "?{}", self.sub(inner));
                 }
                 for (i, m) in ms.iter().enumerate() {
                     if i > 0 {
                         write!(f, "|")?;
                     }
-                    write!(f, "{}", m.display(self.names))?;
+                    write!(f, "{}", self.sub(m))?;
                 }
                 Ok(())
             }

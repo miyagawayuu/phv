@@ -5,7 +5,8 @@
 //! service a client span under it (its `traceparent` names that span), and
 //! each run of a background job a span of its own. Spans are queued and sent
 //! by one thread, in batches of up to 512 every 5 seconds. The queue holds at
-//! most 8,192 spans: past that, spans are dropped (counted in
+//! most 8,192 spans and 16 MB of them (a name or text value keeps its first
+//! 1,024 bytes): past that, spans are dropped (counted in
 //! `phv_telemetry_dropped_spans_total`), so a collector that is slow or down
 //! never holds the server's memory or its requests. A failed export is
 //! dropped too, and reported at most once a minute.
@@ -19,7 +20,54 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const QUEUE: usize = 8192;
+/// The queue is bounded by its bytes too (found by the 1.2 audit: 8,192
+/// spans named by 63 KB request methods held 1.36 GB).
+const QUEUE_BYTES: usize = 16 << 20;
+/// The longest name or text value a span keeps; longer ones are cut.
+const MAX_TEXT: usize = 1024;
+/// What a span holds besides its texts (ids, times, its vectors).
+const SPAN_BYTES: usize = 256;
 const BATCH: usize = 512;
+
+/// What the queue holds: spans, and their bytes (`size`).
+#[derive(Default)]
+struct Queued {
+    spans: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+impl Queued {
+    fn sub(&self, spans: &[Span]) {
+        self.spans.fetch_sub(spans.len(), Ordering::Relaxed);
+        self.bytes.fetch_sub(spans.iter().map(size).sum(), Ordering::Relaxed);
+    }
+}
+
+/// The bytes a span holds, about.
+fn size(s: &Span) -> usize {
+    let text = |v: &SpanValue| match v {
+        SpanValue::Str(t) => t.len(),
+        SpanValue::Int(_) => 8,
+    };
+    SPAN_BYTES
+        + s.name.len()
+        + s.trace_id.len()
+        + s.span_id.len()
+        + s.parent_id.as_ref().map_or(0, String::len)
+        + s.attributes.iter().map(|(_, v)| 32 + text(v)).sum::<usize>()
+}
+
+/// Cuts `t` to `MAX_TEXT` bytes (at a character's start).
+fn cut(t: &mut String) {
+    if t.len() > MAX_TEXT {
+        let mut n = MAX_TEXT;
+        while !t.is_char_boundary(n) {
+            n -= 1;
+        }
+        t.truncate(n);
+        t.shrink_to_fit();
+    }
+}
 const EVERY: Duration = Duration::from_secs(5);
 const TIMEOUT: Duration = Duration::from_secs(10);
 const WARN_EVERY: Duration = Duration::from_secs(60);
@@ -29,7 +77,7 @@ pub struct Exporter {
     tx: std::sync::Mutex<Option<SyncSender<Vec<Span>>>>,
     /// Gets a message when the thread has sent what it held.
     done: std::sync::Mutex<Receiver<()>>,
-    queued: Arc<AtomicUsize>,
+    queued: Arc<Queued>,
     dropped: Arc<AtomicU64>,
     sample: f64,
 }
@@ -51,7 +99,7 @@ impl Exporter {
             }
         }
         let (tx, rx) = sync_channel(QUEUE);
-        let queued = Arc::new(AtomicUsize::new(0));
+        let queued = Arc::new(Queued::default());
         let resource = resource(&cfg.service_name);
         let (tls, q) = (cfg.tls, queued.clone());
         let (done_tx, done) = std::sync::mpsc::channel();
@@ -84,17 +132,29 @@ impl Exporter {
     }
 
     /// Queues spans to send, or drops them when the queue is full.
-    pub fn send(&self, spans: Vec<Span>) {
+    pub fn send(&self, mut spans: Vec<Span>) {
         let n = spans.len();
         if n == 0 {
             return;
         }
+        for s in &mut spans {
+            cut(&mut s.name);
+            for (_, v) in &mut s.attributes {
+                if let SpanValue::Str(t) = v {
+                    cut(t);
+                }
+            }
+        }
+        let bytes: usize = spans.iter().map(size).sum();
         let sent = || match &*self.tx.lock().unwrap_or_else(|e| e.into_inner()) {
             Some(tx) => tx.try_send(spans).is_ok(),
             None => false,
         };
-        if self.queued.fetch_add(n, Ordering::Relaxed) + n > QUEUE || !sent() {
-            self.queued.fetch_sub(n, Ordering::Relaxed);
+        let full = self.queued.spans.fetch_add(n, Ordering::Relaxed) + n > QUEUE;
+        let too_large = self.queued.bytes.fetch_add(bytes, Ordering::Relaxed) + bytes > QUEUE_BYTES;
+        if full || too_large || !sent() {
+            self.queued.spans.fetch_sub(n, Ordering::Relaxed);
+            self.queued.bytes.fetch_sub(bytes, Ordering::Relaxed);
             self.dropped.fetch_add(n as u64, Ordering::Relaxed);
         }
     }
@@ -162,7 +222,7 @@ pub fn body(resource: &Value, spans: &[Span]) -> Vec<u8> {
 
 fn send_loop(
     rx: Receiver<Vec<Span>>,
-    queued: Arc<AtomicUsize>,
+    queued: Arc<Queued>,
     url: String,
     tls: Option<bool>,
     headers: Vec<(String, String)>,
@@ -176,7 +236,7 @@ fn send_loop(
             return;
         }
         let spans = std::mem::take(batch);
-        queued.fetch_sub(spans.len(), Ordering::Relaxed);
+        queued.sub(&spans);
         let result = phv_std::post_telemetry(&url, tls, headers.clone(), body(&resource, &spans), TIMEOUT);
         let problem = match result {
             Ok(status) if (200..300).contains(&status) => None,
@@ -239,5 +299,50 @@ mod tests {
         assert!(span.get("parentSpanId").is_none());
         assert_eq!(span["attributes"][0]["value"]["intValue"], "200");
         assert_eq!(v["resourceSpans"][0]["resource"]["attributes"][0]["value"]["stringValue"], "blog");
+    }
+
+    /// Long texts are cut, and the queue is bounded by its bytes as well as
+    /// by its spans (found by the 1.2 audit: 8,192 spans of 63 KB held 1.36 GB).
+    #[test]
+    fn the_queue_is_bounded_by_its_bytes() {
+        let (tx, rx) = sync_channel(QUEUE);
+        let (_done_tx, done) = std::sync::mpsc::channel();
+        let exporter = Exporter {
+            tx: std::sync::Mutex::new(Some(tx)),
+            done: std::sync::Mutex::new(done),
+            queued: Arc::new(Queued::default()),
+            dropped: Arc::new(AtomicU64::new(0)),
+            sample: 1.0,
+        };
+        let t = std::time::SystemTime::now();
+        let long = "é".repeat(30_000);
+        for _ in 0..QUEUE {
+            exporter.send(vec![Span {
+                trace_id: "0af7651916cd43dd8448eb211c80319c".into(),
+                span_id: "b7ad6b7169203331".into(),
+                parent_id: None,
+                name: long.clone(),
+                kind: SpanKind::Server,
+                start: t,
+                end: t,
+                attributes: (0..10).map(|_| ("http.route", SpanValue::Str(long.clone()))).collect(),
+                error: false,
+            }]);
+        }
+        let bytes = exporter.queued.bytes.load(Ordering::Relaxed);
+        let spans = exporter.queued.spans.load(Ordering::Relaxed);
+        assert!(bytes <= QUEUE_BYTES, "{bytes} bytes queued");
+        // About 11 KB each once cut: far fewer than 8,192 fit.
+        assert!(spans > 1000 && spans < 2000, "{spans} spans queued");
+        assert_eq!(exporter.dropped.load(Ordering::Relaxed) as usize, QUEUE - spans);
+        let first = rx.recv().unwrap().remove(0);
+        assert_eq!(first.name.len(), MAX_TEXT);
+        assert!(first.attributes.iter().all(|(_, v)| matches!(v, SpanValue::Str(s) if s.len() == MAX_TEXT)));
+        // Sending frees its share.
+        exporter.queued.sub(&[first]);
+        assert_eq!(exporter.queued.spans.load(Ordering::Relaxed), spans - 1);
+        assert_eq!(phv_vm::Span::method("GET"), "GET");
+        assert_eq!(phv_vm::Span::method("get"), "_OTHER");
+        assert_eq!(phv_vm::Span::method(&"X".repeat(60_000)), "_OTHER");
     }
 }

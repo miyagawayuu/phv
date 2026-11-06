@@ -27,33 +27,39 @@ impl Window {
     }
 }
 
-static TABLE: LazyLock<Mutex<HashMap<String, Window>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// A table key: the caller's key (`base_of`) and the window length in
+/// milliseconds, so a per-minute and a per-day limit on the same key count
+/// separately. The two are kept apart, so `reset` forgets the windows of its
+/// own key only (found by the 1.2.0 audit: a key and its window were one
+/// string, and resetting `k` also reset every key that starts with `k\0`).
+type TableKey = (String, u128);
 
-/// The table key: the caller's key and the window length (so a per-minute and
-/// a per-day limit on the same key count separately). Long keys are hashed
-/// so the table's memory stays bounded.
-fn key_of(key: &str, window: Duration) -> String {
-    format!("{}{}", base_of(key), window.as_millis())
+static TABLE: LazyLock<Mutex<HashMap<TableKey, Window>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn key_of(key: &str, window: Duration) -> TableKey {
+    (base_of(key), window.as_millis())
 }
 
-/// Everything in a table key before the window length.
+/// The caller's key as the table holds it. Long keys are hashed so the
+/// table's memory stays bounded; the first character tells the two kinds
+/// apart, so a short key cannot be written as the hash of a long one.
 fn base_of(key: &str) -> String {
     if key.len() <= 128 {
-        format!("{key}\u{0}")
+        format!("={key}")
     } else {
         use sha2::{Digest, Sha256};
-        format!("#{:x}\u{0}", Sha256::digest(key.as_bytes()))
+        format!("#{:x}", Sha256::digest(key.as_bytes()))
     }
 }
 
 /// Makes room for one more key, in amortized O(1): each pass frees a tenth.
-fn make_room(t: &mut HashMap<String, Window>) {
+fn make_room(t: &mut HashMap<TableKey, Window>) {
     t.retain(|_, w| !w.expired());
     let target = MAX_KEYS * 9 / 10;
     if t.len() <= target {
         return;
     }
-    let mut order: Vec<(bool, Instant, String)> =
+    let mut order: Vec<(bool, Instant, TableKey)> =
         t.iter().map(|(k, w)| (w.hits >= w.max, w.start, k.clone())).collect();
     // Not-limited before limited, then oldest first.
     order.sort();
@@ -94,7 +100,7 @@ pub fn retry_after(key: &str, window: Duration) -> u64 {
 pub fn reset(key: &str) {
     let mut t = TABLE.lock().unwrap_or_else(|e| e.into_inner());
     let base = base_of(key);
-    t.retain(|k, _| !k.starts_with(&base));
+    t.retain(|(k, _), _| *k != base);
 }
 
 /// Counts a hit in the store phv.toml names: the Redis database of
@@ -179,6 +185,32 @@ mod tests {
         assert!(!hit(short, 1, Duration::from_millis(20)));
         std::thread::sleep(Duration::from_millis(30));
         assert!(hit(short, 1, Duration::from_millis(20)));
+    }
+
+    /// Resetting a key leaves the keys that start with it alone (found by the
+    /// 1.2.0 audit: `reset("login:a")` also reset `"login:a\0b"`).
+    #[test]
+    fn reset_clears_only_its_own_key() {
+        let minute = Duration::from_secs(60);
+        let long = format!("test:reset-own:{}", "x".repeat(200));
+        let others =
+            ["test:reset-own\0b", "test:reset-own\0", "test:reset-own\u{0}60000", "test:reset-ownb", long.as_str()];
+        for k in others {
+            assert!(hit(k, 1, minute));
+            assert!(!hit(k, 1, minute));
+        }
+        assert!(hit("test:reset-own", 1, minute));
+        reset("test:reset-own");
+        assert!(hit("test:reset-own", 1, minute), "its own window is forgotten");
+        for k in others {
+            assert!(!hit(k, 1, minute), "{k:?} is still limited");
+        }
+        // A short key cannot name the hashed form of a long one.
+        use sha2::{Digest, Sha256};
+        let hashed = format!("#{:x}", Sha256::digest(long.as_bytes()));
+        assert!(hit(&hashed, 1, minute));
+        reset(&hashed);
+        assert!(!hit(&long, 1, minute));
     }
 
     #[test]

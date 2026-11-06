@@ -130,8 +130,11 @@ fn values_of(v: &serde_json::Value) -> Option<IndexMap<String, String>> {
 /// sessions are written, with bookkeeping keys of the site's own
 /// (`phv:sessions:<namespace>:`); PostgreSQL and MySQL in a table of the
 /// site's own (`phv_sessions_<namespace>`), which the sweep keeps within the
-/// same limits. So the `session_ttl` and the limits of one site never remove
-/// another's sessions. Both drop sessions whose visitor never came back first.
+/// same limits; a site without a namespace uses `phv:sessions:unnamed:` and
+/// `phv_sessions_unnamed`. So the `session_ttl` and the limits of one site
+/// never remove the sessions of a site with another namespace, nor those
+/// every site kept in the shared store of 1.1. Both drop sessions whose
+/// visitor never came back first.
 /// A database that cannot be reached loses the session (a warning is logged)
 /// instead of failing the request.
 struct DbStore {
@@ -1049,8 +1052,9 @@ mod tests {
                 max_sessions: MAX_SESSIONS,
                 max_bytes: MAX_BYTES,
             };
-            // Written as 1.1 wrote them: the site's key, in the shared store
-            // (the store of a site without a namespace).
+            // Written as 1.1 wrote them: the site's key, in the store every
+            // site shared then.
+            let old = Some(phv_std::SESSIONS_OF_1_1);
             let now = now_secs();
             let old_session = |user: &str| -> String {
                 let id = phv_std::random_hex(32);
@@ -1061,7 +1065,7 @@ mod tests {
                     returned: true,
                 };
                 let key = shared_session_key(Some(&ns), &id);
-                assert!(phv_std::session_insert(&spec, None, &key, &row, &limits).unwrap(), "{var}");
+                assert!(phv_std::session_insert(&spec, old, &key, &row, &limits).unwrap(), "{var}");
                 format!("PHVSESSID={id}")
             };
             let store =
@@ -1082,8 +1086,8 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2100));
                 let brief = phv_std::SessionLimits { ttl: Duration::from_secs(1), ..limits };
                 let other = phv_std::SessionRow { data: "{}".into(), created: now, last: now, returned: false };
-                assert!(phv_std::session_insert(&spec, None, "legacy-writer", &other, &brief).unwrap());
-                phv_std::session_remove(&spec, None, "legacy-writer").unwrap();
+                assert!(phv_std::session_insert(&spec, old, "legacy-writer", &other, &brief).unwrap());
+                phv_std::session_remove(&spec, old, "legacy-writer").unwrap();
                 assert_eq!(user(&header).as_deref(), Some("ann"), "{var}: removed by the shared bookkeeping");
             }
             // Logged out while a slow request holds it: gone from both stores.
@@ -1096,7 +1100,7 @@ mod tests {
             assert!(store.save(slow).is_none(), "{var}");
             assert!(store.load(Some(&header)).id.is_none(), "{var}: the logged-out session came back");
             let id = header.trim_start_matches("PHVSESSID=");
-            assert!(phv_std::session_read(&spec, None, &shared_session_key(Some(&ns), id)).unwrap().is_none());
+            assert!(phv_std::session_read(&spec, old, &shared_session_key(Some(&ns), id)).unwrap().is_none());
 
             // Regenerated (at login) by two requests at once: one takes it
             // over, under a new id in the site's own store.
@@ -1112,7 +1116,7 @@ mod tests {
             let new_id = taken.split(['=', ';']).nth(1).unwrap().to_string();
             if var != "PHV_TEST_REDIS_URL" {
                 let key = shared_session_key(Some(&ns), &new_id);
-                assert!(phv_std::session_read(&spec, None, &key).unwrap().is_none(), "{var}: in the shared table");
+                assert!(phv_std::session_read(&spec, old, &key).unwrap().is_none(), "{var}: in the shared table");
             }
             let header = format!("PHVSESSID={new_id}");
             let mut done = store.load(Some(&header));

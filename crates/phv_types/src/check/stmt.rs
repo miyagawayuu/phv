@@ -1,4 +1,4 @@
-use super::flow::{assigned_vars, Flow};
+use super::flow::{assigned_vars, ContinueTo, Flow};
 use super::Checker;
 use crate::hir::*;
 use crate::types::*;
@@ -38,11 +38,15 @@ fn breaks_out(stmts: &[Stmt], nest: u32) -> bool {
 /// Strings and numbers are escaped and need no look.
 fn html_inside(h: HExpr, ctx: phv_syntax::ast::EchoContext) -> HExpr {
     use phv_syntax::ast::EchoContext;
+    // `watched `: where the end tag of any raw-text element may end what a
+    // browser reads (found by the 1.2 audit).
     let place = match ctx {
         EchoContext::ForeignText => "foreign",
         EchoContext::RawText(tag) => tag,
-        EchoContext::Comment(false) => "comment",
-        EchoContext::Comment(true) => "bogus comment",
+        EchoContext::Comment { bogus: false, watched: false } => "comment",
+        EchoContext::Comment { bogus: false, watched: true } => "watched comment",
+        EchoContext::Comment { bogus: true, watched: false } => "bogus comment",
+        EchoContext::Comment { bogus: true, watched: true } => "watched bogus comment",
         _ => return h,
     };
     let plain = |t: &Type| matches!(t, Type::Int | Type::Float | Type::Bool | Type::Str | Type::Null | Type::Error);
@@ -64,6 +68,18 @@ impl Checker<'_> {
     }
 
     pub(crate) fn stmt(&mut self, s: &Stmt, out: &mut Vec<HStmt>) {
+        // Past the budget of large types, the rest is not checked (an error was reported).
+        if self.reported_type_nodes {
+            return;
+        }
+        self.stmt_sized(s, out);
+        if super::take_too_large() {
+            let msg = format!("a type here is too large (more than {} type nodes)", super::MAX_TYPE_SIZE);
+            self.error(msg, s.span);
+        }
+    }
+
+    fn stmt_sized(&mut self, s: &Stmt, out: &mut Vec<HStmt>) {
         if s.out.is_some() {
             let mut inner = Vec::new();
             self.stmt_here(s, &mut inner);
@@ -150,7 +166,7 @@ impl Checker<'_> {
                 let entry = self.cx().flow.clone();
                 let (hc, then_facts, _) = self.cond(cond);
                 self.cx().apply(&then_facts);
-                let hbody = self.loop_body(body);
+                let (hbody, _) = self.loop_body(body, &entry);
                 let infinite = matches!(cond.kind, ExprKind::Bool(true)) && !breaks_out(body, 0);
                 self.cx().flow = entry;
                 self.cx().flow.dead = infinite;
@@ -159,8 +175,8 @@ impl Checker<'_> {
             StmtKind::DoWhile { body, cond } => {
                 self.invalidate_for(body, &[]);
                 let entry = self.cx().flow.clone();
-                let hbody = self.loop_body(body);
-                self.cx().flow.dead = false;
+                let (hbody, continued) = self.loop_body(body, &entry);
+                self.after_body(continued);
                 let (hc, _, _) = self.cond(cond);
                 self.cx().flow = entry;
                 out.push(HStmt::Loop { cond: Some(hc), body: hbody, step: Vec::new(), do_while: true });
@@ -177,8 +193,8 @@ impl Checker<'_> {
                     self.cx().apply(&facts);
                     h
                 });
-                let hbody = self.loop_body(body);
-                self.cx().flow.dead = false;
+                let (hbody, continued) = self.loop_body(body, &entry);
+                self.after_body(continued);
                 let mut hstep = Vec::new();
                 for st in step {
                     self.stmt(st, &mut hstep);
@@ -197,6 +213,9 @@ impl Checker<'_> {
                     self.error(format!("`{word}` outside of a loop"), s.span);
                 } else if *level > depth {
                     self.error(format!("cannot `{word} {level}`: only {depth} loop(s) to leave"), s.span);
+                }
+                if !is_break {
+                    self.note_continue(*level);
                 }
                 out.push(if is_break { HStmt::Break(*level) } else { HStmt::Continue(*level) });
                 self.cx().flow.dead = true;
@@ -246,6 +265,9 @@ impl Checker<'_> {
                 let mut names = HashSet::new();
                 assigned_vars(body, &mut names);
                 let entry = self.cx().flow.clone();
+                // A `continue` in the body or a `catch` runs the `finally` first.
+                let fin_depth = u32::from(finally.is_some());
+                self.cx().finally_depth += fin_depth;
                 let mut hbody = Vec::new();
                 self.block(body, &mut hbody);
                 let mut result = std::mem::take(&mut self.cx().flow);
@@ -281,6 +303,7 @@ impl Checker<'_> {
                     result = Flow::merge(result, f);
                     hcatches.push(HCatch { classes, var, body: hb });
                 }
+                self.cx().finally_depth -= fin_depth;
                 let mut hfinally = None;
                 if let Some(f) = finally {
                     // `finally` runs after normal completion, and also when an
@@ -293,11 +316,17 @@ impl Checker<'_> {
                     let escape = std::mem::take(&mut self.cx().flow);
                     self.cx().flow = Flow::merge(result.clone(), escape);
                     self.cx().flow.dead = false;
+                    let mut written = HashSet::new();
+                    assigned_vars(f, &mut written);
+                    let mut ids: HashSet<LocalId> =
+                        written.iter().filter_map(|n| self.cx().names.get(n).copied()).collect();
+                    let gen = self.cx().prop_gen;
                     let mut hf = Vec::new();
                     self.block(f, &mut hf);
-                    if self.cx().flow.dead {
-                        result.dead = true;
-                    }
+                    ids.extend(written.iter().filter_map(|n| self.cx().names.get(n).copied()));
+                    let calls = self.cx().prop_gen != gen;
+                    let fin = std::mem::take(&mut self.cx().flow);
+                    result = Flow::after_finally(result, &fin, &ids, calls);
                     hfinally = Some(hf);
                 }
                 self.cx().flow = result;
@@ -399,12 +428,48 @@ impl Checker<'_> {
         }
     }
 
-    fn loop_body(&mut self, body: &[Stmt]) -> Vec<HStmt> {
-        self.cx().loop_depth += 1;
+    /// Checks a loop's body from `entry` (the flow at the loop's start, after
+    /// what the loop changes was forgotten). Returns the body and what is known
+    /// where its `continue`s go (dead when there are none).
+    fn loop_body(&mut self, body: &[Stmt], entry: &Flow) -> (Vec<HStmt>, Flow) {
+        let cx = self.cx();
+        cx.loop_depth += 1;
+        let finally_depth = cx.finally_depth;
+        let mut dead = Flow::default();
+        dead.dead = true;
+        cx.continues.push(ContinueTo { flow: dead, entry: entry.clone(), finally_depth });
         let mut out = Vec::new();
         self.block(body, &mut out);
-        self.cx().loop_depth -= 1;
-        out
+        let cx = self.cx();
+        cx.loop_depth -= 1;
+        let to = cx.continues.pop().expect("loop");
+        (out, to.flow)
+    }
+
+    /// Records what is known at a `continue` that goes to the loop `level`
+    /// loops out. A `continue` that leaves a `try` runs its `finally` first,
+    /// which may change anything the loop changes: the loop's entry is then
+    /// joined in, which has forgotten those.
+    fn note_continue(&mut self, level: u32) {
+        let cx = self.cx();
+        let n = cx.continues.len();
+        if level == 0 || level as usize > n || cx.flow.dead {
+            return;
+        }
+        let here = cx.flow.clone();
+        let to = &mut cx.continues[n - level as usize];
+        let here = if cx.finally_depth > to.finally_depth { Flow::merge(here, to.entry.clone()) } else { here };
+        to.flow = Flow::merge(std::mem::take(&mut to.flow), here);
+    }
+
+    /// The flow where a `for` step or `do`-`while` condition starts: the end of
+    /// the body joined with the paths that `continue`d.
+    fn after_body(&mut self, continued: Flow) {
+        let end = std::mem::take(&mut self.cx().flow);
+        // When neither is reached, the step is never run: what the end knew is kept.
+        let mut flow = if continued.dead { end } else { Flow::merge(end, continued) };
+        flow.dead = false;
+        self.cx().flow = flow;
     }
 
     fn invalidate_for(&mut self, body: &[Stmt], extra: &[&str]) {
@@ -482,7 +547,7 @@ impl Checker<'_> {
             self.invalidate_for(body, &extra);
             let entry = self.cx().flow.clone();
             let var = self.loop_var(&value.0, Type::Int, value.1);
-            let hbody = self.loop_body(body);
+            let (hbody, _) = self.loop_body(body, &entry);
             self.cx().flow = entry;
             out.push(HStmt::ForRange { var, from: hf, to: ht, inclusive: *inclusive, body: hbody });
             return;
@@ -505,7 +570,7 @@ impl Checker<'_> {
         let entry = self.cx().flow.clone();
         let k = key.map(|(name, span)| self.loop_var(name, kt, *span));
         let v = self.loop_var(&value.0, vt, value.1);
-        let hbody = self.loop_body(body);
+        let (hbody, _) = self.loop_body(body, &entry);
         self.cx().flow = entry;
         out.push(HStmt::Foreach { subject: hs, key: k, val: v, body: hbody });
     }

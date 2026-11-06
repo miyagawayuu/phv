@@ -364,7 +364,18 @@ impl Installer<'_> {
                     "package \"{by}\" names \"{name}\" by `path`; packages can only use git and the registry"
                 ));
             }
-            return Ok(Want::Path(self.root.join(p)));
+            let dir = self.root.join(p);
+            // Nothing is looked at there before this check: opening a folder on
+            // another machine makes Windows contact the host with the user's
+            // credentials (found by the 16th assessment; see `Loader::remote`).
+            if phv_std::safefs::on_another_machine_below(self.root, &dir) {
+                return Err(format!(
+                    "the path \"{}\" is on another machine (a network share or drive, or a link to one); \
+                     packages are read only from this machine",
+                    phv_syntax::diag::printable_text(p)
+                ));
+            }
+            return Ok(Want::Path(dir));
         }
         let url = match &dep.git {
             Some(u) => u.clone(),
@@ -654,6 +665,45 @@ mod tests {
         no_filters(&clone).unwrap();
         let attr = git(&["check-attr", "filter", "--", "a.bin"], Some(&clone)).unwrap();
         assert!(attr.ends_with("unset"), "{attr}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Found by the 16th assessment: a `path` package that is a link to a
+    /// share (or a share by name) was opened (`is_dir`, its phv.toml), which
+    /// makes Windows contact the host. Making a link needs Developer Mode or
+    /// the privilege: that part is skipped without.
+    #[cfg(windows)]
+    #[test]
+    fn path_packages_on_another_machine_are_refused_before_they_are_opened() {
+        let dir = std::env::temp_dir().join(format!("phv-path-pkg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("pkgs/local")).unwrap();
+        let mut ins = Installer {
+            root: &dir,
+            old: Lock::default(),
+            locked_only: false,
+            registry: None,
+            tags: HashMap::new(),
+            revs: HashMap::new(),
+        };
+        let path = |p: &str| Dependency { path: Some(p.into()), ..Default::default() };
+        let start = std::time::Instant::now();
+        for p in [r"\\phv-test.invalid\share\pkg", "//phv-test.invalid/share/pkg", r"\\?\UNC\phv-test.invalid\s\pkg"] {
+            let e = ins.want("far", &path(p), "phv.toml").err().unwrap_or_default();
+            assert!(e.contains("another machine"), "{p}: {e}");
+        }
+        assert!(matches!(ins.want("near", &path("pkgs/local"), "phv.toml"), Ok(Want::Path(_))));
+        if std::os::windows::fs::symlink_dir(r"\\phv-test.invalid\share\pkg", dir.join("pkgs/far")).is_ok() {
+            let e = ins.want("far", &path("pkgs/far"), "phv.toml").err().unwrap_or_default();
+            assert!(e.contains("another machine"), "{e}");
+            // Also behind a link to a folder of this machine that holds it.
+            std::os::windows::fs::symlink_dir(dir.join("pkgs"), dir.join("via")).unwrap();
+            let e = ins.want("far", &path("via/far"), "phv.toml").err().unwrap_or_default();
+            assert!(e.contains("another machine"), "{e}");
+            let _ = std::fs::remove_dir(dir.join("via"));
+            let _ = std::fs::remove_dir(dir.join("pkgs/far"));
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

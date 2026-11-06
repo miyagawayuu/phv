@@ -98,7 +98,9 @@ struct Parser {
     /// current function), with the HTML state where each began: `break`,
     /// `continue`, `return` and `throw` must leave the HTML where the code
     /// they jump to expects it.
-    exits: Vec<(Exit, crate::htmlctx::HtmlTracker)>,
+    /// With, for a loop, `after_value()` of the HTML at a `break` and at a
+    /// `continue` that leave it (bits of each).
+    exits: Vec<(Exit, crate::htmlctx::HtmlTracker, [u8; 2])>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -379,6 +381,24 @@ impl Parser {
                 self.diags.push(d);
                 return;
             }
+            InlineCode::ForeignStructure(msg) => {
+                let mut d = Diagnostic::error(msg, span);
+                d.add_note("what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these");
+                self.diags.push(d);
+                return;
+            }
+            InlineCode::CdataEnd => {
+                let mut d = Diagnostic::error("`>` inside a CDATA section that is not the end of `]]>`", span);
+                d.add_note("where a browser reads the section as a bogus comment (inside HTML in SVG), it ends at the first `>` and what follows becomes markup; write `&gt;` or move the text out of the section");
+                self.diags.push(d);
+                return;
+            }
+            InlineCode::RawTextInSelect(tag) => {
+                let mut d = Diagnostic::error(format!("`<{tag}>` inside `<select>`"), span);
+                d.add_note("older browsers ignore it there and read its text as markup, where this template is checked as its text; close the `<select>` first");
+                self.diags.push(d);
+                return;
+            }
             InlineCode::MetaHttpEquiv => {
                 let mut d =
                     Diagnostic::error("`http-equiv` after a value inserted into the `content` of this `<meta>`", span);
@@ -458,8 +478,13 @@ impl Parser {
         if self.at(&Tok::LBrace) {
             self.block()
         } else {
+            // `if ($a) while ($b) ...` nests as deeply as braces would.
+            self.enter(0)?;
+            self.depth += 1;
             let entry = self.html.clone();
-            let s = self.stmt()?;
+            let s = self.stmt();
+            self.depth -= 1;
+            let s = s?;
             self.check_block_html(&entry);
             Ok(vec![s])
         }
@@ -478,9 +503,30 @@ impl Parser {
 
     /// Parses a loop's or `try` block's body with `kind` as a target of exits.
     fn exit_target<T>(&mut self, kind: Exit, body: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
-        self.exits.push((kind, self.html.clone()));
+        self.exits.push((kind, self.html.clone(), [0, 0]));
         let r = body(self);
         self.exits.pop();
+        r
+    }
+
+    /// Parses a loop's body (a target of `break` and `continue`). Its start
+    /// may follow its end or a `continue`, and what follows the loop may
+    /// follow a `break`: in a comment, they may not end it after a value
+    /// there (found by the 1.2 audit).
+    fn loop_body<T>(&mut self, body: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        let start = self.span();
+        let head = self.html.begin_loop();
+        self.exits.push((Exit::Loop, self.html.clone(), [0, 0]));
+        let r = body(self);
+        let [broke, continued] = self.exits.pop().map_or([0, 0], |e| e.2);
+        if self.html.end_loop(head, continued, broke) && !self.halted {
+            let mut d = Diagnostic::error(
+                "this loop's body starts with `>`, `!>`, `->` or `-!>` in a comment, and may follow a value at its end",
+                start,
+            );
+            d.add_note("on the next run, a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; start the body with a space");
+            self.diags.push(d);
+        }
         r
     }
 
@@ -488,21 +534,21 @@ impl Parser {
     /// the HTML must be where the code it jumps to began (the loop, the `try`
     /// block, or the start of the function), and where every `try` block it
     /// leaves began (their `finally` runs on the way out).
-    fn check_exit(&mut self, loop_level: u32, throw: bool, span: Span) {
+    fn check_exit(&mut self, loop_level: u32, throw: bool, is_break: bool, span: Span) {
         let mut checked = Vec::new();
         let mut loops = 0;
         let mut target = None;
-        for (kind, at) in self.exits.iter().rev() {
+        for (k, (kind, at, _)) in self.exits.iter().enumerate().rev() {
             match kind {
                 Exit::Try if throw => {
-                    target = Some(at.clone());
+                    target = Some((k, at.clone()));
                     break;
                 }
                 Exit::Try => checked.push(at.clone()),
                 Exit::Loop if loop_level > 0 => {
                     loops += 1;
                     if loops == loop_level {
-                        target = Some(at.clone());
+                        target = Some((k, at.clone()));
                         break;
                     }
                 }
@@ -512,6 +558,12 @@ impl Parser {
         if loop_level > 0 && target.is_none() {
             return; // Not inside that many loops: the type checker reports it.
         }
+        // What follows the loop (`break`) or its body's start (`continue`) may
+        // follow a value written right before the jump.
+        if let (true, Some((k, _))) = (loop_level > 0, &target) {
+            self.exits[*k].2[if is_break { 0 } else { 1 }] |= self.html.after_value();
+        }
+        let target = target.map(|(_, at)| at);
         checked.push(target.unwrap_or_default());
         if self.halted || checked.iter().all(|at| self.html.same_place(at)) {
             return;
@@ -563,7 +615,10 @@ impl Parser {
                         | crate::htmlctx::InlineCode::MetaHttpEquiv
                         | crate::htmlctx::InlineCode::ForeignCdata
                         | crate::htmlctx::InlineCode::HiddenEndTag
-                        | crate::htmlctx::InlineCode::CommentEnd => 1,
+                        | crate::htmlctx::InlineCode::CommentEnd
+                        | crate::htmlctx::InlineCode::ForeignStructure(_)
+                        | crate::htmlctx::InlineCode::CdataEnd
+                        | crate::htmlctx::InlineCode::RawTextInSelect(_) => 1,
                     };
                     self.inline_code_warning(Span { start: pos, end: pos + len, ..start }, what);
                 }
@@ -597,7 +652,7 @@ impl Parser {
             Tok::While => {
                 self.bump();
                 let cond = self.paren_expr()?;
-                let body = self.exit_target(Exit::Loop, |p| {
+                let body = self.loop_body(|p| {
                     if p.eat(&Tok::Colon) {
                         let b = p.block_until(&[Tok::Endwhile]);
                         p.expect(Tok::Endwhile)?;
@@ -611,7 +666,7 @@ impl Parser {
             }
             Tok::Do => {
                 self.bump();
-                let body = self.exit_target(Exit::Loop, |p| p.stmt_or_block())?;
+                let body = self.loop_body(|p| p.stmt_or_block())?;
                 self.expect(Tok::While)?;
                 let cond = self.paren_expr()?;
                 self.semi()?;
@@ -622,7 +677,7 @@ impl Parser {
             Tok::Try => return self.try_stmt(),
             Tok::Return => {
                 let span = self.bump();
-                self.check_exit(0, false, span);
+                self.check_exit(0, false, false, span);
                 let value =
                     if matches!(self.peek(), Tok::Semi | Tok::CloseTag | Tok::Eof) { None } else { Some(self.expr()?) };
                 self.semi()?;
@@ -636,7 +691,7 @@ impl Parser {
                     self.bump();
                     level = n.max(1) as u32;
                 }
-                self.check_exit(level, false, span);
+                self.check_exit(level, false, is_break, span);
                 self.semi()?;
                 if is_break {
                     StmtKind::Break(level)
@@ -646,7 +701,7 @@ impl Parser {
             }
             Tok::Throw => {
                 let span = self.bump();
-                self.check_exit(0, true, span);
+                self.check_exit(0, true, false, span);
                 let e = self.expr()?;
                 self.semi()?;
                 StmtKind::Throw(e)
@@ -781,6 +836,8 @@ impl Parser {
             // Template-friendly syntax: if (...): ... elseif (...): ... else: ... endif;
             then = self.block_until(&[Tok::Elseif, Tok::Else, Tok::Endif]);
             loop {
+                // Each `elseif` nests the tree one level deeper (in the checker and compiler).
+                self.enter(elifs.len() as u32)?;
                 if self.eat(&Tok::Elseif) {
                     let c = self.paren_expr()?;
                     self.expect(Tok::Colon)?;
@@ -798,6 +855,7 @@ impl Parser {
         } else {
             then = self.stmt_or_block()?;
             loop {
+                self.enter(elifs.len() as u32)?;
                 if self.eat(&Tok::Elseif) {
                     let c = self.paren_expr()?;
                     elifs.push((c, self.stmt_or_block()?));
@@ -843,7 +901,7 @@ impl Parser {
             }
         }
         self.expect(Tok::RParen)?;
-        let body = self.exit_target(Exit::Loop, |p| {
+        let body = self.loop_body(|p| {
             if p.eat(&Tok::Colon) {
                 let b = p.block_until(&[Tok::Endfor]);
                 p.expect(Tok::Endfor)?;
@@ -873,7 +931,7 @@ impl Parser {
             (None, first)
         };
         self.expect(Tok::RParen)?;
-        let mut body = self.exit_target(Exit::Loop, |p| {
+        let mut body = self.loop_body(|p| {
             if p.eat(&Tok::Colon) {
                 let b = p.block_until(&[Tok::Endforeach]);
                 p.expect(Tok::Endforeach)?;
@@ -928,7 +986,13 @@ impl Parser {
             let body = self.block()?;
             catches.push(Catch { classes, var, body, span: cstart.to(self.prev_span()) });
         }
-        let finally = if self.eat(&Tok::Finally) { Some(self.block()?) } else { None };
+        // `finally` runs after a `break` or `continue` in the `try` block too.
+        let finally = if self.eat(&Tok::Finally) {
+            self.html.after_any_value();
+            Some(self.block()?)
+        } else {
+            None
+        };
         if catches.is_empty() && finally.is_none() {
             return Err(self.error_here("expected `catch` or `finally` after `try` block"));
         }
@@ -1296,6 +1360,15 @@ impl Parser {
     }
 
     fn ty_atom(&mut self) -> PResult<TypeExpr> {
+        // `?`, `(...)`, `list<...>` and `fn(...): ...` nest types inside each other.
+        self.enter(0)?;
+        self.depth += 1;
+        let t = self.ty_atom_inner();
+        self.depth -= 1;
+        t
+    }
+
+    fn ty_atom_inner(&mut self) -> PResult<TypeExpr> {
         let start = self.span();
         let kind = match self.peek().clone() {
             Tok::Question => {

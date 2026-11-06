@@ -48,7 +48,10 @@ export class SignIn {
         public readonly ?int $expiresIn,
         /** The scopes granted, if the provider said (space-separated). */
         public readonly ?string $scope,
-        /** The ID token (OpenID Connect), already verified. */
+        /**
+         * The ID token (OpenID Connect), already verified. Null without OpenID Connect:
+         * an ID token that was not verified is not passed on.
+         */
         public readonly ?string $idToken,
         /** The claims of the ID token; empty without OpenID Connect. */
         public readonly map<string, any> $claims,
@@ -101,7 +104,8 @@ export class OAuth {
      * Finishes the sign-in on the redirect URI: checks the answer, exchanges the code
      * for tokens and verifies the ID token. Throws OAuthError when the sign-in failed,
      * NetworkError when the provider cannot be reached. Call `session()->regenerate()`
-     * before you store who signed in.
+     * before you store who signed in. It must come before `response()->flush()` (the
+     * sign-in is kept in the session); after it, it throws ValueError.
      */
     public function callback(): SignIn {
         $r = __oauth_finish($this->name);

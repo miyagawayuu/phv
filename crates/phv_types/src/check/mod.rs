@@ -248,6 +248,9 @@ pub(crate) struct Checker<'a> {
     alias_nodes: usize,
     /// Bytes of strings built by constant expressions so far (see `MAX_CONST_TOTAL`).
     const_bytes: usize,
+    /// Nodes of the large types of expressions so far (see `MAX_TYPE_TOTAL`).
+    type_nodes: usize,
+    reported_type_nodes: bool,
 }
 
 /// What an annotation can be written before.
@@ -307,6 +310,17 @@ const MAX_ALIAS_TOTAL: usize = 2_000_000;
 /// Nodes of a type a type alias stands for (`type P<T> = fn(T): T;` doubles
 /// with each alias that applies the one before).
 const MAX_ALIAS_SIZE: usize = 10_000;
+
+/// Nodes of the type of one expression, inferred from the types of others
+/// (`function f<T>(T $x): fn(T): T` doubles the type of its argument).
+pub(crate) const MAX_TYPE_SIZE: usize = 10_000;
+
+/// Nodes of all the large types (`LARGE_TYPE` nodes or more) of expressions in
+/// a program: each use of a variable holds its own copy of its type.
+const MAX_TYPE_TOTAL: usize = 2_000_000;
+
+/// Types smaller than this are not counted in `MAX_TYPE_TOTAL`.
+const LARGE_TYPE: usize = 100;
 
 /// Properties of one class, its inherited ones included: a property's slot is a
 /// 16-bit operand of the bytecode.
@@ -391,6 +405,8 @@ impl<'a> Checker<'a> {
             in_alias: false,
             alias_nodes: 0,
             const_bytes: 0,
+            type_nodes: 0,
+            reported_type_nodes: false,
         }
     }
 
@@ -471,6 +487,7 @@ impl<'a> Checker<'a> {
     }
 
     fn run(&mut self) {
+        take_too_large();
         self.collect();
         self.resolve_imports();
         let order = self.order_classes();
@@ -479,7 +496,13 @@ impl<'a> Checker<'a> {
         self.resolve_classes(&order);
         self.resolve_functions();
         self.check_bodies();
+        self.count_field_defaults();
         self.warn_unused_imports();
+        // A type made too large outside the statements (in a signature) and not reported there.
+        if take_too_large() && !self.diags.iter().any(|d| d.is_error()) {
+            let msg = format!("a type in this program is too large (more than {MAX_TYPE_SIZE} type nodes)");
+            self.error(msg, Span::default());
+        }
     }
 
     /// Warns about imported names that their module never uses. Only the
@@ -1986,6 +2009,32 @@ impl<'a> Checker<'a> {
             && self.assignable(&view(&a.ret, a), &view(&b.ret, b))
     }
 
+    /// Each class holds the default values of its properties, inherited ones
+    /// included, and so does the bytecode (and its cache): their strings count
+    /// against `MAX_CONST_TOTAL` once for each class (found by the 1.2.0 audit:
+    /// a 1 MiB default in a class with 1,000 subclasses took 2.5 GB).
+    fn count_field_defaults(&mut self) {
+        let mut total = self.const_bytes;
+        for c in &self.classes {
+            for f in &c.fields {
+                if let Some(HConst::Str(s)) = &f.default {
+                    total = total.saturating_add(s.len());
+                }
+            }
+            if total > MAX_CONST_TOTAL {
+                let msg = format!(
+                    "the default values of the properties of all classes are too long in total (at most 16 MiB, \
+                     counting each class that inherits one); `{}` goes over",
+                    c.name
+                );
+                let span = c.span;
+                self.error(msg, span)
+                    .add_note("assign a long string in the constructor instead (`$this->text = LONG_TEXT;`)");
+                return;
+            }
+        }
+    }
+
     /// Counts `n` more inherited members; true (after reporting it once) when
     /// that goes over `MAX_INHERITED_MEMBERS`, and the members are then not copied.
     fn over_inherit_limit(&mut self, n: usize, decl: &ClassDecl) -> bool {
@@ -2672,7 +2721,8 @@ impl<'a> Checker<'a> {
 
     fn check_bodies(&mut self) {
         let mut fid = 0;
-        while fid < self.funcs.len() {
+        // Past the budget of large types (an error was reported), the rest is not checked.
+        while fid < self.funcs.len() && !self.reported_type_nodes {
             if !matches!(self.funcs[fid].body, Body::Done) {
                 self.check_func(fid as FuncId);
             }
@@ -2820,7 +2870,12 @@ impl<'a> Checker<'a> {
         };
         self.note_scope(code_span, &ctx);
         self.type_params.clear();
-        if !ctx.flow.dead && !matches!(ret, Type::Void | Type::Error) && kind != FuncKind::Template && !is_abstract {
+        if !ctx.flow.dead
+            && !matches!(ret, Type::Void | Type::Error)
+            && kind != FuncKind::Template
+            && !is_abstract
+            && !self.reported_type_nodes
+        {
             let msg = format!("`{name}` must return a value of type `{}` on every path", self.tn(&ret));
             self.error(msg, span);
         }
@@ -2986,20 +3041,32 @@ pub(crate) fn subst_params(t: &Type, names: &[Name], args: &[Type]) -> Type {
     if names.is_empty() || !has_param(t) {
         return t.clone();
     }
+    let sizes: Vec<usize> = args.iter().map(|a| type_size(a, MAX_TYPE_SIZE)).collect();
+    if sizes.iter().any(|&n| n > 1) && subst_size(t, names, &sizes) > MAX_TYPE_SIZE {
+        note_too_large();
+        return Type::Error;
+    }
+    subst_params_in(t, names, args)
+}
+
+fn subst_params_in(t: &Type, names: &[Name], args: &[Type]) -> Type {
+    if !has_param(t) {
+        return t.clone();
+    }
     match t {
         Type::Param(n) => match names.iter().position(|p| p == n) {
             Some(i) => args.get(i).cloned().unwrap_or(Type::Error),
             None => t.clone(),
         },
-        Type::List(x) => Type::list(subst_params(x, names, args)),
-        Type::Set(x) => Type::set(subst_params(x, names, args)),
-        Type::Map(k, v) => Type::map(subst_params(k, names, args), subst_params(v, names, args)),
+        Type::List(x) => Type::list(subst_params_in(x, names, args)),
+        Type::Set(x) => Type::set(subst_params_in(x, names, args)),
+        Type::Map(k, v) => Type::map(subst_params_in(k, names, args), subst_params_in(v, names, args)),
         Type::Func(ps, r) => Type::Func(
-            ps.iter().map(|p| subst_params(p, names, args)).collect(),
-            Box::new(subst_params(r, names, args)),
+            ps.iter().map(|p| subst_params_in(p, names, args)).collect(),
+            Box::new(subst_params_in(r, names, args)),
         ),
-        Type::Union(ms) => Type::union(ms.iter().map(|m| subst_params(m, names, args)).collect()),
-        Type::Class(c, xs) => Type::Class(*c, xs.iter().map(|x| subst_params(x, names, args)).collect()),
+        Type::Union(ms) => Type::union(ms.iter().map(|m| subst_params_in(m, names, args)).collect()),
+        Type::Class(c, xs) => Type::Class(*c, xs.iter().map(|x| subst_params_in(x, names, args)).collect()),
         other => other.clone(),
     }
 }
@@ -3015,11 +3082,20 @@ fn param_text(p: &ParamInfo, show: impl Fn(&Type) -> String) -> String {
 /// The number of nodes `subst_params(t, names, args)` would have (at most),
 /// where `sizes` are the numbers of nodes of `args`.
 fn subst_size(t: &Type, names: &[Name], sizes: &[usize]) -> usize {
+    replaced_size(t, |t| match t {
+        Type::Param(p) => names.iter().position(|x| x == p).map(|i| sizes.get(i).copied().unwrap_or(1)),
+        _ => None,
+    })
+}
+
+/// The number of nodes `t` would have (at most) with some of its leaves
+/// replaced: `size_of` gives the size of what replaces a leaf, or `None` for
+/// one that stays.
+pub(crate) fn replaced_size(t: &Type, size_of: impl Fn(&Type) -> Option<usize>) -> usize {
     let mut n = 0usize;
     let mut stack = vec![t];
     while let Some(t) = stack.pop() {
         let own = match t {
-            Type::Param(p) => names.iter().position(|x| x == p).map_or(1, |i| sizes.get(i).copied().unwrap_or(1)),
             Type::List(e) | Type::Set(e) => {
                 stack.push(e);
                 1
@@ -3041,15 +3117,33 @@ fn subst_size(t: &Type, names: &[Name], sizes: &[usize]) -> usize {
                 stack.extend(args.iter());
                 1
             }
-            _ => 1,
+            t => size_of(t).unwrap_or(1),
         };
         n = n.saturating_add(own);
     }
     n
 }
 
+thread_local! {
+    /// Set when a type would have grown past `MAX_TYPE_SIZE` and `Type::Error`
+    /// was made instead (by `subst_params`, inference or a join); the
+    /// expression or statement being checked then reports it.
+    static TOO_LARGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn note_too_large() {
+    TOO_LARGE.with(|c| c.set(true));
+}
+
+pub(crate) fn take_too_large() -> bool {
+    TOO_LARGE.with(|c| c.replace(false))
+}
+
 /// The number of nodes in `t`, counting stopped past `limit`.
-fn type_size(t: &Type, limit: usize) -> usize {
+pub(crate) fn type_size(t: &Type, limit: usize) -> usize {
+    if !matches!(t, Type::List(_) | Type::Set(_) | Type::Map(..) | Type::Func(..) | Type::Union(_) | Type::Class(..)) {
+        return 1;
+    }
     let mut n = 0;
     let mut stack = vec![t];
     while let Some(t) = stack.pop() {

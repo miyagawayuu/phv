@@ -13,12 +13,17 @@ static ALLOC: CountingAlloc = CountingAlloc;
 /// Returns the result (output or first error), the most memory held at once
 /// and the time taken.
 fn compile_src(name: &str, src: String) -> (String, usize, Duration) {
+    compile_on(name, src, 64 << 20)
+}
+
+/// `compile_src` on a thread with a stack of `stack` bytes.
+fn compile_on(name: &str, src: String, stack: usize) -> (String, usize, Duration) {
     let dir = std::env::temp_dir().join(format!("phv-compile-cost-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let entry = dir.join("main.phv");
     std::fs::write(&entry, src).unwrap();
     let (d, e) = (dir.clone(), entry.clone());
-    let worker = std::thread::Builder::new().stack_size(64 * 1024 * 1024);
+    let worker = std::thread::Builder::new().stack_size(stack);
     let out = worker
         .spawn(move || {
             let base = thread_allocated();
@@ -193,4 +198,150 @@ fn narrowing_costs_what_branches_change() {
     assert_eq!(out, "0 9999");
     assert!(peak < 400 << 20, "held {} MB", peak >> 20);
     assert!(took < Duration::from_secs(120), "took {took:?}");
+}
+
+/// A generic call can double the type of its argument (`function dbl<T>(T
+/// $x): fn(T): T`; 24 lines took 4.5 GB and 15 s), and closures that return
+/// one of the two before grow like Fibonacci numbers: inferred types are
+/// measured before they are built and refused past 10,000 nodes. Each use of a
+/// value copies its type, so large ones also count against a total.
+#[test]
+fn inferred_types_stay_small() {
+    let dbl = "function dbl<T>(T $x): fn(T): T { return fn(T $y): T => $x; }\n$a0 = 1;\n";
+    let mut src = format!("<?phv\n{dbl}");
+    for i in 1..30 {
+        src += &format!("$a{i} = dbl($a{});\n", i - 1);
+    }
+    src += "echo 1;\n";
+    let (out, peak, _) = compile_src("dbl", src);
+    assert!(out.contains("the type of this expression is too large (more than 10000 type nodes)"), "{out}");
+    assert!(peak < 64 << 20, "held {} MB", peak >> 20);
+
+    let mut src = String::from("<?phv\n$c = strlen(\"x\") == 1;\n$f0 = fn(): int => 1;\n$f1 = fn(): string => \"\";\n");
+    for i in 2..40 {
+        src += &format!("$f{i} = fn() => $c ? $f{} : $f{};\n", i - 1, i - 2);
+    }
+    src += "echo 1;\n";
+    let (out, peak, _) = compile_src("fib", src);
+    assert!(out.contains("is too large (more than 10000 type nodes)"), "{out}");
+    assert!(peak < 64 << 20, "held {} MB", peak >> 20);
+
+    // 2,000 uses of a value whose type has 8,191 nodes.
+    let mut src = format!("<?phv\n{dbl}");
+    for i in 1..13 {
+        src += &format!("$a{i} = dbl($a{});\n", i - 1);
+    }
+    src += &format!("$all = [{}];\necho 1;\n", vec!["$a12"; 2000].join(", "));
+    let (out, peak, _) = compile_src("uses", src);
+    assert!(out.contains("are too large in total (more than 2000000 type nodes)"), "{out}");
+    assert!(peak < 200 << 20, "held {} MB", peak >> 20);
+    // A generic call that wraps its argument in one more list each time: 30,000
+    // lines took 60 GB (each variable held its own copy of a longer type).
+    let wrap = "function wrap<T>(T $x): list<T> { return [$x]; }\n$a0 = 1;\n";
+    let mut src = format!("<?phv\n{wrap}");
+    for i in 1..30_000 {
+        src += &format!("$a{i} = wrap($a{});\n", i - 1);
+    }
+    let (out, peak, _) = compile_src("wrap", src + "echo 1;\n");
+    assert!(out.contains("are too large in total (more than 2000000 type nodes)"), "{}", &out[..out.len().min(300)]);
+    assert!(peak < 400 << 20, "held {} MB", peak >> 20);
+    // A type 9,900 levels deep (as deep as 10,000 nodes allow) is shown in a
+    // message, on the 16 MB stack of a `phv serve` worker.
+    let ty = format!("{}T{}", "list<".repeat(450), ">".repeat(450));
+    let mut src = format!("<?phv\nfunction w<T>(T $x): {ty} {{ return []; }}\n$a0 = 1;\n");
+    for i in 1..=22 {
+        src += &format!("$a{i} = w($a{});\n", i - 1);
+    }
+    let (out, _, _) = compile_on("deep", src + "$b = $a22 + 1;\n", 16 << 20);
+    assert!(out.contains("cannot apply `+` to `list<list<"), "{}", &out[..out.len().min(300)]);
+
+    // A few levels are fine.
+    let mut src = format!("<?phv\n{dbl}");
+    for i in 1..8 {
+        src += &format!("$a{i} = dbl($a{});\n", i - 1);
+    }
+    src += "echo $a7($a6)($a5)($a4)($a3)($a2)($a1)($a0);\n";
+    let (out, _, _) = compile_src("dbl_ok", src);
+    assert_eq!(out, "1");
+}
+
+/// A long constant string is held once: as a property's default it was copied
+/// for each class that has the property (1,000 subclasses of a class with a
+/// 1 MiB default took 2.5 GB, and a 1 GB cache entry), and each use of it
+/// hashed the whole text again (100,000 uses took 21 s).
+#[test]
+fn long_constant_strings_are_not_copied() {
+    let mut consts = String::from("<?phv\nconst C0 = \"xxxxxxxxxxxxxxxx\";\n");
+    for i in 1..17 {
+        consts += &format!("const C{i} = C{} . C{};\n", i - 1, i - 1);
+    }
+    let classes = |n: usize| -> String {
+        let mut s = format!("{consts}class A {{ public string $s = C16; }}\n");
+        for i in 0..n {
+            s += &format!("class K{i} extends A {{ }}\n");
+        }
+        s + "echo strlen((new K0())->s);\n"
+    };
+    let (out, peak, _) = compile_src("fields", classes(100));
+    assert!(out.contains("the default values of the properties of all classes are too long in total"), "{out}");
+    assert!(peak < 64 << 20, "held {} MB", peak >> 20);
+    let (out, _, _) = compile_src("fields_ok", classes(10));
+    assert_eq!(out, "1048576");
+
+    let uses = |c: &str| {
+        format!("{consts}function f(): int {{\n{}return 0;\n}}\necho f();\n", format!("$s = {c};\n").repeat(2000))
+    };
+    let (out, _, short) = compile_src("uses_short", uses("C0"));
+    assert_eq!(out, "0");
+    let (out, _, long) = compile_src("uses_long", uses("C16"));
+    assert_eq!(out, "0");
+    assert!(long < short * 3 + Duration::from_secs(2), "{long:?} for 1 MiB, {short:?} for 16 bytes");
+}
+
+/// Long `elseif` chains, statements nested without braces and types nested in
+/// types count against the nesting limit: 60,000 `elseif`s, or 75,000 nested
+/// types, overflowed the stack and ended the process. They are checked on a
+/// thread with the 16 MB stack that `phv serve` gives its workers.
+#[test]
+fn long_chains_and_deep_types_are_limited() {
+    type Shape = fn(usize) -> String;
+    let shapes: Vec<(&str, Shape)> = vec![
+        ("elseif", |n| {
+            let arms: String = (1..n).map(|i| format!("elseif ($a == {i}) {{ echo {i}; }}\n")).collect();
+            format!("<?phv\n$a = strlen(\"x\");\nif ($a == 0) {{ echo 0; }}\n{arms}")
+        }),
+        ("else_if", |n| {
+            let arms: String = (1..n).map(|i| format!("else if ($a == {i}) {{ echo {i}; }}\n")).collect();
+            format!("<?phv\n$a = strlen(\"x\");\nif ($a == 0) {{ echo 0; }}\n{arms}")
+        }),
+        ("template_elseif", |n| {
+            let arms: String = (1..n).map(|i| format!("elseif ($a == {i}):\necho {i};\n")).collect();
+            format!("<?phv\n$a = strlen(\"x\");\nif ($a == 0):\necho 0;\n{arms}endif;\n")
+        }),
+        ("unbraced", |n| format!("<?phv\n$a = true;\n{}echo 1;\n", "if ($a) ".repeat(n))),
+        ("unbraced_loops", |n| format!("<?phv\n{}echo 1;\n", "foreach ([1] as $x) ".repeat(n))),
+        ("generic_type", |n| {
+            format!(
+                "<?phv\nfunction f({}int{} $x): int {{ return 1; }}\necho f([]);\n",
+                "list<".repeat(n),
+                ">".repeat(n)
+            )
+        }),
+        ("paren_type", |n| {
+            format!("<?phv\nfunction f({}int{} $x): int {{ return $x; }}\necho f(1);\n", "(".repeat(n), ")".repeat(n))
+        }),
+        ("fn_type", |n| {
+            format!("<?phv\nfunction f({}int $x): int {{ return 1; }}\necho f(null);\n", "?fn(): ".repeat(n))
+        }),
+    ];
+    for (name, shape) in shapes {
+        let (out, _, _) = compile_on(name, shape(50_000), 16 << 20);
+        assert!(
+            out.contains("code is nested too deeply (more than 500 levels)"),
+            "{name}: {}",
+            &out[..out.len().min(300)]
+        );
+        let (out, _, _) = compile_on(name, shape(240), 16 << 20);
+        assert_eq!(out, "1", "{name}");
+    }
 }

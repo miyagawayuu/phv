@@ -422,6 +422,80 @@ fn profile_report(prog: &phv_vm::Program, p: &phv_vm::vm::Profile) -> String {
     out
 }
 
+/// Writes `tree` (the one-line `Debug` text of a syntax tree) a field per
+/// line, indented by depth, as `{:#?}` would. The indentation stops growing
+/// past 32 levels: `{:#?}` takes time and output in proportion to the depth
+/// for each line (found by the 1.2.0 audit: deep input took cubic time).
+fn indent_tree(tree: &str, out: &mut impl Write) -> std::io::Result<()> {
+    const MAX_INDENT: usize = 32;
+    let pad = |out: &mut dyn Write, depth: usize| -> std::io::Result<()> {
+        out.write_all(b"\n")?;
+        for _ in 0..depth.min(MAX_INDENT) {
+            out.write_all(b"    ")?;
+        }
+        Ok(())
+    };
+    let b = tree.as_bytes();
+    let (mut i, mut depth, mut quote) = (0, 0usize, None);
+    while i < b.len() {
+        let c = b[i];
+        if let Some(q) = quote {
+            if c == b'\\' && i + 1 < b.len() {
+                out.write_all(&b[i..i + 2])?;
+                i += 2;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            out.write_all(&[c])?;
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => {
+                quote = Some(c);
+                out.write_all(&[c])?;
+            }
+            b'{' | b'[' | b'(' => {
+                let close = match c {
+                    b'{' => b'}',
+                    b'[' => b']',
+                    _ => b')',
+                };
+                let rest = &b[i + 1..];
+                let skip = rest.iter().take_while(|x| **x == b' ').count();
+                if rest.get(skip) == Some(&close) {
+                    out.write_all(&[c, close])?;
+                    i += skip + 2;
+                    continue;
+                }
+                out.write_all(&[c])?;
+                depth += 1;
+                pad(out, depth)?;
+                i += 1 + skip;
+                continue;
+            }
+            b'}' | b']' | b')' => {
+                depth = depth.saturating_sub(1);
+                out.write_all(b",")?;
+                pad(out, depth)?;
+                out.write_all(&[c])?;
+            }
+            b',' => {
+                out.write_all(b",")?;
+                pad(out, depth)?;
+                i += 1 + b[i + 1..].iter().take_while(|x| **x == b' ').count();
+                continue;
+            }
+            b' ' if matches!(b.get(i + 1), Some(b'}' | b']' | b')')) => {}
+            _ => out.write_all(&[c])?,
+        }
+        i += 1;
+    }
+    out.write_all(b"\n")
+}
+
 fn main() -> ExitCode {
     // An executable made by `phv build` runs what it carries instead.
     if let Some(bundle) = phv_driver::bundle::read_own() {
@@ -608,7 +682,9 @@ fn exec(cmd: Command) -> ExitCode {
             let mut sources = phv_syntax::SourceMap::default();
             let id = sources.add(file.display().to_string(), Some(file.clone()), text);
             let (module, diags) = phv_syntax::parse_module(&sources.get(id).text, id, is_template);
-            println!("{module:#?}");
+            let tree = format!("{module:?}");
+            let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+            let _ = indent_tree(&tree, &mut out).and_then(|_| out.flush());
             if diags.is_empty() {
                 ExitCode::SUCCESS
             } else {
@@ -709,6 +785,27 @@ fn exec(cmd: Command) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    /// `phv parse` prints a tree as `{:#?}` does, and deep trees in time that
+    /// follows the size of the tree (the 1.2.0 audit: `{:#?}` took cubic time).
+    #[test]
+    fn syntax_trees_are_printed_in_linear_time() {
+        let src = "<?phv\n$a = [\"x{\" => '(', \"y\\\"]\" => fn(int $i): ?int => -$i];\nif ($a) { echo \"}\"; }\n";
+        let (module, _) = phv_syntax::parse_module(src, 0, false);
+        let mut out = Vec::new();
+        super::indent_tree(&format!("{module:?}"), &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{module:#?}\n"));
+
+        let deep = |n: usize| {
+            let src = format!("<?phv\nfunction f({}int{} $x): int {{ return 1; }}\n", "list<".repeat(n), ">".repeat(n));
+            let (module, _) = phv_syntax::parse_module(&src, 0, false);
+            let mut out = Vec::new();
+            super::indent_tree(&format!("{module:?}"), &mut out).unwrap();
+            out.len()
+        };
+        // 400 levels print at most 40 times what 40 levels do (the indentation stops at 32 levels).
+        assert!(deep(400) < 40 * deep(40), "{} {}", deep(400), deep(40));
+    }
 
     /// `phv doc` does not write through a planted link (the v0.9.0 audit).
     #[cfg(unix)]

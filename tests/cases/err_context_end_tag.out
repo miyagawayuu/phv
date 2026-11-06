@@ -8,7 +8,7 @@ error: code right after `<` or `</` in a comment, an attribute value or raw text
 error: code right after `<` or `</` in a comment, an attribute value or raw text, where it could complete `</noscript>` (or, inside `<noscript>`, `<svg>` or `<math>`, another raw-text element's end tag)
  --> err_context_end_tag.phv:7:24
   |
-7 | <svg><p title="</<?phv f(); ?>"></p></svg>
+7 | <svg><a title="</<?phv f(); ?>"></a></svg>
   |                        ^
   = note: a browser would read that end tag there (this template or function may be written inside a `<noscript>`); put a space after `<`, or move the code
 

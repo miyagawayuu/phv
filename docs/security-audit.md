@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates fifteen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, §24 an assessment of the whole implementation before 1.1.0, and §25 an assessment of the whole implementation before 1.1.1.
+This report consolidates sixteen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, §24 an assessment of the whole implementation before 1.1.0, §25 an assessment of the whole implementation before 1.1.1, and §26 an assessment of the whole implementation before 1.2.0.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§25: 2026-11-06)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§25: 2026-11-06, §26: 2026-11-07)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -1600,3 +1600,147 @@ Regression tests:
 
 All tests pass on Windows and on Linux, with PostgreSQL 17, MySQL 8.4 and Redis 7, and with clippy (`-D warnings`) and
 rustfmt.
+
+## 26. Sixteenth Assessment: the Whole Implementation (before 1.2.0)
+
+Date: 2026-11-07. Scope: everything at bf7aee0. That is 1.1.1 plus the features of 1.2: sign-in with OAuth 2.0 and
+OpenID Connect (`std.oauth`), JSON Web Tokens signed with RS256, ES256, EdDSA and HS256 with key sets (`std.jwt`),
+streaming responses (`response()->flush()`) and OpenTelemetry traces (`[telemetry]`). Every earlier fix was attacked
+again, and the fixes of 1.1.1 (§25) were assessed for the first time.
+
+Seven reviewers each took one area: sign-in and tokens; the web server; the standard library and its clients; the
+compiler, the type checker, the VM and the JIT; templates, the website and the examples; the tools and their supply
+chain; and background jobs with the job and session stores. They attacked a release build locally, with fake
+identity providers, key-set servers and collectors on their own ports. Each finding was confirmed with a PoC. The
+template findings were also confirmed in Chrome, and the main session ran the most serious ones again. Seven groups
+then fixed every finding, each with regression tests. As they worked, three of them found and fixed more of the same
+kind; these are noted in the rows below.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| Critical | 1 | Fixed |
+| High | 2 | Fixed |
+| Medium | 13 | Fixed |
+| Low | 15 | Fixed |
+| Info | 9 | Fixed or documented |
+
+### Critical
+
+| # | Finding | Fix |
+|---|---|---|
+| R19-1 | The VS Code extension started `phv lsp` and `phv dap` by the bare name `phv`, with the opened folder as their working directory. On Windows a program found by name is looked for in the working directory before `PATH`, so opening a `.phv` file in a cloned folder ran the folder's own `phv.exe`. This held also in Restricted Mode, and in every published version of the extension | The extension finds `phv` itself: an absolute `phv.path`, or the first `.exe`/`.com` in an absolute `PATH` entry outside every workspace folder. It starts that file by its full path, from its own folder, with `NoDefaultCurrentDirectoryInExePath` set. A relative `phv.path` is refused |
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R19-2 | After a `try` with `finally`, the type checker kept what the `try` had proved about variables and forgot what the `finally` assigned: a narrowed variable could hold an object of another class. A script read and overwrote another class's private property, and a typed function returned null (a VM "compiler bug"). Found in the fixes: the step of a `for` loop and the condition of `do`-`while` ignored the paths that `continue`d | After a `finally`, what it assigns (and, when it calls anything, every property fact) comes from its end. The flow of each `continue` is joined into the step and the condition |
+| R19-3 | SQLite looked at the time limit only every 10,000 steps, and one step can be a function call on a 30 MB value: queries ran 12–468 seconds under a 1-second limit. Statements that read a long value over and over without allocating could run minutes more | PHV's own SQL functions check the time as they go. SQLite's allocations stop at the deadline, and the progress handler runs every 100 steps. Each statement's program is weighed when it is compiled, and one that would read long values too many times is refused. Values are limited to 16 MB |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R19-4 | A page that streamed to a visitor who had left, or answered a HEAD request, freed each flushed chunk twice in the count: a page under 32 MB took 400–794 MB | A chunk leaves the page's count only when it really leaves the page |
+| R19-5 | Streamed chunks went to the connection whole, so the kernel held them outside the output cap: 60 clients that do not read held 470 MB, where plain pages are refused after 17 | Streamed chunks are counted in slices of 64 KB, like other output |
+| R19-6 | Span names and attributes came from the request's method, which a visitor sets to any 63 KB token, and the exporter's queue was bounded by count only: 9,000 requests held 1.36 GB | Methods are named as OpenTelemetry says (`_OTHER` for others). Names and text attributes are cut to 1,024 bytes, and the queue is bounded at 16 MB too |
+| R19-7 | A `catch` after `flush()` inside its `try` cut the output at an offset from before the flush, so it wrote into a tag the flush had sent: an escaped value became an event handler | Handlers follow what was flushed. A `catch` that would write into HTML that was already sent stops the page, and the response is cut |
+| R19-8 | An `</svg>` or `</math>` that browsers ignore (while an HTML element in `<foreignObject>` or `<annotation-xml>` is open) put the template check out of step: a visitor's string ran in an SVG `<script>` with the page's nonce | The check follows the elements inside SVG and MathML as browsers do, and refuses what it cannot follow (such as breakout tags) |
+| R19-9 | `<![CDATA[` in literal SVG or MathML was read as a bogus comment ending at `>`; browsers read it to `]]>` | Read as browsers do; a `>` inside it is refused |
+| R19-10 | The rule of R18-2 (no `>` right after a value in a comment) did not see a loop's way back to its start: `<!-- <?phv foreach (…) { ?>> <a href=<?= $x ?><?phv } ?> -->` gave a live link | Loop bodies, `break`, `continue` and `finally` are checked against what may come before them |
+| R19-11 | The rule of R18-1 did not cover `Html` inserted into a comment, an attribute or raw text: a partial with a `<noscript>` fallback ended an enclosing `<noscript>` | `Html` holding `</noscript` (and, where the check may be out of step, any raw-text end tag) is refused there. `<` and `>` in `Html` in attributes are written as character references |
+| R19-12 | Inferred generic types had no size: `$a = dbl($a)` doubled per line, so 480 bytes took 4.5 GB. Found in the fixes: a type one level larger per line, copied at each use, took over 60 GB with 30,000 lines | A type has at most 10,000 nodes, and a program's large types 2,000,000 in all |
+| R19-13 | Long `elseif` chains, statements without braces under `if` and loops, and deeply nested types overflowed the stack and killed the process | They count against the nesting limit of 500 |
+| R19-14 | Constant strings were copied for each class's field defaults (inherited ones too) and at each use. A 24 KB source took 2.5 GB, and wrote a 1 GB cache entry on every run | Field defaults count against the 16 MiB constant budget, and strings are shared. Cache entries over 256 MB are not written |
+| R19-15 | The editor kept one analysis per open document, with no total: 20 pages held 1 GB | One budget for all kept analyses (250,000 tokens, 16 MB of source); old ones are dropped |
+| R19-16 | Keyed `enqueue()`s waiting for another transaction's key took the connections that the scheduler and adds near the cap use: a scheduled minute was lost, and other visitors' adds failed after 10 seconds | Keyed adds try briefly and hold no connection between tries. At most 8 wait per store and process, and others fail at once. The scheduler has connections of its own and tries a failed minute again |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R19-17 | An RSA key with a modulus of zero panicked instead of being refused, and one such key in a provider's key set failed every sign-in | Refused; a key set skips it |
+| R19-18 | `OAuth::callback()` after `flush()` did not use up the sign-in's state, so the callback could be replayed for 10 minutes | Refused after `flush()` |
+| R19-19 | Key sets and discovery documents were decoded outside the script's memory limit | Decoded within it |
+| R19-20 | A kept key set was found by its URL only, so two services that differ by a header (a tenant) shared one | Kept per service, headers and URL |
+| R19-21 | `rate_limit_reset(key)` also reset other keys that start with `key` and a NUL | Exactly its own key |
+| R19-22 | A fixed query parameter of an `[http]` service could be replaced by a spelling that PHP backends read as the same name (`account.id`, `account%20id`) | Names are compared as PHP and ASP.NET read them |
+| R19-23 | A streaming page held its worker until its time limit when the client stopped reading | `flush()` gives up after 10 seconds without progress |
+| R19-24 | A streamed form that wrote a CSRF token after `flush()` was sent without `Cache-Control: private, no-store` | A streamed head is personal when the request carries a cookie or `Authorization`; a token after `flush()` needs one |
+| R19-25 | A page could write a visitor's text unescaped as `text/plain` and then switch to `text/html` | The type cannot change to an escaped one after unescaped output |
+| R19-26 | Raw-text start tags inside `<select>` are ignored by older parsers but were read as raw text | Refused inside `<select>` |
+| R19-27 | Two values in a row in a comment (`-` and `Html` `-> …`) could end it | `Html` in a comment may not start with `>`, `!>`, `->` or `-!>` |
+| R19-28 | A running server's check for changed files went through a directory link to a share (R18-12) | Links on the way are checked too |
+| R19-29 | `phv install` followed a `path` package that is a link to a share, and the link check misread relative links when the project is reached through a link | Refused before it is opened; links are resolved against the real folder |
+| R19-30 | R18-14 could be passed by deallocating only the statements the client prepared to look up types | The reset checks every statement the client prepared, by name |
+| R19-31 | A site without a namespace swept the shared session store by its own `session_ttl`, removing other sites' sessions stored by 1.1 | Such sites have a table and keys of their own; the shared store is swept only by its 24-hour lifetime |
+
+### Info
+
+| # | Finding | Fix |
+|---|---|---|
+| R19-32 | An ES256 signature has two valid forms (high and low S), so a token's text is not unique | Documented: check `jti` for replays |
+| R19-33 | The older `jwt_decode` accepted `crit` and an `iat` in the future | Refused, as in `std.jwt` |
+| R19-34 | A plain OAuth 2.0 provider's `id_token` was passed on unverified; `token_type` was not checked; the RFC 9207 `iss` was checked after an error; a failed first fetch of a key set was tried again by every request | `idToken` is set only after verification; a `token_type` other than Bearer is refused; `iss` is checked first; failures are remembered for 10 seconds |
+| R19-35 | A discovery document could send the token request, with the client secret, in plain text to a loopback port of the provider's choosing | Discovered endpoints keep the issuer's scheme, and loopback hosts only when the issuer is one |
+| R19-36 | PHV's SQL functions allocated outside SQLite's budget | Checked against the script's memory |
+| R19-37 | `phv fmt` wrote through hard links | Refused |
+| R19-38 | `phv parse` printed deep trees in cubic time; `hexdec()` and its kind quoted the whole argument in errors | Linear; 64 characters at most |
+| R19-39 | With `[telemetry]` or `request_ids`, requests to third parties carry `traceparent` | Documented (as before) |
+| R19-40 | §25's residual risks were checked again: the type checker's re-reading of nested bodies (240 levels around 200,000 statements: 4 seconds), the collector's budget, the program budget | Hold as written |
+
+### Residual Risks
+
+- A statement at the weight limit can still run about 3 seconds past the time limit on a fast machine, and more on
+  a slow one. Statements heavier than the limit (more than about 30 columns of arithmetic on values) are refused and
+  must be split.
+- A streaming client that stops reading holds a worker for up to 10 seconds.
+- The template check now refuses some markup that browsers would accept. Examples are unclosed HTML elements inside
+  `<foreignObject>`, breakout tags in SVG, any element in `<annotation-xml>` other than `<svg>`, and loops in SVG
+  that leave elements open. Inside SVG, a value that completes the end tag of a raw-text element other than
+  `<noscript>` is still caught when the page runs.
+- If a script deallocates some of the client's type lookups in the same run as the first lookup, one later statement
+  on that connection can fail once before the connection is closed.
+- Concurrent requests during the very first fetch of a key set all wait for it.
+- While 1.1.1 and 1.2 processes of a site without a namespace run side by side, the older ones do not read sessions
+  the newer ones stored.
+- §25's residual risks remain, apart from those checked above.
+
+### Verification
+
+The PoCs were run again against the fixed build (before → after):
+- the extension, with a marker `phv.exe` in the opened folder: started from the folder → started from the installed
+  `phv` by its full path;
+- `finally` type confusion: accepted, and a private property read and overwritten → refused at check;
+- SQLite: 468, 202, 24 and 18 seconds under 1 → 1.1. Statements reading a 16 MB value 1,000 times: 66 seconds →
+  refused in 0.1;
+- streaming after the visitor left: 395 MB under 32 MB → 56 MB and a memory error. Stalled readers: 60 admitted → 18
+  (plain pages 17). Long methods: 507 MB → 17 MB;
+- the template PoCs (SVG breakout, CDATA, the loop, `</noscript` in `Html`, two values) are refused at check or stop
+  when the page runs. The differential check of §24, extended to 6,048 templates around SVG, MathML, `<select>` and
+  `<noscript>`, flags none (450 before). All 237 templates in the repository check as before;
+- generic types: 4.5 GB → 4 MB and an error. Deep chains: a stack overflow → an error in 0.1 seconds. Constant strings:
+  2.5 GB and a 1 GB cache file → 6 MB and an error;
+- the editor with 20 pages: 1,064 MB held → 6 MB;
+- jobs: other visitors' adds while keys are held, 3 of 28 failed and a minute was lost → 81 of 81 within 1.6 seconds,
+  and every minute ran;
+- sign-in: a zero-modulus key in a provider's set, 500 → 200; a replayed callback after `flush()`, accepted three
+  times → refused; a token of one tenant through another's service, valid → invalid.
+
+Ordinary programs check and run at the same speed (137 test cases and examples: 2.06 and 2.08 seconds).
+
+Regression tests are named after what they check, in each crate's tests and in `tests/cases` (`err_finally_flow`,
+`finally_flow`, `err_svg_end_ignored`, `err_svg_cdata`, `err_loop_comment_start`, `err_select_raw_text`,
+`err_html_noscript_in_comment`, `err_html_noscript_in_textarea`, `err_html_raw_end_in_svg_comment`,
+`err_html_comment_start`, `jwt`, `numbers`). Some of the others:
+- `flush.rs`, `stream.rs`: streaming;
+- `compile_cost.rs`: types, chains and constants;
+- `sqlite_limits.rs`: SQLite's time and memory;
+- `databases.rs`: keyed waits, the scheduler and type lookups;
+- `jwks.rs`, `oauth.rs`: key sets and sign-in;
+- `editors/vscode/test/phv-path.test.js`: finding `phv`.
+
+All tests pass on Windows and on Linux, with PostgreSQL 17, MySQL 8.4 and Redis 7, and with clippy (`-D warnings`)
+and rustfmt.

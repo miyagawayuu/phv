@@ -14,9 +14,14 @@ use std::alloc::Layout;
 use std::cell::Cell;
 use std::ffi::{c_int, c_void};
 use std::sync::OnceLock;
+use std::time::Instant;
 
 /// The bytes before each allocation that hold its size (and keep it aligned).
 const HEADER: usize = 16;
+
+/// While a budget with a deadline is set, the deadline is looked at again
+/// once SQLite has allocated this many bytes since the last look.
+const LOOK_EVERY: usize = 1 << 20;
 
 thread_local! {
     // Const-initialized and without a destructor: read from inside the allocator.
@@ -24,6 +29,12 @@ thread_local! {
     static CAP: Cell<isize> = const { Cell::new(isize::MAX) };
     /// Whether an allocation was refused since the budget was set.
     static REFUSED: Cell<bool> = const { Cell::new(false) };
+    /// The script's deadline, after which SQLite's allocations fail.
+    static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// Bytes allocated since the deadline was last looked at.
+    static SINCE: Cell<usize> = const { Cell::new(0) };
+    /// Whether an allocation was refused because the deadline had passed.
+    static LATE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Makes SQLite allocate through the program's allocator. It must run before
@@ -48,9 +59,15 @@ pub(super) fn init() -> bool {
 }
 
 /// While it lives, SQLite's allocations on this thread fail once the script
-/// would pass its memory limit.
+/// would pass its memory limit, and once its time limit has passed.
+///
+/// The deadline is looked at every `LOOK_EVERY` bytes SQLite allocates (found
+/// by the 1.2.0 audit: SQLite's progress handler runs only between steps, and
+/// a step may make a value of many MB; a run of such steps without a jump
+/// between them never calls the handler).
 pub(super) struct Budget {
     prev: isize,
+    prev_deadline: Option<Instant>,
 }
 
 impl Budget {
@@ -60,24 +77,61 @@ impl Budget {
             None => isize::MAX,
         };
         let prev = CAP.with(|c| c.replace(cap));
+        let prev_deadline = DEADLINE.with(|d| d.replace(vm.deadline()));
         REFUSED.with(|r| r.set(false));
-        Budget { prev }
+        LATE.with(|r| r.set(false));
+        SINCE.with(|s| s.set(0));
+        Budget { prev, prev_deadline }
     }
 
     /// Whether SQLite was refused memory since the budget was set.
     pub(super) fn refused() -> bool {
         REFUSED.with(Cell::get)
     }
+
+    /// Whether SQLite was refused memory since the budget was set because
+    /// the time limit had passed.
+    pub(super) fn late() -> bool {
+        LATE.with(Cell::get)
+    }
 }
 
 impl Drop for Budget {
     fn drop(&mut self) {
         CAP.with(|c| c.set(self.prev));
+        DEADLINE.with(|d| d.set(self.prev_deadline));
     }
+}
+
+/// Whether `more` bytes, which code of ours (an SQL function) is about to
+/// allocate while SQLite runs, fit in the budget (and notes that they did
+/// not). They are refused as SQLite's own would be.
+pub(super) fn room(more: usize) -> bool {
+    !over(more)
+}
+
+/// Whether the deadline has passed, looked at once `more` bytes bring the
+/// bytes allocated since the last look to `LOOK_EVERY` (and notes that it had).
+fn late(more: usize) -> bool {
+    let Some(deadline) = DEADLINE.try_with(Cell::get).ok().flatten() else { return false };
+    let since = SINCE.try_with(Cell::get).unwrap_or(0).saturating_add(more);
+    if since < LOOK_EVERY {
+        let _ = SINCE.try_with(|s| s.set(since));
+        return false;
+    }
+    let _ = SINCE.try_with(|s| s.set(0));
+    if Instant::now() <= deadline {
+        return false;
+    }
+    let _ = LATE.try_with(|r| r.set(true));
+    true
 }
 
 /// Whether `more` bytes would pass the budget (and notes that they did).
 fn over(more: usize) -> bool {
+    if late(more) {
+        return true;
+    }
     let cap = CAP.try_with(Cell::get).unwrap_or(isize::MAX);
     if cap == isize::MAX || thread_allocated().saturating_add(more.min(isize::MAX as usize) as isize) <= cap {
         return false;

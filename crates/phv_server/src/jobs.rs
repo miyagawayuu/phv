@@ -297,24 +297,46 @@ impl State {
     }
 }
 
+/// A minute of a schedule whose job could not be added is tried again this
+/// often, for this long at most.
+const SCHEDULE_RETRY: Duration = Duration::from_secs(5);
+const SCHEDULE_RETRY_FOR: i64 = 3600;
+
 /// Adds the jobs of `[[schedule]]` when their minute comes, and cleans the
 /// store up once a minute. Every process does: on a shared store, the key of
 /// each minute adds the job once.
+///
+/// A minute whose job could not be added (the store did not answer in time)
+/// is tried again a few seconds later, for an hour at most, with the minutes
+/// after it (found by the 1.2 audit: such a minute was lost).
 fn schedule(state: &State, store: &Store, stop: &AtomicBool) {
     let mut last = now_secs();
     let mut swept = Instant::now();
+    // The first minute that failed, while it is tried again, and when.
+    let mut failing: Option<i64> = None;
+    let mut retry_at = Instant::now();
     while !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(250));
         let now = now_secs();
-        if now == last {
+        if now == last || Instant::now() < retry_at {
             continue;
         }
-        for e in add_scheduled(&state.config.schedules, store, last, now) {
-            state.metrics.health.failed(StoreKind::Jobs);
-            eprintln!("warning: {e}");
+        let failed = add_scheduled(&state.config.schedules, store, last, now);
+        match failed.iter().map(|(minute, _)| *minute).min() {
+            Some(first) => {
+                state.metrics.health.failed(StoreKind::Jobs);
+                // Once for each minute that fails, not at every try.
+                if failing != Some(first) {
+                    for (_, e) in &failed {
+                        eprintln!("warning: {e}; trying again");
+                    }
+                }
+                failing = Some(first);
+                retry_at = Instant::now() + SCHEDULE_RETRY;
+            }
+            None => failing = None,
         }
-        // A clock set back is not run again; one set forward runs the minutes it skipped (at most 60).
-        last = now.max(last);
+        last = looked_until(last, now, failing);
         if swept.elapsed() >= Duration::from_secs(60) {
             swept = Instant::now();
             if let Err(e) = store.sweep() {
@@ -325,21 +347,33 @@ fn schedule(state: &State, store: &Store, stop: &AtomicBool) {
     }
 }
 
+/// Where the next look at the schedule starts after one from `last` to `now`
+/// in which the minute `failed` (the first) could not be added: just before
+/// it, for an hour at most. A clock set back is not run again; one set forward
+/// runs the minutes it skipped (at most 60).
+fn looked_until(last: i64, now: i64, failed: Option<i64>) -> i64 {
+    match failed {
+        Some(first) => (first - 1).max(now - SCHEDULE_RETRY_FOR).max(last),
+        None => now.max(last),
+    }
+}
+
 /// Adds the jobs of `schedules` whose minute is after `from` and at most `to`
 /// (Unix seconds; at most 60 minutes of each), keyed by the minute: on a shared
-/// store, every process adding them adds each job once. The errors, if any.
+/// store, every process adding them adds each job once. The minutes whose
+/// job could not be added, with the errors.
 pub(crate) fn add_scheduled(
     schedules: &[phv_driver::config::Schedule],
     store: &Store,
     from: i64,
     to: i64,
-) -> Vec<String> {
+) -> Vec<(i64, String)> {
     let mut errors = Vec::new();
     for s in schedules {
         for minute in s.cron.due(from, to, 60) {
             let key = phv_std::jobs::schedule_key(&s.job, minute);
-            if let Err(e) = store.add(&s.job, "", 0, Some(&key)) {
-                errors.push(format!("the scheduled job {} could not be added ({e})", s.job));
+            if let Err(e) = store.add_scheduled(&s.job, &key) {
+                errors.push((minute, format!("the scheduled job {} could not be added ({e})", s.job)));
             }
         }
     }
@@ -358,6 +392,21 @@ mod tests {
         assert_eq!(retry_wait(first, 4), Duration::from_secs(240));
         assert_eq!(retry_wait(first, 10), MAX_RETRY_WAIT);
         assert_eq!(retry_wait(first, 100), MAX_RETRY_WAIT);
+    }
+
+    /// A minute whose job could not be added is looked at again, with those
+    /// after it, for an hour at most (found by the 1.2 audit: it was lost).
+    #[test]
+    fn a_minute_that_failed_is_tried_again() {
+        let minute = 1_793_000_040;
+        assert_eq!(looked_until(minute - 30, minute + 5, None), minute + 5);
+        // Failed at the minute: the next look starts just before it.
+        assert_eq!(looked_until(minute - 30, minute + 5, Some(minute)), minute - 1);
+        assert!(looked_until(minute - 1, minute + 600, Some(minute)) < minute);
+        // An hour later it is given up.
+        assert_eq!(looked_until(minute - 1, minute + 4000, Some(minute)), minute + 4000 - 3600);
+        // A clock set back is not run again.
+        assert_eq!(looked_until(minute + 100, minute, None), minute + 100);
     }
 
     /// Three processes look at the schedule each second for a day: each

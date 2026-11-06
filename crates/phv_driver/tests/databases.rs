@@ -141,6 +141,35 @@ fn a_connection_whose_statements_a_script_deallocated_is_not_reused() {
     assert_eq!(run_script(&host, "postgres_dealloc_after", Some(Duration::from_secs(30))), "y\ndone\n");
 }
 
+/// A script that deallocates only the statements the client prepared to look
+/// types up (here in a function, where PHV cannot see it) does not leave a
+/// connection that fails for later scripts: the reset finds them gone by
+/// their names and closes it; when they were prepared in the same run, so
+/// the reset never saw them, it is closed too; and when only some of them
+/// were, the first statement that fails on one closes it (found by the 1.2
+/// audit: such a connection failed for its whole life).
+#[test]
+fn a_connection_whose_type_lookups_a_script_deallocated_is_not_reused() {
+    let Some(url) = server("PHV_TEST_POSTGRES_URL") else { return };
+    // Pools of their own (pool_size 5 to 7): one connection each, used by the scripts in turn.
+    let host = |pool_size: usize| {
+        let spec = DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size };
+        Arc::new(Host { root: root(), databases: BTreeMap::from([("main".to_string(), spec)]), ..Host::default() })
+    };
+    let limit = Some(Duration::from_secs(30));
+    let (seen, same_run, partly) = (host(5), host(6), host(7));
+    assert_eq!(run_script(&seen, "postgres_typeinfo", limit), "x\n");
+    assert_eq!(run_script(&seen, "postgres_typeinfo_poison", limit), "deallocated\n");
+    assert_eq!(run_script(&seen, "postgres_typeinfo_after", limit), "y\n", "deallocated after the reset saw them");
+    assert_eq!(run_script(&same_run, "postgres_typeinfo_both", limit), "x\ndeallocated\n");
+    assert_eq!(run_script(&same_run, "postgres_typeinfo_after", limit), "y\n", "deallocated in the run that made them");
+    assert_eq!(run_script(&partly, "postgres_typeinfo_partial", limit), "x\ndeallocated\n");
+    let first = run_script(&partly, "postgres_typeinfo_after", limit);
+    assert!(first == "y\n" || first.contains("does not exist"), "{first}");
+    assert_eq!(run_script(&partly, "postgres_typeinfo_after", limit), "y\n", "some of them deallocated");
+    assert_eq!(run_script(&seen, "postgres_typeinfo_drop", limit), "done\n");
+}
+
 #[test]
 fn mysql() {
     let Some(url) = server("PHV_TEST_MYSQL_URL") else { return };
@@ -454,6 +483,64 @@ fn check_keyed_wait(url: &str) {
         assert_eq!(run_script(&host, "jobs_key_waits", limit), "0", "{url}: statements left waiting on the server");
         assert_eq!(holder.join().unwrap(), "rolled back", "{url}");
     });
+}
+
+/// While an open transaction holds a key and more scripts than the store has
+/// connections wait for it, the scheduler and a script adding another key add
+/// their jobs at once; the waits past `JOB_KEY_WAITERS` fail at once, and the
+/// others end when the transaction does (found by the 1.2 audit: the waits
+/// took every connection those used, a scheduled run was lost, and the other
+/// key failed after 10 s).
+fn check_held_key_waits(url: &str) {
+    let ns = "f4f4f4f4f4f4f4f4";
+    let host = jobs_host(url, ns, &["k"]);
+    let pool_size = host.databases["main"].pool_size;
+    let waiters = phv_std::jobs::JOB_KEY_WAITERS + pool_size;
+    let store = phv_std::jobs::Store::Db(host.databases["main"].clone(), Some(ns.into()));
+    // Far within the waits' time limit (8 s): no wait for a connection.
+    let at_once = Duration::from_secs(2);
+    std::thread::scope(|s| {
+        // Holds the key five seconds.
+        let holder = s.spawn(|| run_script(&host, "jobs_held_hold", Some(Duration::from_secs(60))));
+        std::thread::sleep(Duration::from_secs(2));
+        let waiting: Vec<_> = (0..waiters)
+            .map(|_| {
+                s.spawn(|| {
+                    let start = Instant::now();
+                    let out = run_script(&host, "jobs_held_add", Some(Duration::from_secs(8)));
+                    (start.elapsed(), out)
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(500));
+        for minute in [60, 120] {
+            let start = Instant::now();
+            let key = phv_std::jobs::schedule_key("k", 1_800_000_000 + minute);
+            assert!(store.add_scheduled("k", &key).is_ok_and(|r| r.is_some()), "{url}: the scheduled job");
+            assert!(start.elapsed() < at_once, "{url}: the scheduled job took {:?}", start.elapsed());
+            let start = Instant::now();
+            assert_eq!(run_script(&host, "jobs_other_key_add", Some(Duration::from_secs(8))), "added", "{url}");
+            assert!(start.elapsed() < at_once, "{url}: another key took {:?}", start.elapsed());
+        }
+        assert!(!holder.is_finished(), "{url}: the key is no longer held");
+        let outs: Vec<(Duration, String)> = waiting.into_iter().map(|w| w.join().unwrap()).collect();
+        let refused = outs.iter().filter(|(took, out)| out.contains("other adds wait") && *took < at_once).count();
+        assert_eq!(refused, waiters - phv_std::jobs::JOB_KEY_WAITERS, "{url}: {outs:?}");
+        let ended = outs.iter().filter(|(_, out)| out == "added" || out == "taken").count();
+        assert_eq!(ended, phv_std::jobs::JOB_KEY_WAITERS, "{url}: {outs:?}");
+        assert_eq!(outs.iter().filter(|(_, out)| out == "added").count(), 1, "{url}: {outs:?}");
+        assert_eq!(holder.join().unwrap(), "rolled back", "{url}");
+    });
+}
+
+#[test]
+fn waits_for_held_keys_leave_the_scheduler_its_connections() {
+    let _one_at_a_time = heavy();
+    for var in ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
+        if let Some(url) = server(var) {
+            check_held_key_waits(&url);
+        }
+    }
 }
 
 #[test]

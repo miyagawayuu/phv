@@ -1,0 +1,10 @@
+<?phv
+// `Html` inserted into a comment may not start with `>`, `!>`, `->` or `-!>`:
+// right after a value ending with `-` (or `--`, `--!`) it would end the
+// comment (found by the 1.2 audit: `"-"` then `-> next` wrote `-->`). The page
+// stops.
+$a = "-";
+?>
+<!-- path: <?= $a ?> <?= render("views/plain.phv.html") ?> -->
+<!-- path: <?= $a ?><?= render("views/arrow.phv.html") ?> <a href="x">old</a> -->
+not reached

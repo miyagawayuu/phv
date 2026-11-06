@@ -1,0 +1,19 @@
+<?phv
+// A loop's body may follow its own end (or a `continue`): in a comment, a body
+// that starts with `>`, `!>`, `->` or `-!>` may not end with a value, which
+// could end with `--` (found by the 1.2 audit: with `["--", "javascript:..."]`
+// the first line wrote a live link). After a `break`, what follows the loop
+// may follow a value too. Every line is an error but the last.
+$xs = ["--", "javascript:alert(1)"];
+$c = true;
+?>
+<!-- <?phv foreach ($xs as $x) { ?>> <a href=<?= $x ?><?phv } ?> -->x</a>
+<!-- <?phv foreach ($xs as $x): ?>-> <?= $x ?><?phv endforeach; ?> -->
+<!-- <?phv for ($i = 0; $i < 2; $i++) { ?>!> <?= $xs[$i] ?><?phv } ?> -->
+<!-- <?phv $i = 0; while ($i < 2) { ?>-!> <?= $xs[$i] ?><?phv $i++; } ?> -->
+<!-- <?phv do { ?>> <?= $xs[0] ?><?phv } while (false); ?> -->
+<!-- <?phv foreach ($xs as $x) { if ($c) { ?>><?phv } ?> <?= $x ?><?phv } ?> -->
+<!-- <?phv foreach ($xs as $x) { ?>> <?= $x ?><?phv if ($c) { continue; } ?> . <?phv } ?> -->
+<!-- <?phv foreach ($xs as $x) { ?> <?= $x ?><?phv if ($c) { break; } ?> . <?phv } ?>> -->
+<!-- <?= $xs[0] ?>!<?phv $c = false; ?>> -->
+<!-- <?phv foreach ($xs as $x) { ?> > <?= $x ?><?phv } ?> -->

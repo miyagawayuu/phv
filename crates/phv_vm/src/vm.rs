@@ -173,6 +173,17 @@ pub struct Span {
     pub error: bool,
 }
 
+impl Span {
+    /// A request's method as spans record it: a standard method, or `_OTHER`
+    /// (the OpenTelemetry convention). A request may name any method, up to
+    /// the length of its head (found by the 1.2 audit: 63 KB names, one per
+    /// span, filled the export queue with gigabytes).
+    pub fn method(m: &str) -> &'static str {
+        const KNOWN: [&str; 9] = ["GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"];
+        KNOWN.into_iter().find(|k| *k == m).unwrap_or("_OTHER")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpanKind {
     Internal,
@@ -190,8 +201,11 @@ pub enum SpanValue {
 /// Sends a page's response while it runs (`response()->flush()`).
 pub trait FlushSink: Send {
     /// Sends the response's head the first time (from `http`), then `chunk`
-    /// of the body. False once the client has gone away.
-    fn flush(&mut self, http: &mut HttpCtx, chunk: Vec<u8>) -> bool;
+    /// of the body. `Ok` when the chunk was handed on: its bytes leave this
+    /// thread (they are freed elsewhere, so the script's memory count lets
+    /// them go). `Err` gives the chunk back once the client has gone away (or
+    /// has stopped reading): it is freed on this thread, where it was counted.
+    fn flush(&mut self, http: &mut HttpCtx, chunk: Vec<u8>) -> Result<(), Vec<u8>>;
     /// The page ended: `chunk` is the rest of its output. Without this call
     /// (the page failed), the response is cut off.
     fn finish(&mut self, chunk: Vec<u8>);
@@ -636,12 +650,19 @@ struct Handler {
     in_guard: bool,
     /// `guards` when the `try` began.
     guards: usize,
+    /// `Vm::flushes` when the `try` began.
+    flushes: u64,
 }
 
 /// Why output was refused (see `Vm::guards`).
 const GUARDED_OUTPUT: &str = "a function wrote output inside a `<script>`, an attribute, a URL, CSS, a comment, \
     `<svg>`/`<math>` or the text of an element such as `<textarea>`, where HTML escaping does not protect it (or \
     browsers read its markup in another way); return the value (or `Html`) from the function and insert it with `<?= ?>`";
+
+/// Why a caught exception stopped the page (see `Vm::output_flushed`).
+const FLUSHED_GUARD: &str = "an exception was caught after response()->flush() sent part of a tag, an attribute, \
+    a `<script>` or similar HTML that the exception left unfinished, so the `catch` cannot write in its place; \
+    call flush() outside such HTML, or catch the exception where it is thrown";
 
 pub struct Vm {
     pub prog: Arc<Program>,
@@ -655,9 +676,11 @@ pub struct Vm {
     frames: Vec<Frame>,
     handlers: Vec<Handler>,
     /// Statements running in HTML other than element text, as (frame, output
-    /// depth): functions they call may not write to that output, where text
-    /// escaping would not protect what they write.
-    guards: Vec<(usize, usize)>,
+    /// depth, `flushes` when it began): functions they call may not write to
+    /// that output, where text escaping would not protect what they write.
+    guards: Vec<(usize, usize, u64)>,
+    /// How many times `response()->flush()` has sent the output so far.
+    flushes: u64,
     consts: Vec<Option<Value>>,
     pub out: Vec<OutBuf>,
     pub http: HttpCtx,
@@ -1023,6 +1046,7 @@ impl Vm {
             frames: Vec::new(),
             handlers: Vec::new(),
             guards: Vec::new(),
+            flushes: 0,
             consts: vec![None; nconsts],
             out: vec![OutBuf { buf: String::new(), html: html_output }],
             http: HttpCtx::default(),
@@ -1078,6 +1102,18 @@ impl Vm {
     pub fn take_output(&mut self) -> String {
         self.out.truncate(1);
         std::mem::take(&mut self.out[0].buf)
+    }
+
+    /// `response()->flush()` took the first `sent` bytes of the base output
+    /// and sent them: a `catch` can no longer take them back, so each `try`
+    /// that began before now drops only what was written after them.
+    pub fn output_flushed(&mut self, sent: usize) {
+        self.flushes += 1;
+        for h in &mut self.handlers {
+            if h.out_depth == 1 {
+                h.out_len = h.out_len.saturating_sub(sent);
+            }
+        }
     }
 
     /// Calls a PHV function from Rust (also used by builtins such as `map`).
@@ -1339,7 +1375,7 @@ impl Vm {
     /// frame below it runs in HTML other than element text, into the same output.
     fn output_allowed(&self, frame: usize) -> Result<(), VmError> {
         let depth = self.out.len();
-        if self.guards.iter().any(|&(f, d)| f < frame && d == depth) {
+        if self.guards.iter().any(|&(f, d, _)| f < frame && d == depth) {
             return Err(VmError::Fatal(GUARDED_OUTPUT.to_string()));
         }
         Ok(())
@@ -1806,6 +1842,16 @@ impl Vm {
                     match self.handlers.last() {
                         Some(h) if h.frame >= stop_at => {
                             let h = self.handlers.pop().unwrap();
+                            // The HTML the exception left open (or the `try` began in)
+                            // was sent by flush(): the `catch` cannot write where it
+                            // began, so the page stops and its response is cut off.
+                            let open = &self.guards[h.guards.min(self.guards.len())..];
+                            if (h.in_guard && h.out_depth == 1 && h.flushes < self.flushes)
+                                || open.iter().any(|&(_, d, at)| d == 1 && at < self.flushes)
+                            {
+                                self.unwind_to(stop_at);
+                                return Err(VmError::Fatal(FLUSHED_GUARD.to_string()));
+                            }
                             self.frames.truncate(h.frame + 1);
                             self.out.truncate(h.out_depth);
                             if h.in_guard || self.guards.len() > h.guards {
@@ -2525,7 +2571,7 @@ impl Vm {
                         let out_depth = self.out.len();
                         let out_len = self.out.last().map_or(0, |o| o.buf.len());
                         let guards = self.guards.len();
-                        let in_guard = self.guards.iter().any(|&(f, d)| f == fi && d == out_depth);
+                        let in_guard = self.guards.iter().any(|&(f, d, _)| f == fi && d == out_depth);
                         self.handlers.push(Handler {
                             frame: fi,
                             catch_pc: *catch,
@@ -2534,6 +2580,7 @@ impl Vm {
                             out_len,
                             in_guard,
                             guards,
+                            flushes: self.flushes,
                         });
                     }
                     Instr::TryEnd(n) => {
@@ -2607,7 +2654,7 @@ impl Vm {
                         reg!(*dst) = Value::Closure(Rc::new(Closure { func: *f, caps }));
                     }
 
-                    Instr::GuardOutput => self.guards.push((fi, self.out.len())),
+                    Instr::GuardOutput => self.guards.push((fi, self.out.len(), self.flushes)),
                     Instr::EndGuard => {
                         if matches!(self.guards.last(), Some(g) if g.0 == fi) {
                             self.guards.pop();
@@ -2638,7 +2685,7 @@ impl Vm {
                         match (ins, &v) {
                             (Instr::EchoAttr(_), Value::Html(s)) if self.out.last().is_some_and(|o| o.html) => {
                                 let buf = &mut self.out.last_mut().unwrap().buf;
-                                if s.contains(['"', '\'']) {
+                                if s.contains(['"', '\'', '<', '>']) {
                                     tri!(self.reserve(s.len().saturating_mul(6)));
                                     let buf = &mut self.out.last_mut().unwrap().buf;
                                     attr_quotes_into(s, buf);

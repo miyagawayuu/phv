@@ -1,0 +1,9 @@
+<?phv
+// `Html` holding `</noscript` may not be inserted into the text of a
+// `<textarea>` (or `<title>`...) either: inside a `<noscript>`, browsers with
+// scripting on end it there (found by the 1.2 audit). The page stops.
+$h = render("views/pixel.phv.html");
+?>
+<noscript><textarea><?= render("views/plain.phv.html") ?></textarea></noscript>
+<noscript><textarea><?= $h ?> <a href="<?= "javascript:alert(1)" ?>">x</a></textarea></noscript>
+not reached

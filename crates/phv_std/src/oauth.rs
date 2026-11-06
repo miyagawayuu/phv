@@ -15,7 +15,9 @@
 //! The endpoints of an OpenID Connect provider come from its discovery
 //! document (`<issuer>/.well-known/openid-configuration`), whose `issuer` must
 //! be the configured one; it is kept for an hour. Endpoints must use TLS,
-//! except on this machine or with `tls = false`.
+//! except on this machine or with `tls = false`; those of a discovery
+//! document use TLS when the issuer does, and are on this machine only when
+//! the issuer is.
 //!
 //! Failures the provider or the visitor cause come back as
 //! `["error" => code, "message" => text]` (std.oauth throws `OAuthError`);
@@ -121,6 +123,8 @@ static DISCOVERY: LazyLock<Mutex<HashMap<String, Kept>>> = LazyLock::new(|| Mute
 const DISCOVERY_AGE: Duration = Duration::from_secs(3600);
 const DISCOVERY_RETRY: Duration = Duration::from_secs(30);
 const DISCOVERY_STALE: Duration = Duration::from_secs(86_400);
+/// Issuers whose document could not be read and is not kept (see `jwt::Failures`).
+static DISCOVERY_FAILED: jwt::Failures = jwt::Failures::new();
 
 fn doc_str(m: &phv_vm::Map, k: &str) -> Option<String> {
     match m.get(&str_key(k)) {
@@ -129,9 +133,24 @@ fn doc_str(m: &phv_vm::Map, k: &str) -> Option<String> {
     }
 }
 
-fn parse_discovery(issuer: &str, tls: Option<bool>, body: &[u8]) -> Result<Discovery, String> {
-    let text = std::str::from_utf8(body).map_err(|_| "the discovery document is not UTF-8".to_string())?;
-    let doc = crate::web::json_decode(text).map_err(|e| format!("the discovery document is not JSON: {e}"))?;
+/// A discovery document, decoded within the script's limits when there is a
+/// `vm` (the outer error); the inner error says why it cannot be used.
+fn parse_discovery(
+    vm: Option<&Vm>,
+    issuer: &str,
+    tls: Option<bool>,
+    body: &[u8],
+) -> Result<Result<Discovery, String>, VmError> {
+    let Ok(text) = std::str::from_utf8(body) else { return Ok(Err("the discovery document is not UTF-8".into())) };
+    let doc = match vm {
+        Some(vm) => crate::web::json_decode_in(vm, text)?,
+        None => crate::web::json_decode(text),
+    };
+    Ok(discovery_of(doc, issuer, tls))
+}
+
+fn discovery_of(doc: Result<Value, String>, issuer: &str, tls: Option<bool>) -> Result<Discovery, String> {
+    let doc = doc.map_err(|e| format!("the discovery document is not JSON: {e}"))?;
     let Value::Map(m) = &doc else { return Err("the discovery document is not a JSON object".into()) };
     // OpenID Connect Discovery 1.0, 4.3: the issuer must be exactly the one asked for.
     if doc_str(m, "issuer").as_deref() != Some(issuer) {
@@ -139,7 +158,7 @@ fn parse_discovery(issuer: &str, tls: Option<bool>, body: &[u8]) -> Result<Disco
     }
     let endpoint = |k: &str| -> Result<String, String> {
         let u = doc_str(m, k).ok_or_else(|| format!("the discovery document has no {k}"))?;
-        crate::httpclient::check_oauth_url(&u, tls).map_err(|e| format!("{k}: {e}"))?;
+        crate::httpclient::check_discovered_url(issuer, &u, tls).map_err(|e| format!("{k}: {e}"))?;
         if u.contains('#') {
             return Err(format!("{k} has a fragment"));
         }
@@ -172,15 +191,21 @@ fn discovery(vm: &Vm, name: &str, issuer: &str, tls: Option<bool>) -> Result<Arc
             }
         }
     }
+    // A provider that could not be read a moment ago is not asked again yet.
+    if let Some(e) = DISCOVERY_FAILED.recent(issuer) {
+        let secs = jwt::RETRY_FAILED.as_secs();
+        let msg = format!("sign-in provider \"{name}\": {e} (it is tried again at most every {secs} seconds)");
+        return Err(vm.throw("NetworkError", msg));
+    }
     let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
     let accept = vec![("Accept".to_string(), "application/json".to_string())];
-    let result = crate::httpclient::send_url(vm, "GET", &url, tls, accept, Vec::new(), MAX_DOC).and_then(|r| {
-        if r.status() != 200 {
-            return Err(format!("the discovery document answered {}", r.status()));
-        }
-        parse_discovery(issuer, tls, r.body())
-    });
+    let result = crate::httpclient::send_url(vm, "GET", &url, tls, accept, Vec::new(), MAX_DOC);
     vm.check_limits()?;
+    let result = match result {
+        Ok(r) if r.status() != 200 => Err(format!("the discovery document answered {}", r.status())),
+        Ok(r) => parse_discovery(Some(vm), issuer, tls, r.body())?,
+        Err(e) => Err(e),
+    };
     let mut cache = DISCOVERY.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     match result {
@@ -190,6 +215,7 @@ fn discovery(vm: &Vm, name: &str, issuer: &str, tls: Option<bool>) -> Result<Arc
                 cache.clear();
             }
             cache.insert(issuer.to_string(), (d.clone(), now, now));
+            DISCOVERY_FAILED.clear(issuer);
             Ok(d)
         }
         Err(e) => match cache.get_mut(issuer) {
@@ -197,7 +223,11 @@ fn discovery(vm: &Vm, name: &str, issuer: &str, tls: Option<bool>) -> Result<Arc
                 *tried = now;
                 Ok(d.clone())
             }
-            _ => Err(vm.throw("NetworkError", format!("sign-in provider \"{name}\": {e}"))),
+            _ => {
+                drop(cache);
+                DISCOVERY_FAILED.note(issuer, &e);
+                Err(vm.throw("NetworkError", format!("sign-in provider \"{name}\": {e}")))
+            }
         },
     }
 }
@@ -266,11 +296,13 @@ fn pending(vm: &Vm) -> Vec<Pending> {
                 started,
             })
         })
-        .filter(|p| (0..PENDING_TTL).contains(&(now - p.started)))
+        // Saturating: the session value is only text, and an odd one must not stop the script.
+        .filter(|p| (0..PENDING_TTL).contains(&now.saturating_sub(p.started)))
         .collect()
 }
 
 fn save_pending(vm: &mut Vm, list: &[Pending]) -> Result<(), VmError> {
+    crate::web::unsent(vm, "the session")?;
     if list.is_empty() {
         if vm.http.session.values.shift_remove(PENDING_KEY).is_some() {
             vm.http.session.changed = true;
@@ -298,6 +330,14 @@ fn save_pending(vm: &mut Vm, list: &[Pending]) -> Result<(), VmError> {
 fn in_page(vm: &Vm, what: &str) -> Result<(), VmError> {
     if vm.host.cli || vm.http.job.is_some() {
         return Err(vm.throw("ValueError", format!("OAuth::{what}() works only in a page")));
+    }
+    // The sign-in is kept in the session, which is not saved once the response
+    // is sent: a callback after flush() could not use up its state.
+    if vm.http.flushed {
+        return Err(vm.throw(
+            "ValueError",
+            format!("OAuth::{what}() must come before response()->flush(): the sign-in is kept in the session"),
+        ));
     }
     Ok(())
 }
@@ -382,17 +422,18 @@ fn finish(vm: &mut Vm, a: &[Value]) -> R {
     };
     let p = list.remove(i);
     save_pending(vm, &list)?;
+    // RFC 9207: an `iss` in the answer names the provider that sent it, an
+    // error answer too (so another provider's error is not shown as this one's).
+    if let (Some(iss), Some(issuer)) = (query(vm, "iss"), &spec.issuer) {
+        if &iss != issuer {
+            return Ok(error_map("invalid_issuer", "the answer came from another provider"));
+        }
+    }
     if let Some(code) = query(vm, "error") {
         let desc = query(vm, "error_description").map(|d| clean(&d, 256)).unwrap_or_default();
         let code = clean(&code, 64);
         let msg = if desc.is_empty() { format!("the provider refused the sign-in: {code}") } else { desc };
         return Ok(error_map(&code, &msg));
-    }
-    // RFC 9207: an `iss` in the answer names the provider that sent it.
-    if let (Some(iss), Some(issuer)) = (query(vm, "iss"), &spec.issuer) {
-        if &iss != issuer {
-            return Ok(error_map("invalid_issuer", "the answer came from another provider"));
-        }
     }
     let Some(code) = query(vm, "code") else {
         return Ok(error_map("invalid_request", "the provider sent no code"));
@@ -454,6 +495,17 @@ fn finish(vm: &mut Vm, a: &[Value]) -> R {
     let Some(access) = doc_str(m, "access_token").filter(|t| !t.is_empty()) else {
         return Ok(error_map("invalid_token_response", "the token endpoint sent no access token"));
     };
+    // RFC 6749 7.1: a token of another type (such as one bound to a key) is
+    // not used the way SignIn's accessToken says. Some providers leave
+    // token_type out; it is then taken to be Bearer.
+    match m.get(&str_key("token_type")) {
+        None => {}
+        Some(Value::Str(t)) if t.eq_ignore_ascii_case("bearer") => {}
+        Some(_) => {
+            let msg = "the token endpoint sent an access token that is not a Bearer token";
+            return Ok(error_map("unsupported_token_type", msg));
+        }
+    }
     let expires = match m.get(&str_key("expires_in")) {
         Some(Value::Int(i)) => Value::Int(*i),
         Some(Value::Str(s)) => s.parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
@@ -467,7 +519,6 @@ fn finish(vm: &mut Vm, a: &[Value]) -> R {
     out.insert(str_key("expires_in"), expires);
     out.insert(str_key("refresh_token"), opt("refresh_token"));
     out.insert(str_key("scope"), opt("scope"));
-    out.insert(str_key("id_token"), opt("id_token"));
 
     // OpenID Connect: the ID token says who signed in.
     let claims = match (&spec.issuer, &ep.jwks) {
@@ -484,9 +535,14 @@ fn finish(vm: &mut Vm, a: &[Value]) -> R {
             if let Err(why) = id_token_ok(&claims, &client_id, &p.nonce) {
                 return Ok(error_map("invalid_id_token", why));
             }
+            out.insert(str_key("id_token"), Value::str(id_token));
             claims
         }
-        _ => Value::map(IndexMap::new()),
+        // Without OpenID Connect an ID token is not verified, so it is not passed on.
+        _ => {
+            out.insert(str_key("id_token"), Value::Null);
+            Value::map(IndexMap::new())
+        }
     };
     out.insert(str_key("claims"), claims);
     Ok(Value::map(out))
@@ -569,11 +625,41 @@ mod tests {
                 r#"{{"issuer":"{iss}","authorization_endpoint":"https://id.example/auth","token_endpoint":"https://id.example/token","jwks_uri":"https://id.example/jwks"}}"#
             )
         };
-        assert!(parse_discovery("https://id.example", None, doc("https://id.example").as_bytes()).is_ok());
-        assert!(parse_discovery("https://id.example", None, doc("https://evil.example").as_bytes()).is_err());
-        assert!(parse_discovery("https://id.example", None, doc("https://id.example/").as_bytes()).is_err());
+        let parse = |issuer: &str, doc: &str| {
+            parse_discovery(None, issuer, None, doc.as_bytes()).unwrap_or_else(|_| panic!("no limits"))
+        };
+        assert!(parse("https://id.example", &doc("https://id.example")).is_ok());
+        assert!(parse("https://id.example", &doc("https://evil.example")).is_err());
+        assert!(parse("https://id.example", &doc("https://id.example/")).is_err());
         let plain = r#"{"issuer":"https://id.example","authorization_endpoint":"http://id.example/auth","token_endpoint":"https://id.example/token","jwks_uri":"https://id.example/jwks"}"#;
-        assert!(parse_discovery("https://id.example", None, plain.as_bytes()).is_err(), "http endpoint");
+        assert!(parse("https://id.example", plain).is_err(), "http endpoint");
+    }
+
+    /// A remote provider cannot name an endpoint on this machine, where TLS is
+    /// not needed (found by the 16th assessment: the code and the client secret
+    /// could go in plain text to a local port of the provider's choosing).
+    #[test]
+    fn discovered_endpoints_stay_with_the_issuer() {
+        let doc = |iss: &str, token: &str| {
+            format!(
+                r#"{{"issuer":"{iss}","authorization_endpoint":"{iss}/auth","token_endpoint":"{token}","jwks_uri":"{iss}/jwks"}}"#
+            )
+        };
+        let parse = |issuer: &str, doc: &str, tls: Option<bool>| {
+            parse_discovery(None, issuer, tls, doc.as_bytes()).unwrap_or_else(|_| panic!("no limits"))
+        };
+        let remote = "https://id.example";
+        assert!(parse(remote, &doc(remote, "https://token.id.example/t"), None).is_ok(), "another remote host");
+        for local in ["http://127.0.0.1:9/token", "http://localhost/token", "http://[::1]:9/t", "https://127.0.0.1/t"] {
+            assert!(parse(remote, &doc(remote, local), None).is_err(), "{local}");
+        }
+        // With tls = false the issuer may be plain, but still not send the secret here.
+        let plain = "http://id.example";
+        assert!(parse(plain, &doc(plain, "http://id.example/token"), Some(false)).is_ok());
+        assert!(parse(plain, &doc(plain, "http://127.0.0.1:9/token"), Some(false)).is_err());
+        // A provider on this machine (tests, development) keeps its endpoints here.
+        let local = "http://127.0.0.1:8080";
+        assert!(parse(local, &doc(local, "http://127.0.0.1:8081/token"), None).is_ok());
     }
 
     #[test]

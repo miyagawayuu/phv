@@ -1,0 +1,50 @@
+error: `</svg>` while the HTML element `<div>` opened inside SVG or MathML is still open, where browsers ignore it
+ --> err_svg_end_ignored.phv:9:31
+  |
+9 | <svg><foreignObject><div></svg></div></foreignObject><script><a x="</script>"></a> <?= $v ?></script></svg>
+  |                               ^
+  = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</math>` while the HTML element `<b>` opened inside SVG or MathML is still open, where browsers ignore it
+  --> err_svg_end_ignored.phv:10:23
+   |
+10 | <math><mtext><b></math></b></mtext></math>
+   |                       ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</svg>` while the HTML element `<p>` opened inside SVG or MathML is still open, where browsers ignore it
+  --> err_svg_end_ignored.phv:11:28
+   |
+11 | <svg><desc><p>a</desc></svg></p>
+   |                            ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: the HTML element `<p>` directly inside `<svg>` or `<math>`, where browsers end the SVG or MathML before it
+  --> err_svg_end_ignored.phv:12:8
+   |
+12 | <svg><p>a</p></svg>
+   |        ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</p>` directly inside `<svg>` or `<math>`, where browsers end the SVG or MathML before it
+  --> err_svg_end_ignored.phv:13:12
+   |
+13 | <svg><g></p></g></svg>
+   |            ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: the element `<div>` inside MathML `<annotation-xml>`, which browsers read as HTML or as MathML depending on its `encoding`
+  --> err_svg_end_ignored.phv:14:48
+   |
+14 | <math><annotation-xml encoding="text/html"><div>a</div></annotation-xml></math>
+   |                                                ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</div>` inside SVG or MathML that an HTML element `<div>` around it is open for, where browsers may close that element and the SVG or MathML inside it
+  --> err_svg_end_ignored.phv:15:36
+   |
+15 | <svg><foreignObject><div><svg></div></svg></foreignObject></svg>
+   |                                    ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+7 errors found

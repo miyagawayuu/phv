@@ -58,6 +58,10 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FIELDS: usize = 1000;
 /// A connection is closed when the client accepts no data for this long.
 const WRITE_STALL: Duration = Duration::from_secs(30);
+/// `response()->flush()` gives up (returns false) when the client has taken
+/// nothing for this long: a client that stops reading holds the page's
+/// worker this long at most, not until the page's time limit.
+const FLUSH_STALL: Duration = Duration::from_secs(10);
 /// Time a request waits for a free worker before it gets 503.
 const QUEUE_WAIT: Duration = Duration::from_secs(10);
 /// Static files larger than this are sent uncompressed.
@@ -1240,8 +1244,10 @@ fn finish(
             metrics::Kind::Static => Some("static"),
             _ => route,
         };
+        // A standard method or `_OTHER`: a request may name any (found by the 1.2 audit).
+        let method = phv_vm::Span::method(method.as_str());
         let mut attributes = vec![
-            ("http.request.method", phv_vm::SpanValue::Str(method.as_str().to_string())),
+            ("http.request.method", phv_vm::SpanValue::Str(method.into())),
             ("http.response.status_code", phv_vm::SpanValue::Int(status as i64)),
             ("url.scheme", phv_vm::SpanValue::Str(if state.config.tls.is_some() { "https" } else { "http" }.into())),
             ("phv.kind", phv_vm::SpanValue::Str(kind.label().into())),
@@ -1266,9 +1272,12 @@ fn finish(
             span_id: id.span.clone(),
             parent_id: id.parent.clone(),
             // No path: it may hold ids and names (the route of a page has none).
-            name: match route {
-                Some(r) => format!("{method} {r}"),
-                None => method.as_str().to_string(),
+            name: {
+                let method = if method == "_OTHER" { "HTTP" } else { method };
+                match route {
+                    Some(r) => format!("{method} {r}"),
+                    None => method.to_string(),
+                }
             },
             kind: phv_vm::SpanKind::Server,
             start: end.checked_sub(start.elapsed()).unwrap_or(end),
@@ -2571,7 +2580,14 @@ impl State {
         }
         // Personalized responses must not be stored by shared caches: those that use the
         // session or cookies, or carry a CSRF token (it is tied to the visitor's cookie).
-        let personal = touched_session || sets_cookie || http.personalized;
+        // A streamed page (flush()) may still make itself personal after its head
+        // is sent (a CSRF token needs the visitor's cookie): its head is personal
+        // when the request carries a cookie or credentials (found by the 1.2 audit).
+        let credentials =
+            keep && http.headers.iter().any(|(k, v)| (k == "cookie" || k == "authorization") && !v.trim().is_empty());
+        let personal = touched_session || sets_cookie || http.personalized || credentials;
+        // What the page does after flush() knows whether its head was personal.
+        http.personalized = personal;
         if personal && !h.contains_key("cache-control") {
             h.insert("cache-control", HeaderValue::from_static("private, no-store"));
         }
@@ -2747,14 +2763,15 @@ async fn run_script(
 /// Where a page's output goes once it calls `response()->flush()`: the head
 /// is handed to the request (as its response), then each chunk is sent
 /// through a channel of one, so a page runs at most one chunk ahead of what
-/// the client has read. A chunk waits up to `WRITE_STALL` (and never past
-/// the page's time limit) for the client; after that, or once the client is
-/// gone, flush() returns false and later output is dropped.
+/// the client has read. A chunk waits for the client while it keeps reading
+/// (never past the page's time limit); once it has taken nothing for
+/// `FLUSH_STALL`, or is gone, flush() returns false and later output is dropped.
 struct PageStream {
     state: Arc<State>,
     head: Option<tokio::sync::oneshot::Sender<Resp>>,
     body: Option<tokio::sync::mpsc::Sender<Bytes>>,
     aborted: Arc<std::sync::atomic::AtomicBool>,
+    progress: Arc<body::Progress>,
     handle: tokio::runtime::Handle,
     deadline: Instant,
     /// The page ended normally: the body ends instead of failing.
@@ -2768,43 +2785,67 @@ impl PageStream {
             head: Some(head),
             body: None,
             aborted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            progress: body::Progress::new(),
             handle: tokio::runtime::Handle::current(),
             deadline,
             finished: false,
         }
     }
 
-    fn send(&mut self, chunk: Vec<u8>) -> bool {
-        let Some(tx) = &self.body else { return false };
+    /// Hands `chunk` to the connection; gives it back when it was not sent.
+    fn send(&mut self, chunk: Vec<u8>) -> Result<(), Vec<u8>> {
+        let Some(tx) = &self.body else { return Err(chunk) };
         if chunk.is_empty() {
-            return !tx.is_closed();
+            return if tx.is_closed() { Err(chunk) } else { Ok(()) };
         }
-        let bytes = body::counted_bytes(chunk, &self.state.buffered);
-        let wait = WRITE_STALL.min(self.deadline.saturating_duration_since(Instant::now()));
+        let (progress, deadline, buffered) = (&self.progress, self.deadline, &self.state.buffered);
+        let began = Instant::now();
         // A runtime that is shutting down (the server stopping) panics on timers: the client is gone then.
         let sent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.handle.block_on(tokio::time::timeout(wait, tx.send(bytes)))
+            self.handle.block_on(async {
+                loop {
+                    // The client may take its time while it keeps reading (found by
+                    // the 1.2 audit: one that did not read held the page's worker
+                    // until the page's time limit).
+                    let now = Instant::now();
+                    let idle = now.saturating_duration_since(progress.last().max(began));
+                    if idle >= FLUSH_STALL || now >= deadline {
+                        return Err(chunk);
+                    }
+                    let wait = (FLUSH_STALL - idle).min(deadline - now);
+                    match tokio::time::timeout(wait, tx.reserve()).await {
+                        Ok(Ok(permit)) => {
+                            // Counted in the output total from now until it is written.
+                            permit.send(body::counted_bytes(chunk, buffered));
+                            return Ok(());
+                        }
+                        Ok(Err(_)) => return Err(chunk),
+                        Err(_) => {}
+                    }
+                }
+            })
         }));
         match sent {
-            Ok(Ok(Ok(()))) => true,
+            Ok(Ok(())) => Ok(()),
             // The client is gone, or has not read for too long: what is held is cut off.
-            _ => {
+            failed => {
                 self.aborted.store(true, Ordering::Release);
                 self.body = None;
-                false
+                failed.unwrap_or_else(|_| Err(Vec::new()))
             }
         }
     }
 }
 
 impl FlushSink for PageStream {
-    fn flush(&mut self, http: &mut HttpCtx, chunk: Vec<u8>) -> bool {
+    fn flush(&mut self, http: &mut HttpCtx, chunk: Vec<u8>) -> Result<(), Vec<u8>> {
         if let Some(head) = self.head.take() {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let had_session = http.session.id.is_some();
-            let resp = self.state.head(http, had_session, RespBody::Chunks { rx, aborted: self.aborted.clone() }, true);
+            let body = RespBody::chunks(rx, self.aborted.clone(), self.progress.clone());
+            let resp = self.state.head(http, had_session, body, true);
             if head.send(resp).is_err() {
-                return false;
+                return Err(chunk);
             }
             self.body = Some(tx);
         }
@@ -2812,7 +2853,7 @@ impl FlushSink for PageStream {
     }
 
     fn finish(&mut self, chunk: Vec<u8>) {
-        if self.send(chunk) || self.body.is_none() {
+        if self.send(chunk).is_ok() || self.body.is_none() {
             self.finished = true;
         }
         self.body = None;

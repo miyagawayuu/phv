@@ -1,0 +1,12 @@
+<?phv
+// `Html` holding `</noscript` may not be inserted into a comment or the text
+// of a `<textarea>`: any template may be written inside a `<noscript>`, whose
+// text browsers with scripting on read as raw text up to `</noscript`, so the
+// rest would be markup (found by the 1.2 audit). In an attribute value its
+// `<` and `>` are encoded (the value is the same). Here the page stops at the
+// comment.
+$h = render("views/pixel.phv.html");
+echo render("views/titled.phv.html", h: $h);
+?>
+<noscript><p>Turn on JavaScript.</p><!-- <?= $h ?> <a href="<?= "javascript:alert(1)" ?>">old link</a> --></noscript>
+not reached

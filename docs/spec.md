@@ -177,6 +177,9 @@ $len = $user?->email?->len();             // ?int
 `!= null`, `== null`, `is`, `!`, `&&`, `||`, and early `return` / `throw` / `break` / `continue` are used for narrowing.
 Narrowing applies to local variables and to properties of local variables (`$this->user != null`). Narrowing of a property
 is reset by a function or method call or by an assignment to a property (because the call may have changed the value).
+After a `try`, what its `finally` assigns, or what a call in it may have changed, is no longer narrowed by what the `try`
+proved. The step of a `for` loop and the condition of a `do`-`while` loop know only what holds both at the end of the
+body and at each `continue`.
 
 ## 6. Operators
 
@@ -640,8 +643,10 @@ import lib.legacy.render as render_legacy;
 - Only files inside the project and package directories can be loaded (symbolic links cannot be used to escape them).
   A module, template, package or `phv.toml` that is a symbolic link or junction to another machine (a network share
   such as `\\host\share`, a network drive, or an object path such as `\GLOBAL??\UNC\host\share`), or lies behind one,
-  is refused without being resolved, so its host is never contacted. The project itself may be on a share. `phv lsp`
-  does not resolve an open document behind such a link, and `phv serve` serves no page or file behind one.
+  is refused without being resolved, so its host is never contacted. The project itself may be on a share; a project
+  reached through a link to a folder is looked at in the folder it really is, where Windows resolves the relative
+  links in it. `phv lsp` does not resolve an open document behind such a link, and `phv serve` serves no page or file
+  behind one, also when a folder of a running site becomes such a link (the page is compiled again, and refused).
 - A program (a page or script with every module, template and package it uses, std included) may have up to
   2,000,000 tokens, 32 MB of source and 2,000 files in all. One past them is refused with "this program is too large"
   before it is checked, at the import or template that passed the limit. Split it into smaller pages.
@@ -719,7 +724,9 @@ are output as is. `echo` and `<?= ?>` follow the same rules.
   (all types that browsers do not render as HTML; `X-Content-Type-Options: nosniff` is also always sent).
   HTML, XML, SVG, and unknown types stay escaped. A JavaScript response (`text/javascript` or any type browsers run as
   a script) takes only `json_html()` values and numbers: a string or a template's output would be code, so writing one
-  is an error when the page runs. Its type must be set before any output.
+  is an error when the page runs. Its type must be set before any output. Likewise, a type that is escaped (HTML or
+  any other) cannot replace one that is not once output other than whitespace has been written (`ValueError`): that
+  output was not escaped.
 
 ### HTML context checks
 
@@ -729,7 +736,15 @@ the content of `<textarea>`, `<title>`, and similar elements, `<!--` inside `<sc
 and `<math>` (where any markup, such as a tag, comment or CDATA section, in a `<script>` or `<style>` is an error; a self-closed `<svg/>`
 opens nothing, and `</math>` does not close an `<svg>`), markup inside `<noscript>` (checked as markup), a `<` written just
 before a value or block (a value there would name a tag: an error),
-and text such as `</scripts>` that looks like an end tag but is not one. Inside `<noscript>`, `<svg>` and `<math>`, the end tag of an
+and text such as `</scripts>` that looks like an end tag but is not one. Inside `<svg>` and `<math>`, the elements are followed
+as browsers build them, and what browsers would read in another way is an error: `</svg>` (or `</math>`) while an HTML element
+opened inside a `<foreignObject>`, `<desc>`, `<title>` or MathML text element (`<mi>`, `<mtext>`...) is still open (browsers
+ignore it and read on as SVG: close the element first); an HTML element such as `<p>`, `<div>`, `<b>` or `<font>` (or `</p>`,
+`</br>`) right inside SVG or MathML, where browsers end the SVG before it; an element other than `<svg>` inside MathML
+`<annotation-xml>`; an end tag inside SVG that would close an HTML element around it; and a `>` inside a CDATA section
+(`<![CDATA[ ... ]]>`, read to `]]>` there) that is not the end of `]]>`. A `<title>`, `<style>`, `<xmp>`, `<iframe>`,
+`<noembed>`, `<noframes>` or `<plaintext>` inside an open `<select>` is an error: older browsers ignore it there and read its
+text as markup. Inside `<noscript>`, `<svg>` and `<math>`, the end tag of an
 element whose text a browser may read as raw text (`</textarea>`, `</noscript>`, `</xmp>`...) inside a comment or an attribute value
 is an error, and so is a value right after `</` and the start of such a name there, or any other statement there
 (`</<?phv f(); ?>`: a function could write the rest): where a browser reads the element differently (`<noscript>` with scripting
@@ -740,9 +755,9 @@ while it is checked on its own. So `<!--</<?= $v ?>-->` and `title="</nos<?phv f
 
 | Location | Example | Treatment |
 |---|---|---|
-| Element content, quoted attribute value | `<p><?= $s ?></p>`, `title="<?= $s ?>"` | Escaped and output. `Html` is output as it is, except that in an attribute value its `"` and `'` are written as `&quot;` and `&#039;`, so no `Html` can end the attribute |
-| Comment | `<!-- <?= $s ?> -->` | As element content, but a value may not come right after `<!--`, `<!---` or a `-` (`<!-- a-<?= $s ?>`), and the text right after a value may not start with `>`, `!>`, `->` or `-!>` (`<!-- <?= $s ?>> -->`): a value ending with `--` would end the comment there. `Html` that holds `-->` or `--!>` (in a bogus comment such as `<!x ...>`, `>`) stops the script with a runtime error. A `-` at the end of a comment's text is read with the text after a statement (`-<?phv f(); ?>->` ends the comment) |
-| Text of `<textarea>`, `<title>`, `<xmp>`, `<iframe>`, `<noembed>`, `<noframes>` | `<textarea><?= $s ?></textarea>` | As element content. `Html` that holds the element's end tag (`</textarea`) stops the script with a runtime error: it would end the element there |
+| Element content, quoted attribute value | `<p><?= $s ?></p>`, `title="<?= $s ?>"` | Escaped and output. `Html` is output as it is, except that in an attribute value its `"`, `'`, `<` and `>` are written as `&quot;`, `&#039;`, `&lt;` and `&gt;` (the value is the same), so no `Html` can end the attribute, or a `<noscript>` or `<title>` that a browser reads around it as raw text |
+| Comment | `<!-- <?= $s ?> -->` | As element content, but a value may not come right after `<!--`, `<!---` or a `-` (`<!-- a-<?= $s ?>`), and the text right after a value may not start with `>`, `!>`, `->` or `-!>` (`<!-- <?= $s ?>> -->`), also with a statement between (`<?= $s ?>!<?phv f(); ?>>`): a value ending with `--` would end the comment there. A loop's body may follow its own end or a `continue`, what follows a loop may follow a `break`, and a `finally` block may follow a value before a jump in its `try` block, so the same holds there: `<!-- <?phv foreach ($xs as $x) { ?>> <?= $x ?><?phv } ?> -->` is an error. `Html` that holds `-->` or `--!>` (in a bogus comment such as `<!x ...>`, `>`), that starts with `>`, `!>`, `->` or `-!>` (it may come right after a value), or that holds `</noscript` (inside `<noscript>`, `<svg>` or `<math>`, the end tag of any raw-text element such as `</title`) stops the script with a runtime error. A `-` at the end of a comment's text is read with the text after a statement (`-<?phv f(); ?>->` ends the comment) |
+| Text of `<textarea>`, `<title>`, `<xmp>`, `<iframe>`, `<noembed>`, `<noframes>` | `<textarea><?= $s ?></textarea>` | As element content. `Html` that holds the element's end tag (`</textarea`) or `</noscript` stops the script with a runtime error: it would end the element (or a `<noscript>` around it, read as raw text with scripting on) there |
 | Element content or a comment inside `<svg>` or `<math>` | `<svg><?= render("bar.phv.html") ?></svg>` | As element content. Browsers read markup there as foreign content, while a template was checked as HTML: `Html` that holds a CDATA section, the end tag of a raw-text element it did not open, or a raw-text element (`<title>`, `<style>`, `<textarea>`...) whose text holds `<` or does not end, stops the script with a runtime error (an SVG `<title>Bar 3</title>` or `<style>.a{fill:red}</style>` is fine) |
 | Unquoted attribute value | `href=<?= $u ?>` | Error (add quotes) |
 | Inside a tag (between attributes) | `<div <?= $attrs ?>>` | Error |
@@ -774,7 +789,10 @@ while it is checked on its own. So `<!--</<?= $v ?>-->` and `title="</nos<?phv f
 - When an exception thrown inside a `<script>`, a tag or an attribute is caught, what the `try` block wrote is
   dropped, so the `catch` block writes where the `try` began rather than inside what was left open. Other
   exceptions keep the output written before them.
-- Expressions and statements can be nested up to 500 levels (this prevents deeply nested source from overflowing the implementation's stack).
+- Expressions, statements and types can be nested up to 500 levels (this prevents deeply nested source from overflowing
+  the implementation's stack). A statement written without braces under `if`, a loop or `else` counts as a level, each
+  `elseif` (or `else if`) of a chain counts as one more, and so does each operator of a chain (`$a . $b . $c`). Use
+  `match` for a long list of cases.
 - A source file may have up to 1,000,000 tokens, the code inside its strings included: a larger one is refused before it is
   parsed, since its syntax tree would take many times its size in memory.
 
@@ -981,9 +999,12 @@ sample = 1.0                                    # the share of new traces record
   trace (its span becomes the request span's parent) and its sampled flag decides whether the trace is recorded; new
   traces are recorded with the probability `sample`. A trace that is not recorded still passes its `traceparent` on,
   with the flag unset.
+- A method other than the standard ones (`GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`,
+  `PATCH`) is recorded as `_OTHER`, and the span is named `HTTP` (`HTTP /posts/[id]`), as OpenTelemetry asks. A span's
+  name and each text attribute keep their first 1,024 bytes.
 - Spans are queued and sent by a thread of their own, in batches of up to 512 every 5 seconds and when the server
-  stops. The queue holds at most 8,192 spans: when the collector is slow or down, further spans are dropped and counted
-  in `phv_telemetry_dropped_spans_total`. A failed export is dropped and reported at most once a minute. Requests never
+  stops. The queue holds at most 8,192 spans and 16 MB of them: when the collector is slow or down, further spans are
+  dropped and counted in `phv_telemetry_dropped_spans_total`. A failed export is dropped and reported at most once a minute. Requests never
   wait for the collector.
 - The span of a request ends when the head of its response is sent (a page that streams with `flush()` goes on after
   that).
@@ -1078,13 +1099,24 @@ foreach ($db->query(sql"SELECT id, total FROM orders") as $i => $row) {
 - After the first `flush()`, the status, headers, cookies and session cannot change (`ValueError`); the session is
   saved, and its cookie sent, with the head. The session can still be read. `csrf_token()` needs the visitor's CSRF
   cookie, which can no longer be sent: on a visitor's first page, call it before `flush()`.
+- A streamed head is sent with `Cache-Control: private, no-store` (unless the page set `Cache-Control`) when the page
+  used the session or set a cookie, made a CSRF token, or the request carries a `Cookie` or `Authorization` header: the
+  page may make itself personal after its head is sent. `csrf_token()` after `flush()` is refused (`ValueError`) when
+  the head was not sent as personal.
 - `flush()` waits until the connection has taken the previous chunk, so a page never runs more than one chunk ahead of
-  its visitor; the output it sends no longer counts in its memory limit, but in the server's output total. It returns
-  `false` once the visitor has gone away or has read nothing for 30 seconds; what the page writes after that is
-  dropped. A page holds its worker until it ends, within its time limit as any page.
+  its visitor; the output it sends no longer counts in its memory limit, but in the server's output total, until it is
+  written to the connection (it is handed over in pieces of 64 KB, as other responses are). It returns `false` once the
+  visitor has gone away (also for a `HEAD` request) or has taken nothing for 10 seconds; what the page writes after
+  that is dropped, and output that was not sent stays counted in the page's memory until it is freed. A visitor that
+  keeps reading, however slowly, is waited for. A page holds its worker until it ends, within its time limit as any
+  page.
 - A page that fails after `flush()` cannot show an error page: its response is cut off (the HTTP/1.1 connection is
   closed without the last chunk, an HTTP/2 stream is reset), so the client sees that it is incomplete. The error is
   logged as usual.
+- What `flush()` sent cannot be taken back by a `catch`: a `try` that began before a flush drops only what was written
+  after it. When the exception left a tag, attribute, `<script>` or similar HTML unfinished (where a `catch` writes in
+  place of what the `try` wrote) and `flush()` sent the start of that HTML, the page stops with an error that cannot be
+  caught, and its response is cut off.
 - Streamed responses are not compressed. `flush()` cannot be called while output is captured (in a page with
   `layout()`, or in a template), in a WebSocket script or after `response()->file()` (`ValueError`). Middleware that
   calls it has answered the request. Outside `phv serve` (`phv run`, `phv test`) it keeps the output and returns
@@ -1122,16 +1154,18 @@ session()->destroy();                 // log out
 - Sites that share a database keep their sessions apart by the site's namespace: `[security] store_namespace`, or
   else `[project] name` (rate limits and jobs are kept under it too). Two copies of a site with the same name, such as
   staging and production, must set different `store_namespace` values (a server using a shared store without it
-  says so when it starts); a site with neither shares the store with every other such site (the table
-  `phv_sessions` and the keys `phv:sessions:*`). Sessions stored before 1.1 are not read by a site with a namespace,
-  so upgrading to 1.1 signed its visitors out once. Each site has its own `session_ttl` and its own limits: sites
-  that share a database share only its capacity.
-- Sessions that 1.1 stored for a site with a namespace in the shared table `phv_sessions` (PostgreSQL, MySQL), or
-  counted under the shared keys `phv:sessions:new`, `back`, `keep`, `size` and `bytes` (Redis), are still read,
-  updated where they are and logged out, so upgrading from 1.1 signs no one out. They last at most 24 hours: the sweep
-  of every site, with a namespace or not, removes them after that (and, in Redis, their counts once Redis has expired
-  them), never one that is still alive for any site. Once no 1.1 process uses the database, that table and those keys
-  may be removed, unless a site without a namespace uses them.
+  says so when it starts); a site with neither shares the store with every other such site (since 1.2 the table
+  `phv_sessions_unnamed` and the keys `phv:sessions:unnamed:*`). Sessions stored before 1.1 are not read by a site
+  with a namespace, so upgrading to 1.1 signed its visitors out once. Each site has its own `session_ttl` and its own
+  limits: sites that share a database share only its capacity.
+- Sessions that 1.1 stored in the shared table `phv_sessions` (PostgreSQL, MySQL), or counted under the shared keys
+  `phv:sessions:new`, `back`, `keep`, `size` and `bytes` (Redis), are still read, updated where they are and logged
+  out by the site that stored them, so upgrading signs no one out; the same holds for the sessions 1.1.1 stored there
+  for a site without a namespace. They last at most 24 hours: the sweep of every site removes them after that (and,
+  in Redis, their counts once Redis has expired them), never one that is still alive for any site; a site's own
+  `session_ttl` and limits never apply to them. Once no 1.1 or 1.1.1 process uses the database, that table and those
+  keys may be removed. While processes of 1.1.1 and 1.2 of a site without a namespace run side by side, the 1.1.1
+  processes do not read the sessions the 1.2 ones stored.
 - In every store, a session is saved only while it still exists (a new or regenerated id only if it is new), each as
   one atomic step: a request that finishes after a logout, in this process or another, cannot bring the session back,
   and of two requests that regenerate the same session only one gets it.
@@ -1291,6 +1325,18 @@ only its own changes are undone, and nothing is committed until the outermost on
 - `ATTACH` is disabled, so databases other than the permitted files cannot be accessed (also in `phv db migrate`).
 - `LIKE` and `GLOB` stop at the script's time limit like the rest of a query; `instr()`, `replace()` and `trim(X, Y)`
   search in linear time. `PRAGMA case_sensitive_like` is refused (it would bring back SQLite's own `LIKE`).
+- A query stops soon after the script's time limit, also when it works on long values: SQLite looks at the deadline
+  every 100 steps of its program, every MB it allocates and after each row, and `LIKE`, `GLOB`, `instr()`,
+  `replace()` and `trim(X, Y)` look at it on every call. These functions count what they allocate toward the memory
+  limit. A text or blob is at most 16 MB (SQLite raises "string or blob too big").
+- Some single steps read a whole value without looking at the deadline: turning a text into a number (`b * 2`,
+  `CAST`, `NOT b`), `length()`, `substr()`, `NOCASE`, comparing or copying it. Before a statement first runs, its
+  program is weighed: each such step counts by how long it may take, up to 2 for two operands that are turned into
+  numbers, an eighth for a copy and a sixteenth for a comparison; PHV's own functions and those that build a new value
+  (`upper()`, `hex()`, `printf()`...) count nothing. A statement that weighs more than 128 raises `DatabaseError`
+  ("split it into smaller statements"), also when a view, a `WITH` table or a trigger repeats the steps. The
+  statements of programs weigh up to about 10 (30 columns of arithmetic weigh 120); at 128, a statement on 16 MB
+  values runs about 3 seconds past the time limit. A statement has at most 43,008 steps.
 - SQL errors raise `DatabaseError`.
 - A connection to a database file is kept for the next script that opens the same file (up to 30 seconds idle;
   `:memory:` databases are never kept), so pages that open the database on every request do not reopen the file.
@@ -1344,8 +1390,11 @@ The methods are the same as for SQLite (`query`, `first`, `execute`, `transactio
   connection), so a statement run again skips that step. Only `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `WITH` and
   `VALUES` are kept; any other statement (`ALTER TABLE`, `DEALLOCATE`, `SET`, ...) drops them. A kept statement is
   prepared again when its table changed (also by another connection); inside a transaction only the statements
-  prepared in that transaction are used. A connection on which a script deallocated every statement (`DEALLOCATE ALL`
-  or `DISCARD ALL`, also inside a function) is closed after the script instead of going back to the pool.
+  prepared in that transaction are used. A connection on which a script deallocated statements the client prepared
+  for itself (`DEALLOCATE ALL`, `DISCARD ALL`, or a `DEALLOCATE` of only those that look types up, also inside a
+  function) is closed after the script instead of going back to the pool: the reset looks for them by their names.
+  A statement that fails with "prepared statement ... does not exist" because one was missed also closes the
+  connection.
 - A statement running past the script's time limit is stopped: by the server (PostgreSQL `statement_timeout`,
   MySQL `max_execution_time`, which applies to `SELECT`) and, also when a script changes those settings, on the client
   side (PostgreSQL connections stop reading at the deadline; MySQL statements are stopped with `KILL QUERY`). A result
@@ -1588,7 +1637,11 @@ when the body is not JSON).
 - Header names and values are checked (no line breaks). `Host`, `Content-Length`, `Transfer-Encoding`,
   `Connection` and the other headers that frame the message are set by PHV. Scripts can replace the `headers` of
   `phv.toml`, but not those of `headers_env` (also not under another spelling: `_` counts as `-`, as CGI servers read
-  both the same way). A query parameter of the base URL cannot be given again in `$query`.
+  both the same way). A query parameter of the base URL cannot be given again in `$query`, also not under a name
+  the server may read as the same: PHP reads `.`, a space and a `[` without a `]` after it as `_`, drops leading
+  spaces and what follows a NUL, and reads `name[...]` as `name`; ASP.NET ignores case; a name is also compared
+  once more percent-decoded. With `account_id` in the base URL, `account.id`, `account id`, `account_id[]` and
+  `Account_ID` raise `ValueError` too.
 - Errors come back as responses: a 4xx or 5xx status does not throw. **Redirects are not followed**: a 3xx response
   is returned with its `Location` header.
 - **TLS (`https://`) is required for every host except `localhost`**, with the server certificate checked against the
@@ -1654,25 +1707,32 @@ response()->redirect("/");
   a session may have 4 sign-ins started at once (tabs). Extra parameters such as `["prompt" => "select_account"]` can be
   given, but not those of the flow itself.
 - `callback()` accepts only a `state` this session started for this provider, so a sign-in cannot be finished in
-  another browser, and another site cannot sign a visitor in to an account of its own. It passes the provider's error
-  (`?error=access_denied`) on as `OAuthError`, refuses an `iss` parameter that names another issuer (RFC 9207), and
-  exchanges the code at the token endpoint with the verifier and the client secret (with HTTP Basic, unless
-  `client_auth = "post"` or the discovery document allows only `client_secret_post`).
+  another browser, and another site cannot sign a visitor in to an account of its own. It refuses an `iss` parameter
+  that names another issuer (RFC 9207; an error answer too), passes the provider's error (`?error=access_denied`) on as
+  `OAuthError`, and exchanges the code at the token endpoint with the verifier and the client secret (with HTTP Basic,
+  unless `client_auth = "post"` or the discovery document allows only `client_secret_post`). The access token must be
+  a Bearer token (`token_type` in any case; a response without `token_type` is taken as Bearer); another type is
+  refused with `unsupported_token_type`. The sign-in is kept in the session, so `redirect()`, `authorizationUrl()` and
+  `callback()` must come before `response()->flush()`; after it they throw `ValueError` (a callback after it could
+  not use up its state).
 - With OpenID Connect the ID token must be signed by a key of the provider's JWKS (RS256, ES256 or EdDSA; kept as by
   `KeySet::fetch()` of std.jwt), name the issuer exactly and this client as its audience (and as `azp` when it has
   several), hold the sign-in's nonce, `sub`, `exp` and `iat`, and be valid now (60 seconds of leeway); otherwise
   `callback()` throws `OAuthError` with `invalid_id_token`. `SignIn` has `claims`, `subject()`, `claim($name)`,
   `verifiedEmail()`, `accessToken`, `refreshToken`, `expiresIn`, `scope` and `idToken`. Without OpenID Connect,
-  `claims` is empty: ask the provider's API with the access token (`HttpClient` with an `Authorization: Bearer`
-  header).
+  `claims` is empty and `idToken` is null (an ID token that was not verified is not passed on): ask the provider's API
+  with the access token (`HttpClient` with an `Authorization: Bearer` header).
 - Know users by the provider and `subject()`, not by their e-mail address: an address can pass to someone else, and
   only `verifiedEmail()` says that the provider checked it. Call `session()->regenerate()` after a sign-in, as after
   any login.
 - The discovery document (`<issuer>/.well-known/openid-configuration`) must name the configured issuer exactly. It is
-  kept for an hour (for up to a day when it cannot be fetched again, tried every 30 seconds). Endpoints need TLS unless
-  they are on this machine or `tls = false`; the redirect URI needs TLS unless it is on this machine. The client secret
-  comes from the environment (scripts cannot read the variable) and is never shown; an unset variable is reported when
-  a sign-in starts.
+  kept for an hour (for up to a day when it cannot be fetched again, tried every 30 seconds); when it cannot be fetched
+  and none is kept, it is tried again at most every 10 seconds, and sign-ins meanwhile throw `NetworkError` at once.
+  Endpoints need TLS unless they are on this machine or `tls = false`; the redirect URI needs TLS unless it is on this
+  machine. The endpoints a discovery document names must use `https://` when the issuer does, and may be on this
+  machine only when the issuer is (so a remote provider cannot have the code and the secret sent in plain text to a
+  port here). The client secret comes from the environment (scripts cannot read the variable) and is never shown; an
+  unset variable is reported when a sign-in starts.
 - Failures of the provider or the visitor throw `OAuthError` (`$e->error` is the OAuth error code, and texts from the
   provider are cut to printable ASCII); a provider that cannot be reached throws `NetworkError`; mistakes in phv.toml or
   the script throw `ValueError`. `redirect()` and `callback()` work in pages only.
@@ -1853,8 +1913,10 @@ $data = json_decode($j->payload);
 - A `key` adds a job once: while a job of the same name and key waits, runs or was given up, and for a day after it
   ended, `enqueue()` returns `null`. A store remembers the keys of at most 100,000 ended jobs (the latest). While
   another open transaction has added a job with the same key, `enqueue()` waits for it to end, and no longer than the
-  script may still run; such waits are kept apart from the connections that other jobs are added on and that run
-  jobs.
+  script may still run (10 seconds at most); then it throws `DatabaseError` ("the key is held by a transaction that
+  has not ended"). It looks at the key again every 10 to 200 ms and holds no connection in between, so such waits
+  never take the connections that other jobs are added on, that run jobs or that add the jobs of schedules. At most 8
+  scripts of a process wait for held keys of a site at once; another throws the same error at once.
 - With PostgreSQL or MySQL, `enqueue()` inside a `transaction()` on the store's database adds the job with the
   transaction: only if it commits (with MySQL, only `transaction()` ties them: a `BEGIN` sent as SQL does not). Jobs
   are kept in a table `phv_jobs_<hash>` of the site's namespace (see "Sessions"; `phv_jobs` for a site without one),
@@ -1876,7 +1938,10 @@ $data = json_decode($j->payload);
   matches, in `timezone`. Fields are `*`, numbers, ranges `a-b`, steps `*/n` and lists `a,b`; days of the week are 0
   to 7 (Sunday is 0 and 7); when the day of the month and the day of the week are both given, either one matches. Each
   process adds the jobs, keyed by the minute: with a shared store a job is added once however many processes run;
-  with `store = "memory"` each process runs its own. Minutes while no process was running are not made up for. When
+  with `store = "memory"` each process runs its own. The jobs of schedules are added on connections of the store that
+  scripts never use. A minute whose job could not be added (the store did not answer in time) is tried again every 5
+  seconds, with the minutes after it, for an hour at most; a warning is logged once. Minutes while no process was
+  running are not made up for. When
   the clocks change in `timezone`, a time that does not exist that day does not run, and one that comes twice runs
   twice. At most 100 schedules.
 - `phv jobs run [dir]` runs the jobs (and schedules) of a project without serving its pages, until Ctrl-C or
@@ -1941,7 +2006,7 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
 | `json_decode($s): any` | Depth up to 128 |
 | `encrypt($text, $key)`, `decrypt($box, $key): ?string` | ChaCha20-Poly1305, with a key derived for each message (HKDF-SHA256 with a random salt) and a random nonce; the result is base64url text. `decrypt` returns `null` if the text was changed or the key is not the one it was encrypted with |
 | `sign_token($data, $key)`, `sign_token($data, $key, $seconds)`, `verify_token($token, $key): ?string` | Data with an HMAC-SHA256 signature, valid for `$seconds` when given (links in e-mails, such as password resets). The data can be read (it is only base64url): encrypt what must stay secret. `verify_token` returns the data, or `null` if the token was changed, signed with another key, or has expired |
-| `jwt_encode($claims, $key)`, `jwt_decode($token, $key): ?map<string, any>` | JSON Web Tokens with HS256 only (RS256, ES256, EdDSA and key sets: see std.jwt): a token that names another algorithm (`none` included) is refused. `exp` and `nbf` are checked. The key is used as it is (as other JWT libraries expect), so do not also use it with `hash_hmac()`: an HMAC of a visitor's text would be a valid signature |
+| `jwt_encode($claims, $key)`, `jwt_decode($token, $key): ?map<string, any>` | JSON Web Tokens with HS256 only (RS256, ES256, EdDSA and key sets: see std.jwt): a token that names another algorithm (`none` included) is refused. `exp` and `nbf` are checked; as in std.jwt, a token with `crit` in its header, or with an `iat` (a number) more than a minute ahead, is refused. The key is used as it is (as other JWT libraries expect), so do not also use it with `hash_hmac()`: an HMAC of a visitor's text would be a valid signature |
 
 Keys for `encrypt`, `sign_token` and the JWT functions are secrets of at least 32 bytes (`random_token()` makes one);
 keep them in an environment variable (`getenv`), not in the code. `encrypt` and `sign_token` derive their own keys
@@ -1973,7 +2038,9 @@ $claims = $auth->verify($token, issuer: "https://auth.example.com/", audience: "
 - `verify()` returns the claims, or `null` when the signature, the algorithm or the claims are not right: `exp` and
   `nbf` (numbers) with up to `$leeway` seconds (0 to 300), an `iat` more than a minute ahead, `iss` when `$issuer` is
   given, and `aud` (the string `$audience`, or a list that holds it). A token that has `aud` is refused when no
-  `$audience` is given: it was made for someone else.
+  `$audience` is given: it was made for someone else. A token's text is not unique: a valid token can be written in
+  another form that also verifies (an ES256 signature has two), so to refuse a token used twice, remember its `jti`
+  claim, not the token.
 - `KeySet::of([...])` verifies with several keys (the old and the new while keys are replaced); the token's `kid`
   picks the key. `KeySet::fromJson()` reads a JWKS document; `toJson()` writes the public keys of a set, to serve at
   `/.well-known/jwks.json`. Keys of other kinds in a JWKS are skipped, and `oct` keys are never read from one.
@@ -1981,9 +2048,11 @@ $claims = $auth->verify($token, issuer: "https://auth.example.com/", audience: "
   the whole server process, and fetched again when they are older than their `Cache-Control: max-age` (1 minute to a
   day; an hour without one) and when a token names a key id the set lacks: the first such token at once, later ones at
   most every 30 seconds, so made-up key ids cannot make the server fetch it over and over. A set that cannot be fetched
-  again is used for up to a day and tried again every 30 seconds. A JWKS may be 512 KB; 64 of its keys are read, and
-  32 sets are kept.
-- `jwt_encode()` and `jwt_decode()` (HS256) remain as they are.
+  again is used for up to a day and tried again every 30 seconds; one that cannot be fetched and of which none is kept
+  is tried again at most every 10 seconds (`NetworkError` at once meanwhile). Sets are kept per service and its
+  configured headers, so services that share a URL and differ in a header (a tenant) never share a set. A JWKS may be
+  512 KB, and is read within the script's memory and time limits; 64 of its keys are read, and 32 sets are kept.
+- `jwt_encode()` and `jwt_decode()` (HS256) remain, as in the table above.
 
 ### Content-Security-Policy
 
@@ -2029,7 +2098,8 @@ rate_limit_reset("login:" . ip_group(request()->ip));
   `rate_limit()` returns `false` (a limit that cannot be counted refuses), `rate_limit_reset()` throws
   `DatabaseError`, and `requests_per_minute` counts in the process; each failure is logged. After such a failure the
   server is not asked again for 5 seconds: meanwhile every call fails the same way at once, without waiting for it.
-- The same key is counted separately for each window length (you can apply both 5 per minute and 50 per day). When there are more than 100,000 keys,
+- The same key is counted separately for each window length (you can apply both 5 per minute and 50 per day).
+  `rate_limit_reset($key)` forgets the windows of that key, of every length, and of no other key. When there are more than 100,000 keys,
   keys that have not reached their limit are discarded first, so using a large number of keys does not release keys that are currently limited.
 - `requests_per_minute` counts IPv6 addresses grouped by /64. Do the same in keys: `ip_group($ip)` returns the /64 of
   an IPv6 address (and an IPv4 address as it is), as in `rate_limit("login:" . ip_group(request()->ip), 5, 60)`, since one
@@ -2287,6 +2357,14 @@ When code uses a PHP function name, the error message suggests the alternative
 - semantic colouring of names (classes, functions, methods, properties, variables, constants), and the inferred type
   of a variable shown before the variable where it is first assigned (`$total = ...` shows `int`).
 
+The VS Code extension starts `phv lsp` and `phv dap` by a full path, never by the bare name: on Windows a bare name
+is looked for in the working directory (a workspace folder) before `PATH`, so opening a file in a cloned folder
+would run that folder's `phv.exe`. The setting `phv.path` (a user setting only; a workspace cannot change it) is
+either a full path, used as it is, or a name (`phv` by default) looked for in `PATH`. Only the absolute entries of
+`PATH` outside every workspace folder are searched, on Windows for `.exe` and `.com` files (in the order of
+`PATHEXT`); a relative `phv.path` or `PATH` entry is not used. When nothing is found, the extension says so and
+starts no server.
+
 ### Debugging and profiling
 
 `phv dap` is a debug adapter (the Debug Adapter Protocol), which the VS Code extension starts for launch
@@ -2384,6 +2462,7 @@ $body = render(
 
 `phv fmt` never joins lines, and never changes a line that holds a comment, a multi-line string, inline HTML or
 `<?phv` / `?>` tags, so formatting cannot change what a program does; formatting a formatted file changes nothing.
+A file with more than one hard link is reported and left as it is (writing it would change the other name too).
 
 ### Testing
 
@@ -2493,7 +2572,8 @@ import textutils.strings.slugify;      // vendor/textutils/strings.phv
   - **git** with a `version`: the newest tag `vX.Y.Z` that fits the requirement. Requirements are semver ranges:
     `^1.2` (1.2 up to 2.0), `~0.3.1`, `>=1.0, <1.5`, `=2.0.0`, `*`.
   - **git** with a `rev` (a tag, branch or commit; the default branch without one).
-  - **path**: a directory used in place. Only the project's own phv.toml can name one.
+  - **path**: a directory used in place. Only the project's own phv.toml can name one. A path on another machine (a
+    network share or drive, or a link to one) is refused before anything there is opened.
 - `phv install` also installs the packages a package needs (its own `[dependencies]`; nothing else of its phv.toml
   is read). Each package is installed once, into `vendor/<name>`: for version requirements, at the newest version
   that every package asking for it accepts. If none fits all of them, it is an error that lists each requirement and
@@ -2578,34 +2658,39 @@ It then runs the type checker and shows the places that need manual work, such a
 | Execution time | `serve`: 30 seconds (`--time-limit`), `run`: none | Fatal error (cannot be caught) |
 | Memory | 128 MB (`[security] memory_limit_mb`) | Fatal error |
 | SQLite databases a script has open at once | 64 | `DatabaseError` |
+| SQLite text or blob | 16 MB | `DatabaseError` (string or blob too big) |
+| SQLite statement: weight of its steps that read a whole value (see SQLite above); steps | 128; 43,008 | `DatabaseError` |
 | Call depth | 10,000 (callbacks of builtins inside each other: 200, each only while 512 KB of the thread's stack is left) | Fatal error |
 | Request body | 8 MB | 413 |
 | Scripts running at once (`serve`) | two per CPU, at least 8 (`[server] workers`) | waits up to 10 seconds, then 503 |
 | Jobs running at once (`serve`, `phv jobs run`) | 2 per process (`[jobs] workers`), each with `[jobs] time_limit` (300 s) and `memory_limit_mb`, besides the scripts of pages | the job waits in the store |
 | Jobs waiting and running in the store | 100,000 or 1 GB of payloads (memory: 10,000 or 64 MB); a payload 64 KB | `enqueue()` throws |
 | Keys of ended jobs a store remembers | 100,000 (the latest), each a day | the oldest are forgotten |
+| Scripts waiting for a job key an open transaction holds | 8 per process and site, each 10 seconds at most | `enqueue()` throws `DatabaseError` |
 | Output waiting to be sent (`serve`) | `workers` × `memory_limit_mb`, a quarter of it for event streams | 503; an event stream is ended or skips the event |
 | Request body bytes past the first 64 KB, received or held (`serve`) | `workers` × 8 MB | waits up to 10 seconds, then 503 |
-| A streamed response (`flush()`) | one chunk ahead of the client; 30 seconds without reading | `flush()` returns false |
+| A streamed response (`flush()`) | one chunk ahead of the client; 10 seconds without reading | `flush()` returns false |
 | A JSON Web Token (std.jwt) | 256 KB, its header 8 KB | `verify()` returns null |
 | A JWKS | 512 KB, 64 keys read; 32 sets kept per process | `NetworkError` (`fetch`), `ValueError` (`fromJson`) |
 | Sign-ins a session has started (std.oauth) | 4, each for 10 minutes | the oldest is forgotten |
 | Spans a script records (`[telemetry]`) | 1,000 | not recorded |
-| Spans waiting to be exported | 8,192 | dropped (`phv_telemetry_dropped_spans_total`) |
+| Spans waiting to be exported | 8,192 and 16 MB; a span's name or text attribute 1,024 bytes | dropped (`phv_telemetry_dropped_spans_total`); longer texts are cut |
 | Source file (module, template, script) | 8 MB | Compile error (`phv lsp`: a larger open document is not checked or formatted, and renames are refused while it is open) |
 | Tokens of one source file (the code inside its strings included) | 1,000,000 | Compile error (the file is not parsed) |
-| All the files of one program (a page or script with what it imports and renders, std included) | 2,000,000 tokens, 32 MB of source, 2,000 files | Compile error (the program is not checked; `phv lsp` keeps no analysis of a program of more than 250,000 tokens between requests) |
+| All the files of one program (a page or script with what it imports and renders, std included) | 2,000,000 tokens, 32 MB of source, 2,000 files | Compile error (the program is not checked; between requests `phv lsp` keeps the analyses of open documents up to 250,000 tokens and 16 MB of source in all, the least recently used dropped first, each for at most 2 seconds) |
 | Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits) |
 | Levels of classes and interfaces above a class (`extends`, `implements`) | 256 | Compile error |
 | Ancestors, interfaces and the type arguments given to them, all classes together | 2,000,000 (a type argument given to an ancestor: 10,000 type nodes) | Compile error (each class lists all of its ancestors) |
 | Variables and temporary values of one function | 65,534 | Compile error (split the function) |
 | Instructions of one function | 8,388,608 | Compile error (split the function) |
 | Properties of one class (inherited ones included) | 65,535 | Compile error |
-| A string built by a constant expression | 1 MiB (16 MiB for all of a program's) | Compile error |
+| A string built by a constant expression | 1 MiB (16 MiB for all of a program's, with the string default values of the properties of every class, inherited ones included) | Compile error |
 | Type aliases resolved inside each other | 64 | Compile error |
 | Type parameters of a function, class or type alias | 4 | Compile error |
 | Members of a union type written in the source | 256 | Compile error |
 | Size of the type an alias stands for | 10,000 type nodes (2,000,000 for all uses together) | Compile error |
+| Size of the type of an expression, inferred from the types of others (a generic call, a closure, a list) | 10,000 type nodes (2,000,000 for all expressions together whose types have 100 nodes or more) | Compile error |
+| A bytecode cache entry (`.phv-cache/`) | 256 MB | not written (the program is compiled at each run) |
 
 `unsafe` is used only in the allocator that counts memory usage (`phv_vm/src/alloc.rs`), in the JIT
 (`phv_jit`, for calling generated code, and the helpers it calls in `phv_vm/src/jit.rs`), in asking the OS where a thread's

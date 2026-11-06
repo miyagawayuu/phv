@@ -436,7 +436,22 @@ struct Kept {
     stmt: postgres::Statement,
     /// The `PgConn::epoch` it was prepared in.
     epoch: u64,
+    /// Its name on the server (`statement_name`).
+    name: Option<String>,
 }
+
+/// The name a statement was prepared under on the server. The client shows
+/// it only in `Debug` (`Statement { name: "s12", .. }`).
+fn statement_name(stmt: &postgres::Statement) -> Option<String> {
+    let shown = format!("{stmt:?}");
+    let rest = shown.strip_prefix("Statement { name: \"")?;
+    Some(rest.split_once('"')?.0.to_string()).filter(|n| !n.is_empty())
+}
+
+/// The most statements a connection's client prepared for itself that the
+/// reset checks (`PgConn::own`): the sentinel, and the client's statements
+/// that look types up (three at most).
+const OWN_STATEMENTS: usize = 16;
 
 struct PgConn {
     client: PgClient,
@@ -462,10 +477,19 @@ struct PgConn {
     /// this connection: each of its statements is sent with a
     /// `statement_timeout` that ends there (see `store_prelude`).
     store_until: Option<Instant>,
-    /// A statement prepared when the connection was made and never closed,
-    /// and its text (unique to the connection): gone only when a script
-    /// deallocated the client's statements (see `PG_RESET`).
-    sentinel: (String, postgres::Statement),
+    /// A statement prepared when the connection was made and never closed:
+    /// gone only when a script deallocated the client's statements (see
+    /// `PG_RESET`). Held so the client never closes it; the reset looks for
+    /// it by its name, the first of `own`.
+    #[allow(dead_code)]
+    sentinel: postgres::Statement,
+    /// The server's names of the statements the client prepared for itself
+    /// and keeps for its whole life: the sentinel's, then those that look
+    /// types up, as the reset finds them (see `PgConn::reset_session`).
+    own: Vec<String>,
+    /// Whether the client looked a type up (with statements of its own) since
+    /// it was made.
+    looked_up: bool,
 }
 
 /// Clears what a script can leave on a session, in one round trip. This is
@@ -476,17 +500,21 @@ struct PgConn {
 /// only warns; inside one it ends it, so the reset itself does not run inside
 /// the script's transaction.
 ///
-/// The last statement also looks for the connection's `sentinel`: when a
-/// script deallocated the client's own statements (`DEALLOCATE ALL`, or
-/// `DISCARD ALL`, perhaps inside a function where PHV cannot see it), the
-/// client still holds the statements it prepared to look up types, and would
-/// fail on them for every later script ("prepared statement ... does not
-/// exist"); such a connection is closed instead of reused (found by the
-/// 1.1.1 tests).
+/// The last statement lists the session's prepared statements: those of
+/// SQL's `PREPARE` (`sql <name>`), which are deallocated, and those the
+/// client prepared (`own <name>`). When a script deallocated statements the
+/// client prepared for itself (`DEALLOCATE ALL`, or `DISCARD ALL`, perhaps
+/// inside a function where PHV cannot see it), the client still holds those
+/// it prepared to look up types, and would fail on them for every later
+/// script ("prepared statement ... does not exist"); such a connection is
+/// closed instead of reused (found by the 1.1.1 tests). Each statement is
+/// looked for by its name, which a script cannot give its own statements
+/// (found by the 1.2 audit: the sentinel was looked for by its text, which a
+/// script could prepare again, and a script could deallocate the type
+/// lookups alone).
 const PG_RESET: &str = "ROLLBACK; CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; \
     SELECT pg_advisory_unlock_all(); DISCARD PLANS; DISCARD TEMP; DISCARD SEQUENCES; \
-    SELECT name FROM pg_prepared_statements WHERE from_sql UNION ALL \
-    SELECT NULL WHERE EXISTS (SELECT 1 FROM pg_prepared_statements WHERE NOT from_sql AND statement = ";
+    SELECT CASE WHEN from_sql THEN 'sql ' ELSE 'own ' END || name FROM pg_prepared_statements";
 
 /// What a statement's text is, for the kept statements: only plain data
 /// statements are kept; the others are run as before, and may change the
@@ -545,14 +573,34 @@ impl PgConn {
     }
 
     fn reset_session(&mut self) -> bool {
-        // The sentinel's row is a NULL (read as ""): no statement is named so.
-        let sql = format!("{PG_RESET}'{}')", self.sentinel.0);
-        let Ok(names) = self.client.simple_last_column(&sql) else { return false };
-        names.iter().any(String::is_empty)
-            && names
-                .iter()
-                .filter(|n| !n.is_empty())
-                .all(|n| self.client.batch_execute(&format!("DEALLOCATE \"{}\"", n.replace('"', "\"\""))).is_ok())
+        let Ok(rows) = self.client.simple_last_column(PG_RESET) else { return false };
+        let mut on_server = HashSet::new();
+        for row in &rows {
+            if let Some(n) = row.strip_prefix("sql ") {
+                if self.client.batch_execute(&format!("DEALLOCATE \"{}\"", n.replace('"', "\"\""))).is_err() {
+                    return false;
+                }
+            } else if let Some(n) = row.strip_prefix("own ") {
+                on_server.insert(n);
+            }
+        }
+        // Every statement the client prepared for itself is still there.
+        if !self.own.iter().all(|n| on_server.contains(n.as_str())) {
+            return false;
+        }
+        // The client's other statements are the kept ones (any other was
+        // closed when the client dropped it, before this reset): the rest are
+        // those it prepared to look types up, which it keeps from now on.
+        let kept: Option<HashSet<&str>> = self.kept.iter().map(|k| k.name.as_deref()).collect();
+        let Some(kept) = kept else { return true };
+        for n in on_server {
+            if !kept.contains(n) && !self.own.iter().any(|o| o == n) && self.own.len() < OWN_STATEMENTS {
+                self.own.push(n.to_string());
+            }
+        }
+        // A type was looked up, but no statement that does is left: a script
+        // deallocated them in the same run as the first lookup.
+        !(self.looked_up && self.own.len() < 2)
     }
 
     /// Drops the kept statements (and the types the client looked up, which a
@@ -586,7 +634,8 @@ impl PgConn {
         {
             self.kept.remove(0);
         }
-        self.kept.push(Kept { text: text.to_string(), stmt: stmt.clone(), epoch: self.epoch });
+        let name = statement_name(stmt);
+        self.kept.push(Kept { text: text.to_string(), stmt: stmt.clone(), epoch: self.epoch, name });
     }
 
     /// Runs `run` with the statement for `text`: a kept one, or one prepared
@@ -610,6 +659,7 @@ impl PgConn {
                     // The prelude, if any, ran before the statement failed.
                     self.forget_statements();
                     let again = self.client.run(None, self.client.client().prepare(text)).and_then(|fresh| {
+                        self.note_types(&fresh);
                         let r = run(&self.client, &fresh, None);
                         self.keep(text, &fresh);
                         r
@@ -623,10 +673,21 @@ impl PgConn {
             }
         }
         let stmt = self.client.run(prelude, self.client.client().prepare(text))?;
+        self.note_types(&stmt);
         if keep {
             self.keep(text, &stmt);
         }
         run(&self.client, &stmt, None)
+    }
+
+    /// Notes when `stmt` has a type the client does not know by itself: the
+    /// client looked it up, with statements it prepared for itself.
+    fn note_types(&mut self, stmt: &postgres::Statement) {
+        use postgres::types::Type;
+        let looked_up = |t: &Type| Type::from_oid(t.oid()).is_none();
+        if stmt.params().iter().any(looked_up) || stmt.columns().iter().any(|c| looked_up(c.type_())) {
+            self.looked_up = true;
+        }
     }
 }
 
@@ -737,8 +798,16 @@ fn pg_connect(url: &str, spec: &DatabaseSpec, timeout: Duration) -> Result<PgCon
     let make_tls = || tokio_postgres_rustls::MakeRustlsConnect::new((*crate::netio::tls_config()).clone());
     let client = PgClient::connect(&config, tls.then(make_tls), timeout, meter.clone())?;
     let text = format!("SELECT 1 AS phv_{}", crate::random_hex(8));
-    let stmt = client.run(None, client.client().prepare(&text)).map_err(|e| pg_message(&e))?;
-    let sentinel = (text, stmt);
+    let sentinel = client.run(None, client.client().prepare(&text)).map_err(|e| pg_message(&e))?;
+    // Its name, which no script has had the chance to prepare a statement under yet.
+    let named = client
+        .query("SELECT name FROM pg_prepared_statements WHERE NOT from_sql AND statement = $1", &[&text])
+        .map_err(|e| pg_message(&e))?;
+    let name = named
+        .first()
+        .and_then(|r| r.try_get::<_, String>(0).ok())
+        .or_else(|| statement_name(&sentinel))
+        .ok_or_else(|| "the server does not list the connection's statements".to_string())?;
     meter.set(None, RESET_BUDGET);
     Ok(PgConn {
         client,
@@ -750,6 +819,8 @@ fn pg_connect(url: &str, spec: &DatabaseSpec, timeout: Duration) -> Result<PgCon
         jobs_tx: None,
         store_until: None,
         sentinel,
+        own: vec![name],
+        looked_up: false,
     })
 }
 
@@ -799,6 +870,13 @@ enum PgFailure {
 /// cannot be reused (closed, or stopped by the meter in the middle of a reply).
 fn pg_failure(c: &mut Pooled<PgConn>, e: &postgres::Error) -> PgFailure {
     if c.get().client.is_closed() {
+        c.broken = true;
+    }
+    // A prepared statement that does not exist, past the retry of a stale
+    // kept one: perhaps one the client prepared for itself to look types up,
+    // which a script deallocated where the reset could not tell. The client
+    // would fail on it for every later script (found by the 1.2 audit).
+    if e.code() == Some(&postgres::error::SqlState::INVALID_SQL_STATEMENT_NAME) {
         c.broken = true;
     }
     match c.get().meter.tripped() {
@@ -1901,6 +1979,27 @@ pub(crate) enum PoolUse {
     /// Jobs added near the cap, which wait for the store's lock: apart, so
     /// they never hold the connections of `Jobs` while they wait.
     JobLock,
+    /// Jobs added with a key by scripts: each try is short (a key an open
+    /// transaction holds is looked at again later, on a connection taken
+    /// again), and on connections apart from those of the scheduler and of
+    /// the adds near the cap (found by the 1.2 audit: waits on held keys
+    /// took every connection those used).
+    JobKey,
+    /// The jobs of `[[schedule]]`: a pool of their own, which scripts never use.
+    Schedule,
+}
+
+impl PoolUse {
+    /// What the pool is for, in the error of a pool whose connections are all in use.
+    fn what(self) -> &'static str {
+        match self {
+            PoolUse::Scripts => "scripts",
+            PoolUse::Sessions => "sessions",
+            PoolUse::RateLimits => "rate limits",
+            PoolUse::Publish => "publishing",
+            PoolUse::Jobs | PoolUse::JobLock | PoolUse::JobKey | PoolUse::Schedule => "the job store",
+        }
+    }
 }
 
 fn pool_key(spec: &DatabaseSpec, url: &str, use_: PoolUse) -> (String, usize) {
@@ -1912,6 +2011,8 @@ fn pool_key(spec: &DatabaseSpec, url: &str, use_: PoolUse) -> (String, usize) {
         PoolUse::Publish => (format!("publish|{key}"), 1),
         PoolUse::Jobs => (format!("jobs|{key}"), spec.pool_size.min(4)),
         PoolUse::JobLock => (format!("joblock|{key}"), spec.pool_size.min(4)),
+        PoolUse::JobKey => (format!("jobkey|{key}"), spec.pool_size.min(4)),
+        PoolUse::Schedule => (format!("schedule|{key}"), spec.pool_size.min(2)),
     }
 }
 
@@ -1942,7 +2043,12 @@ fn detached_conn<C: Driver>(
 ) -> Result<Pooled<C>, String> {
     match pooled(registry, spec, url, use_, until, connect) {
         Ok(c) => Ok(c),
-        Err(AcquireError::Busy) => Err(format!("all {} connections are in use (raise pool_size?)", spec.pool_size)),
+        // The size of the pool that was full (found by the 1.2 audit: the
+        // error named pool_size for the smaller pools of PHV's own stores).
+        Err(AcquireError::Busy) => Err(match pool_key(spec, url, use_).1 {
+            n if use_ == PoolUse::Scripts => format!("all {n} connections are in use (raise pool_size?)"),
+            n => format!("all {n} connections for {} are in use", use_.what()),
+        }),
         Err(AcquireError::Connect(e)) => Err(format!("cannot connect: {e}")),
     }
 }
@@ -2095,13 +2201,17 @@ fn my_detached(
 // a table `phv_sessions_<namespace>` (PostgreSQL, MySQL) and, in Redis, with
 // bookkeeping keys `phv:sessions:<namespace>:*` of its own, so the
 // `session_ttl` and the limits of one site never remove another's sessions
-// (found by the 1.1.1 audit). A site without a namespace keeps `phv_sessions`
-// and `phv:sessions:*`, shared with every other such site.
+// (found by the 1.1.1 audit). A site without a namespace has a table and keys
+// of its own too, `phv_sessions_unnamed` and `phv:sessions:unnamed:*` (shared
+// with every other site without one), apart from the store every site shared
+// in 1.1 (found by the 1.2 audit: its ttl and limits removed the sessions
+// other sites had kept there).
 //
-// Sessions that 1.1 kept in `phv_sessions` for a site with a namespace are
-// still read and updated where they are, and removed from both tables; new and
-// regenerated sessions go to the site's own table. A session is in one table
-// only, so each step stays atomic, and upgrading signs no one out.
+// Sessions that 1.1 kept in `phv_sessions` are still read and updated where
+// they are, and removed from both tables; new and regenerated sessions go to
+// the site's own table. A session is in one table only, so each step stays
+// atomic, and upgrading signs no one out. What is left in the shared store is
+// removed only once no site can use it (see `session_sweep`).
 
 /// One stored session: its values as JSON, Unix times, and whether its
 /// visitor came back (sent the cookie) at least once.
@@ -2127,23 +2237,35 @@ const SESSION_WAIT: Duration = Duration::from_secs(5);
 const NEW_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// The table and the Redis bookkeeping that every site shared in 1.1 (and
-/// that sites without a namespace still share).
+/// sites without a namespace in 1.1.1).
 const SESSIONS_SHARED: &str = "phv_sessions";
 const REDIS_SESSIONS_SHARED: &str = "phv:sessions:";
+/// Those of the sites without a namespace (since 1.2). Not hex digits: no
+/// namespace names them.
+const SESSIONS_UNNAMED: &str = "phv_sessions_unnamed";
+const REDIS_SESSIONS_UNNAMED: &str = "phv:sessions:unnamed:";
+
+/// The namespace that names the store every site shared in 1.1 itself, to
+/// write sessions there as 1.1 did (for the tests of the upgrade). No site
+/// has it: a site's namespace is hex digits.
+#[doc(hidden)]
+pub const SESSIONS_OF_1_1: &str = "1.1";
 
 /// The table of a site's sessions (see `jobs_table`).
 fn sessions_table(ns: Option<&str>) -> String {
     match ns {
+        Some(SESSIONS_OF_1_1) => SESSIONS_SHARED.to_string(),
         Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_hexdigit()) => format!("phv_sessions_{n}"),
-        _ => SESSIONS_SHARED.to_string(),
+        _ => SESSIONS_UNNAMED.to_string(),
     }
 }
 
 /// The prefix of a site's session bookkeeping in Redis (see `sessions_table`).
 fn redis_sessions_prefix(ns: Option<&str>) -> String {
     match ns {
+        Some(SESSIONS_OF_1_1) => REDIS_SESSIONS_SHARED.to_string(),
         Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_hexdigit()) => format!("phv:sessions:{n}:"),
-        _ => REDIS_SESSIONS_SHARED.to_string(),
+        _ => REDIS_SESSIONS_UNNAMED.to_string(),
     }
 }
 
@@ -2696,12 +2818,13 @@ pub fn session_remove(spec: &DatabaseSpec, ns: Option<&str>, key: &str) -> Resul
 /// whose visitor never came back first, then the least recently used, down to
 /// 90%. (Redis keeps within its limits as sessions are written.)
 ///
-/// A site with a namespace also clears what 1.1 left in the shared store,
-/// without touching a session that is still alive for any site (found by the
-/// 1.1.1 audit: only sites without a namespace swept it): rows of the shared
-/// table older than `max_lifetime`, which every site has expired, and in
-/// Redis the shared bookkeeping of sessions Redis has expired since. Both in
-/// bounded batches.
+/// Each site also clears what 1.1 left in the shared store, without touching
+/// a session that is still alive for any site (found by the 1.1.1 audit: only
+/// sites without a namespace swept it, and by the 1.2 audit: by their own ttl
+/// and limits): rows of the shared table older than `max_lifetime` (24 hours,
+/// the same for every site), which every site has expired, and in Redis the
+/// shared bookkeeping of sessions Redis has expired since. Both in bounded
+/// batches.
 pub fn session_sweep(spec: &DatabaseSpec, ns: Option<&str>, limits: &SessionLimits) -> Result<(), String> {
     let (mut conn, until, t) = session_conn(spec, ns)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
@@ -3326,7 +3449,8 @@ return 1
 /// most a second old (one per process); near them it is added under the
 /// store's lock (`job_add_locked`), and counted there only (found by the 1.1.1
 /// audit: near the cap each job counted the table twice).
-pub fn job_add(
+#[cfg(test)]
+fn job_add(
     spec: &DatabaseSpec,
     ns: Option<&str>,
     job: (&str, &str, &str),
@@ -3335,23 +3459,140 @@ pub fn job_add(
     cap: JobCap,
     deadline: Option<Instant>,
 ) -> Result<Option<()>, String> {
+    job_add_by(spec, ns, job, run_at, uniq, cap, deadline, JobAdder::Script)
+}
+
+/// Who adds a job: a script (`enqueue()`), or the scheduler of `[[schedule]]`,
+/// whose adds have connections of their own (`PoolUse::Schedule`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum JobAdder {
+    Script,
+    Schedule,
+}
+
+/// How long one try of adding a job with a key waits on the server for the
+/// key's row, when another transaction added the same key and has not ended.
+const JOB_KEY_TRY_MS: u64 = 10;
+/// How many adds of a process may wait for keys held by open transactions on
+/// a store at once; the others fail at once (`KEY_HELD`).
+pub const JOB_KEY_WAITERS: usize = 8;
+const KEY_HELD: &str = "the key is held by a transaction that has not ended";
+
+/// The adds waiting for held keys now, by store (`job_count_key`).
+static KEY_WAITERS: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Default::default);
+
+/// One of the `JOB_KEY_WAITERS` places of a store, while an add waits.
+struct KeyWaiter(String);
+
+impl KeyWaiter {
+    fn take(store: &str) -> Option<KeyWaiter> {
+        let mut waiters = lock(&KEY_WAITERS);
+        let n = waiters.entry(store.to_string()).or_insert(0);
+        if *n >= JOB_KEY_WAITERS {
+            return None;
+        }
+        *n += 1;
+        Some(KeyWaiter(store.to_string()))
+    }
+}
+
+impl Drop for KeyWaiter {
+    fn drop(&mut self) {
+        let mut waiters = lock(&KEY_WAITERS);
+        if let Some(n) = waiters.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                waiters.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// What one try of adding a job came to: done (`None` when its key is taken),
+/// or its key is held by a transaction that has not ended yet.
+enum Tried {
+    Done(Option<()>),
+    Held,
+}
+
+/// `job_add` for `adder`.
+///
+/// A job whose key an open transaction holds (added it, not yet ended) is
+/// tried again a little later, until the deadline, on a connection taken
+/// again each time: no connection is held while it waits, so such waits
+/// never take the connections the scheduler, the adds near the cap or the
+/// other adds use. At most `JOB_KEY_WAITERS` scripts of a process wait for a
+/// store's keys at once (found by the 1.2 audit: four waits took every
+/// connection the scheduler used, and a scheduled run was lost).
+#[allow(clippy::too_many_arguments)]
+pub fn job_add_by(
+    spec: &DatabaseSpec,
+    ns: Option<&str>,
+    job: (&str, &str, &str),
+    run_at: i64,
+    uniq: Option<&str>,
+    cap: JobCap,
+    deadline: Option<Instant>,
+    adder: JobAdder,
+) -> Result<Option<()>, String> {
+    // One deadline for all the tries.
+    let until = deadline.map_or(Instant::now() + JOB_WAIT, |d| d.min(Instant::now() + JOB_WAIT));
+    let mut waiting = None;
+    let mut pause = Duration::from_millis(10);
+    loop {
+        match job_add_once(spec, ns, job, run_at, uniq, cap, until, adder)? {
+            Tried::Done(r) => return Ok(r),
+            Tried::Held => {
+                if adder == JobAdder::Script && waiting.is_none() {
+                    let store = job_count_key(spec, &jobs_table(ns));
+                    let place = KeyWaiter::take(&store).ok_or_else(|| {
+                        format!("{KEY_HELD} ({JOB_KEY_WAITERS} other adds wait for held keys already)")
+                    })?;
+                    waiting = Some(place);
+                }
+                if Instant::now() + pause >= until {
+                    return Err(KEY_HELD.into());
+                }
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+/// One try of `job_add_by`, by `until`.
+#[allow(clippy::too_many_arguments)]
+fn job_add_once(
+    spec: &DatabaseSpec,
+    ns: Option<&str>,
+    job: (&str, &str, &str),
+    run_at: i64,
+    uniq: Option<&str>,
+    cap: JobCap,
+    until: Instant,
+    adder: JobAdder,
+) -> Result<Tried, String> {
     let (id, name, payload) = job;
     let t = jobs_table(ns);
     let size = payload.len();
     let count_key = job_count_key(spec, &t);
+    let lock_use = if adder == JobAdder::Schedule { PoolUse::Schedule } else { PoolUse::JobLock };
     // Near the caps by this process's count of the last second: straight to the lock.
     let redis = spec.url.as_deref().is_some_and(|u| kind_of(u) == Kind::Redis);
     if let Some(load) = cached_job_load(&count_key).filter(|l| !redis && !l.far(cap)) {
         if load.full(cap, size) {
             return Err(cap.full());
         }
-        return job_add_locked(spec, ns, job, run_at, uniq, cap, deadline);
+        return job_add_locked(spec, ns, job, run_at, uniq, cap, Some(until), lock_use).map(Tried::Done);
     }
-    // A job with a key may wait for the row of a transaction that added the
-    // same key: on connections apart, so such waits never hold those that the
-    // job runners and the other jobs use (found by the 1.1.1 audit).
-    let use_ = if uniq.is_some() { PoolUse::JobLock } else { PoolUse::Jobs };
-    let (mut conn, until) = job_conn_for(spec, ns, deadline, use_)?;
+    // Jobs with a key apart from the others (see `PoolUse::JobKey`), and the
+    // scheduler's apart from the scripts'.
+    let use_ = match adder {
+        JobAdder::Schedule => PoolUse::Schedule,
+        JobAdder::Script if uniq.is_some() => PoolUse::JobKey,
+        JobAdder::Script => PoolUse::Jobs,
+    };
+    let (mut conn, until) = job_conn_for(spec, ns, Some(until), use_)?;
     let now = now_ms();
     let load = match &mut conn {
         SessionConn::Redis(c) => {
@@ -3369,8 +3610,8 @@ pub fn job_add(
                 bytes_s.as_bytes(),
             ];
             return match job_redis(c, &REDIS_JOB_ADD, &jobs_prefix(ns), &args, until)? {
-                Reply::Int(1) => Ok(Some(())),
-                Reply::Int(0) => Ok(None),
+                Reply::Int(1) => Ok(Tried::Done(Some(()))),
+                Reply::Int(0) => Ok(Tried::Done(None)),
                 Reply::Int(_) => Err(cap.full()),
                 _ => Err("the server sent an invalid reply".into()),
             };
@@ -3391,21 +3632,33 @@ pub fn job_add(
     if load.far(cap) {
         return match &mut conn {
             SessionConn::Pg(c) => {
-                pg_job_insert(c.get(), &t, false, job, run_at, uniq, now, None).map_err(|e| pg_message(&e))
+                let conn = c.get();
+                // A held key waits `JOB_KEY_TRY_MS` at most (the connection
+                // is reset when it goes back to the pool).
+                let prelude = conn.store_prelude().filter(|_| uniq.is_some());
+                let prelude = prelude.map(|set| format!("{set}; SET lock_timeout = {JOB_KEY_TRY_MS}"));
+                match pg_job_insert(conn, &t, false, job, run_at, uniq, now, prelude.as_deref()) {
+                    Err(e) if uniq.is_some() && e.code() == Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {
+                        Ok(Tried::Held)
+                    }
+                    r => r.map(Tried::Done).map_err(|e| pg_message(&e)),
+                }
             }
-            SessionConn::My(c) => my_job_insert(c.get(), &t, job, run_at, uniq, now, until),
+            SessionConn::My(c) => my_job_try_insert(c.get(), &t, job, run_at, uniq, now),
             SessionConn::Redis(_) => unreachable!("Redis added the job above"),
         };
     }
     drop(conn);
-    job_add_locked(spec, ns, job, run_at, uniq, cap, deadline)
+    job_add_locked(spec, ns, job, run_at, uniq, cap, Some(until), lock_use).map(Tried::Done)
 }
 
 /// `job_add` near the caps: in a transaction of its own that takes the store's
 /// lock first, as transactions that add jobs do (see `job_add_in_transaction`),
 /// so jobs are counted and added one at a time and none goes past the caps.
 /// The count is the one kept in `phv_jobs_counts` while it is fresh, so a
-/// burst of jobs near the cap does not count the table for each.
+/// burst of jobs near the cap does not count the table for each. On the
+/// connections of `use_`: `JobLock` for scripts, `Schedule` for the scheduler.
+#[allow(clippy::too_many_arguments)]
 fn job_add_locked(
     spec: &DatabaseSpec,
     ns: Option<&str>,
@@ -3414,10 +3667,11 @@ fn job_add_locked(
     uniq: Option<&str>,
     cap: JobCap,
     deadline: Option<Instant>,
+    use_: PoolUse,
 ) -> Result<Option<()>, String> {
     use mysql::prelude::Queryable;
     let t = jobs_table(ns);
-    let (mut conn, until) = job_conn_for(spec, ns, deadline, PoolUse::JobLock)?;
+    let (mut conn, until) = job_conn_for(spec, ns, deadline, use_)?;
     let now = now_ms();
     let size = job.2.len();
     let count_key = job_count_key(spec, &t);
@@ -3717,28 +3971,43 @@ fn my_job_insert(
     now: i64,
     until: Instant,
 ) -> Result<Option<()>, String> {
-    use mysql::prelude::Queryable;
-    let w = conn.watch();
-    if let Some(u) = uniq {
-        let mut pause = Duration::from_millis(10);
-        loop {
-            let probe = format!("SELECT id FROM {t} WHERE uniq = ? FOR UPDATE NOWAIT");
-            match conn.conn.exec_first::<String, _, _>(probe, (u,)) {
-                Ok(Some(_)) => return Ok(None),
-                Ok(None) => break,
-                // 3572: the row is locked (MySQL); 1205: the same in MariaDB.
-                Err(mysql::Error::MySqlError(e)) if e.code == 3572 || e.code == 1205 => {
-                    if Instant::now() + pause >= until {
-                        return Err("the key is held by a transaction that has not ended".into());
-                    }
-                    std::thread::sleep(pause);
-                    pause = (pause * 2).min(Duration::from_millis(200));
+    let mut pause = Duration::from_millis(10);
+    loop {
+        match my_job_try_insert(conn, t, job, run_at, uniq, now)? {
+            Tried::Done(r) => return Ok(r),
+            Tried::Held => {
+                if Instant::now() + pause >= until {
+                    return Err(KEY_HELD.into());
                 }
-                Err(e) => return Err(w.msg(e)),
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(200));
             }
         }
     }
-    my_job_insert_on(&mut conn.conn, t, job, run_at, uniq, now).map_err(|e| w.msg(e))
+}
+
+/// One try of `my_job_insert`: a key that another transaction holds is not waited for.
+fn my_job_try_insert(
+    conn: &mut MyConn,
+    t: &str,
+    job: (&str, &str, &str),
+    run_at: i64,
+    uniq: Option<&str>,
+    now: i64,
+) -> Result<Tried, String> {
+    use mysql::prelude::Queryable;
+    let w = conn.watch();
+    if let Some(u) = uniq {
+        let probe = format!("SELECT id FROM {t} WHERE uniq = ? FOR UPDATE NOWAIT");
+        match conn.conn.exec_first::<String, _, _>(probe, (u,)) {
+            Ok(Some(_)) => return Ok(Tried::Done(None)),
+            Ok(None) => {}
+            // 3572: the row is locked (MySQL); 1205: the same in MariaDB.
+            Err(mysql::Error::MySqlError(e)) if e.code == 3572 || e.code == 1205 => return Ok(Tried::Held),
+            Err(e) => return Err(w.msg(e)),
+        }
+    }
+    my_job_insert_on(&mut conn.conn, t, job, run_at, uniq, now).map(Tried::Done).map_err(|e| w.msg(e))
 }
 
 fn my_job_insert_on(
@@ -4950,14 +5219,15 @@ mod tests {
         };
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let row = |created: u64, last: u64| SessionRow { data: "{}".into(), created, last, returned: true };
+        let old = Some(SESSIONS_OF_1_1);
         for (var, spec) in test_servers() {
             let dead = format!("a-i2-dead-{}", crate::random_hex(8));
             let alive = format!("a-i2-alive-{}", crate::random_hex(8));
             if var == "PHV_TEST_REDIS_URL" {
                 // As 1.1 stored them: the dead one has a second of its lifetime left.
                 let lifetime = limits.max_lifetime.as_secs();
-                assert!(session_insert(&spec, None, &dead, &row(now - lifetime + 1, now), &limits).unwrap());
-                assert!(session_insert(&spec, None, &alive, &row(now, now), &limits).unwrap());
+                assert!(session_insert(&spec, old, &dead, &row(now - lifetime + 1, now), &limits).unwrap());
+                assert!(session_insert(&spec, old, &alive, &row(now, now), &limits).unwrap());
                 std::thread::sleep(Duration::from_millis(2100));
                 let until = Instant::now() + Duration::from_secs(5);
                 let mut c = redis_conn(&spec, PoolUse::Sessions, until).unwrap();
@@ -4965,20 +5235,93 @@ mod tests {
                     let r = redis_run(&mut c, &[b"ZSCORE", b"phv:sessions:back", key.as_bytes()], until).unwrap();
                     !matches!(r, Reply::Nil)
                 };
-                assert!(session_read(&spec, None, &dead).unwrap().is_none(), "Redis expired it");
+                assert!(session_read(&spec, old, &dead).unwrap().is_none(), "Redis expired it");
                 assert!(counted(&dead), "still counted in the shared bookkeeping");
                 session_sweep(&spec, Some("a12a12a12a12"), &limits).unwrap();
                 assert!(!counted(&dead), "{var}: the shared bookkeeping of an expired session was kept");
                 assert!(counted(&alive), "{var}: a live session was forgotten");
             } else {
                 let day = 24 * 3600;
-                assert!(session_insert(&spec, None, &dead, &row(now - day - 60, now - day - 60), &limits).unwrap());
-                assert!(session_insert(&spec, None, &alive, &row(now - 100, now - 100), &limits).unwrap());
+                assert!(session_insert(&spec, old, &dead, &row(now - day - 60, now - day - 60), &limits).unwrap());
+                assert!(session_insert(&spec, old, &alive, &row(now - 100, now - 100), &limits).unwrap());
                 session_sweep(&spec, Some("a12a12a12a12"), &limits).unwrap();
-                assert!(session_read(&spec, None, &dead).unwrap().is_none(), "{var}: an expired session was kept");
-                assert!(session_read(&spec, None, &alive).unwrap().is_some(), "{var}: a live session was removed");
+                assert!(session_read(&spec, old, &dead).unwrap().is_none(), "{var}: an expired session was kept");
+                assert!(session_read(&spec, old, &alive).unwrap().is_some(), "{var}: a live session was removed");
             }
-            session_remove(&spec, None, &alive).unwrap();
+            session_remove(&spec, old, &alive).unwrap();
+        }
+    }
+
+    /// A site without a namespace keeps its sessions apart from the store
+    /// every site shared in 1.1: its short ttl and small limits do not remove
+    /// the sessions other sites kept there, and its own sessions of 1.1 are
+    /// still read (found by the 1.2 audit: it swept the shared store by its
+    /// own ttl and limits).
+    /// The reset knows the client's statements by the names the server
+    /// lists: those the client shows (`statement_name`) and the sentinel's.
+    #[test]
+    fn statements_are_known_by_their_names() {
+        let Some(url) = std::env::var("PHV_TEST_POSTGRES_URL").ok().filter(|u| !u.is_empty()) else { return };
+        let spec = DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 1 };
+        let mut c = pg_connect(&url, &spec, Duration::from_secs(10)).unwrap();
+        let stmt = c.client.run(None, c.client.client().prepare("SELECT 2 AS phv_named")).unwrap();
+        let name = statement_name(&stmt).expect("the client shows the name");
+        c.keep("SELECT 2 AS phv_named", &stmt);
+        let listed = c.client.simple_last_column("SELECT name FROM pg_prepared_statements WHERE NOT from_sql").unwrap();
+        assert!(listed.contains(&name) && listed.contains(&c.own[0]), "{listed:?}");
+        assert!(c.reset(), "a reset of a sound connection");
+        assert_eq!(c.own.len(), 1, "a kept statement is not one of the client's own");
+    }
+
+    #[test]
+    fn a_site_without_a_namespace_keeps_to_its_own_sessions() {
+        let short = SessionLimits {
+            ttl: Duration::from_secs(60),
+            max_lifetime: Duration::from_secs(24 * 3600),
+            max_sessions: 1,
+            max_bytes: 256 << 20,
+        };
+        let long = SessionLimits { ttl: Duration::from_secs(7200), max_sessions: 50_000, ..short };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let row = |at: u64| SessionRow { data: "{}".into(), created: at, last: at, returned: true };
+        let old = Some(SESSIONS_OF_1_1);
+        for (var, spec) in test_servers() {
+            // Kept by 1.1: another site's session, and one of this site's own,
+            // both idle for two minutes (past this site's ttl).
+            let theirs = format!("f3-theirs-{}", crate::random_hex(8));
+            let mine = format!("f3-mine-{}", crate::random_hex(8));
+            let redis = var == "PHV_TEST_REDIS_URL";
+            // Redis takes the time of the last use from its own writes.
+            let idle = if redis { now } else { now - 120 };
+            assert!(session_insert(&spec, old, &theirs, &row(idle), &long).unwrap(), "{var}");
+            assert!(session_insert(&spec, old, &mine, &row(idle), &long).unwrap(), "{var}");
+            if redis {
+                std::thread::sleep(Duration::from_millis(2100));
+            }
+            // The site without a namespace writes two sessions (past its
+            // limit of one) and sweeps, with a ttl of one second in Redis.
+            let brief = SessionLimits { ttl: if redis { Duration::from_secs(1) } else { short.ttl }, ..short };
+            let new = [format!("f3-new-{}", crate::random_hex(8)), format!("f3-new-{}", crate::random_hex(8))];
+            for k in &new {
+                assert!(session_insert(&spec, None, k, &row(now), &brief).unwrap(), "{var}");
+            }
+            session_sweep(&spec, None, &brief).unwrap();
+            assert!(session_read(&spec, old, &theirs).unwrap().is_some(), "{var}: another site's session was removed");
+            if redis {
+                let until = Instant::now() + Duration::from_secs(5);
+                let mut c = redis_conn(&spec, PoolUse::Sessions, until).unwrap();
+                let r = redis_run(&mut c, &[b"ZSCORE", b"phv:sessions:back", theirs.as_bytes()], until).unwrap();
+                assert!(!matches!(r, Reply::Nil), "{var}: forgotten by the shared bookkeeping");
+            }
+            // Its own session of 1.1 is read, updated where it is, and logged out.
+            assert!(session_read(&spec, None, &mine).unwrap().is_some(), "{var}: its own old session was not read");
+            assert!(session_update(&spec, None, &mine, &row(now), &long).unwrap(), "{var}");
+            assert!(session_remove(&spec, None, &mine).unwrap(), "{var}");
+            assert!(session_read(&spec, old, &mine).unwrap().is_none(), "{var}");
+            for k in new.iter().chain([&theirs]) {
+                session_remove(&spec, old, k).unwrap();
+                session_remove(&spec, None, k).unwrap();
+            }
         }
     }
 

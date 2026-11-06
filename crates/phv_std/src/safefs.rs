@@ -237,9 +237,10 @@ pub fn opened_at(f: &File, path: &Path) -> Result<(), FsError> {
 /// Opening one makes Windows contact the host with the user's credentials, so
 /// links are read, never followed, and each target is looked at first (found
 /// by the 1.1.1 review: a link to a share, or a network drive, passed the
-/// check of the name's first characters). A missing path is not refused here
-/// (opening it fails). On Unix, network file systems are mounted by the
-/// administrator: false.
+/// check of the name's first characters). A missing file is not refused here
+/// (opening it fails), but a folder on the way that cannot be read after a
+/// link is. On Unix, network file systems are mounted by the administrator:
+/// false.
 #[cfg(windows)]
 pub fn on_another_machine(path: &Path) -> bool {
     imp::on_another_machine(None, path)
@@ -254,7 +255,9 @@ pub fn on_another_machine(_path: &Path) -> bool {
 /// which the user chose and may be anywhere): only the part of `path` below
 /// `base` is looked at, and where its links lead. A link that leads back
 /// below `base` is fine; one that leads elsewhere is looked at whole. A path
-/// not below `base` is looked at whole.
+/// not below `base` is looked at whole. `base` is taken by its real folder
+/// (where Windows resolves the relative links below it), unless it is on
+/// another machine.
 #[cfg(windows)]
 pub fn on_another_machine_below(base: &Path, path: &Path) -> bool {
     imp::on_another_machine(Some(base), path)
@@ -811,14 +814,70 @@ mod imp {
         rooted || spelled_remote(target)
     }
 
+    /// `p` with `.` and `..` taken out by its spelling, as Windows does with a
+    /// name (and with a link's target, against the folder the link is in).
+    fn lexical(p: &Path) -> PathBuf {
+        use std::path::Component;
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                        out.pop();
+                    } else if !out.has_root() {
+                        out.push("..");
+                    }
+                }
+                c => out.push(c.as_os_str()),
+            }
+        }
+        out
+    }
+
+    /// `p` without the `\\?\` that `canonicalize` puts before a drive or a share.
+    fn plain(p: PathBuf) -> PathBuf {
+        use std::path::{Component, Prefix};
+        let mut comps = p.components();
+        let start = match comps.next() {
+            Some(Component::Prefix(x)) => match x.kind() {
+                Prefix::VerbatimDisk(d) => PathBuf::from(format!("{}:\\", d as char)),
+                Prefix::VerbatimUNC(host, share) => {
+                    let mut s = std::ffi::OsString::from(r"\\");
+                    s.push(host);
+                    s.push(r"\");
+                    s.push(share);
+                    s.push(r"\");
+                    PathBuf::from(s)
+                }
+                _ => return p,
+            },
+            _ => return p,
+        };
+        let mut out = start;
+        for c in comps {
+            if !matches!(c, Component::RootDir) {
+                out.push(c.as_os_str());
+            }
+        }
+        out
+    }
+
     /// See `super::on_another_machine_below`; `base` None: the whole path.
     pub fn on_another_machine(base: Option<&Path>, path: &Path) -> bool {
         use std::path::Component;
         let mut p = path.to_path_buf();
+        let mut base: Option<PathBuf> = base.map(Path::to_path_buf);
+        // Whether the base was taken by its real folder (at the first link).
+        let mut rebased = false;
+        // Whether a link was followed: after one, the path is our own spelling
+        // of where Windows goes, and a part of it that cannot be read is refused
+        // rather than passed (found by the 16th assessment).
+        let mut followed = false;
         // As many links in a row as Windows follows.
         for _ in 0..63 {
             // The components of `base` are not looked at.
-            let known = match base {
+            let known = match &base {
                 Some(b) if p.starts_with(b) => b.components().count(),
                 _ => {
                     if spelled_remote(&p) {
@@ -843,23 +902,59 @@ mod imp {
                         if remote_link_target(&target) {
                             return true;
                         }
+                        // At the first link, the base is taken by its real folder
+                        // and the path looked at again from there.
+                        if !rebased {
+                            rebased = true;
+                            if let Some((real, moved)) = base.as_deref().and_then(|b| real_base(b, &p)) {
+                                if moved != p {
+                                    base = Some(real);
+                                    next = Some((moved, false));
+                                    break;
+                                }
+                            }
+                        }
                         let mut t = at.parent().unwrap_or(Path::new("")).join(target);
                         for rest in &comps[i + 1..] {
                             t.push(rest.as_os_str());
                         }
-                        next = Some(t);
+                        // The folders before the link are real (looked at, or the
+                        // base's real folder), so `..` is taken out by spelling.
+                        next = Some((lexical(&t), true));
                         break;
                     }
                     Ok(_) => {}
-                    Err(_) => return false,
+                    // A missing file is not refused (opening it fails); a part
+                    // before it that cannot be read after a link is.
+                    Err(_) => return followed && i + 1 < comps.len(),
                 }
             }
             match next {
-                Some(t) => p = t,
+                Some((t, link)) => {
+                    p = t;
+                    followed |= link;
+                }
                 None => return false,
             }
         }
         true
+    }
+
+    /// The real folder of `base`, and `p` (below `base`) moved there; none for
+    /// a base on another machine (resolving it would contact the host) or a `p`
+    /// not below it. Found by the 16th assessment: Windows resolves a relative
+    /// link's target against the folder the link is really in, so with a base
+    /// reached through a link to a folder, joining it to the base as spelled
+    /// led the check elsewhere (often to a missing folder, which passed).
+    fn real_base(base: &Path, p: &Path) -> Option<(PathBuf, PathBuf)> {
+        let b = std::path::absolute(base).ok()?;
+        let rest = std::path::absolute(p).ok()?.strip_prefix(&b).ok()?.to_path_buf();
+        if on_another_machine(None, &b) {
+            return None;
+        }
+        let real = plain(b.canonicalize().ok()?);
+        let moved = real.join(rest);
+        Some((real, moved))
     }
 }
 
@@ -1083,6 +1178,44 @@ mod tests {
             // A relative link that stays below the base is fine.
             std::os::windows::fs::symlink_file(r"..\outside\secret.txt", d.join("data/ok.txt")).unwrap();
             assert!(!on_another_machine_below(&d, &d.join("data/ok.txt")));
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Found by the 16th assessment: with the base reached through a link to a
+    /// directory, a relative link's target was joined to the base's spelling,
+    /// while Windows resolves it against the link's real folder; the folder it
+    /// named was missing, which passed as "not on another machine".
+    #[cfg(windows)]
+    #[test]
+    fn a_base_reached_through_a_link_is_looked_at_by_its_real_folder() {
+        use std::os::windows::fs::symlink_dir;
+        let d = tmp("baselink");
+        let proj = d.join("real").join("proj");
+        std::fs::create_dir_all(proj.join("sub")).unwrap();
+        // far -> a share; a -> ..\proj\far; work -> real\proj (the user's way in).
+        if symlink_dir(r"\\phv-test.invalid\share\pkg", proj.join("far")).is_err() {
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        symlink_dir(r"..\proj\far", proj.join("a")).unwrap();
+        symlink_dir(r"real\proj", d.join("work")).unwrap();
+        let start = std::time::Instant::now();
+        assert!(on_another_machine_below(&proj, &proj.join(r"a\m.phv")));
+        assert!(on_another_machine_below(&d.join("work"), &d.join(r"work\a\m.phv")));
+        assert!(on_another_machine_below(&d.join("work"), &d.join(r"work\.\a\m.phv")));
+        assert!(on_another_machine(&d.join(r"work\a\m.phv")));
+        // A folder that cannot be read after a link is refused; a missing file
+        // through a link that stays here is not.
+        symlink_dir(r"..\proj\missing\deeper", proj.join("gone")).unwrap();
+        symlink_dir(r"..\proj\sub", proj.join("here")).unwrap();
+        assert!(on_another_machine_below(&d.join("work"), &d.join(r"work\gone\x\m.phv")));
+        assert!(!on_another_machine_below(&d.join("work"), &d.join(r"work\here\m.phv")));
+        assert!(!on_another_machine_below(&d.join("work"), &d.join(r"work\sub\m.phv")));
+        assert!(!on_another_machine_below(&d.join("work"), &d.join(r"work\missing\m.phv")));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+        for l in [d.join("work"), proj.join("a"), proj.join("far"), proj.join("gone"), proj.join("here")] {
+            let _ = std::fs::remove_dir(l);
         }
         let _ = std::fs::remove_dir_all(&d);
     }

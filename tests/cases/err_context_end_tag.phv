@@ -4,6 +4,6 @@
 function f(): void {}
 ?>
 <noscript><!--</<?phv f(); ?>--></noscript>
-<svg><p title="</<?phv f(); ?>"></p></svg>
+<svg><a title="</<?phv f(); ?>"></a></svg>
 <math><!--</<?phv f(); ?>--></math>
 <noscript><!--</ <?phv f(); ?>--></noscript>

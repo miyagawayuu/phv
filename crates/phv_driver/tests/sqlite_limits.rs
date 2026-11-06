@@ -16,6 +16,11 @@ const LIMIT: usize = 16 << 20;
 /// Runs `src` in a site that may write `data/`; returns its output and first
 /// error line, and the most memory the run held at once.
 fn run_site(name: &str, src: &str, max_memory: usize) -> (String, usize) {
+    run_site_for(name, src, max_memory, std::time::Duration::from_secs(60))
+}
+
+/// `run_site` with the time limit `max_time`.
+fn run_site_for(name: &str, src: &str, max_memory: usize, max_time: std::time::Duration) -> (String, usize) {
     let dir = std::env::temp_dir().join(format!("phv-sqlite-limits-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("data")).unwrap();
@@ -27,11 +32,7 @@ fn run_site(name: &str, src: &str, max_memory: usize) -> (String, usize) {
         permissions: Permissions { write: vec!["data/".into()], ..Permissions::default() },
         ..Host::default()
     };
-    let limits = Limits {
-        max_memory: Some(max_memory),
-        max_time: Some(std::time::Duration::from_secs(60)),
-        ..Limits::default()
-    };
+    let limits = Limits { max_memory: Some(max_memory), max_time: Some(max_time), ..Limits::default() };
     let base = thread_allocated();
     reset_thread_peak();
     let outcome = run(&c, RunOptions { html: false, limits, http: None, host: Some(Arc::new(host)) });
@@ -144,4 +145,146 @@ $db->execute(sql"INSERT INTO s WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT
     // 4 MB.
     assert_eq!(run_site("group_small", &fill(8, group), LIMIT).0, "groups: 8");
     assert_eq!(run_site("index_small", &fill(8, index), LIMIT).0, "indexed");
+}
+
+/// Found by the 1.2.0 audit: SQLite looked at the deadline every 10,000
+/// steps, and one step may be a function call on a value of many MB: these
+/// queries ran 20 to 470 seconds under a 1 second limit. Each case does about
+/// a thousand calls on 15 MB values between two of the old looks (tens of
+/// seconds or more on a fast machine); now it stops soon after the limit.
+#[test]
+fn sqlite_functions_on_large_values_stop_at_the_time_limit() {
+    let cases = [
+        ("trim", "length(trim('mk1', substr($y, a % 2 + 1)))"),
+        ("trim_x", "length(trim(substr($y, a % 2 + 1), 'mk1'))"),
+        ("instr", "instr(substr($y, a % 2 + 1), 'mk1')"),
+        ("replace", "length(replace(substr($y, a % 2 + 1), 'mk1', 'x'))"),
+        ("like", "substr($y, a % 2 + 1) LIKE '%mk1'"),
+        ("upper", "length(upper(substr($y, a % 2 + 1)))"),
+    ];
+    for (name, call) in cases {
+        let call = call.replace("$y", "{$y}");
+        let src = format!(
+            r#"$db = Database::open(":memory:");
+$db->execute(sql"CREATE TABLE t (a INTEGER)");
+$db->execute(sql"INSERT INTO t WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 3000) SELECT i FROM c");
+$y = str_repeat("abcdefghijklmnopqrstuvwxyz0123", 500000);
+echo $db->first(sql"SELECT sum({call}) AS s FROM t")?->int("s") ?? 0;
+"#
+        );
+        let start = std::time::Instant::now();
+        let (out, _) = run_site_for(name, &src, 1 << 30, std::time::Duration::from_secs(1));
+        assert!(out.contains("time limit was reached") || out.contains("maximum execution time"), "{name}: {out}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(8), "{name} took {:?}", start.elapsed());
+    }
+}
+
+/// Found by the 1.2.0 audit: PHV's own SQL functions (`replace()`, `trim()`,
+/// `instr()`, `LIKE`) copied their arguments and built their results without
+/// asking the memory limit, passing it by up to four values of the longest.
+#[test]
+fn sqlite_functions_count_against_the_memory_limit() {
+    // 1.9 MB of `0`, each replaced by 8 characters: a 15.2 MB result.
+    let src = r#"$db = Database::open(":memory:");
+echo $db->first(sql"SELECT length(replace(hex(zeroblob(950000)), '0', 'abcdefgh')) AS n")?->int("n") ?? 0;
+"#;
+    let (out, peak) = run_site("replace_mem", src, LIMIT);
+    assert!(out.contains("allowed memory size of 16 MB exhausted"), "{out}");
+    assert!(peak < LIMIT, "held {} MB", peak >> 20);
+    // Smaller values still work, also blobs that are not UTF-8.
+    let src = r#"$db = Database::open(":memory:");
+echo $db->first(sql"SELECT length(replace(hex(zeroblob(500000)), '0', 'ab')) AS n")?->int("n") ?? 0, " ";
+echo $db->first(sql"SELECT length(trim(x'ff' || hex(zeroblob(1000)) || x'ff', x'ff')) AS n")?->int("n") ?? 0, " ";
+echo $db->first(sql"SELECT instr(x'ff41ff42', 'B') AS n")?->int("n") ?? 0;
+"#;
+    assert_eq!(run_site("small_mem", src, LIMIT).0, "2000000 2000 4");
+}
+
+/// The script's statements in the following tests: a table `t` holding one
+/// value of 16 MB of digits (each `b * b` turns it into a number twice,
+/// about 60 ms; nothing in SQLite looks at the deadline meanwhile), and `n`
+/// of 100,000 rows.
+const LONG_DIGITS: &str = r#"$db = Database::open(":memory:");
+$db->execute(sql"CREATE TABLE t (b TEXT)");
+$v = str_repeat("1111111111", 1600000);
+$db->execute(sql"INSERT INTO t VALUES ({$v})");
+$v = "";
+$db->execute(sql"CREATE TABLE n (i INTEGER)");
+$db->execute(sql"INSERT INTO n WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 100000) SELECT i FROM c");
+"#;
+
+/// Found by the 1.2.0 audit (after the fix above): SQLite looks at the
+/// deadline only where its program jumps back, so one row computed by
+/// thousands of steps that each read a long value ran for minutes, and a
+/// short text makes such a program by expanding a `WITH` table, a view or a
+/// trigger. Such statements are refused before they run, and the heaviest
+/// statement allowed reads a long value at most 128 times. The bound is
+/// counted in reads, timed on this machine: 250 of them (the old code ran
+/// 1,000 and more).
+#[test]
+fn sqlite_statements_that_reread_long_values_are_refused() {
+    let x = |n: usize, term: &str, sep: &str| vec![term; n].join(sep);
+    // The time of one `b * b`.
+    let src = format!(
+        "{LONG_DIGITS}$t = microtime();\n$db->query(sql\"SELECT {} FROM t\");\necho round((microtime() - $t) / 32 * 1000000);\n",
+        x(32, "b * b", ", ")
+    );
+    let (out, _) = run_site_for("unit", &src, 256 << 20, std::time::Duration::from_secs(120));
+    let micros: f64 = out.trim().parse().unwrap_or_else(|_| panic!("{out}"));
+    let unit = std::time::Duration::from_secs_f64(micros / 1e6);
+    let flat = format!("SELECT {} FROM t", x(1000, "b * b", ", "));
+    let cte = format!(
+        "WITH a(x) AS (SELECT {} FROM t), a2(y) AS (SELECT {} FROM a) SELECT {} FROM a2",
+        x(10, "b * b", " + "),
+        x(10, "x", " + "),
+        x(10, "y", " + ")
+    );
+    let view = format!(
+        "{LONG_DIGITS}$db->execute(sql\"CREATE VIEW v AS SELECT {} AS x FROM t\");\n$db->query(sql\"SELECT {} FROM v\");\n",
+        x(20, "b * b", " + "),
+        x(20, "x", " + ")
+    );
+    let trigger = format!(
+        "{LONG_DIGITS}$db->execute(sql\"CREATE TABLE log (x)\");\n$db->execute(sql\"CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log SELECT {}; END\");\n$db->execute(sql\"UPDATE t SET b = b\");\n",
+        x(400, "new.b * new.b", " + ")
+    );
+    for (name, src) in [
+        ("flat", format!("{LONG_DIGITS}$db->query(sql\"{flat}\");\n")),
+        ("cte", format!("{LONG_DIGITS}$db->query(sql\"{cte}\");\n")),
+        ("view", view),
+        ("trigger", trigger),
+        // A loop: SQLite's progress handler looks at the deadline.
+        ("loop", format!("{LONG_DIGITS}$db->query(sql\"SELECT sum(b * b) FROM t, n\");\n")),
+    ] {
+        let start = std::time::Instant::now();
+        let (out, _) = run_site_for(name, &src, 256 << 20, std::time::Duration::from_secs(1));
+        let took = start.elapsed();
+        assert!(
+            out.contains("split it into smaller statements")
+                || out.contains("time limit was reached")
+                || out.contains("maximum execution time"),
+            "{name}: {out}"
+        );
+        assert!(took < std::time::Duration::from_secs(3) + unit * 250, "{name} took {took:?} (one read: {unit:?})");
+    }
+    // The statements of real programs are far lighter.
+    let src = format!(
+        "{LONG_DIGITS}echo count($db->query(sql\"SELECT {} FROM n WHERE i < 3\"));\n",
+        (0..30).map(|i| format!("i * {i} + i AS x{i}")).collect::<Vec<_>>().join(", ")
+    );
+    assert_eq!(run_site_for("ordinary", &src, 256 << 20, std::time::Duration::from_secs(60)).0, "2");
+    // `IN` with 10,000 values (30,000 steps).
+    let src = format!(
+        "{LONG_DIGITS}$q = sql\"SELECT i FROM n WHERE i IN (0\";\nfor ($i = 1; $i <= 10000; $i++) {{ $q = $q . sql\", {{$i}}\"; }}\necho count($db->query($q . sql\")\"));\n"
+    );
+    assert_eq!(run_site_for("in_list", &src, 256 << 20, std::time::Duration::from_secs(60)).0, "10000");
+    // A program of more than 43,008 steps.
+    let src = format!(
+        "{LONG_DIGITS}$db->query(sql\"WITH a(x) AS (SELECT {} FROM n), a2(y) AS (SELECT {} FROM a) SELECT {} FROM a2\");\n",
+        x(40, "i", " + "),
+        x(40, "x", " + "),
+        x(40, "y", " + ")
+    );
+    let (out, _) = run_site_for("steps", &src, 256 << 20, std::time::Duration::from_secs(60));
+    assert!(out.contains("more than 43,008 steps"), "{out}");
 }

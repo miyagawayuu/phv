@@ -1,0 +1,36 @@
+error: `>` inside a CDATA section that is not the end of `]]>`
+ --> err_svg_cdata.phv:9:16
+  |
+9 | <svg><![CDATA[ ><a x="]]><a href="<?= safe_url($v) ?>">"></a></svg>
+  |                ^
+  = note: where a browser reads the section as a bogus comment (inside HTML in SVG), it ends at the first `>` and what follows becomes markup; write `&gt;` or move the text out of the section
+
+error: `>` inside a CDATA section that is not the end of `]]>`
+  --> err_svg_cdata.phv:10:19
+   |
+10 | <math><![CDATA[ a > b ]]></math>
+   |                   ^
+   = note: where a browser reads the section as a bogus comment (inside HTML in SVG), it ends at the first `>` and what follows becomes markup; write `&gt;` or move the text out of the section
+
+error: `>` inside a CDATA section that is not the end of `]]>`
+  --> err_svg_cdata.phv:11:27
+   |
+11 | <svg><![CDATA[ ]]<?= $v ?>> ]]></svg>
+   |                           ^
+   = note: where a browser reads the section as a bogus comment (inside HTML in SVG), it ends at the first `>` and what follows becomes markup; write `&gt;` or move the text out of the section
+
+error: `>` inside a CDATA section that is not the end of `]]>`
+  --> err_svg_cdata.phv:12:40
+   |
+12 | <svg><![CDA<?phv if ($v != "") { ?>TA[ ><?phv } ?> ]]></svg>
+   |                                        ^
+   = note: where a browser reads the section as a bogus comment (inside HTML in SVG), it ends at the first `>` and what follows becomes markup; write `&gt;` or move the text out of the section
+
+error: the HTML in this block does not end where it started
+  --> err_svg_cdata.phv:12:47
+   |
+12 | <svg><![CDA<?phv if ($v != "") { ?>TA[ ><?phv } ?> ]]></svg>
+   |                                               ^
+   = note: close every tag, attribute and `<script>`/`<style>` opened inside a block, loop or function before it ends
+
+5 errors found

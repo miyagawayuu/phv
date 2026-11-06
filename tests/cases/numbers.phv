@@ -17,3 +17,9 @@ try {
 } catch (ValueError $e) {
     echo $e->getMessage(), "\n";
 }
+try {
+    base_convert(str_repeat("z", 100000), 10, 16);
+} catch (ValueError $e) {
+    // Only the start of a long argument is quoted.
+    echo $e->getMessage(), "\n";
+}

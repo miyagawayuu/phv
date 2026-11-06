@@ -55,18 +55,35 @@ fn unify(param: &Type, actual: &Type, b: &mut Bindings) {
     }
 }
 
+/// `t` with the inferred types put in; `Type::Error` (and noted, see
+/// `note_too_large`) when that would be larger than `MAX_TYPE_SIZE`.
 fn subst(t: &Type, b: &Bindings) -> Type {
+    let sizes = b.each_ref().map(|x| x.as_ref().map_or(1, |t| super::type_size(t, super::MAX_TYPE_SIZE)));
+    if sizes.iter().any(|&n| n > 1) {
+        let size = super::replaced_size(t, |x| match x {
+            Type::Generic(i) => sizes.get(*i as usize).copied(),
+            _ => None,
+        });
+        if size > super::MAX_TYPE_SIZE {
+            super::note_too_large();
+            return Type::Error;
+        }
+    }
+    subst_in(t, b)
+}
+
+fn subst_in(t: &Type, b: &Bindings) -> Type {
     match t {
         Type::Generic(i) => match b.get(*i as usize) {
             Some(bound) => bound.clone().unwrap_or(Type::Infer),
             None => Type::Error,
         },
-        Type::List(x) => Type::list(subst(x, b)),
-        Type::Set(x) => Type::set(subst(x, b)),
-        Type::Map(k, v) => Type::map(subst(k, b), subst(v, b)),
-        Type::Func(ps, r) => Type::Func(ps.iter().map(|p| subst(p, b)).collect(), Box::new(subst(r, b))),
-        Type::Union(ms) => Type::union(ms.iter().map(|m| subst(m, b)).collect()),
-        Type::Class(c, args) => Type::Class(*c, args.iter().map(|a| subst(a, b)).collect()),
+        Type::List(x) => Type::list(subst_in(x, b)),
+        Type::Set(x) => Type::set(subst_in(x, b)),
+        Type::Map(k, v) => Type::map(subst_in(k, b), subst_in(v, b)),
+        Type::Func(ps, r) => Type::Func(ps.iter().map(|p| subst_in(p, b)).collect(), Box::new(subst_in(r, b))),
+        Type::Union(ms) => Type::union(ms.iter().map(|m| subst_in(m, b)).collect()),
+        Type::Class(c, args) => Type::Class(*c, args.iter().map(|a| subst_in(a, b)).collect()),
         other => other.clone(),
     }
 }
@@ -170,19 +187,31 @@ impl<'a> Checker<'a> {
         if a == b {
             return a.clone();
         }
+        // A union of two types each as large as allowed (`$c ? fn() => $a : fn() => $b`
+        // grows by their sum each time) is not made.
+        let union = || {
+            if super::type_size(a, super::MAX_TYPE_SIZE) + super::type_size(b, super::MAX_TYPE_SIZE)
+                > super::MAX_TYPE_SIZE
+            {
+                super::note_too_large();
+                return Type::Error;
+            }
+            Type::union(vec![a.clone(), b.clone()])
+        };
         match (a, b) {
             (Type::Never, t) | (t, Type::Never) => t.clone(),
             (Type::Error, _) | (_, Type::Error) => Type::Error,
             (Type::Int, Type::Float) | (Type::Float, Type::Int) if widen => Type::Float,
             (Type::Class(..), Type::Class(..)) => {
-                match self.as_single_class(&Type::union(vec![a.clone(), b.clone()])) {
+                let u = union();
+                match self.as_single_class(&u) {
                     Some(t) => t,
-                    None => Type::union(vec![a.clone(), b.clone()]),
+                    None => u,
                 }
             }
             _ if self.assignable_exact(a, b) => b.clone(),
             _ if self.assignable_exact(b, a) => a.clone(),
-            _ => Type::union(vec![a.clone(), b.clone()]),
+            _ => union(),
         }
     }
 
@@ -322,7 +351,7 @@ impl<'a> Checker<'a> {
                 "in an attribute, write `escape(json_encode($value))` (e.g. in a `data-*` attribute)",
             ),
             // `Html` is checked when it is inserted (`html_inside`).
-            Text | Attr | ForeignText | RawText(_) | Comment(_) => return,
+            Text | Attr | ForeignText | RawText(_) | Comment { .. } => return,
             Unquoted => (
                 "values in attributes must be quoted",
                 "write `attr=\"<?= $value ?>\"`: escaping does not protect unquoted attribute values",
@@ -665,6 +694,46 @@ impl<'a> Checker<'a> {
     // ----- expressions -----------------------------------------------------
 
     pub(crate) fn expr(&mut self, e: &Expr, expect: Option<&Type>) -> HExpr {
+        // Past the budget of large types, the rest is not checked (an error was reported).
+        if self.reported_type_nodes {
+            return err(e.span);
+        }
+        let mut h = self.expr_here(e, expect);
+        self.check_type_size(&mut h);
+        h
+    }
+
+    /// Refuses the type of an expression that is too large on its own (made
+    /// larger than `MAX_TYPE_SIZE` from the types of others), and counts a
+    /// large one against `MAX_TYPE_TOTAL`.
+    pub(crate) fn check_type_size(&mut self, h: &mut HExpr) {
+        use super::{LARGE_TYPE, MAX_TYPE_SIZE, MAX_TYPE_TOTAL};
+        let n = super::type_size(&h.ty, MAX_TYPE_SIZE);
+        if super::take_too_large() || n > MAX_TYPE_SIZE {
+            let msg = format!("the type of this expression is too large (more than {MAX_TYPE_SIZE} type nodes)");
+            self.error(msg, h.span).add_note(
+                "it is made from the types of the values it uses (a generic call or a closure can double them); \
+                 declare a smaller type for one of those values, e.g. a class",
+            );
+            h.ty = Type::Error;
+            return;
+        }
+        if n >= LARGE_TYPE {
+            self.type_nodes += n;
+            if self.type_nodes > MAX_TYPE_TOTAL && !self.reported_type_nodes {
+                self.reported_type_nodes = true;
+                let msg = format!(
+                    "the types of the expressions in this program are too large in total (more than {MAX_TYPE_TOTAL} type nodes)"
+                );
+                self.error(msg, h.span).add_note(
+                    "each use of a value holds a copy of its type; declare smaller types for the values used most, e.g. classes",
+                );
+                h.ty = Type::Error;
+            }
+        }
+    }
+
+    fn expr_here(&mut self, e: &Expr, expect: Option<&Type>) -> HExpr {
         let span = e.span;
         let mk = |kind, ty| HExpr { kind, ty, span };
         match &e.kind {
@@ -2473,7 +2542,7 @@ impl<'a> Checker<'a> {
                 }
                 self.block(stmts, &mut body);
                 let rt = self.cx().ret.clone();
-                if !self.cx().flow.dead && !matches!(rt, Type::Void | Type::Error) {
+                if !self.cx().flow.dead && !matches!(rt, Type::Void | Type::Error) && !self.reported_type_nodes {
                     let msg = format!("this closure must return a value of type `{}` on every path", self.tn(&rt));
                     self.error(msg, span);
                 }

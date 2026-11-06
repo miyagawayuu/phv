@@ -8,7 +8,9 @@
 //!   HMAC-SHA256 with a key derived for signing (so one key can both encrypt and
 //!   sign). The expiry is seconds since 1970 (0: never).
 //! - `jwt_encode` / `jwt_decode`: HS256 only, so a token cannot choose a weaker
-//!   algorithm (`none`) or another kind of key. `exp` and `nbf` are enforced.
+//!   algorithm (`none`) or another kind of key. `exp` and `nbf` are enforced;
+//!   as in std.jwt, a header with `crit` and an `iat` more than a minute ahead
+//!   are refused.
 //!
 //! Keys are secret strings of at least 32 bytes (`random_token()` makes one).
 
@@ -178,11 +180,21 @@ fn jwt_decode(vm: Option<&Vm>, token: &str, key: &[u8], now: i64) -> Result<Opti
         Some(Value::Str(alg)) if alg.as_str() == "HS256" => {}
         _ => return Ok(None),
     }
+    // As std.jwt: extensions that are not understood must not be ignored (RFC 7515 4.1.11).
+    if header.contains_key(&Key::Str("crit".to_string().into())) {
+        return Ok(None);
+    }
     let Some(claims) = json(p)? else { return Ok(None) };
     let Value::Map(m) = &claims else { return Ok(None) };
     let now = now as f64;
-    let (Ok(exp), Ok(nbf)) = (time_claim(m, "exp"), time_claim(m, "nbf")) else { return Ok(None) };
+    let (Ok(exp), Ok(nbf), Ok(iat)) = (time_claim(m, "exp"), time_claim(m, "nbf"), time_claim(m, "iat")) else {
+        return Ok(None);
+    };
     if exp.is_some_and(|exp| now >= exp) || nbf.is_some_and(|nbf| now < nbf) {
+        return Ok(None);
+    }
+    // Issued more than a minute ahead, as std.jwt refuses: a clock far off, or a token made to last.
+    if iat.is_some_and(|iat| iat > now + 60.0) {
         return Ok(None);
     }
     Ok(Some(claims))
@@ -299,5 +311,23 @@ mod tests {
         let good = format!("{h}.{claims}.{}", URL_SAFE_NO_PAD.encode(mac.as_ref()));
         assert!(jwt_decode(None, &good, K, 1999).is_ok_and(|c| c.is_some()));
         assert!(jwt_decode(None, &good, K, 2000).is_ok_and(|c| c.is_none()), "expired");
+    }
+
+    fn hs256(header: &str, claims: &str) -> String {
+        let signed = format!("{}.{}", URL_SAFE_NO_PAD.encode(header), URL_SAFE_NO_PAD.encode(claims));
+        let mac = jwt_mac(K, &signed);
+        format!("{signed}.{}", URL_SAFE_NO_PAD.encode(mac.as_ref()))
+    }
+
+    #[test]
+    fn jwt_refuses_crit_and_tokens_issued_ahead() {
+        // As std.jwt does: a header with `crit`, and an `iat` more than a minute ahead.
+        let crit = hs256(r#"{"alg":"HS256","crit":["exp"]}"#, r#"{"sub":"7"}"#);
+        assert!(jwt_decode(None, &crit, K, 0).is_ok_and(|c| c.is_none()), "crit");
+        let ahead = hs256(JWT_HEADER, r#"{"sub":"7","iat":1061}"#);
+        assert!(jwt_decode(None, &ahead, K, 1000).is_ok_and(|c| c.is_none()), "issued ahead");
+        assert!(jwt_decode(None, &ahead, K, 1001).is_ok_and(|c| c.is_some()), "a minute of clock difference");
+        let bad = hs256(JWT_HEADER, r#"{"iat":"soon"}"#);
+        assert!(jwt_decode(None, &bad, K, 0).is_ok_and(|c| c.is_none()), "iat must be a number");
     }
 }

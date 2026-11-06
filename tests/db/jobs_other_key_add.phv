@@ -1,0 +1,10 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: adds a job with a key of its
+// own while jobs_held_hold.phv holds another.
+import std.jobs.enqueue;
+
+try {
+    echo enqueue("k", "other", key: "other-" . (string)random_int(1, 999999999)) == null ? "taken" : "added";
+} catch (Exception $e) {
+    echo "error: ", $e->getMessage();
+}

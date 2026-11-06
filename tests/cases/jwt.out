@@ -43,6 +43,10 @@ ValueError: JwtKey::fromJwk(): symmetric (oct) keys are not read from JWKs; use 
 ValueError: JwtKey::fromJwk(): only EC keys on the P-256 curve are supported
 ValueError: JwtKey::fromJwk(): the RSA key is not 2048 to 8192 bits
 ValueError: JwtKey::fromJwk(): the JWK is not for signatures ("use" is not "sig")
+ValueError: JwtKey::fromJwk(): the RSA key is not 2048 to 8192 bits
+ValueError: JwtKey::fromJwk(): the RSA key is not 2048 to 8192 bits
+ValueError: JwtKey::fromPem(): the key is not an RSA (2048 to 4096 bits to sign, up to 8192 to verify), P-256 or Ed25519 key
+zero key skipped: 7
 ValueError: JwtKey::secret(): the secret must be at least 32 bytes; make one with random_token() and keep it in an environment variable
 ValueError: KeySet::fromJson(): the key set holds no RS256, ES256 or EdDSA signing key
 ValueError: verify(): the leeway must be 0 to 300 seconds

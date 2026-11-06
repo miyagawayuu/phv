@@ -1,0 +1,20 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: makes the types and the
+// function of the postgres_typeinfo_* scripts, then a query that makes the
+// client look a type up (with statements it prepares for itself).
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->execute(sql"DROP TYPE IF EXISTS phv_ti_a");
+$db->execute(sql"DROP TYPE IF EXISTS phv_ti_b");
+$db->execute(sql"CREATE TYPE phv_ti_a AS ENUM ('x')");
+$db->execute(sql"CREATE TYPE phv_ti_b AS ENUM ('y')");
+// Deallocates the statements of the session whose text matches `pat`, where
+// PHV cannot see it.
+$db->execute(sql"CREATE OR REPLACE FUNCTION phv_ti_poison(pat text) RETURNS int LANGUAGE plpgsql
+    AS 'DECLARE r record; n int := 0; BEGIN
+        FOR r IN SELECT name FROM pg_prepared_statements WHERE NOT from_sql AND statement LIKE pat LOOP
+            EXECUTE ''DEALLOCATE '' || quote_ident(r.name); n := n + 1;
+        END LOOP;
+        RETURN n; END'");
+echo $db->first(sql"SELECT 'x'::phv_ti_a::text AS v, 'x'::phv_ti_a AS t")?->string("v") ?? "?", "\n";

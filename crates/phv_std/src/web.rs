@@ -386,6 +386,16 @@ pub fn csrf_matches(expected: &str, submitted: &str) -> bool {
 }
 
 pub fn csrf_token(vm: &mut Vm) -> Result<String, VmError> {
+    // A token ties the page to the visitor: one whose head flush() sent without
+    // `Cache-Control: private, no-store` could be kept by a shared cache (found by
+    // the 1.2 audit). The server marks a streamed head personal when the request
+    // carries a cookie, which a token after flush() needs anyway.
+    if vm.http.flushed && !vm.http.personalized {
+        return Err(vm.throw(
+            "ValueError",
+            "call csrf_token() or csrf_field() before response()->flush(): the response was sent as one that shared caches may keep",
+        ));
+    }
     vm.http.personalized = true;
     let cookie = match (&vm.http.new_csrf_cookie, &vm.http.csrf_cookie) {
         (Some(c), _) | (None, Some(c)) => c.clone(),

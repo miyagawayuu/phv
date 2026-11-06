@@ -57,7 +57,7 @@ pub use crypt::{hmac_sha256, server_key, store_namespace};
 pub use httpclient::{check_header_name, check_header_value, check_http_url, check_oauth_url, post_telemetry};
 pub use netdb::{
     redis_publish, redis_subscribe, session_insert, session_read, session_remove, session_sweep, session_update,
-    Pushed, RedisSubscriber, SessionLimits, SessionRow,
+    Pushed, RedisSubscriber, SessionLimits, SessionRow, SESSIONS_OF_1_1,
 };
 pub use sys::{constant_time_eq, sha256_hex};
 pub use web::{csrf_expected, csrf_matches, json_decode, mask_csrf, random_hex};
@@ -117,10 +117,14 @@ fn tag_name_at(b: &[u8], at: usize, name: &str) -> bool {
 
 /// Why `Html` cannot be inserted at `place` (see `__html_inside`), if it cannot.
 ///
-/// In a `comment` or `bogus comment`: what ends it.
+/// In a `comment` or `bogus comment`: what ends it, and in a comment what
+/// would end it right after a value (`>`, `->`... at the start).
 ///
 /// In the text of the raw-text element `place` (`textarea`...): its end tag,
 /// which would end the element there.
+///
+/// In both: `</noscript`, and with `watched ` before `place` (inside
+/// `<noscript>`, `<svg>` or `<math>`) the end tag of any raw-text element.
 ///
 /// Inside SVG or MathML (`foreign`), browsers read markup as foreign content,
 /// while the template that made the `Html` was checked as HTML. The two read
@@ -131,27 +135,63 @@ fn tag_name_at(b: &[u8], at: usize, name: &str) -> bool {
 /// SVG or MathML holds, such as a `<foreignObject>`).
 fn html_inside(html: &str, place: &str) -> Option<String> {
     let b = html.as_bytes();
+    // `watched `: inside `<noscript>`, `<svg>` or `<math>` (see below).
+    let (watched, place) = match place.strip_prefix("watched ") {
+        Some(p) => (true, p),
+        None => (false, place),
+    };
+    // An end tag that ends an element a browser may read around the `Html` as
+    // raw text, where the template was checked as a comment or raw text: any
+    // template may be written inside a `<noscript>` (raw text with scripting
+    // on), and inside one or inside SVG or MathML, HTML that this tracker
+    // does not follow there may hold a `<title>`, `<textarea>`... (found by
+    // the 1.2 audit).
+    let hidden = || {
+        html.match_indices("</").find_map(|(i, _)| {
+            std::iter::once("noscript")
+                .chain(RAW_TEXT_TAGS.iter().copied().filter(|_| watched))
+                .find(|t| tag_name_at(b, i + 2, t))
+        })
+    };
+    let hides = |into: &str, t: &str| {
+        Some(format!(
+            "`Html` inserted into {into} holds the end tag `</{t}`, which would end a `<{t}>` that browsers may \
+             read around it as raw text, and turn the rest into markup; insert a string (it is escaped) instead"
+        ))
+    };
     // In a comment: what ends it (`-->`, `--!>`; a bogus comment such as
-    // `<!x ...>` ends at the first `>`). A value next to it cannot add a `>`
+    // `<!x ...>` ends at the first `>`). A string next to it cannot add a `>`
     // (strings are escaped), and the text after it is checked when compiled.
     if place == "comment" || place == "bogus comment" {
         let ends = if place == "comment" { html.contains("-->") || html.contains("--!>") } else { html.contains('>') };
-        return ends.then(|| {
-            format!(
+        if ends {
+            return Some(format!(
                 "`Html` inserted into a {place} holds what ends it (`{}`), which would turn the rest into \
                  markup; insert a string (it is escaped) instead",
                 if place == "comment" { "-->" } else { ">" }
-            )
-        });
+            ));
+        }
+        // Right after a value ending with `--` (or `-`, `--!`), these end it
+        // (found by the 1.2 audit: `"-"` then `Html` `-> next`).
+        if place == "comment" && [">", "!>", "->", "-!>"].iter().any(|s| html.starts_with(s)) {
+            return Some(
+                "`Html` inserted into a comment starts with `>`, `!>`, `->` or `-!>`, which would end it after \
+                 a value ending with `--` (or `-`, `--!`) and turn the rest into markup; insert a string (it is \
+                 escaped) instead"
+                    .into(),
+            );
+        }
+        return hidden().and_then(|t| hides(&format!("a {place}"), t));
     }
     if place != "foreign" {
         let at = html.match_indices("</").find(|&(i, _)| tag_name_at(b, i + 2, place));
-        return at.map(|_| {
-            format!(
+        if at.is_some() {
+            return Some(format!(
                 "`Html` inserted into a `<{place}>` holds its end tag `</{place}`, which would end the element \
                  there; insert a string (it is escaped) instead"
-            )
-        });
+            ));
+        }
+        return hidden().and_then(|t| hides(&format!("a `<{place}>`"), t));
     }
     let refused = |what: &str| {
         Some(format!(
@@ -727,8 +767,17 @@ fn set_type(vm: &mut Vm, ct: &str) -> Result<(), VmError> {
         return Err(vm.throw("ValueError", format!("invalid Content-Type \"{ct}\"")));
     }
     let media = ["image/", "audio/", "video/", "font/"].iter().any(|p| mime.starts_with(p)) && mime != "image/svg+xml";
+    let html = !(PLAIN_TYPES.contains(&mime.as_str()) || media);
+    if html && !vm.out[0].html && !vm.out[0].buf.trim().is_empty() {
+        // What was written so far was not escaped: a browser would read it as markup
+        // (found by the 1.2 audit).
+        return Err(vm.throw(
+            "ValueError",
+            format!("set the Content-Type \"{ct}\" before writing any output: what was written under a type that is not escaped (such as text/plain) would be read as markup"),
+        ));
+    }
     vm.http.content_type = Some(ct.to_string());
-    vm.out[0].html = !(PLAIN_TYPES.contains(&mime.as_str()) || media);
+    vm.out[0].html = html;
     // Every type browsers run as a script (the WHATWG list).
     let js = matches!(
         mime.as_str(),
@@ -1394,10 +1443,27 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
                 return Err(vm.throw("ValueError", "response()->flush() cannot send output after response()->file()"));
             }
             let Some(mut sink) = vm.http.stream.take() else { return Ok(Value::Bool(true)) };
-            let chunk = std::mem::take(&mut vm.out[0].buf).into_bytes();
-            // The output leaves this script: it is counted in the server's output total instead.
-            phv_vm::alloc::uncharge_thread(chunk.capacity());
-            let open = sink.flush(&mut vm.http, chunk);
+            let mut chunk = std::mem::take(&mut vm.out[0].buf).into_bytes();
+            vm.output_flushed(chunk.len());
+            if chunk.is_empty() {
+                // Room without bytes is freed here.
+                chunk = Vec::new();
+            }
+            let room = chunk.capacity();
+            // Output the sink took leaves this script: it is counted in the server's
+            // output total instead. Output it gave back (the client is gone) is freed
+            // here, and stays counted until then (found by the 1.2 audit: it was let
+            // go of either way, so each flush to a closed connection added room).
+            let open = match sink.flush(&mut vm.http, chunk) {
+                Ok(()) => {
+                    phv_vm::alloc::uncharge_thread(room);
+                    true
+                }
+                Err(unsent) => {
+                    drop(unsent);
+                    false
+                }
+            };
             vm.http.flushed = true;
             vm.http.stream = Some(sink);
             vm.check_limits()?;

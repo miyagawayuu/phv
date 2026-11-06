@@ -1,0 +1,5 @@
+<noscript><textarea>plain text
+</textarea></noscript>
+<noscript><textarea>
+--- runtime error ---
+Fatal error: `Html` inserted into a `<textarea>` holds the end tag `</noscript`, which would end a `<noscript>` that browsers may read around it as raw text, and turn the rest into markup; insert a string (it is escaped) instead
