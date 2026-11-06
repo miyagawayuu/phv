@@ -47,6 +47,9 @@ echo greet($name);                                 // HTML-escaped automatically
 - **Web applications**: routes with parameters (`public/posts/[id].phv`), middleware (`_middleware.phv`), custom
   error pages, layouts, form validation (`std.validate`), mail (`std.mail`), database migrations (`phv db migrate`),
   caching and range requests for static files, gzip, CORS, access logs and a graceful stop.
+- **Web services**: several server processes or machines share sessions, rate limits, CSRF tokens (`secret_env`) and
+  `publish()` to WebSockets and Server-Sent Events (`publish_store`); background jobs with retries and cron-like
+  schedules (`std.jobs`, `phv jobs`); health checks and Prometheus metrics on an admin port, and request ids.
 - **Standard library**: regular expressions (`std.regex`), `format()` checked at compile time, dates in time zones
   (`std.time`), JSON decoded into typed classes (`json_decode_as`), encryption, signed tokens and JWT, list and map
   methods, mathematics, UUIDs, CSV, URLs, directories, logging, and arguments and standard input for scripts.
@@ -168,9 +171,9 @@ error: a URL attribute cannot start with an unchecked value
 | `phv_compiler` | HIR → register bytecode |
 | `phv_vm` | Values, bytecode format, interpreter, runtime limits |
 | `phv_jit` | Native code for functions that use int/bool/float/string values (Cranelift) |
-| `phv_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, PostgreSQL, MySQL, Redis, WebSocket, HTTP client, background work, sessions) and the prelude, `std.http`, `std.db`, `std.net`, `std.async`, `std.validate`, `std.mail`, `std.regex`, `std.time`, `std.ws` and `std.testing` written in PHV; migrations |
+| `phv_std` | Builtins (strings, JSON, dates, crypto, files, SQLite, PostgreSQL, MySQL, Redis, WebSocket, HTTP client, background work, sessions) and the prelude, `std.http`, `std.db`, `std.net`, `std.async`, `std.validate`, `std.mail`, `std.regex`, `std.time`, `std.ws`, `std.jobs` and `std.testing` written in PHV; migrations, the job store |
 | `phv_driver` | Loading modules and templates, `phv.toml`, bytecode cache, running programs |
-| `phv_server` | Web server (hyper + tokio, HTTPS and HTTP/2), routing, sessions, CSRF, uploads, WebSocket server |
+| `phv_server` | Web server (hyper + tokio, HTTPS and HTTP/2), routing, sessions, CSRF, uploads, WebSocket server and Server-Sent Events, `publish()` between processes, job runner, admin port and metrics |
 | `phv_cli` | The `phv` command (run / check / serve / test / fmt / lsp / install / migrate) |
 
 ## Tests
@@ -203,7 +206,7 @@ published.
 | 10 million loop iterations | 14 ms | 286 ms | 348 ms |
 | Concatenating 1 million characters | 22 ms | 31 ms | 66 ms |
 | Mandelbrot 300×300 (floats) | 4.2 ms | 234 ms | 198 ms |
-| Building 1 million strings from numbers | 715 ms | 711 ms | 351 ms |
+| Building 1 million strings from numbers | 304 ms | 337 ms | 351 ms |
 | map / filter / sum over 1 million elements | 184 ms | 180 ms | 88 ms |
 | 200,000 map updates | 42 ms | 46 ms | 34 ms |
 | Sieve of Eratosthenes up to 1 million (`list<bool>`) | 89 ms | 155 ms | 107 ms |
@@ -211,15 +214,15 @@ published.
 | Appending to a property with `.=` 200,000 times | 12 ms | 11 ms | 333 ms |
 | 1 million string comparisons (`==`) | 21 ms | 46 ms | 40 ms |
 | Escaping 200,000 strings for HTML | 89 ms | 86 ms | 93 ms |
-| Creating 1 million objects | 201 ms | 207 ms | 110 ms |
-| Throwing and catching 100,000 exceptions | 73 ms | 69 ms | 14 ms |
+| Creating 1 million objects | 178 ms | 183 ms | 110 ms |
+| Throwing and catching 100,000 exceptions | 40 ms | 42 ms | 14 ms |
 | Sorting 200,000 elements with `sortBy` | 318 ms | 306 ms | 269 ms |
 
 The JIT compiles functions whose values are all `int`, `bool`, `float` or `string`, nullable ones, or lists and
 maps of them. Lists and maps are handled by the interpreter's own code, so the gain is in the loops around them.
 Code that relies on closures or objects runs in the interpreter and, as the table shows, can be slower than
-CPython (`PHV_JIT_EXPLAIN=1` shows why a function is not compiled); so are turning many numbers into strings, where
-formatting dominates, and exceptions, which record where they were thrown (to be improved). Set `PHV_JIT=0` to turn the JIT off.
+CPython (`PHV_JIT_EXPLAIN=1` shows why a function is not compiled); so are exceptions, which note where they were
+thrown (to be improved). Set `PHV_JIT=0` to turn the JIT off.
 
 ## License
 

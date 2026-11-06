@@ -169,7 +169,7 @@ fn reserve_log(vm: &Vm, a: &[Value]) -> Result<(), VmError> {
     vm.reserve(n.saturating_mul(10))
 }
 
-fn log(level: &str, a: &[Value]) {
+fn log(vm: &Vm, level: &str, a: &[Value]) {
     let time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut line = format!("{time} {level} {}", log_value(s(&a[0])));
     if let Some(ctx) = a.get(1) {
@@ -180,6 +180,10 @@ fn log(level: &str, a: &[Value]) {
             };
             line.push_str(&format!(" {}={}", log_value(&key), log_value(&v.to_display_string())));
         }
+    }
+    // `[server] request_ids`: the id of the request the line belongs to.
+    if let Some(id) = &vm.http.request_id {
+        line.push_str(&format!(" req={}", log_value(id)));
     }
     // A closed standard error must not stop the script (`eprintln!` panics).
     use std::io::Write;
@@ -269,17 +273,17 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "log_info" => |vm, a| {
             reserve_log(vm, a)?;
-            log("INFO", a);
+            log(vm, "INFO", a);
             Ok(Value::Null)
         },
         "log_warn" => |vm, a| {
             reserve_log(vm, a)?;
-            log("WARN", a);
+            log(vm, "WARN", a);
             Ok(Value::Null)
         },
         "log_error" => |vm, a| {
             reserve_log(vm, a)?;
-            log("ERROR", a);
+            log(vm, "ERROR", a);
             Ok(Value::Null)
         },
         "argv" => |vm, _| {

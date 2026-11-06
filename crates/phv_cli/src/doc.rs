@@ -18,6 +18,7 @@ const STD_MODULES: &[&str] = &[
     "std.regex",
     "std.time",
     "std.ws",
+    "std.jobs",
 ];
 
 /// Files documented at most (the rest of a huge tree is left out).

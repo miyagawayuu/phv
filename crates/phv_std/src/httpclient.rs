@@ -652,6 +652,12 @@ fn prepare(vm: &mut Vm, a: &[Value]) -> Result<(Base, Request, String), VmError>
     if !has(&headers, "accept-encoding") {
         headers.push(("Accept-Encoding".into(), "identity".into()));
     }
+    // `[server] request_ids`: the request's trace goes on to the services it calls.
+    if let Some(tp) = &vm.http.traceparent {
+        if !has(&headers, "traceparent") {
+            headers.push(("traceparent".into(), tp.clone()));
+        }
+    }
     let base = match parse_base(&url) {
         Ok(b) => b,
         Err(e) => return Err(fail(vm, e)),

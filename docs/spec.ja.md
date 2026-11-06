@@ -296,6 +296,8 @@ try {
 ```
 
 `getTraceAsString()` は、例外が最初に投げられたときの呼び出しを内側から順に返す(投げられていない例外では空)。
+実行環境は投げられた場所を覚えておき、文字列は `getTraceAsString()` が初めて求めたときに作る。読まずに捕捉する例外は
+安く済む。
 深いトレースは内側と外側の 50 個ずつの呼び出しを残し、名前は 200 文字までにする。
 捕まえられなかった例外は原因も表示する: `Uncaught ConfigError: bad port (caused by ValueError: ...)`。
 
@@ -623,7 +625,7 @@ import lib.legacy.render as render_legacy;
   ディレクトリ)からの `a/b.phv` を読み込む。
 - import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`const`、`type`、`import`)
   しか書けない。モジュールを読み込んでも副作用は起きない。
-- `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`、`std.async`、`std.validate`、`std.mail`、`std.testing`、`std.regex`、`std.time`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
+- `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`、`std.async`、`std.validate`、`std.mail`、`std.testing`、`std.regex`、`std.time`、`std.ws`、`std.jobs`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
 - 読み込めるのはプロジェクトとパッケージのディレクトリの中のファイルだけ(シンボリックリンクで外に出ることはできない)。
 
 ## 12. テンプレート
@@ -881,8 +883,58 @@ public/docs/[...path].phv      /docs/guide/intro  request()->param("path") == "g
   `Origin` が許可されていれば `Access-Control-Allow-Origin` を付ける。`credentials = true` で許可したオリジンは、訪問者の
   Cookie 付きで JSON のリクエストを送れるので、信頼できるオリジンだけを書くこと。
 - `[server] access_log = "logs/access.log"` を書くと、プロジェクト内のファイルにもリクエストごとに 1 行を追記する
-  (`access_log_format = "json"` なら `time`、`ip`、`method`、`path`、`status`、`ms` を持つ JSON)。パスはクエリ文字列なしで
-  記録する。
+  (`access_log_format = "json"` なら `time`、`ip`、`method`、`path`、`status`、`ms`、リクエスト ID があれば `id` を持つ
+  JSON)。パスはクエリ文字列なしで記録する。
+
+### リクエスト ID
+
+```toml
+[server]
+request_ids = true          # 既定: false
+trust_request_id = false    # true: 前にいるプロキシが送る ID とトレースを使う
+```
+
+- `request_ids` を有効にすると、各リクエストに ID が付く。W3C Trace Context のトレース ID(16 進数 32 桁)である。
+  レスポンスの `X-Request-Id`、JSON のアクセスログの `id` に入り、そのリクエストで書いた `log_info()`・`log_warn()`・
+  `log_error()` の行の末尾に `req=<id>` が付く。ページからは std.http の `request_id()` で読める(`request_ids` がなければ
+  `null`)。
+- ページが `HttpClient` で送るリクエストには、そのリクエストのトレースと独自のスパンを持つ `traceparent` ヘッダーが
+  付くので、トレースのシステムで呼び出しをつなげられる(ページが自分で `traceparent` を設定したときは除く)。
+- `trust_request_id` を有効にすると、リクエストの `X-Request-Id`(英数字・`.`・`_`・`-` の 1〜128 文字)と
+  `traceparent` のトレース(バージョン `00`、小文字の 16 進数)を、形が正しければそのまま使う。正しくなければ新しく作る。
+  これらのヘッダーを設定または削除するプロキシの後ろでだけ有効にすること。それ以外ではクライアントが書いた文字列である。
+
+### ヘルスチェックとメトリクス
+
+```toml
+[admin]
+listen = "127.0.0.1:9100"        # 管理用ポート。サイトとは別のリスナー
+token_env = "PHV_ADMIN_TOKEN"    # listen がループバック以外なら必須
+```
+
+`[admin]` を書くと、サイトとは別のポートを開き、次の 3 つのパスに答える(サイトのパスはそこでは答えず、
+これらのパスはサイトのポートでは答えない)。
+
+| パス | 応答 |
+|---|---|
+| `/health` | サーバーが動いている間は 200 `ok`。止まり始めた時点(Ctrl-C、SIGTERM)から、実行中のリクエストが終わるのを待つ間は 503 |
+| `/ready` | サーバーが使うストアが最後に使ったときに失敗していれば、また答えるまで 503: セッションのデータベース、レート制限のストア、`publish()` のストア(`unavailable: sessions, ...`)。probe のためにサーバーがどこかへ接続することはない |
+| `/metrics` | 下の値を Prometheus のテキスト形式で返す。`token_env` があれば `Authorization: Bearer <token>` が必要(なければ 401) |
+
+- ループバック以外のアドレス(コンテナの probe 用の `0.0.0.0:9100` など)には `token_env` が必要で、ないとサーバーは
+  起動しない。`/metrics` にはサイトのルートと負荷が出るためである。トークンは起動時に読み、16 バイト以上必要。
+  `/health` と `/ready` はトークンを求めない(ロードバランサーは送れないことが多い)。分かるのはサーバーが動いているか
+  だけである。
+- 管理用ポートは `GET` と `HEAD` に答え、1 接続 1 リクエスト、同時に 64 接続まで。クライアントは 5 秒以内にリクエストを
+  送る必要がある。
+- メトリクス(すべて `phv_` で始まる): `requests_total{kind, code}`(`kind`: `page`、`static`、`ws`、`sse`、`other`。`code`:
+  `2xx` など)、`request_duration_seconds{route}`(ページごとのヒストグラム。ラベルはファイル名から作る `/posts/[id]` で、
+  要求されたパスは決して入らない。ルートは 1,000 個までで、残りは `other`。静的ファイルは `static`)、
+  `worker_wait_seconds`、`rejected_total{reason}`(`busy`、`output`、`body`、`rate_limit`、`too_large`)、
+  `script_failures_total{kind}`(`exception`、`time`、`memory`、`compile`、`other`)、`ws_messages_total{dir}`、
+  `publish_total{result}`、`jobs_total{result}`、`job_duration_seconds`、`store_errors_total{store}`、およびゲージ
+  `up`、`ready`、`uptime_seconds`、`workers`、`workers_busy`、`connections`、`websockets`、`output_waiting_bytes`、
+  `async_running`、`build_info{version}`。数えるときにロックを取るのはページのヒストグラムだけである。
 
 ### std.http
 
@@ -906,6 +958,7 @@ $req->isPost();            // bool
 $req->param("id");         // ?string: ページのパスのパラメータ(`public/posts/[id].phv`)
 $req->params;              // map<string, string>
 locals()->get("user_id");  // ?string: `_middleware.phv` が locals()->set() で設定した値
+request_id();              // ?string: リクエストの ID([server] request_ids のとき。「リクエスト ID」)
 
 response()->status(404);
 response()->header("Cache-Control", "no-store");
@@ -973,6 +1026,24 @@ JSON のリクエストは CORS のプリフライトが必要なので、ほか
 本番では HTTPS で配信して `secure_cookies = true` にする(Cookie が `__Host-` 付きになり、平文の通信や
 サブドメインから上書きされなくなる)。
 `[security] csrf = false` で無効にできる。
+
+HMAC の鍵はサーバーが起動するたびに新しくなる。サイトに秘密鍵があればそれを使うので、再起動のあともフォームは有効で、
+サイトのどのサーバープロセスでも受け付けられる。ロードバランサーの後ろで、あるプロセスが出したフォームを別のプロセスに
+送れる。
+
+```toml
+[security]
+secret_env = "PHV_SECRET"          # 32 バイト以上を入れた環境変数(random_token() で作れる)
+secret_old_env = "PHV_SECRET_OLD"  # 任意: 前の秘密鍵。入れ替えの間だけ受け付ける
+```
+
+- サーバーは起動時に変数を読む。設定されていない、または 32 バイトに満たない変数があると、変数の名前を示したエラーで
+  止まる(値は決して示さない)。サーバーの設定なので `[permissions] env` に書く必要はなく、`phv build` の実行ファイルには
+  名前だけが入る。
+- サーバーは用途ごとに秘密鍵から別の鍵を導く(HKDF-SHA256): CSRF トークンと、`publish()` がほかのサーバープロセスに
+  送るメッセージ。スクリプトから秘密鍵や導いた鍵は読めない。
+- 秘密鍵を入れ替えるときは、新しい鍵を `secret_env` に、古い鍵を `secret_old_env` に入れて全プロセスを再起動し、
+  それ以前に出したフォームが使われなくなったら(数時間後)`secret_old_env` を外す。トークンは常に新しい鍵で作られる。
 
 ### Cookie
 
@@ -1160,7 +1231,7 @@ $redis->rpush("jobs", "a");  $redis->lpop("jobs");  $redis->lrange("jobs", 0, -1
 
 メソッド: `get`、`set`、`delete`、`exists`、`incr`、`expire`、`ttl`、`hget`、`hset`、`hdel`、`hgetAll`、
 `rpush`、`lpop`、`lrange`、`close`。送れるのはこれらのコマンドだけで、`KEYS`、`FLUSHALL`、`CONFIG`、`EVAL`
-などは使えません。`phv:` で始まるキーは PHV のもの(Redis に置くセッションとレート制限)で、`ValueError` になります。
+などは使えません。`phv:` で始まるキーは PHV のもの(Redis に置くセッション・レート制限・ジョブ)で、`ValueError` になります。
 リモートのサーバーには `rediss://` の URL が必要です(または `tls = false`)。エラーは `DatabaseError`。
 各コマンドが待つのはスクリプトの制限時間までで、スクリプトに残っているメモリより大きい応答は拒否します。
 
@@ -1198,8 +1269,8 @@ if ($ws->event == WsEvent::Open) {
   あいだ、接続は VM もワーカーも持たない。1 つの接続のメッセージは 1 つずつ順に処理する。
 - 実行のあいだに残るのは、接続が `$ws->set($key, $value)` で残した値(`get()` で読む。256 個まで、合計 64 KB まで。
   値 1 つにつき 64 バイト多く数える)と、参加したトピックだけ。`$ws->id` はランダムな ID で、1 つの接続のすべてのイベントで同じ。
-- `$ws->send($text)` はこの接続に送る。`publish($topic, $text)` は、このサーバープロセスで `$topic` に参加した
-  すべての接続に送る(`$ws->join()`、`$ws->leave()`。1 つの接続につき 64 トピックまで)。`publish()` はどのページからも
+- `$ws->send($text)` はこの接続に送る。`publish($topic, $text)` は、このサーバープロセス(`publish_store` があれば
+  サイトのほかのサーバープロセスも)で `$topic` に参加したすべての接続に送る(`$ws->join()`、`$ws->leave()`。1 つの接続につき 64 トピックまで)。`publish()` はどのページからも
   使える(たとえばフォームを保存したあと)。メッセージはスクリプトが終わってから送る。出力(`echo`)は捨てる。
   `$ws->close($code, $reason)` で接続を閉じる(コードは 1000 か 3000〜4999)。
 - ブラウザはページのオリジンを送る。別のサイトからの接続は、`[cors] origins` がそのサイトを名前で挙げ、
@@ -1211,8 +1282,59 @@ if ($ws->event == WsEvent::Open) {
   何も届かない接続は閉じる。`[security] requests_per_minute` があれば、メッセージ 1 つを 1 リクエストと数え、上限を
   超えた接続は閉じる。
 - スクリプトのエラーは接続をコード 1011 で閉じる。サーバーを止めるときは 1001 で閉じる。
-- `publish()` が届くのは 1 つのサーバープロセスの接続だけ。WebSocket は HTTP/1.1(と HTTPS)で使う。HTTP/2 の
-  クライアントは HTTP/1.1 に切り替えて接続する。
+- WebSocket は HTTP/1.1(と HTTPS)で使う。HTTP/2 のクライアントは HTTP/1.1 に切り替えて接続する。
+
+#### Server-Sent Events
+
+同じスクリプトが、ブラウザの `EventSource`(自分でつなぎ直しもする)向けの Server-Sent Events にも答える。
+
+```js
+const events = new EventSource("/chat?name=ann");
+events.onmessage = (e) => console.log(e.data);
+```
+
+- `*.ws.phv` のパスに、`text/event-stream` を受け付ける `GET` が来て、そのパスに答えるページがなければ、WebSocket と同じく
+  `WsEvent::Open` のイベントを実行する(ミドルウェア、`request()`、`session()`。200 以外のステータスで断る)。そのあと
+  レスポンスはストリームになり、スクリプトが送ったもの(`$ws->send()`)と、参加したトピックに publish されたものが
+  イベントとして届く(本文の各行が `data:` の 1 行)。クライアントが去ると `WsEvent::Close` を実行する。
+  `WsEvent::Message` のイベントはない。クライアントからは普通のリクエスト(`publish()` を呼ぶページ)で送る。
+- イベントストリームは WebSocket の接続として数え(合わせて同時に 1,024 まで)、同じ 1 MB のキューを持ち(読まない
+  クライアントは切る)、プロキシが閉じないよう 15 秒ごとにコメント行(`: ping`)を送る。圧縮もキャッシュもされず、
+  HTTP/1.1 と HTTP/2 で使える。ほかのサイトが開けるのは WebSocket と同じ場合だけ(`[cors]`)。イベントの間は
+  ワーカーを使わない。
+
+#### サーバープロセスをまたぐ publish()
+
+ストアがなければ、`publish()` が届くのは自分のサーバープロセスの接続だけである。ロードバランサーの後ろで複数の
+プロセスやマシンを動かすサイトでは、プロセスの間でメッセージを運ぶ Redis のデータベースを `[databases]` から指定する。
+
+```toml
+[databases.cache]
+url_env = "REDIS_URL"
+
+[security]
+secret_env = "PHV_SECRET"     # 必須: メッセージはこれで署名する
+
+[server]
+publish_store = "cache"
+```
+
+- プロセスは、スクリプトが publish したものを、ストアがないときと同じくまず自分の接続に届け、それからほかのプロセス
+  向けのキューに積む。スクリプトが Redis を待つことはない。キューは 10,000 メッセージ、32 MB まで。いっぱいのとき、
+  または Redis に届かないときは、ほかのプロセス向けのメッセージを捨てる(`phv_publish_total{result="dropped"}` で
+  数え、警告は 1 分に 1 回まで)。
+- 各プロセスはキューを Redis に送り(PUBLISH をパイプラインで)、自分専用の購読用の接続を 1 本持つ。届いたメッセージは、
+  そのトピックに参加したこのプロセスの接続に渡す。切れた接続は 1 秒後、次は 2 秒、4 秒、…最大 30 秒後に開き直す。
+  その間 `/ready` は 503 を返す(「ヘルスチェックとメトリクス」)。
+- **配信は最大 1 回(at-most-once)。** プロセスが Redis につながっていない間に publish されたメッセージは、そのプロセスの
+  接続には届かない。失ってはならないものはデータベースに保存し、`publish()` は何かが変わったことを知らせるのに使う。
+- メッセージは `secret_env` から導いた鍵で署名し、送ったプロセスの ID を持つ。プロセスは自分のメッセージを読み飛ばし、
+  サイトの鍵で署名されていないもの、形が正しくないもの、`publish()` の規則(トピックは制御文字なしの 1〜200 バイト、
+  本文は 1 MB まで)に反するもの、それより長いものを捨てる(`invalid` として数える)。長すぎるメッセージは届くそばから
+  読み捨て、メモリに持たない。チャネルの名前も鍵から導くので、Redis サーバーを共有するサイトどうしは互いのメッセージを
+  見ない。スクリプトが自分で Redis に publish することはできない(`std.db` に PUBLISH はない)。
+- Redis サーバーに書き込める者は、メッセージを落としたりストアを止めたりはできる。PHV には専用の Redis ユーザーを与え、
+  別のマシンのサーバーには `rediss://` の URL を使うこと。
 
 ### WebSocket (std.net)
 
@@ -1421,6 +1543,73 @@ DateTime::parse("2026-11-05 09:30", "Asia/Tokyo");    // ?DateTime
 - `plus(Duration::days(1))` はちょうど 24 時間後、`addDays(1)` は翌日の同じ現地時刻で、時計の切り替えをまたぐと両者は異なる。
 - 不明なタイムゾーンは `ValueError`。
 
+### バックグラウンドジョブ(std.jobs)
+
+ページを待たせたくない仕事(メールの送信、レポートの作成、遅いサービスの呼び出し)は**ジョブ**にする。`jobs/` に置いた
+スクリプトで、`phv serve` がリクエストの外で実行する。
+
+```toml
+[jobs]
+store = "db:main"     # "memory"(既定)、または [databases] の PostgreSQL・MySQL・Redis
+# dir = "jobs"        # ジョブのスクリプトのディレクトリ(public/ の外)
+# workers = 2         # 1 つのサーバープロセスが同時に実行するジョブ(1〜64)
+# time_limit = 300    # 1 回の実行にかけてよい秒数(1〜3600)
+# max_attempts = 5    # 失敗し続けるジョブをあきらめるまでの実行回数(1〜100)
+# retry_delay = 30    # 失敗したジョブを再び実行するまでの秒数。毎回 2 倍(最大 1 時間)
+# run = true          # false: phv serve はジョブを追加するだけ。実行は `phv jobs run`
+
+[[schedule]]
+job = "cleanup"
+cron = "0 3 * * *"        # 分、時、日、月、曜日
+timezone = "Asia/Tokyo"   # 既定: UTC
+```
+
+```phv
+// public/signup.phv
+import std.jobs.enqueue;
+enqueue("send_welcome", json_encode(["user" => $id]));      // ?string: ジョブの ID
+enqueue("report", "", delay: 3600);                          // 早くても 1 時間後
+enqueue("sync", (string)$id, key: "sync:{$id}");             // 待っているものがあれば追加しない(null)
+```
+
+```phv
+<?phv
+// jobs/send_welcome.phv
+import std.jobs.job;
+$j = job();                 // Job: name、id、payload、attempt(1 回目は 1)
+$data = json_decode($j->payload);
+```
+
+- ジョブはスクリプト `<dir>/<name>.phv` で、名前は英小文字・数字・`_`。`enqueue()` は、存在しないジョブ、64 KB を超える
+  payload、30 日を超える delay、200 バイトを超える key で `ValueError` を投げ、ストアに待ち・実行中のジョブが 100,000 件
+  (メモリでは 10,000 件か 64 MB)あれば `RuntimeException` を投げる。`[jobs]` のないプロジェクトでも `RuntimeException`。
+- `phv serve` は、各プロセスで `[jobs] workers` 個のジョブを専用のスレッドで同時に実行する。ジョブがページのワーカーを
+  使うことはない。実行ごとに新しい VM、`time_limit`、`[security] memory_limit_mb`、phv.toml の許可を、ページと同じく
+  持つ。`request()` と `session()` は空で、`job()` はジョブの中でだけ使える。ジョブは `publish()`(WebSocket の接続へ)や
+  ほかのジョブの `enqueue()` ができる。実行中に出力したものは捨てる。
+- **ジョブは少なくとも 1 回実行される。** 実行はリース(`time_limit` + 30 秒)付きでジョブを取る。例外を投げたり上限に
+  達したりしたジョブは `retry_delay` 秒後、次はその 2 倍後、…にもう一度実行し、`max_attempts` 回実行したらあきらめて、
+  エラーとともに 1 週間(最大 10,000 件)残す。実行中にプロセスが止まったジョブは、リースが切れたら取り直す。
+  2 回実行されても害のないジョブを書くこと(または `key` を付ける)。
+- `key` を付けると 1 回だけ追加する。同じ名前と key のジョブが待っている・実行中・あきらめられた間と、終わってから 1 日の
+  間、`enqueue()` は `null` を返す。
+- PostgreSQL と MySQL では、ストアのデータベースへの `transaction()` の中の `enqueue()` は、トランザクションと一緒に
+  追加する(コミットされたときだけ)。ジョブはテーブル `phv_jobs`(初めて要るときに作る)に置き、
+  `SELECT ... FOR UPDATE SKIP LOCKED` で取る。Redis では `phv:jobs:` の下に置く。同じストアを使うサーバープロセスと
+  マシンはジョブを共有する。`store = "memory"` ではジョブはサーバープロセスの中にあり、止めると消える。
+- **スケジュール**: `[[schedule]]` は、`cron` の式が `timezone` で一致する分ごとに、そのジョブを(空の payload で)
+  追加する。フィールドは `*`、数、範囲 `a-b`、間隔 `*/n`、列挙 `a,b`。曜日は 0〜7(日曜は 0 と 7)。日と曜日の両方を
+  指定したときは、どちらかが一致すればよい。各プロセスが分をキーにして追加するので、共有のストアなら何プロセス
+  動いていても 1 回だけ追加される。`store = "memory"` では各プロセスがそれぞれ実行する。どのプロセスも動いていなかった
+  分を後から実行することはない。スケジュールは 100 個まで。
+- `phv jobs run [dir]` は、ページを配信せずにプロジェクトのジョブ(とスケジュール)を Ctrl-C か SIGTERM まで実行する
+  (ワーカー用のマシン向け)。`[jobs] run = false` なら `phv serve` はジョブを追加するだけになる。
+  `phv jobs list [--failed]` は共有のストアのジョブを表示し、`phv jobs retry <id>` はあきらめたジョブをキューに戻す。
+- コンパイルできないジョブがあると、`phv serve`・`phv jobs run`・`phv build` は止まる。サーバーを止めるとき、実行中の
+  ジョブは `shutdown_timeout` の残りの時間を使える。終わらなかったものは、リースが切れたあとほかで実行される。
+- payload はそのまま保存する。秘密にすべきものは暗号化(`encrypt()`)すること。訪問者のためにジョブを追加するページには
+  レート制限(`rate_limit()`)をかけ、訪問者がキューを埋められないようにする。
+
 ### 非同期 I/O(std.async)
 
 ```phv
@@ -1580,6 +1769,7 @@ csp = "default"         # "off" か、{nonce} を含められる独自のポリ�
 requests_per_minute = 0 # 接続元アドレスごとの上限(0 は無制限)
 session_store = "memory"  # またはディレクトリ("sessions/")、データベース("db:cache")
 rate_limit_store = "cache"  # この Redis のデータベースでレート制限を数える(既定: プロセスの中)
+secret_env = "PHV_SECRET"   # サーバーの秘密鍵。サイトのプロセスが共有する(「CSRF 対策」)
 
 [server]
 workers = 16            # 同時に実行するスクリプトの数(既定: CPU 数の 2 倍、最小 8)
@@ -1591,6 +1781,11 @@ shutdown_timeout = 30   # サーバーを止めるとき、実行中のリクエ
 tls_cert = "certs/fullchain.pem"   # HTTPS と HTTP/2 で待ち受ける(「HTTPS と HTTP/2」を参照)
 tls_key = "certs/privkey.pem"
 h2c = false             # TLS なしの HTTP/2 も受け付ける(HTTP/2 で接続してくるプロキシ向け)
+request_ids = true      # リクエストごとに ID を付ける(「リクエスト ID」)
+publish_store = "cache" # publish() をほかのサーバープロセスにも届ける(std.ws)
+
+[admin]
+listen = "127.0.0.1:9100"   # /health、/ready、/metrics(「ヘルスチェックとメトリクス」)
 
 [cors]
 origins = ["https://app.example.com"]
@@ -1598,6 +1793,13 @@ origins = ["https://app.example.com"]
 [mail.default]
 url_env = "SMTP_URL"
 from = "Example <noreply@example.com>"
+
+[jobs]
+store = "db:main"       # バックグラウンドジョブ(「バックグラウンドジョブ」)
+
+[[schedule]]
+job = "cleanup"
+cron = "0 3 * * *"
 
 [fmt]
 width = 100             # phv fmt はこれより長い行を折り返す
@@ -1657,7 +1859,7 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 | `file_append(path, text)`、`filesize(path)`、`filemtime(path)`、`is_dir(path)`、`scandir(dir): list<string>`、`mkdir(dir)`、`copy(from, to)`、`rename(from, to)` | ファイルとディレクトリ。`[permissions]` が必要(§14) |
 | `csv_parse(string): list<list<string>>`、`csv_encode(list<list<string>>): string` | RFC 4180(引用符で囲んだフィールド、`""`、フィールド内の改行)。`csv_encode` の行末は CRLF。表計算ソフトは `=`・`+`・`-`・`@` で始まるセルを数式として実行するので、訪問者のテキストを表計算ソフトで開くファイルに入れるときは、そのようなセルの前に `'` を付ける |
 | `parse_url(string): map<string, string>`、`parse_query(string): map<string, string>` | キーは `scheme`、`host`、`port`、`user`、`pass`、`path`、`query`、`fragment`(あるものだけ)。不正な URL は `ValueError` |
-| `log_info(msg, ?fields)`、`log_warn(...)`、`log_error(...)` | 標準エラーに 1 行(サーバー自身のログと並ぶ): `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`。空白・`"`・`=` を含む値は引用符で囲み、改行・制御文字・テキストの向きを変える文字(U+202E など)はエスケープするので、値で行を偽造できない |
+| `log_info(msg, ?fields)`、`log_warn(...)`、`log_error(...)` | 標準エラーに 1 行(サーバー自身のログと並ぶ): `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`。空白・`"`・`=` を含む値は引用符で囲み、改行・制御文字・テキストの向きを変える文字(U+202E など)はエスケープするので、値で行を偽造できない。`[server] request_ids` があれば、リクエストのために書いた行の末尾に `req=<id>` が付く |
 | `argv(): list<string>`、`stdin_read_line(): ?string`、`stdin_read_all(): string` | `phv run` で実行したスクリプトだけ(ほかでは `RuntimeException`): ファイルの後の引数と標準入力 |
 | `sql_ident(string): Sql` | 列名・テーブル名 |
 | `assert(bool, ?string)`, `assert_eq(any, any, ?string)` | テスト用 |
@@ -1736,6 +1938,7 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
 | `phv dap` | エディタ用のデバッグアダプタ(下のデバッグの節を参照) |
 | `phv doc [paths] [--std] [--format html\|md] [-o file]` | ドキュメントコメントから API リファレンスを作る(下の API リファレンスの節を参照) |
 | `phv install [--locked]` | `[dependencies]` とそれらが使うパッケージを取得して `phv.lock` に固定 |
+| `phv jobs run [dir]`、`phv jobs list [--failed] [dir]`、`phv jobs retry <id> [dir]` | ページを配信せずにバックグラウンドジョブを実行する。ストアのジョブを表示する。失敗したジョブを戻す(「バックグラウンドジョブ」) |
 | `phv migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
 | `phv disasm file.phv` | バイトコードを表示 |
 | `phv parse file.phv` | 構文木を表示 |
@@ -1822,6 +2025,8 @@ phv.toml に書かず環境変数(`url_env`、`headers_env`)で渡す。書く�
 
 バンドルには SHA-256 と、作った phv のバージョンが入っている。壊れたバンドルや、別のバージョンで作ったものは起動時に
 拒否する。実行ファイルは、動かすプラットフォームで作る(そのプラットフォームの phv の写しなので)。
+`[jobs]` のジョブもサイトの実行ファイルにコンパイルして入れる。`--jobs-only` を付けると、ページを配信せずにジョブだけを
+実行する(`phv jobs run` と同じ)。
 
 ### 整形
 
@@ -1991,7 +2196,8 @@ phv migrate legacy/page.php      # page.phv を書き出す
      スクリプトの実行中に解放される。循環参照の回収は、生きているオブジェクトの数が前回の回収から 2 倍になるたびに
      (初回は 4,096 個)命令の合間に行われ、前回から作られたオブジェクト 1 個あたり 16 個までの値しか調べない。
      変数・list・map・クロージャ・生きている別のオブジェクトからたどれるオブジェクトは解放されない。実行が終わると、
-     残ったすべてのオブジェクトのフィールドを空にする。
+     残ったすべてのオブジェクトのフィールドを空にする。プロパティがすべてスカラー・文字列・enum のケースを持つクラスの
+     オブジェクトは循環できないので、回収の対象にしない。
    - **JIT**(Cranelift): ローカル変数がすべて `int`・`bool`・`float`・`string` か、その null 許容型(`?int` など)か、
      それらの list・map(`list<int>`、`map<string, int>` など)の関数は、使う命令がすべて対応していればネイティブコードに
      なる: `**` を含む算術、比較(`null` との比較も)、変換、文字列定数、`.`、`.=`、`(string)`、`strlen()`、`->len()`。
@@ -2026,6 +2232,8 @@ phv migrate legacy/page.php      # page.phv を書き出す
 | 呼び出しの深さ | 10,000 | 致命的エラー |
 | リクエスト本文 | 8 MB | 413 |
 | 同時に実行するスクリプト(`serve`) | CPU 数の 2 倍、最小 8(`[server] workers`) | 最大 10 秒待ち、その後 503 |
+| 同時に実行するジョブ(`serve`、`phv jobs run`) | プロセスごとに 2(`[jobs] workers`)。それぞれ `[jobs] time_limit`(300 秒)と `memory_limit_mb`。ページのスクリプトとは別 | ジョブはストアで待つ |
+| ストアで待つ・実行中のジョブ | 100,000(メモリ: 10,000 か 64 MB)。payload は 64 KB | `enqueue()` が例外を投げる |
 | 送信待ちの出力(`serve`) | `workers` × `memory_limit_mb` | 503 |
 | 受信中・保持中のリクエスト本文の、最初の 64 KB より後のバイト(`serve`) | `workers` × 8 MB | 最大 10 秒待ち、その後 503 |
 | ソースファイル(モジュール、テンプレート、スクリプト) | 8 MB | コンパイルエラー(`phv lsp`: それより大きい開いた文書は検査も整形もせず、開いている間は名前の変更を拒む) |
@@ -2119,8 +2327,14 @@ phv = "^1.2"   # PHV 1.2.0 以降の 1.x
   Homebrew と Scoop も実装済み。
 - **1.0 速度と安定性**(実装済み): 実行中の循環参照の解放、list・map・null 許容型を扱う JIT、HTTPS と HTTP/2、
   WebSocket サーバー、`Set` 型、§18 の互換性の規則。
-- **1.0 の後**(マイナーリリースで): クロージャとオブジェクトの JIT、サーバープロセスをまたぐ `publish()`、標準ライブラリの
-  拡充。ジェネレータ(`yield`)とトレイトは検討中で、言語に加えるだけなので、入れるとしてもマイナーリリースになる。
+- **1.1 Web サービス**: サイトのサーバープロセスが共有する秘密鍵(`[security] secret_env`)、サーバープロセスをまたぐ
+  `publish()`(`[server] publish_store`)、管理用ポートのヘルスチェックと Prometheus のメトリクス(`[admin]`)、
+  リクエスト ID とトレースコンテキスト、バックグラウンドジョブとスケジュール(`std.jobs`、`[jobs]`、`[[schedule]]`、
+  `phv jobs`)、Server-Sent Events、数値の文字列化・例外・オブジェクト生成の高速化。
+- **1.2**: OAuth 2.0 と OpenID Connect によるサインイン、RS256・ES256・EdDSA で署名した JSON Web Token(JWKS を含む)、
+  ストリーミングレスポンス、トレースの送信(OpenTelemetry)。
+- **その後**(マイナーリリースで): クロージャとオブジェクトの JIT、標準ライブラリの拡充。ジェネレータ(`yield`)と
+  トレイトは検討中で、言語に加えるだけなので、入れるとしてもマイナーリリースになる。
 
 設計方針(§1)に反するため、意図して入れないものもある: `eval`、可変変数、static プロパティとグローバル変数、
 参照(`&$x`)、真偽値への暗黙の変換、`===`、`@`、`goto`、`__get` などのマジックメソッド、`extract` / `compact`、

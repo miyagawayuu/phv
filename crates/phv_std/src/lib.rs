@@ -11,9 +11,11 @@ use std::rc::Rc;
 
 mod asyncio;
 mod collections;
+pub mod cron;
 mod crypt;
 mod db;
 mod httpclient;
+pub mod jobs;
 mod jsonas;
 mod mail;
 pub mod migrate;
@@ -42,9 +44,12 @@ pub fn sqlite_kept_stats() -> (usize, u64) {
 }
 pub mod wsserver;
 
+pub use asyncio::running as async_running;
+pub use crypt::{hmac_sha256, server_key};
 pub use httpclient::{check_header_name, check_header_value, check_http_url};
 pub use netdb::{
-    session_insert, session_read, session_remove, session_sweep, session_update, SessionLimits, SessionRow,
+    redis_publish, redis_subscribe, session_insert, session_read, session_remove, session_sweep, session_update,
+    Pushed, RedisSubscriber, SessionLimits, SessionRow,
 };
 pub use sys::{constant_time_eq, sha256_hex};
 pub use web::{csrf_expected, csrf_matches, json_decode, mask_csrf, random_hex};
@@ -69,6 +74,7 @@ pub fn std_module(name: &str) -> Option<&'static str> {
         "std.regex" => Some(include_str!("phv/regex.phv")),
         "std.time" => Some(include_str!("phv/time.phv")),
         "std.ws" => Some(include_str!("phv/ws.phv")),
+        "std.jobs" => Some(include_str!("phv/jobs.phv")),
         _ => None,
     }
 }
@@ -776,6 +782,7 @@ const PROVIDERS: &[fn(&str) -> Option<BuiltinFn>] = &[
     timez::lookup,
     jsonas::lookup,
     crypt::lookup,
+    jobs::lookup,
 ];
 
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
@@ -1215,6 +1222,13 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::Null)
         },
         "__locals_all" => |vm, _| Ok(string_map(&vm.http.locals)),
+        "__exc_trace" => |vm, a| {
+            Ok(Value::str(match &a[0] {
+                Value::Object(o) => vm.exception_trace(o),
+                _ => String::new(),
+            }))
+        },
+        "__request_id" => |vm, _| Ok(vm.http.request_id.as_deref().map_or(Value::Null, Value::str)),
         "__req_query" => |vm, _| Ok(string_map(&vm.http.query)),
         "__req_form" => |vm, _| Ok(string_map(&vm.http.form)),
         "__req_query_all" => |vm, a| Ok(values_named(&vm.http.query, s(&a[0]))),

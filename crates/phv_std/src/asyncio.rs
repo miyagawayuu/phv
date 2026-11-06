@@ -26,6 +26,11 @@ const MAX_PER_SCRIPT: usize = 16;
 pub(crate) const MAX_RUNNING: usize = 1024;
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
 
+/// Operations of `*Async` methods running now, in the process (for `/metrics`).
+pub fn running() -> usize {
+    RUNNING.load(Ordering::Relaxed)
+}
+
 /// What background work produced, in data that can cross threads.
 pub(crate) enum Outcome {
     Http(Result<crate::httpclient::Response, String>),

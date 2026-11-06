@@ -15,6 +15,7 @@ mod build;
 mod dap;
 mod db;
 mod doc;
+mod jobs;
 mod lsp;
 mod migrate;
 mod new;
@@ -62,6 +63,33 @@ struct DbArgs {
     /// The project's directory.
     #[arg(default_value = ".")]
     project: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum JobsAction {
+    /// Run the jobs of [jobs] (and [[schedule]]) without serving the pages, until Ctrl-C.
+    Run {
+        /// The project's directory.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// List the waiting, running and failed jobs of the store.
+    List {
+        /// Only the jobs that were given up.
+        #[arg(long)]
+        failed: bool,
+        /// The project's directory.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// Put a failed job back in the queue.
+    Retry {
+        /// The job's id (from `phv jobs list`).
+        id: String,
+        /// The project's directory.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -134,6 +162,11 @@ enum Command {
         /// The executable to write.
         #[arg(short, long)]
         output: PathBuf,
+    },
+    /// Run, list and retry background jobs ([jobs] in phv.toml).
+    Jobs {
+        #[command(subcommand)]
+        action: JobsAction,
     },
     /// Apply the SQL files of migrations/ to a database, or list them.
     Db {
@@ -493,6 +526,11 @@ fn exec(cmd: Command) -> ExitCode {
         }
         Command::Install { dir, locked } => pkg::install(&dir, locked),
         Command::Build { path, output } => build::build(&path, &output),
+        Command::Jobs { action } => match action {
+            JobsAction::Run { project } => jobs::run(&project, 30.0),
+            JobsAction::List { failed, project } => jobs::list(&project, failed),
+            JobsAction::Retry { id, project } => jobs::retry(&project, &id),
+        },
         Command::Db { action } => {
             let (a, apply) = match &action {
                 DbAction::Migrate(a) => (a, true),

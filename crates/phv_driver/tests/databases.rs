@@ -207,3 +207,120 @@ fn remote_servers_need_tls() {
     assert!(out.contains("cannot connect"), "{out}");
     assert!(!out.contains("secret-pw"), "{out}");
 }
+
+/// The job store of `[jobs] store = "db:..."` on each server: jobs are taken
+/// once, with a lease; failed ones run again or are given up; keys add a job
+/// once; inside a transaction() a job is added only if it commits.
+fn check_jobs(url: &str) {
+    use phv_std::jobs::{End, Store};
+    let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 4 };
+    let store = Store::Db(spec.clone());
+    // Start from an empty store (the tests of each server run one at a time).
+    let clear = |store: &Store| {
+        while let Some(j) = store.take(Duration::from_secs(60)).unwrap() {
+            store.end(&j, End::Done { keyed: false }).unwrap();
+        }
+        for j in store.list(true).unwrap() {
+            store.requeue(&j.id).unwrap();
+            let t = store.take(Duration::from_secs(60)).unwrap().unwrap();
+            store.end(&t, End::Done { keyed: false }).unwrap();
+        }
+    };
+    clear(&store);
+    let lease = Duration::from_secs(60);
+    let id = store.add("a", "payload", 0, None).unwrap().unwrap();
+    let later = store.add("later", "", 3600, None).unwrap().unwrap();
+    let job = store.take(lease).unwrap().unwrap();
+    assert_eq!(
+        (job.id.as_str(), job.name.as_str(), job.payload.as_str(), job.attempts),
+        (id.as_str(), "a", "payload", 1)
+    );
+    assert!(store.take(lease).unwrap().is_none(), "the other job is not due");
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    assert!(store.end(&job, End::Retry { at: now() - 1, error: "first" }).unwrap());
+    let again = store.take(lease).unwrap().unwrap();
+    assert_eq!(again.attempts, 2);
+    assert!(!store.end(&job, End::Done { keyed: false }).unwrap(), "the first lease is gone");
+    assert!(store.end(&again, End::Dead { error: "given up" }).unwrap());
+    let failed = store.list(true).unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!((failed[0].id.as_str(), failed[0].state, failed[0].error.as_str()), (id.as_str(), "failed", "given up"));
+    assert!(store.requeue(&id).unwrap());
+    let third = store.take(lease).unwrap().unwrap();
+    assert_eq!(third.attempts, 1);
+    store.end(&third, End::Done { keyed: false }).unwrap();
+
+    // A lease that runs out: the job is taken again.
+    store.add("crash", "", 0, None).unwrap().unwrap();
+    let first = store.take(Duration::from_millis(1)).unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let second = store.take(lease).unwrap().unwrap();
+    assert_eq!((second.id.as_str(), second.attempts), (first.id.as_str(), 2));
+    assert!(!store.end(&first, End::Done { keyed: false }).unwrap());
+    assert!(store.end(&second, End::Done { keyed: false }).unwrap());
+
+    // Keys: once while it waits, and for a day after it ended.
+    let k = phv_std::jobs::uniq_key("keyed", &format!("k-{}", now()));
+    assert!(store.add("keyed", "", 0, Some(&k)).unwrap().is_some());
+    assert!(store.add("keyed", "", 0, Some(&k)).unwrap().is_none());
+    let j = store.take(lease).unwrap().unwrap();
+    store.end(&j, End::Done { keyed: true }).unwrap();
+    assert!(store.add("keyed", "", 0, Some(&k)).unwrap().is_none());
+
+    // Three takers at once: each of 150 jobs is taken exactly once.
+    for i in 0..150 {
+        store.add("many", &i.to_string(), 0, None).unwrap().unwrap();
+    }
+    let taken = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..3 {
+            s.spawn(|| {
+                while let Some(j) = store.take(lease).unwrap() {
+                    taken.lock().unwrap().push(j.payload.clone());
+                    store.end(&j, End::Done { keyed: false }).unwrap();
+                }
+            });
+        }
+    });
+    let mut taken = taken.into_inner().unwrap();
+    taken.sort();
+    taken.dedup();
+    assert_eq!(taken.len(), 150);
+    store.sweep().unwrap();
+    // The later job is still there, and no other job of this run.
+    let left: Vec<String> = store.list(false).unwrap().into_iter().map(|j| j.id).collect();
+    assert!(left.contains(&later), "{left:?}");
+    assert!(!left.contains(&id));
+    clear(&store);
+
+    // The outbox: enqueue() inside a transaction() on PostgreSQL and MySQL
+    // (Redis has no transaction() in std.db).
+    if url.starts_with("redis") {
+        return;
+    }
+    let mut h = (*host(url)).clone();
+    h.jobs = Some(phv_vm::JobsSpec {
+        store: Some("main".into()),
+        names: Some(vec!["outbox".into()]),
+        memory_key: String::new(),
+    });
+    let out = run_script(&Arc::new(h), "jobs_outbox", Some(Duration::from_secs(30)));
+    let expected = std::fs::read_to_string(root().join("jobs_outbox.out")).unwrap().replace("\r\n", "\n");
+    assert_eq!(out, expected);
+    let mut payloads = Vec::new();
+    while let Some(j) = store.take(lease).unwrap() {
+        payloads.push(j.payload.clone());
+        store.end(&j, End::Done { keyed: false }).unwrap();
+    }
+    payloads.sort();
+    assert_eq!(payloads, ["committed", "plain", "x"]);
+}
+
+#[test]
+fn job_stores() {
+    for var in ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL", "PHV_TEST_REDIS_URL"] {
+        if let Some(url) = server(var) {
+            check_jobs(&url);
+        }
+    }
+}

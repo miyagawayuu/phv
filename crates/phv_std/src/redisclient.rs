@@ -32,6 +32,16 @@ impl Reply {
     }
 }
 
+/// A message pushed to a subscribed connection.
+pub(crate) enum Push {
+    /// The data of a `message`.
+    Message(Vec<u8>),
+    /// A `message` longer than allowed, thrown away.
+    TooLarge,
+    /// Another kind (`pong`, `subscribe`, ...).
+    Other(Vec<u8>),
+}
+
 pub(crate) enum RedisError {
     /// The server answered with an error; the connection is still usable.
     Server(String),
@@ -152,6 +162,154 @@ impl RedisConn {
         match reply? {
             Ok(r) => Ok(r),
             Err(message) => Err(RedisError::Server(message)),
+        }
+    }
+
+    /// Writes one command without reading its reply (for pipelines and the
+    /// commands of a subscribed connection).
+    pub(crate) fn send(&mut self, args: &[&[u8]], until: Instant) -> Result<(), RedisError> {
+        self.stream.set_deadline(until);
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b"\r\n");
+        }
+        let io = |e: std::io::Error| RedisError::Broken(describe(&e));
+        self.stream.write_all(&out).map_err(io)?;
+        self.stream.flush().map_err(io)
+    }
+
+    /// Reads the next reply, before `until` and within `budget` bytes; bytes
+    /// past it are kept for the next one (pipelines, pushed messages).
+    pub(crate) fn next_reply(&mut self, until: Instant, budget: usize) -> Result<Reply, RedisError> {
+        self.stream.set_deadline(until);
+        // What is already buffered counts against the budget too.
+        self.budget = budget.saturating_sub(self.buf.len() - self.pos);
+        let reply = self.reply(0);
+        self.buf.drain(..self.pos);
+        self.pos = 0;
+        match reply? {
+            Ok(r) => Ok(r),
+            Err(message) => Err(RedisError::Server(message)),
+        }
+    }
+
+    /// Reads one message pushed to a subscribed connection (`*N` of bulk
+    /// strings), before `until`. Its last element longer than `max` bytes is
+    /// read and thrown away as it arrives, never held: the connection stays usable.
+    pub(crate) fn next_push(&mut self, until: Instant, max: usize) -> Result<Push, RedisError> {
+        let invalid = || RedisError::Broken("the server sent an invalid reply".into());
+        self.stream.set_deadline(until);
+        // What is held is bounded by the lines (`short_line`), the elements
+        // (`max`, 1 KB) and one read ahead: the reads need no budget of their own.
+        self.budget = usize::MAX;
+        let head = self.short_line()?;
+        let n = head.strip_prefix('*').map(Self::length).transpose()?.ok_or_else(invalid)?;
+        if !(1..=4).contains(&n) {
+            return Err(invalid());
+        }
+        let mut items: Vec<Vec<u8>> = Vec::new();
+        let mut too_large = false;
+        for i in 0..n {
+            let line = self.short_line()?;
+            let len = line.strip_prefix('$').map(Self::length).transpose()?.ok_or_else(invalid)?;
+            if len < 0 {
+                return Err(invalid());
+            }
+            let len = len as usize;
+            let limit = if i + 1 == n { max } else { 1024 };
+            if len > limit {
+                if i + 1 != n {
+                    return Err(invalid());
+                }
+                self.skip(len + 2)?;
+                too_large = true;
+                break;
+            }
+            while self.buf.len() - self.pos < len + 2 {
+                self.fill()?;
+            }
+            if &self.buf[self.pos + len..self.pos + len + 2] != b"\r\n" {
+                return Err(invalid());
+            }
+            items.push(self.buf[self.pos..self.pos + len].to_vec());
+            self.pos += len + 2;
+        }
+        self.buf.drain(..self.pos);
+        self.pos = 0;
+        let kind = items.first().cloned().unwrap_or_default();
+        Ok(match (kind.as_slice(), too_large) {
+            (b"message", true) => Push::TooLarge,
+            (b"message", false) if items.len() == 3 => Push::Message(items.pop().unwrap_or_default()),
+            _ if too_large => return Err(invalid()),
+            _ => Push::Other(kind),
+        })
+    }
+
+    /// A line of at most 64 bytes (the header of a pushed message, or of one of its elements).
+    fn short_line(&mut self) -> Result<String, RedisError> {
+        loop {
+            if let Some(i) = self.buf[self.pos..].windows(2).position(|w| w == b"\r\n") {
+                let line = String::from_utf8_lossy(&self.buf[self.pos..self.pos + i]).into_owned();
+                self.pos += i + 2;
+                return Ok(line);
+            }
+            if self.buf.len() - self.pos > 64 {
+                return Err(RedisError::Broken("the server sent an invalid reply".into()));
+            }
+            self.fill()?;
+        }
+    }
+
+    /// Reads `n` bytes and throws them away, a chunk at a time.
+    fn skip(&mut self, mut n: usize) -> Result<(), RedisError> {
+        loop {
+            let have = (self.buf.len() - self.pos).min(n);
+            self.pos += have;
+            n -= have;
+            if n == 0 {
+                return Ok(());
+            }
+            self.buf.clear();
+            self.pos = 0;
+            let mut chunk = [0u8; 16 << 10];
+            let got = loop {
+                match self.stream.read(&mut chunk[..n.min(16 << 10)]) {
+                    Ok(0) => return Err(RedisError::Broken("the server closed the connection".into())),
+                    Ok(k) => break k,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(RedisError::Broken(describe(&e))),
+                }
+            };
+            n -= got;
+            if n == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Whether bytes arrive before `until` (`false` when none did: the
+    /// connection is still usable). At most `budget` bytes are read.
+    pub(crate) fn wait_data(&mut self, until: Instant, budget: usize) -> Result<bool, RedisError> {
+        if self.pos < self.buf.len() {
+            return Ok(true);
+        }
+        self.buf.clear();
+        self.pos = 0;
+        self.stream.set_deadline(until);
+        let mut chunk = [0u8; 16 << 10];
+        loop {
+            match self.stream.read(&mut chunk[..budget.clamp(1, 16 << 10)]) {
+                Ok(0) => return Err(RedisError::Broken("the server closed the connection".into())),
+                Ok(n) => {
+                    self.buf.extend_from_slice(&chunk[..n]);
+                    return Ok(true);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(false),
+                Err(e) => return Err(RedisError::Broken(describe(&e))),
+            }
         }
     }
 
@@ -288,5 +446,41 @@ mod tests {
         for bad in ["http://a", "redis://", "redis://a:x", "redis://a/x"] {
             assert!(parse_url(bad).is_err(), "{bad}");
         }
+    }
+
+    /// A subscribed connection reads pushed messages; one longer than allowed
+    /// is thrown away as it arrives and the connection goes on; a malformed
+    /// one breaks it.
+    #[test]
+    fn pushed_messages_are_read_or_thrown_away() {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let msg = |data: &[u8]| {
+                let mut m = format!("*3\r\n$7\r\nmessage\r\n$2\r\nch\r\n${}\r\n", data.len()).into_bytes();
+                m.extend_from_slice(data);
+                m.extend_from_slice(b"\r\n");
+                m
+            };
+            s.write_all(&msg(b"hello")).unwrap();
+            s.write_all(&msg(&vec![b'x'; 200_000])).unwrap();
+            s.write_all(b"*2\r\n$4\r\npong\r\n$0\r\n\r\n").unwrap();
+            s.write_all(&msg(b"after")).unwrap();
+            s.write_all(b"*3\r\n$7\r\nmessage\r\n$2000\r\n").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        let until = || Instant::now() + std::time::Duration::from_secs(5);
+        let mut c = RedisConn::connect(&format!("redis://127.0.0.1:{port}"), None, until()).unwrap();
+        let max = 1000;
+        assert!(matches!(c.next_push(until(), max), Ok(Push::Message(m)) if m == b"hello"));
+        assert!(matches!(c.next_push(until(), max), Ok(Push::TooLarge)));
+        assert!(c.buf.len() <= 64 << 10, "a large message is not held: {}", c.buf.len());
+        assert!(matches!(c.next_push(until(), max), Ok(Push::Other(k)) if k == b"pong"));
+        assert!(matches!(c.next_push(until(), max), Ok(Push::Message(m)) if m == b"after"));
+        // A channel name longer than 1 KB is not a message of ours.
+        assert!(matches!(c.next_push(until(), max), Err(RedisError::Broken(_))));
+        server.join().unwrap();
     }
 }

@@ -10,6 +10,7 @@
 - [std.regex](#stdregex)
 - [std.time](#stdtime)
 - [std.ws](#stdws)
+- [std.jobs](#stdjobs)
 
 ## std.http
 
@@ -132,6 +133,17 @@ function response(): Response
 ```phv
 function session(): Session
 ```
+
+### function request_id
+
+```phv
+function request_id(): ?string
+```
+
+The id of this request, with `[server] request_ids = true` in phv.toml
+(otherwise null). The server sends it in the `X-Request-Id` header, writes
+it in the JSON access log and adds it to the lines of `log_info()`,
+`log_warn()` and `log_error()`, so the lines of one request can be found.
 
 
 ## std.db
@@ -653,6 +665,67 @@ The connection this script runs for. Only in `public/*.ws.phv`.
 function publish(string $topic, string $text): void
 ```
 
-Sends `text` to every connection that joined `topic` (in this server
-process), after the script ends. Any page may publish.
+Sends `text` to every connection that joined `topic`, after the script
+ends: those of this server process, and with `[server] publish_store` those
+of the site's other server processes. Any page may publish.
+
+
+## std.jobs
+
+std.jobs — background jobs (`[jobs]` in phv.toml).
+
+A job is a script in the jobs directory (`jobs/send_welcome.phv`). Any page
+or job adds one with `enqueue()`; `phv serve` (and `phv jobs run`) take the
+jobs and run them, outside any request, each with its own time and memory
+limits. A job that throws is run again later, up to `[jobs] max_attempts`
+times.
+
+```phv
+import std.jobs.enqueue;
+enqueue("send_welcome", json_encode(["user" => $id]));
+```
+
+
+```phv
+// jobs/send_welcome.phv
+import std.jobs.job;
+$data = json_decode(job()->payload);
+```
+
+### class Job
+
+```phv
+class Job
+```
+
+The job a script of the jobs directory runs for.
+
+- `public readonly string $name` — The job's name: its file in the jobs directory, without `.phv`.
+- `public readonly string $id` — A random id, the same for every run of the job.
+- `public readonly string $payload` — What `enqueue()` was given.
+- `public readonly int $attempt` — 1 for the first run, 2 for the first retry, ...
+- `public function __construct(public readonly string $name, public readonly string $id, public readonly string $payload, public readonly int $attempt)`
+
+### function enqueue
+
+```phv
+function enqueue(string $job, string $payload = "", int $delay = 0, ?string $key = null): ?string
+```
+
+Adds a job: the script `<name>.phv` of `[jobs] dir` runs with `payload`
+(at most 64 KB; JSON is handy), `delay` seconds from now at the earliest
+(at most 30 days). With a `key`, a job of the same name and key is added
+only once (while it waits, runs or failed, and for a day after it ended):
+the result is then null. Otherwise the result is the job's id.
+
+Inside a `transaction()` on the database of `[jobs] store` (PostgreSQL or
+MySQL), the job is added only if the transaction commits.
+
+### function job
+
+```phv
+function job(): Job
+```
+
+The job this script runs for. Only in a job.
 

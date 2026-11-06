@@ -73,6 +73,9 @@ struct SiteArgs {
     /// Maximum execution time per request, in seconds.
     #[arg(long, default_value_t = 30.0)]
     time_limit: f64,
+    /// Run the site's jobs (`[jobs]`) only, without serving its pages.
+    #[arg(long)]
+    jobs_only: bool,
 }
 
 /// Options of an executable built from a script.
@@ -103,6 +106,14 @@ pub fn run_bundle(b: Bundle) -> ExitCode {
                 Err(e) => return fail(e),
             };
         }
+        let mut jobs = HashMap::new();
+        for p in b.jobs {
+            let name = p.path.clone();
+            match p.into_compiled() {
+                Ok(c) => jobs.insert(name, Arc::new(c)),
+                Err(e) => return fail(e),
+            };
+        }
         let statics = b.statics.into_iter().map(|(k, v)| (k, bytes::Bytes::from(v))).collect();
         let loopback =
             args.host == "localhost" || args.host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
@@ -114,7 +125,13 @@ pub fn run_bundle(b: Bundle) -> ExitCode {
             time_limit: Duration::from_secs_f64(args.time_limit),
             watch: false,
         };
-        let embedded = phv_server::Embedded { pages, statics, config: b.config };
+        let embedded = phv_server::Embedded { pages, jobs, statics, config: b.config };
+        if args.jobs_only {
+            return match phv_server::run_jobs(opts, Some(embedded), None) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(e),
+            };
+        }
         return match phv_server::serve_embedded(opts, embedded) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(e),

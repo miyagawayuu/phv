@@ -10,12 +10,19 @@
 //! `publish()` hands a message to the hub, which puts it in the queue of each
 //! connection that joined the topic. A connection whose queue grows past
 //! `MAX_QUEUED` (a client that does not read) is closed.
+//!
+//! The same script answers Server-Sent Events: a `GET` with `Accept:
+//! text/event-stream` to its path (when no page answers it) runs the Open
+//! event, then streams what is sent and published to the connection as
+//! `data:` lines; the Close event runs when the client goes away. There are no
+//! Message events (the client cannot send on the stream).
 
+use crate::body::RespBody;
 use crate::{busy, simple, Page, Resp, State};
 use futures_util::{SinkExt, StreamExt};
 use hyper::body::Incoming;
 use hyper::header::HeaderValue;
-use hyper::{Request, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use phv_vm::{WsCtx, WsEvent};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -36,6 +43,9 @@ const MAX_MESSAGE: usize = 64 * 1024;
 const MAX_QUEUED: usize = 1 << 20;
 /// A ping is sent this often; a connection silent for `SILENT` is closed.
 const PING_EVERY: Duration = Duration::from_secs(30);
+/// An event stream gets a comment line this often, so proxies keep it open and
+/// an HTTP/2 connection never looks stalled (`WRITE_STALL`, 30 s).
+const EVENT_PING_EVERY: Duration = Duration::from_secs(15);
 const SILENT: Duration = Duration::from_secs(75);
 
 /// What waits to be sent to a connection.
@@ -218,6 +228,7 @@ async fn run_event(
     ws: WsCtx,
 ) -> EventResult {
     let Ok(Ok(permit)) = tokio::time::timeout(crate::QUEUE_WAIT, state.workers.clone().acquire_owned()).await else {
+        state.metrics.reject(crate::metrics::Reject::Busy);
         return Err(Box::new(busy()));
     };
     let (st, script, params, ip, parts) =
@@ -254,7 +265,10 @@ pub async fn upgrade(
             "WebSocket connections from other sites are refused".into(),
         );
     }
-    let Ok(slot) = state.ws_slots.clone().try_acquire_owned() else { return busy() };
+    let Ok(slot) = state.ws_slots.clone().try_acquire_owned() else {
+        state.metrics.reject(crate::metrics::Reject::Busy);
+        return busy();
+    };
     let key = req.headers().get("sec-websocket-key").map(|k| k.as_bytes().to_vec()).unwrap_or_default();
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(&key);
     let on_upgrade = hyper::upgrade::on(&mut req);
@@ -305,6 +319,85 @@ pub async fn upgrade(
     r
 }
 
+/// Whether a request asks for Server-Sent Events: a `GET` (or `HEAD`) that
+/// accepts `text/event-stream` and is not a WebSocket upgrade.
+pub fn wants_events(req: &Request<Incoming>) -> bool {
+    (req.method() == hyper::Method::GET || req.method() == hyper::Method::HEAD)
+        && !is_upgrade(req)
+        && req.headers().get_all(hyper::header::ACCEPT).iter().filter_map(|v| v.to_str().ok()).any(|v| {
+            v.split(',').any(|t| t.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("text/event-stream"))
+        })
+}
+
+/// One message as an event: a `data:` line for each of its lines.
+fn event_bytes(text: &str) -> bytes::Bytes {
+    let mut out = String::with_capacity(text.len() + 16);
+    for line in text.split("\r\n").flat_map(|l| l.split(['\r', '\n'])) {
+        out.push_str("data: ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+    bytes::Bytes::from(out)
+}
+
+/// Answers a request for Server-Sent Events with `script` (`*.ws.phv`): runs
+/// its Open event and, unless it refuses, streams the connection's messages.
+pub async fn events(
+    state: &Arc<State>,
+    script: PathBuf,
+    params: Vec<(String, String)>,
+    ip: String,
+    req: Request<Incoming>,
+) -> Resp {
+    if !origin_allowed(state, &req) {
+        return simple(StatusCode::FORBIDDEN, "text/plain", "event streams for other sites are refused".into());
+    }
+    let Ok(slot) = state.ws_slots.clone().try_acquire_owned() else {
+        state.metrics.reject(crate::metrics::Reject::Busy);
+        return busy();
+    };
+    let head = req.method() == hyper::Method::HEAD;
+    let id = phv_std::random_hex(16);
+    let origin = Origin { method: hyper::Method::GET, uri: req.uri().clone(), headers: req.headers().clone() };
+    let outbox = state.hub.lock().unwrap_or_else(|e| e.into_inner()).register(&id);
+    let open = WsCtx { event: WsEvent::Open, id: id.clone(), ..WsCtx::default() };
+    let (kept, cookies) = match run_event(state, &script, &params, &ip, &origin, open).await {
+        Ok(k) => k,
+        Err(refused) => {
+            state.hub.lock().unwrap_or_else(|e| e.into_inner()).unregister(&id);
+            return *refused;
+        }
+    };
+    // A few chunks in flight; the rest waits in the outbox (`MAX_QUEUED`).
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+    let mut r = Response::new(RespBody::Stream(rx));
+    let h = r.headers_mut();
+    h.insert(hyper::header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream; charset=utf-8"));
+    h.insert(hyper::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    // Proxies (nginx) pass each event on at once.
+    h.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    for c in cookies {
+        h.append(hyper::header::SET_COOKIE, c);
+    }
+    // For one visitor: never compressed or kept by a cache.
+    r.extensions_mut().insert(crate::static_files::Personal);
+    r.extensions_mut().insert(crate::Served { kind: crate::metrics::Kind::Sse, route: None });
+    if head {
+        state.hub.lock().unwrap_or_else(|e| e.into_inner()).unregister(&id);
+        *r.body_mut() = RespBody::full(bytes::Bytes::new());
+        return r;
+    }
+    let st = state.clone();
+    tokio::spawn(async move {
+        let _slot = slot;
+        let conn = Conn { state: st.clone(), script, params, ip, origin, outbox, kept };
+        conn.stream_events(tx).await;
+        st.hub.lock().unwrap_or_else(|e| e.into_inner()).unregister(&id);
+    });
+    r
+}
+
 struct Conn {
     state: Arc<State>,
     script: PathBuf,
@@ -319,6 +412,49 @@ struct Conn {
 type Stream = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
 impl Conn {
+    /// Sends the connection's messages as events until the client goes away,
+    /// the script closes it or the server stops; then runs the Close event.
+    async fn stream_events(self, tx: tokio::sync::mpsc::Sender<bytes::Bytes>) {
+        let mut closing = self.state.ws_closing.subscribe();
+        let mut ping = tokio::time::interval(EVENT_PING_EVERY);
+        ping.tick().await;
+        let mut stopping = false;
+        'conn: loop {
+            if self.outbox.overflow.load(Ordering::SeqCst) {
+                break;
+            }
+            while let Some(out) = self.outbox.pop() {
+                match out {
+                    Out::Text(t) => {
+                        if tx.send(event_bytes(&t)).await.is_err() {
+                            break 'conn;
+                        }
+                        self.state.metrics.ws_out.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Out::Close(..) => break 'conn,
+                }
+            }
+            tokio::select! {
+                _ = self.outbox.ready.notified() => {}
+                _ = tx.closed() => break,
+                _ = ping.tick() => {
+                    if tx.send(bytes::Bytes::from_static(b": ping\n\n")).await.is_err() {
+                        break;
+                    }
+                }
+                _ = closing.changed() => {
+                    stopping = true;
+                    break;
+                }
+            }
+        }
+        drop(tx);
+        if !stopping {
+            let ev = self.event(WsEvent::Close, String::new());
+            let _ = run_event(&self.state, &self.script, &self.params, &self.ip, &self.origin, ev).await;
+        }
+    }
+
     fn event(&self, event: WsEvent, message: String) -> WsCtx {
         WsCtx { event, id: self.kept.id.clone(), message, state: self.kept.state.clone(), ..WsCtx::default() }
     }
@@ -344,6 +480,7 @@ impl Conn {
                         if stream.send(Message::text(t.as_ref())).await.is_err() {
                             break 'conn;
                         }
+                        self.state.metrics.ws_out.fetch_add(1, Ordering::Relaxed);
                     }
                     Out::Close(code, reason) => {
                         let frame = CloseFrame { code: CloseCode::from(code), reason: reason.into() };
@@ -356,6 +493,7 @@ impl Conn {
                 m = stream.next(), if running.is_none() => match m {
                     Some(Ok(Message::Text(t))) => {
                         seen = Instant::now();
+                        self.state.metrics.ws_in.fetch_add(1, Ordering::Relaxed);
                         // Counted like requests: the same key (IPv6 by /64) and store
                         // (found by the 1.0 audit: messages had a key of their own).
                         let ip = self.ip.parse::<std::net::IpAddr>().ok();

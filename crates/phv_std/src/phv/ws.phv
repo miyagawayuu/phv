@@ -79,8 +79,9 @@ export function socket(): Socket {
 }
 
 /**
- * Sends `text` to every connection that joined `topic` (in this server
- * process), after the script ends. Any page may publish.
+ * Sends `text` to every connection that joined `topic`, after the script
+ * ends: those of this server process, and with `[server] publish_store` those
+ * of the site's other server processes. Any page may publish.
  */
 export function publish(string $topic, string $text): void {
     __sock_publish($topic, $text);

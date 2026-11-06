@@ -98,10 +98,8 @@ impl Value {
     pub fn append_to(&self, out: &mut String) {
         match self {
             Value::Str(s) | Value::Html(s) => out.push_str(s),
-            Value::Int(i) => {
-                let _ = write!(out, "{i}");
-            }
-            Value::Float(f) => out.push_str(&format_float(*f)),
+            Value::Int(i) => write_int(out, *i),
+            Value::Float(f) => write_float(out, *f),
             Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
             Value::Null => {}
             other => out.push_str(other.type_name()),
@@ -341,34 +339,119 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
 
 /// Formats a float like PHP's `echo` (14 significant digits).
 pub fn format_float(f: f64) -> String {
-    if f.is_nan() {
-        return "NAN".into();
-    }
-    if f.is_infinite() {
-        return if f > 0.0 { "INF".into() } else { "-INF".into() };
-    }
-    if f == 0.0 {
-        return if f.is_sign_negative() { "-0".into() } else { "0".into() };
-    }
-    let sci = format!("{:.13e}", f);
-    let (mantissa, exp) = sci.split_once('e').unwrap();
-    let exp: i32 = exp.parse().unwrap();
-    if !(-4..14).contains(&exp) {
-        let m = trim_zeros(mantissa);
-        let m = if m.contains('.') { m.to_string() } else { format!("{m}.0") };
-        let sign = if exp < 0 { '-' } else { '+' };
-        return format!("{m}E{sign}{}", exp.abs());
-    }
-    let decimals = (13 - exp).max(0) as usize;
-    trim_zeros(&format!("{:.*}", decimals, f)).to_string()
+    let mut out = String::new();
+    write_float(&mut out, f);
+    out
 }
 
-fn trim_zeros(s: &str) -> &str {
-    if s.contains('.') {
-        s.trim_end_matches('0').trim_end_matches('.')
-    } else {
-        s
+/// A buffer on the stack for `write!` (the text of one number).
+struct StackText {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl std::fmt::Write for StackText {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        if end > self.buf.len() {
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
     }
+}
+
+/// Appends `f` as `format_float` writes it, without allocating: the 14
+/// significant digits of `{:.13e}` are placed around the decimal point
+/// directly (rounding at the same digit as a second, fixed-point format would).
+pub fn write_float(out: &mut String, f: f64) {
+    if f.is_nan() {
+        return out.push_str("NAN");
+    }
+    if f.is_infinite() {
+        return out.push_str(if f > 0.0 { "INF" } else { "-INF" });
+    }
+    if f == 0.0 {
+        return out.push_str(if f.is_sign_negative() { "-0" } else { "0" });
+    }
+    let mut sci = StackText { buf: [0; 64], len: 0 };
+    let _ = write!(sci, "{:.13e}", f);
+    let text = std::str::from_utf8(&sci.buf[..sci.len]).unwrap_or("0e0");
+    let (mantissa, exp) = text.split_once('e').unwrap_or((text, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let (negative, mantissa) = match mantissa.strip_prefix('-') {
+        Some(m) => (true, m),
+        None => (false, mantissa),
+    };
+    // The 14 digits, and how many stay after dropping trailing zeros.
+    let mut digits = [0u8; 14];
+    let mut n = 0;
+    for b in mantissa.bytes().filter(u8::is_ascii_digit) {
+        if n < digits.len() {
+            digits[n] = b;
+            n += 1;
+        }
+    }
+    while n > 1 && digits[n - 1] == b'0' {
+        n -= 1;
+    }
+    let digits = &digits[..n];
+    if negative {
+        out.push('-');
+    }
+    let push = |out: &mut String, d: &[u8]| out.push_str(std::str::from_utf8(d).unwrap_or(""));
+    if !(-4..14).contains(&exp) {
+        // `1.5E+20`, `1.0E-5`.
+        push(out, &digits[..1]);
+        out.push('.');
+        if digits.len() > 1 {
+            push(out, &digits[1..]);
+        } else {
+            out.push('0');
+        }
+        out.push('E');
+        out.push(if exp < 0 { '-' } else { '+' });
+        let _ = write!(out, "{}", exp.abs());
+    } else if exp < 0 {
+        // `0.0001`: zeros before the digits.
+        out.push_str("0.");
+        for _ in 0..(-exp - 1) {
+            out.push('0');
+        }
+        push(out, digits);
+    } else {
+        let int_len = exp as usize + 1;
+        if digits.len() <= int_len {
+            push(out, digits);
+            for _ in digits.len()..int_len {
+                out.push('0');
+            }
+        } else {
+            push(out, &digits[..int_len]);
+            out.push('.');
+            push(out, &digits[int_len..]);
+        }
+    }
+}
+
+/// Appends an integer without the formatting machinery.
+pub fn write_int(out: &mut String, i: i64) {
+    let mut buf = [0u8; 20];
+    let mut pos = buf.len();
+    let mut n = i.unsigned_abs();
+    loop {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if i < 0 {
+        out.push('-');
+    }
+    out.push_str(std::str::from_utf8(&buf[pos..]).unwrap_or(""));
 }
 
 /// Appends `s` with each byte `entity` maps to replaced by that entity. The
@@ -420,6 +503,86 @@ pub fn html_escape(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// `format_float` before 1.1 (two formatting passes), to compare with.
+    fn format_float_before(f: f64) -> String {
+        fn trim_zeros(s: &str) -> &str {
+            if s.contains('.') {
+                s.trim_end_matches('0').trim_end_matches('.')
+            } else {
+                s
+            }
+        }
+        if f.is_nan() {
+            return "NAN".into();
+        }
+        if f.is_infinite() {
+            return if f > 0.0 { "INF".into() } else { "-INF".into() };
+        }
+        if f == 0.0 {
+            return if f.is_sign_negative() { "-0".into() } else { "0".into() };
+        }
+        let sci = format!("{:.13e}", f);
+        let (mantissa, exp) = sci.split_once('e').unwrap();
+        let exp: i32 = exp.parse().unwrap();
+        if !(-4..14).contains(&exp) {
+            let m = trim_zeros(mantissa);
+            let m = if m.contains('.') { m.to_string() } else { format!("{m}.0") };
+            let sign = if exp < 0 { '-' } else { '+' };
+            return format!("{m}E{sign}{}", exp.abs());
+        }
+        let decimals = (13 - exp).max(0) as usize;
+        trim_zeros(&format!("{:.*}", decimals, f)).to_string()
+    }
+
+    /// The text of every float is what it was: random bit patterns (every
+    /// exponent), values with few decimals, values near the rounding and
+    /// exponent boundaries, and the special values. `PHV_FLOAT_CHECKS` sets
+    /// how many random values (default 2,000,000).
+    #[test]
+    fn floats_print_as_before() {
+        let n: u64 = std::env::var("PHV_FLOAT_CHECKS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000_000);
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let check = |f: f64| assert_eq!(format_float(f), format_float_before(f), "{f:e} ({:#x})", f.to_bits());
+        for _ in 0..n {
+            check(f64::from_bits(next()));
+            let r = next();
+            // Numbers people print: a few decimals, at every magnitude near the boundaries.
+            let k = (r >> 40) as i64 % 2_000_000 - 1_000_000;
+            let scale = 10f64.powi(((r >> 8) % 40) as i32 - 20);
+            check(k as f64 * scale);
+            check(k as f64 / 1000.0);
+            check((r % 100_000) as f64 * 0.5);
+        }
+        for e in -330..330 {
+            let p = 10f64.powi(e);
+            for f in
+                [p, -p, p * 0.999999999999995, p * 9.99999999999995, p * 1.00000000000005, p.next_up(), p.next_down()]
+            {
+                check(f);
+            }
+        }
+        for f in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.0, f64::MAX, f64::MIN, f64::MIN_POSITIVE, 5e-324]
+        {
+            check(f);
+        }
+    }
+
+    #[test]
+    fn integers_print_as_before() {
+        let mut s = String::new();
+        for i in [0, 1, -1, 9, 10, -10, 99, 100, 12345, i64::MAX, i64::MIN, i64::MIN + 1, 1_000_000_000_000] {
+            s.clear();
+            write_int(&mut s, i);
+            assert_eq!(s, i.to_string());
+        }
+    }
+
     #[test]
     fn floats_print_like_php() {
         assert_eq!(format_float(0.1 + 0.2), "0.3");
@@ -432,6 +595,9 @@ mod tests {
         assert_eq!(format_float(1.0 / 3.0), "0.33333333333333");
         assert_eq!(format_float(123456.789), "123456.789");
         assert_eq!(format_float(0.00001), "1.0E-5");
+        assert_eq!(format_float(9.999999999999999), "10");
+        assert_eq!(format_float(-99999999999999.5), "-1.0E+14");
+        assert_eq!(format_float(f64::MIN_POSITIVE), "2.2250738585072E-308");
     }
 
     #[test]

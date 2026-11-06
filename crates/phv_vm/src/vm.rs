@@ -40,9 +40,19 @@ impl Exc {
 
 /// The calls on the stack where an exception was first thrown: `(function,
 /// pc)` of each call kept, innermost first, and how many calls there were.
+#[derive(Clone)]
 struct ThrownAt {
     calls: Vec<(u32, u32)>,
     depth: usize,
+}
+
+/// Where the exception objects of a run were first thrown, by object: the
+/// text of a trace is made only when `getTraceAsString()` asks for it.
+#[derive(Default)]
+struct Traces {
+    by_object: std::collections::HashMap<usize, (std::rc::Weak<RefCell<Object>>, ThrownAt)>,
+    /// Entries of objects that are gone are dropped when there are this many.
+    prune_at: usize,
 }
 
 pub enum VmError {
@@ -119,6 +129,12 @@ pub struct HttpCtx {
     pub publishes: Vec<(String, String)>,
     /// `publish()` can be used: the script runs in `phv serve`.
     pub can_publish: bool,
+    /// The request's id (`[server] request_ids`), and the W3C `traceparent`
+    /// this request's calls to other services send.
+    pub request_id: Option<String>,
+    pub traceparent: Option<String>,
+    /// The job this script runs for (`[jobs]`), if it is one.
+    pub job: Option<JobCtx>,
 }
 
 /// What happened on a WebSocket connection.
@@ -175,6 +191,9 @@ impl Default for HttpCtx {
             ws: None,
             publishes: Vec::new(),
             can_publish: false,
+            request_id: None,
+            traceparent: None,
+            job: None,
         }
     }
 }
@@ -227,6 +246,30 @@ pub struct Host {
     pub args: Vec<String>,
     /// Standard input is not the script's (under `phv dap` it carries the protocol).
     pub no_stdin: bool,
+    /// `[jobs]` of phv.toml: where `std.jobs` adds jobs.
+    pub jobs: Option<JobsSpec>,
+}
+
+/// `[jobs]` of phv.toml, as `std.jobs` uses it.
+#[derive(Clone, Debug, Default)]
+pub struct JobsSpec {
+    /// The database of `databases` jobs are kept in; None keeps them in this
+    /// process's memory.
+    pub store: Option<String>,
+    /// The project's jobs (the scripts of `[jobs] dir`), when they are known.
+    pub names: Option<Vec<String>>,
+    /// Names the in-memory queue of the project (its root).
+    pub memory_key: String,
+}
+
+/// The job a script runs for (`std.jobs`: `job()`).
+#[derive(Clone, Debug, Default)]
+pub struct JobCtx {
+    pub name: String,
+    pub id: String,
+    pub payload: String,
+    /// 1 for the first run, 2 for the first retry, ...
+    pub attempt: u32,
 }
 
 /// A mail server named in phv.toml (`[mail.<name>]`). The URL holds credentials
@@ -539,6 +582,8 @@ pub struct Vm {
     /// them while the script runs, and the fields of all objects still alive
     /// are cleared when the run ends.
     objects: RefCell<Vec<std::rc::Weak<RefCell<Object>>>>,
+    /// Where each exception object was first thrown (see `Traces`).
+    traces: RefCell<Traces>,
     /// The number of live objects at which the cycle collector runs next.
     gc_next: std::cell::Cell<usize>,
     /// Set when that number is reached; the collector runs at the next check
@@ -863,6 +908,7 @@ impl Vm {
             enum_cache: Vec::new(),
             field_defaults: RefCell::new(Vec::new()),
             objects: RefCell::new(Vec::new()),
+            traces: RefCell::new(Traces::default()),
             gc_next: std::cell::Cell::new(GC_FIRST),
             gc_due: std::cell::Cell::new(false),
             coverage: None,
@@ -1213,29 +1259,55 @@ impl Vm {
         }
     }
 
-    /// Stores where an exception was first thrown in its `trace` field, which
-    /// `getTraceAsString()` returns. A rethrown exception keeps the first one.
+    /// Notes where an exception was first thrown, for `getTraceAsString()`
+    /// (`exception_trace`). A rethrown exception keeps the first place. The text
+    /// is made only when it is asked for: most exceptions are caught unread.
     fn record_trace(&self, e: &Exc) {
         let (Value::Object(o), Some(at)) = (&e.value, &e.at) else { return };
-        let mut o = o.borrow_mut();
-        let cls = &self.prog.classes[o.class as usize];
-        let Some(i) = cls.fields.iter().position(|f| f.name == "trace") else { return };
-        if matches!(&o.fields[i], Value::Str(s) if s.is_empty()) {
-            // Many exceptions kept in a chain (`previous:`) each hold their
-            // text: past the memory limit, the trace is left out (found by the
-            // 1.0.0 audit; the next check stops the script).
-            if self.check_memory().is_err() {
+        let key = Rc::as_ptr(o) as usize;
+        let mut traces = self.traces.borrow_mut();
+        if let Some((w, _)) = traces.by_object.get(&key) {
+            if w.strong_count() > 0 {
                 return;
             }
-            let mut text = String::new();
-            self.trace_lines(at, |func, file, line| {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                let _ = write!(text, "at {func} ({file}:{line})");
-            });
-            o.fields[i] = Value::str(text);
         }
+        {
+            let ob = o.borrow();
+            let cls = &self.prog.classes[ob.class as usize];
+            let Some(i) = cls.fields.iter().position(|f| f.name == "trace") else { return };
+            if !matches!(&ob.fields[i], Value::Str(s) if s.is_empty()) {
+                return;
+            }
+        }
+        // Many exceptions kept in a chain (`previous:`) each hold their place:
+        // past the memory limit it is left out (found by the 1.0.0 audit; the
+        // next check stops the script).
+        if self.check_memory().is_err() {
+            return;
+        }
+        if traces.by_object.len() >= traces.prune_at.max(1024) {
+            traces.by_object.retain(|_, (w, _)| w.strong_count() > 0);
+            traces.prune_at = traces.by_object.len() * 2;
+        }
+        traces.by_object.insert(key, (Rc::downgrade(o), (**at).clone()));
+    }
+
+    /// The text of the trace of exception object `o` (`getTraceAsString()`):
+    /// one `at function (file:line)` line per call, innermost first, or empty.
+    pub fn exception_trace(&self, o: &Rc<RefCell<Object>>) -> String {
+        let key = Rc::as_ptr(o) as usize;
+        let at = match self.traces.borrow().by_object.get(&key) {
+            Some((w, at)) if w.upgrade().is_some_and(|x| Rc::ptr_eq(&x, o)) => at.clone(),
+            _ => return String::new(),
+        };
+        let mut text = String::new();
+        self.trace_lines(&at, |func, file, line| {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            let _ = write!(text, "at {func} ({file}:{line})");
+        });
+        text
     }
 
     /// After an instruction that went over `bytes` of a string: a long one
@@ -2089,10 +2161,13 @@ impl Vm {
                     Instr::NewObject(d, class) => {
                         let fields = self.new_fields(*class);
                         let o = Rc::new(RefCell::new(Object { class: *class, fields }));
-                        self.track(&o);
-                        if self.gc_due.get() {
-                            // Collect at the next loop step or call.
-                            self.budget = 1;
+                        // An object that can hold no other object is never in a cycle.
+                        if !self.prog.classes[*class as usize].acyclic {
+                            self.track(&o);
+                            if self.gc_due.get() {
+                                // Collect at the next loop step or call.
+                                self.budget = 1;
+                            }
                         }
                         reg!(*d) = Value::Object(o);
                     }

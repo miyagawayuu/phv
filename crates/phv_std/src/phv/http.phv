@@ -272,3 +272,13 @@ export function response(): Response {
 export function session(): Session {
     return new Session();
 }
+
+/**
+ * The id of this request, with `[server] request_ids = true` in phv.toml
+ * (otherwise null). The server sends it in the `X-Request-Id` header, writes
+ * it in the JSON access log and adds it to the lines of `log_info()`,
+ * `log_warn()` and `log_error()`, so the lines of one request can be found.
+ */
+export function request_id(): ?string {
+    return __request_id();
+}

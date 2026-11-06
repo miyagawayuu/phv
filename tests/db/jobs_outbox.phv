@@ -1,0 +1,24 @@
+<?phv
+// enqueue() inside a transaction() on the store's database: the job is added
+// only if the transaction commits.
+import std.db.Database;
+import std.jobs.enqueue;
+
+$db = Database::connect("main");
+try {
+    $db->transaction(function () use ($db): void {
+        enqueue("outbox", "rolled back");
+        throw new RuntimeException("undo");
+    });
+} catch (RuntimeException $e) {
+    echo "rolled back: ", $e->getMessage(), "\n";
+}
+$db->transaction(function () use ($db): void {
+    $id = enqueue("outbox", "committed");
+    echo "added: ", $id == null ? "no" : "yes", "\n";
+    $again = enqueue("outbox", "x", key: "once");
+    $twice = enqueue("outbox", "y", key: "once");
+    echo "keyed: ", $again == null ? "no" : "yes", " ", $twice == null ? "no" : "yes", "\n";
+});
+// Outside a transaction, on a connection of its own.
+echo "plain: ", enqueue("outbox", "plain") == null ? "no" : "yes", "\n";

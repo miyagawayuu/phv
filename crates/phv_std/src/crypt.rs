@@ -56,6 +56,21 @@ fn derive(key: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
     out
 }
 
+/// The key the server uses for one purpose (`"phv csrf v1"`, `"phv publish v1"`),
+/// derived from `[security] secret_env`, so one secret serves them all and a
+/// key of one purpose says nothing about the others.
+pub fn server_key(secret: &[u8], purpose: &str) -> Vec<u8> {
+    derive(secret, b"phv server secret", purpose.as_bytes()).to_vec()
+}
+
+/// HMAC-SHA256 of `data` (for the server's own messages, with a key from `server_key`).
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(tag.as_ref());
+    out
+}
+
 fn cipher(key: &[u8], salt: &[u8]) -> aead::LessSafeKey {
     let k = derive(key, salt, b"phv encrypt v1");
     aead::LessSafeKey::new(aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &k).expect("32-byte key"))

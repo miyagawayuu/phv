@@ -1,0 +1,48 @@
+// std.jobs — background jobs (`[jobs]` in phv.toml).
+//
+// A job is a script in the jobs directory (`jobs/send_welcome.phv`). Any page
+// or job adds one with `enqueue()`; `phv serve` (and `phv jobs run`) take the
+// jobs and run them, outside any request, each with its own time and memory
+// limits. A job that throws is run again later, up to `[jobs] max_attempts`
+// times.
+//
+//   import std.jobs.enqueue;
+//   enqueue("send_welcome", json_encode(["user" => $id]));
+//
+//   // jobs/send_welcome.phv
+//   import std.jobs.job;
+//   $data = json_decode(job()->payload);
+
+/** The job a script of the jobs directory runs for. */
+export class Job {
+    public function __construct(
+        /** The job's name: its file in the jobs directory, without `.phv`. */
+        public readonly string $name,
+        /** A random id, the same for every run of the job. */
+        public readonly string $id,
+        /** What `enqueue()` was given. */
+        public readonly string $payload,
+        /** 1 for the first run, 2 for the first retry, ... */
+        public readonly int $attempt,
+    ) {}
+}
+
+/**
+ * Adds a job: the script `<name>.phv` of `[jobs] dir` runs with `payload`
+ * (at most 64 KB; JSON is handy), `delay` seconds from now at the earliest
+ * (at most 30 days). With a `key`, a job of the same name and key is added
+ * only once (while it waits, runs or failed, and for a day after it ended):
+ * the result is then null. Otherwise the result is the job's id.
+ *
+ * Inside a `transaction()` on the database of `[jobs] store` (PostgreSQL or
+ * MySQL), the job is added only if the transaction commits.
+ */
+export function enqueue(string $job, string $payload = "", int $delay = 0, ?string $key = null): ?string {
+    return __jobs_add($job, $payload, $delay, $key);
+}
+
+/** The job this script runs for. Only in a job. */
+export function job(): Job {
+    $j = __job_info();
+    return new Job($j[0], $j[1], $j[2], $j[3]->toInt() ?? 1);
+}

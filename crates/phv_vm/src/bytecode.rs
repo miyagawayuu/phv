@@ -308,6 +308,10 @@ pub struct Class {
     /// Method name id to function, for interface calls, sorted by name id.
     pub by_name: Vec<(u32, u32)>,
     pub cases: Vec<(String, Const)>,
+    /// Its objects cannot be part of a reference cycle (every field holds a
+    /// scalar, a string or an enum case): `new` does not give them to the
+    /// cycle collector.
+    pub acyclic: bool,
 }
 
 impl Class {

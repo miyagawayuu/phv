@@ -16,5 +16,5 @@ lrange: ["a","b","c"]
 lpop: a
 lrange: ["b","c"]
 error: database "main" is a Redis server; use Redis::connect()
-refused: Redis keys starting with `phv:` belong to PHV (sessions, rate limits): "phv:session:x"
+refused: Redis keys starting with `phv:` belong to PHV (sessions, rate limits, jobs): "phv:session:x"
 error: the database connection is closed

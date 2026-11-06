@@ -252,6 +252,9 @@ pub struct HClass {
     pub by_name: Vec<(String, FuncId)>,
     /// Enum cases: name and backing value (`Null` for pure enums).
     pub cases: Vec<(String, HConst)>,
+    /// Its objects cannot be part of a reference cycle: every field holds a
+    /// scalar, a string or an enum case (the cycle collector skips them).
+    pub acyclic: bool,
 }
 
 #[derive(Clone, Debug, Default)]

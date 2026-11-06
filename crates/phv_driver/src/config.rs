@@ -10,6 +10,7 @@
 //! session_ttl = 7200      # seconds of inactivity before a session expires
 //! memory_limit_mb = 128   # per request
 //! rate_limit_store = "cache"  # count rate limits in this Redis database (default: in the process)
+//! secret_env = "PHV_SECRET"   # the server's secret (32+ bytes), shared by its processes (CSRF tokens)
 //!
 //! [server]
 //! workers = 16            # scripts running at once (default: 2 per CPU, at least 8)
@@ -82,6 +83,109 @@ struct File {
     mail: BTreeMap<String, MailSection>,
     #[serde(default)]
     fmt: FmtSection,
+    #[serde(default)]
+    admin: Option<AdminSection>,
+    #[serde(default)]
+    jobs: Option<JobsSection>,
+    #[serde(default)]
+    schedule: Vec<ScheduleSection>,
+}
+
+/// `[jobs]`: background jobs, run by `phv serve` and `phv jobs run`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobsSection {
+    /// "memory" (default) or "db:<name>" (PostgreSQL, MySQL or Redis).
+    #[serde(default)]
+    store: Option<String>,
+    /// The directory of the job scripts (default "jobs").
+    #[serde(default)]
+    dir: Option<String>,
+    /// Jobs one process runs at once (default 2).
+    #[serde(default)]
+    workers: Option<usize>,
+    /// Seconds a job may run (default 300).
+    #[serde(default)]
+    time_limit: Option<u64>,
+    /// Runs before a failing job is given up (default 5).
+    #[serde(default)]
+    max_attempts: Option<u32>,
+    /// Seconds before a failed job runs again, doubled after each run (default 30).
+    #[serde(default)]
+    retry_delay: Option<u64>,
+    /// `phv serve` runs jobs too (default true).
+    #[serde(default)]
+    run: Option<bool>,
+}
+
+/// `[[schedule]]`: a job added at the times of a cron expression.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScheduleSection {
+    job: String,
+    cron: String,
+    #[serde(default)]
+    timezone: Option<String>,
+}
+
+/// `[jobs]`, checked.
+#[derive(Clone, Debug)]
+pub struct Jobs {
+    /// A database of `[databases]`; None keeps jobs in memory.
+    pub store: Option<String>,
+    /// The directory of the job scripts, relative to the project.
+    pub dir: String,
+    pub workers: usize,
+    pub time_limit: u64,
+    pub max_attempts: u32,
+    /// Seconds before the first retry (doubled each time, at most an hour).
+    pub retry_delay: u64,
+    pub run: bool,
+}
+
+/// `[[schedule]]`, checked.
+#[derive(Clone, Debug)]
+pub struct Schedule {
+    pub job: String,
+    pub cron: phv_std::cron::Cron,
+}
+
+/// Whether `name` can name a job: lowercase letters, digits and `_`, at most 64.
+pub fn job_name(name: &str) -> bool {
+    (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// The jobs of a project: the `.phv` files directly in `dir` with a name a
+/// job can have (sorted). None when the directory does not exist.
+pub fn scan_jobs(root: &Path, dir: &str) -> Option<Vec<String>> {
+    let entries = std::fs::read_dir(root.join(dir)).ok()?;
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".phv")).map(str::to_string))
+        .filter(|n| job_name(n))
+        .collect();
+    names.sort();
+    Some(names)
+}
+
+/// `[admin]`: the admin port, with `/health`, `/ready` and `/metrics`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminSection {
+    /// The address it listens on (`127.0.0.1:9100`).
+    listen: String,
+    /// An environment variable holding the token `/metrics` asks for
+    /// (`Authorization: Bearer ...`); needed unless `listen` is a loopback address.
+    #[serde(default)]
+    token_env: Option<String>,
+}
+
+/// `[admin]`, checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Admin {
+    pub listen: std::net::SocketAddr,
+    pub token_env: Option<String>,
 }
 
 /// `[mail.<name>]`: a mail server scripts send through with `std.mail`.
@@ -289,6 +393,13 @@ struct ServerSection {
     tls_key: Option<String>,
     /// Accept HTTP/2 without TLS ("prior knowledge"), for a proxy in front.
     h2c: Option<bool>,
+    /// Give each request an id (`X-Request-Id`, the access log, `log_info()`).
+    request_ids: Option<bool>,
+    /// Take the request id and `traceparent` a proxy in front sends.
+    trust_request_id: Option<bool>,
+    /// A Redis database in `[databases]` that carries `publish()` to the
+    /// other server processes.
+    publish_store: Option<String>,
 }
 
 /// `[cors]`: which other sites may call this one from a browser.
@@ -363,6 +474,14 @@ struct Security {
     /// several server processes share them.
     #[serde(default)]
     rate_limit_store: Option<String>,
+    /// An environment variable holding the server's secret (at least 32
+    /// bytes), shared by every server process of the site: CSRF tokens made by
+    /// one are accepted by the others and after a restart.
+    #[serde(default)]
+    secret_env: Option<String>,
+    /// The previous secret, still accepted while the secret is replaced.
+    #[serde(default)]
+    secret_old_env: Option<String>,
 }
 
 impl Default for Security {
@@ -376,6 +495,8 @@ impl Default for Security {
             requests_per_minute: 0,
             session_store: None,
             rate_limit_store: None,
+            secret_env: None,
+            secret_old_env: None,
         }
     }
 }
@@ -588,6 +709,21 @@ pub struct Config {
     pub tls: Option<Tls>,
     /// HTTP/2 without TLS is accepted too.
     pub h2c: bool,
+    /// `[security] secret_env` and `secret_old_env`: the environment variables
+    /// holding the server's secret and the previous one.
+    pub secret_env: Option<String>,
+    pub secret_old_env: Option<String>,
+    /// `[admin]`: the admin port.
+    pub admin: Option<Admin>,
+    /// `[server] request_ids` and `trust_request_id`.
+    pub request_ids: bool,
+    pub trust_request_id: bool,
+    /// `[server] publish_store`: the Redis database of `[databases]` that
+    /// carries `publish()` to the other server processes.
+    pub publish_store: Option<String>,
+    /// `[jobs]` and `[[schedule]]`.
+    pub jobs: Option<Jobs>,
+    pub schedules: Vec<Schedule>,
 }
 
 /// `[server] tls_cert` / `tls_key`, resolved against the project root.
@@ -620,6 +756,14 @@ impl Config {
             cors: None,
             tls: None,
             h2c: false,
+            secret_env: None,
+            secret_old_env: None,
+            admin: None,
+            request_ids: false,
+            trust_request_id: false,
+            publish_store: None,
+            jobs: None,
+            schedules: Vec::new(),
         }
     }
 }
@@ -852,6 +996,126 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
             Some(_) => {}
         }
     }
+    for (key, var) in [("secret_env", &file.security.secret_env), ("secret_old_env", &file.security.secret_old_env)] {
+        if let Some(v) = var {
+            if !env_name(v) {
+                return Err(format!("[security].{key} must be the name of an environment variable (A-Z, 0-9, _)"));
+            }
+        }
+    }
+    if file.security.secret_old_env.is_some() && file.security.secret_env.is_none() {
+        return Err("[security].secret_old_env needs secret_env".into());
+    }
+    let admin = match file.admin {
+        None => None,
+        Some(a) => {
+            let listen: std::net::SocketAddr = a.listen.parse().map_err(|_| {
+                format!("[admin].listen must be an address and port, such as \"127.0.0.1:9100\" (not \"{}\")", a.listen)
+            })?;
+            if let Some(v) = &a.token_env {
+                if !env_name(v) {
+                    return Err("[admin].token_env must be the name of an environment variable (A-Z, 0-9, _)".into());
+                }
+            } else if !listen.ip().is_loopback() {
+                return Err(format!(
+                    "[admin].listen = \"{listen}\" can be reached from other machines: give token_env too, so that \
+                     /metrics needs a token"
+                ));
+            }
+            Some(Admin { listen, token_env: a.token_env })
+        }
+    };
+    let publish_store = file.server.publish_store.clone();
+    if let Some(name) = &publish_store {
+        let redis = |u: &str| u.starts_with("redis://") || u.starts_with("rediss://");
+        match file.databases.get(name) {
+            None => return Err(format!("[server].publish_store: no database named \"{name}\" in [databases]")),
+            Some(d) if d.url.as_deref().is_some_and(|u| !redis(u)) => {
+                return Err(format!("[server].publish_store: database \"{name}\" is not a Redis server"))
+            }
+            Some(_) => {}
+        }
+        if file.security.secret_env.is_none() {
+            return Err(
+                "[server].publish_store needs [security].secret_env: the messages between server processes are signed with it"
+                    .into(),
+            );
+        }
+    }
+    let jobs = match &file.jobs {
+        None => None,
+        Some(j) => {
+            let store = match j.store.as_deref() {
+                None | Some("memory") => None,
+                Some(s) => {
+                    let Some(name) = s.strip_prefix("db:") else {
+                        return Err(
+                            "[jobs].store must be \"memory\" or \"db:<name>\" (a database of [databases])".into()
+                        );
+                    };
+                    if !file.databases.contains_key(name) {
+                        return Err(format!("[jobs].store: no database named \"{name}\" in [databases]"));
+                    }
+                    Some(name.to_string())
+                }
+            };
+            let dir = j.dir.clone().unwrap_or_else(|| "jobs".into());
+            let segment_ok = |s: &str| {
+                !s.is_empty()
+                    && !s.starts_with('.')
+                    && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            };
+            let trimmed = dir.trim_end_matches('/');
+            if !trimmed.split('/').all(segment_ok) || trimmed.split('/').next() == Some("public") {
+                return Err(format!(
+                    "[jobs].dir: \"{dir}\" must be a directory of the project outside public/ (letters, digits, _ and -)"
+                ));
+            }
+            let workers = j.workers.unwrap_or(2);
+            if !(1..=64).contains(&workers) {
+                return Err("[jobs].workers must be between 1 and 64".into());
+            }
+            let time_limit = j.time_limit.unwrap_or(300);
+            if !(1..=3600).contains(&time_limit) {
+                return Err("[jobs].time_limit must be between 1 and 3600 seconds".into());
+            }
+            let max_attempts = j.max_attempts.unwrap_or(5);
+            if !(1..=100).contains(&max_attempts) {
+                return Err("[jobs].max_attempts must be between 1 and 100".into());
+            }
+            let retry_delay = j.retry_delay.unwrap_or(30);
+            if !(1..=3600).contains(&retry_delay) {
+                return Err("[jobs].retry_delay must be between 1 and 3600 seconds".into());
+            }
+            Some(Jobs {
+                store,
+                dir: trimmed.to_string(),
+                workers,
+                time_limit,
+                max_attempts,
+                retry_delay,
+                run: j.run.unwrap_or(true),
+            })
+        }
+    };
+    let mut schedules = Vec::new();
+    for s in &file.schedule {
+        let Some(j) = &jobs else { return Err("[[schedule]] needs a [jobs] section".into()) };
+        if !job_name(&s.job) {
+            return Err(format!("[[schedule]]: \"{}\" is not the name of a job (a-z, 0-9, _)", s.job));
+        }
+        if let Some(names) = scan_jobs(root, &j.dir) {
+            if !names.contains(&s.job) {
+                return Err(format!("[[schedule]]: there is no job {}/{}.phv", j.dir, s.job));
+            }
+        }
+        let cron = phv_std::cron::Cron::parse(&s.cron, s.timezone.as_deref())
+            .map_err(|e| format!("[[schedule]] of {}: {e}", s.job))?;
+        schedules.push(Schedule { job: s.job.clone(), cron });
+    }
+    if schedules.len() > 100 {
+        return Err("at most 100 [[schedule]] entries".into());
+    }
     if file.server.workers.is_some_and(|w| !(1..=1024).contains(&w)) {
         return Err("[server].workers must be between 1 and 1024".into());
     }
@@ -932,6 +1196,11 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
             cli: false,
             no_stdin: false,
             args: Vec::new(),
+            jobs: jobs.as_ref().map(|j| phv_vm::JobsSpec {
+                store: j.store.clone(),
+                names: scan_jobs(root, &j.dir),
+                memory_key: root.to_string_lossy().into_owned(),
+            }),
         }),
         csrf: file.security.csrf,
         // Served over HTTPS: cookies are `Secure` and HSTS is sent.
@@ -952,7 +1221,24 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
         cors,
         tls,
         h2c: file.server.h2c.unwrap_or(false),
+        secret_env: file.security.secret_env,
+        secret_old_env: file.security.secret_old_env,
+        admin,
+        request_ids: file.server.request_ids.unwrap_or(false),
+        trust_request_id: file.server.trust_request_id.unwrap_or(false),
+        publish_store,
+        jobs,
+        schedules,
     })
+}
+
+/// A name an environment variable can have: letters, digits and `_`, not
+/// starting with a digit.
+fn env_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && !s.as_bytes()[0].is_ascii_digit()
 }
 
 #[cfg(test)]
@@ -983,6 +1269,53 @@ mod tests {
             let e = load(&format!("[permissions]\nwrite = [\"{d}\"]\n")).err().unwrap_or_default();
             assert!(e.contains("has a `~`"), "{d}: {e}");
         }
+    }
+
+    #[test]
+    fn the_server_secret_is_named_by_an_environment_variable() {
+        let c = load("[security]\nsecret_env = \"APP_SECRET\"\nsecret_old_env = \"APP_SECRET_OLD\"\n").unwrap();
+        assert_eq!(c.secret_env.as_deref(), Some("APP_SECRET"));
+        assert_eq!(c.secret_old_env.as_deref(), Some("APP_SECRET_OLD"));
+        assert!(load("").unwrap().secret_env.is_none());
+        for bad in ["", "1ABC", "A-B", "A B", "$X"] {
+            let e = load(&format!("[security]\nsecret_env = \"{bad}\"\n")).err().unwrap_or_default();
+            assert!(e.contains("must be the name of an environment variable"), "{bad}: {e}");
+        }
+        let e = load("[security]\nsecret_old_env = \"OLD\"\n").err().unwrap_or_default();
+        assert!(e.contains("needs secret_env"), "{e}");
+    }
+
+    #[test]
+    fn the_admin_port_and_request_ids() {
+        let c = load("[admin]\nlisten = \"127.0.0.1:9100\"\n[server]\nrequest_ids = true\n").unwrap();
+        assert_eq!(c.admin.as_ref().unwrap().listen, "127.0.0.1:9100".parse().unwrap());
+        assert!(c.request_ids && !c.trust_request_id);
+        assert!(load("").unwrap().admin.is_none());
+        let e = load("[admin]\nlisten = \"0.0.0.0:9100\"\n").err().unwrap_or_default();
+        assert!(e.contains("give token_env too"), "{e}");
+        assert!(load("[admin]\nlisten = \"0.0.0.0:9100\"\ntoken_env = \"ADMIN_TOKEN\"\n").is_ok());
+        let e = load("[admin]\nlisten = \"localhost\"\n").err().unwrap_or_default();
+        assert!(e.contains("must be an address and port"), "{e}");
+        let e = load("[admin]\nlisten = \"127.0.0.1:1\"\ntoken_env = \"a b\"\n").err().unwrap_or_default();
+        assert!(e.contains("token_env must be the name"), "{e}");
+    }
+
+    #[test]
+    fn publish_store_is_a_redis_database_and_needs_the_secret() {
+        let redis =
+            "[databases.cache]\nurl = \"redis://localhost\"\n[databases.pg]\nurl = \"postgres://localhost/x\"\n";
+        let ok = format!("{redis}[security]\nsecret_env = \"S\"\n[server]\npublish_store = \"cache\"\n");
+        assert_eq!(load(&ok).unwrap().publish_store.as_deref(), Some("cache"));
+        let e = load(&format!("{redis}[server]\npublish_store = \"cache\"\n")).err().unwrap_or_default();
+        assert!(e.contains("needs [security].secret_env"), "{e}");
+        let e = load(&format!("{redis}[security]\nsecret_env = \"S\"\n[server]\npublish_store = \"pg\"\n"))
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("is not a Redis server"), "{e}");
+        let e = load(&format!("{redis}[security]\nsecret_env = \"S\"\n[server]\npublish_store = \"x\"\n"))
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("no database named"), "{e}");
     }
 
     #[test]

@@ -297,7 +297,9 @@ try {
 ```
 
 `getTraceAsString()` gives the calls where the exception was first thrown, innermost first (empty for an exception that
-was never thrown). A deep trace keeps its 50 innermost and 50 outermost calls, with names shortened to 200 characters. An uncaught exception shows its causes too: `Uncaught ConfigError: bad port (caused by ValueError: ...)`.
+was never thrown). A deep trace keeps its 50 innermost and 50 outermost calls, with names shortened to 200 characters.
+The runtime notes where an exception was thrown and makes the text the first time `getTraceAsString()` asks for it, so
+exceptions that are caught without reading it cost little. An uncaught exception shows its causes too: `Uncaught ConfigError: bad port (caused by ValueError: ...)`.
 
 ## 8. Functions
 
@@ -630,7 +632,7 @@ import lib.legacy.render as render_legacy;
 - The top level of an imported module can contain only declarations (`function`, `class`, `interface`, `enum`, `const`, `type`, `import`).
   Loading a module has no side effects.
 - `std.*` are the standard modules (`std.http`, `std.db`, `std.net`, `std.async`, `std.validate`, `std.mail`,
-  `std.testing`, `std.regex`, `std.time`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
+  `std.testing`, `std.regex`, `std.time`, `std.ws`, `std.jobs`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
 - Only files inside the project and package directories can be loaded (symbolic links cannot be used to escape them).
 
 ## 12. Templates
@@ -896,8 +898,59 @@ new route files are picked up within a second.
   `Access-Control-Allow-Origin` when the request's `Origin` is allowed. An origin allowed with `credentials = true` can
   send JSON requests with the visitor's cookies: list only origins you trust.
 - `[server] access_log = "logs/access.log"` also appends one line per request to a file inside the project
-  (`access_log_format = "json"` writes JSON objects with `time`, `ip`, `method`, `path`, `status` and `ms`). The path is
-  logged without the query string.
+  (`access_log_format = "json"` writes JSON objects with `time`, `ip`, `method`, `path`, `status` and `ms`, and `id`
+  with request ids). The path is logged without the query string.
+
+### Request ids
+
+```toml
+[server]
+request_ids = true          # default: false
+trust_request_id = false    # true: take the id and the trace a proxy in front sends
+```
+
+- With `request_ids`, each request gets an id: the trace id of W3C Trace Context, 32 hex digits. The response carries it
+  in `X-Request-Id`, the JSON access log in `id`, and the lines of `log_info()`, `log_warn()` and `log_error()` written
+  for the request end with `req=<id>`. A page reads it with `request_id()` of std.http (`null` without
+  `request_ids`).
+- Requests the page sends with `HttpClient` carry a `traceparent` header with the request's trace and a span of their
+  own, so a tracing system can join them (unless the page sets `traceparent` itself).
+- With `trust_request_id`, the server takes the `X-Request-Id` (1 to 128 letters, digits, `.`, `_` and `-`) and the
+  trace of `traceparent` (version `00`, lowercase hex) that the request carries, when they are well formed; others are
+  replaced by new ones. Set it only behind a proxy that sets or removes these headers: elsewhere they are the client's
+  own text.
+
+### Health checks and metrics
+
+```toml
+[admin]
+listen = "127.0.0.1:9100"        # the admin port, a listener of its own
+token_env = "PHV_ADMIN_TOKEN"    # needed unless listen is a loopback address
+```
+
+`[admin]` opens a second port with three paths, apart from the site's own (the site's paths are not served there, and
+these are not served on the site's port):
+
+| Path | Answer |
+|---|---|
+| `/health` | 200 `ok` while the server runs; 503 from the moment it begins to stop (Ctrl-C, SIGTERM), while running requests finish |
+| `/ready` | Also 503 while a store the server uses failed the last time it was used, until it answers again: the session database, the rate limit store, the `publish()` store (`unavailable: sessions, ...`). A probe makes the server connect nowhere |
+| `/metrics` | The counters below in the Prometheus text format. With `token_env`, only with `Authorization: Bearer <token>` (401 otherwise) |
+
+- An address other than a loopback one (`0.0.0.0:9100` for a container's probes) needs `token_env`, or the server does
+  not start: `/metrics` shows the site's routes and load. The token is read when the server starts and must hold at
+  least 16 bytes. `/health` and `/ready` need no token (load balancers often cannot send one); they tell only whether
+  the server is up.
+- The admin port answers `GET` and `HEAD`, one request per connection, at most 64 connections at once; a client must
+  send its request within 5 seconds.
+- Metrics (all start with `phv_`): `requests_total{kind, code}` (`kind`: `page`, `static`, `ws`, `sse`, `other`; `code`:
+  `2xx`...), `request_duration_seconds{route}` (a histogram per page, labelled with its file: `/posts/[id]`, never the
+  path asked for; at most 1,000 routes, the rest as `other`; static files as `static`), `worker_wait_seconds`,
+  `rejected_total{reason}` (`busy`, `output`, `body`, `rate_limit`, `too_large`), `script_failures_total{kind}`
+  (`exception`, `time`, `memory`, `compile`, `other`), `ws_messages_total{dir}`, `publish_total{result}`,
+  `jobs_total{result}`, `job_duration_seconds`, `store_errors_total{store}`, and the gauges `up`, `ready`,
+  `uptime_seconds`, `workers`, `workers_busy`, `connections`, `websockets`, `output_waiting_bytes`, `async_running` and
+  `build_info{version}`. Counting takes no lock except a page's histogram.
 
 ### std.http
 
@@ -921,6 +974,7 @@ $req->isPost();            // bool
 $req->param("id");         // ?string: a parameter of the page's path (`public/posts/[id].phv`)
 $req->params;              // map<string, string>
 locals()->get("user_id");  // ?string: a value `_middleware.phv` set with locals()->set()
+request_id();              // ?string: the request's id, with [server] request_ids (see "Request ids")
 
 response()->status(404);
 response()->header("Cache-Control", "no-store");
@@ -990,6 +1044,25 @@ not give the token away through its size (BREACH). The server accepts the masked
 In production, serve over HTTPS and set `secure_cookies = true` (the cookie gets the `__Host-` prefix and can no longer be overwritten
 over plaintext connections or from subdomains).
 It can be disabled with `[security] csrf = false`.
+
+The key of the HMAC is new each time the server starts, unless the site has a secret: then forms stay valid across
+restarts and on every server process of the site, so a form served by one process can be sent to another behind a
+load balancer.
+
+```toml
+[security]
+secret_env = "PHV_SECRET"          # an environment variable holding at least 32 bytes (random_token() makes one)
+secret_old_env = "PHV_SECRET_OLD"  # optional: the previous secret, accepted while it is replaced
+```
+
+- The server reads the variables when it starts: one that is unset or holds fewer than 32 bytes stops it with an
+  error that names the variable, never its value. They are server settings, so `[permissions] env` need not list them,
+  and `phv build` puts only their names in the executable.
+- The server derives a key of its own for each use from the secret (HKDF-SHA256): CSRF tokens, and the messages
+  `publish()` sends to other server processes. Scripts cannot read the secret or the keys.
+- To replace the secret, set the new one in `secret_env` and the old one in `secret_old_env`, restart every process,
+  and remove `secret_old_env` once the forms served before are no longer used (a few hours). Tokens are always made
+  with the new secret.
 
 ### Cookie
 
@@ -1182,7 +1255,7 @@ $redis->rpush("jobs", "a");  $redis->lpop("jobs");  $redis->lrange("jobs", 0, -1
 Methods: `get`, `set`, `delete`, `exists`, `incr`, `expire`, `ttl`, `hget`, `hset`, `hdel`, `hgetAll`, `rpush`,
 `lpop`, `lrange`, `close`. Each command waits at most until the script's time limit, and a reply larger than the
 memory left to the script is refused. Only these commands can be sent: commands such as `KEYS`, `FLUSHALL`, `CONFIG` or
-`EVAL` are not available. Keys starting with `phv:` belong to PHV (sessions and rate limits kept in Redis) and raise
+`EVAL` are not available. Keys starting with `phv:` belong to PHV (sessions, rate limits and jobs kept in Redis) and raise
 `ValueError`. A remote server needs a `rediss://` URL (or `tls = false`). Errors raise `DatabaseError`.
 
 ### WebSocket server (std.ws)
@@ -1220,7 +1293,7 @@ if ($ws->event == WsEvent::Open) {
 - Nothing is kept between runs except what the connection keeps with `$ws->set($key, $value)` (read with `get()`;
   at most 256 values and 64 KB in all, each value counting 64 bytes more) and the topics it joined. `$ws->id` is a random id, the same for all the events of a connection.
 - `$ws->send($text)` sends to this connection; `publish($topic, $text)` to every connection of this server process
-  that joined `$topic` (`$ws->join()`, `$ws->leave()`; 64 topics per connection). Any page may call `publish()`,
+  (and, with `publish_store`, of the site's other server processes) that joined `$topic` (`$ws->join()`, `$ws->leave()`; 64 topics per connection). Any page may call `publish()`,
   for example after a form is saved. Messages are sent after the script ends; output (`echo`) is discarded.
   `$ws->close($code, $reason)` closes the connection (code 1000 or 3000–4999).
 - Browsers send the page's origin: a connection from another site is refused (403) unless `[cors] origins` names
@@ -1232,8 +1305,60 @@ if ($ws->event == WsEvent::Open) {
   30 seconds and closes a connection it has not heard from for 75 seconds. With `[security] requests_per_minute`,
   each message counts as a request; a connection over the limit is closed.
 - A script error closes the connection with code 1011. When the server stops, connections are closed with 1001.
-- `publish()` reaches the connections of one server process. WebSockets are served over HTTP/1.1 (and HTTPS);
-  HTTP/2 clients fall back to it.
+- WebSockets are served over HTTP/1.1 (and HTTPS); HTTP/2 clients fall back to it.
+
+#### Server-Sent Events
+
+The same script answers Server-Sent Events, for browsers' `EventSource` (which also reconnects by itself):
+
+```js
+const events = new EventSource("/chat?name=ann");
+events.onmessage = (e) => console.log(e.data);
+```
+
+- A `GET` that accepts `text/event-stream` to the path of a `*.ws.phv` script, where no page answers, runs its
+  `WsEvent::Open` event as for a WebSocket (middleware, `request()`, `session()`; a status other than 200 refuses it).
+  The response is then a stream: what the script sends (`$ws->send()`) and what is published to the topics it joined
+  arrives as events, a `data:` line for each line of the text. When the client goes away, `WsEvent::Close` runs. There
+  are no `WsEvent::Message` events: a client sends with an ordinary request (a page that calls `publish()`).
+- An event stream counts as a WebSocket connection (1,024 at once with them), has their queue of 1 MB (a client that
+  does not read is dropped), and gets a comment line (`: ping`) every 15 seconds so proxies keep it open. It is never
+  compressed or cached, works over HTTP/1.1 and HTTP/2, and other sites may open one only as for WebSockets (`[cors]`).
+  A stream holds no worker between events.
+
+#### publish() across server processes
+
+Without a store, `publish()` reaches the connections of its own server process. When a site runs several processes or
+machines behind a load balancer, name a Redis database of `[databases]` that carries the messages between them:
+
+```toml
+[databases.cache]
+url_env = "REDIS_URL"
+
+[security]
+secret_env = "PHV_SECRET"     # needed: the messages are signed with it
+
+[server]
+publish_store = "cache"
+```
+
+- A process delivers what its scripts publish to its own connections first, as without a store, then queues it for
+  the others; a script never waits for Redis. The queue holds at most 10,000 messages and 32 MB: when it is full, or
+  Redis cannot be reached, messages for the other processes are dropped (counted in `phv_publish_total{result="dropped"}`,
+  and a warning is logged at most once a minute).
+- Each process sends the queue to Redis (PUBLISH, in pipelines) and keeps one subscribed connection of its own, which
+  hands each message to the connections of the process that joined its topic. A lost connection is opened again after
+  1 second, then 2, 4, ... up to 30 seconds; meanwhile `/ready` answers 503 (see "Health checks and metrics").
+- **Delivery is at most once.** A message published while a process is not connected to Redis never reaches that
+  process's connections. Keep what must not be lost in a database, and use `publish()` to say that something changed.
+- Messages are signed with a key derived from `secret_env` and carry the id of the process that sent them. A process
+  skips its own, and drops (and counts as `invalid`) a message that is not signed with the site's key, is malformed,
+  breaks the rules of `publish()` (a topic of 1 to 200 bytes without control characters, a text of at most 1 MB), or is
+  longer than that: such a message is read and thrown away as it arrives, never held. The channel's name is derived
+  from the key too, so sites that share a Redis server do not see each other's messages. Scripts cannot publish to
+  Redis themselves (`std.db` has no PUBLISH).
+- Anyone who can write to the Redis server can still drop messages or stop the store; give PHV a Redis user of its own
+  and a `rediss://` URL for a server on another machine.
 
 ### WebSocket (std.net)
 
@@ -1452,6 +1577,75 @@ A `DateTime` is an instant (`timestamp`, seconds since 1970-01-01 UTC) seen in a
   two differ across a change of clocks.
 - An unknown zone throws `ValueError`.
 
+### Background jobs (std.jobs)
+
+Work that should not hold up a page (sending mail, resizing a report, calling a slow service) goes into a **job**: a
+script in `jobs/` that `phv serve` runs outside any request.
+
+```toml
+[jobs]
+store = "db:main"     # "memory" (default), or a PostgreSQL, MySQL or Redis database of [databases]
+# dir = "jobs"        # the directory of the job scripts (outside public/)
+# workers = 2         # jobs one server process runs at once (1 to 64)
+# time_limit = 300    # seconds a run may take (1 to 3600)
+# max_attempts = 5    # runs before a failing job is given up (1 to 100)
+# retry_delay = 30    # seconds before a failed job runs again, doubled each time (at most an hour)
+# run = true          # false: phv serve only adds jobs; `phv jobs run` runs them
+
+[[schedule]]
+job = "cleanup"
+cron = "0 3 * * *"        # minute, hour, day of the month, month, day of the week
+timezone = "Asia/Tokyo"   # default: UTC
+```
+
+```phv
+// public/signup.phv
+import std.jobs.enqueue;
+enqueue("send_welcome", json_encode(["user" => $id]));      // ?string: the job's id
+enqueue("report", "", delay: 3600);                          // in an hour at the earliest
+enqueue("sync", (string)$id, key: "sync:{$id}");             // added once while one waits (null otherwise)
+```
+
+```phv
+<?phv
+// jobs/send_welcome.phv
+import std.jobs.job;
+$j = job();                 // Job: name, id, payload, attempt (1 for the first run)
+$data = json_decode($j->payload);
+```
+
+- A job is the script `<dir>/<name>.phv`; names are lowercase letters, digits and `_`. `enqueue()` throws `ValueError`
+  for a job that does not exist, a payload over 64 KB, a delay over 30 days or a key over 200 bytes, and
+  `RuntimeException` when the store holds 100,000 waiting and running jobs (10,000 or 64 MB in memory). It throws
+  `RuntimeException` too in a project without `[jobs]`.
+- `phv serve` runs `[jobs] workers` jobs at once in each process, on threads of their own: jobs never take the
+  workers of pages. Each run gets a fresh VM, `time_limit` and `[security] memory_limit_mb`, and the permissions of
+  phv.toml, as a page does. `request()` and `session()` are empty, and `job()` works only in a job. A job may
+  `publish()` (to WebSocket connections) and `enqueue()` other jobs; what a run printed is discarded.
+- **A job runs at least once.** A run takes the job with a lease (`time_limit` + 30 seconds). A job that throws, or
+  hits a limit, runs again after `retry_delay` seconds, then twice that, and so on; after `max_attempts` runs it is
+  given up and kept for a week (at most 10,000), with its error. A job whose process stopped while it ran is taken
+  again when its lease runs out. So write jobs that may run twice without harm (or give them a `key`).
+- A `key` adds a job once: while a job of the same name and key waits, runs or was given up, and for a day after it
+  ended, `enqueue()` returns `null`.
+- With PostgreSQL or MySQL, `enqueue()` inside a `transaction()` on the store's database adds the job with the
+  transaction: only if it commits. Jobs are kept in a table `phv_jobs` (created when first needed), taken with
+  `SELECT ... FOR UPDATE SKIP LOCKED`; Redis keeps them under `phv:jobs:`. Every server process and machine using the
+  same store shares the jobs. With `store = "memory"` the jobs live in the server process and are lost when it stops.
+- **Schedules**: each `[[schedule]]` adds its job (with an empty payload) in the minutes its `cron` expression
+  matches, in `timezone`. Fields are `*`, numbers, ranges `a-b`, steps `*/n` and lists `a,b`; days of the week are 0
+  to 7 (Sunday is 0 and 7); when the day of the month and the day of the week are both given, either one matches. Each
+  process adds the jobs, keyed by the minute: with a shared store a job is added once however many processes run;
+  with `store = "memory"` each process runs its own. Minutes while no process was running are not made up for. At
+  most 100 schedules.
+- `phv jobs run [dir]` runs the jobs (and schedules) of a project without serving its pages, until Ctrl-C or
+  SIGTERM, for a worker machine; with `[jobs] run = false`, `phv serve` only adds jobs. `phv jobs list [--failed]`
+  shows the jobs of a shared store, and `phv jobs retry <id>` puts a job that was given up back in the queue.
+- A job that does not compile stops `phv serve`, `phv jobs run` and `phv build`. When the server stops, running jobs
+  get what is left of `shutdown_timeout`; one that does not finish runs again elsewhere when its lease runs out.
+- The payload is stored as it is: encrypt (`encrypt()`) what must stay secret. A page that adds jobs for visitors
+  should be rate limited (`rate_limit()`), so a visitor cannot fill the queue.
+
 ### Asynchronous I/O (std.async)
 
 ```phv
@@ -1613,6 +1807,7 @@ csp = "default"         # "off" or a custom policy that may contain {nonce}
 requests_per_minute = 0 # limit per client address (0 means unlimited)
 session_store = "memory"  # or a directory ("sessions/"), or a database ("db:cache")
 rate_limit_store = "cache"  # count rate limits on this Redis database (default: in the process)
+secret_env = "PHV_SECRET"   # the server's secret, shared by its processes (see "CSRF protection")
 
 [server]
 workers = 16            # scripts running at once (default: two per CPU, at least 8)
@@ -1624,6 +1819,11 @@ shutdown_timeout = 30   # seconds running requests get when the server stops
 tls_cert = "certs/fullchain.pem"   # serve HTTPS and HTTP/2 (see "HTTPS and HTTP/2")
 tls_key = "certs/privkey.pem"
 h2c = false             # also accept HTTP/2 without TLS, from a proxy that speaks it
+request_ids = true      # give each request an id (see "Request ids")
+publish_store = "cache" # carry publish() to the other server processes (see std.ws)
+
+[admin]
+listen = "127.0.0.1:9100"   # /health, /ready and /metrics (see "Health checks and metrics")
 
 [cors]
 origins = ["https://app.example.com"]
@@ -1631,6 +1831,13 @@ origins = ["https://app.example.com"]
 [mail.default]
 url_env = "SMTP_URL"
 from = "Example <noreply@example.com>"
+
+[jobs]
+store = "db:main"       # background jobs (see "Background jobs")
+
+[[schedule]]
+job = "cleanup"
+cron = "0 3 * * *"
 
 [fmt]
 width = 100             # phv fmt wraps longer lines
@@ -1691,7 +1898,7 @@ create files at the root of a drive), in the shared temporary directory, and on 
 | `file_append(path, text)`, `filesize(path)`, `filemtime(path)`, `is_dir(path)`, `scandir(dir): list<string>`, `mkdir(dir)`, `copy(from, to)`, `rename(from, to)` | Files and directories; require `[permissions]` (below) |
 | `csv_parse(string): list<list<string>>`, `csv_encode(list<list<string>>): string` | RFC 4180 (quoted fields, `""`, line breaks in fields); `csv_encode` ends lines with CRLF. Spreadsheets run a cell that starts with `=`, `+`, `-` or `@` as a formula: when visitors' text goes into a file people open in one, prefix such cells with `'` |
 | `parse_url(string): map<string, string>`, `parse_query(string): map<string, string>` | Keys `scheme`, `host`, `port`, `user`, `pass`, `path`, `query`, `fragment` (those present); an invalid URL throws `ValueError` |
-| `log_info(msg, ?fields)`, `log_warn(...)`, `log_error(...)` | One line on standard error, next to the server's own log: `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`. Text with spaces, `"` or `=` is quoted; line breaks, control characters and the characters that reorder text (U+202E...) are escaped, so a value cannot forge a line |
+| `log_info(msg, ?fields)`, `log_warn(...)`, `log_error(...)` | One line on standard error, next to the server's own log: `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`. Text with spaces, `"` or `=` is quoted; line breaks, control characters and the characters that reorder text (U+202E...) are escaped, so a value cannot forge a line. With `[server] request_ids`, lines written for a request end with `req=<id>` |
 | `argv(): list<string>`, `stdin_read_line(): ?string`, `stdin_read_all(): string` | Only in scripts run with `phv run` (elsewhere `RuntimeException`): the arguments after the file, and standard input |
 | `sql_ident(string): Sql` | Column and table names |
 | `assert(bool, ?string)`, `assert_eq(any, any, ?string)` | For tests |
@@ -1771,6 +1978,7 @@ When code uses a PHP function name, the error message suggests the alternative
 | `phv dap` | Debug adapter for editors (see Debugging below) |
 | `phv doc [paths] [--std] [--format html\|md] [-o file]` | An API reference from doc comments (see API reference below) |
 | `phv install [--locked]` | Fetch `[dependencies]` and the packages they need, and pin them in `phv.lock` |
+| `phv jobs run [dir]`, `phv jobs list [--failed] [dir]`, `phv jobs retry <id> [dir]` | Run a project's background jobs without serving its pages; list the jobs of its store; put a failed job back (see "Background jobs") |
 | `phv migrate file.php` | Convert PHP mechanically and list the places that need manual work |
 | `phv disasm file.phv` | Show the bytecode |
 | `phv parse file.phv` | Show the syntax tree |
@@ -1859,6 +2067,8 @@ types it never serves, such as `.toml` or `.env`). phv.toml is included: keep se
 
 The bundle carries its SHA-256 and the version of phv that built it; a damaged bundle, or one from another version,
 is refused at startup. Build the executable on the platform it runs on (it is a copy of that platform's phv).
+The jobs of `[jobs]` are compiled into a site's executable too; `--jobs-only` runs them without serving the pages
+(as `phv jobs run`).
 
 ### Formatting
 
@@ -2032,7 +2242,8 @@ It then runs the type checker and shows the places that need manual work, such a
      it) are freed while the script runs: a cycle collector runs between instructions each time the number of live
      objects has doubled since its last run (first at 4,096), and it looks at no more than 16 values per object made
      since then. Objects that are still reachable from a variable, a list, a map, a closure or another live object are
-     never freed. When a run ends, the fields of every object left are cleared.
+     never freed. When a run ends, the fields of every object left are cleared. Objects of a class whose properties all
+     hold scalars, strings or enum cases cannot be part of a cycle: the collector does not look at them.
    - **JIT** (Cranelift): functions whose locals are all `int`, `bool`, `float` or `string`, nullable ones (`?int`,
      ...), or lists and maps of them (`list<int>`, `map<string, int>`, ...) are compiled to native code when every
      instruction they use is supported: arithmetic including `**`, comparisons (also with `null`), conversions,
@@ -2071,6 +2282,8 @@ It then runs the type checker and shows the places that need manual work, such a
 | Call depth | 10,000 | Fatal error |
 | Request body | 8 MB | 413 |
 | Scripts running at once (`serve`) | two per CPU, at least 8 (`[server] workers`) | waits up to 10 seconds, then 503 |
+| Jobs running at once (`serve`, `phv jobs run`) | 2 per process (`[jobs] workers`), each with `[jobs] time_limit` (300 s) and `memory_limit_mb`, besides the scripts of pages | the job waits in the store |
+| Jobs waiting and running in the store | 100,000 (memory: 10,000 or 64 MB); a payload 64 KB | `enqueue()` throws |
 | Output waiting to be sent (`serve`) | `workers` × `memory_limit_mb` | 503 |
 | Request body bytes past the first 64 KB, received or held (`serve`) | `workers` × 8 MB | waits up to 10 seconds, then 503 |
 | Source file (module, template, script) | 8 MB | Compile error (`phv lsp`: a larger open document is not checked or formatted, and renames are refused while it is open) |
@@ -2168,9 +2381,15 @@ Planned, in this order. Each release is audited before it is published, as befor
   (`ghcr.io/miyagawayuu/phv`), Homebrew and Scoop from this release on (done).
 - **1.0, speed and stability** (done): freeing reference cycles while a script runs, a JIT that covers lists, maps
   and nullable values, HTTPS and HTTP/2, a WebSocket server, a `Set` type, and the compatibility rules of §18.
-- **After 1.0**, in minor releases: the JIT for closures and objects, `publish()` across server processes, and more
-  of the standard library. Generators (`yield`) and traits are being considered; they would come in a minor
-  release too, since they only add to the language.
+- **1.1, web services**: a secret shared by a site's server processes (`[security] secret_env`), `publish()` across
+  server processes (`[server] publish_store`), health checks and Prometheus metrics on an admin port (`[admin]`),
+  request ids and trace context, background jobs and schedules (`std.jobs`, `[jobs]`, `[[schedule]]`, `phv jobs`),
+  Server-Sent Events, and faster number formatting, exceptions and object creation.
+- **1.2**: sign-in with OAuth 2.0 and OpenID Connect, JSON Web Tokens signed with RS256, ES256 and EdDSA (with JWKS),
+  streaming responses, and exporting traces (OpenTelemetry).
+- **Later**, in minor releases: the JIT for closures and objects, and more of the standard library. Generators
+  (`yield`) and traits are being considered; they would come in a minor release too, since they only add to the
+  language.
 
 Some features are left out on purpose, because they work against the design principles (§1): `eval`, variable
 variables, static properties and global variables, references (`&$x`), truthiness, `===`, `@`, `goto`, magic

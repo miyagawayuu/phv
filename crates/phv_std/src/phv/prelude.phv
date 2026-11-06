@@ -26,7 +26,11 @@ class Exception {
     }
 
     // Where it was first thrown: one `at function (file:line)` line per call, innermost first.
+    // The runtime keeps the place; the text is made the first time it is asked for.
     public function getTraceAsString(): string {
+        if ($this->trace == "") {
+            $this->trace = __exc_trace($this);
+        }
         return $this->trace;
     }
 }

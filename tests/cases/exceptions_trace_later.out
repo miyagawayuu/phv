@@ -1,0 +1,5 @@
+same object
+at fail (exceptions_trace_later.phv:6)
+at first (exceptions_trace_later.phv:15)
+at {main} (exceptions_trace_later.phv:22)
+stable

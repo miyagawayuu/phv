@@ -21,7 +21,13 @@ const FRAME: usize = 64 << 10;
 /// and `response()->file()`), so large files never sit in memory whole.
 pub enum RespBody {
     Full(Option<Bytes>),
-    File { file: tokio::fs::File, left: u64, buf: Box<[u8]> },
+    File {
+        file: tokio::fs::File,
+        left: u64,
+        buf: Box<[u8]>,
+    },
+    /// Chunks sent as they come (Server-Sent Events), until the sender is dropped.
+    Stream(tokio::sync::mpsc::Receiver<Bytes>),
 }
 
 /// Output counted in a server-wide total until the last copy of its bytes is
@@ -64,7 +70,7 @@ impl RespBody {
     pub fn take_bytes(&mut self) -> Option<Bytes> {
         match self {
             RespBody::Full(b) => b.take(),
-            RespBody::File { .. } => None,
+            RespBody::File { .. } | RespBody::Stream(_) => None,
         }
     }
 
@@ -115,6 +121,11 @@ impl Body for RespBody {
                     Poll::Pending => Poll::Pending,
                 }
             }
+            RespBody::Stream(rx) => match rx.poll_recv(cx) {
+                Poll::Ready(Some(b)) => Poll::Ready(Some(Ok(Frame::data(b)))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            },
         }
     }
 
@@ -122,6 +133,7 @@ impl Body for RespBody {
         match self {
             RespBody::Full(b) => b.as_ref().is_none_or(|b| b.is_empty()),
             RespBody::File { left, .. } => *left == 0,
+            RespBody::Stream(_) => false,
         }
     }
 
@@ -129,6 +141,7 @@ impl Body for RespBody {
         match self {
             RespBody::Full(b) => SizeHint::with_exact(b.as_ref().map_or(0, |b| b.len() as u64)),
             RespBody::File { left, .. } => SizeHint::with_exact(*left),
+            RespBody::Stream(_) => SizeHint::default(),
         }
     }
 }

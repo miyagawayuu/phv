@@ -2767,6 +2767,24 @@ impl<'a> Checker<'a> {
         c.field_slots.get(name).copied()
     }
 
+    /// Whether a value of type `t` holds no object that could hold other
+    /// values: scalars, strings, and enum cases (whose fields are constants).
+    fn holds_no_objects(&self, t: &Type) -> bool {
+        match t {
+            Type::Int
+            | Type::Float
+            | Type::Str
+            | Type::Bool
+            | Type::Null
+            | Type::Html
+            | Type::SafeUrl
+            | Type::SafeJs => true,
+            Type::Class(id, args) => args.is_empty() && self.classes[*id as usize].kind == ClassKind::Enum,
+            Type::Union(members) => members.iter().all(|m| self.holds_no_objects(m)),
+            _ => false,
+        }
+    }
+
     fn finish(mut self) -> (HProgram, Vec<Diagnostic>) {
         let classes = self
             .classes
@@ -2796,6 +2814,7 @@ impl<'a> Checker<'a> {
                     v
                 },
                 cases: c.cases.clone(),
+                acyclic: c.kind != ClassKind::Interface && c.fields.iter().all(|f| self.holds_no_objects(&f.ty)),
             })
             .collect();
         let mut exc_classes = HashMap::new();

@@ -822,3 +822,91 @@ fn javascript_responses_take_only_inert_values() {
     assert!(policy.1.contains("'strict-dynamic'") && !policy.1.contains("script-src 'self'"), "{}", policy.1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The CSRF token in a page from `csrf_field()`, and the CSRF cookie set with it.
+fn csrf_form(addr: SocketAddr) -> (String, String) {
+    let r = get(addr, "/form", "");
+    let cookie = r
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+        .map(|(_, v)| v.split(';').next().unwrap().to_string())
+        .find(|c| c.starts_with("PHVCSRF="))
+        .expect("the CSRF cookie");
+    let token = r.body.split("value=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    (cookie, token)
+}
+
+/// With `[security] secret_env`, every server process of a site accepts the
+/// forms of the others (and its own after a restart); without the same secret,
+/// they do not. While the secret is replaced (`secret_old_env`), forms made
+/// with the old one still pass.
+#[test]
+fn a_shared_secret_makes_forms_work_on_every_server() {
+    std::env::set_var("PHV_TEST_A1_SECRET", "a".repeat(40));
+    std::env::set_var("PHV_TEST_A1_OTHER", "b".repeat(40));
+    std::env::set_var("PHV_TEST_A1_SHORT", "c".repeat(31));
+    let site = |name: &str, toml: &str| {
+        let dir = std::env::temp_dir().join(format!("phv-http-secret-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "phv.toml", toml);
+        write(
+            &dir,
+            "public/form.phv",
+            "<?phv\nimport std.http.request;\nif (request()->isPost()) {\n    echo \"accepted\";\n    return;\n}\necho csrf_field();\n",
+        );
+        dir
+    };
+    let shared = site("shared", "[security]\nsecret_env = \"PHV_TEST_A1_SECRET\"\n");
+    let other = site("other", "[security]\nsecret_env = \"PHV_TEST_A1_OTHER\"\n");
+    let rotated =
+        site("rotated", "[security]\nsecret_env = \"PHV_TEST_A1_OTHER\"\nsecret_old_env = \"PHV_TEST_A1_SECRET\"\n");
+    let none = site("none", "");
+    let (a, b, c, d, e) = (start(&shared), start(&shared), start(&other), start(&rotated), start(&none));
+
+    let (cookie, token) = csrf_form(a);
+    let body = format!("_csrf={token}");
+    assert_eq!(post(a, "/form", &cookie, &body).body, "accepted");
+    assert_eq!(post(b, "/form", &cookie, &body).body, "accepted", "another process with the same secret");
+    assert_eq!(post(c, "/form", &cookie, &body).status, 403, "a process with another secret");
+    assert_eq!(post(d, "/form", &cookie, &body).body, "accepted", "the old secret while it is replaced");
+    assert_eq!(post(e, "/form", &cookie, &body).status, 403, "a process without a secret");
+    // Tokens made after the change use the new secret only.
+    let (cookie, token) = csrf_form(d);
+    let body = format!("_csrf={token}");
+    assert_eq!(post(c, "/form", &cookie, &body).body, "accepted");
+    assert_eq!(post(a, "/form", &cookie, &body).status, 403);
+    // Without a secret, each process has its own key, as before.
+    let f = start(&none);
+    let (cookie, token) = csrf_form(e);
+    assert_eq!(post(f, "/form", &cookie, &format!("_csrf={token}")).status, 403);
+
+    // A variable that is unset or too short stops the server; its value is never shown.
+    for (name, toml, needle) in [
+        ("unset", "[security]\nsecret_env = \"PHV_TEST_A1_UNSET\"\n", "PHV_TEST_A1_UNSET is not set"),
+        ("short", "[security]\nsecret_env = \"PHV_TEST_A1_SHORT\"\n", "at least 32 bytes"),
+        (
+            "oldshort",
+            "[security]\nsecret_env = \"PHV_TEST_A1_SECRET\"\nsecret_old_env = \"PHV_TEST_A1_SHORT\"\n",
+            "PHV_TEST_A1_SHORT must hold",
+        ),
+    ] {
+        let dir = site(name, toml);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let opts = ServeOptions {
+            root: dir.clone(),
+            host: "127.0.0.1".into(),
+            port: 0,
+            dev: true,
+            time_limit: Duration::from_secs(5),
+            watch: false,
+        };
+        let err = serve_on(listener, opts).unwrap_err();
+        assert!(err.contains(needle), "{err}");
+        assert!(!err.contains("ccccc"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    for dir in [shared, other, rotated, none] {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

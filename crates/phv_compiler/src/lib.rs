@@ -64,6 +64,7 @@ pub fn compile_with(h: &HProgram, sources: &SourceMap, opts: Options) -> Result<
                 by_name
             },
             cases: c.cases.iter().map(|(n, v)| (n.clone(), to_const(v))).collect(),
+            acyclic: c.acyclic,
         })
         .collect();
     let files = sources

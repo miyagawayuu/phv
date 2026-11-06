@@ -2,8 +2,12 @@
 //! each request in a fresh VM (nothing is shared between requests except the
 //! compiled, immutable bytecode).
 
+mod admin;
 mod body;
+mod bus;
+mod jobs;
 mod log;
+mod metrics;
 mod multipart;
 mod routes;
 mod session;
@@ -83,6 +87,8 @@ const H2_IDLE: Duration = Duration::from_secs(30);
 /// stay on disk, under the root given to the server.
 pub struct Embedded {
     pub pages: HashMap<String, Arc<Compiled>>,
+    /// The jobs of `[jobs] dir`, by name.
+    pub jobs: HashMap<String, Arc<Compiled>>,
     pub statics: HashMap<String, Bytes>,
     pub config: Option<String>,
 }
@@ -107,8 +113,14 @@ struct State {
     time_limit: Duration,
     config: Config,
     sessions: session::Store,
-    /// Key for CSRF tokens; new on every start (open forms then need a reload).
+    /// Key for CSRF tokens: derived from `[security] secret_env`, or new on
+    /// every start (open forms then need a reload).
     csrf_secret: Vec<u8>,
+    /// The key derived from `secret_old_env`, still accepted while the secret
+    /// is being replaced.
+    csrf_old: Option<Vec<u8>>,
+    /// The server's secret (`[security] secret_env`), when the site has one.
+    secret: Option<Vec<u8>>,
     csrf_cookie: &'static str,
     /// Compiled pages, and a lock for each page being compiled (one thread
     /// compiles it; the others wait for its result).
@@ -152,11 +164,19 @@ struct State {
     /// The last change stamp and when it was taken (every open tab asks each second).
     watch_stamp: tokio::sync::Mutex<Option<(Instant, String)>>,
     /// WebSocket connections and the topics they joined.
-    hub: Mutex<ws::Hub>,
+    hub: Arc<Mutex<ws::Hub>>,
+    /// `[server] publish_store`: carries `publish()` to the other server processes.
+    bus: Option<bus::Bus>,
     /// A slot for each WebSocket connection that may be open.
     ws_slots: Arc<tokio::sync::Semaphore>,
     /// Set when the server stops: WebSocket connections are closed.
     ws_closing: tokio::sync::watch::Sender<bool>,
+    /// What `/metrics` shows.
+    metrics: Arc<metrics::Metrics>,
+    /// The server is stopping (`/health` answers 503).
+    stopping: std::sync::atomic::AtomicBool,
+    /// A slot for each connection that may be open.
+    conn_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl State {
@@ -164,6 +184,7 @@ impl State {
         let mut secret = vec![0u8; 32];
         getrandom::fill(&mut secret).expect("operating system random number generator failed");
         let csp_plain = config.csp.header(None).and_then(|c| HeaderValue::from_str(&c).ok());
+        let metrics = Arc::new(metrics::Metrics::default());
         State {
             public: root.join("public"),
             sessions: match config.session_db.as_ref().and_then(|n| config.host.databases.get(n)) {
@@ -171,6 +192,7 @@ impl State {
                     Duration::from_secs(config.session_ttl),
                     config.secure_cookies,
                     spec.clone(),
+                    metrics.health.clone(),
                 ),
                 None => session::Store::new(
                     Duration::from_secs(config.session_ttl),
@@ -180,6 +202,8 @@ impl State {
             },
             csrf_cookie: if config.secure_cookies { "__Host-PHVCSRF" } else { "PHVCSRF" },
             csrf_secret: secret,
+            csrf_old: None,
+            secret: None,
             workers: Arc::new(tokio::sync::Semaphore::new(config.workers)),
             body_budget: Arc::new(tokio::sync::Semaphore::new(config.workers.max(1) * (MAX_BODY / 1024))),
             buffered: Arc::new(AtomicUsize::new(0)),
@@ -203,10 +227,62 @@ impl State {
             gz_flight: Mutex::new(HashMap::new()),
             watch: false,
             watch_stamp: tokio::sync::Mutex::new(None),
-            hub: Mutex::new(ws::Hub::default()),
+            hub: Arc::new(Mutex::new(ws::Hub::default())),
+            bus: None,
             ws_slots: Arc::new(tokio::sync::Semaphore::new(ws::MAX_WEBSOCKETS)),
             ws_closing: tokio::sync::watch::channel(false).0,
+            metrics,
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            conn_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
         }
+    }
+
+    /// Delivers what a script published: to the connections of this process,
+    /// then (queued: the script never waits for the store) to the others.
+    fn deliver(&self, publishes: &[(String, String)]) {
+        if publishes.is_empty() {
+            return;
+        }
+        {
+            let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+            for (topic, text) in publishes {
+                hub.publish(topic, text);
+            }
+        }
+        self.metrics.publish_local.fetch_add(publishes.len() as u64, Ordering::Relaxed);
+        if let Some(bus) = &self.bus {
+            for (topic, text) in publishes {
+                bus.send(topic, text);
+            }
+        }
+    }
+
+    /// The text of `/metrics`: the counters, and the gauges read now.
+    fn metrics_text(&self) -> String {
+        self.metrics.jobs_enqueued.store(phv_std::jobs::added_count(), Ordering::Relaxed);
+        let busy = self.config.workers.saturating_sub(self.workers.available_permits());
+        let conns = MAX_CONNECTIONS.saturating_sub(self.conn_slots.available_permits());
+        let sockets = ws::MAX_WEBSOCKETS.saturating_sub(self.ws_slots.available_permits());
+        let ready = !self.stopping.load(Ordering::SeqCst) && self.metrics.health.down().is_empty();
+        self.metrics.render(&[
+            (
+                "phv_up",
+                "1 while the server runs, 0 once it is stopping.",
+                f64::from(u8::from(!self.stopping.load(Ordering::SeqCst))),
+            ),
+            ("phv_ready", "1 when the server and the stores it uses answer.", f64::from(u8::from(ready))),
+            ("phv_uptime_seconds", "Seconds since the server started.", self.started.elapsed().as_secs_f64()),
+            ("phv_workers", "Scripts that may run at once ([server] workers).", self.config.workers as f64),
+            ("phv_workers_busy", "Scripts running now.", busy as f64),
+            ("phv_connections", "Open connections.", conns as f64),
+            ("phv_websockets", "Open WebSocket connections.", sockets as f64),
+            (
+                "phv_output_waiting_bytes",
+                "Bytes of output waiting to be sent.",
+                self.buffered.load(Ordering::Relaxed) as f64,
+            ),
+            ("phv_async_running", "Operations of *Async methods running now.", phv_std::async_running() as f64),
+        ])
     }
 
     fn scan_routes(&self) -> Result<routes::Table, String> {
@@ -265,7 +341,17 @@ pub fn serve(opts: ServeOptions) -> Result<(), String> {
 
 /// Serves on an already bound listener (tests bind port 0) until Ctrl-C or SIGTERM.
 pub fn serve_on(listener: std::net::TcpListener, opts: ServeOptions) -> Result<(), String> {
-    serve_with(listener, opts, None, None)
+    serve_with(Some(listener), opts, None, None)
+}
+
+/// `phv jobs run`: runs the site's jobs (and its admin port, if it has one)
+/// without serving its pages, until Ctrl-C or SIGTERM, or `stop`.
+pub fn run_jobs(
+    opts: ServeOptions,
+    embedded: Option<Embedded>,
+    stop: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+) -> Result<(), String> {
+    serve_with(None, opts, embedded, stop)
 }
 
 /// Serves until `stop` completes, then lets running requests finish.
@@ -274,7 +360,7 @@ pub fn serve_until(
     opts: ServeOptions,
     stop: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
-    serve_with(listener, opts, None, Some(Box::pin(stop)))
+    serve_with(Some(listener), opts, None, Some(Box::pin(stop)))
 }
 
 /// Ctrl-C, or SIGTERM (what `docker stop` and process managers send).
@@ -305,10 +391,42 @@ pub fn serve_embedded(opts: ServeOptions, embedded: Embedded) -> Result<(), Stri
         .parse()
         .map_err(|e| format!("invalid address {}:{}: {e}", opts.host, opts.port))?;
     let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
-    serve_with(listener, opts, Some(embedded), None)
+    serve_with(Some(listener), opts, Some(embedded), None)
 }
 
 type Stop = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// The server's secret and the previous one (`[security] secret_env`, `secret_old_env`).
+type Secrets = (Vec<u8>, Option<Vec<u8>>);
+
+/// The shortest secret `[security] secret_env` may hold.
+const MIN_SECRET: usize = 32;
+
+/// Reads `[security] secret_env` and `secret_old_env`: the secret and the
+/// previous one. A variable that is unset or too short stops the server; its
+/// value is never shown.
+fn server_secrets(
+    config: &Config,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Option<Secrets>, String> {
+    let read = |name: &str| -> Result<Vec<u8>, String> {
+        let value = var(name)
+            .ok_or_else(|| format!("[security] secret_env: the environment variable {name} is not set"))?
+            .into_string()
+            .map_err(|_| format!("[security] secret_env: the environment variable {name} is not UTF-8 text"))?;
+        if value.len() < MIN_SECRET {
+            return Err(format!(
+                "[security] secret_env: the environment variable {name} must hold at least {MIN_SECRET} bytes \
+                 (random_token() makes one)"
+            ));
+        }
+        Ok(value.into_bytes())
+    };
+    let Some(name) = &config.secret_env else { return Ok(None) };
+    let secret = read(name)?;
+    let old = config.secret_old_env.as_deref().map(read).transpose()?;
+    Ok(Some((secret, old)))
+}
 
 /// Opens `[server] access_log` (a file inside the project) for appending,
 /// making its directories: links, junctions and hard links on the way are
@@ -328,13 +446,18 @@ fn open_access_log(root: &Path, path: &Path) -> Result<std::fs::File, String> {
 }
 
 fn serve_with(
-    listener: std::net::TcpListener,
+    listener: Option<std::net::TcpListener>,
     opts: ServeOptions,
     embedded: Option<Embedded>,
     stop: Option<Stop>,
 ) -> Result<(), String> {
-    let addr = listener.local_addr().map_err(|e| e.to_string())?;
-    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let addr = match &listener {
+        Some(l) => {
+            l.set_nonblocking(true).map_err(|e| e.to_string())?;
+            Some(l.local_addr().map_err(|e| e.to_string())?)
+        }
+        None => None,
+    };
     let root = opts.root.canonicalize().map_err(|e| format!("cannot open {}: {e}", opts.root.display()))?;
     let config = match &embedded {
         Some(e) => phv_driver::config::parse_config(&root, e.config.as_deref().unwrap_or(""))?,
@@ -345,7 +468,41 @@ fn serve_with(
             load_config(&root)?
         }
     };
+    let secrets = server_secrets(&config, |v| std::env::var_os(v))?;
+    let admin = match &config.admin {
+        None => None,
+        Some(a) => {
+            let token = match &a.token_env {
+                None => None,
+                Some(name) => {
+                    let t = std::env::var(name)
+                        .map_err(|_| format!("[admin] token_env: the environment variable {name} is not set"))?;
+                    if t.len() < 16 {
+                        return Err(format!(
+                            "[admin] token_env: the environment variable {name} must hold at least 16 bytes"
+                        ));
+                    }
+                    Some(t.into_bytes())
+                }
+            };
+            let l = std::net::TcpListener::bind(a.listen)
+                .map_err(|e| format!("cannot listen on the admin address {}: {e}", a.listen))?;
+            l.set_nonblocking(true).map_err(|e| e.to_string())?;
+            Some((l, token))
+        }
+    };
     let mut state = State::new(root, opts.dev, opts.time_limit, config);
+    if let Some((secret, old)) = secrets {
+        state.csrf_secret = phv_std::server_key(&secret, "phv csrf v1");
+        state.csrf_old = old.map(|o| phv_std::server_key(&o, "phv csrf v1"));
+        state.secret = Some(secret);
+    }
+    if let Some(name) = &state.config.publish_store {
+        let spec = state.config.host.databases.get(name).cloned();
+        if let (Some(spec), Some(secret)) = (spec, &state.secret) {
+            state.bus = Some(bus::Bus::start(spec, secret, state.hub.clone(), state.metrics.clone()));
+        }
+    }
     state.watch = opts.watch && opts.dev && state.embedded.is_none();
     if let Some((path, _)) = &state.config.access_log {
         let file = open_access_log(&state.root, path)
@@ -364,6 +521,10 @@ fn serve_with(
     };
     let state = Arc::new(state);
     let log = state.log.clone();
+    if listener.is_none() && state.config.jobs.is_none() {
+        return Err("phv.toml has no [jobs] section: there are no jobs to run".into());
+    }
+    let runner = jobs::start(&state)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // Scripts run on blocking threads; give them room for deep recursion.
@@ -372,21 +533,44 @@ fn serve_with(
         .map_err(|e| e.to_string())?;
     let result = rt.block_on(async move {
         let mut stop: Stop = stop.unwrap_or_else(|| Box::pin(os_shutdown()));
-        let listener = TcpListener::from_std(listener).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
-        let mode = if state.dev { "development" } else { "production" };
-        let scheme = if acceptor.is_some() { "https" } else { "http" };
-        eprintln!("PHV server ({mode} mode) listening on {scheme}://{addr}");
-        if state.dev && !addr.ip().is_loopback() {
-            eprintln!("warning: development mode shows error details to every visitor; use --prod");
+        let listener = match (listener, addr) {
+            (Some(l), Some(addr)) => {
+                let l = TcpListener::from_std(l).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
+                let mode = if state.dev { "development" } else { "production" };
+                let scheme = if acceptor.is_some() { "https" } else { "http" };
+                eprintln!("PHV server ({mode} mode) listening on {scheme}://{addr}");
+                if state.dev && !addr.ip().is_loopback() {
+                    eprintln!("warning: development mode shows error details to every visitor; use --prod");
+                }
+                match &state.embedded {
+                    Some(e) => {
+                        eprintln!("Serving the built site ({} pages, {} files)", e.pages.len(), e.statics.len())
+                    }
+                    None => eprintln!("Serving {}", state.public.display()),
+                }
+                Some(l)
+            }
+            _ => None,
+        };
+        if let Some(j) = &state.config.jobs {
+            if runner.is_some() {
+                eprintln!("Running jobs of {}/ ({} at once)", j.dir, j.workers);
+            }
         }
-        match &state.embedded {
-            Some(e) => eprintln!("Serving the built site ({} pages, {} files)", e.pages.len(), e.statics.len()),
-            None => eprintln!("Serving {}", state.public.display()),
+        if let Some((l, token)) = admin {
+            let at = l.local_addr().map_err(|e| e.to_string())?;
+            let l = TcpListener::from_std(l).map_err(|e| format!("cannot listen on {at}: {e}"))?;
+            eprintln!("Admin port (/health, /ready, /metrics) on http://{at}");
+            tokio::spawn(admin::serve(state.clone(), l, token));
         }
-        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+        let slots = state.conn_slots.clone();
         // Tells the connections to finish their request and close.
         let (closing, closed) = tokio::sync::watch::channel(false);
-        loop {
+        // Without a listener (`phv jobs run`), only the jobs run, until the stop.
+        if listener.is_none() {
+            (&mut stop).await;
+        }
+        while let Some(listener) = &listener {
             let permit = tokio::select! {
                 p = slots.clone().acquire_owned() => p.expect("semaphore is never closed"),
                 _ = &mut stop => break,
@@ -426,17 +610,27 @@ fn serve_with(
             });
         }
         // New connections are refused; running requests get `shutdown_timeout` to finish.
+        state.stopping.store(true, Ordering::SeqCst);
+        if let Some(r) = &runner {
+            r.stop();
+        }
         drop(listener);
         let wait = Duration::from_secs(state.config.shutdown_timeout);
         eprintln!("Stopping: letting running requests finish (at most {} s)", wait.as_secs());
         let _ = closing.send(true);
         let _ = state.ws_closing.send(true);
         let all = slots.acquire_many(MAX_CONNECTIONS as u32);
-        if tokio::time::timeout(wait, all).await.is_err() {
-            eprintln!("Stopped with requests still running");
-        } else {
-            eprintln!("Stopped");
+        let started = Instant::now();
+        let mut finished = tokio::time::timeout(wait, all).await.is_ok();
+        // Jobs that are running get what is left of the time (an unfinished one runs again elsewhere).
+        if let Some(r) = runner {
+            let left = wait.saturating_sub(started.elapsed());
+            finished &= tokio::task::spawn_blocking(move || r.wait(left)).await.unwrap_or(false);
         }
+        if let Some(b) = &state.bus {
+            b.stop();
+        }
+        eprintln!("{}", if finished { "Stopped" } else { "Stopped with requests or jobs still running" });
         Ok(())
     });
     // Scripts still running past the timeout are not waited for.
@@ -719,6 +913,11 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
         return Ok(simple(StatusCode::BAD_REQUEST, "text/plain", "bad request: more than one Host".into()));
     }
     let start = Instant::now();
+    let mut req = req;
+    let id = state.config.request_ids.then(|| request_id(req.headers(), state.config.trust_request_id));
+    if let Some(id) = &id {
+        req.extensions_mut().insert(id.clone());
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let ip = peer.ip().to_canonical().to_string();
@@ -786,11 +985,12 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
         }
         static_files::vary(r.headers_mut(), "Origin");
         add_security_headers(&state, &mut r);
-        log_request(&state, &ip, &method, &path, r.status().as_u16(), start);
+        finish(&state, &mut r, id.as_ref(), &ip, &method, &path, start);
         return Ok(r);
     }
     let limited = rate_limited(&state, peer.ip()).await;
     let mut resp = if let Some(wait) = limited {
+        state.metrics.reject(metrics::Reject::RateLimit);
         let mut r = simple(StatusCode::TOO_MANY_REQUESTS, "text/plain", "too many requests".into());
         r.headers_mut().insert("retry-after", HeaderValue::from(wait));
         r
@@ -814,8 +1014,84 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
         resp = compress(&state, resp, gzip_ok, credentialed).await;
     }
     add_security_headers(&state, &mut resp);
-    log_request(&state, &ip, &method, &path, resp.status().as_u16(), start);
+    finish(&state, &mut resp, id.as_ref(), &ip, &method, &path, start);
     Ok(resp)
+}
+
+/// What answered a request, for `/metrics` (a response extension).
+#[derive(Clone)]
+struct Served {
+    kind: metrics::Kind,
+    route: Option<String>,
+}
+
+/// The id of a request (`[server] request_ids`) and its W3C trace context.
+#[derive(Clone)]
+struct RequestId {
+    id: String,
+    /// The trace (32 hex digits) and the flags of `traceparent`.
+    trace: String,
+    flags: String,
+}
+
+impl RequestId {
+    /// The `traceparent` the request's calls to other services send: this
+    /// request's trace, with a span of its own.
+    fn traceparent(&self) -> String {
+        format!("00-{}-{}-{}", self.trace, phv_std::random_hex(8), self.flags)
+    }
+}
+
+/// A new id for a request, or with `trust` the one the proxy in front sent
+/// (`X-Request-Id`, and the trace of `traceparent`), when it is well formed.
+fn request_id(headers: &hyper::HeaderMap, trust: bool) -> RequestId {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
+    let parent = trust.then(|| header("traceparent")).flatten().and_then(parse_traceparent);
+    let given = trust.then(|| header("x-request-id")).flatten().filter(|v| {
+        (1..=128).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    });
+    let (trace, flags) = parent.unwrap_or_else(|| (phv_std::random_hex(16), "01".into()));
+    let id = given.map(str::to_string).unwrap_or_else(|| trace.clone());
+    RequestId { id, trace, flags }
+}
+
+/// The trace id and flags of a W3C `traceparent` (version 00), if it is valid.
+fn parse_traceparent(v: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = v.split('-').collect();
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let [version, trace, span, flags] = parts[..] else { return None };
+    let ok = version == "00"
+        && hex(trace, 32)
+        && hex(span, 16)
+        && hex(flags, 2)
+        && trace.bytes().any(|b| b != b'0')
+        && span.bytes().any(|b| b != b'0');
+    ok.then(|| (trace.to_string(), flags.to_string()))
+}
+
+/// The last steps of every request: its id in the response, the log line,
+/// and the metrics.
+fn finish(
+    state: &State,
+    resp: &mut Resp,
+    id: Option<&RequestId>,
+    ip: &str,
+    method: &Method,
+    path: &str,
+    start: Instant,
+) {
+    if let Some(v) = id.and_then(|i| HeaderValue::from_str(&i.id).ok()) {
+        resp.headers_mut().insert("x-request-id", v);
+    }
+    let status = resp.status().as_u16();
+    log_request(state, ip, method, path, status, start, id.map(|i| i.id.as_str()));
+    let served = resp.extensions_mut().remove::<Served>();
+    let (kind, route) = match &served {
+        Some(s) => (s.kind, s.route.as_deref()),
+        None => (metrics::Kind::Other, None),
+    };
+    // A WebSocket's time is that of its upgrade, not of the connection.
+    state.metrics.request(kind, route, status, start.elapsed());
 }
 
 /// `[security] requests_per_minute`: counts one request (or WebSocket
@@ -836,8 +1112,12 @@ async fn rate_limited(state: &State, ip: std::net::IpAddr) -> Option<u64> {
             tokio::task::spawn_blocking(move || phv_std::ratelimit::hit_shared(&host, &key, limit, minute, until))
                 .await;
         match shared {
-            Ok(Ok((allowed, wait))) => (!allowed).then_some(wait),
+            Ok(Ok((allowed, wait))) => {
+                state.metrics.health.ok(metrics::StoreKind::RateLimit);
+                (!allowed).then_some(wait)
+            }
             Ok(Err(e)) => {
+                state.metrics.health.failed(metrics::StoreKind::RateLimit);
                 eprintln!("warning: the shared rate limit store cannot be used ({e}); counting in this process");
                 (!phv_std::ratelimit::hit(&client, limit, minute))
                     .then(|| phv_std::ratelimit::retry_after(&client, minute))
@@ -1027,7 +1307,10 @@ fn clip(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
 }
 
 /// One line on stderr, and in the access log when phv.toml sets one.
-fn log_request(state: &State, ip: &str, method: &Method, path: &str, status: u16, start: Instant) {
+/// The line of a request on standard error, and in the access log. The id
+/// (`[server] request_ids`) goes to the JSON access log only, so the text
+/// formats stay as they were.
+fn log_request(state: &State, ip: &str, method: &Method, path: &str, status: u16, start: Instant, id: Option<&str>) {
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     // A path of a request may be 64 KB: lines show its start (found by the
     // 1.0.0 audit: the queue of lines then held gigabytes for a slow stderr).
@@ -1044,7 +1327,7 @@ fn log_request(state: &State, ip: &str, method: &Method, path: &str, status: u16
             format!("{time} {ip} \"{method} {path}\" {status} {ms:.1}ms\n")
         }
         LogFormat::Json => {
-            let v = serde_json::json!({
+            let mut v = serde_json::json!({
                 "time": time,
                 "ip": ip,
                 "method": &*method,
@@ -1052,6 +1335,9 @@ fn log_request(state: &State, ip: &str, method: &Method, path: &str, status: u16
                 "status": status,
                 "ms": (ms * 10.0).round() / 10.0,
             });
+            if let Some(id) = id {
+                v["id"] = serde_json::Value::from(id);
+            }
             format!("{v}\n")
         }
     };
@@ -1276,14 +1562,33 @@ fn find(state: &State, url_path: &str, upgrade: bool) -> Found {
 }
 
 async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
+    let mut r = route_inner(state, ip, req).await;
+    if r.extensions().get::<Served>().is_none() {
+        let kind = if r.status() == StatusCode::SWITCHING_PROTOCOLS { metrics::Kind::Ws } else { metrics::Kind::Other };
+        r.extensions_mut().insert(Served { kind, route: None });
+    }
+    r
+}
+
+async fn route_inner(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
     let gzip_ok = state.config.compress && static_files::accepts_gzip(req.headers());
     let get = req.method() == Method::GET || req.method() == Method::HEAD;
+    let as_static = |mut r: Resp| {
+        r.extensions_mut().insert(Served { kind: metrics::Kind::Static, route: None });
+        r
+    };
     if get {
         if let Some(r) = cached_static(state, &req).await {
-            return r;
+            return as_static(r);
         }
     }
     let found = locate(state, req.uri().path(), ws::is_upgrade(&req)).await;
+    // Server-Sent Events: a path no page answers, whose `*.ws.phv` does.
+    if matches!(found, Found::Nothing(_)) && ws::wants_events(&req) {
+        if let Found::Ws(script, params) = locate(state, req.uri().path(), true).await {
+            return ws::events(state, script, params, ip, req).await;
+        }
+    }
     match found {
         Found::RouteError(e) => {
             eprintln!("error in the routes of public/: {e}");
@@ -1300,13 +1605,13 @@ async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
             // Labelled by its name: `compress` keeps one copy per file however
             // the path is spelled (found by the 1.0.0 audit).
             let label = url_rel(req.uri().path()).unwrap_or_default();
-            bytes_response(state, req.headers(), bytes, ct, &v, &label)
+            as_static(bytes_response(state, req.headers(), bytes, ct, &v, &label))
         }
         Found::Target(Target::Static(p)) => {
             if !get {
                 return method_not_allowed();
             }
-            serve_static(state, &req, p, gzip_ok).await
+            as_static(serve_static(state, &req, p, gzip_ok).await)
         }
         Found::Target(Target::Script(p, params)) => run_script(state, p, params, ip, req, Page::Normal).await,
     }
@@ -1790,14 +2095,19 @@ impl State {
             || content_type.starts_with("multipart/form-data")
             || content_type.starts_with("text/plain");
         if self.config.csrf && unsafe_method && simple_body {
-            let expected = csrf_cookie.as_ref().map(|c| phv_std::csrf_expected(&self.csrf_secret, c));
             let submitted = form
                 .iter()
                 .find(|(k, _)| k == "_csrf")
                 .map(|(_, v)| v.as_str())
                 .or_else(|| parts.headers.get("x-csrf-token").and_then(|v| v.to_str().ok()));
             // Tokens are masked with a pad of their own on each page (BREACH).
-            let ok = matches!((&expected, submitted), (Some(e), Some(s)) if phv_std::csrf_matches(e, s));
+            // While the secret is replaced, tokens made with the old one still pass.
+            let ok = match (&csrf_cookie, submitted) {
+                (Some(c), Some(s)) => std::iter::once(&self.csrf_secret)
+                    .chain(self.csrf_old.as_ref())
+                    .any(|key| phv_std::csrf_matches(&phv_std::csrf_expected(key, c), s)),
+                _ => false,
+            };
             if !ok {
                 let hint = if self.dev {
                     "<p class=\"hint\">Add <code>&lt;?= csrf_field() ?&gt;</code> inside the form, or send the token from \
@@ -1830,6 +2140,8 @@ impl State {
             csp_nonce: self.config.csp.uses_nonce().then(|| phv_std::random_hex(16)),
             body: if raw_body { String::from_utf8_lossy(&body).into_owned() } else { String::new() },
             params,
+            request_id: parts.extensions.get::<RequestId>().map(|r| r.id.clone()),
+            traceparent: parts.extensions.get::<RequestId>().map(RequestId::traceparent),
             status: match kind {
                 Page::Normal | Page::Event => 200,
                 Page::NotFound => 404,
@@ -1894,6 +2206,7 @@ impl State {
         let compiled = match self.compiled(script) {
             Ok(c) => c,
             Err(diagnostics) => {
+                self.metrics.failure(metrics::Failure::Compile);
                 eprintln!("compile error in {rel}:\n{diagnostics}");
                 return Err(("Compile error".into(), format!("{rel} could not be compiled.\n\n{diagnostics}")));
             }
@@ -1906,6 +2219,7 @@ impl State {
         let host = Some(self.config.host.clone());
         let outcome = run(&compiled, RunOptions { html: true, limits, http: Some(ctx), host });
         if let Some(err) = &outcome.error {
+            self.metrics.failure(metrics::Failure::of(&err.message));
             let text = err.render();
             eprintln!("runtime error in {rel}:\n{text}");
             return Err(("Runtime error".into(), text));
@@ -1921,18 +2235,12 @@ impl State {
     /// The response for what a script did: status, headers, cookies and body.
     fn respond(&self, outcome: phv_driver::RunOutcome, had_session: bool) -> Resp {
         let mut http = outcome.http;
-        // What the script published, and asked of its WebSocket connection.
-        let publishes = std::mem::take(&mut http.publishes);
+        // What the script asked of its WebSocket connection, and published.
         let ws = http.ws.take();
-        if !publishes.is_empty() || ws.is_some() {
-            let mut hub = self.hub.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(w) = &ws {
-                hub.apply(w);
-            }
-            for (topic, text) in &publishes {
-                hub.publish(topic, text);
-            }
+        if let Some(w) = &ws {
+            self.hub.lock().unwrap_or_else(|e| e.into_inner()).apply(w);
         }
+        self.deliver(&std::mem::take(&mut http.publishes));
         let csp = self.config.csp.page_header(http.csp_nonce.as_deref());
         let flags = if self.config.secure_cookies { "; Secure" } else { "" };
         let session = std::mem::take(&mut http.session);
@@ -2104,16 +2412,33 @@ async fn run_script(
     // Over HTTP/2 a connection has several requests at once: none of their
     // bodies is free of the budget (found by the 1.0 audit).
     let small = if parts.version == hyper::Version::HTTP_2 { 0 } else { SMALL_BODY };
+    let served = Served { kind: metrics::Kind::Page, route: Some(metrics::route_of(&state.public, &script)) };
     let (body, reserved) = match read_body(state, body, small).await {
         Ok(b) => b,
-        Err(r) => return *r,
+        Err(r) => {
+            let why = if r.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                Some(metrics::Reject::TooLarge)
+            } else if r.status() == StatusCode::SERVICE_UNAVAILABLE {
+                Some(metrics::Reject::Body)
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                state.metrics.reject(why);
+            }
+            return *r;
+        }
     };
     if state.buffered.load(Ordering::Relaxed) > state.buffered_cap {
+        state.metrics.reject(metrics::Reject::Output);
         return busy();
     }
+    let waited = Instant::now();
     let Ok(Ok(permit)) = tokio::time::timeout(QUEUE_WAIT, state.workers.clone().acquire_owned()).await else {
+        state.metrics.reject(metrics::Reject::Busy);
         return busy();
     };
+    state.metrics.worker_wait(waited.elapsed());
     let st = state.clone();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -2122,7 +2447,10 @@ async fn run_script(
     })
     .await
     {
-        Ok(r) => r,
+        Ok(mut r) => {
+            r.extensions_mut().insert(served);
+            r
+        }
         Err(e) => {
             eprintln!("internal error: {e}");
             page(StatusCode::INTERNAL_SERVER_ERROR, "500 Internal Server Error", "<p>Something went wrong.</p>")

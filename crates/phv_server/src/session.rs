@@ -23,6 +23,7 @@
 //! while it still exists, each as one atomic step, so a request that finishes
 //! after a logout (in this process or another) cannot bring the session back.
 
+use crate::metrics::{Health, StoreKind};
 use indexmap::IndexMap;
 use phv_std::safefs;
 use phv_vm::SessionData;
@@ -31,7 +32,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_SESSIONS: usize = 50_000;
@@ -128,11 +129,22 @@ struct DbStore {
     swept: AtomicU64,
     /// Sessions written since the last sweep; a burst triggers an early sweep.
     written: AtomicU64,
+    /// Whether the database answered (`/ready`, `/metrics`).
+    health: Arc<Health>,
 }
 
 impl DbStore {
     fn warn(what: &str, e: String) {
         eprintln!("warning: cannot {what} the session in the database: {e}");
+    }
+
+    /// Notes whether the database answered.
+    fn seen<T>(&self, r: Result<T, String>) -> Result<T, String> {
+        match &r {
+            Ok(_) => self.health.ok(StoreKind::Sessions),
+            Err(_) => self.health.failed(StoreKind::Sessions),
+        }
+        r
     }
 
     fn row(r: &Record, returned: bool) -> phv_std::SessionRow {
@@ -142,7 +154,7 @@ impl DbStore {
 
 impl Backend for DbStore {
     fn read(&self, id: &str) -> Option<(Record, bool)> {
-        let row = match phv_std::session_read(&self.spec, &session_key(id)) {
+        let row = match self.seen(phv_std::session_read(&self.spec, &session_key(id))) {
             Ok(r) => r?,
             Err(e) => {
                 Self::warn("read", e);
@@ -155,17 +167,17 @@ impl Backend for DbStore {
 
     fn insert(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<bool> {
         self.written.fetch_add(1, Ordering::Relaxed);
-        phv_std::session_insert(&self.spec, &session_key(id), &Self::row(r, returned), &self.limits)
+        self.seen(phv_std::session_insert(&self.spec, &session_key(id), &Self::row(r, returned), &self.limits))
             .map_err(std::io::Error::other)
     }
 
     fn update(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<bool> {
-        phv_std::session_update(&self.spec, &session_key(id), &Self::row(r, returned), &self.limits)
+        self.seen(phv_std::session_update(&self.spec, &session_key(id), &Self::row(r, returned), &self.limits))
             .map_err(std::io::Error::other)
     }
 
     fn remove(&self, id: &str) -> bool {
-        phv_std::session_remove(&self.spec, &session_key(id)).unwrap_or_else(|e| {
+        self.seen(phv_std::session_remove(&self.spec, &session_key(id))).unwrap_or_else(|e| {
             Self::warn("remove", e);
             false
         })
@@ -513,7 +525,7 @@ impl Store {
     }
 
     /// A store that keeps sessions in a database of `[databases]` (see `DbStore`).
-    pub fn with_database(ttl: Duration, secure: bool, spec: phv_vm::DatabaseSpec) -> Store {
+    pub fn with_database(ttl: Duration, secure: bool, spec: phv_vm::DatabaseSpec, health: Arc<Health>) -> Store {
         let mut store = Store::new(ttl, secure, None);
         let limits = phv_std::SessionLimits {
             ttl,
@@ -521,7 +533,8 @@ impl Store {
             max_sessions: MAX_SESSIONS,
             max_bytes: MAX_BYTES,
         };
-        store.files = Some(Box::new(DbStore { spec, limits, swept: AtomicU64::new(0), written: AtomicU64::new(0) }));
+        store.files =
+            Some(Box::new(DbStore { spec, limits, swept: AtomicU64::new(0), written: AtomicU64::new(0), health }));
         store
     }
 
@@ -825,7 +838,7 @@ mod tests {
                 continue;
             };
             let spec = phv_vm::DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 2 };
-            let store = Store::with_database(Duration::from_secs(60), false, spec.clone());
+            let store = Store::with_database(Duration::from_secs(60), false, spec.clone(), Arc::default());
             let mut s = SessionData::default();
             s.values.insert("user".into(), "alice".into());
             s.changed = true;

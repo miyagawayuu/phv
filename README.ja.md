@@ -45,6 +45,9 @@ echo greet($name);                                 // Web ページでは自動�
 - **Web アプリケーション**: パラメータ付きのルート(`public/posts/[id].phv`)、ミドルウェア(`_middleware.phv`)、
   独自のエラーページ、レイアウト、入力の検証(`std.validate`)、メール(`std.mail`)、データベースのマイグレーション
   (`phv db migrate`)、静的ファイルのキャッシュと範囲リクエスト、gzip、CORS、アクセスログ、穏やかな停止
+- **Web サービス**: 複数のサーバープロセスやマシンが、セッション、レート制限、CSRF トークン(`secret_env`)、
+  WebSocket と Server-Sent Events への `publish()`(`publish_store`)を共有する。再試行と cron 形式のスケジュールを持つ
+  バックグラウンドジョブ(`std.jobs`、`phv jobs`)。管理用ポートのヘルスチェックと Prometheus のメトリクス、リクエスト ID
 - **標準ライブラリ**: 正規表現(`std.regex`)、コンパイル時に検査する `format()`、タイムゾーン付きの日時(`std.time`)、
   型付きのクラスへの JSON のデコード(`json_decode_as`)、暗号化・署名付きトークン・JWT、list と map のメソッド、
   数学関数、UUID、CSV、URL、ディレクトリ、ログ、スクリプトの引数と標準入力
@@ -162,9 +165,9 @@ error: a URL attribute cannot start with an unchecked value
 | `phv_compiler` | HIR → レジスタ型バイトコード |
 | `phv_vm` | 値、バイトコード形式、インタプリタ、実行時の上限 |
 | `phv_jit` | int/bool/float/string を扱う関数を Cranelift でネイティブコードにする |
-| `phv_std` | 組み込み関数(文字列・JSON・日付・暗号・ファイル・SQLite・PostgreSQL・MySQL・Redis・WebSocket・HTTP クライアント・裏で動く処理・セッション)と、PHV で書かれた prelude・`std.http`・`std.db`・`std.net`・`std.async`・`std.validate`・`std.mail`・`std.regex`・`std.time`・`std.ws`・`std.testing`。マイグレーション |
+| `phv_std` | 組み込み関数(文字列・JSON・日付・暗号・ファイル・SQLite・PostgreSQL・MySQL・Redis・WebSocket・HTTP クライアント・裏で動く処理・セッション)と、PHV で書かれた prelude・`std.http`・`std.db`・`std.net`・`std.async`・`std.validate`・`std.mail`・`std.regex`・`std.time`・`std.ws`・`std.jobs`・`std.testing`。マイグレーション、ジョブのストア |
 | `phv_driver` | モジュールとテンプレートの読み込み、`phv.toml`、バイトコードキャッシュ、実行 |
-| `phv_server` | Web サーバー(hyper + tokio、HTTPS と HTTP/2)、ルーティング、セッション、CSRF、アップロード、WebSocket サーバー |
+| `phv_server` | Web サーバー(hyper + tokio、HTTPS と HTTP/2)、ルーティング、セッション、CSRF、アップロード、WebSocket サーバーと Server-Sent Events、プロセス間の `publish()`、ジョブの実行、管理用ポートとメトリクス |
 | `phv_cli` | `phv` コマンド(run / check / serve / test / fmt / lsp / install / migrate) |
 
 ## テスト
@@ -196,7 +199,7 @@ CI(`.github/workflows/ci.yml`)は Linux / Windows / macOS でこれらと clippy
 | 1,000 万回のループ | 14 ms | 286 ms | 348 ms |
 | 100 万文字の連結 | 22 ms | 31 ms | 66 ms |
 | マンデルブロ集合 300×300(float) | 4.2 ms | 234 ms | 198 ms |
-| 数値から文字列を 100 万個作る | 715 ms | 711 ms | 351 ms |
+| 数値から文字列を 100 万個作る | 304 ms | 337 ms | 351 ms |
 | 100 万要素の map / filter / sum | 184 ms | 180 ms | 88 ms |
 | map の更新 20 万回 | 42 ms | 46 ms | 34 ms |
 | 100 万までのエラトステネスの篩(`list<bool>`) | 89 ms | 155 ms | 107 ms |
@@ -204,15 +207,15 @@ CI(`.github/workflows/ci.yml`)は Linux / Windows / macOS でこれらと clippy
 | プロパティへの `.=` 20 万回 | 12 ms | 11 ms | 333 ms |
 | 文字列の比較(`==`)100 万回 | 21 ms | 46 ms | 40 ms |
 | 20 万個の文字列の HTML エスケープ | 89 ms | 86 ms | 93 ms |
-| オブジェクトを 100 万個作る | 201 ms | 207 ms | 110 ms |
-| 例外の送出と捕捉 10 万回 | 73 ms | 69 ms | 14 ms |
+| オブジェクトを 100 万個作る | 178 ms | 183 ms | 110 ms |
+| 例外の送出と捕捉 10 万回 | 40 ms | 42 ms | 14 ms |
 | 20 万要素の `sortBy` | 318 ms | 306 ms | 269 ms |
 
 JIT の対象は、扱う値がすべて `int`・`bool`・`float`・`string` か、その null 許容型か、それらの list・map の関数です。
 list と map はインタプリタと同じコードで処理するので、速くなるのはそのまわりのループです。クロージャやオブジェクトを
 多く使う処理はインタプリタで動き、上の表のとおり CPython より遅いものがあります(関数がコンパイルされない理由は
-`PHV_JIT_EXPLAIN=1` で分かります)。数値を大量に文字列にする処理(書式化に時間がかかる)と、
-例外(投げた場所を記録する)も遅くなります(今後の課題)。`PHV_JIT=0` で JIT を無効にできます。
+`PHV_JIT_EXPLAIN=1` で分かります)。例外(投げた場所を記録する)も遅くなります(今後の課題)。
+`PHV_JIT=0` で JIT を無効にできます。
 
 ## ライセンス
 

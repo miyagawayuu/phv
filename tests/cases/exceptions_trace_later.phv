@@ -1,0 +1,35 @@
+<?phv
+// The trace of an exception is made when it is first read: one kept while
+// thousands of others are thrown and freed still shows where it was thrown,
+// and a rethrown exception keeps its first place.
+function fail(string $why): void {
+    throw new RuntimeException($why);
+}
+
+function again(RuntimeException $e): void {
+    throw $e;
+}
+
+function first(): RuntimeException {
+    try {
+        fail("kept");
+    } catch (RuntimeException $e) {
+        return $e;
+    }
+    return new RuntimeException("not thrown");
+}
+
+$kept = first();
+for ($i = 0; $i < 5000; $i++) {
+    try {
+        fail("dropped");
+    } catch (RuntimeException $e) {
+    }
+}
+try {
+    again($kept);
+} catch (RuntimeException $e) {
+    echo $e == $kept ? "same object\n" : "another object\n";
+}
+echo $kept->getTraceAsString(), "\n";
+echo $kept->getTraceAsString() == $kept->getTraceAsString() ? "stable\n" : "changed\n";

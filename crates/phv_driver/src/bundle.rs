@@ -31,6 +31,8 @@ pub struct Bundle {
     pub pages: Vec<Page>,
     pub statics: Vec<(String, Vec<u8>)>,
     pub site: bool,
+    /// A site's jobs (`[jobs] dir`), each with its name as the path.
+    pub jobs: Vec<Page>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -81,7 +83,14 @@ fn config_text(root: &Path) -> Result<Option<String>, String> {
 pub fn build_script(root: &Path, entry: &Path) -> Result<Bundle, String> {
     let p = page(root, entry, String::new()).map_err(|e| e.render(false))?;
     let config = config_text(root)?;
-    Ok(Bundle { version: env!("CARGO_PKG_VERSION").into(), config, pages: vec![p], statics: Vec::new(), site: false })
+    Ok(Bundle {
+        version: env!("CARGO_PKG_VERSION").into(),
+        config,
+        pages: vec![p],
+        statics: Vec::new(),
+        site: false,
+        jobs: Vec::new(),
+    })
 }
 
 /// Compiles every page of the site at `root` (`public/**/*.phv`) and takes
@@ -117,7 +126,22 @@ pub fn build_site(root: &Path) -> Result<Bundle, String> {
         return Err(errors);
     }
     let config = config_text(root)?;
-    Ok(Bundle { version: env!("CARGO_PKG_VERSION").into(), config, pages, statics, site: true })
+    // The jobs of `[jobs] dir`, compiled like the pages.
+    let mut jobs = Vec::new();
+    let parsed = crate::config::parse_config(root, config.as_deref().unwrap_or(""))?;
+    if let Some(j) = &parsed.jobs {
+        for name in crate::config::scan_jobs(root, &j.dir).unwrap_or_default() {
+            let file = root.join(&j.dir).join(format!("{name}.phv"));
+            match page(root, &file, name) {
+                Ok(p) => jobs.push(p),
+                Err(e) => errors.push_str(&e.render(false)),
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(Bundle { version: env!("CARGO_PKG_VERSION").into(), config, pages, statics, site: true, jobs })
 }
 
 /// The regular files under `dir` (no links), as `/`-separated paths.
