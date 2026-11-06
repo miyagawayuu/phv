@@ -17,7 +17,7 @@
 //! `data:` lines; the Close event runs when the client goes away. There are no
 //! Message events (the client cannot send on the stream).
 
-use crate::body::RespBody;
+use crate::body::{Held, RespBody};
 use crate::{busy, simple, Page, Resp, State};
 use futures_util::{SinkExt, StreamExt};
 use hyper::body::Incoming;
@@ -363,6 +363,7 @@ pub async fn events(
         return busy();
     };
     let head = req.method() == hyper::Method::HEAD;
+    let abort = req.extensions().get::<crate::Abort>().cloned();
     let id = phv_std::random_hex(16);
     let origin = Origin { method: hyper::Method::GET, uri: req.uri().clone(), headers: req.headers().clone() };
     let outbox = state.hub.lock().unwrap_or_else(|e| e.into_inner()).register(&id);
@@ -396,11 +397,116 @@ pub async fn events(
     let st = state.clone();
     tokio::spawn(async move {
         let _slot = slot;
+        let held = Held::new();
+        let me = Registered { held: held.clone(), abort: abort.clone() };
+        st.streams.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), me);
         let conn = Conn { state: st.clone(), script, params, ip, origin, outbox, kept };
-        conn.stream_events(tx).await;
+        conn.stream_events(tx, held, abort).await;
+        st.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         st.hub.lock().unwrap_or_else(|e| e.into_inner()).unregister(&id);
     });
     r
+}
+
+/// An open event stream as the others see it (`State::streams`).
+pub struct Registered {
+    held: Arc<Held>,
+    abort: Option<crate::Abort>,
+}
+
+/// A stream that has held output this long without sending all of it may be
+/// dropped to make room for a stream that sent everything (its client reads).
+const MAKE_ROOM_AFTER: Duration = Duration::from_secs(1);
+/// How long such a stream waits for that room before it skips the event.
+const ROOM_WAIT: Duration = Duration::from_millis(200);
+
+/// How the sending of one chunk ended.
+enum Sent {
+    Yes,
+    /// The client went away.
+    Gone,
+    /// The stream must end and its connection be dropped: it held output for
+    /// too long, or more messages waited than its queue takes.
+    Cut,
+    /// The server is stopping.
+    Stopping,
+}
+
+/// What a stream has to watch while it waits to hand over a chunk.
+struct Watch<'a> {
+    tx: &'a tokio::sync::mpsc::Sender<bytes::Bytes>,
+    held: &'a Held,
+    outbox: &'a Outbox,
+    check: tokio::time::Interval,
+    drain: Duration,
+    closing: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Watch<'_> {
+    /// Whether the stream has held output for longer than it may.
+    fn stuck(&self) -> bool {
+        self.held.held_for().is_some_and(|d| d >= self.drain)
+    }
+
+    /// Hands `chunk` to the connection when it takes it, watching meanwhile
+    /// that the stream does not hold output for too long.
+    async fn send(&mut self, chunk: bytes::Bytes) -> Sent {
+        loop {
+            tokio::select! {
+                p = self.tx.reserve() => {
+                    return match p {
+                        Ok(p) => {
+                            p.send(chunk);
+                            Sent::Yes
+                        }
+                        Err(_) => Sent::Gone,
+                    }
+                }
+                _ = self.check.tick() => {
+                    if self.stuck() {
+                        return Sent::Cut;
+                    }
+                }
+                _ = self.outbox.ready.notified() => {
+                    if self.outbox.overflow.load(Ordering::SeqCst) {
+                        return Sent::Cut;
+                    }
+                }
+                _ = self.closing.changed() => return Sent::Stopping,
+            }
+        }
+    }
+}
+
+/// Counts the event `bytes` for stream `me`, which holds nothing, when the
+/// events' budget had no room for it: drops the connections of the other
+/// streams that have held output for `MAKE_ROOM_AFTER`, then tries again
+/// for up to `ROOM_WAIT`.
+async fn make_room(st: &State, me: &str, held: &Arc<Held>, bytes: Vec<u8>) -> Result<bytes::Bytes, Vec<u8>> {
+    {
+        let streams = st.streams.lock().unwrap_or_else(|e| e.into_inner());
+        for (id, s) in streams.iter() {
+            if id != me && s.held.held_for().is_some_and(|d| d >= MAKE_ROOM_AFTER) {
+                if let Some(a) = &s.abort {
+                    a.now();
+                }
+            }
+        }
+    }
+    let until = Instant::now() + ROOM_WAIT;
+    let mut bytes = bytes;
+    loop {
+        if st.events_buffered.load(Ordering::Relaxed) + bytes.len() <= st.events_cap {
+            match crate::body::counted_twice_within(bytes, &st.events_buffered, held, st.events_cap) {
+                Ok(chunk) => return Ok(chunk),
+                Err(b) => bytes = b,
+            }
+        }
+        if Instant::now() >= until {
+            return Err(bytes);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 struct Conn {
@@ -419,15 +525,32 @@ type Stream = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 impl Conn {
     /// Sends the connection's messages as events until the client goes away,
     /// the script closes it or the server stops; then runs the Close event.
-    async fn stream_events(self, tx: tokio::sync::mpsc::Sender<bytes::Bytes>) {
-        // What this stream has queued and not yet sent.
-        let mine = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut closing = self.state.ws_closing.subscribe();
+    ///
+    /// `held` is what the stream has handed over and the connection has not
+    /// sent yet; `abort` drops the stream's connection.
+    async fn stream_events(
+        self,
+        tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        held: Arc<Held>,
+        abort: Option<crate::Abort>,
+    ) {
+        let st = self.state.clone();
         let mut ping = tokio::time::interval(EVENT_PING_EVERY);
         ping.tick().await;
+        let drain = crate::event_drain();
+        let mut check = tokio::time::interval((drain / 10).clamp(Duration::from_millis(10), Duration::from_secs(1)));
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        check.tick().await;
+        let mut w =
+            Watch { tx: &tx, held: &held, outbox: &self.outbox, check, drain, closing: st.ws_closing.subscribe() };
+        // Ended while holding output its client has not taken (it does not
+        // read, or reads too little): its connection is dropped, so what it
+        // holds is freed at once.
+        let mut cut = false;
         let mut stopping = false;
         'conn: loop {
             if self.outbox.overflow.load(Ordering::SeqCst) {
+                cut = true;
                 break;
             }
             while let Some(out) = self.outbox.pop() {
@@ -437,13 +560,8 @@ impl Conn {
                         // as pages do (found by the 1.1 audit: 30 slow readers held
                         // 3.9 GB). A stream that still holds output is the one
                         // ended, when it would hold more than `STREAM_HELD` or the
-                        // server is over its cap; one that sent everything goes on,
+                        // events' budget is full; one that sent everything goes on,
                         // so slow readers cannot end the others' streams.
-                        let st = &self.state;
-                        // Streams have a budget of their own (found by the 1.1 audit:
-                        // counted with pages, streams that did not read made every
-                        // page answer 503). When it is full, a stream that sent
-                        // everything skips the event (delivery is at most once).
                         let bytes = event_bytes(&t);
                         // A message of so many lines that its event passes the
                         // limit is not sent as an event.
@@ -451,24 +569,64 @@ impl Conn {
                             st.metrics.reject(crate::metrics::Reject::Output);
                             continue;
                         }
-                        let held = mine.load(Ordering::Relaxed);
-                        if held + bytes.len() > STREAM_HELD {
+                        let had = held.bytes();
+                        if had + bytes.len() > STREAM_HELD {
                             st.metrics.reject(crate::metrics::Reject::Output);
+                            cut = true;
                             break 'conn;
                         }
-                        let Some(chunk) =
-                            crate::body::counted_twice_within(bytes, &st.events_buffered, &mine, st.buffered_cap)
-                        else {
-                            st.metrics.reject(crate::metrics::Reject::Output);
-                            if held > 0 {
+                        // Streams have a budget of their own (found by the 1.1 audit:
+                        // counted with pages, streams that did not read made every
+                        // page answer 503). A stream that holds output may fill three
+                        // quarters of it: the rest is kept for streams that sent
+                        // everything, whose clients read (found by the 1.1.1 review:
+                        // room freed by one stream that did not read was taken by
+                        // another, and readers missed events).
+                        let cap = if had > 0 { st.events_cap - st.events_cap / 4 } else { st.events_cap };
+                        let counted = crate::body::counted_twice_within(bytes, &st.events_buffered, &held, cap);
+                        // One that has held output for a while (its client does not
+                        // read) is ended; one that took its last event just now
+                        // skips this one.
+                        let lagging = held.held_for().is_some_and(|d| d >= MAKE_ROOM_AFTER);
+                        let chunk = match counted {
+                            Ok(chunk) => chunk,
+                            Err(_) if had > 0 && lagging => {
+                                st.metrics.reject(crate::metrics::Reject::Output);
+                                cut = true;
                                 break 'conn;
                             }
-                            continue;
+                            Err(_) if had > 0 => {
+                                st.metrics.reject(crate::metrics::Reject::Output);
+                                continue;
+                            }
+                            // When it is full, a stream that sent everything first
+                            // drops the streams that have held output for a while
+                            // (found by the 1.1.1 review: enough streams that did not
+                            // read made readers miss events until they were dropped),
+                            // then skips the event if there is still no room
+                            // (delivery is at most once).
+                            Err(bytes) => match make_room(&st, &self.kept.id, &held, bytes).await {
+                                Ok(chunk) => chunk,
+                                Err(_) => {
+                                    st.metrics.reject(crate::metrics::Reject::Output);
+                                    continue;
+                                }
+                            },
                         };
-                        if tx.send(chunk).await.is_err() {
-                            break 'conn;
+                        match w.send(chunk).await {
+                            Sent::Yes => {}
+                            Sent::Gone => break 'conn,
+                            Sent::Cut => {
+                                st.metrics.reject(crate::metrics::Reject::Output);
+                                cut = true;
+                                break 'conn;
+                            }
+                            Sent::Stopping => {
+                                stopping = true;
+                                break 'conn;
+                            }
                         }
-                        self.state.metrics.ws_out.fetch_add(1, Ordering::Relaxed);
+                        st.metrics.ws_out.fetch_add(1, Ordering::Relaxed);
                     }
                     Out::Close(..) => break 'conn,
                 }
@@ -476,21 +634,57 @@ impl Conn {
             tokio::select! {
                 _ = self.outbox.ready.notified() => {}
                 _ = tx.closed() => break,
-                _ = ping.tick() => {
-                    if tx.send(bytes::Bytes::from_static(b": ping\n\n")).await.is_err() {
+                _ = ping.tick() => match w.send(bytes::Bytes::from_static(b": ping\n\n")).await {
+                    Sent::Yes => {}
+                    Sent::Gone => break,
+                    Sent::Cut => {
+                        st.metrics.reject(crate::metrics::Reject::Output);
+                        cut = true;
+                        break;
+                    }
+                    Sent::Stopping => {
+                        stopping = true;
+                        break;
+                    }
+                },
+                // Output not all sent within `drain` (found by the 1.1.1 review: a
+                // client that read a little now and then kept up to 2 MB counted
+                // for as long as it liked).
+                _ = w.check.tick() => {
+                    if w.stuck() {
+                        st.metrics.reject(crate::metrics::Reject::Output);
+                        cut = true;
                         break;
                     }
                 }
-                _ = closing.changed() => {
+                _ = w.closing.changed() => {
                     stopping = true;
                     break;
                 }
             }
         }
+        let Watch { mut check, .. } = w;
         drop(tx);
+        if cut && held.bytes() > 0 {
+            if let Some(a) = &abort {
+                a.now();
+            }
+        }
         if !stopping {
             let ev = self.event(WsEvent::Close, String::new());
-            let _ = run_event(&self.state, &self.script, &self.params, &self.ip, &self.origin, ev).await;
+            let _ = run_event(&st, &self.script, &self.params, &self.ip, &self.origin, ev).await;
+            // Closed by the script (or its client went away): the client may
+            // take the rest, within the same time (found by the 1.1.1 review: over
+            // HTTP/2, what was left after the end of the stream was not watched).
+            while held.bytes() > 0 {
+                if held.held_for().is_some_and(|d| d >= drain) {
+                    if let Some(a) = &abort {
+                        a.now();
+                    }
+                    break;
+                }
+                check.tick().await;
+            }
         }
     }
 

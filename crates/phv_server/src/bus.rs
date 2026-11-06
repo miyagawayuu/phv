@@ -166,19 +166,54 @@ enum Decoded {
     /// From this process.
     Own,
     Invalid,
-    /// Signed, but older than `MAX_AGE_MS` or seen before: published again.
+    /// Signed, but seen before (or older than one seen): published again.
     Replayed,
+    /// Signed, but sent more than `MAX_AGE_MS` from this process's clock, or
+    /// before this process last subscribed: published again, or the clocks of
+    /// the processes differ. `age` is how long before this process's time it
+    /// was sent, in ms.
+    Clock {
+        from: [u8; ID_LEN],
+        age: i64,
+    },
 }
 
-/// The last sequence number of each process heard from.
+/// What is remembered of a process heard from.
+struct Sender {
+    /// Its last sequence number.
+    seq: u64,
+    /// When it was last heard from (ms, this process's clock).
+    at: i64,
+    /// How far ahead of this process's clock its clock is, at most (its
+    /// time minus this process's at receipt, the largest seen: the network
+    /// only makes it smaller, and a message published again smaller still).
+    offset: i64,
+}
+
+/// What a message must be to be new: the last sequence number of each
+/// process heard from, and when this process last subscribed.
 #[derive(Default)]
 struct Seen {
-    last: HashMap<[u8; ID_LEN], (u64, i64)>,
-    /// When this process subscribed (ms): a message from a process not heard
-    /// from yet, sent before that, was never owed to it (delivery is at most
-    /// once), so it is refused (found by the 1.1 audit: after a restart a
-    /// captured message was accepted again).
+    last: HashMap<[u8; ID_LEN], Sender>,
+    /// When this process last subscribed, or subscribed again after losing
+    /// its connection (ms). A message sent before that, while it was not
+    /// subscribed, was never owed to it (delivery is at most once), so it is
+    /// refused: from a process not heard from yet by its time (found by the
+    /// 1.1 audit: after a restart a captured message was accepted again), and
+    /// from one heard from by its time on this process's clock (found by the
+    /// 1.1.1 audit: messages sent while the connection was down, and captured,
+    /// were accepted once it was back). A second is allowed for the time a
+    /// subscription takes.
     since: i64,
+}
+
+/// Why `Seen::fresh` refused a message.
+#[derive(Debug, PartialEq)]
+enum Stale {
+    /// Seen before, or older than one seen.
+    Seen,
+    /// Sent before this process last subscribed.
+    Early,
 }
 
 impl Seen {
@@ -186,25 +221,46 @@ impl Seen {
         Seen { last: HashMap::new(), since }
     }
 
+    /// This process subscribed (again) at `now`, or asked to then.
+    fn subscribed(&mut self, now: i64) {
+        self.since = now;
+    }
+
     /// Whether `seq` from `from`, sent at `time`, is new; remembers it.
-    fn fresh(&mut self, from: [u8; ID_LEN], seq: u64, time: i64, now: i64) -> bool {
-        if let Some(&(last, _)) = self.last.get(&from) {
-            if seq <= last {
-                return false;
+    fn fresh(&mut self, from: [u8; ID_LEN], seq: u64, time: i64, now: i64) -> Result<(), Stale> {
+        let offset = time - now;
+        if let Some(s) = self.last.get(&from) {
+            if seq <= s.seq {
+                return Err(Stale::Seen);
+            }
+            if time - s.offset < self.since - 1000 {
+                return Err(Stale::Early);
             }
         } else if time < self.since - 1000 {
-            return false;
+            return Err(Stale::Early);
         } else if self.last.len() >= MAX_SENDERS {
             // Processes not heard from within the window can be forgotten:
             // their old messages are refused by their time.
-            self.last.retain(|_, (_, at)| now - *at <= 2 * MAX_AGE_MS);
+            self.last.retain(|_, s| now - s.at <= 2 * MAX_AGE_MS);
             if self.last.len() >= MAX_SENDERS {
-                return false;
+                return Err(Stale::Seen);
             }
         }
-        self.last.insert(from, (seq, now));
-        true
+        let offset = self.last.get(&from).map_or(offset, |s| s.offset.max(offset));
+        self.last.insert(from, Sender { seq, at: now, offset });
+        Ok(())
     }
+}
+
+/// The warning, once for each process, about a message signed with the
+/// site's key that was refused for its time.
+fn clock_warning(from: &[u8; ID_LEN], age: i64) -> String {
+    let when = if age >= 0 { format!("{age} ms ago") } else { format!("{} ms ahead", -age) };
+    format!(
+        "warning: publish_store: a message from server process {} was refused for its time (sent {when} by this \
+         server's clock, or before this process subscribed again); if this repeats, keep the servers' clocks in step",
+        hex(&from[..4])
+    )
 }
 
 fn decode(key: &[u8], instance: &[u8; ID_LEN], now: i64, seen: &mut Seen, f: &[u8]) -> Decoded {
@@ -224,7 +280,7 @@ fn decode(key: &[u8], instance: &[u8; ID_LEN], now: i64, seen: &mut Seen, f: &[u
     let time = i64::from_be_bytes(body[at..at + 8].try_into().expect("8 bytes"));
     let seq = u64::from_be_bytes(body[at + 8..at + 16].try_into().expect("8 bytes"));
     if (now - time).abs() > MAX_AGE_MS {
-        return Decoded::Replayed;
+        return Decoded::Clock { from, age: now - time };
     }
     let tlen = u16::from_be_bytes([body[head - 2], body[head - 1]]) as usize;
     if tlen == 0 || tlen > MAX_TOPIC || head + tlen > body.len() {
@@ -238,10 +294,11 @@ fn decode(key: &[u8], instance: &[u8; ID_LEN], now: i64, seen: &mut Seen, f: &[u
     if text.len() > MAX_TEXT || topic.chars().any(char::is_control) {
         return Decoded::Invalid;
     }
-    if !seen.fresh(from, seq, time, now) {
-        return Decoded::Replayed;
+    match seen.fresh(from, seq, time, now) {
+        Ok(()) => Decoded::Message(topic.to_string(), text.to_string()),
+        Err(Stale::Seen) => Decoded::Replayed,
+        Err(Stale::Early) => Decoded::Clock { from, age: now - time },
     }
-    Decoded::Message(topic.to_string(), text.to_string())
 }
 
 /// Signs and numbers the messages of this process, in the order they are sent
@@ -346,6 +403,8 @@ fn receive_loop(
     let mut warned = false;
     // Kept across connections: a frame seen before a reconnect is still refused.
     let mut seen = Seen::new(now_ms());
+    // Processes whose messages were refused for their time, said once each.
+    let mut warned_clock: std::collections::HashSet<[u8; ID_LEN]> = Default::default();
     // Waits up to `d`, a second at a time, unless the server stops.
     let pause = |d: Duration| {
         let until = Instant::now() + d;
@@ -354,8 +413,13 @@ fn receive_loop(
         }
     };
     while !stop.load(Ordering::SeqCst) {
+        // Before asking: nothing sent before this was owed to this process.
+        let asked = now_ms();
         let mut sub = match phv_std::redis_subscribe(spec, channel, Instant::now() + Duration::from_secs(10)) {
-            Ok(s) => s,
+            Ok(s) => {
+                seen.subscribed(asked);
+                s
+            }
             Err(e) => {
                 metrics.health.failed(StoreKind::Publish);
                 if !warned {
@@ -392,6 +456,12 @@ fn receive_loop(
                         Decoded::Own => {}
                         Decoded::Invalid | Decoded::Replayed => {
                             metrics.publish_invalid.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Decoded::Clock { from, age } => {
+                            metrics.publish_clock.fetch_add(1, Ordering::Relaxed);
+                            if warned_clock.len() < MAX_SENDERS && warned_clock.insert(from) {
+                                eprintln!("{}", clock_warning(&from, age));
+                            }
                         }
                     }
                 }
@@ -489,10 +559,11 @@ mod tests {
         assert_eq!(decode(&key, &me, now, &mut seen, &f1), Decoded::Replayed, "the same frame again");
         assert!(matches!(decode(&key, &me, now, &mut seen, &f2), Decoded::Message(..)));
         assert_eq!(decode(&key, &me, now, &mut seen, &f1), Decoded::Replayed, "an older one");
-        // Too old, or from too far ahead, even for a receiver that never saw it.
+        // Too old, or from too far ahead, even for a receiver that never saw it
+        // (refused for its time: counted apart, see `clock_warning`).
         for t in [now - MAX_AGE_MS - 1, now + MAX_AGE_MS + 1] {
             let f = encode(&key, &them, t, 9, "lobby", "x");
-            assert_eq!(decode(&key, &me, now, &mut Seen::new(0), &f), Decoded::Replayed);
+            assert_eq!(decode(&key, &me, now, &mut Seen::new(0), &f), Decoded::Clock { from: them, age: now - t });
         }
         // Another process's numbers are its own.
         let other = encode(&key, &[3u8; ID_LEN], now, 1, "lobby", "x");
@@ -501,8 +572,52 @@ mod tests {
         // sender it has not heard from (a restart does not open a window).
         let mut restarted = Seen::new(now);
         let before = encode(&key, &[4u8; ID_LEN], now - 5000, 1, "lobby", "x");
-        assert_eq!(decode(&key, &me, now, &mut restarted, &before), Decoded::Replayed);
+        assert!(matches!(decode(&key, &me, now, &mut restarted, &before), Decoded::Clock { .. }));
         let after = encode(&key, &[4u8; ID_LEN], now, 2, "lobby", "x");
         assert!(matches!(decode(&key, &me, now, &mut restarted, &after), Decoded::Message(..)));
+    }
+
+    /// After its connection to the store was lost and opened again, a process
+    /// refuses the messages a sender it knows sent while it was away, which
+    /// it was never owed (found by the 1.1.1 audit: a captured message sent
+    /// meanwhile was accepted, its number being higher than the last one
+    /// seen), measured by the sender's clock as this process saw it: a sender
+    /// whose clock is ahead or behind keeps its messages after the gap.
+    #[test]
+    fn frames_sent_before_subscribing_again_are_refused() {
+        let key = b"k".repeat(32);
+        let me = [1u8; ID_LEN];
+        let t0 = 1_000_000_000;
+        for skew in [0i64, 20_000, -20_000] {
+            let them = [9u8; ID_LEN];
+            // Subscribed a minute before (a sender not heard from yet is
+            // judged by its own clock).
+            let mut seen = Seen::new(t0 - 60_000);
+            // Heard from before the gap (their clock is `skew` ms off; the
+            // network took 5 ms).
+            let first = encode(&key, &them, t0 + 1000 + skew, 1, "lobby", "before");
+            assert!(matches!(decode(&key, &me, t0 + 1005, &mut seen, &first), Decoded::Message(..)), "{skew}");
+            // The connection is lost at t0 + 2 s and back at t0 + 10 s; they
+            // sent number 2 at t0 + 3 s, which is published again later.
+            let away = encode(&key, &them, t0 + 3000 + skew, 2, "lobby", "away");
+            seen.subscribed(t0 + 10_000);
+            assert_eq!(
+                decode(&key, &me, t0 + 10_500, &mut seen, &away),
+                Decoded::Clock { from: them, age: 7500 - skew },
+                "{skew}"
+            );
+            // What they send once it is back is delivered, then not twice.
+            let back = encode(&key, &them, t0 + 10_200 + skew, 3, "lobby", "back");
+            assert!(matches!(decode(&key, &me, t0 + 10_205, &mut seen, &back), Decoded::Message(..)), "{skew}");
+            assert_eq!(decode(&key, &me, t0 + 10_300, &mut seen, &back), Decoded::Replayed);
+            // A message sent while it subscribed again (within a second) is kept.
+            seen.subscribed(t0 + 20_000);
+            let racing = encode(&key, &them, t0 + 19_500 + skew, 4, "lobby", "racing");
+            assert!(matches!(decode(&key, &me, t0 + 20_010, &mut seen, &racing), Decoded::Message(..)), "{skew}");
+        }
+        // The warning names the sender and how far off its time was, never its text.
+        let w = clock_warning(&[0xab; ID_LEN], 7500);
+        assert!(w.starts_with("warning: publish_store:") && w.contains("abababab") && w.contains("7500 ms ago"), "{w}");
+        assert!(clock_warning(&[0; ID_LEN], -61_000).contains("61000 ms ahead"));
     }
 }

@@ -144,6 +144,46 @@ fn kept_connections_carry_nothing_between_scripts() {
     assert_eq!(reused(), before, "the connection of a failed statement was kept");
 }
 
+/// An idle connection is closed when it has been idle for the kept time (30
+/// seconds; 4 here), not up to half as long again (found by the 1.1.1 audit:
+/// the sweep woke every 15 seconds, so a connection held its file for up to
+/// 45). Only the time from a connection's return to its close is measured, so
+/// a slow machine running the scripts slowly does not change the result.
+#[test]
+fn idle_connections_are_closed_on_time() {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            phv_std::sqlite_set_kept_idle(None);
+        }
+    }
+    let site = Site::new("idle");
+    let idle = Duration::from_secs(4);
+    phv_std::sqlite_set_kept_idle(Some(idle));
+    let _restore = Restore;
+    let kept = || phv_std::sqlite_kept_stats().0;
+    let wait_for_none = |what: &str| -> Instant {
+        let until = Instant::now() + Duration::from_secs(120);
+        while kept() > 0 {
+            assert!(Instant::now() < until, "{what}: {} connections still kept", kept());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Instant::now()
+    };
+    // The connections other tests left go first (they may take 30 seconds).
+    wait_for_none("other tests' connections");
+    // One connection starts the sweep; a second one is returned while the
+    // first is still kept (the old sweep then closed it at 1.4 times the time).
+    assert_eq!(site.run("$a = Database::open(\"data/a.db\"); echo \"a\";", None), "a");
+    std::thread::sleep(idle * 6 / 10);
+    assert_eq!(site.run("$b = Database::open(\"data/b.db\"); echo \"b\";", None), "b");
+    let returned = Instant::now();
+    assert_eq!(kept(), 2);
+    let closed = wait_for_none("the idle connections");
+    let held = closed - returned;
+    assert!(held < idle + Duration::from_secs(1), "kept {held:?} after it was returned");
+}
+
 /// A recursive query that runs for a while.
 const SLOW: &str = "$n = $db->query(sql\"WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 3000000) SELECT count(*) AS n FROM c\")[0]->int(\"n\") ?? 0; echo $n;";
 

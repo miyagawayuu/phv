@@ -138,12 +138,20 @@ struct State {
     body_budget: Arc<tokio::sync::Semaphore>,
     /// Bytes of script output waiting to be sent, over all connections.
     buffered: Arc<AtomicUsize>,
-    /// Bytes of event streams waiting to be sent: a budget of their own, the
-    /// size of `buffered_cap`, so streams cannot make pages answer 503 (found
-    /// by the 1.1 audit).
+    /// Bytes of event streams waiting to be sent: a budget of their own,
+    /// `events_cap`, so streams cannot make pages answer 503 (found by the 1.1
+    /// audit).
     events_buffered: Arc<AtomicUsize>,
-    /// No new script runs while `buffered` is above this.
+    /// No new script runs while `buffered` and `events_buffered` together are
+    /// above this.
     buffered_cap: usize,
+    /// A quarter of `buffered_cap`: pages always have the other three
+    /// quarters, and both together stay within `buffered_cap` (found by the
+    /// 1.1.1 review: each had all of it, so the output reached twice the cap).
+    events_cap: usize,
+    /// The open event streams, by id: what each holds and how to drop its
+    /// connection (to make room for streams whose clients read).
+    streams: Mutex<HashMap<String, ws::Registered>>,
     /// Pages with parameters, and when `public/` was last scanned for them
     /// (again after a second in development mode, where files change).
     routes: Mutex<(Instant, Arc<routes::Table>)>,
@@ -215,6 +223,8 @@ impl State {
             events_buffered: Arc::new(AtomicUsize::new(0)),
             // As much output as the workers could make at once.
             buffered_cap: config.workers * (config.memory_limit_mb as usize) * 1024 * 1024,
+            events_cap: config.workers * (config.memory_limit_mb as usize) * 1024 * 1024 / 4,
+            streams: Mutex::new(HashMap::new()),
             config,
             root,
             dev,
@@ -672,20 +682,63 @@ fn serve_with(
     result
 }
 
-/// Runs connection `$conn` until it ends, or until the server stops (then
-/// it finishes the requests it has). With `$idle`, an HTTP/2 connection that
-/// has had no request for `H2_IDLE` is closed the same way.
+/// Drops the connection a request came on (each request carries one): an
+/// event stream that ends while holding output its client has not taken
+/// frees it at once, with everything the connection queued (found by the
+/// 1.1.1 review: it stayed counted until the connection stalled for 30 s, or
+/// for as long as the client read a little now and then).
+#[derive(Clone)]
+struct Abort(Arc<tokio::sync::Notify>);
+
+impl Abort {
+    fn new() -> Abort {
+        Abort(Arc::new(tokio::sync::Notify::new()))
+    }
+
+    /// Kept until the connection looks (`notify_one`), so it is never missed.
+    fn now(&self) {
+        self.0.notify_one();
+    }
+}
+
+/// How long an event stream may hold output without getting back to having
+/// sent all of it: as long as a write may stall (`WRITE_STALL`), unless a test
+/// shortened it.
+static EVENT_DRAIN_MS: AtomicU64 = AtomicU64::new(0);
+
+fn event_drain() -> Duration {
+    match EVENT_DRAIN_MS.load(Ordering::Relaxed) {
+        0 => WRITE_STALL,
+        ms => Duration::from_millis(ms),
+    }
+}
+
+/// For tests only (not a setting): shortens the time an event stream may
+/// hold output without sending all of it, for every server of this process.
+#[doc(hidden)]
+pub fn set_event_drain_for_tests(limit: Duration) {
+    EVENT_DRAIN_MS.store(limit.as_millis().max(1) as u64, Ordering::Relaxed);
+}
+
+/// Runs connection `$conn` until it ends, until the server stops (then it
+/// finishes the requests it has), or until `$abort` drops it. With `$idle`,
+/// an HTTP/2 connection that has had no request for `H2_IDLE` is closed the
+/// same way.
 macro_rules! drive {
-    ($conn:expr, $closed:expr, $idle:expr) => {{
+    ($conn:expr, $closed:expr, $idle:expr, $abort:expr) => {{
         let conn = $conn;
         tokio::pin!(conn);
         let idle: Option<Arc<Activity>> = $idle;
+        let abort: Abort = $abort;
         let mut closed = $closed;
         // Responses waiting to be sent, and when bytes last went out.
         let (mut last_written, mut progress) = (0u64, Instant::now());
         loop {
             tokio::select! {
                 _ = conn.as_mut() => break,
+                // Dropped here: the socket, the connection's queues and its
+                // streams' bodies go with it.
+                _ = abort.0.notified() => break,
                 _ = closed.changed() => {
                     conn.as_mut().graceful_shutdown();
                     let _ = conn.await;
@@ -855,8 +908,13 @@ async fn serve_h1<I>(state: Arc<State>, peer: SocketAddr, io: I, closed: Closed)
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let service = service_fn(move |req| handle(state.clone(), peer, req));
-    drive!(h1_builder().serve_connection(TokioIo::new(io), service).with_upgrades(), closed, None)
+    let abort = Abort::new();
+    let a = abort.clone();
+    let service = service_fn(move |mut req: Request<Incoming>| {
+        req.extensions_mut().insert(a.clone());
+        handle(state.clone(), peer, req)
+    });
+    drive!(h1_builder().serve_connection(TokioIo::new(io), service).with_upgrades(), closed, None, abort)
 }
 
 async fn serve_h2<I>(state: Arc<State>, peer: SocketAddr, io: I, closed: Closed, written: Arc<AtomicU64>)
@@ -865,7 +923,10 @@ where
 {
     let activity = Activity::new(written);
     let a = activity.clone();
-    let service = service_fn(move |req| {
+    let abort = Abort::new();
+    let ab = abort.clone();
+    let service = service_fn(move |mut req: Request<Incoming>| {
+        req.extensions_mut().insert(ab.clone());
         let open = OpenRequest::new(&a);
         let (state, a) = (state.clone(), a.clone());
         async move {
@@ -874,7 +935,7 @@ where
             r.map(|resp| resp.map(|b| Sending::new(b, &a)))
         }
     });
-    drive!(h2_builder().serve_connection(TokioIo::new(io), service), closed, Some(activity))
+    drive!(h2_builder().serve_connection(TokioIo::new(io), service), closed, Some(activity), abort)
 }
 
 /// `[server] h2c`: HTTP/1.1, or HTTP/2 when the client starts with its preface.
@@ -884,7 +945,10 @@ where
 {
     let activity = Activity::new(written);
     let a = activity.clone();
-    let service = service_fn(move |req| {
+    let abort = Abort::new();
+    let ab = abort.clone();
+    let service = service_fn(move |mut req: Request<Incoming>| {
+        req.extensions_mut().insert(ab.clone());
         let open = OpenRequest::new(&a);
         let (state, a) = (state.clone(), a.clone());
         async move {
@@ -896,7 +960,7 @@ where
     let mut b = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     h1_options!(b.http1());
     h2_options!(b.http2());
-    drive!(b.serve_connection_with_upgrades(TokioIo::new(io), service), closed, Some(activity))
+    drive!(b.serve_connection_with_upgrades(TokioIo::new(io), service), closed, Some(activity), abort)
 }
 
 type Resp = Response<RespBody>;
@@ -1742,21 +1806,38 @@ enum Opened {
     Missing,
 }
 
-/// Opens static file `p` (a blocking call): refused when it has another name
-/// too, or when it is no longer the file at `p`; read at once when it has at
-/// most `read_up_to` bytes.
-fn open_static(p: &Path, read_up_to: u64) -> Opened {
+/// Opens the file at `p`, a path inside `public` found earlier (up to a second
+/// earlier in production): a link or junction put on the way since then must
+/// not lead outside public/ (found by the 1.0.0 audit).
+///
+/// On Unix the path is walked from `public` one directory at a time without
+/// following links, and the file is opened without blocking, so a FIFO is
+/// refused as not a file (found by the 1.1.1 review: the name was looked up
+/// twice after the file was opened, and opening a FIFO stopped a thread).
+#[cfg(unix)]
+fn open_beneath(public: &Path, p: &Path) -> Option<std::fs::File> {
+    let rel = p.strip_prefix(public).ok()?;
+    let (dir, name) = phv_std::safefs::open_parent(public, rel).ok()?;
+    dir.open(&name, false).ok()
+}
+
+/// On Windows the handle's own path must still be `p`.
+#[cfg(not(unix))]
+fn open_beneath(_public: &Path, p: &Path) -> Option<std::fs::File> {
+    let file = std::fs::File::open(p).ok()?;
+    phv_std::safefs::opened_at(&file, p).ok()?;
+    Some(file)
+}
+
+/// Opens static file `p` beneath `public` (a blocking call): refused when it
+/// has another name too, or when it is no longer the file at `p`; read at once
+/// when it has at most `read_up_to` bytes.
+fn open_static(public: &Path, p: &Path, read_up_to: u64) -> Opened {
     use std::io::Read;
-    let Ok(file) = std::fs::File::open(p) else { return Opened::Missing };
+    let Some(file) = open_beneath(public, p) else { return Opened::Missing };
     // A file with another name (a hard link) may be one kept outside
     // public/, such as the TLS key (found by the 1.0 audit).
     if phv_std::safefs::single_file(&file).is_err() {
-        return Opened::Missing;
-    }
-    // `p` was found earlier (up to a second earlier in production): a link or
-    // junction put on the way since then must not lead outside public/
-    // (found by the 1.0.0 audit).
-    if phv_std::safefs::opened_at(&file, p).is_err() {
         return Opened::Missing;
     }
     let (len, modified) = match file.metadata() {
@@ -1824,7 +1905,8 @@ async fn serve_static(state: &Arc<State>, req: &Request<Incoming>, p: PathBuf, g
         (false, false) => 0,
     };
     let q = p.clone();
-    let Ok(opened) = tokio::task::spawn_blocking(move || open_static(&q, read_up_to)).await else {
+    let public = state.public.clone();
+    let Ok(opened) = tokio::task::spawn_blocking(move || open_static(&public, &q, read_up_to)).await else {
         return not_found();
     };
     let (file, len, modified, data) = match opened {
@@ -1906,7 +1988,7 @@ async fn cached_static(state: &Arc<State>, req: &Request<Incoming>) -> Option<Re
 /// same checks as when it was first sent).
 fn still_kept(state: &State, url_path: &str, e: &StaticEntry) -> bool {
     matches!(resolve(state, url_path), Some(Target::Static(p)) if p == e.path)
-        && matches!(open_static(&e.path, STATIC_KEEP), Opened::File { data: Some(d), .. } if d == e.data)
+        && matches!(open_static(&state.public, &e.path, STATIC_KEEP), Opened::File { data: Some(d), .. } if d == e.data)
 }
 
 /// A 206 answer for bytes `a..=b` of `len`.
@@ -2462,7 +2544,8 @@ async fn run_script(
             return *r;
         }
     };
-    if state.buffered.load(Ordering::Relaxed) > state.buffered_cap {
+    // Event streams count too: theirs is a quarter of the cap at most.
+    if state.buffered.load(Ordering::Relaxed) + state.events_buffered.load(Ordering::Relaxed) > state.buffered_cap {
         state.metrics.reject(metrics::Reject::Output);
         return busy();
     }
@@ -2564,7 +2647,7 @@ impl State {
             Some(Target::Script(p, params)) => self.execute(&p, params, ip, parts, body, Page::Normal, None),
             // Static files get the server's checks and headers (read whole: the
             // test reads the body at once).
-            Some(Target::Static(p)) => match open_static(&p, MAX_STATIC) {
+            Some(Target::Static(p)) => match open_static(&self.public, &p, MAX_STATIC) {
                 Opened::File { mut file, len, modified, data } => {
                     let data = match data {
                         Some(d) => d,

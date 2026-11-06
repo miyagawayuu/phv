@@ -249,6 +249,39 @@ fn copies_and_long_keys_stop_at_the_time_limit() {
     }
 }
 
+/// Found by the 1.0.0 audit: `==` on two structures that share their parts
+/// differently grew its table of pairs compared in one step, past the memory
+/// limit (to about twice it), before the limit was checked.
+#[test]
+fn shared_structures_compare_within_the_memory_limit() {
+    // Each level holds 2048 lists of two, made of lists of the level below;
+    // the sides pick them in different orders, so the pairs compared grow
+    // toward 2048 × 2048 per level while the values take a few MB.
+    let src = r#"<?phv
+$m = 2048;
+list<any> $a = [];
+list<any> $b = [];
+for ($i = 0; $i < $m; $i++) { $a[] = [0]; $b[] = [0]; }
+for ($k = 0; $k < 40; $k++) {
+    list<any> $na = [];
+    list<any> $nb = [];
+    for ($i = 0; $i < $m; $i++) {
+        $na[] = [$a[(2 * $i) % $m], $a[(2 * $i + 1) % $m]];
+        $nb[] = [$b[(3 * $i) % $m], $b[(3 * $i + 1) % $m]];
+    }
+    $a = $na;
+    $b = $nb;
+}
+echo $a == $b ? "equal" : "different";
+"#;
+    let limit = 32 << 20;
+    let (out, peak) = run_limited("shared_equal", src, Limits { max_memory: Some(limit), ..Limits::default() });
+    assert!(out.contains("allowed memory size of 32 MB exhausted"), "{out}");
+    // The table grows by doubling: without the reservation it held about
+    // 59 MB at once here.
+    assert!(peak < limit + limit / 4, "held {} MB", peak >> 20);
+}
+
 /// Found by the 1.1 audit: literal HTML written in a loop was never counted
 /// (4 GB under 128 MB).
 #[test]
@@ -331,7 +364,8 @@ fn enum_cases_are_timed() {
 #[test]
 fn enum_lookups_are_timed() {
     let mut src = String::from("<?phv\nenum E: int {\n");
-    for i in 0..200_000 {
+    // Five tokens a case: as many as a file may have (1,000,000 tokens).
+    for i in 0..190_000 {
         src.push_str(&format!("    case C{i} = {i};\n"));
     }
     src.push_str("}\n$n = 0;\nwhile (true) { $n = $n + (E::tryFrom(-1) == null ? 1 : 0); }\n");

@@ -91,6 +91,8 @@ fine-grained token with read and write access to the contents of those two repos
 
 ## 6. After the release
 
-- Set `ARG PHV_VERSION` in `examples/demo/Dockerfile` to the new version, push it, and deploy the demo
+- Set `ARG PHV_VERSION` in `examples/demo/Dockerfile` to the new version and `ARG PHV_SHA256` to the hash of
+  `phv-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz` in the `SHA256SUMS` checked in step 4 (the build refuses any other
+  archive, so a release asset replaced later is not used), push it, and deploy the demo
   (`fly deploy -a phv-demo` from `examples/demo`). Check that every page of https://demo.phv-lang.org/ answers.
 - The website is deployed by `.github/workflows/website.yml` when `docs/` or `website/` change on `main`.

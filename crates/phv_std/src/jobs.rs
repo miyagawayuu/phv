@@ -455,16 +455,14 @@ fn add(vm: &mut Vm, a: &[Value]) -> R {
         if let Err(e) = netdb::job_store_ready(db, ns.as_deref(), vm.deadline()) {
             return Err(vm.throw("DatabaseError", format!("enqueue(): {e}")));
         }
-        match netdb::job_add_in_transaction(vm, db_name, (&id, &name, &payload), run_at, uniq.as_deref(), MAX_JOBS) {
+        let job = (id.as_str(), name.as_str(), payload.as_str());
+        match netdb::job_add_in_transaction(vm, db, db_name, job, run_at, uniq.as_deref(), MAX_JOBS) {
             Some(Ok(Some(()))) => {
                 added(&store);
                 return Ok(Value::str(id));
             }
             Some(Ok(None)) => return Ok(Value::Null),
-            Some(Err(e)) if e.starts_with("the job queue holds") => {
-                return Err(vm.throw("RuntimeException", format!("enqueue(): {e}")))
-            }
-            Some(Err(e)) => return Err(vm.throw("DatabaseError", format!("enqueue(): {e}"))),
+            Some(Err(e)) => return Err(e),
             // No transaction: added on a connection of its own below.
             None => {}
         }

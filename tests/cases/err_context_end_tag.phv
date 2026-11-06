@@ -1,0 +1,9 @@
+<?phv
+// Code between `</` and the rest of an end tag that a browser may read inside
+// `<noscript>`, `<svg>` or `<math>` could complete it (errors, but the last line).
+function f(): void {}
+?>
+<noscript><!--</<?phv f(); ?>--></noscript>
+<svg><p title="</<?phv f(); ?>"></p></svg>
+<math><!--</<?phv f(); ?>--></math>
+<noscript><!--</ <?phv f(); ?>--></noscript>

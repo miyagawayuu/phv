@@ -720,8 +720,9 @@ opens nothing, and `</math>` does not close an `<svg>`), markup inside `<noscrip
 before a value or block (a value there would name a tag: an error),
 and text such as `</scripts>` that looks like an end tag but is not one. The end tag of an element whose text a browser may read as raw
 text (`</textarea>`, `</noscript>`, `</xmp>`...) inside a comment or an attribute value is an error, and so is a value right after `</`
-and the start of such a name there: where a browser reads the element differently (`<noscript>` with scripting on, `<foreignObject>`),
-that end tag would end it and turn what follows into markup.
+and the start of such a name there, or any other statement there (`</<?phv f(); ?>`: a function could write the rest): where a
+browser reads the element differently (`<noscript>` with scripting on, `<foreignObject>`), that end tag would end it and turn what
+follows into markup.
 
 | Location | Example | Treatment |
 |---|---|---|
@@ -754,6 +755,8 @@ that end tag would end it and turn what follows into markup.
   dropped, so the `catch` block writes where the `try` began rather than inside what was left open. Other
   exceptions keep the output written before them.
 - Expressions and statements can be nested up to 500 levels (this prevents deeply nested source from overflowing the implementation's stack).
+- A source file may have up to 1,000,000 tokens, the code inside its strings included: a larger one is refused before it is
+  parsed, since its syntax tree would take many times its size in memory.
 
 ## 14. Web server
 
@@ -767,6 +770,10 @@ phv serve examples/site --port 8080
 - Not served: anything outside `public/`, files and directories whose names start with `.` or `_` (`_partial.phv` can be used as a partial),
   `.phv.html` (templates), and unknown extensions (`.php`, `.bak`, `.sql`, etc.). The URL must match the file name's spelling
   exactly (`INDEX.PHV`, Windows short names, and `::$DATA` do not open the file).
+- A static file is never reached through a symbolic link or junction, even one put on the way after the path was
+  found. On Unix it is opened from `public/` one directory at a time without following links, and without waiting:
+  a FIFO or device is not served, nor a file under a directory other users can write to. A file with another hard
+  link is not served either.
 - Each request runs in a new VM (a new heap). Only the compiled bytecode is shared.
 - When a file is saved, it is recompiled on the next request (the modification times of all the files it depends on are checked).
   A production server (`--prod`) looks at the files at most once a second: what a request path leads to, the files a
@@ -777,8 +784,8 @@ phv serve examples/site --port 8080
   client accepts no data for 30 seconds. Static files (and `response()->file()`) are sent from disk as they are read,
   so they do not take memory; a production server keeps static files of up to 256 KB in memory, 32 MB in all.
 - At most `[server] workers` scripts run at once (default: two per CPU, at least 8); a request waits up to 10 seconds
-  for one. A request that cannot get one in time, or that arrives while the output waiting to be sent to clients is
-  more than the workers could produce (`workers` × `memory_limit_mb`), gets `503 Service Unavailable` with
+  for one. A request that cannot get one in time, or that arrives while the output waiting to be sent to clients
+  (event streams included) is more than the workers could produce (`workers` × `memory_limit_mb`), gets `503 Service Unavailable` with
   `Retry-After: 5`. Static files do not need a worker. Past their first 64 KB, request bodies are received only within a
   budget of `workers` × 8 MB, taken as the bytes arrive (a stated `Content-Length` or a chunked body that has not been
   sent holds nothing) and kept until its script ends; a request whose next bytes cannot get their share within
@@ -809,7 +816,8 @@ tls_key = "/etc/letsencrypt/live/example.com/privkey.pem"
 ```
 
 - With `tls_cert` and `tls_key` (PEM files on this machine; a relative path is relative to the project; a network
-  share such as `\\host\share` is refused), `phv serve` speaks HTTPS only. Clients choose HTTP/2 or
+  share such as `\\host\share`, a network drive, or a symbolic link to one is refused, and links are looked at without
+  being followed, so the host is never contacted), `phv serve` speaks HTTPS only. Clients choose HTTP/2 or
   HTTP/1.1 during the handshake (ALPN). TLS 1.2 and 1.3 are offered, with the safe default cipher suites of rustls;
   0-RTT is not.
 - The files are read when the server starts: a key that does not belong to the certificate, a file that is not
@@ -1012,20 +1020,27 @@ session()->destroy();                 // log out
   sends the cookie back, and is then renamed to `<hash>.json`.
 - With `[security] session_store = "db:<name>"`, sessions are kept in that database of `[databases]` (Redis, PostgreSQL
   or MySQL), shared by every server process and machine that uses it. Redis keeps each under `phv:session:<hash>` and
-  expires it itself; a session whose visitor has not sent the cookie back expires after an hour at most. PostgreSQL and
-  MySQL keep them in a table `phv_sessions`, created when first needed; every 30 seconds (sooner after 1,000 new
-  sessions) a server removes expired sessions and keeps the table within the limits below. If the database cannot be
-  reached, the request goes on without its session and a warning is logged.
+  expires it itself; a session whose visitor has not sent the cookie back expires after an hour at most. The counts
+  that keep a site within the limits below are under `phv:sessions:<namespace>:`. PostgreSQL and MySQL keep a site's
+  sessions in a table of its own, `phv_sessions_<namespace>`, created when first needed; every 30 seconds (sooner
+  after 1,000 new sessions) a server removes expired sessions and keeps the table within the limits below. If the
+  database cannot be reached, the request goes on without its session and a warning is logged.
 - Sites that share a database keep their sessions apart by the site's namespace: `[security] store_namespace`, or
   else `[project] name` (rate limits and jobs are kept under it too). Two copies of a site with the same name, such as
   staging and production, must set different `store_namespace` values (a server using a shared store without it
-  says so when it starts); a site with neither shares the store with every other such site. Sessions stored before 1.1 are not read by a site with a namespace, so upgrading signs its
-  visitors out once. Sites sharing a session database still share its limits (below), and with PostgreSQL or MySQL
-  the shortest `session_ttl` among them: give each site a database of its own where you can.
+  says so when it starts); a site with neither shares the store with every other such site (the table
+  `phv_sessions` and the keys `phv:sessions:*`). Sessions stored before 1.1 are not read by a site with a namespace,
+  so upgrading to 1.1 signed its visitors out once. Each site has its own `session_ttl` and its own limits: sites
+  that share a database share only its capacity.
+- Sessions that 1.1 stored for a site with a namespace in the shared table `phv_sessions` (PostgreSQL, MySQL), or
+  counted under the shared keys `phv:sessions:new`, `back`, `keep`, `size` and `bytes` (Redis), are still read,
+  updated where they are and logged out, so upgrading from 1.1 signs no one out. They last at most 24 hours. Once no
+  1.1 process uses the database, that table and those keys may be removed, unless a site without a namespace uses
+  them.
 - In every store, a session is saved only while it still exists (a new or regenerated id only if it is new), each as
   one atomic step: a request that finishes after a logout, in this process or another, cannot bring the session back,
   and of two requests that regenerate the same session only one gets it.
-- The store holds at most 50,000 sessions and 256 MB of session data (Redis keeps within both as sessions are written).
+- A site's store holds at most 50,000 sessions and 256 MB of session data (Redis keeps within both as sessions are written).
   When it is full, sessions whose visitor never came back are removed first (the least recently used), then the newest
   of the rest: a flood of sessions, even ones whose cookie is sent back, removes its own sessions and never those
   created before it. Idle sessions still end after `session_lifetime`.
@@ -1336,14 +1351,23 @@ events.onmessage = (e) => console.log(e.data);
   does not read is dropped), and gets a comment line (`: ping`) every 15 seconds so proxies keep it open. It is never
   compressed or cached, works over HTTP/1.1 and HTTP/2, and other sites may open one only as for WebSockets (`[cors]`).
   A stream holds no worker between events.
-- Events count until they are sent, in a budget of their own of `workers` × `memory_limit_mb` (apart from pages',
-  so streams never make pages wait; the server's output can reach twice that in all). A stream may hold 2 MB unsent,
-  and a message whose event is larger (1 MB of text with more than about 150,000 lines) is not sent as an event. A
-  stream that still holds output is ended when its next event would pass that, or while the budget is full, and the
-  browser connects again; a stream that has sent everything skips events while the budget is full (delivery is at
-  most once). Both count as `output` in `phv_rejected_total`. So clients that do not read cannot end the streams of
-  those that do, nor slow down pages; only as many of them as the budget holds at 2 MB each (1,000 for 2 GB) make
-  readers miss events, until they are dropped (30 seconds without progress).
+- Events count until they are sent, in a budget of their own: a quarter of `workers` × `memory_limit_mb`. Pages
+  always have the other three quarters, so streams never make pages wait, and pages and streams together stay within
+  `workers` × `memory_limit_mb`. A stream may hold 2 MB unsent, and a message whose event is larger (1 MB of text with
+  more than about 150,000 lines) is not sent as an event.
+- A stream that still holds output may fill three quarters of the budget; the last quarter is kept for streams that
+  have sent everything. A stream that has held output for a second is ended when its next event would pass 2 MB or
+  find no room; one that took its last event less than a second ago skips the event instead.
+- A stream must get back to having sent everything within 30 seconds, or it is ended. So a client that reads only a
+  little now and then cannot keep its output counted.
+- When a stream is ended while it still holds output, its connection is dropped at once (over HTTP/2, with the other
+  requests on it), so what it held is freed; the browser connects again. A stream that the script closes may still
+  send what it holds, within the same 30 seconds.
+- When the budget is full, a stream that has sent everything drops the connections of the streams that have held
+  output for a second, waits up to 0.2 seconds for room, and skips the event if there is still none (delivery is at
+  most once). Ended streams and skipped events count as `output` in `phv_rejected_total`. So clients that do not
+  read cannot end the streams of those that do, nor slow down pages, nor make readers miss events for more than
+  about a second.
 
 #### publish() across server processes
 
@@ -1373,8 +1397,11 @@ publish_store = "cache"
   (`client-output-buffer-limit pubsub`, 32 MB by default): the process connects again, and what was sent in between is
   lost. Keep what must not be lost in a database, and use `publish()` to say that something changed.
 - Messages are signed with a key derived from `secret_env` and carry the id of the process that sent them, the time
-  they were sent and a number that grows with each message. A process skips its own, and drops (and counts as
-  `invalid`) a message sent more than 60 seconds before or after its own clock (keep the servers' clocks in step), one
+  they were sent and a number that grows with each message. A process skips its own. It drops a message sent more
+  than 60 seconds before or after its own clock, and one sent before the process last subscribed (after a lost
+  connection too), judged by the sender's clock as the process saw it: such a message was never owed to it. These
+  count as `clock` in `phv_publish_total`, and the first from each sending process logs a warning (keep the servers'
+  clocks in step). It drops (and counts as `invalid`) a message
   it has already received or older than one it received from the same process, one that is not signed with the site's key, is malformed,
   breaks the rules of `publish()` (a topic of 1 to 200 bytes without control characters, a text of at most 1 MB), or is
   longer than that: such a message is read and thrown away as it arrives, never held. The channel's name is derived
@@ -1658,10 +1685,13 @@ $data = json_decode($j->payload);
   are kept in a table `phv_jobs_<hash>` of the site's namespace (see "Sessions"; `phv_jobs` for a site without one),
   created when first needed and taken with `SELECT ... FOR UPDATE SKIP LOCKED`; Redis keeps them under
   `phv:jobs:<hash>:`. Every server process and machine of the site using the same store shares the jobs; other sites
-  on the same database do not see them; jobs left in the shared table when a site gets a name are not taken. Jobs
-  added by transactions that have not committed yet are not counted toward the 100,000, so transactions running at
-  the same time can each pass it by what they add. With `store = "memory"` the jobs live in the server process and
-  are lost when it stops.
+  on the same database do not see them; jobs left in the shared table when a site gets a name are not taken. The
+  100,000 hold for transactions running at the same time too: `enqueue()` in a transaction takes a lock of the site's
+  jobs that the transaction holds until it ends (PostgreSQL an advisory lock, MySQL a row of a table
+  `phv_jobs_lock`), so transactions that add jobs to the same site wait for one another, and so does an `enqueue()`
+  outside a transaction when the queue is within 10,000 jobs of the cap. Farther from the cap it does not wait: a
+  transaction that adds more than 10,000 jobs while others are added outside can still pass the cap by its jobs
+  beyond 10,000. With `store = "memory"` the jobs live in the server process and are lost when it stops.
 - **Schedules**: each `[[schedule]]` adds its job (with an empty payload) in the minutes its `cron` expression
   matches, in `timezone`. Fields are `*`, numbers, ranges `a-b`, steps `*/n` and lists `a,b`; days of the week are 0
   to 7 (Sunday is 0 and 7); when the day of the month and the day of the week are both given, either one matches. Each
@@ -2274,8 +2304,11 @@ It then runs the type checker and shows the places that need manual work, such a
      Objects that reach each other in a cycle (`$node->next = $node`, or an object holding a closure that captured
      it) are freed while the script runs: a cycle collector runs between instructions each time the number of live
      objects has doubled since its last run (first at 4,096), and it looks at no more than 16 values per object made
-     since then. Objects that are still reachable from a variable, a list, a map, a closure or another live object are
-     never freed. When a run ends, the fields of every object left are cleared. Objects of a class whose properties all
+     since then. It also runs when the memory in use passes three quarters of the limit, and once more before a script
+     is stopped at the limit, if objects were made since its last run (still within the 16 values per object made).
+     Native code cannot run it: when native code runs out of memory and the collector frees cycles made before the
+     call, the interpreter runs the call again. Objects that are still reachable from a variable, a list, a map, a
+     closure or another live object are never freed. When a run ends, the fields of every object left are cleared. Objects of a class whose properties all
      hold scalars, strings or enum cases cannot be part of a cycle: the collector does not look at them.
    - **JIT** (Cranelift): functions whose locals are all `int`, `bool`, `float` or `string`, nullable ones (`?int`,
      ...), or lists and maps of them (`list<int>`, `map<string, int>`, ...) are compiled to native code when every
@@ -2289,7 +2322,8 @@ It then runs the type checker and shows the places that need manual work, such a
      that kept it out.
      Integer overflow, division and modulo by zero, negative shifts, out-of-range float to int conversion, recursion
      depth, and the execution time and memory limits are checked in the JIT just as in the interpreter. Native code
-     uses at most 8 MB of stack: a call that needs more (deep recursion of a function with a large frame) is run by
+     uses at most 8 MB of stack, and never comes within 1 MB of the end of the thread's stack (on Windows, Linux and
+     macOS, which tell where it ends): a call that needs more (deep recursion of a function with a large frame) is run by
      the interpreter instead, whose frames are not on the stack. Compiled functions have no side effects, so the
      result is the same; a function that changes a string, list or map parameter in place (`$xs[] = ...`) stops
      with "maximum call stack depth exceeded" instead (its arguments are not kept for a rerun, so changing them
@@ -2312,14 +2346,15 @@ It then runs the type checker and shows the places that need manual work, such a
 |---|---|---|
 | Execution time | `serve`: 30 seconds (`--time-limit`), `run`: none | Fatal error (cannot be caught) |
 | Memory | 128 MB (`[security] memory_limit_mb`) | Fatal error |
-| Call depth | 10,000 | Fatal error |
+| Call depth | 10,000 (callbacks of builtins inside each other: 200, each only while 512 KB of the thread's stack is left) | Fatal error |
 | Request body | 8 MB | 413 |
 | Scripts running at once (`serve`) | two per CPU, at least 8 (`[server] workers`) | waits up to 10 seconds, then 503 |
 | Jobs running at once (`serve`, `phv jobs run`) | 2 per process (`[jobs] workers`), each with `[jobs] time_limit` (300 s) and `memory_limit_mb`, besides the scripts of pages | the job waits in the store |
 | Jobs waiting and running in the store | 100,000 (memory: 10,000 or 64 MB); a payload 64 KB | `enqueue()` throws |
-| Output waiting to be sent (`serve`) | `workers` × `memory_limit_mb` | 503 |
+| Output waiting to be sent (`serve`) | `workers` × `memory_limit_mb`, a quarter of it for event streams | 503; an event stream is ended or skips the event |
 | Request body bytes past the first 64 KB, received or held (`serve`) | `workers` × 8 MB | waits up to 10 seconds, then 503 |
 | Source file (module, template, script) | 8 MB | Compile error (`phv lsp`: a larger open document is not checked or formatted, and renames are refused while it is open) |
+| Tokens of one source file (the code inside its strings included) | 1,000,000 | Compile error (the file is not parsed) |
 | Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits) |
 | Variables and temporary values of one function | 65,534 | Compile error (split the function) |
 | Properties of one class (inherited ones included) | 65,535 | Compile error |
@@ -2330,7 +2365,8 @@ It then runs the type checker and shows the places that need manual work, such a
 | Size of the type an alias stands for | 10,000 type nodes (2,000,000 for all uses together) | Compile error |
 
 `unsafe` is used only in the allocator that counts memory usage (`phv_vm/src/alloc.rs`), in the JIT
-(`phv_jit`, for calling generated code, and the helpers it calls in `phv_vm/src/jit.rs`), in calls to OS file APIs (`phv_std/src/safefs.rs`) and in the SQLite VFS
+(`phv_jit`, for calling generated code, and the helpers it calls in `phv_vm/src/jit.rs`), in asking the OS where a thread's
+stack ends (`phv_vm/src/stack.rs`), in calls to OS file APIs (`phv_std/src/safefs.rs`) and in the SQLite VFS
 that checks journal files (`phv_std/src/db/vfs.rs`).
 
 ## 18. Compatibility and versions

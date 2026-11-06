@@ -1,0 +1,21 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: fills the job store of the
+// test's namespace with 97,000 waiting jobs, 3,000 below the cap.
+import std.db.Database;
+import std.jobs.enqueue;
+
+$db = Database::connect("main");
+enqueue("burst", "first");
+$db->execute(sql"DELETE FROM phv_jobs_cafe0123cafe0123cafe0123cafe0123");
+try {
+    $db->execute(sql"INSERT INTO phv_jobs_cafe0123cafe0123cafe0123cafe0123
+        (id, name, payload, run_at, attempts, state, created)
+        SELECT md5(g::text), 'burst', '', 0, 0, 0, 0 FROM generate_series(1, 97000) g");
+} catch (DatabaseError $e) {
+    $db->execute(sql"SET SESSION cte_max_recursion_depth = 100000");
+    $db->execute(sql"INSERT INTO phv_jobs_cafe0123cafe0123cafe0123cafe0123
+        (id, name, payload, run_at, attempts, state, created)
+        WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < 97000)
+        SELECT md5(n), 'burst', '', 0, 0, 0, 0 FROM g");
+}
+echo $db->first(sql"SELECT count(*) AS n FROM phv_jobs_cafe0123cafe0123cafe0123cafe0123")?->int("n") ?? -1;

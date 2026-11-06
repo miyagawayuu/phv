@@ -1,13 +1,16 @@
 use crate::ast::*;
 use crate::diag::Diagnostic;
-use crate::lexer::{lex, Mode};
+use crate::lexer::{lex, lex_counted, too_many_tokens, Mode, MAX_TOKENS};
 use crate::span::Span;
 use crate::token::{StrPart, Tok, Token};
 
 pub fn parse_module(src: &str, file: u32, is_template: bool) -> (Module, Vec<Diagnostic>) {
     let mode = if is_template { Mode::Html } else { Mode::Code };
-    let (toks, mut diags) = lex(src, file, 0, mode);
+    let (toks, mut diags, too_large) = lex_counted(src, file, 0, mode);
     let mut p = Parser::new(toks, file, is_template);
+    // Past the limit of tokens, nothing of the file is parsed: it is refused.
+    p.tokens = p.toks.len() - 1;
+    p.halted = too_large;
     let stmts = p.block_until(&[]);
     // A page with a layout must end at the top too: its output is joined with the layout's.
     if (is_template || p.uses_layout) && !p.halted && !p.html.at_top_level() {
@@ -64,6 +67,9 @@ struct Parser {
     /// Set when the nesting limit was hit: the rest of the file is skipped and
     /// no further errors are reported.
     halted: bool,
+    /// Tokens of the file so far, those of interpolated expressions included
+    /// (see `lexer::MAX_TOKENS`).
+    tokens: usize,
     /// Tokens that `expect_gt` split (`>>` into `>` `>`), with their original
     /// form, so a parse that backtracks can put them back.
     splits: Vec<(usize, Token)>,
@@ -142,6 +148,7 @@ impl Parser {
             uses_layout: false,
             depth: 0,
             halted: false,
+            tokens: 0,
             splits: Vec::new(),
             exits: Vec::new(),
         }
@@ -488,7 +495,23 @@ impl Parser {
 
     fn stmt(&mut self) -> PResult<Stmt> {
         let ctx = self.html.context();
+        // Code between `</` and the rest of an end tag hidden from the tracker
+        // could complete it (found by the 1.0.0 audit: a function called there
+        // passed `phv check` and stopped the page only at run time).
+        let hidden_end_tag = self.html.watched_end_tag_start();
+        let start = self.span();
         let mut s = self.stmt_here()?;
+        if hidden_end_tag
+            && !self.halted
+            && !matches!(s.kind, StmtKind::InlineHtml(..) | StmtKind::Echo(..) | StmtKind::HtmlEcho(..))
+        {
+            let mut d = Diagnostic::error(
+                "code right after `<` or `</` in a comment, an attribute value or raw text inside `<noscript>`, `<svg>` or `<math>`",
+                start,
+            );
+            d.add_note("it could complete the end tag of a raw-text element (such as `</noscript>`), which a browser would read there; put a space after `<`, or move the code");
+            self.diags.push(d);
+        }
         if ctx != EchoContext::Text && !matches!(s.kind, StmtKind::InlineHtml(..)) {
             s.out = Some(ctx);
         }
@@ -1808,8 +1831,20 @@ impl Parser {
     }
 
     fn sub_expr(&mut self, code: &str, offset: u32) -> PResult<Expr> {
+        if self.halted {
+            return Err(PErr);
+        }
         let (toks, diags) = lex(code, self.file, offset, Mode::Code);
         self.diags.extend(diags);
+        // The code inside strings counts toward the file's tokens.
+        self.tokens += toks.len() - 1;
+        if self.tokens > MAX_TOKENS {
+            let span = Span::new(self.file, offset, offset);
+            self.diags.push(too_many_tokens(span));
+            self.halted = true;
+            self.pos = self.toks.len() - 1;
+            return Err(PErr);
+        }
         let mut p = Parser::new(toks, self.file, false);
         p.depth = self.depth;
         let e = p.expr();

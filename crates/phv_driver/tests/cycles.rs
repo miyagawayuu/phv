@@ -123,3 +123,36 @@ echo $cb === null ? -1 : $cb(), " ", $holder->next === null ? "lost" : "kept";
     assert_eq!(err, None);
     assert_eq!(out, "1225 6225 11225 16225 21225 26225 7 kept");
 }
+
+/// Found by the 1.0.0 audit: the collector ran on the number of objects, so a
+/// few cycles holding large strings reached the memory limit although they
+/// were garbage. It also runs when memory runs short.
+#[test]
+fn cycles_are_collected_when_memory_runs_short() {
+    let limits = phv_vm::Limits { max_memory: Some(32 << 20), ..Default::default() };
+    let node = "<?phv\nclass Node {\n    public ?Node $next = null;\n    public string $data = \"\";\n}\n\
+                $big = str_repeat(\"x\", 1 << 20);\n";
+    // 300 cycles of one object holding 1 MB each: 300 MB if none is freed.
+    let src = format!(
+        "{node}for ($i = 0; $i < 300; $i++) {{\n    $n = new Node();\n    $n->data = $big . $i;\n    \
+         $n->next = $n;\n}}\necho \"done\";\n"
+    );
+    let (out, err) = run_src("pressure", &src, limits);
+    assert_eq!((out.as_str(), err), ("done", None));
+    // Cycles made before many strings are kept, with no object made after.
+    let src = format!(
+        "{node}for ($i = 0; $i < 20; $i++) {{\n    $n = new Node();\n    $n->data = $big . $i;\n    \
+         $n->next = $n;\n}}\n$k = str_repeat(\"k\", 1000);\nlist<string> $parts = [];\n\
+         for ($i = 0; $i < 20000; $i++) {{ $parts[] = $k . $i; }}\necho count($parts);\n"
+    );
+    let (out, err) = run_src("pressure_strings", &src, limits);
+    assert_eq!((out.as_str(), err), ("20000", None));
+    // Memory held by live objects still stops the script.
+    let src = format!(
+        "{node}list<Node> $keep = [];\nfor ($i = 0; $i < 300; $i++) {{\n    $n = new Node();\n    \
+         $n->data = $big . $i;\n    $n->next = $n;\n    $keep[] = $n;\n}}\necho \"done\";\n"
+    );
+    let (out, err) = run_src("pressure_live", &src, limits);
+    assert_eq!(out, "");
+    assert!(err.as_deref().is_some_and(|e| e.contains("allowed memory size of 32 MB exhausted")), "{err:?}");
+}

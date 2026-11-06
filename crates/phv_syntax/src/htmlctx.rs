@@ -681,6 +681,18 @@ fn html_space(c: char) -> bool {
 }
 
 impl HtmlTracker {
+    /// Where an end tag hidden from this tracker is watched (inside
+    /// `<noscript>`, `<svg>` or `<math>`), the literal text ends where code
+    /// could complete one: after `<`, or `</` and the start of a raw-text
+    /// element's name.
+    pub fn watched_end_tag_start(&self) -> bool {
+        let in_comment_or_value =
+            matches!(self.state, State::Comment | State::Bogus | State::Quoted { .. } | State::Unquoted { .. });
+        let in_text = matches!(self.state, State::Text);
+        let watched = (in_comment_or_value && self.out_of_step_possible()) || (self.noscript > 0 && !in_text);
+        watched && hidden_end_tag_start(&self.tail)
+    }
+
     /// The context a value inserted at the current position lands in.
     pub fn context(&self) -> EchoContext {
         if !self.carry.is_empty() {
@@ -689,11 +701,7 @@ impl HtmlTracker {
         if self.pending.is_some() {
             return EchoContext::Tag;
         }
-        let in_comment_or_value =
-            matches!(self.state, State::Comment | State::Bogus | State::Quoted { .. } | State::Unquoted { .. });
-        let in_text = matches!(self.state, State::Text);
-        let watched = (in_comment_or_value && self.out_of_step_possible()) || (self.noscript > 0 && !in_text);
-        if watched && hidden_end_tag_start(&self.tail) {
+        if self.watched_end_tag_start() {
             return EchoContext::AfterMarkup;
         }
         match &self.state {
@@ -1475,6 +1483,40 @@ mod tests {
         // `<noscript/>` opens a noscript (browsers ignore `/>` on HTML elements).
         assert!(found("<noscript/><!--</noscript><a>").contains(&InlineCode::HiddenEndTag));
         assert!(found("<noscript/><textarea></noscript>").contains(&InlineCode::HiddenEndTag));
+    }
+
+    /// Found by the 1.0.0 audit: a statement between `</` and the rest of an
+    /// end tag hidden from the tracker passed `phv check` (a function it calls
+    /// could write the rest); only values (`<?= ?>`) were refused there.
+    #[test]
+    fn statements_after_a_hidden_end_tag_start_are_refused() {
+        let parse = |src: &str| crate::parse_module(src, 0, true).1;
+        for src in [
+            "<noscript><!--</<?phv f(); ?>--></noscript>",
+            "<noscript><!--<<?phv f(); ?>--></noscript>",
+            "<noscript><!--</nos<?phv $x = 1; ?>--></noscript>",
+            "<noscript><textarea></<?phv f(); ?></textarea></noscript>",
+            "<svg><p title=\"</<?phv f(); ?>\"></p></svg>",
+            "<svg><!--</<?phv f(); ?>--></svg>",
+            "<math><!--</<?phv f(); ?>--></math>",
+            "<math><mi title='</ti<?phv f(); ?>'></mi></math>",
+        ] {
+            let diags = parse(src);
+            assert!(
+                diags.iter().any(|d| d.is_error() && d.message.contains("code right after `<` or `</`")),
+                "{src}: {diags:?}"
+            );
+        }
+        // Elsewhere, and after other text, statements are fine.
+        for src in [
+            "<p><!--</<?phv f(); ?>--></p>",
+            "<noscript><!--</b <?phv f(); ?>--></noscript>",
+            "<noscript><!-- <?phv f(); ?> --></noscript>",
+            "<svg><p title=\"</b<?phv f(); ?>\"></p></svg>",
+            "<noscript><p>a <?phv f(); ?></p></noscript>",
+        ] {
+            assert!(parse(src).iter().all(|d| !d.is_error()), "{src}");
+        }
     }
 
     /// Found by the 1.0.0 audit: spaces after an attribute name were looked

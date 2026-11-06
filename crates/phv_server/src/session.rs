@@ -127,10 +127,13 @@ fn values_of(v: &serde_json::Value) -> Option<IndexMap<String, String>> {
 /// Sessions in a database of `[databases]`: Redis keeps them under
 /// `phv:session:<hash>`, expires them itself (a session whose visitor has not
 /// come back after an hour) and keeps within `MAX_SESSIONS` and `MAX_BYTES` as
-/// sessions are written; PostgreSQL and MySQL in a `phv_sessions` table, which
-/// the sweep keeps within the same limits. Both drop sessions whose visitor
-/// never came back first. A database that cannot be reached loses the session
-/// (a warning is logged) instead of failing the request.
+/// sessions are written, with bookkeeping keys of the site's own
+/// (`phv:sessions:<namespace>:`); PostgreSQL and MySQL in a table of the
+/// site's own (`phv_sessions_<namespace>`), which the sweep keeps within the
+/// same limits. So the `session_ttl` and the limits of one site never remove
+/// another's sessions. Both drop sessions whose visitor never came back first.
+/// A database that cannot be reached loses the session (a warning is logged)
+/// instead of failing the request.
 struct DbStore {
     spec: phv_vm::DatabaseSpec,
     limits: phv_std::SessionLimits,
@@ -147,6 +150,10 @@ struct DbStore {
 impl DbStore {
     fn key(&self, id: &str) -> String {
         shared_session_key(self.namespace.as_deref(), id)
+    }
+
+    fn ns(&self) -> Option<&str> {
+        self.namespace.as_deref()
     }
 }
 
@@ -173,7 +180,7 @@ impl Backend for DbStore {
     fn read(&self, id: &str) -> Option<(Record, bool)> {
         // Sessions made before the site had a namespace (1.0) are not read: a
         // site that could read them could read those of any site without one.
-        let row = match self.seen(phv_std::session_read(&self.spec, &self.key(id))) {
+        let row = match self.seen(phv_std::session_read(&self.spec, self.ns(), &self.key(id))) {
             Ok(r) => r?,
             Err(e) => {
                 Self::warn("read", e);
@@ -186,17 +193,17 @@ impl Backend for DbStore {
 
     fn insert(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<bool> {
         self.written.fetch_add(1, Ordering::Relaxed);
-        self.seen(phv_std::session_insert(&self.spec, &self.key(id), &Self::row(r, returned), &self.limits))
+        self.seen(phv_std::session_insert(&self.spec, self.ns(), &self.key(id), &Self::row(r, returned), &self.limits))
             .map_err(std::io::Error::other)
     }
 
     fn update(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<bool> {
-        self.seen(phv_std::session_update(&self.spec, &self.key(id), &Self::row(r, returned), &self.limits))
+        self.seen(phv_std::session_update(&self.spec, self.ns(), &self.key(id), &Self::row(r, returned), &self.limits))
             .map_err(std::io::Error::other)
     }
 
     fn remove(&self, id: &str) -> bool {
-        self.seen(phv_std::session_remove(&self.spec, &self.key(id))).unwrap_or_else(|e| {
+        self.seen(phv_std::session_remove(&self.spec, self.ns(), &self.key(id))).unwrap_or_else(|e| {
             Self::warn("remove", e);
             false
         })
@@ -218,7 +225,7 @@ impl Backend for DbStore {
             return;
         }
         self.written.store(0, Ordering::Relaxed);
-        if let Err(e) = phv_std::session_sweep(&self.spec, &self.limits) {
+        if let Err(e) = phv_std::session_sweep(&self.spec, self.ns(), &self.limits) {
             Self::warn("clean up", e);
         }
     }
@@ -856,6 +863,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The tests on database servers share the stores of sites without a
+    /// namespace: one at a time.
+    static DB_TESTS: Mutex<()> = Mutex::new(());
+
     /// The database stores keep the rules of the others: values come back,
     /// a logged-out session stays gone, and the sweep removes expired
     /// sessions and then the excess, those whose visitor never came back first.
@@ -863,6 +874,7 @@ mod tests {
     /// `PHV_TEST_POSTGRES_URL` and `PHV_TEST_MYSQL_URL` (skipped without them).
     #[test]
     fn database_stores_keep_the_same_rules() {
+        let _one_at_a_time = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         for var in ["PHV_TEST_REDIS_URL", "PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
             let Some(url) = std::env::var(var).ok().filter(|u| !u.is_empty()) else {
                 eprintln!("skipped: {var} is not set");
@@ -913,6 +925,11 @@ mod tests {
             let now = now_secs();
             let row =
                 |last: u64, returned: bool| phv_std::SessionRow { data: "{}".into(), created: last, last, returned };
+            // The limits below are a site's own (a namespace of the tests).
+            let ns = Some("5e55a1");
+            let left_of = |ns: Option<&str>, keys: &[&'static str]| -> Vec<&'static str> {
+                keys.iter().copied().filter(|k| phv_std::session_read(&spec, ns, k).unwrap().is_some()).collect()
+            };
             if var == "PHV_TEST_REDIS_URL" {
                 // Redis keeps within the limits as sessions are written: new
                 // sessions go first, never the one being written.
@@ -924,47 +941,185 @@ mod tests {
                 };
                 let keys = ["cap-back-1", "cap-back-2", "cap-new-1", "cap-new-2"];
                 for (i, k) in keys.iter().enumerate() {
-                    let _ = phv_std::session_remove(&spec, k);
-                    assert!(phv_std::session_insert(&spec, k, &row(now, i < 2), &limits).unwrap());
+                    let _ = phv_std::session_remove(&spec, ns, k);
+                    assert!(phv_std::session_insert(&spec, ns, k, &row(now, i < 2), &limits).unwrap());
                 }
-                assert!(!phv_std::session_insert(&spec, "cap-new-2", &row(now, false), &limits).unwrap());
-                let left: Vec<&str> =
-                    keys.iter().copied().filter(|k| phv_std::session_read(&spec, k).unwrap().is_some()).collect();
-                assert_eq!(left, ["cap-back-1", "cap-back-2", "cap-new-2"]);
+                assert!(!phv_std::session_insert(&spec, ns, "cap-new-2", &row(now, false), &limits).unwrap());
+                assert_eq!(left_of(ns, &keys), ["cap-back-1", "cap-back-2", "cap-new-2"]);
                 // A byte limit evicts the others, returning visitors' too.
                 let tiny = phv_std::SessionLimits { max_bytes: 1, ..limits };
-                assert!(phv_std::session_update(&spec, "cap-new-2", &row(now, true), &tiny).unwrap());
-                let left: Vec<&str> =
-                    keys.iter().copied().filter(|k| phv_std::session_read(&spec, k).unwrap().is_some()).collect();
-                assert_eq!(left, ["cap-new-2"]);
-                assert!(phv_std::session_remove(&spec, "cap-new-2").unwrap());
-                assert!(!phv_std::session_update(&spec, "cap-new-2", &row(now, true), &limits).unwrap());
+                assert!(phv_std::session_update(&spec, ns, "cap-new-2", &row(now, true), &tiny).unwrap());
+                assert_eq!(left_of(ns, &keys), ["cap-new-2"]);
+                assert!(phv_std::session_remove(&spec, ns, "cap-new-2").unwrap());
+                assert!(!phv_std::session_update(&spec, ns, "cap-new-2", &row(now, true), &limits).unwrap());
+            } else {
+                // The sweep: one expired session, two returning and two new ones, room for three.
+                let ttl = Duration::from_secs(60);
+                let keys = ["sweep-expired", "sweep-back-1", "sweep-back-2", "sweep-new-1", "sweep-new-2"];
+                let rows = [
+                    row(now - 3600, true),
+                    row(now - 5, true),
+                    row(now - 4, true),
+                    row(now - 3, false),
+                    row(now - 2, false),
+                ];
+                let limits =
+                    phv_std::SessionLimits { ttl, max_lifetime: MAX_LIFETIME, max_sessions: 3, max_bytes: MAX_BYTES };
+                for (k, r) in keys.iter().zip(&rows) {
+                    let _ = phv_std::session_remove(&spec, ns, k);
+                    assert!(phv_std::session_insert(&spec, ns, k, r, &limits).unwrap());
+                }
+                phv_std::session_sweep(&spec, ns, &limits).unwrap();
+                // 90% of 3 is 2: the new ones go first.
+                assert_eq!(left_of(ns, &keys), ["sweep-back-1", "sweep-back-2"], "{var}");
+                for k in keys {
+                    phv_std::session_remove(&spec, ns, k).unwrap();
+                }
+            }
+
+            // Two sites on the same database, one with a short session_ttl and
+            // room for two sessions: what it writes and sweeps never removes
+            // the other site's sessions (found by the 1.1.1 audit: the shortest
+            // ttl and the limits applied to every site).
+            let (long_ns, short_ns) = (Some("5e55b2"), Some("5e55c3"));
+            let long = phv_std::SessionLimits {
+                ttl: Duration::from_secs(7200),
+                max_lifetime: MAX_LIFETIME,
+                max_sessions: 100,
+                max_bytes: MAX_BYTES,
+            };
+            let short = phv_std::SessionLimits {
+                ttl: Duration::from_secs(1),
+                max_lifetime: MAX_LIFETIME,
+                max_sessions: 2,
+                max_bytes: MAX_BYTES,
+            };
+            let theirs = ["site-long-back", "site-long-new"];
+            let mine = ["site-short-1", "site-short-2", "site-short-3"];
+            for k in theirs {
+                let _ = phv_std::session_remove(&spec, long_ns, k);
+            }
+            for k in mine {
+                let _ = phv_std::session_remove(&spec, short_ns, k);
+            }
+            // Idle for two minutes: past the short ttl, well within the long one.
+            let idle = if var == "PHV_TEST_REDIS_URL" { now } else { now - 120 };
+            assert!(phv_std::session_insert(&spec, long_ns, theirs[0], &row(idle, true), &long).unwrap());
+            assert!(phv_std::session_insert(&spec, long_ns, theirs[1], &row(idle, false), &long).unwrap());
+            if var == "PHV_TEST_REDIS_URL" {
+                // Redis takes the time of the last use from its own writes:
+                // wait past the short ttl (its times are in seconds).
+                std::thread::sleep(Duration::from_millis(2100));
+            }
+            for k in mine {
+                assert!(phv_std::session_insert(&spec, short_ns, k, &row(now_secs(), false), &short).unwrap());
+            }
+            phv_std::session_sweep(&spec, short_ns, &short).unwrap();
+            assert_eq!(left_of(long_ns, &theirs), theirs, "{var}: the other site's sessions were removed");
+            let kept = left_of(short_ns, &mine);
+            assert!(kept.len() <= 2, "{var}: {kept:?}");
+            for k in theirs {
+                phv_std::session_remove(&spec, long_ns, k).unwrap();
+            }
+            for k in mine {
+                phv_std::session_remove(&spec, short_ns, k).unwrap();
+            }
+        }
+    }
+
+    /// Sessions that 1.1 stored for a site with a namespace (in the shared
+    /// `phv_sessions` table, or with the shared bookkeeping of Redis) are
+    /// still read, updated and logged out after the upgrade, as atomically as
+    /// before: no one is signed out by it, and a request that finishes after a
+    /// logout does not bring the session back. Needs the servers of
+    /// `database_stores_keep_the_same_rules`.
+    #[test]
+    fn sessions_written_by_1_1_are_still_read() {
+        let _one_at_a_time = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        for var in ["PHV_TEST_REDIS_URL", "PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
+            let Some(url) = std::env::var(var).ok().filter(|u| !u.is_empty()) else {
+                eprintln!("skipped: {var} is not set");
                 continue;
+            };
+            let spec = phv_vm::DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 2 };
+            let ns = "5e55d4".to_string();
+            let limits = phv_std::SessionLimits {
+                ttl: Duration::from_secs(3600),
+                max_lifetime: MAX_LIFETIME,
+                max_sessions: MAX_SESSIONS,
+                max_bytes: MAX_BYTES,
+            };
+            // Written as 1.1 wrote them: the site's key, in the shared store
+            // (the store of a site without a namespace).
+            let now = now_secs();
+            let old_session = |user: &str| -> String {
+                let id = phv_std::random_hex(32);
+                let row = phv_std::SessionRow {
+                    data: format!("{{\"user\":\"{user}\"}}"),
+                    created: now - 100,
+                    last: now - 100,
+                    returned: true,
+                };
+                let key = shared_session_key(Some(&ns), &id);
+                assert!(phv_std::session_insert(&spec, None, &key, &row, &limits).unwrap(), "{var}");
+                format!("PHVSESSID={id}")
+            };
+            let store =
+                Store::with_database(Duration::from_secs(3600), false, spec.clone(), Arc::default(), Some(ns.clone()));
+            let user = |h: &str| store.load(Some(h)).values.get("user").cloned();
+
+            // Read, updated where it is, and read again.
+            let header = old_session("ann");
+            assert_eq!(user(&header).as_deref(), Some("ann"), "{var}: a session of 1.1 was not read");
+            let mut s = store.load(Some(&header));
+            s.values.insert("seen".into(), "1".into());
+            s.changed = true;
+            assert!(store.save(s).is_none(), "{var}: the same id");
+            assert_eq!(store.load(Some(&header)).values.get("seen").map(String::as_str), Some("1"), "{var}");
+            if var == "PHV_TEST_REDIS_URL" {
+                // Written once since, it left the shared bookkeeping: a site of
+                // 1.1 with a short ttl writing there does not remove it.
+                std::thread::sleep(Duration::from_millis(2100));
+                let brief = phv_std::SessionLimits { ttl: Duration::from_secs(1), ..limits };
+                let other = phv_std::SessionRow { data: "{}".into(), created: now, last: now, returned: false };
+                assert!(phv_std::session_insert(&spec, None, "legacy-writer", &other, &brief).unwrap());
+                phv_std::session_remove(&spec, None, "legacy-writer").unwrap();
+                assert_eq!(user(&header).as_deref(), Some("ann"), "{var}: removed by the shared bookkeeping");
             }
-            // The sweep: one expired session, two returning and two new ones, room for three.
-            let ttl = Duration::from_secs(60);
-            let keys = ["sweep-expired", "sweep-back-1", "sweep-back-2", "sweep-new-1", "sweep-new-2"];
-            let rows = [
-                row(now - 3600, true),
-                row(now - 5, true),
-                row(now - 4, true),
-                row(now - 3, false),
-                row(now - 2, false),
-            ];
-            let limits =
-                phv_std::SessionLimits { ttl, max_lifetime: MAX_LIFETIME, max_sessions: 3, max_bytes: MAX_BYTES };
-            for (k, r) in keys.iter().zip(&rows) {
-                let _ = phv_std::session_remove(&spec, k);
-                assert!(phv_std::session_insert(&spec, k, r, &limits).unwrap());
+            // Logged out while a slow request holds it: gone from both stores.
+            let mut slow = store.load(Some(&header));
+            let mut logout = store.load(Some(&header));
+            logout.destroyed = true;
+            store.save(logout);
+            slow.values.insert("late".into(), "1".into());
+            slow.changed = true;
+            assert!(store.save(slow).is_none(), "{var}");
+            assert!(store.load(Some(&header)).id.is_none(), "{var}: the logged-out session came back");
+            let id = header.trim_start_matches("PHVSESSID=");
+            assert!(phv_std::session_read(&spec, None, &shared_session_key(Some(&ns), id)).unwrap().is_none());
+
+            // Regenerated (at login) by two requests at once: one takes it
+            // over, under a new id in the site's own store.
+            let header = old_session("bob");
+            let (mut x, mut y) = (store.load(Some(&header)), store.load(Some(&header)));
+            for r in [&mut x, &mut y] {
+                r.regenerate = true;
+                r.changed = true;
             }
-            phv_std::session_sweep(&spec, &limits).unwrap();
-            let left: Vec<&str> =
-                keys.iter().copied().filter(|k| phv_std::session_read(&spec, k).unwrap().is_some()).collect();
-            // 90% of 3 is 2: the new ones go first.
-            assert_eq!(left, ["sweep-back-1", "sweep-back-2"], "{var}");
-            for k in keys {
-                phv_std::session_remove(&spec, k).unwrap();
+            let taken = store.save(x).unwrap();
+            assert!(store.save(y).is_none(), "{var}");
+            assert!(store.load(Some(&header)).id.is_none(), "{var}");
+            let new_id = taken.split(['=', ';']).nth(1).unwrap().to_string();
+            if var != "PHV_TEST_REDIS_URL" {
+                let key = shared_session_key(Some(&ns), &new_id);
+                assert!(phv_std::session_read(&spec, None, &key).unwrap().is_none(), "{var}: in the shared table");
             }
+            let header = format!("PHVSESSID={new_id}");
+            let mut done = store.load(Some(&header));
+            assert_eq!(done.values.get("user").map(String::as_str), Some("bob"), "{var}");
+            done.destroyed = true;
+            store.save(done);
+            assert!(store.load(Some(&header)).id.is_none(), "{var}");
         }
     }
 

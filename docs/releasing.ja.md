@@ -86,6 +86,8 @@ amd64 と arm64 の `ghcr.io/miyagawayuu/phv:X.Y.Z` と `:latest` をプッシ�
 
 ## 6. リリースの後
 
-- `examples/demo/Dockerfile` の `ARG PHV_VERSION` を新しいバージョンにしてプッシュし、デモをデプロイする
+- `examples/demo/Dockerfile` の `ARG PHV_VERSION` を新しいバージョンに、`ARG PHV_SHA256` を手順 4 で確かめた
+  `SHA256SUMS` にある `phv-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz` のハッシュにして（ビルドはほかのアーカイブを
+  拒むので、後から差し替えられたリリースのファイルは使われない）プッシュし、デモをデプロイする
   (`examples/demo` で `fly deploy -a phv-demo`)。https://demo.phv-lang.org/ のすべてのページが応答するか確かめる。
 - Web サイトは、`main` の `docs/` か `website/` が変わると `.github/workflows/website.yml` がデプロイする。

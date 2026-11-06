@@ -42,6 +42,12 @@ mod workers;
 pub fn sqlite_kept_stats() -> (usize, u64) {
     db::kept_stats()
 }
+
+/// How long idle SQLite connections are kept (`None`: 30 seconds). For tests.
+#[doc(hidden)]
+pub fn sqlite_set_kept_idle(idle: Option<std::time::Duration>) {
+    db::set_kept_idle(idle)
+}
 pub mod wsserver;
 
 pub use asyncio::running as async_running;

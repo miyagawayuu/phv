@@ -223,23 +223,31 @@ pub fn long_name(path: &Path) -> Option<PathBuf> {
 
 /// Whether `f`, opened by the canonical path `path`, is the file at that path:
 /// not reached through a link or junction put on the way after `path` was
-/// found (which would lead elsewhere).
+/// found (which would lead elsewhere). On Unix, open the file with
+/// `open_parent` instead (found by the 1.1.1 review: checking a file opened
+/// by name took two more lookups by name, which a link swapped in and out
+/// could pass).
 #[cfg(windows)]
 pub fn opened_at(f: &File, path: &Path) -> Result<(), FsError> {
     imp::check_path(f, path)
 }
 
+/// Whether `path` is on another machine, or a link or junction on the way
+/// leads to one: a network share, a mapped network drive or a device path.
+/// Opening one makes Windows contact the host with the user's credentials, so
+/// links are read, never followed, and each target is looked at first (found
+/// by the 1.1.1 review: a link to a share, or a network drive, passed the
+/// check of the name's first characters). A missing path is not refused here
+/// (opening it fails). On Unix, network file systems are mounted by the
+/// administrator: false.
+#[cfg(windows)]
+pub fn on_another_machine(path: &Path) -> bool {
+    imp::on_another_machine(path)
+}
+
 #[cfg(unix)]
-pub fn opened_at(f: &File, path: &Path) -> Result<(), FsError> {
-    use std::os::unix::fs::MetadataExt;
-    if path.canonicalize()? != path {
-        return Err(FsError::Link);
-    }
-    let (opened, named) = (f.metadata()?, std::fs::metadata(path)?);
-    if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
-        return Err(FsError::Link);
-    }
-    Ok(())
+pub fn on_another_machine(_path: &Path) -> bool {
+    false
 }
 
 fn check_plain(f: &File) -> Result<(), FsError> {
@@ -743,6 +751,71 @@ mod imp {
         }
         Ok(info.nNumberOfLinks as u64)
     }
+
+    const DRIVE_REMOTE: u32 = 4;
+
+    /// Whether the spelling of `p` leaves the machine: a UNC path (`\\host`,
+    /// `\\?\UNC\host`), a device or object path (`\\.\`, `\\?\GLOBALROOT`), or
+    /// a path on a network drive. Nothing is opened.
+    pub fn spelled_remote(p: &Path) -> bool {
+        let s = p.as_os_str().to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+        let rest = match s.strip_prefix(r"\\?\").or_else(|| s.strip_prefix(r"\??\")) {
+            Some(rest) if rest.starts_with(r"unc\") => return true,
+            // A local volume by its name (mount points lead there).
+            Some(rest) if rest.starts_with("volume{") => return false,
+            Some(rest) => rest,
+            None if s.starts_with(r"\\") => return true,
+            None => s.as_str(),
+        };
+        let b = rest.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            let root: Vec<u16> = format!("{}:\\", b[0] as char).encode_utf16().chain(Some(0)).collect();
+            // SAFETY: `root` ends with NUL; the call only reads it.
+            return unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) } == DRIVE_REMOTE;
+        }
+        // After `\\?\`, anything but a drive or a volume is a device.
+        rest.len() != s.len()
+    }
+
+    pub fn on_another_machine(path: &Path) -> bool {
+        use std::path::Component;
+        let mut p = path.to_path_buf();
+        // As many links in a row as Windows follows.
+        for _ in 0..63 {
+            if spelled_remote(&p) {
+                return true;
+            }
+            let comps: Vec<Component> = p.components().collect();
+            let mut at = PathBuf::new();
+            let mut next = None;
+            for (i, c) in comps.iter().enumerate() {
+                at.push(c.as_os_str());
+                if !matches!(c, Component::Normal(_)) {
+                    continue;
+                }
+                // Read without following it (FILE_FLAG_OPEN_REPARSE_POINT).
+                match std::fs::symlink_metadata(&at) {
+                    // A symbolic link or a junction: where it leads, then the rest.
+                    Ok(m) if m.file_type().is_symlink() => {
+                        let Ok(target) = std::fs::read_link(&at) else { return true };
+                        let mut t = at.parent().unwrap_or(Path::new("")).join(target);
+                        for rest in &comps[i + 1..] {
+                            t.push(rest.as_os_str());
+                        }
+                        next = Some(t);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            match next {
+                Some(t) => p = t,
+                None => return false,
+            }
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -855,6 +928,48 @@ mod tests {
         let (g, name) = open_parent(&base, Path::new("LONGTEMPLATENAME.PHV.HTML")).unwrap();
         assert!(g.exists(&name).unwrap());
         assert_eq!(std::fs::read_to_string(base.join("longtemplatename.phv.html")).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Found by the 1.1.1 review: a link to a share passed the check of the
+    /// name's first characters, and was followed.
+    #[cfg(windows)]
+    #[test]
+    fn paths_to_other_machines_are_found_without_opening_them() {
+        for p in [r"\\host\share\k.pem", "//host/share/k.pem", r"\\?\UNC\host\share\k.pem", r"\??\UNC\host\s\k"] {
+            assert!(on_another_machine(Path::new(p)), "{p}");
+        }
+        for p in [r"\\.\pipe\x", r"\\?\GLOBALROOT\Device\Mup\host\share"] {
+            assert!(on_another_machine(Path::new(p)), "{p}");
+        }
+        let d = tmp("remote");
+        let local = d.join("outside/secret.txt");
+        assert!(!on_another_machine(&local));
+        assert!(!on_another_machine(&local.canonicalize().unwrap()));
+        assert!(!on_another_machine(&d.join("missing/k.pem")));
+        // A link to a share is read, not followed (the host is never contacted).
+        // Creating one needs Developer Mode or the privilege: skipped without.
+        let link = d.join("data/k.pem");
+        if std::os::windows::fs::symlink_file(r"\\phv-test.invalid\share\k.pem", &link).is_ok() {
+            assert!(on_another_machine(&link));
+            // Also behind a link to a directory that holds such a link.
+            std::os::windows::fs::symlink_dir(d.join("data"), d.join("via")).unwrap();
+            assert!(on_another_machine(&d.join("via/k.pem")));
+            // A relative link to a local file is fine.
+            std::os::windows::fs::symlink_file(r"..\outside\secret.txt", d.join("data/ok.txt")).unwrap();
+            assert!(!on_another_machine(&d.join("data/ok.txt")));
+        }
+        // A junction (always local) to a local directory is fine.
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(d.join("j"))
+            .arg(d.join("outside"))
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if made {
+            assert!(!on_another_machine(&d.join("j/secret.txt")));
+            let _ = std::fs::remove_dir(d.join("j"));
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

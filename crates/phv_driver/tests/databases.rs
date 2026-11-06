@@ -312,16 +312,62 @@ fn check_jobs(url: &str) {
         names: Some(vec!["outbox".into()]),
         memory_key: String::new(),
     });
-    let out = run_script(&Arc::new(h), "jobs_outbox", Some(Duration::from_secs(30)));
+    let h = Arc::new(h);
+    let out = run_script(&h, "jobs_outbox", Some(Duration::from_secs(30)));
     let expected = std::fs::read_to_string(root().join("jobs_outbox.out")).unwrap().replace("\r\n", "\n");
     assert_eq!(out, expected);
+    let mut want = vec!["committed", "plain", "x"];
+    if url.starts_with("postgres") {
+        // A kept statement made stale does not end the next transaction.
+        check(&h, "jobs_kept");
+        want.extend(["kept-1", "kept-2"]);
+    }
     let mut payloads = Vec::new();
     while let Some(j) = store.take(lease).unwrap() {
         payloads.push(j.payload.clone());
         store.end(&j, End::Done { keyed: false }).unwrap();
     }
     payloads.sort();
-    assert_eq!(payloads, ["committed", "plain", "x"]);
+    want.sort();
+    assert_eq!(payloads, want);
+}
+
+/// Transactions that add jobs at the same time keep the cap of 100,000
+/// waiting and running jobs between them (found by the 1.1.1 audit: eight
+/// transactions at 95,000 reached 111,000). Each adds up to 1,000 jobs to a
+/// store 3,000 below the cap: together they add exactly 3,000.
+fn check_job_cap(url: &str) {
+    let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 16 };
+    let host = Arc::new(Host {
+        root: root(),
+        databases: BTreeMap::from([("main".to_string(), spec)]),
+        // The table the scripts name: phv_jobs_cafe0123cafe0123cafe0123cafe0123.
+        store_namespace: Some("cafe0123cafe0123cafe0123cafe0123".into()),
+        jobs: Some(phv_vm::JobsSpec {
+            store: Some("main".into()),
+            names: Some(vec!["burst".into()]),
+            memory_key: String::new(),
+        }),
+        ..Host::default()
+    });
+    let limit = Some(Duration::from_secs(300));
+    assert_eq!(run_script(&host, "jobs_cap_fill", limit), "97000", "{url}");
+    let outs: Vec<String> = std::thread::scope(|s| {
+        let runs: Vec<_> = (0..8).map(|_| s.spawn(|| run_script(&host, "jobs_cap_burst", limit))).collect();
+        runs.into_iter().map(|r| r.join().unwrap()).collect()
+    });
+    let added: i64 = outs.iter().map(|o| o.trim_start_matches("full ").parse::<i64>().unwrap_or(-100_000)).sum();
+    let total = run_script(&host, "jobs_cap_count", limit);
+    assert_eq!((total.as_str(), added), ("100000", 3000), "{url}: {outs:?}");
+}
+
+#[test]
+fn concurrent_transactions_keep_the_job_cap() {
+    for var in ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
+        if let Some(url) = server(var) {
+            check_job_cap(&url);
+        }
+    }
 }
 
 #[test]

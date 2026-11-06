@@ -170,12 +170,15 @@ pub struct Metrics {
     pub ws_out: AtomicU64,
     /// `publish()`: delivered in this process, sent to the others, received
     /// from them, dropped (a queue was full or the store was down), refused
-    /// (a message from the store that was not valid).
+    /// (a message from the store that was not valid), refused for its time
+    /// alone (signed with the site's key, but sent too far from this
+    /// process's clock or before it subscribed again).
     pub publish_local: AtomicU64,
     pub publish_sent: AtomicU64,
     pub publish_received: AtomicU64,
     pub publish_dropped: AtomicU64,
     pub publish_invalid: AtomicU64,
+    pub publish_clock: AtomicU64,
     /// Jobs: added, finished, failed (to be tried again), given up.
     pub jobs_enqueued: AtomicU64,
     pub jobs_done: AtomicU64,
@@ -278,6 +281,7 @@ impl Metrics {
             ("received", &self.publish_received),
             ("dropped", &self.publish_dropped),
             ("invalid", &self.publish_invalid),
+            ("clock", &self.publish_clock),
         ] {
             let _ = writeln!(out, "phv_publish_total{{result=\"{result}\"}} {}", n.load(Ordering::Relaxed));
         }

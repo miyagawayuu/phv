@@ -141,6 +141,17 @@ const KEPT_PER_FILE: usize = 64;
 const KEPT_ALL: usize = 256;
 /// An idle connection is closed after this long.
 const KEPT_IDLE: Duration = Duration::from_secs(30);
+/// `KEPT_IDLE`, in milliseconds; tests make it shorter (`set_kept_idle`).
+static KEPT_IDLE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(KEPT_IDLE.as_millis() as u64);
+
+fn kept_idle() -> Duration {
+    Duration::from_millis(KEPT_IDLE_MS.load(Ordering::SeqCst))
+}
+
+/// Sets how long an idle connection is kept (`None`: `KEPT_IDLE`). For tests.
+pub fn set_kept_idle(idle: Option<Duration>) {
+    KEPT_IDLE_MS.store(idle.unwrap_or(KEPT_IDLE).as_millis() as u64, Ordering::SeqCst);
+}
 
 /// A connection a script holds: the file it is for, and whether it may be kept.
 struct Lease {
@@ -178,7 +189,7 @@ fn take(key: &Path, id: FileId) -> Option<Connection> {
         let list = map.get_mut(key)?;
         let mut found = None;
         while let Some(idle) = list.pop() {
-            if idle.id == id && idle.since.elapsed() < KEPT_IDLE {
+            if idle.id == id && idle.since.elapsed() < kept_idle() {
                 REUSED.fetch_add(1, Ordering::SeqCst);
                 found = Some(idle.conn);
                 break;
@@ -244,32 +255,35 @@ pub(crate) fn release(dir: &DirGuard, name: &std::ffi::OsStr) {
 }
 
 /// Closes idle connections once they are idle for `KEPT_IDLE`, on a thread
-/// that runs while any are kept.
+/// that runs while any are kept. It sleeps until the oldest one's time is up
+/// (found by the 1.1.1 audit: woken every 15 seconds, it kept a connection,
+/// and its file open, for up to 45).
 fn sweep_later() {
     if SWEEPING.swap(true, Ordering::SeqCst) {
         return;
     }
     let started = std::thread::Builder::new().name("phv-sqlite-idle".into()).spawn(|| loop {
-        std::thread::sleep(KEPT_IDLE / 2);
-        let closing: Vec<Idle> = {
+        let idle = kept_idle();
+        let (closing, next): (Vec<Idle>, Option<Instant>) = {
             let mut map = kept();
             let mut out = Vec::new();
             for list in map.values_mut() {
                 let (old, fresh): (Vec<Idle>, Vec<Idle>) =
-                    std::mem::take(list).into_iter().partition(|i| i.since.elapsed() >= KEPT_IDLE);
+                    std::mem::take(list).into_iter().partition(|i| i.since.elapsed() >= idle);
                 *list = fresh;
                 out.extend(old);
             }
             map.retain(|_, l| !l.is_empty());
-            if map.is_empty() {
+            let next = map.values().flatten().map(|i| i.since + idle).min();
+            if next.is_none() {
                 SWEEPING.store(false, Ordering::SeqCst);
-                drop(map);
-                drop(out);
-                return;
             }
-            out
+            (out, next)
         };
+        // Closed outside the lock: closing a file can take a while.
         drop(closing);
+        let Some(next) = next else { return };
+        std::thread::sleep(next.saturating_duration_since(Instant::now()));
     });
     if started.is_err() {
         SWEEPING.store(false, Ordering::SeqCst);

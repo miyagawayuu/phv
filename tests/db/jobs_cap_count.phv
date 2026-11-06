@@ -1,0 +1,8 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: the jobs of the test's
+// namespace, which are then removed.
+import std.db.Database;
+
+$db = Database::connect("main");
+echo $db->first(sql"SELECT count(*) AS n FROM phv_jobs_cafe0123cafe0123cafe0123cafe0123 WHERE state IN (0, 1)")?->int("n") ?? -1;
+$db->execute(sql"DELETE FROM phv_jobs_cafe0123cafe0123cafe0123cafe0123");

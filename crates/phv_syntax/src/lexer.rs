@@ -19,8 +19,33 @@ pub fn lex(src: &str, file: u32, base: u32, mode: Mode) -> (Vec<Token>, Vec<Diag
     (toks, diags)
 }
 
+/// The most tokens one source file may have (the code of interpolated
+/// expressions in its strings included). Each takes about 50 bytes, and more
+/// once parsed and checked (found by the 1.0.0 audit: a file of 8 MB of list
+/// items took about 1.5 GB), so this bounds what a file takes; the largest
+/// file of the repository has a few thousand.
+pub const MAX_TOKENS: usize = 1_000_000;
+
+/// The error of a file with more than `MAX_TOKENS` tokens.
+pub fn too_many_tokens(span: Span) -> Diagnostic {
+    Diagnostic::error(format!("this file is too large: more than {MAX_TOKENS} tokens"), span)
+        .note("split it into several files")
+}
+
 /// Like `lex`, also returning the spans of comments (for the formatter).
 pub fn lex_with_comments(src: &str, file: u32, base: u32, mode: Mode) -> (Vec<Token>, Vec<Span>, Vec<Diagnostic>) {
+    let lx = lex_all(src, file, base, mode);
+    (lx.toks, lx.comments, lx.diags)
+}
+
+/// Like `lex`, also telling whether the file had more than `MAX_TOKENS`
+/// tokens (then only those before were read).
+pub(crate) fn lex_counted(src: &str, file: u32, base: u32, mode: Mode) -> (Vec<Token>, Vec<Diagnostic>, bool) {
+    let lx = lex_all(src, file, base, mode);
+    (lx.toks, lx.diags, lx.too_large)
+}
+
+fn lex_all(src: &str, file: u32, base: u32, mode: Mode) -> Lexer<'_> {
     let mut lx = Lexer {
         src,
         bytes: src.as_bytes(),
@@ -31,9 +56,10 @@ pub fn lex_with_comments(src: &str, file: u32, base: u32, mode: Mode) -> (Vec<To
         diags: Vec::new(),
         comments: Vec::new(),
         stopped: false,
+        too_large: false,
     };
     lx.run(mode);
-    (lx.toks, lx.comments, lx.diags)
+    lx
 }
 
 struct Lexer<'a> {
@@ -48,6 +74,8 @@ struct Lexer<'a> {
     /// Set after `MAX_ERRORS` errors: the rest of the file is not read (a file
     /// of junk would otherwise give one error per byte).
     stopped: bool,
+    /// Set at more than `MAX_TOKENS` tokens: the rest of the file is not read.
+    too_large: bool,
 }
 
 /// Errors reported for one file before the lexer gives up on it.
@@ -68,6 +96,15 @@ impl<'a> Lexer<'a> {
 
     fn push(&mut self, tok: Tok, start: usize) {
         let span = self.span(start, self.pos);
+        if self.toks.len() >= MAX_TOKENS && !matches!(tok, Tok::Eof) {
+            if !self.too_large {
+                self.too_large = true;
+                self.diags.push(too_many_tokens(span));
+            }
+            self.stopped = true;
+            self.pos = self.bytes.len();
+            return;
+        }
         self.toks.push(Token { tok, span });
     }
 
@@ -680,5 +717,28 @@ mod tests {
         let (_, diags) = lex(&junk, 0, 0, Mode::Code);
         assert!(diags.len() <= MAX_ERRORS + 1, "{}", diags.len());
         assert!(diags.last().unwrap().message.contains("too many errors"));
+    }
+
+    /// Found by the 1.0.0 audit: a file of 8 MB of list items took about
+    /// 1.5 GB to parse and check. Past `MAX_TOKENS` tokens (those of the code
+    /// in its strings included), a file is refused before it is parsed.
+    #[test]
+    fn huge_sources_stop_at_the_token_limit() {
+        let parse = |src: &str| crate::parse_module(src, 0, false);
+        let items = |n: usize| format!("$x = [{}0];\n", "0,".repeat(n));
+        // `$x = [` and `0];` are 6 tokens.
+        let (module, diags) = parse(&items((MAX_TOKENS - 6) / 2));
+        assert!(diags.is_empty(), "{:?}", diags.first());
+        assert_eq!(module.stmts.len(), 1);
+        let (module, diags) = parse(&items(4 << 20));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("more than 1000000 tokens"));
+        assert!(module.stmts.is_empty());
+        let (toks, diags) = lex(&items(4 << 20), 0, 0, Mode::Code);
+        assert_eq!((toks.len(), diags.len()), (MAX_TOKENS + 1, 1));
+        // One string of many interpolated expressions.
+        let (_, diags) = parse(&format!("$a = 1;\n$s = \"{}\";\n", "{$a}".repeat(MAX_TOKENS)));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].message.contains("more than 1000000 tokens"));
     }
 }

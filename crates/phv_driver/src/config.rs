@@ -1217,6 +1217,13 @@ pub fn parse_config_with_jobs(root: &Path, text: &str, jobs_given: Option<Vec<St
                         "[server].{what}: \"{p}\" is a network or device path; give a file on this machine"
                     ));
                 }
+                // A network drive, or a link to a share (found by the 1.1.1 review).
+                if phv_std::safefs::on_another_machine(&root.join(p)) {
+                    return Err(format!(
+                        "[server].{what}: \"{p}\" is on another machine (a network drive or share, or a link to \
+                         one); give a file on this machine"
+                    ));
+                }
             }
             Some(Tls { cert: root.join(cert), key: root.join(key) })
         }
@@ -1360,6 +1367,35 @@ mod tests {
             let e = load(&format!("[permissions]\nwrite = [\"{d}\"]\n")).err().unwrap_or_default();
             assert!(e.contains("has a `~`"), "{d}: {e}");
         }
+    }
+
+    /// A link to a share passed the check of the name's first characters
+    /// (found by the 1.1.1 review). Making a link needs Developer Mode or the
+    /// privilege: without, only the local paths are tried.
+    #[cfg(windows)]
+    #[test]
+    fn tls_files_behind_a_link_to_a_share_are_refused() {
+        let dir = std::env::temp_dir().join(format!("phv-config-tlslink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("certs")).unwrap();
+        let toml = "[server]\ntls_cert = \"certs/c.pem\"\ntls_key = \"certs/k.pem\"\n";
+        std::fs::write(dir.join("phv.toml"), toml).unwrap();
+        std::fs::write(dir.join("certs/c.pem"), "x").unwrap();
+        std::fs::write(dir.join("certs/k.pem"), "x").unwrap();
+        // Files on this machine, by a relative or an absolute name, are fine.
+        assert!(load_config(&dir).is_ok());
+        let abs = dir.join("certs/k.pem").canonicalize().unwrap().display().to_string();
+        let toml_abs =
+            format!("[server]\ntls_cert = \"certs/c.pem\"\ntls_key = '{}'\n", abs.trim_start_matches(r"\\?\"));
+        std::fs::write(dir.join("phv.toml"), toml_abs).unwrap();
+        assert!(load_config(&dir).is_ok());
+        std::fs::write(dir.join("phv.toml"), toml).unwrap();
+        std::fs::remove_file(dir.join("certs/k.pem")).unwrap();
+        if std::os::windows::fs::symlink_file(r"\\phv-test.invalid\share\k.pem", dir.join("certs/k.pem")).is_ok() {
+            let e = load_config(&dir).err().unwrap_or_default();
+            assert!(e.contains("is on another machine"), "{e}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// What the server reads for itself is hidden from scripts, whatever

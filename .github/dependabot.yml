@@ -1,5 +1,6 @@
 # Keeps the GitHub Actions used by the workflows (pinned to commit SHAs, with
-# the version in a comment) and the website's deploy tooling up to date.
+# the version in a comment), the demo's base image and the website's deploy
+# tooling up to date.
 # Security updates for the Cargo and npm dependencies are turned on in the
 # repository settings and need no entry here.
 version: 2
@@ -11,6 +12,11 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+  # The demo's base image, pinned by digest in examples/demo/Dockerfile.
+  - package-ecosystem: docker
+    directory: /examples/demo
+    schedule:
+      interval: weekly
   # wrangler, installed by the website workflow's deploy job from this lockfile.
   - package-ecosystem: npm
     directory: /.github/deploy

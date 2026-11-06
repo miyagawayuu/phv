@@ -38,7 +38,9 @@ pub struct JitCtx {
 }
 
 /// Native stack the JIT's code may use below the outermost native call.
-/// Scripts run on threads with more (16 MB for server workers, 64 MB for the CLI).
+/// Scripts run on threads with more (16 MB for server workers, 64 MB for the
+/// CLI); where the thread has less left, native code stops `STACK_MARGIN`
+/// above its end (see `stack.rs`).
 pub const JIT_STACK: usize = 8 << 20;
 
 pub const JIT_ERR_OVERFLOW: i64 = 1;

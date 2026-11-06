@@ -407,6 +407,12 @@ impl std::fmt::Debug for HttpSpec {
 
 const MAX_NATIVE_DEPTH: u32 = 200;
 
+/// A call from Rust (a callback of a builtin) is made only with this much of
+/// the thread's stack left: room for the interpreter and the builtins it
+/// calls before the next such check. A level of callbacks takes about 3 KB
+/// (a release build), so 200 of them fit in any thread that runs scripts.
+const CALL_STACK: usize = 512 << 10;
+
 /// Exception traces keep this many innermost and outermost calls.
 const TRACE_ENDS: usize = 50;
 
@@ -605,6 +611,16 @@ pub struct Vm {
     /// Set when that number is reached; the collector runs at the next check
     /// of the time limit, where no object is in use by an instruction.
     gc_due: std::cell::Cell<bool>,
+    /// The length of `objects` when the cycle collector last ran (less the
+    /// objects found gone since): the objects made since are those after it.
+    gc_base: Cell<usize>,
+    /// The values the cycle collector looked at when it last ran.
+    gc_visited: Cell<usize>,
+    /// Memory in use (bytes) above which a new object also makes the
+    /// collector run (three quarters of the limit): cycles of a few objects
+    /// may hold much memory (found by the 1.0.0 audit: the collector ran on
+    /// their number only).
+    gc_pressure: isize,
 }
 
 impl Drop for Vm {
@@ -929,6 +945,9 @@ impl Vm {
             traces: RefCell::new(Traces::default()),
             gc_next: std::cell::Cell::new(GC_FIRST),
             gc_due: std::cell::Cell::new(false),
+            gc_base: Cell::new(0),
+            gc_visited: Cell::new(0),
+            gc_pressure: limits.max_memory.map_or(isize::MAX, |m| (m / 4 * 3).min(isize::MAX as usize) as isize),
             coverage: None,
             profile: None,
             debug: None,
@@ -994,16 +1013,19 @@ impl Vm {
         let deadline = self.deadline;
         let mut since = self.equal_since.get();
         let mut over: Option<VmError> = None;
-        let r = crate::value::values_equal_metered(a, b, &mut |bytes| {
-            since = since.saturating_add(bytes);
-            // A large step (a long list's pairs about to be queued) is reserved
-            // first; otherwise the limits are looked at every `EQUAL_STEP`.
-            if bytes >= EQUAL_STEP {
-                if let Err(e) = self.reserve(bytes) {
-                    over = Some(e);
-                    return false;
+        let r = crate::value::values_equal_metered(a, b, &mut |charge| {
+            let bytes = match charge {
+                // A list of pairs growing is reserved first, whatever its size.
+                Charge::Alloc(bytes) => {
+                    if let Err(e) = self.reserve(bytes) {
+                        over = Some(e);
+                    }
+                    return over.is_none();
                 }
-            }
+                Charge::Work(bytes) => bytes,
+            };
+            // The limits are looked at every `EQUAL_STEP` of work.
+            since = since.saturating_add(bytes);
             if since >= EQUAL_STEP {
                 since = 0;
                 if let Err(e) = self.check_memory() {
@@ -1023,7 +1045,14 @@ impl Vm {
     }
 
     fn call_inner(&mut self, func: u32, caps: &[Value], args: &[Value]) -> Result<Value, VmError> {
-        if self.native_depth >= MAX_NATIVE_DEPTH || self.frames.len() >= self.limits.max_frames {
+        // Each call from Rust nests the interpreter on the thread's stack: the
+        // depth is bounded, and so is the stack it may take (a thread with
+        // less than the usual room, or larger frames, stops here instead of
+        // overflowing).
+        if self.native_depth >= MAX_NATIVE_DEPTH
+            || self.frames.len() >= self.limits.max_frames
+            || crate::stack::left_below(CALL_STACK)
+        {
             return Err(VmError::Fatal("maximum call stack depth exceeded".into()));
         }
         // A callback from a builtin (`map`, `sortBy` ...) counts as a call: one
@@ -1056,7 +1085,9 @@ impl Vm {
         let mut objects = self.objects.borrow_mut();
         if objects.len() == objects.capacity() && objects.len() >= 1024 {
             // Forget objects that are already gone before the list grows.
+            let before = objects.len();
             objects.retain(|w| w.strong_count() > 0);
+            self.gc_base.set(self.gc_base.get().saturating_sub(before - objects.len()));
             if objects.len() >= self.gc_next.get() {
                 self.gc_due.set(true);
             }
@@ -1066,6 +1097,26 @@ impl Vm {
             room_for_twice(&mut objects);
         }
         objects.push(Rc::downgrade(o));
+        let len = objects.len();
+        drop(objects);
+        // Memory is looked at every 8 objects (each look reads a thread-local).
+        if len.is_multiple_of(8) && self.memory_pressed(len) {
+            self.gc_due.set(true);
+        }
+    }
+
+    /// Objects made since the cycle collector last ran, about (some of them
+    /// may be counted although gone).
+    fn made_since_collection(&self) -> usize {
+        self.objects.borrow().len().saturating_sub(self.gc_base.get())
+    }
+
+    /// Memory is running short and objects were made since the collector
+    /// last ran: the cycles among them may hold it. At most `GC_WORK` values
+    /// are looked at per object made, as when the collector runs by count.
+    fn memory_pressed(&self, objects: usize) -> bool {
+        let made = objects.saturating_sub(self.gc_base.get());
+        made > 0 && made.saturating_mul(GC_WORK) >= self.gc_visited.get() && self.mem().used() > self.gc_pressure
     }
 
     /// Frees the objects that are reachable only through reference cycles
@@ -1076,8 +1127,10 @@ impl Vm {
     pub fn collect_cycles(&mut self) -> usize {
         self.gc_due.set(false);
         let done = crate::cycles::collect(self.objects.get_mut());
+        self.gc_visited.set(done.visited);
         let objects = self.objects.get_mut();
         let live = objects.len();
+        self.gc_base.set(live);
         room_for_twice(objects);
         self.gc_next.set((live.saturating_mul(2)).max(live + done.visited / GC_WORK).max(GC_FIRST));
         done.freed
@@ -1430,11 +1483,18 @@ impl Vm {
             rt.start(&mut []);
         }
         // Native code nested in this call (through the interpreter) shares the
-        // outermost call's stack limit.
+        // outermost call's stack limit: `JIT_STACK` below here, but never
+        // nearer the end of the thread's stack than `STACK_MARGIN` (found by
+        // the 1.0.0 audit: entered deep inside callbacks of builtins, the
+        // budget was measured from there, not from what the thread had left).
         let outermost = self.jit_stack_limit == 0;
         if outermost {
             let here = &raw as *const _ as usize;
-            self.jit_stack_limit = here.saturating_sub(crate::jit::JIT_STACK).max(1);
+            let mut limit = here.saturating_sub(crate::jit::JIT_STACK);
+            if let Some(low) = crate::stack::stack_low() {
+                limit = limit.max(low.saturating_add(crate::stack::STACK_MARGIN));
+            }
+            self.jit_stack_limit = limit.max(1);
         }
         let mut ctx = JitCtx {
             error: 0,
@@ -1458,9 +1518,16 @@ impl Vm {
         self.jit_rt = rt;
         self.budget = ctx.budget.clamp(1, BUDGET as i64) as u32;
         let error = ctx.error;
+        let mut again = error == JIT_ERR_STACK;
+        if error == JIT_ERR_MEMORY && (kept || !boxed_args) && self.made_since_collection() > 0 {
+            // Native code cannot run the cycle collector: when cycles made
+            // before this call held the memory, the interpreter runs the call
+            // again once they are freed.
+            again = self.collect_cycles() > 0 && self.check_memory().is_ok();
+        }
         // The kept arguments are dropped now, so that they do not keep the
         // values shared; only a rerun takes them back.
-        let rerun = if error == JIT_ERR_STACK && kept {
+        let rerun = if again && kept {
             for (r, v) in self.regs[start..start + argc].iter_mut().zip(self.jit_rerun.drain(..)) {
                 *r = v;
             }
@@ -1476,6 +1543,7 @@ impl Vm {
             }
             // The arguments are in their registers again (numbers were never moved).
             JIT_ERR_STACK => return Ok(None),
+            JIT_ERR_MEMORY if again => return Ok(None),
             JIT_ERR_OVERFLOW => return Err(self.throw("ArithmeticError", "integer overflow")),
             JIT_ERR_DIV_ZERO => return Err(self.throw("DivisionByZeroError", "modulo by zero")),
             JIT_ERR_FDIV_ZERO => return Err(self.throw("DivisionByZeroError", "division by zero")),
@@ -1577,10 +1645,18 @@ impl Vm {
             self.budget = PROFILE_BUDGET;
             p.sample(self.frames.iter().map(|f| f.func));
         }
-        if self.gc_due.get() {
+        let objects = self.objects.get_mut().len();
+        if self.gc_due.get() || self.memory_pressed(objects) {
             self.collect_cycles();
         }
-        self.check_memory()?;
+        if let Err(e) = self.check_memory() {
+            // Cycles made since the collector last ran may hold the memory.
+            if self.made_since_collection() == 0 {
+                return Err(e);
+            }
+            self.collect_cycles();
+            self.check_memory()?;
+        }
         {
             if let Some(d) = self.deadline {
                 if Instant::now() > d {

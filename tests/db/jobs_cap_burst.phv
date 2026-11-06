@@ -1,0 +1,19 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs, eight at once: a transaction
+// that adds up to 1,000 jobs, and stops when the queue is full.
+import std.db.Database;
+import std.jobs.enqueue;
+
+$db = Database::connect("main");
+$db->transaction(function (): void {
+    $n = 0;
+    try {
+        for ($i = 0; $i < 1000; $i++) {
+            enqueue("burst", "b");
+            $n++;
+        }
+    } catch (RuntimeException $e) {
+        echo "full ";
+    }
+    echo $n;
+});

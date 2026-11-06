@@ -6,9 +6,9 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// The most of a body in memory handed to the connection at once. The
@@ -49,11 +49,52 @@ impl Drop for Counted {
     }
 }
 
-/// Output counted in two totals (the server's and one connection's) until
-/// its last copy is dropped.
+/// What one event stream holds unsent, and since when it has held any: a
+/// client that reads keeps getting back to nothing held.
+pub struct Held {
+    state: Mutex<(usize, Instant)>,
+}
+
+impl Held {
+    pub fn new() -> Arc<Held> {
+        Arc::new(Held { state: Mutex::new((0, Instant::now())) })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, (usize, Instant)> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn add(&self, n: usize) {
+        let mut s = self.lock();
+        if s.0 == 0 {
+            s.1 = Instant::now();
+        }
+        s.0 += n;
+    }
+
+    fn sub(&self, n: usize) {
+        let mut s = self.lock();
+        s.0 = s.0.saturating_sub(n);
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.lock().0
+    }
+
+    /// How long it has held output without getting back to nothing (`None`
+    /// while it holds nothing).
+    pub fn held_for(&self) -> Option<Duration> {
+        let s = self.lock();
+        (s.0 > 0).then(|| s.1.elapsed())
+    }
+}
+
+/// Output counted in the server's total and in one stream's until its last
+/// copy is dropped.
 struct CountedTwice {
     data: Vec<u8>,
-    totals: [Arc<AtomicUsize>; 2],
+    server: Arc<AtomicUsize>,
+    held: Arc<Held>,
 }
 
 impl AsRef<[u8]> for CountedTwice {
@@ -64,28 +105,28 @@ impl AsRef<[u8]> for CountedTwice {
 
 impl Drop for CountedTwice {
     fn drop(&mut self) {
-        for t in &self.totals {
-            t.fetch_sub(self.data.len(), Ordering::Relaxed);
-        }
+        self.server.fetch_sub(self.data.len(), Ordering::Relaxed);
+        self.held.sub(self.data.len());
     }
 }
 
-/// `data` counted in both `server` and `conn` until it has been sent, unless
-/// that would take `server` past `cap`: then nothing is counted. The size is
-/// added before it is compared, so callers at once pass `cap` by none.
+/// `data` counted in both `server` and `held` until it has been sent, unless
+/// that would take `server` past `cap`: then nothing is counted and `data` is
+/// given back. The size is added before it is compared, so callers at once
+/// pass `cap` by none.
 pub fn counted_twice_within(
     data: Vec<u8>,
     server: &Arc<AtomicUsize>,
-    conn: &Arc<AtomicUsize>,
+    held: &Arc<Held>,
     cap: usize,
-) -> Option<Bytes> {
+) -> Result<Bytes, Vec<u8>> {
     let len = data.len();
     if server.fetch_add(len, Ordering::Relaxed) + len > cap {
         server.fetch_sub(len, Ordering::Relaxed);
-        return None;
+        return Err(data);
     }
-    conn.fetch_add(len, Ordering::Relaxed);
-    Some(Bytes::from_owner(CountedTwice { data, totals: [server.clone(), conn.clone()] }))
+    held.add(len);
+    Ok(Bytes::from_owner(CountedTwice { data, server: server.clone(), held: held.clone() }))
 }
 
 /// `data` as bytes whose size counts in `total` until the last copy (or

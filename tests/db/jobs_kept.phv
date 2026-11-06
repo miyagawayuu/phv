@@ -1,0 +1,20 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs (PostgreSQL): statements the
+// connection keeps prepared are deallocated where PHV cannot see it, in a
+// function; enqueue() in the next transaction still commits (found by the
+// 1.1.1 audit: a stale kept statement ended the transaction).
+import std.db.Database;
+import std.jobs.enqueue;
+
+$db = Database::connect("main");
+$db->execute(sql"CREATE OR REPLACE FUNCTION phv_jobs_dealloc() RETURNS int LANGUAGE plpgsql
+    AS 'BEGIN EXECUTE ''DEALLOCATE ALL''; RETURN 1; END'");
+$db->transaction(function () use ($db): void {
+    enqueue("outbox", "kept-1");
+});
+echo "dealloc: ", $db->first(sql"SELECT phv_jobs_dealloc() AS d")?->int("d") ?? 0, "\n";
+$db->transaction(function () use ($db): void {
+    enqueue("outbox", "kept-2");
+});
+echo "committed\n";
+$db->execute(sql"DROP FUNCTION phv_jobs_dealloc()");

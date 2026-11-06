@@ -22,13 +22,30 @@ const MAX_FILE: u64 = 1 << 20;
 /// The modification times of the two files.
 type Stamp = (Option<SystemTime>, Option<SystemTime>);
 
+/// Where `path` leads (links followed), unless that is on another machine:
+/// opening a file on a network share makes Windows contact its host with the
+/// user's credentials (found by the 1.1.1 review: a link to a share, or a
+/// network drive, passed the check of phv.toml).
+fn local_file(what: &str, path: &Path) -> Result<PathBuf, String> {
+    let remote = || format!("the TLS {what} {} is on another machine; give a file on this machine", path.display());
+    if phv_std::safefs::on_another_machine(path) {
+        return Err(remote());
+    }
+    let real = path.canonicalize().map_err(|e| format!("cannot read the TLS {what} {}: {e}", path.display()))?;
+    if phv_std::safefs::on_another_machine(&real) {
+        return Err(remote());
+    }
+    Ok(real)
+}
+
 /// Reads one PEM file. Messages name the file, never its contents.
 fn read_pem(what: &str, path: &Path) -> Result<Vec<u8>, String> {
-    let meta = std::fs::metadata(path).map_err(|e| format!("cannot read the TLS {what} {}: {e}", path.display()))?;
+    let real = local_file(what, path)?;
+    let meta = std::fs::metadata(&real).map_err(|e| format!("cannot read the TLS {what} {}: {e}", path.display()))?;
     if !meta.is_file() || meta.len() > MAX_FILE {
         return Err(format!("the TLS {what} {} is not a file of at most 1 MB", path.display()));
     }
-    std::fs::read(path).map_err(|e| format!("cannot read the TLS {what} {}: {e}", path.display()))
+    std::fs::read(&real).map_err(|e| format!("cannot read the TLS {what} {}: {e}", path.display()))
 }
 
 fn load_key(provider: &CryptoProvider, tls: &Tls) -> Result<Arc<CertifiedKey>, String> {
@@ -54,7 +71,8 @@ fn load_key(provider: &CryptoProvider, tls: &Tls) -> Result<Arc<CertifiedKey>, S
 }
 
 fn stamp(tls: &Tls) -> Stamp {
-    let m = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    // Looked at only where `read_pem` would read.
+    let m = |p: &PathBuf| local_file("file", p).ok().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
     (m(&tls.cert), m(&tls.key))
 }
 

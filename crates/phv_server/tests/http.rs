@@ -399,6 +399,58 @@ fn production_servers_see_changes_within_a_second() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A static file is opened from `public/` one directory at a time, without
+/// following links and without blocking: a directory swapped for a link to
+/// another place never leads there, and a FIFO put where a file was is
+/// refused at once (found by the 1.1.1 review: the file was opened by name and
+/// checked by two more lookups, and opening a FIFO stopped a thread for good).
+#[cfg(unix)]
+#[test]
+fn static_files_are_opened_without_following_links() {
+    let dir = std::env::temp_dir().join(format!("phv-static-links-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phv.toml", "");
+    write(&dir, "public/assets/a.css", "a{}");
+    write(&dir, "public/f.css", "f{}");
+    write(&dir, "outside/a.css", "SECRET");
+    let addr = start_with(&dir, false);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(get(addr, "/assets/a.css", "").body, "a{}");
+
+    // A FIFO where a file was (what the path leads to is remembered for a
+    // second): refused, not waited on.
+    assert_eq!(get(addr, "/f.css", "").body, "f{}");
+    std::fs::remove_file(dir.join("public/f.css")).unwrap();
+    let made = std::process::Command::new("mkfifo").arg(dir.join("public/f.css")).status().is_ok_and(|s| s.success());
+    if made {
+        for _ in 0..3 {
+            assert_eq!(get(addr, "/f.css", "").status, 404);
+        }
+    }
+
+    // The directory swapped for a link to `outside/` and back, again and again.
+    let (public, outside) = (dir.join("public"), dir.join("outside"));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let swapping = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::fs::rename(public.join("assets"), public.join("real"));
+                let _ = std::os::unix::fs::symlink(&outside, public.join("assets"));
+                let _ = std::fs::remove_file(public.join("assets"));
+                let _ = std::fs::rename(public.join("real"), public.join("assets"));
+            }
+        })
+    };
+    for _ in 0..300 {
+        let r = get(addr, "/assets/a.css", "");
+        assert!(!r.body.contains("SECRET"), "a file outside public/ was served");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapping.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Routes with parameters, middleware that answers or passes values on, and
 /// the site's own error pages.
 #[test]

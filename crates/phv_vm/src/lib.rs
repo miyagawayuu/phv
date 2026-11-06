@@ -4,6 +4,7 @@ pub mod alloc;
 pub mod bytecode;
 mod cycles;
 pub mod jit;
+mod stack;
 pub mod value;
 pub mod vm;
 

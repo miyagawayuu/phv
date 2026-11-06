@@ -283,6 +283,101 @@ fn deep_recursion_of_large_frames_does_not_overflow() {
     assert_eq!(out, ("ok".to_string(), None));
 }
 
+/// Native code cannot run the cycle collector: when it runs out of memory
+/// that cycles made before the call hold, they are freed and the call runs
+/// again in the interpreter, as it would have without the JIT.
+#[test]
+fn native_code_out_of_memory_frees_cycles_first() {
+    let k = "k".repeat(1000);
+    let src = format!(
+        r#"<?phv
+class Node {{
+    public ?Node $next = null;
+    public string $data = "";
+}}
+function fill(int $n): int {{
+    list<string> $parts = [];
+    for ($i = 0; $i < $n; $i++) {{
+        $parts[] = "{k}" . $i;
+    }}
+    return count($parts);
+}}
+$big = str_repeat("x", 1 << 20);
+for ($i = 0; $i < 20; $i++) {{
+    $n = new Node();
+    $n->data = $big . $i;
+    $n->next = $n;
+}}
+echo fill(20000), " ";
+echo fill(40000);
+"#
+    );
+    let limits = Limits { max_memory: Some(32 << 20), ..Limits::default() };
+    let out = run_both("cycles_memory", &src, limits, &["fill"]);
+    // The second call needs more than the limit with nothing to free.
+    assert_eq!(out, "20000 Fatal error: allowed memory size of 32 MB exhausted");
+}
+
+/// Found by the 1.0.0 audit: native code took `JIT_STACK` (8 MB) below where
+/// it was first entered, whatever the thread had left, so entered deep inside
+/// callbacks of builtins, or on a smaller thread, it could run past the end
+/// of the stack. Now it stops before the end (the interpreter runs the call),
+/// and callbacks stop with an error when the stack runs short.
+#[test]
+fn deep_callbacks_into_the_jit_stop_cleanly() {
+    let mut src = String::from("<?phv\nfunction f(int $n): int {\n    $v0 = $n;\n");
+    for i in 1..300 {
+        src.push_str(&format!("    $v{i} = ($v{} * 31 + $n) % 1000003;\n", i - 1));
+    }
+    src.push_str("    $r = 0;\n    if ($n > 0) {\n        $r = f($n - 1);\n    }\n    return $r");
+    for i in 0..300 {
+        src.push_str(&format!(" + $v{i}"));
+    }
+    src.push_str(
+        ";\n}\nfunction nest(int $d, int $n): int {\n    if ($d == 0) { return $n > 0 ? f($n) : 1; }\n    \
+         return [1]->map(fn(int $x): int => nest($d - 1, $n))[0];\n}\n",
+    );
+    let dir = std::env::temp_dir().join(format!("phv-jit-test-{}-callbacks", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // On a thread of 4 MB (less than `JIT_STACK`), native code entered inside
+    // callbacks runs out of its stack and the interpreter finishes the call.
+    // Then 198 levels of callbacks on a thread of 1 MB: they fit in a release
+    // build, and stop with an error in a debug one (larger frames).
+    let cases = [(4 << 20, "echo nest(20, 9500) > 0 ? \"ok\" : \"no\";\n"), (1 << 20, "echo nest(198, 0);\n")];
+    for (i, (stack, main)) in cases.into_iter().enumerate() {
+        let entry = dir.join(format!("main{i}.phv"));
+        std::fs::write(&entry, format!("{src}{main}")).unwrap();
+        let root = dir.clone();
+        // Compiled on a thread of the usual size: only the run is measured.
+        let mut c = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || compile(&root, &entry).unwrap_or_else(|e| panic!("{}", e.render(false))))
+            .unwrap()
+            .join()
+            .unwrap();
+        c.enable_jit();
+        assert_compiled(&c, &["f"]);
+        let out = std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn(move || {
+                let outcome = run(&c, RunOptions { html: false, limits: Limits::default(), http: None, host: None });
+                (outcome.output, outcome.error.map(|e| e.render()))
+            })
+            .unwrap()
+            .join()
+            .expect("the run crashed");
+        match i {
+            0 => assert_eq!(out, ("ok".to_string(), None)),
+            _ => assert!(
+                out == ("1".to_string(), None)
+                    || out.1.as_deref().is_some_and(|e| e.contains("maximum call stack depth exceeded")),
+                "{out:?}"
+            ),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Functions on lists of ints, floats, strings and bools are compiled, and
 /// give what the interpreter gives: values, copies, errors and limits.
 #[test]

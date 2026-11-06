@@ -225,18 +225,71 @@ pub fn flat_equal(a: &Value, b: &Value) -> Option<bool> {
 /// records as seen): their room in its lists, generously.
 pub const PAIR_COST: usize = 32;
 
+/// What `values_equal_metered` tells its meter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Charge {
+    /// Bytes of work: each string compared, each pair of elements and map
+    /// key looked at (for the time limit).
+    Work(usize),
+    /// Bytes about to be allocated at once: a list of pairs or the table of
+    /// pairs seen growing, while the old one is still held.
+    Alloc(usize),
+}
+
+/// The bytes of the table a `HashSet<(usize, usize)>` of `cap` items has:
+/// a power of two of buckets of 16 bytes and a control byte each, and a group
+/// of control bytes more (as hashbrown lays it out, rounded up).
+fn pair_table_bytes(cap: usize) -> usize {
+    let buckets = if cap < 4 {
+        4
+    } else if cap < 8 {
+        8
+    } else {
+        (cap.saturating_mul(8) / 7).checked_next_power_of_two().unwrap_or(usize::MAX)
+    };
+    buckets.saturating_mul(17).saturating_add(16)
+}
+
 /// `values_equal`, telling `meter` the work it does in bytes: each string
 /// compared, each pair of elements and map key looked at, and what its lists
 /// of pairs to compare will hold, before they grow (found by the 1.0.0 audit:
 /// only strings were counted, so `==` on large or differently shared lists ran
-/// past the time and memory limits). `None` when `meter` returns false (stop:
-/// a limit was passed).
-pub fn values_equal_metered(a: &Value, b: &Value, meter: &mut dyn FnMut(usize) -> bool) -> Option<bool> {
+/// past the time and memory limits). Growing a list is told as `Alloc` before
+/// it happens (found by the 1.0.0 audit again: the table of pairs seen grew in
+/// one step, to about twice the memory limit). `None` when `meter` returns
+/// false (stop: a limit was passed).
+pub fn values_equal_metered(a: &Value, b: &Value, meter: &mut dyn FnMut(Charge) -> bool) -> Option<bool> {
+    /// Records the pair `(x, y)`; whether it was new.
+    fn first_visit(
+        seen: &mut std::collections::HashSet<(usize, usize)>,
+        x: usize,
+        y: usize,
+        meter: &mut dyn FnMut(Charge) -> bool,
+    ) -> Option<bool> {
+        if seen.len() == seen.capacity() && !seen.contains(&(x, y)) {
+            // The new table is allocated while the old one is still held.
+            if !meter(Charge::Alloc(pair_table_bytes(seen.capacity().saturating_add(1)))) {
+                return None;
+            }
+            seen.reserve(1);
+        }
+        Some(seen.insert((x, y)))
+    }
+    /// Room in `work` for `n` more pairs, told before the list grows.
+    fn room<T>(work: &mut Vec<T>, n: usize, meter: &mut dyn FnMut(Charge) -> bool) -> bool {
+        if work.capacity() - work.len() < n {
+            let cap = work.capacity().saturating_mul(2).max(work.len().saturating_add(n)).max(4);
+            if !meter(Charge::Alloc(cap.saturating_mul(std::mem::size_of::<T>()))) {
+                return false;
+            }
+            work.reserve(n);
+        }
+        true
+    }
     let mut work: Vec<(&Value, &Value)> = vec![(a, b)];
     // Pairs of lists/maps already queued. Shared structure (`$a = [$a, $a]`)
     // would otherwise be compared exponentially often; each pair is compared once.
     let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-    let mut first_visit = |x: usize, y: usize| seen.insert((x, y));
     while let Some((a, b)) = work.pop() {
         let same = match (a, b) {
             (Value::Null, Value::Null) => true,
@@ -248,19 +301,23 @@ pub fn values_equal_metered(a: &Value, b: &Value, meter: &mut dyn FnMut(usize) -
                 if Rc::ptr_eq(x, y) {
                     true
                 } else {
-                    if !meter(x.len().min(y.len()) + 1) {
+                    if !meter(Charge::Work(x.len().min(y.len()) + 1)) {
                         return None;
                     }
                     x == y
                 }
             }
             (Value::List(x), Value::List(y)) => {
-                if !Rc::ptr_eq(x, y) && first_visit(Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize) {
+                if !Rc::ptr_eq(x, y)
+                    && first_visit(&mut seen, Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize, &mut *meter)?
+                {
                     if x.len() != y.len() {
                         return Some(false);
                     }
                     // The pairs queued, and the pair recorded as seen.
-                    if !meter(x.len().saturating_mul(PAIR_COST).saturating_add(PAIR_COST)) {
+                    if !meter(Charge::Work(x.len().saturating_mul(PAIR_COST).saturating_add(PAIR_COST)))
+                        || !room(&mut work, x.len(), &mut *meter)
+                    {
                         return None;
                     }
                     work.extend(x.iter().zip(y.iter()));
@@ -268,17 +325,21 @@ pub fn values_equal_metered(a: &Value, b: &Value, meter: &mut dyn FnMut(usize) -
                 true
             }
             (Value::Map(x), Value::Map(y)) => {
-                if !Rc::ptr_eq(x, y) && first_visit(Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize) {
+                if !Rc::ptr_eq(x, y)
+                    && first_visit(&mut seen, Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize, &mut *meter)?
+                {
                     if x.len() != y.len() {
                         return Some(false);
                     }
-                    if !meter(x.len().saturating_mul(PAIR_COST).saturating_add(PAIR_COST)) {
+                    if !meter(Charge::Work(x.len().saturating_mul(PAIR_COST).saturating_add(PAIR_COST)))
+                        || !room(&mut work, x.len(), &mut *meter)
+                    {
                         return None;
                     }
                     for (k, v) in x.iter() {
                         // Looking a key up hashes it.
                         if let Key::Str(s) = k {
-                            if s.len() >= 64 && !meter(s.len()) {
+                            if s.len() >= 64 && !meter(Charge::Work(s.len())) {
                                 return None;
                             }
                         }
@@ -301,7 +362,7 @@ pub fn values_equal_metered(a: &Value, b: &Value, meter: &mut dyn FnMut(usize) -
                             Key::Int(_) => 8,
                             Key::Str(s) => s.len() + 1,
                         };
-                        if !meter(bytes) {
+                        if !meter(Charge::Work(bytes)) {
                             return None;
                         }
                         if !y.contains(k) {

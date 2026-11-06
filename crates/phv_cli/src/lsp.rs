@@ -1332,4 +1332,27 @@ mod tests {
         assert!(server.rename(&page, line, character, "$n").is_ok());
         let _ = std::fs::remove_dir_all(&p.dir);
     }
+
+    /// Found by the 1.0.0 audit: a document within the size limit but of
+    /// millions of list items took about 1.5 GB to check. Past the limit of
+    /// tokens, it is refused before it is parsed.
+    #[test]
+    fn documents_with_too_many_tokens_are_not_parsed() {
+        use phv_vm::alloc::{reset_thread_peak, thread_allocated, thread_peak};
+        let p = Project::new("token-limit");
+        let text = format!("<?phv\n$x = [{}0];\n", "0,".repeat(3 << 20));
+        let (mut server, page, _, _) = p.open("page.phv", "|");
+        let text = server.admit(&page, &text);
+        assert!(!text.is_empty(), "the document is within the size limit");
+        server.open.insert(page.clone(), text);
+        let base = thread_allocated();
+        reset_thread_peak();
+        let a = server.analysis(&page);
+        let peak = (thread_peak() - base).max(0) as usize;
+        let messages: Vec<&str> = a.diags.iter().map(|d| d.message.as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("more than 1000000 tokens")), "{messages:?} {:?}", a.messages);
+        // Its 6 million tokens alone would take about 300 MB, and their tree far more.
+        assert!(peak < 128 << 20, "held {} MB", peak >> 20);
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
 }
