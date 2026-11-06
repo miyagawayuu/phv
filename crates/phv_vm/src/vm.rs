@@ -8,7 +8,7 @@ use crate::jit::*;
 pub use crate::jit::{JitCtx, JitEntry, JitLimits, JitTable};
 use crate::value::*;
 use indexmap::IndexMap;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -221,6 +221,11 @@ pub struct Permissions {
     pub write: Vec<String>,
     /// Environment variable names; a trailing `*` matches a prefix.
     pub env: Vec<String>,
+    /// Variables no script may read whatever `env` says: the server's secret,
+    /// the admin token, and the URLs and headers of `[databases]`, `[http]`,
+    /// `[websockets]` and `[mail]` (found by the 1.1 audit: `env = ["APP_*"]`
+    /// gave scripts `APP_SECRET`).
+    pub hidden_env: Vec<String>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -248,6 +253,11 @@ pub struct Host {
     pub no_stdin: bool,
     /// `[jobs]` of phv.toml: where `std.jobs` adds jobs.
     pub jobs: Option<JobsSpec>,
+    /// From `[security] store_namespace` or `[project] name`: what this site
+    /// keeps in a shared store (sessions, rate limits, jobs) is apart from
+    /// other sites using the same database (found by the 1.1 audit: a session
+    /// of one site was valid on another).
+    pub store_namespace: Option<String>,
 }
 
 /// `[jobs]` of phv.toml, as `std.jobs` uses it.
@@ -558,6 +568,12 @@ pub struct Vm {
     mem_base: isize,
     deadline: Option<Instant>,
     budget: u32,
+    /// Bytes echoed since the limits were last checked for output.
+    echoed: usize,
+    /// Bytes compared by `equal` since the limits were last checked: kept
+    /// across calls, so a builtin comparing many values is timed as a whole
+    /// (found by the 1.1 audit: `contains()` ran 18 s past a 1 s limit).
+    equal_since: Cell<usize>,
     pub rng: u64,
     native_depth: u32,
     argbuf: Vec<Value>,
@@ -900,6 +916,8 @@ impl Vm {
             mem_base: crate::alloc::thread_allocated(),
             deadline: limits.max_time.map(|d| Instant::now() + d),
             budget: BUDGET,
+            echoed: 0,
+            equal_since: Cell::new(0),
             rng: seed,
             native_depth: 0,
             argbuf: Vec::new(),
@@ -961,11 +979,20 @@ impl Vm {
             if x.len().min(y.len()) + 1 >= EQUAL_STEP);
         if !long {
             if let Some(r) = crate::value::flat_equal(a, b) {
+                if let (Value::Str(x), Value::Str(y)) | (Value::Html(x), Value::Html(y)) = (a, b) {
+                    let since = self.equal_since.get() + x.len().min(y.len());
+                    if since >= EQUAL_STEP {
+                        self.equal_since.set(0);
+                        self.check_limits()?;
+                    } else {
+                        self.equal_since.set(since);
+                    }
+                }
                 return Ok(r);
             }
         }
         let deadline = self.deadline;
-        let mut since = 0usize;
+        let mut since = self.equal_since.get();
         let mut over: Option<VmError> = None;
         let r = crate::value::values_equal_metered(a, b, &mut |bytes| {
             since = since.saturating_add(bytes);
@@ -987,6 +1014,7 @@ impl Vm {
             }
             over.is_none()
         });
+        self.equal_since.set(since);
         match (r, over) {
             (Some(v), _) => Ok(v),
             (None, Some(e)) => Err(e),
@@ -1316,6 +1344,17 @@ impl Vm {
     #[inline]
     fn long_op(&mut self, bytes: usize) {
         if bytes >= LONG_OP {
+            self.budget = 1;
+        }
+    }
+
+    /// After output of `bytes`: the limits are checked once `LONG_OP` bytes
+    /// were written since the last time, however small each piece (found by
+    /// the 1.1 audit: a loop of literal HTML wrote 4 GB under 128 MB).
+    fn echoed(&mut self, bytes: usize) {
+        self.echoed += bytes;
+        if self.echoed >= LONG_OP {
+            self.echoed = 0;
             self.budget = 1;
         }
     }
@@ -2336,13 +2375,22 @@ impl Vm {
                     }
                     Instr::EnumCases(d, class) => {
                         let n = prog.classes[*class as usize].cases.len() as u32;
+                        // Counted and timed by its size (found by the 1.1 audit: an
+                        // enum of 200,000 cases ran 75 s under a 1 s limit).
+                        let bytes = n as usize * std::mem::size_of::<Value>();
+                        tri!(self.reserve(bytes));
                         let items = (0..n).map(|i| self.enum_case(*class, i)).collect();
                         reg!(*d) = Value::list(items);
+                        self.long_op(bytes.saturating_mul(4));
                     }
                     Instr::EnumFrom { dst, class, val, try_ } => {
                         let wanted = reg!(*val).clone();
                         let cls = &prog.classes[*class as usize];
                         let found = cls.cases.iter().position(|(_, c)| const_equal(c, &wanted));
+                        // Timed by the cases looked at, as `cases()` is (found by the
+                        // 1.1 audit: 200,000 cases ran 2 s under a 1 s limit).
+                        let looked = found.map_or(cls.cases.len(), |i| i + 1);
+                        self.long_op(looked.saturating_mul(4 * std::mem::size_of::<Value>()));
                         let v = match found {
                             Some(i) => self.enum_case(*class, i as u32),
                             None if *try_ => Value::Null,
@@ -2403,13 +2451,22 @@ impl Vm {
                         // dropped after `render()`, so the buffer does not bound it
                         // (found by the 1.0.0 audit).
                         self.long_op(len);
+                        self.echoed(len);
                     }
                     Instr::EchoHtml(c) => {
                         if !self.guards.is_empty() {
                             tri!(self.output_allowed(fi));
                         }
                         if let Const::Str(s) = &prog.consts[*c as usize] {
+                            // As for `Echo`: a large piece, or a large buffer about
+                            // to grow, is counted before it is added.
+                            let len = s.len();
+                            let before = self.out.last().map(|o| o.buf.len()).unwrap_or(0);
+                            if len > 1 << 12 || before > 1 << 20 && before.next_power_of_two() < before + len + 64 {
+                                tri!(self.reserve(len.max(before)));
+                            }
                             self.out.last_mut().unwrap().buf.push_str(s);
+                            self.echoed(len);
                         }
                     }
                     Instr::EchoNonce => {

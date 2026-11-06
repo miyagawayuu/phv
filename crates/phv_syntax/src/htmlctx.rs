@@ -673,6 +673,13 @@ fn is_delim(c: Option<&char>) -> bool {
     matches!(c, Some(c) if c.is_ascii_whitespace() || *c == '/' || *c == '>')
 }
 
+/// Whitespace as the HTML tokenizer reads it: tab, LF, FF, CR and space only
+/// (found by the 1.1 audit: U+3000 or U+00A0 between attributes was taken
+/// for a separator, while browsers read it as part of a name or value).
+fn html_space(c: char) -> bool {
+    c.is_ascii_whitespace()
+}
+
 impl HtmlTracker {
     /// The context a value inserted at the current position lands in.
     pub fn context(&self) -> EchoContext {
@@ -999,7 +1006,10 @@ impl HtmlTracker {
             let c = chars[i];
             self.here = offsets[i];
             if let Some(name) = &mut self.pending {
-                if c.is_ascii_alphanumeric() || c == '-' || c == ':' {
+                // A tag name goes on as browsers read it, up to HTML whitespace,
+                // `/` or `>` (found by the 1.1 audit: `<div\u{3000}title="` ended
+                // the name here, while browsers read on).
+                if !html_space(c) && c != '/' && c != '>' {
                     name.push(c.to_ascii_lowercase());
                     i += 1;
                     continue;
@@ -1184,7 +1194,7 @@ impl HtmlTracker {
                         self.end_tag(name, closing, self_closing);
                         i += 1;
                         continue;
-                    } else if c.is_whitespace() || c == '/' {
+                    } else if html_space(c) || c == '/' {
                         State::Tag { name, closing }
                     } else {
                         self.mark = Some(offsets[i]);
@@ -1206,19 +1216,19 @@ impl HtmlTracker {
                         self.end_tag(tag, closing, self_closing);
                         i += 1;
                         continue;
-                    } else if c.is_whitespace() || c == '/' {
+                    } else if html_space(c) || c == '/' {
                         // `name =value` is rare; a space ends a valueless attribute
                         // unless `=` follows. The spaces are passed at once (found by
                         // the 1.0.0 audit: looking ahead at each one was quadratic).
                         let mut j = i;
-                        while j < chars.len() && chars[j].is_whitespace() {
+                        while j < chars.len() && html_space(chars[j]) {
                             j += 1;
                         }
-                        if c.is_whitespace() && j > i + 1 {
+                        if html_space(c) && j > i + 1 {
                             self.here = offsets[j - 1];
                             i = j - 1;
                         }
-                        if chars.get(j) == Some(&'=') && c.is_whitespace() {
+                        if chars.get(j) == Some(&'=') && html_space(c) {
                             State::AttrName { tag, closing, name }
                         } else {
                             self.attrs.push(name);
@@ -1234,7 +1244,7 @@ impl HtmlTracker {
                         let url = is_url_attr(&tag, &name).then(|| UrlState::Undecided(vec![String::new()]));
                         self.mark = Some(offsets[i]);
                         State::Quoted { tag, closing, name, quote: c, url }
-                    } else if c.is_whitespace() {
+                    } else if html_space(c) {
                         State::BeforeValue { tag, closing, name }
                     } else if c == '>' {
                         self.end_tag(tag, closing, false);
@@ -1306,7 +1316,7 @@ impl HtmlTracker {
                     }
                 }
                 State::Unquoted { tag, closing, name } => {
-                    if c.is_whitespace() {
+                    if html_space(c) {
                         State::Tag { name: tag, closing }
                     } else if c == '>' {
                         self.end_tag(tag, closing, false);
@@ -1477,6 +1487,25 @@ mod tests {
         let html = format!("<a b{}c=\"", " ".repeat(400_000));
         assert_eq!(ctx(&html), EchoContext::Attr);
         assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
+    }
+
+    /// Only tab, LF, FF, CR and space separate names and values, as browsers
+    /// read them (found by the 1.1 audit: a full-width space let a value leave
+    /// what the tracker took for a quoted attribute).
+    #[test]
+    fn only_html_whitespace_separates_attributes() {
+        // Browsers read `btn\u{3000}title="` as one unquoted value.
+        assert_eq!(ctx("<a class=btn\u{3000}title=\""), EchoContext::Unquoted);
+        // `\u{a0}"` is an unquoted value too.
+        assert_eq!(ctx("<a title=\u{a0}\""), EchoContext::Unquoted);
+        // The tag name reads on: the value is inside it.
+        assert_eq!(ctx("<div\u{3000}title=\""), EchoContext::Tag);
+        assert_eq!(ctx("<div\u{3000}title=\"x\">"), EchoContext::Text);
+        // `<script\u{3000}x>` is not a script for a browser.
+        assert_eq!(ctx("<script\u{3000}x>"), EchoContext::Text);
+        // Ordinary whitespace still separates.
+        assert_eq!(ctx("<a class=btn\ttitle=\""), EchoContext::Attr);
+        assert_eq!(ctx("<a\x0Ctitle=\""), EchoContext::Attr);
     }
 
     /// The text of a long `<script>` or `<style>` is read in linear time (found

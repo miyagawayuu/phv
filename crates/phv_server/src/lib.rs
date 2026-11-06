@@ -138,6 +138,10 @@ struct State {
     body_budget: Arc<tokio::sync::Semaphore>,
     /// Bytes of script output waiting to be sent, over all connections.
     buffered: Arc<AtomicUsize>,
+    /// Bytes of event streams waiting to be sent: a budget of their own, the
+    /// size of `buffered_cap`, so streams cannot make pages answer 503 (found
+    /// by the 1.1 audit).
+    events_buffered: Arc<AtomicUsize>,
     /// No new script runs while `buffered` is above this.
     buffered_cap: usize,
     /// Pages with parameters, and when `public/` was last scanned for them
@@ -193,6 +197,7 @@ impl State {
                     config.secure_cookies,
                     spec.clone(),
                     metrics.health.clone(),
+                    config.host.store_namespace.clone(),
                 ),
                 None => session::Store::new(
                     Duration::from_secs(config.session_ttl),
@@ -207,6 +212,7 @@ impl State {
             workers: Arc::new(tokio::sync::Semaphore::new(config.workers)),
             body_budget: Arc::new(tokio::sync::Semaphore::new(config.workers.max(1) * (MAX_BODY / 1024))),
             buffered: Arc::new(AtomicUsize::new(0)),
+            events_buffered: Arc::new(AtomicUsize::new(0)),
             // As much output as the workers could make at once.
             buffered_cap: config.workers * (config.memory_limit_mb as usize) * 1024 * 1024,
             config,
@@ -280,6 +286,11 @@ impl State {
                 "phv_output_waiting_bytes",
                 "Bytes of output waiting to be sent.",
                 self.buffered.load(Ordering::Relaxed) as f64,
+            ),
+            (
+                "phv_events_waiting_bytes",
+                "Bytes of event streams waiting to be sent.",
+                self.events_buffered.load(Ordering::Relaxed) as f64,
             ),
             ("phv_async_running", "Operations of *Async methods running now.", phv_std::async_running() as f64),
         ])
@@ -460,7 +471,12 @@ fn serve_with(
     };
     let root = opts.root.canonicalize().map_err(|e| format!("cannot open {}: {e}", opts.root.display()))?;
     let config = match &embedded {
-        Some(e) => phv_driver::config::parse_config(&root, e.config.as_deref().unwrap_or(""))?,
+        Some(e) => {
+            // A built site's jobs are those of its bundle.
+            let mut names: Vec<String> = e.jobs.keys().cloned().collect();
+            names.sort();
+            phv_driver::config::parse_config_with_jobs(&root, e.config.as_deref().unwrap_or(""), Some(names))?
+        }
         None => {
             if !root.join("public").is_dir() {
                 return Err(format!("{} has no `public/` directory", root.display()));
@@ -524,7 +540,7 @@ fn serve_with(
     if listener.is_none() && state.config.jobs.is_none() {
         return Err("phv.toml has no [jobs] section: there are no jobs to run".into());
     }
-    let runner = jobs::start(&state)?;
+    let runner = jobs::start(&state, listener.is_some())?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // Scripts run on blocking threads; give them room for deep recursion.
@@ -541,6 +557,23 @@ fn serve_with(
                 eprintln!("PHV server ({mode} mode) listening on {scheme}://{addr}");
                 if state.dev && !addr.ip().is_loopback() {
                     eprintln!("warning: development mode shows error details to every visitor; use --prod");
+                }
+                // Copies of a project (staging, production) have the same name: on
+                // one database they would share sessions, rate limits and jobs
+                // (found by the 1.1 audit).
+                let c = &state.config;
+                let shared = c.session_db.is_some()
+                    || c.host.rate_limit_store.is_some()
+                    || c.jobs.as_ref().is_some_and(|j| j.store.is_some());
+                if shared && !c.store_namespace_set {
+                    eprintln!(
+                        "note: sessions, rate limits and jobs in shared stores are kept under {}; set [security] \
+                         store_namespace if another copy of this site uses the same database",
+                        match &c.name {
+                            Some(n) => format!("the project's name \"{}\"", phv_syntax::diag::log_escape(n)),
+                            None => "no name (shared with every site without one)".to_string(),
+                        }
+                    );
                 }
                 match &state.embedded {
                     Some(e) => {
@@ -2221,7 +2254,7 @@ impl State {
         if let Some(err) = &outcome.error {
             self.metrics.failure(metrics::Failure::of(&err.message));
             let text = err.render();
-            eprintln!("runtime error in {rel}:\n{text}");
+            eprintln!("runtime error in {rel}:\n{}", err.render_for_log());
             return Err(("Runtime error".into(), text));
         }
         Ok(outcome)

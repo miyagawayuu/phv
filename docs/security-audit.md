@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates thirteen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, and §23 an assessment of the whole implementation after the processing work.
+This report consolidates fourteen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, and §24 an assessment of the whole implementation before 1.1.0.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23: 2026-11-06)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§24: 2026-11-06)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -1301,3 +1301,146 @@ tests, `kept_connections_carry_no_late_answer_and_answered_requests_are_not_repe
 `tests/cases/err_context` for `&` before a URL value. All tests pass on Windows, and on Linux and macOS in CI, with
 clippy (`-D warnings`) and rustfmt. `npm audit` finds nothing in the extension and the website, and `cargo audit` runs
 in CI.
+
+## 24. Fourteenth Assessment: the Whole Implementation (before 1.1.0)
+
+Date: 2026-11-06. Scope: everything at 6f7acb3, which adds to 1.0.0 what lets a site run on several servers: a secret
+shared by the server processes (`[security] secret_env`), an admin port with health checks and Prometheus metrics,
+request ids and trace context, `publish()` across processes over Redis, background jobs and schedules (`std.jobs`,
+`[jobs]`, `[[schedule]]`, `phv jobs`), Server-Sent Events, and faster number formatting, exception traces and object
+creation. Every earlier fix was attacked again. Six reviewers each took one area: the web server; the standard library
+and its clients; the VM, the JIT and the type checker; templates, the website and the examples; the tools, the editor
+and CI; and background jobs. They attacked a release build locally and confirmed each finding with a PoC. Every finding
+was fixed, or kept as a residual risk with its reason; each reviewer then ran its PoCs again against the fixed build
+and looked for ways around each fix, and what they found was fixed in turn (four rounds for event streams, two for the
+rest).
+
+The differential check of the template tracker against a browser's parser stopped three times when reviewers ran it;
+it was done in the main session instead, with harmless marker values in place of the values: 854 templates compared
+with html5lib (see Verification).
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| Critical | 0 | — |
+| High | 4 | Fixed |
+| Medium | 11 | Fixed |
+| Low | 16 | 13 fixed, 3 kept as residual risks |
+| Info | 9 | Fixed or documented |
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R17-1 | Server-Sent Events were not counted in the server's output: clients that do not read held about 17 messages each, and line breaks made a message seven times larger as an event. 30 such clients held 3.9 GB while pages still answered | Events count until they are sent, in a budget of their own; a stream holds at most 2 MB, and an event larger than that is not sent |
+| R17-2 | Literal HTML written in a loop was never counted: 4.1 GB under 128 MB, and the script succeeded | A large piece is reserved before the buffer grows, and the limits are checked every 64 KB written, however small the pieces |
+| R17-3 | `min()` and `max()` of a list compared long strings with no time check: 23 seconds under 1 | The comparisons are metered |
+| R17-4 | Two sites on one job store took and ran each other's jobs, with the other's payloads | Each site has a namespace (`[security] store_namespace`, or `[project] name`): a table and a Redis prefix of its own |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R17-5 | With R17-1 fixed, clients that do not read filled the shared cap, and the stream that was ended was the next to send: a reader's | Only a stream that still holds output is ended; one that sent everything goes on |
+| R17-6 | Counted with pages, streams that do not read pushed the output past the cap that pages check: every page answered 503 | Event streams have a budget of their own; while it is full, a stream holding nothing skips the event |
+| R17-7 | A full-width or no-break space between attributes put the template check out of step with browsers: `<a class=x　title="<?= $t ?>">` let a value add attributes | Only HTML whitespace separates names and values, and tag names run on as browsers read them |
+| R17-8 | `contains()` and `indexOf()` checked the time every 1,024 elements: 18.8 seconds under 1 with maps (the existing test passed on fast machines only by finishing in time) | `==` keeps its meter across calls, and short string comparisons count too |
+| R17-9 | `groupBy()` hashed long keys without counting them: 15.9 seconds under 1 | The bytes hashed count |
+| R17-10 | With ten or more subscribers, a burst of cross-process `publish()` was dropped almost whole (a fixed budget for the pipelined replies) | Each reply's budget covers the replies still to come |
+| R17-11 | After one failed publish, `/ready` stayed 503 until the next message was sent | The store is tried again, with a PUBLISH, when the wait ends |
+| R17-12 | Sites sharing a Redis or SQL database shared sessions and rate limits: one site's cookie signed a visitor in on another | Sessions and rate limits are kept under the site's namespace |
+| R17-13 | Each `[[schedule]]` entry read the jobs folder before the count of 100 was checked: `phv check` 159 seconds, 15 seconds per edit in the editor | The count is checked first; the folder is read once, 10,000 entries at most |
+| R17-14 | The job cap of 100,000 was not checked inside `transaction()`, and a count a second old let each process pass it | Counted in the transaction; exact near the cap |
+| R17-15 | The memory job store's bound left out jobs given up (658 MB) and keys of ended jobs, and swept everything at each `enqueue()` | Bounded (16 MB, 100,000 keys); swept at most once a second |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R17-16 | Signed bus messages could be published again (also after a reconnect or a restart) and reordered | Messages carry a time and a sequence number given as they are sent: older than 60 seconds, seen before, or sent before the process subscribed are refused |
+| R17-17 | `unique()` compared each value it cannot hash (null) with every int and string kept | Only those values are compared, and each comparison counts |
+| R17-18 | `E::cases()` and `E::tryFrom()` of a huge enum were untimed steps (75.9 and 2.1 seconds under 1) | Timed by the cases they look at |
+| R17-19 | Exception messages, often holding request data, reached the server's log as they were: forged lines, terminal escape sequences | Escaped as `log_*` lines are, for pages and jobs |
+| R17-20 | Through a pattern of `[permissions] env`, and on Windows through any case of the name, scripts read the server's secret and the admin token | The server's own variables are hidden from scripts, compared regardless of case |
+| R17-21 | `phv jobs run` and `phv jobs list` printed job errors, names and ids from the store as they were | Escaped |
+| R17-22 | `phv migrate -o` wrote through a linked directory | Checked as `phv build -o` is |
+| R17-23 | `phv jobs run` and `--jobs-only` ran nothing with `[jobs] run = false` | `run = false` stops only a serving process |
+| R17-24 | `enqueue()` held a page 10 seconds for a store that did not answer, whatever its time limit | No longer than the script may still run |
+| R17-25 | Each `enqueue()` woke every runner, and each asked the store (6.4 seconds of CPU per 1,000 jobs) | One job wakes one runner |
+| R17-26 | Finished jobs without a key were kept a day in the SQL stores; a key a page gave could take a scheduled run's minute; near a full cap every `enqueue()` counted the table | Only keyed jobs are kept; schedules have keys of their own; a full count is kept a second |
+| R17-27 | A built site checked its schedules and job names against the folder it ran in | Its bundle's jobs are used |
+| R17-28 | Enough streams that do not read to fill the events' budget at one event each (about the budget ÷ 2 MB: 1,000 for 2 GB, 32 for 64 MB) make readers miss events until they are dropped | Kept as a residual risk: a stream that was ended keeps its unsent event until its connection is dropped (30 seconds without progress) |
+| R17-29 | Concurrent `transaction()`s can each pass the job cap by what they add (8 at 95,000 reached 111,000) | Kept as a residual risk: jobs of uncommitted transactions are not counted |
+| R17-30 | Sites sharing a PostgreSQL or MySQL session table share its limits and the shortest `session_ttl` | Kept as a residual risk (documented: a database per site) |
+| R17-31 | The subscriber connected again every second to a Redis server that sent garbage | The wait starts over only after a connection lasted 30 seconds |
+
+### Info
+
+| # | Finding | Fix |
+|---|---|---|
+| R17-32 | `[jobs] dir`, or a directory on its way, could be a link; `Public` was accepted on Windows | Refused |
+| R17-33 | A row written by someone else with a huge attempt count stopped the whole queue | The count is capped |
+| R17-34 | `\r` in a metric label was not escaped (labels are file names) | Escaped |
+| R17-35 | The website's build read registry files of any size, and the site sent no `Cross-Origin-Opener-Policy` | 4 KB at most; the header is sent |
+| R17-36 | Copies of one project (staging, production) have the same name, so the same namespace | The server says so when it starts; documented |
+| R17-37 | `/ready` reported a store that takes connections but refuses PUBLISH as ready | The probe publishes |
+| R17-38 | Schedules across a change of the clock in their time zone; `BEGIN` sent as SQL with MySQL | Documented |
+| R17-39 | A message of very many lines becomes an event seven times its size | Events larger than 2 MB are not sent |
+| R17-40 | The demo's board refuses only lowercase link text; WARDOGS asks the game server twice per page view | Noted (examples) |
+
+### Residual Risks
+
+- Enough clients that do not read to fill the events' budget at one event each make readers miss events until the
+  server drops them (30 seconds without progress); they must then be opened again, each with a worker for its Open
+  event and within the rate limit.
+- Concurrent transactions can each add jobs past the cap of 100,000 by what they add before they commit.
+- Sites that share a PostgreSQL or MySQL session database share its limits and its shortest `session_ttl`; sites with
+  the same name, or no name, share sessions, rate limits and jobs in shared stores. Give each site a database, or a
+  `store_namespace`, of its own.
+- A captured bus message can be published again within its 60 seconds to a process that was subscribed before it was
+  sent and has not received it (only by someone who can write to the Redis server). Processes whose clocks differ by
+  more than 60 seconds drop each other's messages; Redis drops a subscriber that falls too far behind (delivery is at
+  most once).
+- The server's output can reach twice `workers` × `memory_limit_mb`: pages and event streams each have that budget.
+- Upgrading a site that keeps sessions in a database and has a name signs its visitors out once, and jobs it left in
+  the shared table are not taken.
+- §23's residual risks remain.
+
+### Verification
+
+Every PoC was rerun against the fixed build:
+- event streams that do not read: 975 MB with 30 of them on a 32-CPU host (3.9 GB); with a 64 MB budget, pages answer
+  200 throughout, the pages' output stays 0, and a reader gets every event with 10 or 60 such streams (3 of 8 with 80:
+  R17-28);
+- the literal HTML loop stops at the limit at 87 MB (4.1 GB);
+- `min()` and `max()` stop at 1.1 seconds (23); `contains()` and `indexOf()` at 1.1–1.2 (up to 18.8); `groupBy()` at
+  1.1 (15.9); `E::cases()` and `E::tryFrom()` at 1.1–1.3 (75.9 and 2.1); `unique()` with nulls takes 0.13 seconds;
+- a burst with ten subscribers is sent (1,766 of 1,800, the rest dropped by the full queue; 76 before); `/ready`
+  recovers without traffic and stays 503 for a user that may not PUBLISH; replays, also after a restart and after
+  `CLIENT KILL`, are refused, and new messages still arrive;
+- two sites with different names on one Redis, PostgreSQL or MySQL database share no session, rate limit or job;
+- `phv check` with 200,000 schedules takes 0.3 seconds (159); the job cap holds in one transaction; the memory store
+  keeps 32 MB after 10,000 jobs given up (658 MB); `enqueue()` on a store that does not answer returns at the page's
+  limit (10 seconds); 200 refused jobs at a full cap read 1,481 pages of the table (260,746);
+- the templates with a full-width or no-break space are refused; the server's log holds no raw control character;
+  hidden variables cannot be read in any case; links on the way of `[jobs] dir` and of `phv migrate -o` are refused.
+
+The differential check: 182 templates of unusual but allowed structures (attributes without spaces, `/` between
+attributes, duplicate attributes, odd comments and bogus comments, raw-text, table and frameset elements, NUL and CR)
+were all accepted, and html5lib put the value in text or an ordinary attribute value in each, or dropped it; 672
+spellings of places that must be refused (handlers, `style`, URLs, raw text, names, unquoted values) were refused, but
+for 50 of the form `<a =onclick="`, where browsers name the attribute `=onclick`, which is not a handler. The check's
+classifier was first tried on 11 known placements.
+
+Regression tests: `only_html_whitespace_separates_attributes` and `log_text_stays_on_one_line` (phv_syntax);
+`events_count_in_the_output_cap` (over HTTP/2 with small windows: three clients that do not read and one that reads),
+`label_values_stay_on_their_line`, `frames_are_signed_and_checked`, `replayed_frames_are_refused`, the replay in
+`publish_reaches_the_other_server_processes`, and another site's namespace in `database_stores_keep_the_same_rules`
+(phv_server); `literal_html_in_a_loop_stops_at_the_memory_limit`, `builtins_over_long_values_stop_at_the_time_limit`,
+`unique_compares_only_what_it_cannot_hash`, `enum_cases_are_timed`, `enum_lookups_are_timed`, and the jobs of another
+namespace in `databases` (phv_driver); `server_variables_are_hidden_from_scripts`,
+`sites_get_a_namespace_from_their_name`, `many_schedules_are_refused_at_once` and `a_linked_jobs_folder_is_refused`
+(the configuration); `namespaces_keep_sites_apart` (rate limits); `what_the_memory_store_keeps_is_bounded` (jobs); and
+`phv migrate -o` in the junction test (phv_cli). All tests pass on Windows, with PostgreSQL 17, MySQL 8.4 and Redis 7,
+and with clippy (`-D warnings`) and rustfmt.

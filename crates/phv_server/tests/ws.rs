@@ -300,9 +300,13 @@ fn publish_reaches_the_other_server_processes() {
     let key = phv_std::server_key(secret.as_bytes(), "phv publish v1");
     let tag: String = phv_std::hmac_sha256(&key, b"channel")[..8].iter().map(|x| format!("{x:02x}")).collect();
     let channel = format!("phv:publish:{tag}");
+    // `PHV2 | instance | time (ms) | sequence number | topic length | topic | text | HMAC`.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
     let frame = |key: &[u8], topic: &str, text: &str| {
-        let mut f = b"PHV1".to_vec();
+        let mut f = b"PHV2".to_vec();
         f.extend_from_slice(&[9u8; 16]);
+        f.extend_from_slice(&now.to_be_bytes());
+        f.extend_from_slice(&1u64.to_be_bytes());
         f.extend_from_slice(&(topic.len() as u16).to_be_bytes());
         f.extend_from_slice(topic.as_bytes());
         f.extend_from_slice(text.as_bytes());
@@ -315,9 +319,13 @@ fn publish_reaches_the_other_server_processes() {
     redis_publish(&url, &channel, &frame(&key, "lob\u{7}by", "forged"));
     redis_publish(&url, &channel, &vec![b'x'; 3 << 20]);
     // A message signed with the site's key is delivered (the key is the secret).
-    redis_publish(&url, &channel, &frame(&key, "lobby", "signed"));
+    let signed = frame(&key, "lobby", "signed");
+    redis_publish(&url, &channel, &signed);
     assert_eq!(text(&mut ann), "signed");
     assert_eq!(text(&mut bob), "signed");
+    // The same message published again is not delivered again (found by the
+    // 1.1 audit): the count below would be 2.
+    redis_publish(&url, &channel, &signed);
 
     // Nothing arrived twice, nothing forged, nothing from the other site.
     for (ws, name) in [(&mut ann, "ann"), (&mut bob, "bob"), (&mut carl, "carl")] {

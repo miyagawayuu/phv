@@ -28,6 +28,10 @@ pub const MAX_JOBS: usize = 100_000;
 /// Waiting and running jobs, and their bytes, the memory store holds at most.
 pub const MAX_MEMORY_JOBS: usize = 10_000;
 pub const MAX_MEMORY_BYTES: usize = 64 << 20;
+/// Payloads of jobs given up that the memory store keeps (for `retry`), and
+/// keys of ended jobs it remembers (found by the 1.1 audit: neither was bounded).
+const MAX_MEMORY_DEAD_BYTES: usize = 16 << 20;
+const MAX_MEMORY_KEYS: usize = 100_000;
 
 type R = Result<Value, VmError>;
 
@@ -53,7 +57,9 @@ static ADDED: LazyLock<(Mutex<u64>, Condvar)> = LazyLock::new(|| (Mutex::new(0),
 fn added() {
     let (m, c) = &*ADDED;
     *lock(m) += 1;
-    c.notify_all();
+    // One job, one runner (found by the 1.1 audit: every runner woke and
+    // asked the store for each job added).
+    c.notify_one();
 }
 
 /// Jobs added in this process so far (for `/metrics`).
@@ -90,6 +96,10 @@ struct MemQueue {
     keys: HashMap<String, (String, i64)>,
     /// Bytes of the payloads of waiting and running jobs.
     bytes: usize,
+    /// Bytes of the payloads of jobs given up.
+    dead_bytes: usize,
+    /// When it was last swept (ms): at most once a second.
+    swept: i64,
 }
 
 /// The memory queues of this process, by project.
@@ -100,15 +110,38 @@ impl MemQueue {
         self.jobs.values().filter(|j| j.state < 2).count()
     }
 
-    fn sweep(&mut self, now: i64) {
+    /// Forgets expired keys and old jobs given up: at most once a second,
+    /// unless a bound is passed (`force`).
+    fn sweep(&mut self, now: i64, force: bool) {
+        let over_bounds = self.dead_bytes > MAX_MEMORY_DEAD_BYTES || self.keys.len() > MAX_MEMORY_KEYS;
+        if !force && !over_bounds && now - self.swept < 1000 {
+            return;
+        }
+        self.swept = now;
         self.keys.retain(|_, (_, until)| *until > now);
+        // Over the bound, the keys that end soonest go first.
+        if self.keys.len() > MAX_MEMORY_KEYS {
+            let mut ends: Vec<(i64, String)> = self
+                .keys
+                .iter()
+                .filter(|(_, (_, until))| *until != i64::MAX)
+                .map(|(k, (_, until))| (*until, k.clone()))
+                .collect();
+            ends.sort();
+            // Down to nine tenths, so the next keys do not sweep again at once.
+            let excess = self.keys.len() - MAX_MEMORY_KEYS * 9 / 10;
+            for (_, k) in ends.into_iter().take(excess) {
+                self.keys.remove(&k);
+            }
+        }
         let mut dead: Vec<(i64, String)> =
             self.jobs.iter().filter(|(_, j)| j.state == 2).map(|(id, j)| (j.run_at, id.clone())).collect();
         dead.sort();
         let over = dead.len().saturating_sub(JOB_MAX_DEAD);
         for (i, (at, id)) in dead.iter().enumerate() {
-            if i < over || *at < now - 7 * 24 * 3600 * 1000 {
+            if i < over || *at < now - 7 * 24 * 3600 * 1000 || self.dead_bytes > MAX_MEMORY_DEAD_BYTES {
                 if let Some(j) = self.jobs.remove(id) {
+                    self.dead_bytes -= j.payload.len();
                     if let Some(u) = j.uniq {
                         self.keys.remove(&u);
                     }
@@ -125,7 +158,8 @@ impl MemQueue {
 pub enum Store {
     /// In this process, under the project's key.
     Memory(String),
-    Db(DatabaseSpec),
+    /// A database, with the site's namespace in it (`Host::store_namespace`).
+    Db(DatabaseSpec, Option<String>),
 }
 
 impl Store {
@@ -134,7 +168,7 @@ impl Store {
         let j = host.jobs.as_ref()?;
         Some(match &j.store {
             None => Store::Memory(j.memory_key.clone()),
-            Some(name) => Store::Db(host.databases.get(name)?.clone()),
+            Some(name) => Store::Db(host.databases.get(name)?.clone(), host.store_namespace.clone()),
         })
     }
 
@@ -147,17 +181,32 @@ impl Store {
         delay_secs: i64,
         uniq: Option<&str>,
     ) -> Result<Option<String>, String> {
+        self.add_before(name, payload, delay_secs, uniq, None)
+    }
+
+    /// `add`, waiting for the store until `deadline` at most.
+    pub fn add_before(
+        &self,
+        name: &str,
+        payload: &str,
+        delay_secs: i64,
+        uniq: Option<&str>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<String>, String> {
         let id = crate::random_hex(16);
         let now = now_ms();
         let run_at = now + delay_secs * 1000;
         let r = match self {
-            Store::Db(spec) => netdb::job_add(spec, (&id, name, payload), run_at, uniq, MAX_JOBS)?.map(|()| id),
+            Store::Db(spec, ns) => {
+                netdb::job_add(spec, ns.as_deref(), (&id, name, payload), run_at, uniq, MAX_JOBS, deadline)?
+                    .map(|()| id)
+            }
             Store::Memory(key) => {
                 let mut all = lock(&MEMORY);
                 let q = all.entry(key.clone()).or_default();
-                q.sweep(now);
+                q.sweep(now, false);
                 if let Some(u) = uniq {
-                    if q.keys.contains_key(u) {
+                    if q.keys.get(u).is_some_and(|(_, until)| *until > now) {
                         return Ok(None);
                     }
                 }
@@ -197,7 +246,7 @@ impl Store {
     pub fn take(&self, lease: Duration) -> Result<Option<JobRow>, String> {
         let lease_ms = lease.as_millis() as i64;
         match self {
-            Store::Db(spec) => netdb::job_take(spec, lease_ms),
+            Store::Db(spec, ns) => netdb::job_take(spec, ns.as_deref(), lease_ms),
             Store::Memory(key) => {
                 let now = now_ms();
                 let mut all = lock(&MEMORY);
@@ -231,7 +280,7 @@ impl Store {
     /// Records how a run ended; `false` when its lease was lost meanwhile.
     pub fn end(&self, job: &JobRow, end: JobEnd) -> Result<bool, String> {
         match self {
-            Store::Db(spec) => netdb::job_end(spec, job, end),
+            Store::Db(spec, ns) => netdb::job_end(spec, ns.as_deref(), job, end),
             Store::Memory(key) => {
                 let now = now_ms();
                 let mut all = lock(&MEMORY);
@@ -259,7 +308,8 @@ impl Store {
                         j.run_at = now;
                         j.error = error.to_string();
                         q.bytes -= j.payload.len();
-                        q.sweep(now);
+                        q.dead_bytes += j.payload.len();
+                        q.sweep(now, true);
                     }
                 }
                 Ok(true)
@@ -270,10 +320,10 @@ impl Store {
     /// Removes old jobs that were given up, and old keys.
     pub fn sweep(&self) -> Result<(), String> {
         match self {
-            Store::Db(spec) => netdb::job_sweep(spec),
+            Store::Db(spec, ns) => netdb::job_sweep(spec, ns.as_deref()),
             Store::Memory(key) => {
                 if let Some(q) = lock(&MEMORY).get_mut(key) {
-                    q.sweep(now_ms());
+                    q.sweep(now_ms(), true);
                 }
                 Ok(())
             }
@@ -283,7 +333,7 @@ impl Store {
     /// The jobs of the store: all, or those given up.
     pub fn list(&self, failed_only: bool) -> Result<Vec<JobInfo>, String> {
         match self {
-            Store::Db(spec) => netdb::job_list(spec, failed_only),
+            Store::Db(spec, ns) => netdb::job_list(spec, ns.as_deref(), failed_only),
             Store::Memory(key) => {
                 let all = lock(&MEMORY);
                 let Some(q) = all.get(key) else { return Ok(Vec::new()) };
@@ -309,7 +359,7 @@ impl Store {
     /// Puts a job that was given up back in the queue.
     pub fn requeue(&self, id: &str) -> Result<bool, String> {
         let r = match self {
-            Store::Db(spec) => netdb::job_requeue(spec, id)?,
+            Store::Db(spec, ns) => netdb::job_requeue(spec, ns.as_deref(), id)?,
             Store::Memory(key) => {
                 let mut all = lock(&MEMORY);
                 let Some(q) = all.get_mut(key) else { return Ok(false) };
@@ -320,6 +370,7 @@ impl Store {
                         j.run_at = now_ms();
                         j.error.clear();
                         q.bytes += j.payload.len();
+                        q.dead_bytes -= j.payload.len();
                         true
                     }
                     _ => false,
@@ -336,6 +387,13 @@ impl Store {
 /// The key a job is stored under for `key`: a hash, scoped by the job's name.
 pub fn uniq_key(name: &str, key: &str) -> String {
     crate::sha256_hex(format!("{name}\0{key}").as_bytes())
+}
+
+/// The key of a schedule's run in `minute`: apart from every key a page can
+/// give (found by the 1.1 audit: `key: "schedule:<minute>"` took a run).
+/// Job names never start with `\x01`.
+pub fn schedule_key(name: &str, minute: i64) -> String {
+    crate::sha256_hex(format!("\x01schedule\0{name}\0{minute}").as_bytes())
 }
 
 // ----- std.jobs ------------------------------------------------------------------
@@ -370,26 +428,29 @@ fn add(vm: &mut Vm, a: &[Value]) -> R {
     };
     // Inside a transaction() on the store's own database, the job is added
     // with the transaction: only if it commits.
-    if let (Store::Db(db), Some(db_name)) = (&store, spec.store.as_deref()) {
+    if let (Store::Db(db, ns), Some(db_name)) = (&store, spec.store.as_deref()) {
         let id = crate::random_hex(16);
         let run_at = now_ms() + delay * 1000;
         // The table must exist before the transaction adds to it (MySQL would
         // commit the transaction to create it).
-        if let Err(e) = netdb::job_store_ready(db) {
+        if let Err(e) = netdb::job_store_ready(db, ns.as_deref(), vm.deadline()) {
             return Err(vm.throw("DatabaseError", format!("enqueue(): {e}")));
         }
-        match netdb::job_add_in_transaction(vm, db_name, (&id, &name, &payload), run_at, uniq.as_deref()) {
+        match netdb::job_add_in_transaction(vm, db_name, (&id, &name, &payload), run_at, uniq.as_deref(), MAX_JOBS) {
             Some(Ok(Some(()))) => {
                 added();
                 return Ok(Value::str(id));
             }
             Some(Ok(None)) => return Ok(Value::Null),
+            Some(Err(e)) if e.starts_with("the job queue holds") => {
+                return Err(vm.throw("RuntimeException", format!("enqueue(): {e}")))
+            }
             Some(Err(e)) => return Err(vm.throw("DatabaseError", format!("enqueue(): {e}"))),
             // No transaction: added on a connection of its own below.
             None => {}
         }
     }
-    match store.add(&name, &payload, delay, uniq.as_deref()) {
+    match store.add_before(&name, &payload, delay, uniq.as_deref(), vm.deadline()) {
         Ok(Some(id)) => Ok(Value::str(id)),
         Ok(None) => Ok(Value::Null),
         Err(e) if e.starts_with("the job queue holds") => Err(vm.throw("RuntimeException", format!("enqueue(): {e}"))),
@@ -474,5 +535,30 @@ mod tests {
         };
         assert_eq!(n, MAX_MEMORY_BYTES / MAX_PAYLOAD);
         assert!(err.contains("the job queue holds"), "{err}");
+    }
+
+    /// Jobs given up and keys of ended jobs are bounded too, and a page's key
+    /// cannot be a schedule's (found by the 1.1 audit).
+    #[test]
+    fn what_the_memory_store_keeps_is_bounded() {
+        let key = format!("test-{}", crate::random_hex(8));
+        let store = Store::Memory(key.clone());
+        let big = "x".repeat(MAX_PAYLOAD);
+        for _ in 0..1000 {
+            store.add("dead", &big, 0, None).unwrap().unwrap();
+            let j = store.take(Duration::from_secs(60)).unwrap().unwrap();
+            store.end(&j, JobEnd::Dead { error: "no" }).unwrap();
+        }
+        let dead_bytes = lock(&MEMORY).get(&key).unwrap().dead_bytes;
+        assert!(dead_bytes <= MAX_MEMORY_DEAD_BYTES, "{} MB of jobs given up", dead_bytes >> 20);
+        for i in 0..MAX_MEMORY_KEYS + 1000 {
+            let k = uniq_key("keyed", &i.to_string());
+            store.add("keyed", "", 0, Some(&k)).unwrap().unwrap();
+            let j = store.take(Duration::from_secs(60)).unwrap().unwrap();
+            store.end(&j, JobEnd::Done { keyed: true }).unwrap();
+        }
+        store.add("one", "", 0, None).unwrap().unwrap();
+        assert!(lock(&MEMORY).get(&key).unwrap().keys.len() <= MAX_MEMORY_KEYS);
+        assert_ne!(schedule_key("report", 29000000), uniq_key("report", "schedule:29000000"));
     }
 }

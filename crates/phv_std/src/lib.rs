@@ -45,7 +45,7 @@ pub fn sqlite_kept_stats() -> (usize, u64) {
 pub mod wsserver;
 
 pub use asyncio::running as async_running;
-pub use crypt::{hmac_sha256, server_key};
+pub use crypt::{hmac_sha256, server_key, store_namespace};
 pub use httpclient::{check_header_name, check_header_value, check_http_url};
 pub use netdb::{
     redis_publish, redis_subscribe, session_insert, session_read, session_remove, session_sweep, session_update,
@@ -986,9 +986,13 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         "list_unique" => |vm, a| {
             let mut seen = HashSet::new();
             let mut out: Vec<Value> = Vec::new();
+            // The values kept that are not hashed: only those are compared
+            // pairwise, and each comparison counts (found by the 1.1 audit:
+            // nulls were compared with every int and string kept).
+            let mut others: Vec<Value> = Vec::new();
+            let mut compared = 0usize;
             let mut hashed = 0usize;
             for (i, x) in list(&a[0]).iter().enumerate() {
-                // Lists and maps are compared pairwise (quadratic): watch the time limit.
                 if i % 1024 == 1023 {
                     vm.check_limits()?;
                 }
@@ -1003,11 +1007,18 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
                     Value::Int(_) | Value::Str(_) => seen.insert(x.to_key()),
                     _ => {
                         let mut found = false;
-                        for y in &out {
+                        for y in &others {
+                            compared += 1;
+                            if compared.is_multiple_of(65536) {
+                                vm.check_limits()?;
+                            }
                             if vm.equal(x, y)? {
                                 found = true;
                                 break;
                             }
+                        }
+                        if !found {
+                            others.push(x.clone());
                         }
                         !found
                     }

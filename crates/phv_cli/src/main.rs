@@ -245,6 +245,9 @@ enum Command {
 /// file is replaced only with `--force`.
 fn write_migrated(input: &Path, out: &Path, text: &str, force: bool) -> Result<(), String> {
     use std::io::Write as _;
+    // The directories on the way are checked as for `phv build -o` (found by
+    // the 1.1 audit: only the file itself was).
+    check_output_dirs(out)?;
     let shown = out.display();
     if let (Ok(a), Ok(b)) = (input.canonicalize(), out.canonicalize()) {
         if a == b {
@@ -756,6 +759,14 @@ mod tests {
             }
             assert!(super::windows_link_on_the_way(&full.join("plain")).is_none());
             assert!(super::windows_link_on_the_way(&full.join("plain").join("new")).is_none());
+            // `phv migrate -o` checks its output's directories too (found by the 1.1 audit).
+            let input = full.join("plain").join("in.php");
+            std::fs::write(&input, "<?php echo 1;").unwrap();
+            for out in [full.join("dist").join("m.phv"), full.join("DIST.").join("n.phv")] {
+                assert!(super::write_migrated(&input, &out, "x", false).is_err(), "{}", out.display());
+            }
+            assert_eq!(std::fs::read_dir(full.join("outside")).unwrap().count(), 0);
+            assert!(super::write_migrated(&input, &full.join("plain").join("m.phv"), "x", false).is_ok());
             // A short 8.3 name of a plain folder names that folder (the CI
             // runner's temporary directory is `C:\Users\RUNNER~1\...`).
             let long = full.join("a folder with a long name");

@@ -23,6 +23,7 @@ use crate::ws::Hub;
 use phv_std::wsserver::{MAX_TEXT, MAX_TOPIC};
 use phv_std::Pushed;
 use phv_vm::DatabaseSpec;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -34,22 +35,28 @@ const MAX_QUEUED: usize = 10_000;
 const MAX_QUEUED_BYTES: usize = 32 << 20;
 /// Messages sent in one pipeline.
 const BATCH: usize = 256;
-const MAGIC: &[u8; 4] = b"PHV1";
+const MAGIC: &[u8; 4] = b"PHV2";
 const ID_LEN: usize = 16;
 const MAC_LEN: usize = 32;
 /// The longest message the store may carry: a topic and a text at their
 /// longest, and the frame around them.
-pub const MAX_FRAME: usize = MAGIC.len() + ID_LEN + 2 + MAX_TOPIC + MAX_TEXT + MAC_LEN;
+pub const MAX_FRAME: usize = HEAD + MAX_TOPIC + MAX_TEXT + MAC_LEN;
+/// Magic, instance, time (ms), sequence number, topic length.
+const HEAD: usize = 4 + ID_LEN + 8 + 8 + 2;
+/// How far a message's time may be from the receiver's clock (found by the
+/// 1.1 audit: a captured message could be published again at any time).
+const MAX_AGE_MS: i64 = 60_000;
+/// The processes whose last sequence number is remembered.
+const MAX_SENDERS: usize = 4096;
 /// Waits before connecting again: 1 s, doubled up to this.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// A quiet subscribed connection is asked to answer this often.
 const PING_EVERY: Duration = Duration::from_secs(30);
 
 pub struct Bus {
-    tx: SyncSender<Vec<u8>>,
+    /// Topic and text of each message for the other processes.
+    tx: SyncSender<(String, String)>,
     queued_bytes: Arc<AtomicUsize>,
-    key: Vec<u8>,
-    instance: [u8; ID_LEN],
     metrics: Arc<Metrics>,
     stop: Arc<AtomicBool>,
 }
@@ -66,11 +73,12 @@ impl Bus {
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         {
-            let (spec, channel, queued, metrics, stop) =
-                (spec.clone(), channel.clone(), queued_bytes.clone(), metrics.clone(), stop.clone());
+            let (spec, channel, queued, metrics, stop, key) =
+                (spec.clone(), channel.clone(), queued_bytes.clone(), metrics.clone(), stop.clone(), key.clone());
+            let signer = Signer { key, instance, seq: 0 };
             std::thread::Builder::new()
                 .name("phv-publish".into())
-                .spawn(move || send_loop(&spec, &channel, rx, &queued, &metrics, &stop))
+                .spawn(move || send_loop(&spec, &channel, rx, signer, &queued, &metrics, &stop))
                 .expect("cannot start a thread");
         }
         {
@@ -80,18 +88,17 @@ impl Bus {
                 .spawn(move || receive_loop(&spec, &channel, &key, instance, &hub, &metrics, &stop))
                 .expect("cannot start a thread");
         }
-        Bus { tx, queued_bytes, key, instance, metrics, stop }
+        Bus { tx, queued_bytes, metrics, stop }
     }
 
     /// Queues a message for the other processes (never waits).
     pub fn send(&self, topic: &str, text: &str) {
-        let frame = encode(&self.key, &self.instance, topic, text);
-        let len = frame.len();
+        let len = topic.len() + text.len();
         if self.queued_bytes.fetch_add(len, Ordering::SeqCst) + len > MAX_QUEUED_BYTES {
             self.queued_bytes.fetch_sub(len, Ordering::SeqCst);
             return self.dropped(1);
         }
-        match self.tx.try_send(frame) {
+        match self.tx.try_send((topic.to_string(), text.to_string())) {
             Ok(()) => {}
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                 self.queued_bytes.fetch_sub(len, Ordering::SeqCst);
@@ -131,11 +138,18 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// `PHV1 | instance | topic length (u16) | topic | text | HMAC-SHA256 of all before`.
-fn encode(key: &[u8], instance: &[u8; ID_LEN], topic: &str, text: &str) -> Vec<u8> {
-    let mut f = Vec::with_capacity(MAGIC.len() + ID_LEN + 2 + topic.len() + text.len() + MAC_LEN);
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+/// `PHV2 | instance | time in ms (i64) | sequence number (u64) | topic length
+/// (u16) | topic | text | HMAC-SHA256 of all before`.
+fn encode(key: &[u8], instance: &[u8; ID_LEN], time: i64, seq: u64, topic: &str, text: &str) -> Vec<u8> {
+    let mut f = Vec::with_capacity(HEAD + topic.len() + text.len() + MAC_LEN);
     f.extend_from_slice(MAGIC);
     f.extend_from_slice(instance);
+    f.extend_from_slice(&time.to_be_bytes());
+    f.extend_from_slice(&seq.to_be_bytes());
     f.extend_from_slice(&(topic.len() as u16).to_be_bytes());
     f.extend_from_slice(topic.as_bytes());
     f.extend_from_slice(text.as_bytes());
@@ -152,10 +166,49 @@ enum Decoded {
     /// From this process.
     Own,
     Invalid,
+    /// Signed, but older than `MAX_AGE_MS` or seen before: published again.
+    Replayed,
 }
 
-fn decode(key: &[u8], instance: &[u8; ID_LEN], f: &[u8]) -> Decoded {
-    let head = MAGIC.len() + ID_LEN + 2;
+/// The last sequence number of each process heard from.
+#[derive(Default)]
+struct Seen {
+    last: HashMap<[u8; ID_LEN], (u64, i64)>,
+    /// When this process subscribed (ms): a message from a process not heard
+    /// from yet, sent before that, was never owed to it (delivery is at most
+    /// once), so it is refused (found by the 1.1 audit: after a restart a
+    /// captured message was accepted again).
+    since: i64,
+}
+
+impl Seen {
+    fn new(since: i64) -> Seen {
+        Seen { last: HashMap::new(), since }
+    }
+
+    /// Whether `seq` from `from`, sent at `time`, is new; remembers it.
+    fn fresh(&mut self, from: [u8; ID_LEN], seq: u64, time: i64, now: i64) -> bool {
+        if let Some(&(last, _)) = self.last.get(&from) {
+            if seq <= last {
+                return false;
+            }
+        } else if time < self.since - 1000 {
+            return false;
+        } else if self.last.len() >= MAX_SENDERS {
+            // Processes not heard from within the window can be forgotten:
+            // their old messages are refused by their time.
+            self.last.retain(|_, (_, at)| now - *at <= 2 * MAX_AGE_MS);
+            if self.last.len() >= MAX_SENDERS {
+                return false;
+            }
+        }
+        self.last.insert(from, (seq, now));
+        true
+    }
+}
+
+fn decode(key: &[u8], instance: &[u8; ID_LEN], now: i64, seen: &mut Seen, f: &[u8]) -> Decoded {
+    let head = HEAD;
     if f.len() < head + MAC_LEN || f.len() > MAX_FRAME || &f[..MAGIC.len()] != MAGIC {
         return Decoded::Invalid;
     }
@@ -163,8 +216,15 @@ fn decode(key: &[u8], instance: &[u8; ID_LEN], f: &[u8]) -> Decoded {
     if !phv_std::constant_time_eq(&phv_std::hmac_sha256(key, body), mac) {
         return Decoded::Invalid;
     }
-    if &body[MAGIC.len()..MAGIC.len() + ID_LEN] == instance {
+    let from: [u8; ID_LEN] = body[MAGIC.len()..MAGIC.len() + ID_LEN].try_into().expect("ID_LEN bytes");
+    if &from == instance {
         return Decoded::Own;
+    }
+    let at = MAGIC.len() + ID_LEN;
+    let time = i64::from_be_bytes(body[at..at + 8].try_into().expect("8 bytes"));
+    let seq = u64::from_be_bytes(body[at + 8..at + 16].try_into().expect("8 bytes"));
+    if (now - time).abs() > MAX_AGE_MS {
+        return Decoded::Replayed;
     }
     let tlen = u16::from_be_bytes([body[head - 2], body[head - 1]]) as usize;
     if tlen == 0 || tlen > MAX_TOPIC || head + tlen > body.len() {
@@ -178,13 +238,33 @@ fn decode(key: &[u8], instance: &[u8; ID_LEN], f: &[u8]) -> Decoded {
     if text.len() > MAX_TEXT || topic.chars().any(char::is_control) {
         return Decoded::Invalid;
     }
+    if !seen.fresh(from, seq, time, now) {
+        return Decoded::Replayed;
+    }
     Decoded::Message(topic.to_string(), text.to_string())
+}
+
+/// Signs and numbers the messages of this process, in the order they are sent
+/// (found by the 1.1 audit: numbered by the scripts, two at once could queue
+/// them out of order, and the receiver dropped the lower one).
+struct Signer {
+    key: Vec<u8>,
+    instance: [u8; ID_LEN],
+    seq: u64,
+}
+
+impl Signer {
+    fn frame(&mut self, topic: &str, text: &str) -> Vec<u8> {
+        self.seq += 1;
+        encode(&self.key, &self.instance, now_ms(), self.seq, topic, text)
+    }
 }
 
 fn send_loop(
     spec: &DatabaseSpec,
     channel: &str,
-    rx: Receiver<Vec<u8>>,
+    rx: Receiver<(String, String)>,
+    mut signer: Signer,
     queued: &AtomicUsize,
     metrics: &Metrics,
     stop: &AtomicBool,
@@ -194,7 +274,29 @@ fn send_loop(
     while !stop.load(Ordering::SeqCst) {
         let first = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(f) => f,
-            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Timeout) => {
+                // Without messages to send, the store is tried again when the
+                // back-off ends, so /ready recovers (found by the 1.1 audit: it
+                // stayed 503 until the next message).
+                if down_until.is_some_and(|t| Instant::now() >= t) {
+                    // A PUBLISH, so a store that takes connections but refuses
+                    // messages is not taken for ready (found by the 1.1 audit).
+                    let probe = format!("{channel}:probe");
+                    match phv_std::redis_publish(spec, &probe, &[Vec::new()], Instant::now() + Duration::from_secs(5)) {
+                        Ok(()) => {
+                            metrics.health.ok(StoreKind::Publish);
+                            down_until = None;
+                            backoff = Duration::from_secs(1);
+                        }
+                        Err(_) => {
+                            metrics.health.failed(StoreKind::Publish);
+                            down_until = Some(Instant::now() + backoff);
+                            backoff = (backoff * 2).min(MAX_BACKOFF);
+                        }
+                    }
+                }
+                continue;
+            }
             Err(RecvTimeoutError::Disconnected) => return,
         };
         let mut batch = vec![first];
@@ -204,13 +306,14 @@ fn send_loop(
                 Err(_) => break,
             }
         }
-        queued.fetch_sub(batch.iter().map(Vec::len).sum(), Ordering::SeqCst);
+        queued.fetch_sub(batch.iter().map(|(t, x)| t.len() + x.len()).sum(), Ordering::SeqCst);
         // While the store is down, messages are dropped at once instead of piling up.
         if down_until.is_some_and(|t| Instant::now() < t) {
             dropped(metrics, batch.len() as u64);
             continue;
         }
-        match phv_std::redis_publish(spec, channel, &batch, Instant::now() + Duration::from_secs(5)) {
+        let frames: Vec<Vec<u8>> = batch.iter().map(|(t, x)| signer.frame(t, x)).collect();
+        match phv_std::redis_publish(spec, channel, &frames, Instant::now() + Duration::from_secs(5)) {
             Ok(()) => {
                 metrics.publish_sent.fetch_add(batch.len() as u64, Ordering::Relaxed);
                 metrics.health.ok(StoreKind::Publish);
@@ -241,6 +344,8 @@ fn receive_loop(
 ) {
     let mut backoff = Duration::from_secs(1);
     let mut warned = false;
+    // Kept across connections: a frame seen before a reconnect is still refused.
+    let mut seen = Seen::new(now_ms());
     // Waits up to `d`, a second at a time, unless the server stops.
     let pause = |d: Duration| {
         let until = Instant::now() + d;
@@ -266,7 +371,10 @@ fn receive_loop(
         if warned {
             eprintln!("the publish_store can be used again");
         }
-        backoff = Duration::from_secs(1);
+        // The wait before connecting again starts over only once a connection
+        // has lasted (found by the 1.1 audit: a server that took the
+        // subscription and then sent garbage was connected to every second).
+        let connected = Instant::now();
         let mut quiet_since = Instant::now();
         let mut pinged: Option<Instant> = None;
         let lost = loop {
@@ -276,13 +384,13 @@ fn receive_loop(
             match sub.next(Duration::from_secs(1), MAX_FRAME) {
                 Ok(Pushed::Message(f)) => {
                     quiet_since = Instant::now();
-                    match decode(key, &instance, &f) {
+                    match decode(key, &instance, now_ms(), &mut seen, &f) {
                         Decoded::Message(topic, text) => {
                             metrics.publish_received.fetch_add(1, Ordering::Relaxed);
                             hub.lock().unwrap_or_else(|e| e.into_inner()).publish(&topic, &text);
                         }
                         Decoded::Own => {}
-                        Decoded::Invalid => {
+                        Decoded::Invalid | Decoded::Replayed => {
                             metrics.publish_invalid.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -312,6 +420,9 @@ fn receive_loop(
         metrics.health.failed(StoreKind::Publish);
         eprintln!("warning: the connection to the publish_store was lost ({lost}); connecting again");
         warned = true;
+        if connected.elapsed() >= Duration::from_secs(30) {
+            backoff = Duration::from_secs(1);
+        }
         pause(backoff);
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
@@ -325,32 +436,73 @@ mod tests {
     fn frames_are_signed_and_checked() {
         let (key, other_key) = (b"k".repeat(32), b"o".repeat(32));
         let (me, them) = ([1u8; ID_LEN], [2u8; ID_LEN]);
-        let f = encode(&key, &them, "lobby", "hello\nworld");
-        assert_eq!(decode(&key, &me, &f), Decoded::Message("lobby".into(), "hello\nworld".into()));
-        assert_eq!(decode(&key, &them, &f), Decoded::Own);
-        assert_eq!(decode(&other_key, &me, &f), Decoded::Invalid, "another site's key");
+        let now = now_ms();
+        let mut n = 0;
+        // A new frame each time (its sequence number goes up).
+        let mut enc = |topic: &str, text: &str| {
+            n += 1;
+            encode(&key, &them, now, n, topic, text)
+        };
+        let check = |f: &[u8]| decode(&key, &me, now, &mut Seen::new(0), f);
+        let f = enc("lobby", "hello\nworld");
+        assert_eq!(check(&f), Decoded::Message("lobby".into(), "hello\nworld".into()));
+        assert_eq!(decode(&key, &them, now, &mut Seen::new(0), &f), Decoded::Own);
+        assert_eq!(decode(&other_key, &me, now, &mut Seen::new(0), &f), Decoded::Invalid, "another site's key");
         for i in 0..f.len() {
             let mut g = f.clone();
             g[i] ^= 1;
-            assert_eq!(decode(&key, &me, &g), Decoded::Invalid, "byte {i} changed");
+            assert_ne!(check(&g), Decoded::Message("lobby".into(), "hello\nworld".into()), "byte {i} changed");
+            assert!(matches!(check(&g), Decoded::Invalid), "byte {i} changed");
         }
-        assert_eq!(decode(&key, &me, &f[..f.len() - 1]), Decoded::Invalid);
-        assert_eq!(decode(&key, &me, b""), Decoded::Invalid);
+        assert_eq!(check(&f[..f.len() - 1]), Decoded::Invalid);
+        assert_eq!(check(b""), Decoded::Invalid);
         // Rules of publish(), even when signed: a topic with a control character, too long, empty.
         for topic in ["a\u{7}b", &"t".repeat(MAX_TOPIC + 1), ""] {
-            assert_eq!(decode(&key, &me, &encode(&key, &them, topic, "x")), Decoded::Invalid, "{topic:?}");
+            assert_eq!(check(&enc(topic, "x")), Decoded::Invalid, "{topic:?}");
         }
         let big = "x".repeat(MAX_TEXT);
-        assert!(matches!(decode(&key, &me, &encode(&key, &them, "t", &big)), Decoded::Message(..)));
+        assert!(matches!(check(&enc("t", &big)), Decoded::Message(..)));
         let too_big = "x".repeat(MAX_TEXT + 1);
-        assert_eq!(decode(&key, &me, &encode(&key, &them, "t", &too_big)), Decoded::Invalid);
+        assert_eq!(check(&enc("t", &too_big)), Decoded::Invalid);
         // A topic length that runs past the end.
-        let mut g = encode(&key, &them, "lobby", "");
-        let at = MAGIC.len() + ID_LEN;
+        let mut g = enc("lobby", "");
+        let at = HEAD - 2;
         g[at..at + 2].copy_from_slice(&100u16.to_be_bytes());
         let body_len = g.len() - MAC_LEN;
         let mac = phv_std::hmac_sha256(&key, &g[..body_len]);
         g[body_len..].copy_from_slice(&mac);
-        assert_eq!(decode(&key, &me, &g), Decoded::Invalid);
+        assert_eq!(check(&g), Decoded::Invalid);
+    }
+
+    /// A signed message published again is refused: seen before, or too old
+    /// (found by the 1.1 audit: a captured message reached visitors again,
+    /// also after the processes restarted).
+    #[test]
+    fn replayed_frames_are_refused() {
+        let key = b"k".repeat(32);
+        let (me, them) = ([1u8; ID_LEN], [2u8; ID_LEN]);
+        let now = now_ms();
+        let mut seen = Seen::new(0);
+        let f1 = encode(&key, &them, now, 1, "lobby", "one");
+        let f2 = encode(&key, &them, now, 2, "lobby", "two");
+        assert!(matches!(decode(&key, &me, now, &mut seen, &f1), Decoded::Message(..)));
+        assert_eq!(decode(&key, &me, now, &mut seen, &f1), Decoded::Replayed, "the same frame again");
+        assert!(matches!(decode(&key, &me, now, &mut seen, &f2), Decoded::Message(..)));
+        assert_eq!(decode(&key, &me, now, &mut seen, &f1), Decoded::Replayed, "an older one");
+        // Too old, or from too far ahead, even for a receiver that never saw it.
+        for t in [now - MAX_AGE_MS - 1, now + MAX_AGE_MS + 1] {
+            let f = encode(&key, &them, t, 9, "lobby", "x");
+            assert_eq!(decode(&key, &me, now, &mut Seen::new(0), &f), Decoded::Replayed);
+        }
+        // Another process's numbers are its own.
+        let other = encode(&key, &[3u8; ID_LEN], now, 1, "lobby", "x");
+        assert!(matches!(decode(&key, &me, now, &mut seen, &other), Decoded::Message(..)));
+        // A process that subscribed after a message was sent refuses it from a
+        // sender it has not heard from (a restart does not open a window).
+        let mut restarted = Seen::new(now);
+        let before = encode(&key, &[4u8; ID_LEN], now - 5000, 1, "lobby", "x");
+        assert_eq!(decode(&key, &me, now, &mut restarted, &before), Decoded::Replayed);
+        let after = encode(&key, &[4u8; ID_LEN], now, 2, "lobby", "x");
+        assert!(matches!(decode(&key, &me, now, &mut restarted, &after), Decoded::Message(..)));
     }
 }

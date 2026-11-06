@@ -223,10 +223,12 @@ async function registryPackages() {
     const signal = AbortSignal.timeout(15000);
     const res = await fetch(`https://api.github.com/repos/${REGISTRY_REPO}/contents/index`, { signal, headers: { "User-Agent": "phv-lang.org" } });
     if (!res.ok) return null;
-    const files = (await res.json()).filter((f) => /^[a-z0-9_]+\.toml$/.test(f.name));
+    // An entry is two short lines: larger files are not fetched (found by the
+    // 1.1 audit: a file of any size was read while the site was built).
+    const files = (await res.json()).filter((f) => /^[a-z0-9_]+\.toml$/.test(f.name) && f.size <= 4096);
     const out = [];
     for (const f of files) {
-      const text = await (await fetch(f.download_url, { signal })).text();
+      const text = (await (await fetch(f.download_url, { signal })).text()).slice(0, 4096);
       // Exactly the two lines the registry's check allows, so the page shows
       // the same `git` URL that `phv install` reads; anything else is skipped.
       const m = /^git = "(https:\/\/[^"\\\s]+)"\r?\ndescription = "([^"\\\r\n]{1,200})"\r?\n?$/.exec(text);

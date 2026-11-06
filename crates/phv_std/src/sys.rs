@@ -310,7 +310,12 @@ pub fn fs_error(vm: &Vm, rel: &str, dir: &str, e: FsError) -> VmError {
 }
 
 fn env_allowed(vm: &Vm, name: &str) -> bool {
-    vm.host.permissions.env.iter().any(|pat| match pat.strip_suffix('*') {
+    let p = &vm.host.permissions;
+    // In any case: Windows reads `APP_secret` as `APP_SECRET` (found by the 1.1 audit).
+    if p.hidden_env.iter().any(|h| h.eq_ignore_ascii_case(name)) {
+        return false;
+    }
+    p.env.iter().any(|pat| match pat.strip_suffix('*') {
         Some(prefix) => name.starts_with(prefix),
         None => pat == name,
     })

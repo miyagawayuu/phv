@@ -248,3 +248,95 @@ fn copies_and_long_keys_stop_at_the_time_limit() {
         assert!(start.elapsed() < Duration::from_secs(5), "{name} took {:?}", start.elapsed());
     }
 }
+
+/// Found by the 1.1 audit: literal HTML written in a loop was never counted
+/// (4 GB under 128 MB).
+#[test]
+fn literal_html_in_a_loop_stops_at_the_memory_limit() {
+    let piece = "x".repeat(1 << 20);
+    let src = format!("<?phv for ($i = 0; $i < 3000; $i++) {{ ?>{piece}<?phv }} ?>");
+    assert_stops_at_limit("echo_html", &src);
+    // Many small pieces too: the bytes written since the last check count.
+    let small = "y".repeat(60 << 10);
+    let src = format!("<?phv for ($i = 0; $i < 100000; $i++) {{ ?>{small}<?phv }} ?>");
+    assert_stops_at_limit("echo_html_small", &src);
+}
+
+/// Found by the 1.1 audit: builtins that compare or hash long values once
+/// per element ran far past the time limit. Each case would take tens of
+/// seconds without the checks, even on a fast machine.
+#[test]
+fn builtins_over_long_values_stop_at_the_time_limit() {
+    let cases = [
+        // `contains()` on maps that differ only at their end (C-3).
+        (
+            "contains_maps",
+            "map<int, int> $m = [];\nfor ($i = 0; $i < 400000; $i++) { $m[$i] = $i; }\n$n = $m;\n$n[399999] = -1;\nlist<map<int, int>> $a = [];\nfor ($i = 0; $i < 2048; $i++) { $a[] = $m; }\necho $a->contains($n) ? 1 : 0;\n",
+        ),
+        // `min()` and `max()` of two long strings alternating (C-2).
+        (
+            "min",
+            "$s = str_repeat(\"a\", 20000000);\n$t = str_repeat(\"a\", 19999999) . \"b\";\nlist<string> $a = [];\nfor ($i = 0; $i < 40000; $i++) { $a[] = $i % 2 == 0 ? $t : $s; }\necho strlen($a->min() ?? \"\");\n",
+        ),
+        (
+            "max",
+            "$s = str_repeat(\"a\", 20000000);\n$t = str_repeat(\"a\", 19999999) . \"b\";\nlist<string> $a = [];\nfor ($i = 0; $i < 40000; $i++) { $a[] = $i % 2 == 0 ? $s : $t; }\necho strlen($a->max() ?? \"\");\n",
+        ),
+        // `groupBy()` with one long key for every item (C-4).
+        (
+            "group_by",
+            "$k = str_repeat(\"k\", 100000000);\necho count(range(1, 100000)->groupBy(fn(int $x): string => $k));\n",
+        ),
+    ];
+    for (name, body) in cases {
+        let limits =
+            Limits { max_time: Some(Duration::from_secs(1)), max_memory: Some(256 << 20), ..Limits::default() };
+        let start = Instant::now();
+        let (out, _) = run_limited(name, &format!("<?phv\n{body}"), limits);
+        assert!(out.contains("maximum execution time"), "{name}: {out}");
+        assert!(start.elapsed() < Duration::from_secs(8), "{name} took {:?}", start.elapsed());
+    }
+}
+
+/// Found by the 1.1 audit: `unique()` compared each value that is not hashed
+/// (here `null`) with every int and string kept.
+#[test]
+fn unique_compares_only_what_it_cannot_hash() {
+    let src = "<?phv\nlist<?int> $a = [];\nfor ($i = 0; $i < 1000000; $i++) { $a[] = $i; }\nfor ($i = 0; $i < 3000; $i++) { $a[] = null; }\necho $a->unique()->len();\n";
+    let limits = Limits { max_time: Some(Duration::from_secs(5)), max_memory: Some(256 << 20), ..Limits::default() };
+    let start = Instant::now();
+    let (out, _) = run_limited("unique_nulls", src, limits);
+    assert_eq!(out, "1000001");
+    assert!(start.elapsed() < Duration::from_secs(3), "took {:?}", start.elapsed());
+}
+
+/// Found by the 1.1 audit: `E::cases()` of a huge enum was one untimed step.
+#[test]
+fn enum_cases_are_timed() {
+    let mut src = String::from("<?phv\nenum E {\n");
+    for i in 0..200_000 {
+        src.push_str(&format!("    case C{i};\n"));
+    }
+    src.push_str("}\n$n = 0;\nwhile (true) { $n = $n + count(E::cases()); }\n");
+    let limits = Limits { max_time: Some(Duration::from_secs(1)), max_memory: Some(256 << 20), ..Limits::default() };
+    let start = Instant::now();
+    let (out, _) = run_limited("enum_cases", &src, limits);
+    assert!(out.contains("maximum execution time"), "{out}");
+    assert!(start.elapsed() < Duration::from_secs(10), "took {:?}", start.elapsed());
+}
+
+/// Found by the 1.1 audit: `E::tryFrom()` looked at every case of a huge
+/// backed enum in one untimed step.
+#[test]
+fn enum_lookups_are_timed() {
+    let mut src = String::from("<?phv\nenum E: int {\n");
+    for i in 0..200_000 {
+        src.push_str(&format!("    case C{i} = {i};\n"));
+    }
+    src.push_str("}\n$n = 0;\nwhile (true) { $n = $n + (E::tryFrom(-1) == null ? 1 : 0); }\n");
+    let limits = Limits { max_time: Some(Duration::from_secs(1)), max_memory: Some(256 << 20), ..Limits::default() };
+    let start = Instant::now();
+    let (out, _) = run_limited("enum_from", &src, limits);
+    assert!(out.contains("maximum execution time"), "{out}");
+    assert!(start.elapsed() < Duration::from_secs(10), "took {:?}", start.elapsed());
+}

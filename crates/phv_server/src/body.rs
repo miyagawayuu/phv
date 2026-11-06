@@ -49,6 +49,45 @@ impl Drop for Counted {
     }
 }
 
+/// Output counted in two totals (the server's and one connection's) until
+/// its last copy is dropped.
+struct CountedTwice {
+    data: Vec<u8>,
+    totals: [Arc<AtomicUsize>; 2],
+}
+
+impl AsRef<[u8]> for CountedTwice {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for CountedTwice {
+    fn drop(&mut self) {
+        for t in &self.totals {
+            t.fetch_sub(self.data.len(), Ordering::Relaxed);
+        }
+    }
+}
+
+/// `data` counted in both `server` and `conn` until it has been sent, unless
+/// that would take `server` past `cap`: then nothing is counted. The size is
+/// added before it is compared, so callers at once pass `cap` by none.
+pub fn counted_twice_within(
+    data: Vec<u8>,
+    server: &Arc<AtomicUsize>,
+    conn: &Arc<AtomicUsize>,
+    cap: usize,
+) -> Option<Bytes> {
+    let len = data.len();
+    if server.fetch_add(len, Ordering::Relaxed) + len > cap {
+        server.fetch_sub(len, Ordering::Relaxed);
+        return None;
+    }
+    conn.fetch_add(len, Ordering::Relaxed);
+    Some(Bytes::from_owner(CountedTwice { data, totals: [server.clone(), conn.clone()] }))
+}
+
 /// `data` as bytes whose size counts in `total` until the last copy (or
 /// slice) of them is dropped.
 pub fn counted_bytes(data: Vec<u8>, total: &Arc<AtomicUsize>) -> Bytes {

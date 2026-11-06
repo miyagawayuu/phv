@@ -98,6 +98,15 @@ fn session_key(id: &str) -> String {
     phv_std::sha256_hex(format!("phv-session:{id}").as_bytes())
 }
 
+/// The key in a shared database: in the site's namespace when it has one, so
+/// a session of one site is not one of another.
+fn shared_session_key(namespace: Option<&str>, id: &str) -> String {
+    match namespace {
+        Some(ns) => phv_std::sha256_hex(format!("phv-session:{ns}:{id}").as_bytes()),
+        None => session_key(id),
+    }
+}
+
 /// A session's values as every store keeps them: a JSON object of strings.
 /// (Where its times are kept differs: in a session file's JSON, in columns of
 /// `phv_sessions` that its sweep sorts by, in the header of a Redis value
@@ -131,6 +140,14 @@ struct DbStore {
     written: AtomicU64,
     /// Whether the database answered (`/ready`, `/metrics`).
     health: Arc<Health>,
+    /// The site's namespace in the shared database (`Host::store_namespace`).
+    namespace: Option<String>,
+}
+
+impl DbStore {
+    fn key(&self, id: &str) -> String {
+        shared_session_key(self.namespace.as_deref(), id)
+    }
 }
 
 impl DbStore {
@@ -154,7 +171,9 @@ impl DbStore {
 
 impl Backend for DbStore {
     fn read(&self, id: &str) -> Option<(Record, bool)> {
-        let row = match self.seen(phv_std::session_read(&self.spec, &session_key(id))) {
+        // Sessions made before the site had a namespace (1.0) are not read: a
+        // site that could read them could read those of any site without one.
+        let row = match self.seen(phv_std::session_read(&self.spec, &self.key(id))) {
             Ok(r) => r?,
             Err(e) => {
                 Self::warn("read", e);
@@ -167,17 +186,17 @@ impl Backend for DbStore {
 
     fn insert(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<bool> {
         self.written.fetch_add(1, Ordering::Relaxed);
-        self.seen(phv_std::session_insert(&self.spec, &session_key(id), &Self::row(r, returned), &self.limits))
+        self.seen(phv_std::session_insert(&self.spec, &self.key(id), &Self::row(r, returned), &self.limits))
             .map_err(std::io::Error::other)
     }
 
     fn update(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<bool> {
-        self.seen(phv_std::session_update(&self.spec, &session_key(id), &Self::row(r, returned), &self.limits))
+        self.seen(phv_std::session_update(&self.spec, &self.key(id), &Self::row(r, returned), &self.limits))
             .map_err(std::io::Error::other)
     }
 
     fn remove(&self, id: &str) -> bool {
-        self.seen(phv_std::session_remove(&self.spec, &session_key(id))).unwrap_or_else(|e| {
+        self.seen(phv_std::session_remove(&self.spec, &self.key(id))).unwrap_or_else(|e| {
             Self::warn("remove", e);
             false
         })
@@ -525,7 +544,13 @@ impl Store {
     }
 
     /// A store that keeps sessions in a database of `[databases]` (see `DbStore`).
-    pub fn with_database(ttl: Duration, secure: bool, spec: phv_vm::DatabaseSpec, health: Arc<Health>) -> Store {
+    pub fn with_database(
+        ttl: Duration,
+        secure: bool,
+        spec: phv_vm::DatabaseSpec,
+        health: Arc<Health>,
+        namespace: Option<String>,
+    ) -> Store {
         let mut store = Store::new(ttl, secure, None);
         let limits = phv_std::SessionLimits {
             ttl,
@@ -533,8 +558,14 @@ impl Store {
             max_sessions: MAX_SESSIONS,
             max_bytes: MAX_BYTES,
         };
-        store.files =
-            Some(Box::new(DbStore { spec, limits, swept: AtomicU64::new(0), written: AtomicU64::new(0), health }));
+        store.files = Some(Box::new(DbStore {
+            spec,
+            limits,
+            swept: AtomicU64::new(0),
+            written: AtomicU64::new(0),
+            health,
+            namespace,
+        }));
         store
     }
 
@@ -838,13 +869,18 @@ mod tests {
                 continue;
             };
             let spec = phv_vm::DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 2 };
-            let store = Store::with_database(Duration::from_secs(60), false, spec.clone(), Arc::default());
+            let store = Store::with_database(Duration::from_secs(60), false, spec.clone(), Arc::default(), None);
             let mut s = SessionData::default();
             s.values.insert("user".into(), "alice".into());
             s.changed = true;
             let cookie = store.save(s).unwrap();
             let header = format!("PHVSESSID={}", cookie.split(['=', ';']).nth(1).unwrap());
             assert_eq!(store.load(Some(&header)).values.get("user").map(String::as_str), Some("alice"), "{var}");
+            // Another site on the same database does not take the cookie
+            // (found by the 1.1 audit).
+            let other =
+                Store::with_database(Duration::from_secs(60), false, spec.clone(), Arc::default(), Some("b".into()));
+            assert!(other.load(Some(&header)).id.is_none(), "{var}: another site took the session");
             // Logged out while a slow request still holds it: it stays gone.
             let mut slow = store.load(Some(&header));
             let mut logout = store.load(Some(&header));

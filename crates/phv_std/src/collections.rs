@@ -6,7 +6,7 @@
 use super::{int, list, map, truthy};
 use indexmap::IndexMap;
 use phv_vm::value::compare;
-use phv_vm::{BuiltinFn, Value, Vm};
+use phv_vm::{BuiltinFn, Value, Vm, VmError};
 
 /// The time limit is checked every this many callback calls (a callback may be cheap).
 const CHECK_EVERY: usize = 1024;
@@ -67,9 +67,19 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let xs = list(&a[0]);
             // Each item may start a group of its own.
             vm.reserve(xs.len().saturating_mul(VALUE + GROUP))?;
+            // Each key is hashed whole: their bytes count (found by the 1.1
+            // audit: one long key returned for every item ran 15 s past the limit).
+            let mut hashed = 0usize;
             for (i, x) in xs.iter().enumerate() {
                 tick(vm, i)?;
                 let key = vm.call_value(&f, std::slice::from_ref(x))?;
+                if let Value::Str(s) = &key {
+                    hashed += s.len();
+                    if hashed >= 16 << 20 {
+                        hashed = 0;
+                        vm.check_limits()?;
+                    }
+                }
                 groups.entry(key.to_key()).or_default().push(x.clone());
             }
             Ok(Value::map(groups.into_iter().map(|(k, v)| (k, Value::list(v))).collect()))
@@ -118,8 +128,8 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             }
             Ok(Value::Int(n))
         },
-        "list_min" => |_, a| Ok(list(&a[0]).iter().min_by(|x, y| compare(x, y)).cloned().unwrap_or(Value::Null)),
-        "list_max" => |_, a| Ok(list(&a[0]).iter().max_by(|x, y| compare(x, y)).cloned().unwrap_or(Value::Null)),
+        "list_min" => |vm, a| extreme(vm, &a[0], std::cmp::Ordering::Less),
+        "list_max" => |vm, a| extreme(vm, &a[0], std::cmp::Ordering::Greater),
         "list_remove_at" => |vm, a| {
             let (items, i) = (list(&a[0]), int(&a[1]));
             if i < 0 || i as usize >= items.len() {
@@ -176,4 +186,57 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         _ => return None,
     };
     Some(f)
+}
+
+/// The least (`Less`) or greatest (`Greater`) element of a list, the first of
+/// equal ones as `min_by` / `max_by` give them, watching the limits: each
+/// comparison of long values counts (found by the 1.1 audit: two long strings
+/// alternating in a list took 23 s under a 1 s limit).
+fn extreme(vm: &Vm, l: &Value, want: std::cmp::Ordering) -> Result<Value, VmError> {
+    let xs = list(l);
+    let mut best: Option<&Value> = None;
+    let mut spent = 0usize;
+    for (i, x) in xs.iter().enumerate() {
+        if i % 1024 == 1023 {
+            vm.check_limits()?;
+        }
+        let Some(b) = best else {
+            best = Some(x);
+            continue;
+        };
+        spent += compare_cost(x).min(compare_cost(b));
+        if spent >= 16 << 20 {
+            spent = 0;
+            vm.check_limits()?;
+        }
+        let ord = compare(x, b);
+        // `min_by` keeps the first of equal elements, `max_by` the last.
+        if ord == want || (want == std::cmp::Ordering::Greater && ord == std::cmp::Ordering::Equal) {
+            best = Some(x);
+        }
+    }
+    Ok(best.cloned().unwrap_or(Value::Null))
+}
+
+/// About how many bytes comparing `v` may read: its text, or for a list, map
+/// or set the text of its elements (one level, which is where long values sit).
+fn compare_cost(v: &Value) -> usize {
+    let shallow = |v: &Value| match v {
+        Value::Str(s) | Value::Html(s) => s.len(),
+        _ => 16,
+    };
+    match v {
+        Value::List(xs) => xs.iter().map(shallow).sum::<usize>() + 16,
+        Value::Map(m) => m.values().map(shallow).sum::<usize>() + 16 * m.len(),
+        Value::Set(s) => {
+            s.iter()
+                .map(|k| match k {
+                    phv_vm::Key::Str(t) => t.len(),
+                    phv_vm::Key::Int(_) => 16,
+                })
+                .sum::<usize>()
+                + 16
+        }
+        _ => shallow(v),
+    }
 }

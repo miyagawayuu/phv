@@ -737,6 +737,9 @@ that end tag would end it and turn what follows into markup.
 | URL of a `<script>` | `<script src="<?= $u ?>">` (and `href` in SVG) | Error, also for `SafeUrl`: the tag gets the CSP nonce, so any URL there would run as a trusted script. Write the URL in the template |
 | `content` of a `<meta>` | `<meta http-equiv="refresh" content="0;url=<?= $u ?>">` | Only numbers, unless a `name`, `property` or `itemprop` attribute comes before `content` and the tag has no `http-equiv` (`<meta property="og:title" content="<?= $t ?>">` is text; `http-equiv` after such text is an error) |
 
+- The tags are read as browsers read them: only tab, line feed, form feed, carriage return and space separate a
+  tag's name and its attributes, so `<a class=x　title="<?= $t ?>">` (a full-width space) is one unquoted value,
+  an error. A tag name runs up to such a space, `/` or `>`.
 - The bodies of functions and closures, and `if` and loop blocks, must end in the same HTML state they started in
   (leaving a `<script>` or an attribute open at the end of a block is an error). This prevents the context from drifting with call order or repetition.
 - For the same reason, `break` and `continue` must be in the HTML state where their loop began, `throw` where its
@@ -946,7 +949,7 @@ these are not served on the site's port):
 - Metrics (all start with `phv_`): `requests_total{kind, code}` (`kind`: `page`, `static`, `ws`, `sse`, `other`; `code`:
   `2xx`...), `request_duration_seconds{route}` (a histogram per page, labelled with its file: `/posts/[id]`, never the
   path asked for; at most 1,000 routes, the rest as `other`; static files as `static`), `worker_wait_seconds`,
-  `rejected_total{reason}` (`busy`, `output`, `body`, `rate_limit`, `too_large`), `script_failures_total{kind}`
+  `rejected_total{reason}` (`busy`, `output`, `body`, `rate_limit`, `too_large`), `events_waiting_bytes`, `script_failures_total{kind}`
   (`exception`, `time`, `memory`, `compile`, `other`), `ws_messages_total{dir}`, `publish_total{result}`,
   `jobs_total{result}`, `job_duration_seconds`, `store_errors_total{store}`, and the gauges `up`, `ready`,
   `uptime_seconds`, `workers`, `workers_busy`, `connections`, `websockets`, `output_waiting_bytes`, `async_running` and
@@ -1013,6 +1016,12 @@ session()->destroy();                 // log out
   MySQL keep them in a table `phv_sessions`, created when first needed; every 30 seconds (sooner after 1,000 new
   sessions) a server removes expired sessions and keeps the table within the limits below. If the database cannot be
   reached, the request goes on without its session and a warning is logged.
+- Sites that share a database keep their sessions apart by the site's namespace: `[security] store_namespace`, or
+  else `[project] name` (rate limits and jobs are kept under it too). Two copies of a site with the same name, such as
+  staging and production, must set different `store_namespace` values (a server using a shared store without it
+  says so when it starts); a site with neither shares the store with every other such site. Sessions stored before 1.1 are not read by a site with a namespace, so upgrading signs its
+  visitors out once. Sites sharing a session database still share its limits (below), and with PostgreSQL or MySQL
+  the shortest `session_ttl` among them: give each site a database of its own where you can.
 - In every store, a session is saved only while it still exists (a new or regenerated id only if it is new), each as
   one atomic step: a request that finishes after a logout, in this process or another, cannot bring the session back,
   and of two requests that regenerate the same session only one gets it.
@@ -1057,12 +1066,14 @@ secret_old_env = "PHV_SECRET_OLD"  # optional: the previous secret, accepted whi
 
 - The server reads the variables when it starts: one that is unset or holds fewer than 32 bytes stops it with an
   error that names the variable, never its value. They are server settings, so `[permissions] env` need not list them,
-  and `phv build` puts only their names in the executable.
+  and `phv build` puts only their names in the executable. Scripts cannot read them, even when a pattern of
+  `[permissions] env` matches them; the same holds for `[admin] token_env` and every `url_env` and `headers_env`.
 - The server derives a key of its own for each use from the secret (HKDF-SHA256): CSRF tokens, and the messages
   `publish()` sends to other server processes. Scripts cannot read the secret or the keys.
 - To replace the secret, set the new one in `secret_env` and the old one in `secret_old_env`, restart every process,
   and remove `secret_old_env` once the forms served before are no longer used (a few hours). Tokens are always made
-  with the new secret.
+  with the new secret. `publish()` between processes uses `secret_env` only: while some processes have the new secret
+  and others the old one, their messages do not reach each other.
 
 ### Cookie
 
@@ -1325,6 +1336,14 @@ events.onmessage = (e) => console.log(e.data);
   does not read is dropped), and gets a comment line (`: ping`) every 15 seconds so proxies keep it open. It is never
   compressed or cached, works over HTTP/1.1 and HTTP/2, and other sites may open one only as for WebSockets (`[cors]`).
   A stream holds no worker between events.
+- Events count until they are sent, in a budget of their own of `workers` × `memory_limit_mb` (apart from pages',
+  so streams never make pages wait; the server's output can reach twice that in all). A stream may hold 2 MB unsent,
+  and a message whose event is larger (1 MB of text with more than about 150,000 lines) is not sent as an event. A
+  stream that still holds output is ended when its next event would pass that, or while the budget is full, and the
+  browser connects again; a stream that has sent everything skips events while the budget is full (delivery is at
+  most once). Both count as `output` in `phv_rejected_total`. So clients that do not read cannot end the streams of
+  those that do, nor slow down pages; only as many of them as the budget holds at 2 MB each (1,000 for 2 GB) make
+  readers miss events, until they are dropped (30 seconds without progress).
 
 #### publish() across server processes
 
@@ -1350,9 +1369,13 @@ publish_store = "cache"
   hands each message to the connections of the process that joined its topic. A lost connection is opened again after
   1 second, then 2, 4, ... up to 30 seconds; meanwhile `/ready` answers 503 (see "Health checks and metrics").
 - **Delivery is at most once.** A message published while a process is not connected to Redis never reaches that
-  process's connections. Keep what must not be lost in a database, and use `publish()` to say that something changed.
-- Messages are signed with a key derived from `secret_env` and carry the id of the process that sent them. A process
-  skips its own, and drops (and counts as `invalid`) a message that is not signed with the site's key, is malformed,
+  process's connections, nor does one sent before it subscribed. Redis drops a subscriber that falls too far behind
+  (`client-output-buffer-limit pubsub`, 32 MB by default): the process connects again, and what was sent in between is
+  lost. Keep what must not be lost in a database, and use `publish()` to say that something changed.
+- Messages are signed with a key derived from `secret_env` and carry the id of the process that sent them, the time
+  they were sent and a number that grows with each message. A process skips its own, and drops (and counts as
+  `invalid`) a message sent more than 60 seconds before or after its own clock (keep the servers' clocks in step), one
+  it has already received or older than one it received from the same process, one that is not signed with the site's key, is malformed,
   breaks the rules of `publish()` (a topic of 1 to 200 bytes without control characters, a text of at most 1 MB), or is
   longer than that: such a message is read and thrown away as it arrives, never held. The channel's name is derived
   from the key too, so sites that share a Redis server do not see each other's messages. Scripts cannot publish to
@@ -1616,8 +1639,10 @@ $data = json_decode($j->payload);
 
 - A job is the script `<dir>/<name>.phv`; names are lowercase letters, digits and `_`. `enqueue()` throws `ValueError`
   for a job that does not exist, a payload over 64 KB, a delay over 30 days or a key over 200 bytes, and
-  `RuntimeException` when the store holds 100,000 waiting and running jobs (10,000 or 64 MB in memory). It throws
-  `RuntimeException` too in a project without `[jobs]`.
+  `RuntimeException` when the store holds 100,000 waiting and running jobs (10,000 or 64 MB in memory), also inside a
+  `transaction()`. It throws `RuntimeException` too in a project without `[jobs]`. It waits for the store no longer
+  than the script may still run. `dir` must be a directory of the project, not a link. The memory store also keeps at
+  most 16 MB of jobs given up and 100,000 keys of ended jobs.
 - `phv serve` runs `[jobs] workers` jobs at once in each process, on threads of their own: jobs never take the
   workers of pages. Each run gets a fresh VM, `time_limit` and `[security] memory_limit_mb`, and the permissions of
   phv.toml, as a page does. `request()` and `session()` are empty, and `job()` works only in a job. A job may
@@ -1629,17 +1654,24 @@ $data = json_decode($j->payload);
 - A `key` adds a job once: while a job of the same name and key waits, runs or was given up, and for a day after it
   ended, `enqueue()` returns `null`.
 - With PostgreSQL or MySQL, `enqueue()` inside a `transaction()` on the store's database adds the job with the
-  transaction: only if it commits. Jobs are kept in a table `phv_jobs` (created when first needed), taken with
-  `SELECT ... FOR UPDATE SKIP LOCKED`; Redis keeps them under `phv:jobs:`. Every server process and machine using the
-  same store shares the jobs. With `store = "memory"` the jobs live in the server process and are lost when it stops.
+  transaction: only if it commits (with MySQL, only `transaction()` ties them: a `BEGIN` sent as SQL does not). Jobs
+  are kept in a table `phv_jobs_<hash>` of the site's namespace (see "Sessions"; `phv_jobs` for a site without one),
+  created when first needed and taken with `SELECT ... FOR UPDATE SKIP LOCKED`; Redis keeps them under
+  `phv:jobs:<hash>:`. Every server process and machine of the site using the same store shares the jobs; other sites
+  on the same database do not see them; jobs left in the shared table when a site gets a name are not taken. Jobs
+  added by transactions that have not committed yet are not counted toward the 100,000, so transactions running at
+  the same time can each pass it by what they add. With `store = "memory"` the jobs live in the server process and
+  are lost when it stops.
 - **Schedules**: each `[[schedule]]` adds its job (with an empty payload) in the minutes its `cron` expression
   matches, in `timezone`. Fields are `*`, numbers, ranges `a-b`, steps `*/n` and lists `a,b`; days of the week are 0
   to 7 (Sunday is 0 and 7); when the day of the month and the day of the week are both given, either one matches. Each
   process adds the jobs, keyed by the minute: with a shared store a job is added once however many processes run;
-  with `store = "memory"` each process runs its own. Minutes while no process was running are not made up for. At
-  most 100 schedules.
+  with `store = "memory"` each process runs its own. Minutes while no process was running are not made up for. When
+  the clocks change in `timezone`, a time that does not exist that day does not run, and one that comes twice runs
+  twice. At most 100 schedules.
 - `phv jobs run [dir]` runs the jobs (and schedules) of a project without serving its pages, until Ctrl-C or
-  SIGTERM, for a worker machine; with `[jobs] run = false`, `phv serve` only adds jobs. `phv jobs list [--failed]`
+  SIGTERM, for a worker machine; with `[jobs] run = false`, `phv serve` only adds jobs (`phv jobs run` and a built
+  site's `--jobs-only` run them all the same). A built site's jobs are those built into it. `phv jobs list [--failed]`
   shows the jobs of a shared store, and `phv jobs retry <id>` puts a job that was given up back in the queue.
 - A job that does not compile stops `phv serve`, `phv jobs run` and `phv build`. When the server stops, running jobs
   get what is left of `shutdown_timeout`; one that does not finish runs again elsewhere when its lease runs out.
@@ -1808,6 +1840,7 @@ requests_per_minute = 0 # limit per client address (0 means unlimited)
 session_store = "memory"  # or a directory ("sessions/"), or a database ("db:cache")
 rate_limit_store = "cache"  # count rate limits on this Redis database (default: in the process)
 secret_env = "PHV_SECRET"   # the server's secret, shared by its processes (see "CSRF protection")
+store_namespace = "blog"    # the site's name in shared stores (default: [project] name; see "Sessions")
 
 [server]
 workers = 16            # scripts running at once (default: two per CPU, at least 8)
@@ -1898,7 +1931,7 @@ create files at the root of a drive), in the shared temporary directory, and on 
 | `file_append(path, text)`, `filesize(path)`, `filemtime(path)`, `is_dir(path)`, `scandir(dir): list<string>`, `mkdir(dir)`, `copy(from, to)`, `rename(from, to)` | Files and directories; require `[permissions]` (below) |
 | `csv_parse(string): list<list<string>>`, `csv_encode(list<list<string>>): string` | RFC 4180 (quoted fields, `""`, line breaks in fields); `csv_encode` ends lines with CRLF. Spreadsheets run a cell that starts with `=`, `+`, `-` or `@` as a formula: when visitors' text goes into a file people open in one, prefix such cells with `'` |
 | `parse_url(string): map<string, string>`, `parse_query(string): map<string, string>` | Keys `scheme`, `host`, `port`, `user`, `pass`, `path`, `query`, `fragment` (those present); an invalid URL throws `ValueError` |
-| `log_info(msg, ?fields)`, `log_warn(...)`, `log_error(...)` | One line on standard error, next to the server's own log: `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`. Text with spaces, `"` or `=` is quoted; line breaks, control characters and the characters that reorder text (U+202E...) are escaped, so a value cannot forge a line. With `[server] request_ids`, lines written for a request end with `req=<id>` |
+| `log_info(msg, ?fields)`, `log_warn(...)`, `log_error(...)` | One line on standard error, next to the server's own log: `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`. Text with spaces, `"` or `=` is quoted; line breaks, control characters and the characters that reorder text (U+202E...) are escaped, so a value cannot forge a line. With `[server] request_ids`, lines written for a request end with `req=<id>`. The server's own lines (errors of pages and jobs) are escaped the same way |
 | `argv(): list<string>`, `stdin_read_line(): ?string`, `stdin_read_all(): string` | Only in scripts run with `phv run` (elsewhere `RuntimeException`): the arguments after the file, and standard input |
 | `sql_ident(string): Sql` | Column and table names |
 | `assert(bool, ?string)`, `assert_eq(any, any, ?string)` | For tests |
@@ -1979,7 +2012,7 @@ When code uses a PHP function name, the error message suggests the alternative
 | `phv doc [paths] [--std] [--format html\|md] [-o file]` | An API reference from doc comments (see API reference below) |
 | `phv install [--locked]` | Fetch `[dependencies]` and the packages they need, and pin them in `phv.lock` |
 | `phv jobs run [dir]`, `phv jobs list [--failed] [dir]`, `phv jobs retry <id> [dir]` | Run a project's background jobs without serving its pages; list the jobs of its store; put a failed job back (see "Background jobs") |
-| `phv migrate file.php` | Convert PHP mechanically and list the places that need manual work |
+| `phv migrate file.php` | Convert PHP mechanically and list the places that need manual work (`-o` names the output, which is not written through a link) |
 | `phv disasm file.phv` | Show the bytecode |
 | `phv parse file.phv` | Show the syntax tree |
 

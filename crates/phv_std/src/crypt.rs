@@ -63,6 +63,12 @@ pub fn server_key(secret: &[u8], purpose: &str) -> Vec<u8> {
     derive(secret, b"phv server secret", purpose.as_bytes()).to_vec()
 }
 
+/// The namespace of a site in shared stores (sessions, rate limits, jobs),
+/// from its name: 32 hex digits (see `Host::store_namespace`).
+pub fn store_namespace(name: &str) -> String {
+    crate::sha256_hex(format!("phv store\0{name}").as_bytes())[..32].to_string()
+}
+
 /// HMAC-SHA256 of `data` (for the server's own messages, with a key from `server_key`).
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data);

@@ -329,8 +329,13 @@ pub fn wants_events(req: &Request<Incoming>) -> bool {
         })
 }
 
+/// What one event stream may hold unsent, and the largest event: a message of
+/// 1 MB with up to about 150,000 lines (found by the 1.1 audit: with 8 MB, a
+/// few streams that did not read filled the events' budget).
+const STREAM_HELD: usize = 2 << 20;
+
 /// One message as an event: a `data:` line for each of its lines.
-fn event_bytes(text: &str) -> bytes::Bytes {
+fn event_bytes(text: &str) -> Vec<u8> {
     let mut out = String::with_capacity(text.len() + 16);
     for line in text.split("\r\n").flat_map(|l| l.split(['\r', '\n'])) {
         out.push_str("data: ");
@@ -338,7 +343,7 @@ fn event_bytes(text: &str) -> bytes::Bytes {
         out.push('\n');
     }
     out.push('\n');
-    bytes::Bytes::from(out)
+    out.into_bytes()
 }
 
 /// Answers a request for Server-Sent Events with `script` (`*.ws.phv`): runs
@@ -369,8 +374,8 @@ pub async fn events(
             return *refused;
         }
     };
-    // A few chunks in flight; the rest waits in the outbox (`MAX_QUEUED`).
-    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+    // Two events in flight; the rest waits in the outbox (`MAX_QUEUED`).
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(2);
     let mut r = Response::new(RespBody::Stream(rx));
     let h = r.headers_mut();
     h.insert(hyper::header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream; charset=utf-8"));
@@ -415,6 +420,8 @@ impl Conn {
     /// Sends the connection's messages as events until the client goes away,
     /// the script closes it or the server stops; then runs the Close event.
     async fn stream_events(self, tx: tokio::sync::mpsc::Sender<bytes::Bytes>) {
+        // What this stream has queued and not yet sent.
+        let mine = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut closing = self.state.ws_closing.subscribe();
         let mut ping = tokio::time::interval(EVENT_PING_EVERY);
         ping.tick().await;
@@ -426,7 +433,39 @@ impl Conn {
             while let Some(out) = self.outbox.pop() {
                 match out {
                     Out::Text(t) => {
-                        if tx.send(event_bytes(&t)).await.is_err() {
+                        // Events count in the server's output until they are sent,
+                        // as pages do (found by the 1.1 audit: 30 slow readers held
+                        // 3.9 GB). A stream that still holds output is the one
+                        // ended, when it would hold more than `STREAM_HELD` or the
+                        // server is over its cap; one that sent everything goes on,
+                        // so slow readers cannot end the others' streams.
+                        let st = &self.state;
+                        // Streams have a budget of their own (found by the 1.1 audit:
+                        // counted with pages, streams that did not read made every
+                        // page answer 503). When it is full, a stream that sent
+                        // everything skips the event (delivery is at most once).
+                        let bytes = event_bytes(&t);
+                        // A message of so many lines that its event passes the
+                        // limit is not sent as an event.
+                        if bytes.len() > STREAM_HELD {
+                            st.metrics.reject(crate::metrics::Reject::Output);
+                            continue;
+                        }
+                        let held = mine.load(Ordering::Relaxed);
+                        if held + bytes.len() > STREAM_HELD {
+                            st.metrics.reject(crate::metrics::Reject::Output);
+                            break 'conn;
+                        }
+                        let Some(chunk) =
+                            crate::body::counted_twice_within(bytes, &st.events_buffered, &mine, st.buffered_cap)
+                        else {
+                            st.metrics.reject(crate::metrics::Reject::Output);
+                            if held > 0 {
+                                break 'conn;
+                            }
+                            continue;
+                        };
+                        if tx.send(chunk).await.is_err() {
                             break 'conn;
                         }
                         self.state.metrics.ws_out.fetch_add(1, Ordering::Relaxed);

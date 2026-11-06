@@ -2440,6 +2440,9 @@ pub struct JobInfo {
     pub error: String,
 }
 
+/// Below the cap by more than this, the count of jobs may be a second old.
+const JOB_COUNT_MARGIN: i64 = 10_000;
+
 /// How long one operation on the job store may take.
 const JOB_WAIT: Duration = Duration::from_secs(10);
 /// Jobs that ended with a key are kept this long (so the key is not used again).
@@ -2448,15 +2451,45 @@ const JOB_KEEP_DONE_MS: i64 = 24 * 3600 * 1000;
 const JOB_KEEP_DEAD_MS: i64 = 7 * 24 * 3600 * 1000;
 pub const JOB_MAX_DEAD: usize = 10_000;
 
-/// Databases whose `phv_jobs` table this process has created (by URL).
+/// Databases whose jobs table this process has created (by URL and table).
 static JOB_TABLES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
-fn job_conn(spec: &DatabaseSpec) -> Result<(SessionConn, Instant), String> {
+/// The table of a site's jobs: one of its own when it has a namespace
+/// (`Host::store_namespace`, hex digits), so sites sharing a database do not
+/// take each other's jobs (found by the 1.1 audit).
+fn jobs_table(ns: Option<&str>) -> String {
+    match ns {
+        Some(n) if n.bytes().all(|b| b.is_ascii_hexdigit()) => format!("phv_jobs_{n}"),
+        _ => "phv_jobs".to_string(),
+    }
+}
+
+/// The Redis prefix of a site's jobs (see `jobs_table`).
+fn jobs_prefix(ns: Option<&str>) -> String {
+    match ns {
+        Some(n) if n.bytes().all(|b| b.is_ascii_hexdigit()) => format!("phv:jobs:{n}:"),
+        _ => "phv:jobs:".to_string(),
+    }
+}
+
+fn job_conn(spec: &DatabaseSpec, ns: Option<&str>) -> Result<(SessionConn, Instant), String> {
+    job_conn_before(spec, ns, None)
+}
+
+/// `job_conn`, waiting until `deadline` at most (a script's time left).
+fn job_conn_before(
+    spec: &DatabaseSpec,
+    ns: Option<&str>,
+    deadline: Option<Instant>,
+) -> Result<(SessionConn, Instant), String> {
+    let t = jobs_table(ns);
     let Some(url) = spec.url.clone() else {
         return Err(format!("the environment variable {} is not set", spec.url_env.as_deref().unwrap_or("?")));
     };
     tls_init();
-    let until = Instant::now() + JOB_WAIT;
+    // No longer than the script may still run (found by the 1.1 audit: a store
+    // that did not answer held a page for 10 s, whatever its time limit).
+    let until = deadline.map_or(Instant::now() + JOB_WAIT, |d| d.min(Instant::now() + JOB_WAIT));
     let use_ = PoolUse::Jobs;
     let mut conn = match kind_of(&url) {
         Kind::Redis => SessionConn::Redis(redis_conn(spec, use_, until)?),
@@ -2469,16 +2502,17 @@ fn job_conn(spec: &DatabaseSpec) -> Result<(SessionConn, Instant), String> {
             my_connect(&url, spec, t, Some(8 << 20), Some(JOB_WAIT))
         })?)),
     };
-    if !matches!(conn, SessionConn::Redis(_)) && !lock(&JOB_TABLES).contains(&url) {
+    let made = format!("{url}|{t}");
+    if !matches!(conn, SessionConn::Redis(_)) && !lock(&JOB_TABLES).contains(&made) {
         match &mut conn {
             SessionConn::Pg(c) => c
                 .get()
                 .client
                 .batch_execute(
-                    "CREATE TABLE IF NOT EXISTS phv_jobs (id varchar(32) PRIMARY KEY, name varchar(64) NOT NULL, \
+                    &format!("CREATE TABLE IF NOT EXISTS {t} (id varchar(32) PRIMARY KEY, name varchar(64) NOT NULL, \
                      payload text NOT NULL, run_at bigint NOT NULL, attempts integer NOT NULL, state smallint NOT NULL, \
                      lease varchar(32), lease_until bigint, uniq varchar(64) UNIQUE, error text, created bigint NOT NULL); \
-                     CREATE INDEX IF NOT EXISTS phv_jobs_due ON phv_jobs (state, run_at)",
+                     CREATE INDEX IF NOT EXISTS {t}_due ON {t} (state, run_at)"),
                 )
                 .map_err(|e| pg_message(&e))?,
             SessionConn::My(c) => {
@@ -2486,16 +2520,16 @@ fn job_conn(spec: &DatabaseSpec) -> Result<(SessionConn, Instant), String> {
                 c.get()
                     .conn
                     .query_drop(
-                        "CREATE TABLE IF NOT EXISTS phv_jobs (id varchar(32) PRIMARY KEY, name varchar(64) NOT NULL, \
+                        format!("CREATE TABLE IF NOT EXISTS {t} (id varchar(32) PRIMARY KEY, name varchar(64) NOT NULL, \
                          payload mediumtext NOT NULL, run_at bigint NOT NULL, attempts integer NOT NULL, \
                          state smallint NOT NULL, lease varchar(32), lease_until bigint, uniq varchar(64) UNIQUE, \
-                         error text, created bigint NOT NULL, INDEX phv_jobs_due (state, run_at))",
+                         error text, created bigint NOT NULL, INDEX {t}_due (state, run_at))"),
                     )
                     .map_err(|e| my_message(&e))?
             }
             SessionConn::Redis(_) => {}
         }
-        lock(&JOB_TABLES).insert(url);
+        lock(&JOB_TABLES).insert(made);
     }
     Ok((conn, until))
 }
@@ -2519,8 +2553,21 @@ fn job_redis_result(c: &mut Pooled<RedisConn>, r: Result<Reply, RedisError>) -> 
     }
 }
 
-fn job_redis(c: &mut Pooled<RedisConn>, script: &LuaScript, args: &[&[u8]], until: Instant) -> Result<Reply, String> {
-    let r = script.run(c.get(), args, until, 32 << 20);
+/// Runs a job script with `prefix` as its key (`args` start with "0", the
+/// count of keys, which becomes 1).
+fn job_redis(
+    c: &mut Pooled<RedisConn>,
+    script: &LuaScript,
+    prefix: &str,
+    args: &[&[u8]],
+    until: Instant,
+) -> Result<Reply, String> {
+    debug_assert_eq!(args.first(), Some(&&b"0"[..]));
+    let mut with_key: Vec<&[u8]> = Vec::with_capacity(args.len() + 1);
+    with_key.push(b"1");
+    with_key.push(prefix.as_bytes());
+    with_key.extend_from_slice(&args[1..]);
+    let r = script.run(c.get(), &with_key, until, 32 << 20);
     job_redis_result(c, r)
 }
 
@@ -2528,7 +2575,7 @@ fn job_redis(c: &mut Pooled<RedisConn>, script: &LuaScript, args: &[&[u8]], unti
 /// 1 added, 0 the key is taken, -1 the queue is full.
 static REDIS_JOB_ADD: LuaScript = LuaScript::new(
     r#"
-local p = 'phv:jobs:'
+local p = KEYS[1]
 if ARGV[5] ~= '' and redis.call('SET', p .. 'key:' .. ARGV[5], ARGV[1], 'NX') == false then return 0 end
 if redis.call('ZCARD', p .. 'due') + redis.call('ZCARD', p .. 'running') >= tonumber(ARGV[6]) then
   if ARGV[5] ~= '' then redis.call('DEL', p .. 'key:' .. ARGV[5]) end
@@ -2543,7 +2590,7 @@ return 1
 /// ARGV: now, lease_until, token. The job taken: {id, name, payload, attempts}, or nil.
 static REDIS_JOB_TAKE: LuaScript = LuaScript::new(
     r#"
-local p = 'phv:jobs:'
+local p = KEYS[1]
 local id = redis.call('ZRANGEBYSCORE', p .. 'running', '-inf', '(' .. ARGV[1], 'LIMIT', 0, 1)[1]
 if id then
   redis.call('ZREM', p .. 'running', id)
@@ -2565,7 +2612,7 @@ return {id, f[1], f[2], n}
 /// ARGV: id, token, "done" | "retry" | "dead", time, error, most jobs given up kept.
 static REDIS_JOB_END: LuaScript = LuaScript::new(
     r#"
-local p = 'phv:jobs:'
+local p = KEYS[1]
 local k = p .. 'job:' .. ARGV[1]
 if redis.call('HGET', k, 'lease') ~= ARGV[2] then return 0 end
 redis.call('ZREM', p .. 'running', ARGV[1])
@@ -2597,7 +2644,7 @@ return 1
 /// ARGV: before (jobs given up before it are removed).
 static REDIS_JOB_SWEEP: LuaScript = LuaScript::new(
     r#"
-local p = 'phv:jobs:'
+local p = KEYS[1]
 local old = redis.call('ZRANGEBYSCORE', p .. 'dead', '-inf', ARGV[1], 'LIMIT', 0, 1000)
 for _, id in ipairs(old) do
   local u = redis.call('HGET', p .. 'job:' .. id, 'uniq')
@@ -2612,7 +2659,7 @@ return #old
 /// ARGV: "all" | "failed". Flat list: id, name, state, attempts, at, error, ...
 static REDIS_JOB_LIST: LuaScript = LuaScript::new(
     r#"
-local p = 'phv:jobs:'
+local p = KEYS[1]
 local out = {}
 local sets = ARGV[1] == 'failed' and {'dead'} or {'due', 'running', 'dead'}
 local states = {due = 'waiting', running = 'running', dead = 'failed'}
@@ -2631,7 +2678,7 @@ return out
 /// ARGV: id, now. 1 if a job given up was put back.
 static REDIS_JOB_REQUEUE: LuaScript = LuaScript::new(
     r#"
-local p = 'phv:jobs:'
+local p = KEYS[1]
 if redis.call('ZREM', p .. 'dead', ARGV[1]) == 0 then return 0 end
 redis.call('HSET', p .. 'job:' .. ARGV[1], 'attempts', 0)
 redis.call('HDEL', p .. 'job:' .. ARGV[1], 'error')
@@ -2644,13 +2691,16 @@ return 1
 /// holds `cap` waiting and running jobs already.
 pub fn job_add(
     spec: &DatabaseSpec,
+    ns: Option<&str>,
     job: (&str, &str, &str),
     run_at: i64,
     uniq: Option<&str>,
     cap: usize,
+    deadline: Option<Instant>,
 ) -> Result<Option<()>, String> {
     let (id, name, payload) = job;
-    let (mut conn, until) = job_conn(spec)?;
+    let t = jobs_table(ns);
+    let (mut conn, until) = job_conn_before(spec, ns, deadline)?;
     let now = now_ms();
     let full = || format!("the job queue holds {cap} jobs already");
     match &mut conn {
@@ -2666,7 +2716,7 @@ pub fn job_add(
                 cap_s.as_bytes(),
                 now_s.as_bytes(),
             ];
-            match job_redis(c, &REDIS_JOB_ADD, &args, until)? {
+            match job_redis(c, &REDIS_JOB_ADD, &jobs_prefix(ns), &args, until)? {
                 Reply::Int(1) => Ok(Some(())),
                 Reply::Int(0) => Ok(None),
                 Reply::Int(_) => Err(full()),
@@ -2674,43 +2724,52 @@ pub fn job_add(
             }
         }
         SessionConn::Pg(c) => {
-            if job_count_cached(spec, || {
+            if job_count_cached(spec, &t, cap, || {
                 let rows = c
                     .get()
-                    .query_kept("SELECT count(*) FROM phv_jobs WHERE state IN (0, 1)", &[])
+                    .query_kept(&format!("SELECT count(*) FROM {t} WHERE state IN (0, 1)"), &[])
                     .map_err(|e| pg_message(&e))?;
                 Ok(rows.first().and_then(|r| r.try_get::<_, i64>(0).ok()).unwrap_or(0))
             })? >= cap as i64
             {
                 return Err(full());
             }
-            pg_job_insert(c.get(), false, (id, name, payload), run_at, uniq, now)
+            pg_job_insert(c.get(), &t, false, (id, name, payload), run_at, uniq, now)
         }
         SessionConn::My(c) => {
             use mysql::prelude::Queryable;
-            if job_count_cached(spec, || {
+            if job_count_cached(spec, &t, cap, || {
                 let n: Option<i64> = c
                     .get()
                     .conn
-                    .query_first("SELECT count(*) FROM phv_jobs WHERE state IN (0, 1)")
+                    .query_first(format!("SELECT count(*) FROM {t} WHERE state IN (0, 1)"))
                     .map_err(|e| my_message(&e))?;
                 Ok(n.unwrap_or(0))
             })? >= cap as i64
             {
                 return Err(full());
             }
-            my_job_insert(&mut c.get().conn, (id, name, payload), run_at, uniq, now)
+            my_job_insert(&mut c.get().conn, &t, (id, name, payload), run_at, uniq, now)
         }
     }
 }
 
 /// The number of waiting and running jobs, counted at most once a second per
 /// store in this process (counting a large table on every job would be slow).
-fn job_count_cached(spec: &DatabaseSpec, count: impl FnOnce() -> Result<i64, String>) -> Result<i64, String> {
+/// Near `cap` it is counted every time (found by the 1.1 audit: each process
+/// went past the cap by a second of jobs).
+fn job_count_cached(
+    spec: &DatabaseSpec,
+    table: &str,
+    cap: usize,
+    count: impl FnOnce() -> Result<i64, String>,
+) -> Result<i64, String> {
     static COUNTS: LazyLock<Mutex<HashMap<String, (Instant, i64)>>> = LazyLock::new(Default::default);
-    let key = spec.url.clone().unwrap_or_default();
+    let key = format!("{}|{table}", spec.url.as_deref().unwrap_or_default());
     if let Some((at, n)) = lock(&COUNTS).get(&key) {
-        if at.elapsed() < Duration::from_secs(1) {
+        // Far below the cap, or full: a second-old count says the same (found by
+        // the 1.1 audit: near a full cap every refused job counted the table).
+        if at.elapsed() < Duration::from_secs(1) && (*n + JOB_COUNT_MARGIN < cap as i64 || *n >= cap as i64) {
             return Ok(*n);
         }
     }
@@ -2721,6 +2780,7 @@ fn job_count_cached(spec: &DatabaseSpec, count: impl FnOnce() -> Result<i64, Str
 
 fn pg_job_insert(
     conn: &mut PgConn,
+    t: &str,
     in_transaction: bool,
     job: (&str, &str, &str),
     run_at: i64,
@@ -2728,8 +2788,10 @@ fn pg_job_insert(
     now: i64,
 ) -> Result<Option<()>, String> {
     let (id, name, payload) = job;
-    let sql = "INSERT INTO phv_jobs (id, name, payload, run_at, attempts, state, uniq, created) \
-               VALUES ($1, $2, $3, $4, 0, 0, $5, $6) ON CONFLICT (uniq) DO NOTHING";
+    let sql = &format!(
+        "INSERT INTO {t} (id, name, payload, run_at, attempts, state, uniq, created) \
+               VALUES ($1, $2, $3, $4, 0, 0, $5, $6) ON CONFLICT (uniq) DO NOTHING"
+    );
     let n = conn
         .with_statement(sql, !in_transaction, in_transaction, None, &mut |client, stmt, prelude| {
             client.run(prelude, client.client().execute(stmt, &[&id, &name, &payload, &run_at, &uniq, &now]))
@@ -2740,6 +2802,7 @@ fn pg_job_insert(
 
 fn my_job_insert(
     conn: &mut mysql::Conn,
+    t: &str,
     job: (&str, &str, &str),
     run_at: i64,
     uniq: Option<&str>,
@@ -2748,8 +2811,10 @@ fn my_job_insert(
     use mysql::prelude::Queryable;
     let (id, name, payload) = job;
     conn.exec_drop(
-        "INSERT IGNORE INTO phv_jobs (id, name, payload, run_at, attempts, state, uniq, created) \
-         VALUES (?, ?, ?, ?, 0, 0, ?, ?)",
+        format!(
+            "INSERT IGNORE INTO {t} (id, name, payload, run_at, attempts, state, uniq, created) \
+         VALUES (?, ?, ?, ?, 0, 0, ?, ?)"
+        ),
         (id, name, payload, run_at, uniq, now),
     )
     .map_err(|e| my_message(&e))?;
@@ -2765,7 +2830,10 @@ pub(crate) fn job_add_in_transaction(
     job: (&str, &str, &str),
     run_at: i64,
     uniq: Option<&str>,
+    cap: usize,
 ) -> Option<Result<Option<()>, String>> {
+    let t = jobs_table(vm.host.store_namespace.as_deref());
+    let full = || Err(format!("the job queue holds {cap} jobs already"));
     let link = vm
         .resources
         .iter()
@@ -2779,22 +2847,46 @@ pub(crate) fn job_add_in_transaction(
         Link::Pg(c) => {
             let depth = c.depth;
             let conn = c.get();
-            (depth > 0 || conn.in_own_transaction).then(|| pg_job_insert(conn, true, job, run_at, uniq, now))
+            if !(depth > 0 || conn.in_own_transaction) {
+                return None;
+            }
+            // The cap holds here too (found by the 1.1 audit: jobs added in
+            // transactions were not counted).
+            let n = match conn.query_kept(&format!("SELECT count(*) FROM {t} WHERE state IN (0, 1)"), &[]) {
+                Ok(rows) => rows.first().and_then(|r| r.try_get::<_, i64>(0).ok()).unwrap_or(0),
+                Err(e) => return Some(Err(pg_message(&e))),
+            };
+            if n >= cap as i64 {
+                return Some(full());
+            }
+            Some(pg_job_insert(conn, &t, true, job, run_at, uniq, now))
         }
-        Link::My(c) if c.depth > 0 => Some(my_job_insert(&mut c.get().conn, job, run_at, uniq, now)),
+        Link::My(c) if c.depth > 0 => {
+            use mysql::prelude::Queryable;
+            let conn = &mut c.get().conn;
+            let n: Option<i64> = match conn.query_first(format!("SELECT count(*) FROM {t} WHERE state IN (0, 1)")) {
+                Ok(n) => n,
+                Err(e) => return Some(Err(my_message(&e))),
+            };
+            if n.unwrap_or(0) >= cap as i64 {
+                return Some(full());
+            }
+            Some(my_job_insert(conn, &t, job, run_at, uniq, now))
+        }
         _ => None,
     }
 }
 
 /// Makes sure the store's table exists (before a script's transaction adds to it:
 /// MySQL would commit the transaction to create it).
-pub fn job_store_ready(spec: &DatabaseSpec) -> Result<(), String> {
-    job_conn(spec).map(|_| ())
+pub fn job_store_ready(spec: &DatabaseSpec, ns: Option<&str>, deadline: Option<Instant>) -> Result<(), String> {
+    job_conn_before(spec, ns, deadline).map(|_| ())
 }
 
 /// Takes the next job due (or one whose lease ran out) for `lease_ms`.
-pub fn job_take(spec: &DatabaseSpec, lease_ms: i64) -> Result<Option<JobRow>, String> {
-    let (mut conn, until) = job_conn(spec)?;
+pub fn job_take(spec: &DatabaseSpec, ns: Option<&str>, lease_ms: i64) -> Result<Option<JobRow>, String> {
+    let t = jobs_table(ns);
+    let (mut conn, until) = job_conn(spec, ns)?;
     let now = now_ms();
     let token = crate::random_hex(16);
     let lease_until = now + lease_ms;
@@ -2802,7 +2894,7 @@ pub fn job_take(spec: &DatabaseSpec, lease_ms: i64) -> Result<Option<JobRow>, St
         SessionConn::Redis(c) => {
             let (now_s, until_s) = (now.to_string(), lease_until.to_string());
             let args: [&[u8]; 4] = [b"0", now_s.as_bytes(), until_s.as_bytes(), token.as_bytes()];
-            match job_redis(c, &REDIS_JOB_TAKE, &args, until)? {
+            match job_redis(c, &REDIS_JOB_TAKE, &jobs_prefix(ns), &args, until)? {
                 Reply::Nil => Ok(None),
                 Reply::Array(items) => {
                     let text = |r: &Reply| match r {
@@ -2825,10 +2917,12 @@ pub fn job_take(spec: &DatabaseSpec, lease_ms: i64) -> Result<Option<JobRow>, St
             let rows = c
                 .get()
                 .query_kept(
-                    "UPDATE phv_jobs SET state = 1, attempts = attempts + 1, lease = $1, lease_until = $2 \
-                     WHERE id = (SELECT id FROM phv_jobs WHERE (state = 0 AND run_at <= $3) \
+                    &format!(
+                        "UPDATE {t} SET state = 1, attempts = LEAST(attempts, 1000) + 1, lease = $1, lease_until = $2 \
+                     WHERE id = (SELECT id FROM {t} WHERE (state = 0 AND run_at <= $3) \
                      OR (state = 1 AND lease_until < $3) ORDER BY run_at LIMIT 1 FOR UPDATE SKIP LOCKED) \
-                     RETURNING id, name, payload, attempts",
+                     RETURNING id, name, payload, attempts"
+                    ),
                     &[&token, &lease_until, &now],
                 )
                 .map_err(|e| pg_message(&e))?;
@@ -2849,8 +2943,10 @@ pub fn job_take(spec: &DatabaseSpec, lease_ms: i64) -> Result<Option<JobRow>, St
             conn.query_drop("START TRANSACTION").map_err(my)?;
             let found: Option<(String, String, String, i64)> = conn
                 .exec_first(
-                    "SELECT id, name, payload, attempts FROM phv_jobs WHERE (state = 0 AND run_at <= ?) \
-                     OR (state = 1 AND lease_until < ?) ORDER BY run_at LIMIT 1 FOR UPDATE SKIP LOCKED",
+                    format!(
+                        "SELECT id, name, payload, attempts FROM {t} WHERE (state = 0 AND run_at <= ?) \
+                     OR (state = 1 AND lease_until < ?) ORDER BY run_at LIMIT 1 FOR UPDATE SKIP LOCKED"
+                    ),
                     (now, now),
                 )
                 .map_err(my)?;
@@ -2859,12 +2955,12 @@ pub fn job_take(spec: &DatabaseSpec, lease_ms: i64) -> Result<Option<JobRow>, St
                 return Ok(None);
             };
             conn.exec_drop(
-                "UPDATE phv_jobs SET state = 1, attempts = attempts + 1, lease = ?, lease_until = ? WHERE id = ?",
+                format!("UPDATE {t} SET state = 1, attempts = LEAST(attempts, 1000) + 1, lease = ?, lease_until = ? WHERE id = ?"),
                 (&token, lease_until, &id),
             )
             .map_err(my)?;
             conn.query_drop("COMMIT").map_err(my)?;
-            Ok(Some(JobRow { id, name, payload, attempts: (attempts + 1).max(0) as u32, lease: token }))
+            Ok(Some(JobRow { id, name, payload, attempts: (attempts.min(1000) + 1).max(0) as u32, lease: token }))
         }
     }
 }
@@ -2880,8 +2976,9 @@ pub enum JobEnd<'a> {
 }
 
 /// Records how a job's run ended; `false` when its lease was lost meanwhile.
-pub fn job_end(spec: &DatabaseSpec, job: &JobRow, end: JobEnd) -> Result<bool, String> {
-    let (mut conn, until) = job_conn(spec)?;
+pub fn job_end(spec: &DatabaseSpec, ns: Option<&str>, job: &JobRow, end: JobEnd) -> Result<bool, String> {
+    let t = jobs_table(ns);
+    let (mut conn, until) = job_conn(spec, ns)?;
     let now = now_ms();
     match &mut conn {
         SessionConn::Redis(c) => {
@@ -2900,7 +2997,7 @@ pub fn job_end(spec: &DatabaseSpec, job: &JobRow, end: JobEnd) -> Result<bool, S
                 error.as_bytes(),
                 cap.as_bytes(),
             ];
-            match job_redis(c, &REDIS_JOB_END, &args, until)? {
+            match job_redis(c, &REDIS_JOB_END, &jobs_prefix(ns), &args, until)? {
                 Reply::Int(n) => Ok(n == 1),
                 _ => Err("the server sent an invalid reply".into()),
             }
@@ -2910,18 +3007,32 @@ pub fn job_end(spec: &DatabaseSpec, job: &JobRow, end: JobEnd) -> Result<bool, S
             let (id, lease) = (&job.id, &job.lease);
             let n = match end {
                 JobEnd::Done { keyed: false } => {
-                    conn.execute_kept("DELETE FROM phv_jobs WHERE id = $1 AND lease = $2", &[id, lease])
+                    conn.execute_kept(&format!("DELETE FROM {t} WHERE id = $1 AND lease = $2"), &[id, lease])
                 }
-                JobEnd::Done { keyed: true } => conn.execute_kept(
-                    "UPDATE phv_jobs SET state = 3, run_at = $3, payload = '', lease = NULL WHERE id = $1 AND lease = $2",
-                    &[id, lease, &now],
-                ),
+                // Kept only when the job has a key (found by the 1.1 audit: every
+                // finished job was kept a day).
+                JobEnd::Done { keyed: true } => conn
+                    .execute_kept(
+                        &format!(
+                            "UPDATE {t} SET state = 3, run_at = $3, payload = '', lease = NULL \
+                             WHERE id = $1 AND lease = $2 AND uniq IS NOT NULL"
+                        ),
+                        &[id, lease, &now],
+                    )
+                    .and_then(|n| match n {
+                        0 => conn.execute_kept(&format!("DELETE FROM {t} WHERE id = $1 AND lease = $2"), &[id, lease]),
+                        n => Ok(n),
+                    }),
                 JobEnd::Retry { at, error } => conn.execute_kept(
-                    "UPDATE phv_jobs SET state = 0, run_at = $3, lease = NULL, error = $4 WHERE id = $1 AND lease = $2",
+                    &format!(
+                        "UPDATE {t} SET state = 0, run_at = $3, lease = NULL, error = $4 WHERE id = $1 AND lease = $2"
+                    ),
                     &[id, lease, &at, &error],
                 ),
                 JobEnd::Dead { error } => conn.execute_kept(
-                    "UPDATE phv_jobs SET state = 2, run_at = $3, lease = NULL, error = $4 WHERE id = $1 AND lease = $2",
+                    &format!(
+                        "UPDATE {t} SET state = 2, run_at = $3, lease = NULL, error = $4 WHERE id = $1 AND lease = $2"
+                    ),
                     &[id, lease, &now, &error],
                 ),
             };
@@ -2933,18 +3044,26 @@ pub fn job_end(spec: &DatabaseSpec, job: &JobRow, end: JobEnd) -> Result<bool, S
             let (id, lease) = (&job.id, &job.lease);
             let r = match end {
                 JobEnd::Done { keyed: false } => {
-                    conn.exec_drop("DELETE FROM phv_jobs WHERE id = ? AND lease = ?", (id, lease))
+                    conn.exec_drop(format!("DELETE FROM {t} WHERE id = ? AND lease = ?"), (id, lease))
                 }
-                JobEnd::Done { keyed: true } => conn.exec_drop(
-                    "UPDATE phv_jobs SET state = 3, run_at = ?, payload = '', lease = NULL WHERE id = ? AND lease = ?",
-                    (now, id, lease),
-                ),
+                JobEnd::Done { keyed: true } => conn
+                    .exec_drop(
+                        format!(
+                            "UPDATE {t} SET state = 3, run_at = ?, payload = '', lease = NULL \
+                             WHERE id = ? AND lease = ? AND uniq IS NOT NULL"
+                        ),
+                        (now, id, lease),
+                    )
+                    .and_then(|()| match conn.affected_rows() {
+                        0 => conn.exec_drop(format!("DELETE FROM {t} WHERE id = ? AND lease = ?"), (id, lease)),
+                        _ => Ok(()),
+                    }),
                 JobEnd::Retry { at, error } => conn.exec_drop(
-                    "UPDATE phv_jobs SET state = 0, run_at = ?, lease = NULL, error = ? WHERE id = ? AND lease = ?",
+                    format!("UPDATE {t} SET state = 0, run_at = ?, lease = NULL, error = ? WHERE id = ? AND lease = ?"),
                     (at, error, id, lease),
                 ),
                 JobEnd::Dead { error } => conn.exec_drop(
-                    "UPDATE phv_jobs SET state = 2, run_at = ?, lease = NULL, error = ? WHERE id = ? AND lease = ?",
+                    format!("UPDATE {t} SET state = 2, run_at = ?, lease = NULL, error = ? WHERE id = ? AND lease = ?"),
                     (now, error, id, lease),
                 ),
             };
@@ -2956,27 +3075,30 @@ pub fn job_end(spec: &DatabaseSpec, job: &JobRow, end: JobEnd) -> Result<bool, S
 
 /// Removes jobs given up more than a week ago (and past `JOB_MAX_DEAD`), and
 /// the kept rows of keyed jobs after a day.
-pub fn job_sweep(spec: &DatabaseSpec) -> Result<(), String> {
-    let (mut conn, until) = job_conn(spec)?;
+pub fn job_sweep(spec: &DatabaseSpec, ns: Option<&str>) -> Result<(), String> {
+    let t = jobs_table(ns);
+    let (mut conn, until) = job_conn(spec, ns)?;
     let now = now_ms();
     let (done_before, dead_before) = (now - JOB_KEEP_DONE_MS, now - JOB_KEEP_DEAD_MS);
     match &mut conn {
         SessionConn::Redis(c) => {
             let before = dead_before.to_string();
-            job_redis(c, &REDIS_JOB_SWEEP, &[b"0", before.as_bytes()], until).map(|_| ())
+            job_redis(c, &REDIS_JOB_SWEEP, &jobs_prefix(ns), &[b"0", before.as_bytes()], until).map(|_| ())
         }
         SessionConn::Pg(c) => {
             let conn = c.get();
             let pg = |e: postgres::Error| pg_message(&e);
             conn.execute_kept(
-                "DELETE FROM phv_jobs WHERE (state = 3 AND run_at < $1) OR (state = 2 AND run_at < $2)",
+                &format!("DELETE FROM {t} WHERE (state = 3 AND run_at < $1) OR (state = 2 AND run_at < $2)"),
                 &[&done_before, &dead_before],
             )
             .map_err(pg)?;
             let keep = JOB_MAX_DEAD as i64;
             conn.execute_kept(
-                "DELETE FROM phv_jobs WHERE state = 2 AND id IN \
-                 (SELECT id FROM phv_jobs WHERE state = 2 ORDER BY run_at DESC OFFSET $1)",
+                &format!(
+                    "DELETE FROM {t} WHERE state = 2 AND id IN \
+                 (SELECT id FROM {t} WHERE state = 2 ORDER BY run_at DESC OFFSET $1)"
+                ),
                 &[&keep],
             )
             .map_err(pg)?;
@@ -2987,18 +3109,18 @@ pub fn job_sweep(spec: &DatabaseSpec) -> Result<(), String> {
             let my = |e: mysql::Error| my_message(&e);
             let conn = &mut c.get().conn;
             conn.exec_drop(
-                "DELETE FROM phv_jobs WHERE (state = 3 AND run_at < ?) OR (state = 2 AND run_at < ?)",
+                format!("DELETE FROM {t} WHERE (state = 3 AND run_at < ?) OR (state = 2 AND run_at < ?)"),
                 (done_before, dead_before),
             )
             .map_err(my)?;
             let cut: Option<i64> = conn
                 .exec_first(
-                    "SELECT run_at FROM phv_jobs WHERE state = 2 ORDER BY run_at DESC LIMIT 1 OFFSET ?",
+                    format!("SELECT run_at FROM {t} WHERE state = 2 ORDER BY run_at DESC LIMIT 1 OFFSET ?"),
                     (JOB_MAX_DEAD as i64,),
                 )
                 .map_err(my)?;
             if let Some(cut) = cut {
-                conn.exec_drop("DELETE FROM phv_jobs WHERE state = 2 AND run_at <= ?", (cut,)).map_err(my)?;
+                conn.exec_drop(format!("DELETE FROM {t} WHERE state = 2 AND run_at <= ?"), (cut,)).map_err(my)?;
             }
             Ok(())
         }
@@ -3006,8 +3128,9 @@ pub fn job_sweep(spec: &DatabaseSpec) -> Result<(), String> {
 }
 
 /// The jobs of the store (at most 1,000 of each state): all, or those given up.
-pub fn job_list(spec: &DatabaseSpec, failed_only: bool) -> Result<Vec<JobInfo>, String> {
-    let (mut conn, until) = job_conn(spec)?;
+pub fn job_list(spec: &DatabaseSpec, ns: Option<&str>, failed_only: bool) -> Result<Vec<JobInfo>, String> {
+    let t = jobs_table(ns);
+    let (mut conn, until) = job_conn(spec, ns)?;
     let state_name = |s: i64| match s {
         0 => "waiting",
         1 => "running",
@@ -3015,13 +3138,13 @@ pub fn job_list(spec: &DatabaseSpec, failed_only: bool) -> Result<Vec<JobInfo>, 
     };
     let filter = if failed_only { "state = 2" } else { "state IN (0, 1, 2)" };
     let sql = format!(
-        "SELECT id, name, state, attempts, run_at, COALESCE(error, '') FROM phv_jobs WHERE {filter} \
+        "SELECT id, name, state, attempts, run_at, COALESCE(error, '') FROM {t} WHERE {filter} \
          ORDER BY state, run_at LIMIT 3000"
     );
     match &mut conn {
         SessionConn::Redis(c) => {
             let which: &[u8] = if failed_only { b"failed" } else { b"all" };
-            let Reply::Array(items) = job_redis(c, &REDIS_JOB_LIST, &[b"0", which], until)? else {
+            let Reply::Array(items) = job_redis(c, &REDIS_JOB_LIST, &jobs_prefix(ns), &[b"0", which], until)? else {
                 return Err("the server sent an invalid reply".into());
             };
             let text = |r: &Reply| match r {
@@ -3082,13 +3205,14 @@ pub fn job_list(spec: &DatabaseSpec, failed_only: bool) -> Result<Vec<JobInfo>, 
 
 /// Puts a job that was given up back in the queue (with its runs counted
 /// from zero); `false` if there is no such job.
-pub fn job_requeue(spec: &DatabaseSpec, id: &str) -> Result<bool, String> {
-    let (mut conn, until) = job_conn(spec)?;
+pub fn job_requeue(spec: &DatabaseSpec, ns: Option<&str>, id: &str) -> Result<bool, String> {
+    let t = jobs_table(ns);
+    let (mut conn, until) = job_conn(spec, ns)?;
     let now = now_ms();
     match &mut conn {
         SessionConn::Redis(c) => {
             let now_s = now.to_string();
-            match job_redis(c, &REDIS_JOB_REQUEUE, &[b"0", id.as_bytes(), now_s.as_bytes()], until)? {
+            match job_redis(c, &REDIS_JOB_REQUEUE, &jobs_prefix(ns), &[b"0", id.as_bytes(), now_s.as_bytes()], until)? {
                 Reply::Int(n) => Ok(n == 1),
                 _ => Err("the server sent an invalid reply".into()),
             }
@@ -3096,7 +3220,9 @@ pub fn job_requeue(spec: &DatabaseSpec, id: &str) -> Result<bool, String> {
         SessionConn::Pg(c) => c
             .get()
             .execute_kept(
-                "UPDATE phv_jobs SET state = 0, attempts = 0, run_at = $2, error = NULL WHERE id = $1 AND state = 2",
+                &format!(
+                    "UPDATE {t} SET state = 0, attempts = 0, run_at = $2, error = NULL WHERE id = $1 AND state = 2"
+                ),
                 &[&id, &now],
             )
             .map(|n| n > 0)
@@ -3105,7 +3231,7 @@ pub fn job_requeue(spec: &DatabaseSpec, id: &str) -> Result<bool, String> {
             use mysql::prelude::Queryable;
             let conn = &mut c.get().conn;
             conn.exec_drop(
-                "UPDATE phv_jobs SET state = 0, attempts = 0, run_at = ?, error = NULL WHERE id = ? AND state = 2",
+                format!("UPDATE {t} SET state = 0, attempts = 0, run_at = ?, error = NULL WHERE id = ? AND state = 2"),
                 (now, id),
             )
             .map_err(|e| my_message(&e))?;
@@ -3125,8 +3251,12 @@ pub fn redis_publish(spec: &DatabaseSpec, channel: &str, messages: &[Vec<u8>], u
         for m in messages {
             c.send(&[b"PUBLISH", channel.as_bytes(), m], until)?;
         }
-        for _ in messages {
-            c.next_reply(until, 1024)?;
+        // Each reply is a count of subscribers (`:12\r\n`). What is read ahead
+        // belongs to the replies still to come, so each one's budget covers
+        // them too (found by the 1.1 audit: past 205 messages with ten
+        // subscribers, the read-ahead passed a fixed 1 KB and the batch failed).
+        for left in (0..messages.len()).rev() {
+            c.next_reply(until, 1024 + 32 * left)?;
         }
         Ok(())
     })();

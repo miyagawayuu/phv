@@ -304,7 +304,15 @@ impl Metrics {
 /// A label value: `\`, `"` and line breaks escaped (routes are file names,
 /// which can hold them on Unix).
 fn label_value(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    // `\r` too, and other controls dropped (found by the 1.1 audit; labels are
+    // names of the site's files, so this is for safety only).
+    s.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r'))
+        .collect::<String>()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// The route of a page: its path under `public/` without `.phv`, and `index`
@@ -320,6 +328,12 @@ pub fn route_of(public: &std::path::Path, script: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A label value cannot end its line (found by the 1.1 audit: `\r` was kept).
+    #[test]
+    fn label_values_stay_on_their_line() {
+        assert_eq!(label_value("a\"b\\c\nd\re\u{1b}f"), "a\\\"b\\\\c\\nd\\re".to_string() + "f");
+    }
 
     #[test]
     fn routes_are_file_names_and_capped() {

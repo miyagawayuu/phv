@@ -101,6 +101,14 @@ pub fn reset(key: &str) {
 /// `[security] rate_limit_store`, or this process. Returns whether the hit is
 /// allowed and the seconds until the window ends. When the Redis server cannot
 /// be reached, the error says why.
+/// A key in the shared store: in this site's namespace when it has one.
+fn shared_key(host: &phv_vm::Host, key: &str) -> String {
+    match &host.store_namespace {
+        Some(ns) => format!("{ns}\0{key}"),
+        None => key.to_string(),
+    }
+}
+
 pub fn hit_shared(
     host: &phv_vm::Host,
     key: &str,
@@ -109,7 +117,7 @@ pub fn hit_shared(
     until: Instant,
 ) -> Result<(bool, u64), String> {
     match store(host)? {
-        Some(spec) => crate::netdb::redis_hit(spec, key, max, window, until),
+        Some(spec) => crate::netdb::redis_hit(spec, &shared_key(host, key), max, window, until),
         None => Ok((hit(key, max, window), retry_after(key, window))),
     }
 }
@@ -117,7 +125,7 @@ pub fn hit_shared(
 /// Forgets the hits of `key` in the store phv.toml names (see `hit_shared`).
 pub fn reset_shared(host: &phv_vm::Host, key: &str, until: Instant) -> Result<(), String> {
     match store(host)? {
-        Some(spec) => crate::netdb::redis_reset(spec, key, until),
+        Some(spec) => crate::netdb::redis_reset(spec, &shared_key(host, key), until),
         None => {
             reset(key);
             Ok(())
@@ -176,6 +184,18 @@ mod tests {
             hit(&format!("test:flood-{i}"), 5, day);
         }
         assert!(!hit("test:flood-victim", 1, day), "still limited after the flood");
+    }
+
+    /// Sites with a namespace count apart in a shared store (found by the 1.1
+    /// audit: one site's login tries limited another's).
+    #[test]
+    fn namespaces_keep_sites_apart() {
+        let plain = phv_vm::Host::default();
+        let a = phv_vm::Host { store_namespace: Some("a".into()), ..phv_vm::Host::default() };
+        let b = phv_vm::Host { store_namespace: Some("b".into()), ..phv_vm::Host::default() };
+        assert_eq!(shared_key(&plain, "login:x"), "login:x");
+        assert_ne!(shared_key(&a, "login:x"), shared_key(&b, "login:x"));
+        assert_ne!(shared_key(&a, "login:x"), "login:x");
     }
 
     /// A store that cannot be reached is not asked again for a few seconds:

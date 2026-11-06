@@ -214,7 +214,7 @@ fn remote_servers_need_tls() {
 fn check_jobs(url: &str) {
     use phv_std::jobs::{End, Store};
     let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 4 };
-    let store = Store::Db(spec.clone());
+    let store = Store::Db(spec.clone(), None);
     // Start from an empty store (the tests of each server run one at a time).
     let clear = |store: &Store| {
         while let Some(j) = store.take(Duration::from_secs(60)).unwrap() {
@@ -230,6 +230,14 @@ fn check_jobs(url: &str) {
     let lease = Duration::from_secs(60);
     let id = store.add("a", "payload", 0, None).unwrap().unwrap();
     let later = store.add("later", "", 3600, None).unwrap().unwrap();
+    // Another site on the same database (another namespace) sees none of
+    // them, and its own jobs stay its own (found by the 1.1 audit).
+    let other = Store::Db(spec.clone(), Some("ab12cd34".into()));
+    assert!(other.take(lease).unwrap().is_none(), "another site took a job");
+    let theirs = other.add("theirs", "", 0, None).unwrap().unwrap();
+    let got = other.take(lease).unwrap().unwrap();
+    assert_eq!(got.id, theirs);
+    other.end(&got, End::Done { keyed: false }).unwrap();
     let job = store.take(lease).unwrap().unwrap();
     assert_eq!(
         (job.id.as_str(), job.name.as_str(), job.payload.as_str(), job.attempts),

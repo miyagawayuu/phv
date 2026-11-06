@@ -149,8 +149,39 @@ pub fn printable_text(s: &str) -> String {
     s.chars().map(|c| if c.is_control() && c != '\t' && c != '\n' { '\u{FFFD}' } else { c }).collect()
 }
 
+/// Text for one line of a log: line breaks, control characters and the
+/// characters that start a line or reorder text in a viewer are escaped, so the
+/// text cannot forge another line or reach the terminal as a command (found by
+/// the 1.1 audit: an exception's message went to the server's stderr as it was).
+pub fn log_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control()
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{061c}')
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c) =>
+            {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod printable_tests {
+    /// Found by the 1.1 audit: an exception's message could forge log lines.
+    #[test]
+    fn log_text_stays_on_one_line() {
+        let s = super::log_escape("x\nGET /admin 200\r\u{1b}[31m\u{202e}\u{85}ok");
+        assert_eq!(s, "x\\nGET /admin 200\\r\\u{1b}[31m\\u{202e}\\u{85}ok");
+        assert!(!s.chars().any(|c| c.is_control()), "{s:?}");
+    }
+
     /// Found by the 1.0 audit: a source line with escape sequences reached
     /// the terminal as it was.
     #[test]

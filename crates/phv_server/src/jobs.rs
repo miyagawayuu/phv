@@ -12,6 +12,7 @@ use crate::metrics::StoreKind;
 use crate::State;
 use phv_driver::{run, RunOptions};
 use phv_std::jobs::{Row, Store};
+use phv_syntax::diag::log_escape;
 use phv_vm::{HttpCtx, JobCtx, Limits};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -61,12 +62,14 @@ pub(crate) fn retry_wait(first: Duration, attempts: u32) -> Duration {
 
 /// Compiles every job (an error stops the server, as a route error does) and
 /// starts the threads.
-pub(crate) fn start(state: &Arc<State>) -> Result<Option<Runner>, String> {
+pub(crate) fn start(state: &Arc<State>, serving: bool) -> Result<Option<Runner>, String> {
     let Some(cfg) = state.config.jobs.clone() else { return Ok(None) };
     for name in state.job_names() {
         state.job_compiled(&name).map_err(|e| format!("job {}/{name}.phv: {e}", cfg.dir))?;
     }
-    if !cfg.run {
+    // `run = false` keeps a serving process from running jobs; `phv jobs run`
+    // and `--jobs-only` run them all the same (found by the 1.1 audit).
+    if !cfg.run && serving {
         return Ok(None);
     }
     let Some(store) = Store::of(&state.config.host) else {
@@ -154,18 +157,32 @@ fn run_one(state: &State, store: &Store, job: &Row, max_attempts: u32, retry_del
         }
         Err(error) => {
             m.jobs_dead.fetch_add(1, Ordering::Relaxed);
-            eprintln!("job {} ({}) was given up after {} runs", job.name, job.id, job.attempts);
+            eprintln!(
+                "job {} ({}) was given up after {} runs",
+                log_escape(&job.name),
+                log_escape(&job.id),
+                job.attempts
+            );
             phv_std::jobs::End::Dead { error }
         }
     };
     match store.end(job, end) {
         Ok(true) => {}
         Ok(false) => {
-            eprintln!("warning: job {} ({}) ran past its lease; another run may have taken it", job.name, job.id)
+            eprintln!(
+                "warning: job {} ({}) ran past its lease; another run may have taken it",
+                log_escape(&job.name),
+                log_escape(&job.id)
+            )
         }
         Err(e) => {
             m.health.failed(StoreKind::Jobs);
-            eprintln!("warning: job {} ({}): its end could not be recorded ({e})", job.name, job.id);
+            eprintln!(
+                "warning: job {} ({}): its end could not be recorded ({})",
+                log_escape(&job.name),
+                log_escape(&job.id),
+                log_escape(&e.to_string())
+            );
         }
     }
 }
@@ -190,6 +207,9 @@ impl State {
             return e.jobs.get(name).cloned().ok_or_else(|| format!("there is no job \"{name}\""));
         }
         let dir = self.config.jobs.as_ref().map_or("jobs", |j| j.dir.as_str());
+        if phv_driver::config::jobs_dir_is_link(&self.root, dir) {
+            return Err(format!("{dir} is a link; the jobs must be in the project"));
+        }
         let script = self.root.join(dir).join(format!("{name}.phv"));
         // Only a plain file of the directory: no link leads elsewhere.
         match std::fs::symlink_metadata(&script) {
@@ -223,7 +243,13 @@ impl State {
         if let Some(err) = &outcome.error {
             self.metrics.failure(crate::metrics::Failure::of(&err.message));
             let text = err.render();
-            eprintln!("job {} ({}) failed (run {}):\n{text}", job.name, job.id, job.attempts);
+            eprintln!(
+                "job {} ({}) failed (run {}):\n{}",
+                log_escape(&job.name),
+                log_escape(&job.id),
+                job.attempts,
+                err.render_for_log()
+            );
             let mut cut = text.len().min(MAX_ERROR);
             while !text.is_char_boundary(cut) {
                 cut -= 1;
@@ -277,7 +303,7 @@ pub(crate) fn add_scheduled(
     let mut errors = Vec::new();
     for s in schedules {
         for minute in s.cron.due(from, to, 60) {
-            let key = phv_std::jobs::uniq_key(&s.job, &format!("schedule:{minute}"));
+            let key = phv_std::jobs::schedule_key(&s.job, minute);
             if let Err(e) = store.add(&s.job, "", 0, Some(&key)) {
                 errors.push(format!("the scheduled job {} could not be added ({e})", s.job));
             }

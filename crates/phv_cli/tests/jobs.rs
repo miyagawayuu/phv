@@ -131,7 +131,7 @@ fn jobs_run_list_and_retry_with_redis() {
     write(&dir, "jobs/fail.phv", "<?phv\nthrow new RuntimeException(\"broken on purpose\");\n");
     std::fs::create_dir_all(dir.join("data")).unwrap();
     let spec = phv_vm::DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 2 };
-    let store = phv_std::jobs::Store::Db(spec);
+    let store = phv_std::jobs::Store::Db(spec, None);
     // Clear what earlier runs left.
     while let Some(j) = store.take(Duration::from_secs(60)).unwrap() {
         store.end(&j, phv_std::jobs::End::Done { keyed: false }).unwrap();

@@ -58,12 +58,14 @@ pub fn list(project: &Path, failed: bool) -> ExitCode {
         let at = chrono::DateTime::from_timestamp_millis(j.at)
             .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
             .unwrap_or_default();
-        println!("{}  {:<8} {:<24} runs {:<3} {at}", j.id, j.state, j.name, j.attempts);
+        // Rows come from the store, which others may write: every field is
+        // escaped (found by the 1.1 audit: ids and names reached the terminal).
+        use phv_syntax::diag::log_escape;
+        let short = |s: &str| log_escape(&s.chars().take(200).collect::<String>());
+        println!("{}  {:<8} {:<24} runs {:<3} {at}", short(&j.id), short(j.state), short(&j.name), j.attempts);
         if !j.error.is_empty() {
-            // The first line of the error, cleaned of control characters.
-            let first: String =
-                j.error.lines().next().unwrap_or("").chars().filter(|c| !c.is_control()).take(200).collect();
-            println!("    {first}");
+            // The first line of the error.
+            println!("    {}", short(j.error.lines().next().unwrap_or("")));
         }
     }
     ExitCode::SUCCESS

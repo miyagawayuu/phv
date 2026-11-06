@@ -150,6 +150,114 @@ fn only_requests_for_events_get_a_stream() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Events count until they are sent: a client that does not read holds at
+/// most 2 MB, and cannot slow pages or the streams of clients that read
+/// (found by the 1.1 audit: 30 such clients held 3.9 GB, then made pages get
+/// 503, then made readers miss events).
+#[test]
+fn events_count_in_the_output_cap() {
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    let dir = site("cap");
+    // The cap is workers × memory_limit_mb: 16 MB here. Over HTTP/2 the client's
+    // small window keeps what it does not read in the server (over TCP the
+    // system's buffers would take it).
+    write(&dir, "phv.toml", "[server]\nworkers = 1\nh2c = true\n[security]\nmemory_limit_mb = 16\n");
+    // A message of 1 MB: an event of 1,000,008 bytes. And one of a million line
+    // breaks, whose event (7 MB) is too large to be sent.
+    write(
+        &dir,
+        "public/flood.phv",
+        "<?phv\nimport std.ws.publish;\npublish(\"lobby\", str_repeat(\"x\", 1000000));\necho \"sent\";\n",
+    );
+    write(
+        &dir,
+        "public/lines.phv",
+        "<?phv\nimport std.ws.publish;\npublish(\"lobby\", str_repeat(\"\\n\", 1000000));\necho \"sent\";\n",
+    );
+    let addr = start(&dir);
+    std::thread::sleep(Duration::from_millis(200));
+    // A client that reads, over HTTP/1.1.
+    let mut reader = Events::open(addr, "/chat?name=reader", "");
+    reader.wait_for("data: welcome reader\n\n");
+    let reading = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(30);
+        let mut buf = vec![0u8; 1 << 16];
+        let mut got = 0usize;
+        while got < 4 * 1_000_008 && Instant::now() < until {
+            match reader.s.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(_) => {}
+            }
+        }
+        got
+    });
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let got = rt.block_on(async {
+        // Three clients that stop reading, each on a connection of its own.
+        let mut bodies = Vec::new();
+        for name in ["slow", "slow2", "slow3"] {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (mut send, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+                .initial_stream_window_size(1024)
+                .initial_connection_window_size(1024)
+                .handshake(TokioIo::new(tcp))
+                .await
+                .unwrap();
+            tokio::spawn(conn);
+            let req = hyper::Request::builder()
+                .uri(format!("http://localhost:{}/chat?name={name}", addr.port()))
+                .header("accept", "text/event-stream")
+                .body(Empty::<bytes::Bytes>::new())
+                .unwrap();
+            let mut body = send.send_request(req).await.unwrap().into_body();
+            let mut seen = String::new();
+            while !seen.contains(&format!("data: welcome {name}\n\n")) {
+                let frame =
+                    tokio::time::timeout(Duration::from_secs(10), body.frame()).await.expect("an event").unwrap();
+                if let Ok(d) = frame.unwrap().into_data() {
+                    seen.push_str(&String::from_utf8_lossy(&d));
+                }
+            }
+            bodies.push((body, send));
+        }
+        // They stop reading while four messages are published, one at a time,
+        // so each leaves the connection's queue (1 MB) before the next.
+        assert!(tokio::task::spawn_blocking(move || get(addr, "/lines", "")).await.unwrap().ends_with("sent"));
+        for _ in 0..4 {
+            assert!(tokio::task::spawn_blocking(move || get(addr, "/flood", "")).await.unwrap().ends_with("sent"));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        // Pages are still answered while the streams hold their events: the
+        // streams have a budget of their own (found by the 1.1 audit: they
+        // pushed the pages' output past its cap, and every page got 503).
+        let page = tokio::task::spawn_blocking(move || get(addr, "/notify", "")).await.unwrap();
+        assert!(page.ends_with("sent"), "{page}");
+        let (mut body, _send) = bodies.remove(0);
+        // Then one of them reads: fewer than the four events arrive (its stream
+        // ends, or the events it could not hold were skipped).
+        let until = Instant::now() + Duration::from_secs(60);
+        let mut got = 0usize;
+        loop {
+            assert!(Instant::now() < until, "still reading after 60 s ({got} bytes)");
+            match tokio::time::timeout(Duration::from_secs(5), body.frame()).await {
+                Ok(Some(Ok(f))) => got += f.into_data().map(|d| d.len()).unwrap_or(0),
+                Ok(_) | Err(_) => break,
+            }
+        }
+        got
+    });
+    // At most two events of 1 MB were held for the client that did not read.
+    assert!(got < 3 * 1_000_008, "{got} bytes: more than 2 MB was held");
+    // The client that read got all four.
+    let read = reading.join().unwrap();
+    assert!(read >= 4 * 1_000_008, "the reader got {read} bytes");
+    // Pages are answered once the stream is gone.
+    assert!(get(addr, "/notify", "").ends_with("sent"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Event streams over HTTP/2 (here without TLS, `[server] h2c`).
 #[test]
 fn events_stream_over_http2() {

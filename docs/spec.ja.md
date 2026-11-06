@@ -728,6 +728,9 @@ HTML エスケープが守れるのは、要素の中身と**引用符で囲ん�
 | `<script>` の URL | `<script src="<?= $u ?>">`(SVG では `href`) | `SafeUrl` でもエラー。このタグには CSP の nonce が付くので、そこに入った URL は信頼されたスクリプトとして実行される。URL はテンプレートに書く |
 | `<meta>` の `content` | `<meta http-equiv="refresh" content="0;url=<?= $u ?>">` | 数値だけ。ただし `content` より前に `name`、`property`、`itemprop` 属性があり、`http-equiv` がなければテキスト(`<meta property="og:title" content="<?= $t ?>">`。テキストの後に `http-equiv` を書くとエラー) |
 
+- タグはブラウザーと同じに読む。タグの名前と属性を区切るのはタブ・改行・改ページ・復帰・半角スペースだけなので、
+  `<a class=x　title="<?= $t ?>">`(全角スペース)は 1 つの引用符なしの値で、エラーになる。タグの名前はそうした
+  空白か `/` か `>` まで続く。
 - 関数・クロージャの本体、`if`・ループのブロックは、始まったときと同じ HTML の状態で終わらなければならない
   (`<script>` や属性をブロックの中で開いたまま終えるとエラー)。呼び出し順や繰り返しで文脈がずれるのを防ぐ。
 - 同じ理由で、`break` と `continue` はそのループが始まったときの HTML の状態で、`throw` はその `try` が始まったとき
@@ -930,7 +933,7 @@ token_env = "PHV_ADMIN_TOKEN"    # listen がループバック以外なら必�
 - メトリクス(すべて `phv_` で始まる): `requests_total{kind, code}`(`kind`: `page`、`static`、`ws`、`sse`、`other`。`code`:
   `2xx` など)、`request_duration_seconds{route}`(ページごとのヒストグラム。ラベルはファイル名から作る `/posts/[id]` で、
   要求されたパスは決して入らない。ルートは 1,000 個までで、残りは `other`。静的ファイルは `static`)、
-  `worker_wait_seconds`、`rejected_total{reason}`(`busy`、`output`、`body`、`rate_limit`、`too_large`)、
+  `worker_wait_seconds`、`rejected_total{reason}`(`busy`、`output`、`body`、`rate_limit`、`too_large`)、`events_waiting_bytes`、
   `script_failures_total{kind}`(`exception`、`time`、`memory`、`compile`、`other`)、`ws_messages_total{dir}`、
   `publish_total{result}`、`jobs_total{result}`、`job_duration_seconds`、`store_errors_total{store}`、およびゲージ
   `up`、`ready`、`uptime_seconds`、`workers`、`workers_busy`、`connections`、`websockets`、`output_waiting_bytes`、
@@ -996,6 +999,12 @@ session()->destroy();                 // ログアウト
   訪問者が Cookie を送り返していないセッションは、長くても 1 時間で消える。PostgreSQL と MySQL は `phv_sessions` テーブル
   (必要になったときに作る)に保存し、30 秒ごと(新しいセッションが 1,000 できたときはその前でも)に期限切れを消して、
   下の上限に収める。データベースに届かないときは、セッションなしでリクエストを続け、警告をログに出す。
+- データベースを共有するサイトどうしは、サイトの名前空間でセッションを分ける: `[security] store_namespace`、なければ
+  `[project] name`(流量制限とジョブもこの下に置く)。ステージングと本番のように同じ名前のサイトを 2 つ置くときは、
+  別々の `store_namespace` を設定すること(設定せずに共有の保存先を使うサーバーは、起動時にそう知らせる)。どちらもないサイトは、ほかのそうしたサイトと保存先を共有する。名前空間の
+  あるサイトは 1.1 より前に保存されたセッションを読まないので、アップグレードで訪問者は一度ログアウトする。
+  セッションのデータベースを共有するサイトどうしは、その上限(下)と、PostgreSQL・MySQL では最も短い `session_ttl` を
+  共有する。できればサイトごとに別のデータベースを使うこと。
 - どの保存先でも、セッションを保存するのはそれがまだあるときだけ(新しい ID や作り直した ID は、まだ使われていない
   ときだけ)で、それぞれを 1 つの不可分な操作で行う。ログアウトのあとに終わったリクエストが(同じプロセスでも別の
   プロセスでも)セッションを復活させることはなく、同じセッションを作り直す 2 つのリクエストのうち、引き継げるのは 1 つだけ。
@@ -1039,11 +1048,14 @@ secret_old_env = "PHV_SECRET_OLD"  # 任意: 前の秘密鍵。入れ替えの�
 
 - サーバーは起動時に変数を読む。設定されていない、または 32 バイトに満たない変数があると、変数の名前を示したエラーで
   止まる(値は決して示さない)。サーバーの設定なので `[permissions] env` に書く必要はなく、`phv build` の実行ファイルには
-  名前だけが入る。
+  名前だけが入る。`[permissions] env` のパターンに当てはまっても、スクリプトからは読めない。`[admin] token_env` と、
+  すべての `url_env`・`headers_env` も同じ。
 - サーバーは用途ごとに秘密鍵から別の鍵を導く(HKDF-SHA256): CSRF トークンと、`publish()` がほかのサーバープロセスに
   送るメッセージ。スクリプトから秘密鍵や導いた鍵は読めない。
 - 秘密鍵を入れ替えるときは、新しい鍵を `secret_env` に、古い鍵を `secret_old_env` に入れて全プロセスを再起動し、
   それ以前に出したフォームが使われなくなったら(数時間後)`secret_old_env` を外す。トークンは常に新しい鍵で作られる。
+  プロセス間の `publish()` は `secret_env` だけを使うので、新しい鍵のプロセスと古い鍵のプロセスが混ざっている間は、
+  互いのメッセージは届かない。
 
 ### Cookie
 
@@ -1302,6 +1314,14 @@ events.onmessage = (e) => console.log(e.data);
   クライアントは切る)、プロキシが閉じないよう 15 秒ごとにコメント行(`: ping`)を送る。圧縮もキャッシュもされず、
   HTTP/1.1 と HTTP/2 で使える。ほかのサイトが開けるのは WebSocket と同じ場合だけ(`[cors]`)。イベントの間は
   ワーカーを使わない。
+- イベントは送り終えるまで、ページとは別の `workers` × `memory_limit_mb` の枠で数える(ストリームがページを待たせる
+  ことはない。サーバーの出力は合わせてその 2 倍まで)。1 つのストリームが送り待ちにできるのは 2 MB で、イベントが
+  それより大きくなるメッセージ(約 150,000 行を超える 1 MB のテキスト)はイベントとして送らない。送り待ちのある
+  ストリームは、次のイベントでそれを超えるとき、または枠がいっぱいの間は終え、ブラウザーはつなぎ直す。送り終えた
+  ストリームは、枠がいっぱいの間はイベントを飛ばす(配信は最大 1 回)。どちらも `phv_rejected_total` の `output` として
+  数える。読まないクライアントが、読むクライアントのストリームを終わらせることも、ページを遅らせることもない。
+  枠を 2 MB ずつで埋めるほどの数(2 GB で 1,000)があるときだけ、それらが切られるまで(30 秒進まなければ)、読む
+  クライアントはイベントを逃す。
 
 #### サーバープロセスをまたぐ publish()
 
@@ -1326,10 +1346,12 @@ publish_store = "cache"
 - 各プロセスはキューを Redis に送り(PUBLISH をパイプラインで)、自分専用の購読用の接続を 1 本持つ。届いたメッセージは、
   そのトピックに参加したこのプロセスの接続に渡す。切れた接続は 1 秒後、次は 2 秒、4 秒、…最大 30 秒後に開き直す。
   その間 `/ready` は 503 を返す(「ヘルスチェックとメトリクス」)。
-- **配信は最大 1 回(at-most-once)。** プロセスが Redis につながっていない間に publish されたメッセージは、そのプロセスの
-  接続には届かない。失ってはならないものはデータベースに保存し、`publish()` は何かが変わったことを知らせるのに使う。
-- メッセージは `secret_env` から導いた鍵で署名し、送ったプロセスの ID を持つ。プロセスは自分のメッセージを読み飛ばし、
-  サイトの鍵で署名されていないもの、形が正しくないもの、`publish()` の規則(トピックは制御文字なしの 1〜200 バイト、
+- **配信は最大 1 回(at-most-once)。** プロセスが Redis につながっていない間に publish されたメッセージも、購読する前に
+  送られたメッセージも、そのプロセスの接続には届かない。Redis は遅れすぎた購読者を切る(`client-output-buffer-limit
+  pubsub`、既定で 32 MB)。プロセスはつなぎ直し、その間に送られたものは失われる。失ってはならないものはデータベースに保存し、`publish()` は何かが変わったことを知らせるのに使う。
+- メッセージは `secret_env` から導いた鍵で署名し、送ったプロセスの ID、送った時刻、メッセージごとに増える番号を持つ。
+  プロセスは自分のメッセージを読み飛ばし、自分の時計と 60 秒より離れた時刻のもの(サーバーの時計を合わせておくこと)、
+  同じプロセスから受け取ったことのあるものやそれより古いもの、サイトの鍵で署名されていないもの、形が正しくないもの、`publish()` の規則(トピックは制御文字なしの 1〜200 バイト、
   本文は 1 MB まで)に反するもの、それより長いものを捨てる(`invalid` として数える)。長すぎるメッセージは届くそばから
   読み捨て、メモリに持たない。チャネルの名前も鍵から導くので、Redis サーバーを共有するサイトどうしは互いのメッセージを
   見ない。スクリプトが自分で Redis に publish することはできない(`std.db` に PUBLISH はない)。
@@ -1582,7 +1604,10 @@ $data = json_decode($j->payload);
 
 - ジョブはスクリプト `<dir>/<name>.phv` で、名前は英小文字・数字・`_`。`enqueue()` は、存在しないジョブ、64 KB を超える
   payload、30 日を超える delay、200 バイトを超える key で `ValueError` を投げ、ストアに待ち・実行中のジョブが 100,000 件
-  (メモリでは 10,000 件か 64 MB)あれば `RuntimeException` を投げる。`[jobs]` のないプロジェクトでも `RuntimeException`。
+  (メモリでは 10,000 件か 64 MB)あれば、`transaction()` の中でも `RuntimeException` を投げる。`[jobs]` のない
+  プロジェクトでも `RuntimeException`。ストアを待つのは、スクリプトがまだ動ける間だけ。`dir` はプロジェクトの
+  ディレクトリで、リンクは使えない。メモリのストアがあきらめたジョブとして残すのは 16 MB まで、終わったジョブの key は
+  100,000 個まで。
 - `phv serve` は、各プロセスで `[jobs] workers` 個のジョブを専用のスレッドで同時に実行する。ジョブがページのワーカーを
   使うことはない。実行ごとに新しい VM、`time_limit`、`[security] memory_limit_mb`、phv.toml の許可を、ページと同じく
   持つ。`request()` と `session()` は空で、`job()` はジョブの中でだけ使える。ジョブは `publish()`(WebSocket の接続へ)や
@@ -1594,16 +1619,22 @@ $data = json_decode($j->payload);
 - `key` を付けると 1 回だけ追加する。同じ名前と key のジョブが待っている・実行中・あきらめられた間と、終わってから 1 日の
   間、`enqueue()` は `null` を返す。
 - PostgreSQL と MySQL では、ストアのデータベースへの `transaction()` の中の `enqueue()` は、トランザクションと一緒に
-  追加する(コミットされたときだけ)。ジョブはテーブル `phv_jobs`(初めて要るときに作る)に置き、
-  `SELECT ... FOR UPDATE SKIP LOCKED` で取る。Redis では `phv:jobs:` の下に置く。同じストアを使うサーバープロセスと
-  マシンはジョブを共有する。`store = "memory"` ではジョブはサーバープロセスの中にあり、止めると消える。
+  追加する(コミットされたときだけ。MySQL で結び付くのは `transaction()` だけで、SQL で送った `BEGIN` は結び付かない)。
+  ジョブはサイトの名前空間のテーブル `phv_jobs_<hash>`(「セッション」を参照。名前空間のないサイトは `phv_jobs`)に
+  置き、初めて要るときに作って `SELECT ... FOR UPDATE SKIP LOCKED` で取る。Redis では `phv:jobs:<hash>:` の下に置く。
+  同じストアを使うサイトのサーバープロセスとマシンはジョブを共有し、同じデータベースのほかのサイトからは見えない。
+  サイトに名前を付けたとき共有のテーブルに残っていたジョブは取らない。まだコミットしていないトランザクションが
+  追加したジョブは 100,000 件に数えないので、同時に動くトランザクションはそれぞれ追加した分だけ超えうる。
+  `store = "memory"` ではジョブはサーバープロセスの中にあり、止めると消える。
 - **スケジュール**: `[[schedule]]` は、`cron` の式が `timezone` で一致する分ごとに、そのジョブを(空の payload で)
   追加する。フィールドは `*`、数、範囲 `a-b`、間隔 `*/n`、列挙 `a,b`。曜日は 0〜7(日曜は 0 と 7)。日と曜日の両方を
   指定したときは、どちらかが一致すればよい。各プロセスが分をキーにして追加するので、共有のストアなら何プロセス
   動いていても 1 回だけ追加される。`store = "memory"` では各プロセスがそれぞれ実行する。どのプロセスも動いていなかった
-  分を後から実行することはない。スケジュールは 100 個まで。
+  分を後から実行することはない。`timezone` で時計が切り替わる日は、その日にない時刻は実行せず、2 回ある時刻は 2 回
+  実行する。スケジュールは 100 個まで。
 - `phv jobs run [dir]` は、ページを配信せずにプロジェクトのジョブ(とスケジュール)を Ctrl-C か SIGTERM まで実行する
-  (ワーカー用のマシン向け)。`[jobs] run = false` なら `phv serve` はジョブを追加するだけになる。
+  (ワーカー用のマシン向け)。`[jobs] run = false` なら `phv serve` はジョブを追加するだけになる(`phv jobs run` と、
+  ビルドしたサイトの `--jobs-only` はそれでも実行する)。ビルドしたサイトのジョブは、ビルドに入ったもの。
   `phv jobs list [--failed]` は共有のストアのジョブを表示し、`phv jobs retry <id>` はあきらめたジョブをキューに戻す。
 - コンパイルできないジョブがあると、`phv serve`・`phv jobs run`・`phv build` は止まる。サーバーを止めるとき、実行中の
   ジョブは `shutdown_timeout` の残りの時間を使える。終わらなかったものは、リースが切れたあとほかで実行される。
@@ -1770,6 +1801,7 @@ requests_per_minute = 0 # 接続元アドレスごとの上限(0 は無制限)
 session_store = "memory"  # またはディレクトリ("sessions/")、データベース("db:cache")
 rate_limit_store = "cache"  # この Redis のデータベースでレート制限を数える(既定: プロセスの中)
 secret_env = "PHV_SECRET"   # サーバーの秘密鍵。サイトのプロセスが共有する(「CSRF 対策」)
+store_namespace = "blog"    # 共有の保存先でのサイトの名前(既定: [project] name。「セッション」)
 
 [server]
 workers = 16            # 同時に実行するスクリプトの数(既定: CPU 数の 2 倍、最小 8)
@@ -1859,7 +1891,7 @@ markdown = { git = "https://example.com/markdown.git", rev = "v1.2.0" }
 | `file_append(path, text)`、`filesize(path)`、`filemtime(path)`、`is_dir(path)`、`scandir(dir): list<string>`、`mkdir(dir)`、`copy(from, to)`、`rename(from, to)` | ファイルとディレクトリ。`[permissions]` が必要(§14) |
 | `csv_parse(string): list<list<string>>`、`csv_encode(list<list<string>>): string` | RFC 4180(引用符で囲んだフィールド、`""`、フィールド内の改行)。`csv_encode` の行末は CRLF。表計算ソフトは `=`・`+`・`-`・`@` で始まるセルを数式として実行するので、訪問者のテキストを表計算ソフトで開くファイルに入れるときは、そのようなセルの前に `'` を付ける |
 | `parse_url(string): map<string, string>`、`parse_query(string): map<string, string>` | キーは `scheme`、`host`、`port`、`user`、`pass`、`path`、`query`、`fragment`(あるものだけ)。不正な URL は `ValueError` |
-| `log_info(msg, ?fields)`、`log_warn(...)`、`log_error(...)` | 標準エラーに 1 行(サーバー自身のログと並ぶ): `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`。空白・`"`・`=` を含む値は引用符で囲み、改行・制御文字・テキストの向きを変える文字(U+202E など)はエスケープするので、値で行を偽造できない。`[server] request_ids` があれば、リクエストのために書いた行の末尾に `req=<id>` が付く |
+| `log_info(msg, ?fields)`、`log_warn(...)`、`log_error(...)` | 標準エラーに 1 行(サーバー自身のログと並ぶ): `2026-11-05T01:00:00.000Z INFO "signed in" user=ann n=3`。空白・`"`・`=` を含む値は引用符で囲み、改行・制御文字・テキストの向きを変える文字(U+202E など)はエスケープするので、値で行を偽造できない。`[server] request_ids` があれば、リクエストのために書いた行の末尾に `req=<id>` が付く。サーバー自身の行(ページやジョブのエラー)も同じくエスケープする |
 | `argv(): list<string>`、`stdin_read_line(): ?string`、`stdin_read_all(): string` | `phv run` で実行したスクリプトだけ(ほかでは `RuntimeException`): ファイルの後の引数と標準入力 |
 | `sql_ident(string): Sql` | 列名・テーブル名 |
 | `assert(bool, ?string)`, `assert_eq(any, any, ?string)` | テスト用 |
@@ -1939,7 +1971,7 @@ PHP の関数名で書いたときは、エラーメッセージで代わりの�
 | `phv doc [paths] [--std] [--format html\|md] [-o file]` | ドキュメントコメントから API リファレンスを作る(下の API リファレンスの節を参照) |
 | `phv install [--locked]` | `[dependencies]` とそれらが使うパッケージを取得して `phv.lock` に固定 |
 | `phv jobs run [dir]`、`phv jobs list [--failed] [dir]`、`phv jobs retry <id> [dir]` | ページを配信せずにバックグラウンドジョブを実行する。ストアのジョブを表示する。失敗したジョブを戻す(「バックグラウンドジョブ」) |
-| `phv migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする |
+| `phv migrate file.php` | PHP を機械的に変換し、手作業が必要な箇所を一覧にする(`-o` で出力先を指定。リンクを通しては書かない) |
 | `phv disasm file.phv` | バイトコードを表示 |
 | `phv parse file.phv` | 構文木を表示 |
 

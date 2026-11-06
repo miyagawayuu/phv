@@ -979,6 +979,18 @@ impl RuntimeError {
         }
         out
     }
+
+    /// The message and trace for a log: each part on its own line, with what
+    /// a script or a visitor put in it escaped (see `diag::log_escape`).
+    pub fn render_for_log(&self) -> String {
+        use phv_syntax::diag::log_escape;
+        let mut out = log_escape(&self.message);
+        out.push('\n');
+        for t in &self.trace {
+            out.push_str(&format!("  at {} ({}:{})\n", log_escape(&t.func), log_escape(&t.file), t.line));
+        }
+        out
+    }
 }
 
 pub struct RunOutcome {

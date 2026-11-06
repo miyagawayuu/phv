@@ -11,6 +11,7 @@
 //! memory_limit_mb = 128   # per request
 //! rate_limit_store = "cache"  # count rate limits in this Redis database (default: in the process)
 //! secret_env = "PHV_SECRET"   # the server's secret (32+ bytes), shared by its processes (CSRF tokens)
+//! store_namespace = "blog"    # the site's name in shared stores (default: [project] name)
 //!
 //! [server]
 //! workers = 16            # scripts running at once (default: 2 per CPU, at least 8)
@@ -158,8 +159,14 @@ pub fn job_name(name: &str) -> bool {
 /// The jobs of a project: the `.phv` files directly in `dir` with a name a
 /// job can have (sorted). None when the directory does not exist.
 pub fn scan_jobs(root: &Path, dir: &str) -> Option<Vec<String>> {
+    // A link or junction is not followed: the jobs are the project's own
+    // (found by the 1.1 audit). Nor are more than `MAX_JOB_ENTRIES` entries read.
+    if jobs_dir_is_link(root, dir) {
+        return Some(Vec::new());
+    }
     let entries = std::fs::read_dir(root.join(dir)).ok()?;
     let mut names: Vec<String> = entries
+        .take(MAX_JOB_ENTRIES)
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".phv")).map(str::to_string))
@@ -167,6 +174,34 @@ pub fn scan_jobs(root: &Path, dir: &str) -> Option<Vec<String>> {
         .collect();
     names.sort();
     Some(names)
+}
+
+/// The entries of `[jobs] dir` read for job names.
+const MAX_JOB_ENTRIES: usize = 10_000;
+
+/// Whether `[jobs] dir` is a link or junction (whose jobs are not run).
+pub fn jobs_dir_is_link(root: &Path, dir: &str) -> bool {
+    // Every directory on the way, not only the last (found by the 1.1 audit:
+    // `work` of `work/jobs` could be a junction).
+    let mut at = root.to_path_buf();
+    for part in dir.split('/').filter(|p| !p.is_empty()) {
+        at.push(part);
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink() || reparse_point(&m)) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn reparse_point(m: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    m.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn reparse_point(_: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// `[admin]`: the admin port, with `/health`, `/ready` and `/metrics`.
@@ -482,6 +517,10 @@ struct Security {
     /// The previous secret, still accepted while the secret is replaced.
     #[serde(default)]
     secret_old_env: Option<String>,
+    /// The site's name in shared stores (default: `[project] name`): sites
+    /// sharing a database keep their sessions, rate limits and jobs apart.
+    #[serde(default)]
+    store_namespace: Option<String>,
 }
 
 impl Default for Security {
@@ -497,6 +536,7 @@ impl Default for Security {
             rate_limit_store: None,
             secret_env: None,
             secret_old_env: None,
+            store_namespace: None,
         }
     }
 }
@@ -713,6 +753,8 @@ pub struct Config {
     /// holding the server's secret and the previous one.
     pub secret_env: Option<String>,
     pub secret_old_env: Option<String>,
+    /// Whether `[security] store_namespace` is set (rather than taken from the name).
+    pub store_namespace_set: bool,
     /// `[admin]`: the admin port.
     pub admin: Option<Admin>,
     /// `[server] request_ids` and `trust_request_id`.
@@ -758,6 +800,7 @@ impl Config {
             h2c: false,
             secret_env: None,
             secret_old_env: None,
+            store_namespace_set: false,
             admin: None,
             request_ids: false,
             trust_request_id: false,
@@ -886,6 +929,13 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
 
 /// The configuration in `text` (a phv.toml) for the project at `root`.
 pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
+    parse_config_with_jobs(root, text, None)
+}
+
+/// `parse_config`, with the names of the jobs given (a built site's, from its
+/// bundle) instead of read from `[jobs] dir` (found by the 1.1 audit: a built
+/// site checked its schedules against the folder it was started in).
+pub fn parse_config_with_jobs(root: &Path, text: &str, jobs_given: Option<Vec<String>>) -> Result<Config, String> {
     let file: File = toml::from_str(text).map_err(|e| format!("phv.toml: {e}"))?;
     if let Some(req) = &file.project.phv {
         check_phv_version(req, env!("CARGO_PKG_VERSION"))?;
@@ -1066,7 +1116,9 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
                     && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
             };
             let trimmed = dir.trim_end_matches('/');
-            if !trimmed.split('/').all(segment_ok) || trimmed.split('/').next() == Some("public") {
+            // In any case: on Windows `Public` is `public` (found by the 1.1 audit).
+            let first = trimmed.split('/').next().unwrap_or("");
+            if !trimmed.split('/').all(segment_ok) || first.eq_ignore_ascii_case("public") {
                 return Err(format!(
                     "[jobs].dir: \"{dir}\" must be a directory of the project outside public/ (letters, digits, _ and -)"
                 ));
@@ -1098,13 +1150,28 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
             })
         }
     };
+    // Counted before anything is read for them (found by the 1.1 audit: the
+    // jobs folder was read for each entry, then the count was checked).
+    if file.schedule.len() > 100 {
+        return Err("at most 100 [[schedule]] entries".into());
+    }
+    if let Some(j) = &jobs {
+        if jobs_given.is_none() && jobs_dir_is_link(root, &j.dir) {
+            return Err(format!("[jobs] dir: {} is a link; the jobs must be in the project", j.dir));
+        }
+    }
+    // The job names, read once.
+    let job_names = match &jobs {
+        Some(j) => jobs_given.or_else(|| scan_jobs(root, &j.dir)),
+        None => None,
+    };
     let mut schedules = Vec::new();
     for s in &file.schedule {
         let Some(j) = &jobs else { return Err("[[schedule]] needs a [jobs] section".into()) };
         if !job_name(&s.job) {
             return Err(format!("[[schedule]]: \"{}\" is not the name of a job (a-z, 0-9, _)", s.job));
         }
-        if let Some(names) = scan_jobs(root, &j.dir) {
+        if let Some(names) = &job_names {
             if !names.contains(&s.job) {
                 return Err(format!("[[schedule]]: there is no job {}/{}.phv", j.dir, s.job));
             }
@@ -1112,9 +1179,6 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
         let cron = phv_std::cron::Cron::parse(&s.cron, s.timezone.as_deref())
             .map_err(|e| format!("[[schedule]] of {}: {e}", s.job))?;
         schedules.push(Schedule { job: s.job.clone(), cron });
-    }
-    if schedules.len() > 100 {
-        return Err("at most 100 [[schedule]] entries".into());
     }
     if file.server.workers.is_some_and(|w| !(1..=1024).contains(&w)) {
         return Err("[server].workers must be between 1 and 1024".into());
@@ -1160,8 +1224,12 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
         _ => return Err("[server]: give both tls_cert and tls_key, or neither".into()),
     };
     let cors = file.cors.map(cors_config).transpose()?;
-    let permissions =
-        Permissions { read: file.permissions.read, write: file.permissions.write, env: file.permissions.env };
+    let mut permissions = Permissions {
+        read: file.permissions.read,
+        write: file.permissions.write,
+        env: file.permissions.env,
+        hidden_env: Vec::new(),
+    };
     let mut databases = BTreeMap::new();
     for (name, d) in file.databases {
         let spec = database_spec(&name, d)?;
@@ -1182,6 +1250,27 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
         let spec = http_spec(&name, h)?;
         http.insert(name, spec);
     }
+    // The site's namespace in shared stores: `[security] store_namespace`, or
+    // the project's name (found by the 1.1 audit: sites sharing a database
+    // shared sessions, rate limits and jobs). Hashed: it names tables and keys.
+    if let Some(n) = &file.security.store_namespace {
+        if n.is_empty() || n.len() > 64 || !n.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b)) {
+            return Err("[security].store_namespace: 1 to 64 letters, digits, `_`, `-` and `.`".into());
+        }
+    }
+    let store_namespace =
+        file.security.store_namespace.as_deref().or(file.project.name.as_deref()).map(phv_std::store_namespace);
+    // What the server reads for itself, no script reads.
+    let hidden = &mut permissions.hidden_env;
+    hidden.extend(file.security.secret_env.iter().chain(&file.security.secret_old_env).cloned());
+    hidden.extend(admin.iter().filter_map(|a| a.token_env.clone()));
+    hidden.extend(databases.values().filter_map(|d| d.url_env.clone()));
+    hidden.extend(websockets.values().filter_map(|w| w.url_env.clone()));
+    hidden.extend(mail.values().filter_map(|m| m.url_env.clone()));
+    for h in http.values() {
+        hidden.extend(h.url_env.iter().cloned());
+        hidden.extend(h.headers_env.iter().map(|(_, var)| var.clone()));
+    }
     Ok(Config {
         name: file.project.name,
         host: Arc::new(Host {
@@ -1196,9 +1285,10 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
             cli: false,
             no_stdin: false,
             args: Vec::new(),
+            store_namespace,
             jobs: jobs.as_ref().map(|j| phv_vm::JobsSpec {
                 store: j.store.clone(),
-                names: scan_jobs(root, &j.dir),
+                names: job_names.clone(),
                 memory_key: root.to_string_lossy().into_owned(),
             }),
         }),
@@ -1223,6 +1313,7 @@ pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
         h2c: file.server.h2c.unwrap_or(false),
         secret_env: file.security.secret_env,
         secret_old_env: file.security.secret_old_env,
+        store_namespace_set: file.security.store_namespace.is_some(),
         admin,
         request_ids: file.server.request_ids.unwrap_or(false),
         trust_request_id: file.server.trust_request_id.unwrap_or(false),
@@ -1269,6 +1360,97 @@ mod tests {
             let e = load(&format!("[permissions]\nwrite = [\"{d}\"]\n")).err().unwrap_or_default();
             assert!(e.contains("has a `~`"), "{d}: {e}");
         }
+    }
+
+    /// What the server reads for itself is hidden from scripts, whatever
+    /// `[permissions] env` says (found by the 1.1 audit).
+    #[test]
+    fn server_variables_are_hidden_from_scripts() {
+        let c = load(concat!(
+            "[permissions]\nenv = [\"APP_*\"]\n",
+            "[security]\nsecret_env = \"APP_SECRET\"\nsecret_old_env = \"APP_OLD\"\n",
+            "[admin]\nlisten = \"127.0.0.1:9100\"\ntoken_env = \"APP_TOKEN\"\n",
+            "[databases.main]\nurl_env = \"APP_DB\"\n",
+            "[http.api]\nurl_env = \"APP_API\"\nheaders_env = { Authorization = \"APP_AUTH\" }\n",
+        ))
+        .unwrap();
+        let hidden = &c.host.permissions.hidden_env;
+        for v in ["APP_SECRET", "APP_OLD", "APP_TOKEN", "APP_DB", "APP_API", "APP_AUTH"] {
+            assert!(hidden.iter().any(|h| h == v), "{v}: {hidden:?}");
+        }
+    }
+
+    /// A site's namespace in shared stores comes from `[security]
+    /// store_namespace` or its name (found by the 1.1 audit).
+    #[test]
+    fn sites_get_a_namespace_from_their_name() {
+        let ns = |toml: &str| load(toml).unwrap().host.store_namespace.clone();
+        assert_eq!(ns(""), None);
+        let blog = ns("[project]\nname = \"blog\"\n").unwrap();
+        assert_eq!(blog.len(), 32);
+        assert!(blog.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(ns("[project]\nname = \"shop\"\n"), Some(blog.clone()));
+        let staging = ns("[project]\nname = \"blog\"\n[security]\nstore_namespace = \"blog-staging\"\n");
+        assert!(staging.is_some() && staging != Some(blog));
+        for bad in ["", "a b", "x/y", &"n".repeat(65)] {
+            let e = load(&format!("[security]\nstore_namespace = \"{bad}\"\n")).err().unwrap_or_default();
+            assert!(e.contains("store_namespace"), "{bad:?}: {e}");
+        }
+    }
+
+    /// The count of `[[schedule]]` entries is checked before any is looked at,
+    /// and the jobs folder is read once (found by the 1.1 audit: 200,000
+    /// entries and 2,000 job files took 159 seconds of `phv check`).
+    #[test]
+    fn many_schedules_are_refused_at_once() {
+        let dir = std::env::temp_dir().join(format!("phv-config-sched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("jobs")).unwrap();
+        for i in 0..1000 {
+            std::fs::write(dir.join("jobs").join(format!("j{i}.phv")), "<?phv\n").unwrap();
+        }
+        let mut toml = String::from("[jobs]\n");
+        for _ in 0..100_000 {
+            toml.push_str("[[schedule]]\njob = \"j1\"\ncron = \"* * * * *\"\n");
+        }
+        let start = std::time::Instant::now();
+        let e = parse_config(&dir, &toml).err().unwrap_or_default();
+        assert!(e.contains("at most 100"), "{e}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
+        // A built site checks against its bundle's jobs, not the folder it runs in.
+        let one = "[jobs]\n[[schedule]]\njob = \"cleanup\"\ncron = \"0 * * * *\"\n";
+        assert!(parse_config(&dir, one).is_err());
+        let c = parse_config_with_jobs(&dir, one, Some(vec!["cleanup".into()])).unwrap();
+        assert_eq!(c.host.jobs.as_ref().unwrap().names.as_deref(), Some(&["cleanup".to_string()][..]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A jobs folder that is a link is refused (found by the 1.1 audit).
+    #[test]
+    fn a_linked_jobs_folder_is_refused() {
+        let dir = std::env::temp_dir().join(format!("phv-config-jlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        std::fs::write(dir.join("outside").join("x.phv"), "<?phv\n").unwrap();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(dir.join("outside"), dir.join("jobs")).is_ok();
+        #[cfg(windows)]
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dir.join("jobs"))
+            .arg(dir.join("outside"))
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if made {
+            let e = parse_config(&dir, "[jobs]\n").err().unwrap_or_default();
+            assert!(e.contains("is a link"), "{e}");
+            assert_eq!(scan_jobs(&dir, "jobs"), Some(Vec::new()));
+            // A link on the way counts too.
+            std::fs::create_dir_all(dir.join("outside").join("inner")).unwrap();
+            let e = parse_config(&dir, "[jobs]\ndir = \"jobs/inner\"\n").err().unwrap_or_default();
+            assert!(e.contains("is a link"), "{e}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
