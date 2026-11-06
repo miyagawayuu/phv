@@ -81,13 +81,15 @@ try {
     echo count($keep), ": ", $e->getMessage(), "\n";
 }
 foreach ($keep as $d) { $d->close(); }
-// Opened and closed many times over: the kept connection is charged only while held.
+// Opened and closed many times over: the kept connection is charged only while
+// held. (Reads only: a write per open waits for the disk, slow on some machines.)
+$n = 0;
 for ($i = 0; $i < 3000; $i++) {
     $d = Database::open("data/small.db");
-    $d->execute(sql"INSERT INTO t (x) VALUES ({$i})");
+    $n += $d->first(sql"SELECT count(*) + 1 AS n FROM t")?->int("n") ?? 0;
     $d->close();
 }
-echo Database::open("data/small.db")->first(sql"SELECT count(*) AS n FROM t")?->int("n") ?? 0;
+echo $n;
 "#;
     let (out, _) = run_site("cap", src, LIMIT);
     assert_eq!(
