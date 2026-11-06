@@ -1272,7 +1272,8 @@ The methods are the same as for SQLite (`query`, `first`, `execute`, `transactio
   connection), so a statement run again skips that step. Only `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `WITH` and
   `VALUES` are kept; any other statement (`ALTER TABLE`, `DEALLOCATE`, `SET`, ...) drops them. A kept statement is
   prepared again when its table changed (also by another connection); inside a transaction only the statements
-  prepared in that transaction are used.
+  prepared in that transaction are used. A connection on which a script deallocated every statement (`DEALLOCATE ALL`
+  or `DISCARD ALL`, also inside a function) is closed after the script instead of going back to the pool.
 - A statement running past the script's time limit is stopped: by the server (PostgreSQL `statement_timeout`,
   MySQL `max_execution_time`, which applies to `SELECT`) and, also when a script changes those settings, on the client
   side (PostgreSQL connections stop reading at the deadline; MySQL statements are stopped with `KILL QUERY`). A result

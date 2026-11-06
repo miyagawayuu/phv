@@ -1,0 +1,15 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: a query that makes the client
+// look a type up (with a statement it prepares for itself), then every
+// statement of the connection deallocated where PHV cannot see it.
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->execute(sql"DROP TYPE IF EXISTS phv_dealloc_a");
+$db->execute(sql"DROP TYPE IF EXISTS phv_dealloc_b");
+$db->execute(sql"CREATE TYPE phv_dealloc_a AS ENUM ('x')");
+$db->execute(sql"CREATE TYPE phv_dealloc_b AS ENUM ('y')");
+$db->execute(sql"CREATE OR REPLACE FUNCTION phv_dealloc_all() RETURNS int LANGUAGE plpgsql
+    AS 'BEGIN EXECUTE ''DEALLOCATE ALL''; RETURN 1; END'");
+echo $db->first(sql"SELECT 'x'::phv_dealloc_a::text AS v, 'x'::phv_dealloc_a AS t")?->string("v") ?? "?", "\n";
+echo "deallocated: ", $db->first(sql"SELECT phv_dealloc_all() AS d")?->int("d") ?? 0, "\n";

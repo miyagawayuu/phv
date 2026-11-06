@@ -1444,8 +1444,8 @@ VM・JIT・型検査、テンプレート・Web サイト・サンプル、ツ�
 | Critical | 0 | — |
 | High | 0 | — |
 | Medium | 8 | 修正済み |
-| Low | 5 | 修正済み |
-| Info | 7 | 修正済み |
+| Low | 6 | 修正済み |
+| Info | 8 | 修正済み |
 
 ### §22〜§24 の残存リスク(1.1.1 で修正)
 
@@ -1488,18 +1488,20 @@ VM・JIT・型検査、テンプレート・Web サイト・サンプル、ツ�
 | R18-11 | ジョブの上限の近くでは、`enqueue()` のたびにテーブルを 2 回、1 つずつ数え、トランザクションはさらに数え直した: 5〜10 倍遅く、開いたトランザクション 1 つですべての追加が止まった | トランザクションは 1 回だけ数える。上限の近くではストアに保存した数を使い、数え直しは 1 秒に 1 回まで |
 | R18-12 | ソースのパスを、プロジェクトの中にあるかを確かめる前に解決していた: Windows で `\\host\share\m.phv` へのリンクがあると、`phv check` とエディターがそのホストに接続した | ほかのマシンへのリンクは解決せずに拒否する: モジュール、テンプレート、パッケージ、`phv.toml`、キャッシュの項目、エディターの文書、ページと静的ファイル |
 | R18-13 | 修正の中で見つかったもの。`finally` の中の `continue` が違うループへ飛んだ。`int` を返す関数の `finally` の中の `break` が検査を通り、関数は null を返した | 正しくコンパイルする。「値を返さなければならない」 |
+| R18-14 | CI で見つかったもの。`DEALLOCATE ALL` や `DISCARD ALL` を実行したスクリプト(データベースの関数の中でも)が、PostgreSQL の接続を型を調べられない状態にした: その接続の後のスクリプトがすべて、接続のある限り失敗した(「prepared statement … does not exist」) | 接続を作ったときに準備した文を後始末で探し、なくなっていれば使い回さずに閉じる |
 
 ### Info
 
 | # | 指摘 | 修正 |
 |---|---|---|
-| R18-14 | `TRACE` でページが実行された(リクエストは返さない) | `CONNECT` とともに 405 |
-| R18-15 | サイトが名前空間を持ったあとも、1.1 が保存したセッションが Redis の共有の管理用キーに残った | サイトの掃除が、Redis が期限切れにしたものを取り除く |
-| R18-16 | SQL と Redis のジョブストアは件数を制限したが、バイト数は制限しなかった(64 KB の payload で 6.4 GB)。終わったジョブのキーを 1 日、上限なしに残した。MySQL はそれを 1 回の `DELETE` で掃除した | payload は 1 GB まで、残すキーは 100,000 件まで。掃除は 10,000 行ずつ |
-| R18-17 | NT の名前空間でのリンク先(`\GLOBAL??\UNC\`、`\Device\Mup\`)をローカルと見なしていた | 遠くのパスと見なす。`\` 1 つで始まるリンク先はすべてそう扱う |
-| R18-18 | Redis の配列の応答の中にエラーがあると、残りを読まずに接続をプールに戻していた。NUL を含む流量制限のキーが、別のサイトのキーと一致しえた | 応答を最後まで読む。そうしたキーには専用の接頭辞を付ける |
-| R18-19 | 2 つ目の `:memory:` データベースが開けなかった。別のバイナリの古いキャッシュの項目を、まるごと読み解いていた(1.9 GB) | メモリ上のデータベースはそれぞれ上限全体を使える(数えられる)。項目の印を先に読む |
-| R18-20 | `number_format(-INF)` が `inf` と出た | `-inf` |
+| R18-15 | `TRACE` でページが実行された(リクエストは返さない) | `CONNECT` とともに 405 |
+| R18-16 | サイトが名前空間を持ったあとも、1.1 が保存したセッションが Redis の共有の管理用キーに残った | サイトの掃除が、Redis が期限切れにしたものを取り除く |
+| R18-17 | SQL と Redis のジョブストアは件数を制限したが、バイト数は制限しなかった(64 KB の payload で 6.4 GB)。終わったジョブのキーを 1 日、上限なしに残した。MySQL はそれを 1 回の `DELETE` で掃除した | payload は 1 GB まで、残すキーは 100,000 件まで。掃除は 10,000 行ずつ |
+| R18-18 | NT の名前空間でのリンク先(`\GLOBAL??\UNC\`、`\Device\Mup\`)をローカルと見なしていた | 遠くのパスと見なす。`\` 1 つで始まるリンク先はすべてそう扱う |
+| R18-19 | Redis の配列の応答の中にエラーがあると、残りを読まずに接続をプールに戻していた。NUL を含む流量制限のキーが、別のサイトのキーと一致しえた | 応答を最後まで読む。そうしたキーには専用の接頭辞を付ける |
+| R18-20 | 2 つ目の `:memory:` データベースが開けなかった。別のバイナリの古いキャッシュの項目を、まるごと読み解いていた(1.9 GB) | メモリ上のデータベースはそれぞれ上限全体を使える(数えられる)。項目の印を先に読む |
+| R18-21 | `number_format(-INF)` が `inf` と出た | `-inf` |
+| R18-22 | CI で見つかったもの。同じ表を同時に作るプロセスが、PostgreSQL(カタログの重複)と MySQL(列の重複)で失敗した | 作り直し、そのときは見つかる。列はあるものとして扱う |
 
 ### 残存リスク
 
@@ -1556,7 +1558,8 @@ VM・JIT・型検査、テンプレート・Web サイト・サンプル、ツ�
   cycles の `the_collector_stays_within_the_memory_limit`。
   sqlite_limits の `page_caches_count_against_the_memory_limit`、`a_script_holds_at_most_64_databases`、
   `temporary_tables_count_against_the_memory_limit`、`sorts_count_against_the_memory_limit`。
-  databases の `keyed_jobs_wait_no_longer_than_the_time_limit`、`adding_jobs_near_the_cap_stays_cheap`。
+  databases の `keyed_jobs_wait_no_longer_than_the_time_limit`、`adding_jobs_near_the_cap_stays_cheap`、
+  `a_connection_whose_statements_a_script_deallocated_is_not_reused`。
 - **phv_cli(エディター):** `programs_past_the_budget_are_not_checked_or_kept`、`documents_behind_a_link_to_a_share_are_not_resolved`。
 - **phv_std:** `object_manager_spellings_of_shares_are_remote`、`only_the_part_below_the_base_is_looked_at`、
   `an_error_in_an_array_reply_reads_the_whole_reply`、`job_stores_cap_the_bytes_of_payloads`、

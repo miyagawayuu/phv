@@ -1472,8 +1472,8 @@ These checks found nothing beyond a cosmetic `number_format(-INF)`, which is fix
 | Critical | 0 | — |
 | High | 0 | — |
 | Medium | 8 | Fixed |
-| Low | 5 | Fixed |
-| Info | 7 | Fixed |
+| Low | 6 | Fixed |
+| Info | 8 | Fixed |
 
 ### The residual risks of §22–§24 (fixed in 1.1.1)
 
@@ -1516,18 +1516,20 @@ These checks found nothing beyond a cosmetic `number_format(-INF)`, which is fix
 | R18-11 | Near the job cap, each `enqueue()` counted the table twice and one at a time, and each transaction counted it again: 5–10 times slower, and one open transaction held up every add | A transaction counts once. Near the cap a count kept in the store is used, recounted at most once a second |
 | R18-12 | Sources were resolved before the check that they lie in the project: on Windows, a link to `\\host\share\m.phv` made `phv check` and the editor connect to that host | Links to other machines are refused unresolved: modules, templates, packages, `phv.toml`, cache entries, the editor's documents, and pages and static files |
 | R18-13 | Found in the fixes. A `continue` in a `finally` went to the wrong loop. A `break` in a `finally` of an `int` function passed the check, and the function then returned null | Compiled correctly; "must return a value" |
+| R18-14 | Found by CI. A script that ran `DEALLOCATE ALL` or `DISCARD ALL` (also inside a database function) left its PostgreSQL connection unable to look up types: every later script on it failed ("prepared statement … does not exist") for as long as the connection lived | The reset looks for a statement the connection prepared when it was made; when it is gone, the connection is closed instead of reused |
 
 ### Info
 
 | # | Finding | Fix |
 |---|---|---|
-| R18-14 | `TRACE` ran the page (without echoing the request) | 405, with `CONNECT` |
-| R18-15 | Sessions stored by 1.1 stayed in Redis's shared bookkeeping after a site had a namespace | A site's sweep removes those that Redis has expired |
-| R18-16 | The SQL and Redis job stores capped the number of jobs but not their bytes (6.4 GB of 64 KB payloads); keys of ended jobs were kept a day without a cap; MySQL swept them in one `DELETE` | At most 1 GB of payloads and 100,000 kept keys; sweeps take 10,000 rows at a time |
-| R18-17 | Link targets in the NT namespace (`\GLOBAL??\UNC\`, `\Device\Mup\`) were taken as local | Taken as remote, as any target starting with a single `\` |
-| R18-18 | An error inside a Redis array reply left the rest unread on a pooled connection. A rate-limit key with a NUL character could match another site's key | The whole reply is read. Such keys get a prefix of their own |
-| R18-19 | A second `:memory:` database could not be opened. A stale cache entry of another binary was decoded whole (1.9 GB) | Each in-memory database has the whole limit (counted). The entry's stamp is read first |
-| R18-20 | `number_format(-INF)` printed `inf` | `-inf` |
+| R18-15 | `TRACE` ran the page (without echoing the request) | 405, with `CONNECT` |
+| R18-16 | Sessions stored by 1.1 stayed in Redis's shared bookkeeping after a site had a namespace | A site's sweep removes those that Redis has expired |
+| R18-17 | The SQL and Redis job stores capped the number of jobs but not their bytes (6.4 GB of 64 KB payloads); keys of ended jobs were kept a day without a cap; MySQL swept them in one `DELETE` | At most 1 GB of payloads and 100,000 kept keys; sweeps take 10,000 rows at a time |
+| R18-18 | Link targets in the NT namespace (`\GLOBAL??\UNC\`, `\Device\Mup\`) were taken as local | Taken as remote, as any target starting with a single `\` |
+| R18-19 | An error inside a Redis array reply left the rest unread on a pooled connection. A rate-limit key with a NUL character could match another site's key | The whole reply is read. Such keys get a prefix of their own |
+| R18-20 | A second `:memory:` database could not be opened. A stale cache entry of another binary was decoded whole (1.9 GB) | Each in-memory database has the whole limit (counted). The entry's stamp is read first |
+| R18-21 | `number_format(-INF)` printed `inf` | `-inf` |
+| R18-22 | Found by CI. Processes making the same table at the same moment failed on PostgreSQL (a duplicate in its catalog) and on MySQL (a duplicate column) | Made again, which then finds it; the column counts as there |
 
 ### Residual Risks
 
@@ -1585,8 +1587,9 @@ Regression tests:
 - **phv_driver (other):** `sources_behind_a_link_to_a_share_are_refused_unresolved`;
   `the_collector_stays_within_the_memory_limit` (cycles); `page_caches_count_against_the_memory_limit`,
   `a_script_holds_at_most_64_databases`, `temporary_tables_count_against_the_memory_limit` and
-  `sorts_count_against_the_memory_limit` (sqlite_limits); `keyed_jobs_wait_no_longer_than_the_time_limit` and
-  `adding_jobs_near_the_cap_stays_cheap` (databases).
+  `sorts_count_against_the_memory_limit` (sqlite_limits); `keyed_jobs_wait_no_longer_than_the_time_limit`,
+  `adding_jobs_near_the_cap_stays_cheap` and `a_connection_whose_statements_a_script_deallocated_is_not_reused`
+  (databases).
 - **phv_cli (the editor):** `programs_past_the_budget_are_not_checked_or_kept`,
   `documents_behind_a_link_to_a_share_are_not_resolved`.
 - **phv_std:** `object_manager_spellings_of_shares_are_remote`, `only_the_part_below_the_base_is_looked_at`,

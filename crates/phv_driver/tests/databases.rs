@@ -125,6 +125,22 @@ fn postgres() {
     check_migrations(&host, "SELECT nope FROM missing_table");
 }
 
+/// A script that deallocates every statement of its connection (here in a
+/// function, where PHV cannot see it) also removes those the client prepared
+/// to look up types: the connection is not given to the next script, which
+/// would fail on them ("prepared statement ... does not exist"; found by the
+/// 1.1.1 tests, after jobs_kept.phv ran on the connection of postgres_types).
+#[test]
+fn a_connection_whose_statements_a_script_deallocated_is_not_reused() {
+    let Some(url) = server("PHV_TEST_POSTGRES_URL") else { return };
+    // A pool of its own (pool_size 3): one connection, used by the two scripts in turn.
+    let spec = DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 3 };
+    let host =
+        Arc::new(Host { root: root(), databases: BTreeMap::from([("main".to_string(), spec)]), ..Host::default() });
+    assert_eq!(run_script(&host, "postgres_dealloc", Some(Duration::from_secs(30))), "x\ndeallocated: 1\n");
+    assert_eq!(run_script(&host, "postgres_dealloc_after", Some(Duration::from_secs(30))), "y\ndone\n");
+}
+
 #[test]
 fn mysql() {
     let Some(url) = server("PHV_TEST_MYSQL_URL") else { return };
@@ -237,7 +253,11 @@ fn check_jobs(url: &str) {
     clear(&store);
     let lease = Duration::from_secs(60);
     let id = store.add("a", "payload", 0, None).unwrap().unwrap();
-    let later = store.add("later", "", 3600, None).unwrap().unwrap();
+    // Due in a few seconds, and taken at the end: a job left waiting (once an
+    // hour) came due in the middle of a later run of these tests and was taken
+    // there as one of its own.
+    let later_due = Instant::now() + Duration::from_secs(LATER_SECS as u64);
+    let later = store.add("later", "", LATER_SECS, None).unwrap().unwrap();
     // Another site on the same database (another namespace) sees none of
     // them, and its own jobs stay its own (found by the 1.1 audit).
     let other = Store::Db(spec.clone(), Some("ab12cd34".into()));
@@ -307,6 +327,10 @@ fn check_jobs(url: &str) {
     let left: Vec<String> = store.list(false).unwrap().into_iter().map(|j| j.id).collect();
     assert!(left.contains(&later), "{left:?}");
     assert!(!left.contains(&id));
+    std::thread::sleep(later_due.saturating_duration_since(Instant::now()) + Duration::from_millis(200));
+    let j = store.take(lease).unwrap().expect("the later job is due");
+    assert_eq!(j.id, later);
+    assert!(store.end(&j, End::Done { keyed: false }).unwrap());
     clear(&store);
 
     // The outbox: enqueue() inside a transaction() on PostgreSQL and MySQL
@@ -470,8 +494,12 @@ fn check_near_cap(url: &str) {
     eprintln!(
         "{url}: 200 jobs far below the cap {far_ms:?} ms, near it {near_ms:?} ms (outside, inside a transaction)"
     );
-    for i in 0..2 {
-        assert!(near_ms[i] <= far_ms[i].max(100) * 4, "{url}: far {far_ms:?} ms, near {near_ms:?} ms");
+    // Outside a transaction an add near the cap takes the store's lock: a few
+    // more round trips and a commit of their own, which cost more on a slow
+    // server (5.7 times on CI's MySQL, 2.3 here). Inside a transaction it costs
+    // no more (the old code counted the table there: 5 to 6.3 times).
+    for (i, times) in [10, 4].into_iter().enumerate() {
+        assert!(near_ms[i] <= far_ms[i].max(100) * times, "{url}: far {far_ms:?} ms, near {near_ms:?} ms");
     }
 }
 
@@ -485,11 +513,21 @@ fn adding_jobs_near_the_cap_stays_cheap() {
     }
 }
 
+/// How long the delayed job of `check_jobs` waits: past the steps that must
+/// not take it.
+const LATER_SECS: i64 = 15;
+
 #[test]
 fn job_stores() {
-    for var in ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL", "PHV_TEST_REDIS_URL"] {
-        if let Some(url) = server(var) {
-            check_jobs(&url);
+    // The servers at once: each waits for its delayed job.
+    std::thread::scope(|s| {
+        let runs: Vec<_> = ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL", "PHV_TEST_REDIS_URL"]
+            .into_iter()
+            .filter_map(server)
+            .map(|url| s.spawn(move || check_jobs(&url)))
+            .collect();
+        for r in runs {
+            r.join().unwrap();
         }
-    }
+    });
 }

@@ -1,0 +1,11 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs after postgres_dealloc.phv, on a
+// connection of the same pool: a type not looked up yet.
+import std.db.Database;
+
+$db = Database::connect("main");
+echo $db->first(sql"SELECT 'y'::phv_dealloc_b::text AS v, 'y'::phv_dealloc_b AS t")?->string("v") ?? "?", "\n";
+$db->execute(sql"DROP FUNCTION phv_dealloc_all()");
+$db->execute(sql"DROP TYPE phv_dealloc_a");
+$db->execute(sql"DROP TYPE phv_dealloc_b");
+echo "done\n";

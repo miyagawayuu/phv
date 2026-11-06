@@ -1250,6 +1250,8 @@ $id = $db->lastInsertId();                                                      
   もう一度実行するときは、その手順を省きます。保持するのは `SELECT`、`INSERT`、`UPDATE`、`DELETE`、`WITH`、`VALUES`
   だけで、それ以外の文(`ALTER TABLE`、`DEALLOCATE`、`SET` など)を実行すると捨てます。表が変わったとき(別の接続が
   変えたときも)はプリペアし直します。トランザクションの中では、そのトランザクションでプリペアした文だけを使います。
+  スクリプトがすべての文を解放した接続(`DEALLOCATE ALL` や `DISCARD ALL`。関数の中でも)は、プールに戻さず
+  スクリプトのあとで閉じます。
 - スクリプトの制限時間を超えた文は止まります。サーバー側(PostgreSQL は `statement_timeout`、MySQL は
   `SELECT` に効く `max_execution_time`)に加えて、スクリプトがその設定を変えてもクライアント側で止めます
   (PostgreSQL の接続は期限で読み取りをやめ、MySQL の文は `KILL QUERY` で止める)。スクリプトに残っているメモリより

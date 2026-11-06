@@ -462,6 +462,10 @@ struct PgConn {
     /// this connection: each of its statements is sent with a
     /// `statement_timeout` that ends there (see `store_prelude`).
     store_until: Option<Instant>,
+    /// A statement prepared when the connection was made and never closed,
+    /// and its text (unique to the connection): gone only when a script
+    /// deallocated the client's statements (see `PG_RESET`).
+    sentinel: (String, postgres::Statement),
 }
 
 /// Clears what a script can leave on a session, in one round trip. This is
@@ -471,9 +475,18 @@ struct PgConn {
 /// scripts prepare are deallocated by name. Outside a transaction `ROLLBACK`
 /// only warns; inside one it ends it, so the reset itself does not run inside
 /// the script's transaction.
+///
+/// The last statement also looks for the connection's `sentinel`: when a
+/// script deallocated the client's own statements (`DEALLOCATE ALL`, or
+/// `DISCARD ALL`, perhaps inside a function where PHV cannot see it), the
+/// client still holds the statements it prepared to look up types, and would
+/// fail on them for every later script ("prepared statement ... does not
+/// exist"); such a connection is closed instead of reused (found by the
+/// 1.1.1 tests).
 const PG_RESET: &str = "ROLLBACK; CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; \
     SELECT pg_advisory_unlock_all(); DISCARD PLANS; DISCARD TEMP; DISCARD SEQUENCES; \
-    SELECT name FROM pg_prepared_statements WHERE from_sql";
+    SELECT name FROM pg_prepared_statements WHERE from_sql UNION ALL \
+    SELECT NULL WHERE EXISTS (SELECT 1 FROM pg_prepared_statements WHERE NOT from_sql AND statement = ";
 
 /// What a statement's text is, for the kept statements: only plain data
 /// statements are kept; the others are run as before, and may change the
@@ -532,8 +545,14 @@ impl PgConn {
     }
 
     fn reset_session(&mut self) -> bool {
-        let Ok(names) = self.client.simple_last_column(PG_RESET) else { return false };
-        names.iter().all(|n| self.client.batch_execute(&format!("DEALLOCATE \"{}\"", n.replace('"', "\"\""))).is_ok())
+        // The sentinel's row is a NULL (read as ""): no statement is named so.
+        let sql = format!("{PG_RESET}'{}')", self.sentinel.0);
+        let Ok(names) = self.client.simple_last_column(&sql) else { return false };
+        names.iter().any(String::is_empty)
+            && names
+                .iter()
+                .filter(|n| !n.is_empty())
+                .all(|n| self.client.batch_execute(&format!("DEALLOCATE \"{}\"", n.replace('"', "\"\""))).is_ok())
     }
 
     /// Drops the kept statements (and the types the client looked up, which a
@@ -632,6 +651,29 @@ impl PgConn {
         }
     }
 
+    /// `CREATE … IF NOT EXISTS` statements: when another connection creates the
+    /// same table or index at the same moment, PostgreSQL reports a duplicate
+    /// (in its catalog) instead of finding it, once that connection commits. The
+    /// statements are run again, and then find it (found by CI: several
+    /// processes making the shared table of job counts at once).
+    fn store_create(&self, sql: &str) -> Result<(), postgres::Error> {
+        use postgres::error::SqlState;
+        let mut tries = 0;
+        loop {
+            match self.store_batch(sql) {
+                Err(e)
+                    if tries < 3
+                        && [SqlState::UNIQUE_VIOLATION, SqlState::DUPLICATE_TABLE, SqlState::DUPLICATE_OBJECT]
+                            .iter()
+                            .any(|c| e.code() == Some(c)) =>
+                {
+                    tries += 1;
+                }
+                r => return r,
+            }
+        }
+    }
+
     fn query_kept(
         &mut self,
         text: &str,
@@ -694,6 +736,9 @@ fn pg_connect(url: &str, spec: &DatabaseSpec, timeout: Duration) -> Result<PgCon
     meter.set(Some(Instant::now() + timeout + RESET_TIMEOUT), RESET_BUDGET);
     let make_tls = || tokio_postgres_rustls::MakeRustlsConnect::new((*crate::netio::tls_config()).clone());
     let client = PgClient::connect(&config, tls.then(make_tls), timeout, meter.clone())?;
+    let text = format!("SELECT 1 AS phv_{}", crate::random_hex(8));
+    let stmt = client.run(None, client.client().prepare(&text)).map_err(|e| pg_message(&e))?;
+    let sentinel = (text, stmt);
     meter.set(None, RESET_BUDGET);
     Ok(PgConn {
         client,
@@ -704,6 +749,7 @@ fn pg_connect(url: &str, spec: &DatabaseSpec, timeout: Duration) -> Result<PgCon
         in_own_transaction: false,
         jobs_tx: None,
         store_until: None,
+        sentinel,
     })
 }
 
@@ -2179,7 +2225,7 @@ fn session_conn(spec: &DatabaseSpec, ns: Option<&str>) -> Result<(SessionConn, I
              created bigint NOT NULL, last bigint NOT NULL, returned smallint NOT NULL)"
         );
         match &mut conn {
-            SessionConn::Pg(c) => c.get().store_batch(&sql).map_err(|e| pg_message(&e))?,
+            SessionConn::Pg(c) => c.get().store_create(&sql).map_err(|e| pg_message(&e))?,
             SessionConn::My(c) => {
                 use mysql::prelude::Queryable;
                 let w = c.get().watch();
@@ -3007,7 +3053,7 @@ const JOBS_COUNTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS phv_jobs_counts (t v
 
 /// Creates the jobs table `t` (PostgreSQL), with what later versions added to it.
 fn pg_job_tables(conn: &mut PgConn, t: &str) -> Result<(), postgres::Error> {
-    conn.store_batch(&format!(
+    conn.store_create(&format!(
         "CREATE TABLE IF NOT EXISTS {t} (id varchar(32) PRIMARY KEY, name varchar(64) NOT NULL, \
          payload text NOT NULL, run_at bigint NOT NULL, attempts integer NOT NULL, state smallint NOT NULL, \
          lease varchar(32), lease_until bigint, uniq varchar(64) UNIQUE, error text, created bigint NOT NULL, \
@@ -3024,7 +3070,7 @@ fn pg_job_tables(conn: &mut PgConn, t: &str) -> Result<(), postgres::Error> {
     )?;
     let (sized, indexed): (i64, i64) = rows.first().map_or(Ok((0, 0)), |r| Ok((r.try_get(0)?, r.try_get(1)?)))?;
     if indexed == 0 {
-        conn.store_batch(&format!("CREATE INDEX IF NOT EXISTS {index} ON {t} (state, run_at)"))?;
+        conn.store_create(&format!("CREATE INDEX IF NOT EXISTS {index} ON {t} (state, run_at)"))?;
     }
     // The bytes of each job's payload (since 1.1.1); jobs added before count none.
     if sized == 0 {
@@ -3072,6 +3118,8 @@ fn my_job_tables(conn: &mut MyConn, t: &str) -> Result<(), String> {
         c.query_drop(format!("SET SESSION lock_wait_timeout = {}", JOB_WAIT.as_secs())).map_err(my)?;
         match alter {
             Err(mysql::Error::MySqlError(e)) if e.code == 1205 => note_sized(t, false),
+            // 1060: another process added it at the same moment.
+            Err(mysql::Error::MySqlError(e)) if e.code == 1060 => note_sized(t, true),
             r => {
                 r.map_err(my)?;
                 note_sized(t, true);
@@ -4631,7 +4679,7 @@ pub fn migration_conn(spec: &DatabaseSpec) -> Result<MigrationConn, String> {
         Kind::Redis => return Err("it is a Redis server; migrations are for SQL databases".into()),
     };
     match &mut conn {
-        MigrationInner::Pg(c) => c.client.batch_execute(MIGRATIONS_TABLE).map_err(|e| pg_message(&e))?,
+        MigrationInner::Pg(c) => c.store_create(MIGRATIONS_TABLE).map_err(|e| pg_message(&e))?,
         MigrationInner::My(c) => {
             use mysql::prelude::Queryable;
             c.conn.query_drop(MIGRATIONS_TABLE).map_err(|e| my_message(&e))?
