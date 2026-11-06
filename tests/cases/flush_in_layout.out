@@ -1,0 +1,7 @@
+<!doctype html>
+<html>
+<head><title>Flush</title></head>
+<body>
+before response()->flush() cannot be called while output is captured (in a layout or a component) after
+</body>
+</html>

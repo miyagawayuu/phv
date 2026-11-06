@@ -1,0 +1,49 @@
+RS256 rsa-1 private
+RS256 - private
+RS256 rsa-1 public
+ES256 ec-1 private
+ES256 - private
+ES256 - public
+EdDSA ed-1 private
+EdDSA - public
+RS256: Ann
+RS256: Ann
+ES256: Ann
+ES256: Ann
+EdDSA: Ann
+ValueError: JwtKey::sign(): a public key cannot sign; load the private key
+refused
+refused
+ES256 ec-1 public
+7
+rsa-1: 7
+ec-1: 7
+ed-1: 7
+7
+3 keys
+expired: refused
+expired, leeway 30: ok
+not yet: refused
+exp as text: refused
+iss and aud: ok
+other iss: refused
+other aud: refused
+aud not asked for: refused
+aud missing: refused
+HS256 signs 1
+ValueError: publicJwk(): a secret key has no public form
+forged: refused
+tampered: refused
+garbage: refused
+none: refused
+ValueError: JwtKey::fromPem(): the key is not in PEM form (-----BEGIN ...-----)
+ValueError: JwtKey::fromPem(): a PEM block of "CERTIFICATE" is not a key
+ValueError: JwtKey::fromPem(): the key is encrypted; decrypt it first (openssl pkcs8 -topk8 -nocrypt)
+ValueError: JwtKey::fromJwk(): symmetric (oct) keys are not read from JWKs; use JwtKey::secret()
+ValueError: JwtKey::fromJwk(): only EC keys on the P-256 curve are supported
+ValueError: JwtKey::fromJwk(): the RSA key is not 2048 to 8192 bits
+ValueError: JwtKey::fromJwk(): the JWK is not for signatures ("use" is not "sig")
+ValueError: JwtKey::secret(): the secret must be at least 32 bytes; make one with random_token() and keep it in an environment variable
+ValueError: KeySet::fromJson(): the key set holds no RS256, ES256 or EdDSA signing key
+ValueError: verify(): the leeway must be 0 to 300 seconds
+NetworkError: no HTTP service named "nowhere" in [http] of phv.toml

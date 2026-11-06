@@ -28,6 +28,14 @@ pub enum RespBody {
     },
     /// Chunks sent as they come (Server-Sent Events), until the sender is dropped.
     Stream(tokio::sync::mpsc::Receiver<Bytes>),
+    /// A page's output sent while it runs (`response()->flush()`). When the
+    /// sender is dropped the body ends, or fails if `aborted` was set first
+    /// (the page failed or stopped): the client sees a cut response, not a
+    /// complete one.
+    Chunks {
+        rx: tokio::sync::mpsc::Receiver<Bytes>,
+        aborted: Arc<std::sync::atomic::AtomicBool>,
+    },
 }
 
 /// Output counted in a server-wide total until the last copy of its bytes is
@@ -150,7 +158,7 @@ impl RespBody {
     pub fn take_bytes(&mut self) -> Option<Bytes> {
         match self {
             RespBody::Full(b) => b.take(),
-            RespBody::File { .. } | RespBody::Stream(_) => None,
+            RespBody::File { .. } | RespBody::Stream(_) | RespBody::Chunks { .. } => None,
         }
     }
 
@@ -206,6 +214,14 @@ impl Body for RespBody {
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             },
+            RespBody::Chunks { rx, aborted } => match rx.poll_recv(cx) {
+                Poll::Ready(Some(b)) => Poll::Ready(Some(Ok(Frame::data(b)))),
+                Poll::Ready(None) if aborted.load(Ordering::Acquire) => {
+                    Poll::Ready(Some(Err(io::Error::new(io::ErrorKind::Interrupted, "the page stopped"))))
+                }
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            },
         }
     }
 
@@ -213,7 +229,7 @@ impl Body for RespBody {
         match self {
             RespBody::Full(b) => b.as_ref().is_none_or(|b| b.is_empty()),
             RespBody::File { left, .. } => *left == 0,
-            RespBody::Stream(_) => false,
+            RespBody::Stream(_) | RespBody::Chunks { .. } => false,
         }
     }
 
@@ -221,7 +237,7 @@ impl Body for RespBody {
         match self {
             RespBody::Full(b) => SizeHint::with_exact(b.as_ref().map_or(0, |b| b.len() as u64)),
             RespBody::File { left, .. } => SizeHint::with_exact(*left),
-            RespBody::Stream(_) => SizeHint::default(),
+            RespBody::Stream(_) | RespBody::Chunks { .. } => SizeHint::default(),
         }
     }
 }

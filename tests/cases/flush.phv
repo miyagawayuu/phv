@@ -1,0 +1,7 @@
+<?phv
+// response()->flush() outside phv serve keeps the output and returns true.
+import std.http.response;
+
+echo "one\n";
+echo response()->flush() ? "kept\n" : "gone\n";
+echo "two\n";

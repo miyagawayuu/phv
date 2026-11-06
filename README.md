@@ -46,12 +46,15 @@ echo greet($name);                                 // HTML-escaped automatically
   (`strlen(...)`), constant expressions, `import ... as`, heredoc strings, and exceptions with a cause and a trace.
 - **Web applications**: routes with parameters (`public/posts/[id].phv`), middleware (`_middleware.phv`), custom
   error pages, layouts, form validation (`std.validate`), mail (`std.mail`), database migrations (`phv db migrate`),
-  caching and range requests for static files, gzip, CORS, access logs and a graceful stop.
+  caching and range requests for static files, gzip, CORS, access logs, a graceful stop, and responses streamed while
+  the page runs (`response()->flush()`).
 - **Web services**: several server processes or machines share sessions, rate limits, CSRF tokens (`secret_env`) and
   `publish()` to WebSockets and Server-Sent Events (`publish_store`); background jobs with retries and cron-like
-  schedules (`std.jobs`, `phv jobs`); health checks and Prometheus metrics on an admin port, and request ids.
+  schedules (`std.jobs`, `phv jobs`); health checks and Prometheus metrics on an admin port, request ids, and traces
+  exported to OpenTelemetry (`[telemetry]`); sign-in with OAuth 2.0 and OpenID Connect (`std.oauth`).
 - **Standard library**: regular expressions (`std.regex`), `format()` checked at compile time, dates in time zones
-  (`std.time`), JSON decoded into typed classes (`json_decode_as`), encryption, signed tokens and JWT, list and map
+  (`std.time`), JSON decoded into typed classes (`json_decode_as`), encryption, signed tokens, JSON Web Tokens signed
+  with RS256, ES256, EdDSA or HS256 and key sets (`std.jwt`), list and map
   methods, mathematics, UUIDs, CSV, URLs, directories, logging, and arguments and standard input for scripts.
 - **Security**:
   - **XSS**: output is escaped automatically, and inserting a value where escaping cannot protect it (unquoted

@@ -1,0 +1,137 @@
+// std.oauth — sign-in with OAuth 2.0 and OpenID Connect (`[oauth.<name>]` in phv.toml).
+//
+//   // public/login/google.phv: send the visitor to the provider
+//   import std.oauth.OAuth;
+//   OAuth::provider("google")->redirect();
+//
+//   // public/auth/google.phv: the redirect URI, where the provider sends the visitor back
+//   import std.http.{response, session};
+//   import std.oauth.{OAuth, OAuthError};
+//   try {
+//       $signIn = OAuth::provider("google")->callback();
+//   } catch (OAuthError $e) {
+//       response()->status(400);
+//       echo "Sign-in failed: ", $e->getMessage();
+//       return;
+//   }
+//   session()->regenerate();
+//   session()->set("user", $signIn->subject() ?? "");
+//   response()->redirect("/");
+//
+// The authorization code flow with PKCE: the state, the nonce and the code verifier are
+// kept in the visitor's session for 10 minutes and one use, so a sign-in cannot be
+// finished in another browser. With OpenID Connect (`issuer`), the ID token's signature,
+// issuer, audience, nonce and expiry are checked before callback() returns.
+
+import std.http.response;
+
+/** A sign-in that failed: the visitor refused it, it expired, or the provider's answer was not valid. */
+export class OAuthError extends Exception {
+    public function __construct(
+        string $message,
+        /** The OAuth error code: `access_denied`, `invalid_state`, `invalid_id_token`, ... */
+        public readonly string $error,
+    ) {
+        parent::__construct($message);
+    }
+}
+
+/** A finished sign-in. */
+export class SignIn {
+    public function __construct(
+        /** The name of the provider in phv.toml. */
+        public readonly string $provider,
+        /** For calls to the provider's API (`Authorization: Bearer ...`). Keep it on the server. */
+        public readonly string $accessToken,
+        public readonly ?string $refreshToken,
+        /** Seconds the access token lasts, if the provider said. */
+        public readonly ?int $expiresIn,
+        /** The scopes granted, if the provider said (space-separated). */
+        public readonly ?string $scope,
+        /** The ID token (OpenID Connect), already verified. */
+        public readonly ?string $idToken,
+        /** The claims of the ID token; empty without OpenID Connect. */
+        public readonly map<string, any> $claims,
+    ) {}
+
+    /** The visitor's id at the provider (`sub`): stable, unlike the e-mail address. Null without OpenID Connect. */
+    public function subject(): ?string {
+        return $this->claim("sub");
+    }
+
+    /** A claim of the ID token that is a string (`name`, `picture`, ...), or null. */
+    public function claim(string $name): ?string {
+        $v = $this->claims[$name] ?? null;
+        return $v is string ? $v : null;
+    }
+
+    /**
+     * The e-mail address, only when the provider says it verified it
+     * (`email_verified` is true). Null otherwise.
+     */
+    public function verifiedEmail(): ?string {
+        $verified = $this->claims["email_verified"] ?? null;
+        return $verified is bool && $verified ? $this->claim("email") : null;
+    }
+}
+
+/** A sign-in provider named `[oauth.<name>]` in phv.toml. */
+export class OAuth {
+    private function __construct(private string $name) {}
+
+    public static function provider(string $name): OAuth {
+        return new OAuth($name);
+    }
+
+    /**
+     * The provider's URL that starts a sign-in, with extra parameters such as
+     * `["prompt" => "select_account"]` or `["login_hint" => $email]` (the ones of
+     * the flow itself are set by PHV). Each call starts a new sign-in in the session.
+     */
+    public function authorizationUrl(map<string, string> $params = []): string {
+        return __oauth_begin($this->name, $params);
+    }
+
+    /** Sends the visitor to the provider (a 302 response). */
+    public function redirect(map<string, string> $params = []): void {
+        response()->redirectExternal($this->authorizationUrl($params));
+    }
+
+    /**
+     * Finishes the sign-in on the redirect URI: checks the answer, exchanges the code
+     * for tokens and verifies the ID token. Throws OAuthError when the sign-in failed,
+     * NetworkError when the provider cannot be reached. Call `session()->regenerate()`
+     * before you store who signed in.
+     */
+    public function callback(): SignIn {
+        $r = __oauth_finish($this->name);
+        $error = $r["error"] ?? null;
+        if ($error is string) {
+            $message = $r["message"] ?? null;
+            throw new OAuthError($message is string ? $message : $error, $error);
+        }
+        $access = $r["access_token"] ?? null;
+        $refresh = $r["refresh_token"] ?? null;
+        $expires = $r["expires_in"] ?? null;
+        $scope = $r["scope"] ?? null;
+        $id = $r["id_token"] ?? null;
+        $claims = $r["claims"] ?? null;
+        map<string, any> $claimMap = [];
+        if ($claims is map) {
+            foreach ($claims as $k => $v) {
+                if ($k is string) {
+                    $claimMap[$k] = $v;
+                }
+            }
+        }
+        return new SignIn(
+            $this->name,
+            $access is string ? $access : "",
+            $refresh is string ? $refresh : null,
+            $expires is int ? $expires : null,
+            $scope is string ? $scope : null,
+            $id is string ? $id : null,
+            $claimMap,
+        );
+    }
+}

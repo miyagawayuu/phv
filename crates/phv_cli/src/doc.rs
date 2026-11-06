@@ -19,6 +19,8 @@ const STD_MODULES: &[&str] = &[
     "std.time",
     "std.ws",
     "std.jobs",
+    "std.jwt",
+    "std.oauth",
 ];
 
 /// Files documented at most (the rest of a huge tree is left out).

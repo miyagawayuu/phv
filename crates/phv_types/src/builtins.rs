@@ -306,6 +306,7 @@ pub static BUILTINS: &[BuiltinSig] = &[
     internal("__resp_status", "fn(int): void"),
     internal("__resp_header", "fn(string, string): void"),
     internal("__resp_type", "fn(string): void"),
+    internal("__resp_flush", "fn(): bool"),
     internal("__resp_file", "fn(string, string): void"),
     internal("__resp_cookie", "fn(string, string, int, string, bool, bool, string): void"),
     internal("__req_cookies", "fn(): map<string, string>"),
@@ -371,6 +372,18 @@ pub static BUILTINS: &[BuiltinSig] = &[
     internal("__async_map", "fn(int): map<string, any>"),
     internal("__async_rows", "fn(int): list<map<string, any>>"),
     internal("__async_int", "fn(int): int"),
+    internal("__jwt_pem", "fn(string, ?string): int"),
+    internal("__jwt_jwk", "fn(string): int"),
+    internal("__jwt_secret", "fn(string, ?string): int"),
+    internal("__jwt_info", "fn(int): list<string>"),
+    internal("__jwt_sign", "fn(int, map<string, any>): string"),
+    internal("__jwt_verify", "fn(int, string, ?string, ?string, int): ?map<string, any>"),
+    internal("__jwt_public", "fn(int, int): string"),
+    internal("__jwt_set", "fn(list<int>): int"),
+    internal("__jwt_set_json", "fn(string): int"),
+    internal("__jwt_set_fetch", "fn(string, string): int"),
+    internal("__oauth_begin", "fn(string, map<string, string>): string"),
+    internal("__oauth_finish", "fn(string): map<string, any>"),
 ];
 
 /// Hints for PHP functions that do not exist in PHV.

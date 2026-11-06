@@ -12,6 +12,7 @@ mod multipart;
 mod routes;
 mod session;
 mod static_files;
+mod telemetry;
 mod tls;
 mod ws;
 
@@ -27,7 +28,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use phv_driver::config::LogFormat;
 use phv_driver::{compile_cached, load_config, run, Compiled, Config, RunOptions};
 use phv_vm::value::html_escape;
-use phv_vm::{HttpCtx, Limits, WsCtx};
+use phv_vm::{FlushSink, HttpCtx, Limits, SessionData, WsCtx};
 use static_files::Validators;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -189,6 +190,8 @@ struct State {
     stopping: std::sync::atomic::AtomicBool,
     /// A slot for each connection that may be open.
     conn_slots: Arc<tokio::sync::Semaphore>,
+    /// `[telemetry]`: where spans go, when traces are exported.
+    telemetry: Option<Arc<telemetry::Exporter>>,
 }
 
 impl State {
@@ -250,6 +253,7 @@ impl State {
             metrics,
             stopping: std::sync::atomic::AtomicBool::new(false),
             conn_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            telemetry: None,
         }
     }
 
@@ -523,6 +527,8 @@ fn serve_with(
         }
     };
     let mut state = State::new(root, opts.dev, opts.time_limit, config);
+    let dropped = state.metrics.telemetry_dropped.clone();
+    state.telemetry = state.config.telemetry.as_ref().and_then(|t| telemetry::Exporter::start(t, dropped));
     if let Some((secret, old)) = secrets {
         state.csrf_secret = phv_std::server_key(&secret, "phv csrf v1");
         state.csrf_old = old.map(|o| phv_std::server_key(&o, "phv csrf v1"));
@@ -677,6 +683,10 @@ fn serve_with(
         }
         if let Some(b) = &state.bus {
             b.stop();
+        }
+        // The spans not sent yet go now (a few seconds at most).
+        if let Some(t) = state.telemetry.clone() {
+            let _ = tokio::task::spawn_blocking(move || t.close(Duration::from_secs(5))).await;
         }
         eprintln!("{}", if finished { "Stopped" } else { "Stopped with requests or jobs still running" });
         Ok(())
@@ -1016,7 +1026,10 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
     }
     let start = Instant::now();
     let mut req = req;
-    let id = state.config.request_ids.then(|| request_id(req.headers(), state.config.trust_request_id));
+    let version = req.version();
+    let id = (state.config.request_ids || state.telemetry.is_some()).then(|| {
+        request_id(req.headers(), state.config.trust_request_id, state.config.request_ids, state.telemetry.as_deref())
+    });
     if let Some(id) = &id {
         req.extensions_mut().insert(id.clone());
     }
@@ -1087,7 +1100,7 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
         }
         static_files::vary(r.headers_mut(), "Origin");
         add_security_headers(&state, &mut r);
-        finish(&state, &mut r, id.as_ref(), &ip, &method, &path, start);
+        finish(&state, &mut r, id.as_ref(), &ip, &method, &path, start, version);
         return Ok(r);
     }
     let limited = rate_limited(&state, peer.ip()).await;
@@ -1116,7 +1129,7 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
         resp = compress(&state, resp, gzip_ok, credentialed).await;
     }
     add_security_headers(&state, &mut resp);
-    finish(&state, &mut resp, id.as_ref(), &ip, &method, &path, start);
+    finish(&state, &mut resp, id.as_ref(), &ip, &method, &path, start, version);
     Ok(resp)
 }
 
@@ -1127,13 +1140,19 @@ struct Served {
     route: Option<String>,
 }
 
-/// The id of a request (`[server] request_ids`) and its W3C trace context.
+/// The id of a request and its W3C trace context (`[server] request_ids`, `[telemetry]`).
 #[derive(Clone)]
 struct RequestId {
     id: String,
     /// The trace (32 hex digits) and the flags of `traceparent`.
     trace: String,
     flags: String,
+    /// This request's span (16 hex digits), and the span of the caller that
+    /// a trusted `traceparent` named.
+    span: String,
+    parent: Option<String>,
+    /// `[server] request_ids`: the id is shown (`X-Request-Id`, the log, `request_id()`).
+    shown: bool,
 }
 
 impl RequestId {
@@ -1142,23 +1161,40 @@ impl RequestId {
     fn traceparent(&self) -> String {
         format!("00-{}-{}-{}", self.trace, phv_std::random_hex(8), self.flags)
     }
+
+    /// Whether the trace is recorded (the sampled flag).
+    fn sampled(&self) -> bool {
+        u8::from_str_radix(&self.flags, 16).is_ok_and(|f| f & 1 == 1)
+    }
 }
 
 /// A new id for a request, or with `trust` the one the proxy in front sent
 /// (`X-Request-Id`, and the trace of `traceparent`), when it is well formed.
-fn request_id(headers: &hyper::HeaderMap, trust: bool) -> RequestId {
+/// A new trace is sampled as `[telemetry] sample` says.
+fn request_id(
+    headers: &hyper::HeaderMap,
+    trust: bool,
+    shown: bool,
+    exporter: Option<&telemetry::Exporter>,
+) -> RequestId {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
-    let parent = trust.then(|| header("traceparent")).flatten().and_then(parse_traceparent);
+    let caller = trust.then(|| header("traceparent")).flatten().and_then(parse_traceparent);
     let given = trust.then(|| header("x-request-id")).flatten().filter(|v| {
         (1..=128).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     });
-    let (trace, flags) = parent.unwrap_or_else(|| (phv_std::random_hex(16), "01".into()));
+    let (trace, flags, parent) = match caller {
+        Some((trace, span, flags)) => (trace, flags, Some(span)),
+        None => {
+            let sampled = exporter.is_none_or(|e| e.sample());
+            (phv_std::random_hex(16), if sampled { "01" } else { "00" }.to_string(), None)
+        }
+    };
     let id = given.map(str::to_string).unwrap_or_else(|| trace.clone());
-    RequestId { id, trace, flags }
+    RequestId { id, trace, flags, span: phv_std::random_hex(8), parent, shown }
 }
 
-/// The trace id and flags of a W3C `traceparent` (version 00), if it is valid.
-fn parse_traceparent(v: &str) -> Option<(String, String)> {
+/// The trace id, span id and flags of a W3C `traceparent` (version 00), if it is valid.
+fn parse_traceparent(v: &str) -> Option<(String, String, String)> {
     let parts: Vec<&str> = v.split('-').collect();
     let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let [version, trace, span, flags] = parts[..] else { return None };
@@ -1168,11 +1204,12 @@ fn parse_traceparent(v: &str) -> Option<(String, String)> {
         && hex(flags, 2)
         && trace.bytes().any(|b| b != b'0')
         && span.bytes().any(|b| b != b'0');
-    ok.then(|| (trace.to_string(), flags.to_string()))
+    ok.then(|| (trace.to_string(), span.to_string(), flags.to_string()))
 }
 
 /// The last steps of every request: its id in the response, the log line,
 /// and the metrics.
+#[allow(clippy::too_many_arguments)]
 fn finish(
     state: &State,
     resp: &mut Resp,
@@ -1181,12 +1218,14 @@ fn finish(
     method: &Method,
     path: &str,
     start: Instant,
+    version: hyper::Version,
 ) {
-    if let Some(v) = id.and_then(|i| HeaderValue::from_str(&i.id).ok()) {
+    let shown = id.filter(|i| i.shown);
+    if let Some(v) = shown.and_then(|i| HeaderValue::from_str(&i.id).ok()) {
         resp.headers_mut().insert("x-request-id", v);
     }
     let status = resp.status().as_u16();
-    log_request(state, ip, method, path, status, start, id.map(|i| i.id.as_str()));
+    log_request(state, ip, method, path, status, start, shown.map(|i| i.id.as_str()));
     let served = resp.extensions_mut().remove::<Served>();
     let (kind, route) = match &served {
         Some(s) => (s.kind, s.route.as_deref()),
@@ -1194,6 +1233,50 @@ fn finish(
     };
     // A WebSocket's time is that of its upgrade, not of the connection.
     state.metrics.request(kind, route, status, start.elapsed());
+    // The request's span: until its head is sent (a streamed page goes on after it).
+    if let (Some(exporter), Some(id)) = (&state.telemetry, id.filter(|i| i.sampled())) {
+        let end = std::time::SystemTime::now();
+        let route = match kind {
+            metrics::Kind::Static => Some("static"),
+            _ => route,
+        };
+        let mut attributes = vec![
+            ("http.request.method", phv_vm::SpanValue::Str(method.as_str().to_string())),
+            ("http.response.status_code", phv_vm::SpanValue::Int(status as i64)),
+            ("url.scheme", phv_vm::SpanValue::Str(if state.config.tls.is_some() { "https" } else { "http" }.into())),
+            ("phv.kind", phv_vm::SpanValue::Str(kind.label().into())),
+        ];
+        let proto = match version {
+            hyper::Version::HTTP_2 => Some("2"),
+            hyper::Version::HTTP_11 => Some("1.1"),
+            hyper::Version::HTTP_10 => Some("1.0"),
+            _ => None,
+        };
+        if let Some(p) = proto {
+            attributes.push(("network.protocol.version", phv_vm::SpanValue::Str(p.into())));
+        }
+        if let Some(r) = route {
+            attributes.push(("http.route", phv_vm::SpanValue::Str(r.to_string())));
+        }
+        if status >= 500 {
+            attributes.push(("error.type", phv_vm::SpanValue::Str(status.to_string())));
+        }
+        exporter.send(vec![phv_vm::Span {
+            trace_id: id.trace.clone(),
+            span_id: id.span.clone(),
+            parent_id: id.parent.clone(),
+            // No path: it may hold ids and names (the route of a page has none).
+            name: match route {
+                Some(r) => format!("{method} {r}"),
+                None => method.as_str().to_string(),
+            },
+            kind: phv_vm::SpanKind::Server,
+            start: end.checked_sub(start.elapsed()).unwrap_or(end),
+            end,
+            attributes,
+            error: status >= 500,
+        }]);
+    }
 }
 
 /// `[security] requests_per_minute`: counts one request (or WebSocket
@@ -2183,6 +2266,7 @@ impl State {
         body: Bytes,
         kind: Page,
         ws: Option<WsCtx>,
+        stream: Option<Box<dyn FlushSink>>,
     ) -> Resp {
         let headers: Vec<(String, String)> = parts
             .headers
@@ -2272,13 +2356,25 @@ impl State {
             csp_nonce: self.config.csp.uses_nonce().then(|| phv_std::random_hex(16)),
             body: if raw_body { String::from_utf8_lossy(&body).into_owned() } else { String::new() },
             params,
-            request_id: parts.extensions.get::<RequestId>().map(|r| r.id.clone()),
-            traceparent: parts.extensions.get::<RequestId>().map(RequestId::traceparent),
+            request_id: parts.extensions.get::<RequestId>().filter(|r| r.shown).map(|r| r.id.clone()),
+            // With [telemetry], each call the script makes gets a span of its own (see `trace`).
+            traceparent: parts
+                .extensions
+                .get::<RequestId>()
+                .filter(|_| self.telemetry.is_none())
+                .map(RequestId::traceparent),
+            trace: self.telemetry.as_ref().and(parts.extensions.get::<RequestId>()).map(|r| phv_vm::TraceCtx {
+                trace_id: r.trace.clone(),
+                span_id: r.span.clone(),
+                sampled: r.sampled(),
+                spans: Default::default(),
+            }),
             status: match kind {
                 Page::Normal | Page::Event => 200,
                 Page::NotFound => 404,
                 Page::Error => 500,
             },
+            stream,
             ..HttpCtx::default()
         };
         drop(body);
@@ -2307,17 +2403,22 @@ impl State {
             }
             self.error_page(title, detail)
         };
+        // A page that failed after flush() sent its response: the response is
+        // cut off (when its stream is dropped); this answer goes nowhere.
+        let stopped = || simple(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", String::new());
 
         // Middleware runs first, outermost first; one that answers (writes
         // output, sets a status, redirects or sends a file) ends the request.
         if kind == Page::Normal {
             for mw in self.middleware_for(script) {
                 match self.run_one(&mw, ctx) {
-                    Err((title, detail)) => return failed(&title, &detail),
+                    Err((_, _, true)) => return stopped(),
+                    Err((title, detail, _)) => return failed(&title, &detail),
                     Ok(outcome) => {
                         let answered = !outcome.output.is_empty()
                             || outcome.http.status != 200
-                            || outcome.http.body_file.is_some();
+                            || outcome.http.body_file.is_some()
+                            || outcome.http.flushed;
                         if answered {
                             return self.respond(outcome, had_session);
                         }
@@ -2328,19 +2429,22 @@ impl State {
         }
         match self.run_one(script, ctx) {
             Ok(outcome) => self.respond(outcome, had_session),
-            Err((title, detail)) => failed(&title, &detail),
+            Err((_, _, true)) => stopped(),
+            Err((title, detail, _)) => failed(&title, &detail),
         }
     }
 
-    /// Runs one script for the request; a compile or runtime error gives its title and details.
-    fn run_one(&self, script: &Path, ctx: HttpCtx) -> Result<phv_driver::RunOutcome, (String, String)> {
+    /// Runs one script for the request; a compile or runtime error gives its
+    /// title and details, and whether the page had sent its response with
+    /// flush() (it is cut off then: no error page can follow).
+    fn run_one(&self, script: &Path, ctx: HttpCtx) -> Result<phv_driver::RunOutcome, (String, String, bool)> {
         let rel = script.strip_prefix(&self.root).unwrap_or(script).to_string_lossy().replace('\\', "/");
         let compiled = match self.compiled(script) {
             Ok(c) => c,
             Err(diagnostics) => {
                 self.metrics.failure(metrics::Failure::Compile);
                 eprintln!("compile error in {rel}:\n{diagnostics}");
-                return Err(("Compile error".into(), format!("{rel} could not be compiled.\n\n{diagnostics}")));
+                return Err(("Compile error".into(), format!("{rel} could not be compiled.\n\n{diagnostics}"), false));
             }
         };
         let limits = Limits {
@@ -2350,13 +2454,22 @@ impl State {
         };
         let host = Some(self.config.host.clone());
         let outcome = run(&compiled, RunOptions { html: true, limits, http: Some(ctx), host });
+        self.export_spans(outcome.http.trace.as_ref());
         if let Some(err) = &outcome.error {
             self.metrics.failure(metrics::Failure::of(&err.message));
             let text = err.render();
             eprintln!("runtime error in {rel}:\n{}", err.render_for_log());
-            return Err(("Runtime error".into(), text));
+            return Err(("Runtime error".into(), text, outcome.http.flushed));
         }
         Ok(outcome)
+    }
+
+    /// Sends the spans a script made (its requests to other services).
+    fn export_spans(&self, trace: Option<&phv_vm::TraceCtx>) {
+        if let (Some(exporter), Some(t)) = (&self.telemetry, trace) {
+            let spans = std::mem::take(&mut *t.spans.lock().unwrap_or_else(|e| e.into_inner()));
+            exporter.send(spans);
+        }
     }
 
     /// Runs an error page; `None` if it fails too (the built-in page is used then).
@@ -2373,18 +2486,12 @@ impl State {
             self.hub.lock().unwrap_or_else(|e| e.into_inner()).apply(w);
         }
         self.deliver(&std::mem::take(&mut http.publishes));
-        let csp = self.config.csp.page_header(http.csp_nonce.as_deref());
-        let flags = if self.config.secure_cookies { "; Secure" } else { "" };
-        let session = std::mem::take(&mut http.session);
-        let touched_session = had_session || session.changed;
-        if let Some(cookie) = self.sessions.save(session) {
-            http.resp_headers.push(("Set-Cookie".into(), cookie));
-        }
-        if let Some(c) = &http.new_csrf_cookie {
-            http.resp_headers.push((
-                "Set-Cookie".into(),
-                format!("{}={c}; Path=/; HttpOnly; SameSite=Lax{flags}", self.csrf_cookie),
-            ));
+        // A page that sent its response with flush(): the rest of its output ends it.
+        if http.flushed {
+            if let Some(mut sink) = http.stream.take() {
+                sink.finish(outcome.output.into_bytes());
+            }
+            return simple(StatusCode::OK, "text/plain", String::new());
         }
         let status = StatusCode::from_u16(http.status).unwrap_or(StatusCode::OK);
         let body = if matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED) {
@@ -2405,15 +2512,46 @@ impl State {
             }
             RespBody::counted(output.into_bytes(), &self.buffered)
         };
+        let mut r = self.head(&mut http, had_session, body, false);
+        if let Some(w) = ws {
+            r.extensions_mut().insert(WsDone(w));
+        }
+        r
+    }
+
+    /// The response for a script's status, headers, cookies and session, with
+    /// `body`. The session is saved now; with `keep`, the script goes on
+    /// running (flush()) and keeps reading the session's values.
+    fn head(&self, http: &mut HttpCtx, had_session: bool, body: RespBody, keep: bool) -> Resp {
+        let csp = self.config.csp.page_header(http.csp_nonce.as_deref());
+        let flags = if self.config.secure_cookies { "; Secure" } else { "" };
+        let session = std::mem::take(&mut http.session);
+        let touched_session = had_session || session.changed;
+        if keep {
+            http.session =
+                SessionData { id: session.id.clone(), values: session.values.clone(), ..SessionData::default() };
+        }
+        if let Some(cookie) = self.sessions.save(session) {
+            http.resp_headers.push(("Set-Cookie".into(), cookie));
+        }
+        if let Some(c) = http.new_csrf_cookie.take() {
+            http.resp_headers.push((
+                "Set-Cookie".into(),
+                format!("{}={c}; Path=/; HttpOnly; SameSite=Lax{flags}", self.csrf_cookie),
+            ));
+            // Tokens made after flush() use the cookie just sent.
+            http.csrf_cookie = Some(c);
+        }
+        let status = StatusCode::from_u16(http.status).unwrap_or(StatusCode::OK);
         let mut r = Response::new(body);
         *r.status_mut() = status;
-        let ct = http.content_type.unwrap_or_else(|| "text/html; charset=utf-8".into());
+        let ct = http.content_type.clone().unwrap_or_else(|| "text/html; charset=utf-8".into());
         let h = r.headers_mut();
         if let Ok(v) = HeaderValue::from_str(&ct) {
             h.insert(CONTENT_TYPE, v);
         }
         let mut sets_cookie = false;
-        for (name, value) in http.resp_headers {
+        for (name, value) in std::mem::take(&mut http.resp_headers) {
             let lower = name.to_ascii_lowercase();
             // Framing headers belong to the server (checked in the builtin too).
             if ["content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer"]
@@ -2439,9 +2577,6 @@ impl State {
         }
         if personal {
             r.extensions_mut().insert(static_files::Personal);
-        }
-        if let Some(w) = ws {
-            r.extensions_mut().insert(WsDone(w));
         }
         r
     }
@@ -2573,13 +2708,31 @@ async fn run_script(
     };
     state.metrics.worker_wait(waited.elapsed());
     let st = state.clone();
-    match tokio::task::spawn_blocking(move || {
+    // A page that calls response()->flush() is answered when it first does;
+    // it goes on running (and holding its worker) while it sends the rest.
+    let (head_tx, mut head_rx) = tokio::sync::oneshot::channel();
+    let sink: Option<Box<dyn FlushSink>> = (kind == Page::Normal).then(|| {
+        Box::new(PageStream::new(state.clone(), head_tx, Instant::now() + state.time_limit)) as Box<dyn FlushSink>
+    });
+    let mut task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _reserved = reserved;
-        st.execute(&script, params, ip, parts, body, kind, None)
-    })
-    .await
-    {
+        st.execute(&script, params, ip, parts, body, kind, None, sink)
+    });
+    let done = tokio::select! {
+        biased;
+        Ok(mut head) = &mut head_rx => {
+            head.extensions_mut().insert(served);
+            return head;
+        }
+        done = &mut task => done,
+    };
+    // The head may have been sent just before the page ended.
+    if let Ok(mut head) = head_rx.try_recv() {
+        head.extensions_mut().insert(served);
+        return head;
+    }
+    match done {
         Ok(mut r) => {
             r.extensions_mut().insert(served);
             r
@@ -2587,6 +2740,89 @@ async fn run_script(
         Err(e) => {
             eprintln!("internal error: {e}");
             page(StatusCode::INTERNAL_SERVER_ERROR, "500 Internal Server Error", "<p>Something went wrong.</p>")
+        }
+    }
+}
+
+/// Where a page's output goes once it calls `response()->flush()`: the head
+/// is handed to the request (as its response), then each chunk is sent
+/// through a channel of one, so a page runs at most one chunk ahead of what
+/// the client has read. A chunk waits up to `WRITE_STALL` (and never past
+/// the page's time limit) for the client; after that, or once the client is
+/// gone, flush() returns false and later output is dropped.
+struct PageStream {
+    state: Arc<State>,
+    head: Option<tokio::sync::oneshot::Sender<Resp>>,
+    body: Option<tokio::sync::mpsc::Sender<Bytes>>,
+    aborted: Arc<std::sync::atomic::AtomicBool>,
+    handle: tokio::runtime::Handle,
+    deadline: Instant,
+    /// The page ended normally: the body ends instead of failing.
+    finished: bool,
+}
+
+impl PageStream {
+    fn new(state: Arc<State>, head: tokio::sync::oneshot::Sender<Resp>, deadline: Instant) -> PageStream {
+        PageStream {
+            state,
+            head: Some(head),
+            body: None,
+            aborted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            handle: tokio::runtime::Handle::current(),
+            deadline,
+            finished: false,
+        }
+    }
+
+    fn send(&mut self, chunk: Vec<u8>) -> bool {
+        let Some(tx) = &self.body else { return false };
+        if chunk.is_empty() {
+            return !tx.is_closed();
+        }
+        let bytes = body::counted_bytes(chunk, &self.state.buffered);
+        let wait = WRITE_STALL.min(self.deadline.saturating_duration_since(Instant::now()));
+        // A runtime that is shutting down (the server stopping) panics on timers: the client is gone then.
+        let sent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.handle.block_on(tokio::time::timeout(wait, tx.send(bytes)))
+        }));
+        match sent {
+            Ok(Ok(Ok(()))) => true,
+            // The client is gone, or has not read for too long: what is held is cut off.
+            _ => {
+                self.aborted.store(true, Ordering::Release);
+                self.body = None;
+                false
+            }
+        }
+    }
+}
+
+impl FlushSink for PageStream {
+    fn flush(&mut self, http: &mut HttpCtx, chunk: Vec<u8>) -> bool {
+        if let Some(head) = self.head.take() {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let had_session = http.session.id.is_some();
+            let resp = self.state.head(http, had_session, RespBody::Chunks { rx, aborted: self.aborted.clone() }, true);
+            if head.send(resp).is_err() {
+                return false;
+            }
+            self.body = Some(tx);
+        }
+        self.send(chunk)
+    }
+
+    fn finish(&mut self, chunk: Vec<u8>) {
+        if self.send(chunk) || self.body.is_none() {
+            self.finished = true;
+        }
+        self.body = None;
+    }
+}
+
+impl Drop for PageStream {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.aborted.store(true, Ordering::Release);
         }
     }
 }
@@ -2658,10 +2894,10 @@ impl State {
         }
         match resolve(self, parts.uri.path()) {
             None => match self.special("_404.phv") {
-                Some(page) => self.execute(&page, Vec::new(), ip, parts, body, Page::NotFound, None),
+                Some(page) => self.execute(&page, Vec::new(), ip, parts, body, Page::NotFound, None, None),
                 None => not_found(),
             },
-            Some(Target::Script(p, params)) => self.execute(&p, params, ip, parts, body, Page::Normal, None),
+            Some(Target::Script(p, params)) => self.execute(&p, params, ip, parts, body, Page::Normal, None, None),
             // Static files get the server's checks and headers (read whole: the
             // test reads the body at once).
             Some(Target::Static(p)) => match open_static(&self.public, &p, MAX_STATIC) {

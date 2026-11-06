@@ -17,11 +17,13 @@ mod db;
 mod httpclient;
 pub mod jobs;
 mod jsonas;
+mod jwt;
 mod mail;
 pub mod migrate;
 mod netdb;
 mod netio;
 mod numbers;
+mod oauth;
 mod pgmeter;
 pub mod ratelimit;
 mod re;
@@ -52,7 +54,7 @@ pub mod wsserver;
 
 pub use asyncio::running as async_running;
 pub use crypt::{hmac_sha256, server_key, store_namespace};
-pub use httpclient::{check_header_name, check_header_value, check_http_url};
+pub use httpclient::{check_header_name, check_header_value, check_http_url, check_oauth_url, post_telemetry};
 pub use netdb::{
     redis_publish, redis_subscribe, session_insert, session_read, session_remove, session_sweep, session_update,
     Pushed, RedisSubscriber, SessionLimits, SessionRow,
@@ -81,6 +83,8 @@ pub fn std_module(name: &str) -> Option<&'static str> {
         "std.time" => Some(include_str!("phv/time.phv")),
         "std.ws" => Some(include_str!("phv/ws.phv")),
         "std.jobs" => Some(include_str!("phv/jobs.phv")),
+        "std.jwt" => Some(include_str!("phv/jwt.phv")),
+        "std.oauth" => Some(include_str!("phv/oauth.phv")),
         _ => None,
     }
 }
@@ -874,6 +878,8 @@ const PROVIDERS: &[fn(&str) -> Option<BuiltinFn>] = &[
     jsonas::lookup,
     crypt::lookup,
     jobs::lookup,
+    jwt::lookup,
+    oauth::lookup,
 ];
 
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
@@ -1346,6 +1352,7 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         "__req_headers" => |vm, _| Ok(string_map(&vm.http.headers)),
         "__req_body" => |vm, _| Ok(Value::str(vm.http.body.as_str())),
         "__resp_status" => |vm, a| {
+            web::unsent(vm, "the status")?;
             let code = int(&a[0]);
             if !(200..=599).contains(&code) {
                 return Err(vm.throw("ValueError", format!("invalid HTTP status code {code}")));
@@ -1354,6 +1361,7 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::Null)
         },
         "__resp_header" => |vm, a| {
+            web::unsent(vm, "headers")?;
             let (name, value) = (s(&a[0]), s(&a[1]));
             check_header(vm, name, value)?;
             if name.eq_ignore_ascii_case("content-type") {
@@ -1365,10 +1373,35 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::Null)
         },
         "__resp_type" => |vm, a| {
+            web::unsent(vm, "the Content-Type")?;
             let ct = s(&a[0]).to_string();
             check_header(vm, "Content-Type", &ct)?;
             set_type(vm, &ct)?;
             Ok(Value::Null)
+        },
+        // __resp_flush(): sends the response so far (see `phv_vm::FlushSink`).
+        "__resp_flush" => |vm, _| {
+            if vm.out.len() != 1 {
+                return Err(vm.throw(
+                    "ValueError",
+                    "response()->flush() cannot be called while output is captured (in a layout or a component)",
+                ));
+            }
+            if vm.http.ws.is_some() {
+                return Err(vm.throw("ValueError", "response()->flush() is for pages, not WebSocket scripts"));
+            }
+            if vm.http.body_file.is_some() {
+                return Err(vm.throw("ValueError", "response()->flush() cannot send output after response()->file()"));
+            }
+            let Some(mut sink) = vm.http.stream.take() else { return Ok(Value::Bool(true)) };
+            let chunk = std::mem::take(&mut vm.out[0].buf).into_bytes();
+            // The output leaves this script: it is counted in the server's output total instead.
+            phv_vm::alloc::uncharge_thread(chunk.capacity());
+            let open = sink.flush(&mut vm.http, chunk);
+            vm.http.flushed = true;
+            vm.http.stream = Some(sink);
+            vm.check_limits()?;
+            Ok(Value::Bool(open))
         },
         _ => return None,
     };

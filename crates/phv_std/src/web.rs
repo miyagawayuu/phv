@@ -272,6 +272,7 @@ fn cookies(vm: &Vm) -> IndexMap<Key, Value> {
 }
 
 fn set_cookie(vm: &mut Vm, a: &[Value]) -> R {
+    unsent(vm, "cookies")?;
     let (name, value, max_age, path) = (s(&a[0]), s(&a[1]), int(&a[2]), s(&a[3]));
     let (secure, http_only, same_site) =
         (matches!(a[4], Value::Bool(true)), matches!(a[5], Value::Bool(true)), s(&a[6]));
@@ -314,7 +315,17 @@ pub fn random_hex(bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn session_set(vm: &mut Vm, k: &str, v: &str) -> R {
+/// Refuses a change to what flush() has already sent: the status, headers,
+/// cookies and the session (whose cookie went with them).
+pub(crate) fn unsent(vm: &Vm, what: &str) -> Result<(), VmError> {
+    if vm.http.flushed {
+        return Err(vm.throw("ValueError", format!("{what} cannot change after response()->flush() sent the response")));
+    }
+    Ok(())
+}
+
+pub(crate) fn session_set(vm: &mut Vm, k: &str, v: &str) -> R {
+    unsent(vm, "the session")?;
     let sess = &mut vm.http.session;
     let current: usize = sess.values.iter().filter(|(key, _)| key.as_str() != k).map(|(a, b)| a.len() + b.len()).sum();
     if current + k.len() + v.len() > MAX_SESSION_BYTES {
@@ -379,6 +390,10 @@ pub fn csrf_token(vm: &mut Vm) -> Result<String, VmError> {
     let cookie = match (&vm.http.new_csrf_cookie, &vm.http.csrf_cookie) {
         (Some(c), _) | (None, Some(c)) => c.clone(),
         (None, None) => {
+            // The token needs a cookie, which can no longer be sent.
+            if vm.http.flushed {
+                return Err(vm.throw("ValueError", "call csrf_token() or csrf_field() before response()->flush()"));
+            }
             let c = random_hex(32);
             vm.http.new_csrf_cookie = Some(c.clone());
             c
@@ -402,6 +417,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             session_set(vm, &k, &v)
         },
         "__sess_remove" => |vm, a| {
+            unsent(vm, "the session")?;
             let sess = &mut vm.http.session;
             if sess.values.shift_remove(s(&a[0])).is_some() {
                 sess.changed = true;
@@ -416,6 +432,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::map(m))
         },
         "__sess_regenerate" => |vm, _| {
+            unsent(vm, "the session")?;
             vm.http.session.regenerate = true;
             vm.http.session.changed = true;
             // Tokens issued before login stop working after it.
@@ -423,6 +440,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::Null)
         },
         "__sess_destroy" => |vm, _| {
+            unsent(vm, "the session")?;
             let sess = &mut vm.http.session;
             sess.values.clear();
             sess.destroyed = true;

@@ -135,6 +135,66 @@ pub struct HttpCtx {
     pub traceparent: Option<String>,
     /// The job this script runs for (`[jobs]`), if it is one.
     pub job: Option<JobCtx>,
+    /// Where `response()->flush()` sends the response while the page runs
+    /// (`phv serve`); None elsewhere, where flush() keeps the output.
+    pub stream: Option<Box<dyn FlushSink>>,
+    /// flush() has sent the response's head: its status, headers, cookies and
+    /// the session can no longer change.
+    pub flushed: bool,
+    /// The trace the script runs in, when traces are exported (`[telemetry]`).
+    pub trace: Option<TraceCtx>,
+}
+
+/// The trace of a request or job whose spans are exported (`[telemetry]`).
+#[derive(Clone, Debug)]
+pub struct TraceCtx {
+    /// 32 lowercase hex digits.
+    pub trace_id: String,
+    /// The span of the request or job (16 hex digits): the parent of the
+    /// spans its scripts make.
+    pub span_id: String,
+    /// Whether the trace is recorded (the `traceparent` flags say so to the services called).
+    pub sampled: bool,
+    /// Spans the scripts made (the requests they sent), for the server to export.
+    pub spans: std::sync::Arc<std::sync::Mutex<Vec<Span>>>,
+}
+
+/// One finished span, in the terms of OpenTelemetry.
+#[derive(Clone, Debug)]
+pub struct Span {
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub kind: SpanKind,
+    pub start: std::time::SystemTime,
+    pub end: std::time::SystemTime,
+    pub attributes: Vec<(&'static str, SpanValue)>,
+    pub error: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpanKind {
+    Internal,
+    Server,
+    Client,
+    Consumer,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SpanValue {
+    Str(String),
+    Int(i64),
+}
+
+/// Sends a page's response while it runs (`response()->flush()`).
+pub trait FlushSink: Send {
+    /// Sends the response's head the first time (from `http`), then `chunk`
+    /// of the body. False once the client has gone away.
+    fn flush(&mut self, http: &mut HttpCtx, chunk: Vec<u8>) -> bool;
+    /// The page ended: `chunk` is the rest of its output. Without this call
+    /// (the page failed), the response is cut off.
+    fn finish(&mut self, chunk: Vec<u8>);
 }
 
 /// What happened on a WebSocket connection.
@@ -194,6 +254,9 @@ impl Default for HttpCtx {
             request_id: None,
             traceparent: None,
             job: None,
+            stream: None,
+            flushed: false,
+            trace: None,
         }
     }
 }
@@ -258,6 +321,8 @@ pub struct Host {
     /// other sites using the same database (found by the 1.1 audit: a session
     /// of one site was valid on another).
     pub store_namespace: Option<String>,
+    /// Sign-in providers, by name (`[oauth]` in phv.toml).
+    pub oauth: std::collections::BTreeMap<String, OAuthSpec>,
 }
 
 /// `[jobs]` of phv.toml, as `std.jobs` uses it.
@@ -345,6 +410,45 @@ impl std::fmt::Debug for DatabaseSpec {
             .field("tls", &self.tls)
             .field("pool_size", &self.pool_size)
             .finish()
+    }
+}
+
+/// A sign-in provider named in phv.toml (`[oauth.<name>]`, std.oauth). The
+/// client secret is never shown.
+#[derive(Clone, Default)]
+pub struct OAuthSpec {
+    /// OpenID Connect: the issuer, whose discovery document names the endpoints.
+    pub issuer: Option<String>,
+    /// OAuth 2.0 without OpenID Connect: the endpoints themselves.
+    pub authorize_url: Option<String>,
+    pub token_url: Option<String>,
+    /// None when `client_id_env` names a variable that is not set.
+    pub client_id: Option<String>,
+    pub client_id_env: Option<String>,
+    /// None for a public client (PKCE only), or when the variable is not set.
+    pub client_secret: Option<String>,
+    pub client_secret_env: Option<String>,
+    /// The site's callback URL, as registered with the provider.
+    pub redirect_uri: Option<String>,
+    pub redirect_uri_env: Option<String>,
+    pub scopes: Vec<String>,
+    /// How the secret is sent to the token endpoint: Some(true) in the body
+    /// (`client_secret_post`), Some(false) with HTTP Basic, None as the
+    /// provider's discovery document allows (Basic when it says nothing).
+    pub secret_in_body: Option<bool>,
+    /// Some(false) allows `http://` endpoints on another machine.
+    pub tls: Option<bool>,
+}
+
+impl std::fmt::Debug for OAuthSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthSpec")
+            .field("issuer", &self.issuer)
+            .field("authorize_url", &self.authorize_url)
+            .field("client_id", &self.client_id)
+            .field("client_secret_env", &self.client_secret_env)
+            .field("redirect_uri", &self.redirect_uri)
+            .finish_non_exhaustive()
     }
 }
 

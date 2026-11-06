@@ -490,6 +490,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
                 .map_err(|_| vm.throw("ValueError", format!("\"{rel}\" is not UTF-8 text")))
         },
         "__resp_file" => |vm, a| {
+            crate::web::unsent(vm, "the response")?;
             let rel = s(&a[0]).to_string();
             let ct = match s(&a[1]) {
                 "" => file_type(&rel).to_string(),

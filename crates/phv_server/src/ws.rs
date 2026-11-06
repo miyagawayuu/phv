@@ -236,7 +236,7 @@ async fn run_event(
     let kind = if ws.event == WsEvent::Open { Page::Normal } else { Page::Event };
     let resp = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        st.execute(&script, params, ip, parts, bytes::Bytes::new(), kind, Some(ws))
+        st.execute(&script, params, ip, parts, bytes::Bytes::new(), kind, Some(ws), None)
     })
     .await
     .map_err(|_| Box::new(simple(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", "internal error".into())))?;

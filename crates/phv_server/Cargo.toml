@@ -35,3 +35,6 @@ futures-util = { workspace = true, features = ["sink"] }
 flate2.workspace = true
 hyper = { workspace = true, features = ["client"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+ring.workspace = true
+base64.workspace = true
+sha2.workspace = true

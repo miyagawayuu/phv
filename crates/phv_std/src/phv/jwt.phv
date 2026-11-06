@@ -1,0 +1,119 @@
+// std.jwt — JSON Web Tokens signed with RS256, ES256, EdDSA or HS256, and key sets (JWKS).
+//
+//   import std.jwt.{JwtKey, KeySet};
+//
+//   $key = JwtKey::fromPem(getenv("JWT_PRIVATE_KEY") ?? "", "2026-11");   // signs and verifies
+//   $token = $key->sign(["sub" => "7", "exp" => time() + 3600]);
+//   $claims = $key->verify($token);            // ?map<string, any>
+//   echo $key->publicJwk();                    // the public key, for others to verify with
+//
+//   $keys = KeySet::fetch("auth", "/.well-known/jwks.json");   // [http.auth] in phv.toml
+//   $claims = $keys->verify($token, issuer: "https://auth.example.com/", audience: "my-api");
+//
+// A key's type decides its algorithm: RSA keys sign with RS256, P-256 keys with ES256,
+// Ed25519 keys with EdDSA, secrets with HS256. A token is checked only with keys of the
+// algorithm its header names, so a token cannot choose another kind of key, or `none`.
+
+/** Something that verifies tokens: a `JwtKey` or a `KeySet`. */
+export abstract class Verifier {
+    protected function __construct(protected int $handle) {}
+
+    /**
+     * The claims of `$token` if one of the keys signed it and it is valid now, or null.
+     * `exp` and `nbf` are checked, with `$leeway` seconds (0 to 300) for clocks that
+     * differ. With `$issuer`, `iss` must be it; with `$audience`, `aud` must be it or
+     * a list that holds it. Without `$audience`, a token that has `aud` is refused:
+     * it was made for someone else.
+     */
+    public function verify(
+        string $token,
+        ?string $issuer = null,
+        ?string $audience = null,
+        int $leeway = 0,
+    ): ?map<string, any> {
+        return __jwt_verify($this->handle, $token, $issuer, $audience, $leeway);
+    }
+}
+
+/** One key: private (signs and verifies), public (verifies) or a secret (HS256). */
+export final class JwtKey extends Verifier {
+    private function __construct(
+        int $handle,
+        /** "RS256", "ES256", "EdDSA" or "HS256". */
+        public readonly string $alg,
+        /** The key id (`kid`) put in the header of the tokens it signs, or null. */
+        public readonly ?string $kid,
+        /** Whether it can sign: a private key or a secret. */
+        public readonly bool $canSign,
+    ) {
+        parent::__construct($handle);
+    }
+
+    private static function wrap(int $h): JwtKey {
+        $info = __jwt_info($h);
+        return new JwtKey($h, $info[0], $info[1] == "" ? null : $info[1], $info[2] == "1");
+    }
+
+    /**
+     * A key in PEM form: a private key (`PRIVATE KEY`, `RSA PRIVATE KEY` or
+     * `EC PRIVATE KEY`) or a public one (`PUBLIC KEY`). RSA keys of 2048 to 4096
+     * bits sign (up to 8192 verify), P-256 and Ed25519 keys both. Throws
+     * ValueError for other keys. Keep private keys in an environment variable.
+     */
+    public static function fromPem(string $pem, ?string $kid = null): JwtKey {
+        return JwtKey::wrap(__jwt_pem($pem, $kid));
+    }
+
+    /** The public key of a JWK (JSON). Private members are not read. */
+    public static function fromJwk(string $jwk): JwtKey {
+        return JwtKey::wrap(__jwt_jwk($jwk));
+    }
+
+    /** An HS256 key: a secret of at least 32 bytes (`random_token()` makes one). */
+    public static function secret(string $secret, ?string $kid = null): JwtKey {
+        return JwtKey::wrap(__jwt_secret($secret, $kid));
+    }
+
+    /** A token with these claims. Throws ValueError for a public key. */
+    public function sign(map<string, any> $claims): string {
+        return __jwt_sign($this->handle, $claims);
+    }
+
+    /** The public key as a JWK (JSON). Throws ValueError for a secret. */
+    public function publicJwk(): string {
+        return __jwt_public($this->handle, 1);
+    }
+}
+
+/** Several keys, such as the JWKS an identity provider publishes. */
+export final class KeySet extends Verifier {
+    private function __construct(int $handle) {
+        parent::__construct($handle);
+    }
+
+    /** The keys given (to accept tokens signed by an old key while a new one takes over). */
+    public static function of(list<JwtKey> $keys): KeySet {
+        return new KeySet(__jwt_set($keys->map(fn($k) => $k->handle)));
+    }
+
+    /** The signing keys of a JWKS document; keys of other kinds are skipped. */
+    public static function fromJson(string $jwks): KeySet {
+        return new KeySet(__jwt_set_json($jwks));
+    }
+
+    /**
+     * The JWKS at `$path` of the HTTP service `[http.<name>]`. Key sets are kept for
+     * the whole server, fetched again when they are older than their
+     * `Cache-Control: max-age` (an hour without one) and when a token names a key
+     * id the set does not have (at most every 30 seconds). Throws NetworkError when
+     * it cannot be fetched and none is kept.
+     */
+    public static function fetch(string $service, string $path): KeySet {
+        return new KeySet(__jwt_set_fetch($service, $path));
+    }
+
+    /** The public keys as a JWKS document, to publish (secrets are left out). */
+    public function toJson(): string {
+        return __jwt_public($this->handle, 0);
+    }
+}

@@ -953,6 +953,43 @@ trust_request_id = false    # true: take the id and the trace a proxy in front s
   replaced by new ones. Set it only behind a proxy that sets or removes these headers: elsewhere they are the client's
   own text.
 
+### Tracing (OpenTelemetry)
+
+```toml
+[telemetry]
+endpoint = "http://localhost:4318"              # an OpenTelemetry collector (OTLP/HTTP), or endpoint_env
+headers_env = { Authorization = "OTEL_AUTH" }   # headers from environment variables (a tracing service's key)
+service_name = "blog"                           # default: [project] name, or "phv"
+sample = 1.0                                    # the share of new traces recorded, 0 to 1 (default 1)
+# tls = false                                   # allow http:// to another machine (not recommended)
+```
+
+- With `[telemetry]`, `phv serve` and `phv jobs run` send traces to the collector as OTLP over HTTP with JSON bodies
+  (`POST <endpoint>/v1/traces`, or the endpoint itself when it ends with `/v1/traces`).
+- Spans: a server span for each request, named by its method and the page's route (`GET /posts/[id]`; static files
+  `GET static`), never by the path asked for or its query (attributes `http.request.method`, `http.route`,
+  `http.response.status_code`, `url.scheme`, `network.protocol.version`, `phv.kind`); under it, a client span for each
+  request a script sends with `HttpClient` (also in the background) and for those std.oauth and std.jwt send
+  (`server.address`, `server.port`, `phv.http.service`, `http.response.status_code`); and a span for each run of a
+  background job, in a trace of its own (`job send_welcome`, with `phv.job.name`, `phv.job.id` and
+  `phv.job.attempt`). Server spans with a 5xx status, client spans with a 4xx or 5xx status or a network error, and
+  failed job runs are marked as errors. A script records at most 1,000 spans. Database queries are not traced.
+- Each request a script sends carries a `traceparent` with the trace and its client span, so the services it calls
+  join the trace. (Without `[telemetry]`, `[server] request_ids` sends a `traceparent` as described above.)
+- Every request gets a trace, also without `request_ids` (the `X-Request-Id` header, the log's `id` and
+  `request_id()` still need it). With `trust_request_id`, a valid `traceparent` from the proxy in front continues its
+  trace (its span becomes the request span's parent) and its sampled flag decides whether the trace is recorded; new
+  traces are recorded with the probability `sample`. A trace that is not recorded still passes its `traceparent` on,
+  with the flag unset.
+- Spans are queued and sent by a thread of their own, in batches of up to 512 every 5 seconds and when the server
+  stops. The queue holds at most 8,192 spans: when the collector is slow or down, further spans are dropped and counted
+  in `phv_telemetry_dropped_spans_total`. A failed export is dropped and reported at most once a minute. Requests never
+  wait for the collector.
+- The span of a request ends when the head of its response is sent (a page that streams with `flush()` goes on after
+  that).
+- `headers_env`, like `[http]`, takes values from environment variables, which scripts cannot read; `headers` takes
+  fixed ones. An unset `endpoint_env` turns tracing off, with a warning when the server starts.
+
 ### Health checks and metrics
 
 ```toml
@@ -981,7 +1018,7 @@ these are not served on the site's port):
   path asked for; at most 1,000 routes, the rest as `other`; static files as `static`), `worker_wait_seconds`,
   `rejected_total{reason}` (`busy`, `output`, `body`, `rate_limit`, `too_large`), `events_waiting_bytes`, `script_failures_total{kind}`
   (`exception`, `time`, `memory`, `compile`, `other`), `ws_messages_total{dir}`, `publish_total{result}`,
-  `jobs_total{result}`, `job_duration_seconds`, `store_errors_total{store}`, and the gauges `up`, `ready`,
+  `jobs_total{result}`, `job_duration_seconds`, `store_errors_total{store}`, `telemetry_dropped_spans_total`, and the gauges `up`, `ready`,
   `uptime_seconds`, `workers`, `workers_busy`, `connections`, `websockets`, `output_waiting_bytes`, `async_running` and
   `build_info{version}`. Counting takes no lock except a page's histogram.
 
@@ -1017,7 +1054,42 @@ response()->redirect("/login");                       // paths within the site o
 response()->redirectExternal("https://example.com/");  // external URL
 response()->json($value);
 response()->file("data/photos/1.jpg");                // sends a file instead of the output
+response()->flush();                                  // sends what was written so far (see "Streaming responses")
 ```
+
+### Streaming responses
+
+```phv
+import std.http.response;
+
+response()->type("text/csv; charset=utf-8")->header("Content-Disposition", "attachment; filename=\"orders.csv\"");
+foreach ($db->query(sql"SELECT id, total FROM orders") as $i => $row) {
+    echo $row->int("id") ?? 0, ",", $row->float("total") ?? 0.0, "\n";
+    if ($i % 1000 == 999 && !response()->flush()) {
+        return;                                   // the visitor has gone away
+    }
+}
+```
+
+- `response()->flush()` sends the status, the headers and what the page has written so far, and keeps the response
+  open (chunked over HTTP/1.1, a stream over HTTP/2). What the page writes afterwards is sent at the next `flush()` or
+  when it ends. It suits long exports, reports and answers that come bit by bit; a page can write Server-Sent Events
+  this way too (`text/event-stream`).
+- After the first `flush()`, the status, headers, cookies and session cannot change (`ValueError`); the session is
+  saved, and its cookie sent, with the head. The session can still be read. `csrf_token()` needs the visitor's CSRF
+  cookie, which can no longer be sent: on a visitor's first page, call it before `flush()`.
+- `flush()` waits until the connection has taken the previous chunk, so a page never runs more than one chunk ahead of
+  its visitor; the output it sends no longer counts in its memory limit, but in the server's output total. It returns
+  `false` once the visitor has gone away or has read nothing for 30 seconds; what the page writes after that is
+  dropped. A page holds its worker until it ends, within its time limit as any page.
+- A page that fails after `flush()` cannot show an error page: its response is cut off (the HTTP/1.1 connection is
+  closed without the last chunk, an HTTP/2 stream is reset), so the client sees that it is incomplete. The error is
+  logged as usual.
+- Streamed responses are not compressed. `flush()` cannot be called while output is captured (in a page with
+  `layout()`, or in a template), in a WebSocket script or after `response()->file()` (`ValueError`). Middleware that
+  calls it has answered the request. Outside `phv serve` (`phv run`, `phv test`) it keeps the output and returns
+  `true`.
+- The access log, `phv_request_duration_seconds` and the trace span of a streamed response end when its head is sent.
 
 ### Sessions
 
@@ -1536,6 +1608,75 @@ when the body is not JSON).
   unset `url_env` or `headers_env` variable is reported when a request is sent, so `phv check` works without the
   production keys.
 
+### Sign-in with OAuth 2.0 and OpenID Connect (std.oauth)
+
+```toml
+[oauth.google]
+issuer = "https://accounts.google.com"            # OpenID Connect: endpoints from the issuer's discovery document
+client_id_env = "GOOGLE_CLIENT_ID"                # or client_id
+client_secret_env = "GOOGLE_CLIENT_SECRET"        # leave it out for a public client (PKCE only)
+redirect_uri = "https://example.com/auth/google"  # or redirect_uri_env; registered with the provider
+scopes = ["openid", "email", "profile"]           # default ["openid"]
+
+[oauth.github]                                    # OAuth 2.0 without OpenID Connect
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url = "https://github.com/login/oauth/access_token"
+client_id_env = "GITHUB_CLIENT_ID"
+client_secret_env = "GITHUB_CLIENT_SECRET"
+client_auth = "post"                              # the secret in the request body ("basic": HTTP Basic)
+redirect_uri = "https://example.com/auth/github"
+scopes = ["read:user"]
+```
+
+```phv
+// public/login/google.phv
+import std.oauth.OAuth;
+OAuth::provider("google")->redirect();               // to the provider (302)
+
+// public/auth/google.phv: the redirect URI
+import std.http.{response, session};
+import std.oauth.{OAuth, OAuthError};
+try {
+    $signIn = OAuth::provider("google")->callback();
+} catch (OAuthError $e) {
+    response()->status(400);
+    echo "Sign-in failed: ", $e->getMessage();       // $e->error: "access_denied", "invalid_state", ...
+    return;
+}
+session()->regenerate();
+session()->set("user", "google:" . ($signIn->subject() ?? ""));   // the visitor's stable id at the provider
+$email = $signIn->verifiedEmail();                                // ?string: only when the provider verified it
+response()->redirect("/");
+```
+
+- The authorization code flow with PKCE (S256). `redirect()`, or `authorizationUrl()` which returns the URL, keeps a
+  random `state`, an OpenID Connect `nonce` and the PKCE verifier in the visitor's session, for 10 minutes and one use;
+  a session may have 4 sign-ins started at once (tabs). Extra parameters such as `["prompt" => "select_account"]` can be
+  given, but not those of the flow itself.
+- `callback()` accepts only a `state` this session started for this provider, so a sign-in cannot be finished in
+  another browser, and another site cannot sign a visitor in to an account of its own. It passes the provider's error
+  (`?error=access_denied`) on as `OAuthError`, refuses an `iss` parameter that names another issuer (RFC 9207), and
+  exchanges the code at the token endpoint with the verifier and the client secret (with HTTP Basic, unless
+  `client_auth = "post"` or the discovery document allows only `client_secret_post`).
+- With OpenID Connect the ID token must be signed by a key of the provider's JWKS (RS256, ES256 or EdDSA; kept as by
+  `KeySet::fetch()` of std.jwt), name the issuer exactly and this client as its audience (and as `azp` when it has
+  several), hold the sign-in's nonce, `sub`, `exp` and `iat`, and be valid now (60 seconds of leeway); otherwise
+  `callback()` throws `OAuthError` with `invalid_id_token`. `SignIn` has `claims`, `subject()`, `claim($name)`,
+  `verifiedEmail()`, `accessToken`, `refreshToken`, `expiresIn`, `scope` and `idToken`. Without OpenID Connect,
+  `claims` is empty: ask the provider's API with the access token (`HttpClient` with an `Authorization: Bearer`
+  header).
+- Know users by the provider and `subject()`, not by their e-mail address: an address can pass to someone else, and
+  only `verifiedEmail()` says that the provider checked it. Call `session()->regenerate()` after a sign-in, as after
+  any login.
+- The discovery document (`<issuer>/.well-known/openid-configuration`) must name the configured issuer exactly. It is
+  kept for an hour (for up to a day when it cannot be fetched again, tried every 30 seconds). Endpoints need TLS unless
+  they are on this machine or `tls = false`; the redirect URI needs TLS unless it is on this machine. The client secret
+  comes from the environment (scripts cannot read the variable) and is never shown; an unset variable is reported when
+  a sign-in starts.
+- Failures of the provider or the visitor throw `OAuthError` (`$e->error` is the OAuth error code, and texts from the
+  provider are cut to printable ASCII); a provider that cannot be reached throws `NetworkError`; mistakes in phv.toml or
+  the script throw `ValueError`. `redirect()` and `callback()` work in pages only.
+
 ### Validation (std.validate)
 
 ```phv
@@ -1800,11 +1941,49 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
 | `json_decode($s): any` | Depth up to 128 |
 | `encrypt($text, $key)`, `decrypt($box, $key): ?string` | ChaCha20-Poly1305, with a key derived for each message (HKDF-SHA256 with a random salt) and a random nonce; the result is base64url text. `decrypt` returns `null` if the text was changed or the key is not the one it was encrypted with |
 | `sign_token($data, $key)`, `sign_token($data, $key, $seconds)`, `verify_token($token, $key): ?string` | Data with an HMAC-SHA256 signature, valid for `$seconds` when given (links in e-mails, such as password resets). The data can be read (it is only base64url): encrypt what must stay secret. `verify_token` returns the data, or `null` if the token was changed, signed with another key, or has expired |
-| `jwt_encode($claims, $key)`, `jwt_decode($token, $key): ?map<string, any>` | JSON Web Tokens with HS256 only: a token that names another algorithm (`none` included) is refused. `exp` and `nbf` are checked. The key is used as it is (as other JWT libraries expect), so do not also use it with `hash_hmac()`: an HMAC of a visitor's text would be a valid signature |
+| `jwt_encode($claims, $key)`, `jwt_decode($token, $key): ?map<string, any>` | JSON Web Tokens with HS256 only (RS256, ES256, EdDSA and key sets: see std.jwt): a token that names another algorithm (`none` included) is refused. `exp` and `nbf` are checked. The key is used as it is (as other JWT libraries expect), so do not also use it with `hash_hmac()`: an HMAC of a visitor's text would be a valid signature |
 
 Keys for `encrypt`, `sign_token` and the JWT functions are secrets of at least 32 bytes (`random_token()` makes one);
 keep them in an environment variable (`getenv`), not in the code. `encrypt` and `sign_token` derive their own keys
 from the one given, so one key can serve both. Tokens are compared as they are: one with spaces around it is invalid.
+
+### JSON Web Tokens (std.jwt)
+
+```phv
+import std.jwt.{JwtKey, KeySet};
+
+$key = JwtKey::fromPem(getenv("JWT_PRIVATE_KEY") ?? "", "2026-11");   // a private key, with its key id
+$token = $key->sign(["sub" => "7", "exp" => time() + 3600]);
+$claims = $key->verify($token);                                      // ?map<string, any>
+echo $key->publicJwk();                                              // the public key as a JWK, to publish
+
+$auth = KeySet::fetch("auth", "/.well-known/jwks.json");             // the JWKS of [http.auth]
+$claims = $auth->verify($token, issuer: "https://auth.example.com/", audience: "my-api", leeway: 30);
+```
+
+- A key's type decides its algorithm: RSA keys sign with RS256, P-256 keys with ES256, Ed25519 keys with EdDSA, and
+  `JwtKey::secret($secret)` (32 bytes or more) with HS256. A token is checked only with keys of the algorithm its header
+  names, so it cannot choose another kind of key (such as a public key used as an HMAC secret) or `none`. A token with
+  `crit` is refused, and header parameters that point to other keys (`jku`, `x5u`, `jwk`, `x5c`) are ignored.
+- `JwtKey::fromPem()` reads private keys (`PRIVATE KEY` (PKCS#8), `RSA PRIVATE KEY`, `EC PRIVATE KEY`) and public keys
+  (`PUBLIC KEY`, `RSA PUBLIC KEY`). RSA keys of 2048 to 4096 bits sign, and of up to 8192 bits verify; encrypted keys
+  and other kinds of keys are refused (`ValueError`). `JwtKey::fromJwk()` reads the public key of a JWK. `alg`, `kid`
+  and `canSign` tell what a key is. Keys stay in the runtime: no value a script holds, nor `dump()`, shows a private
+  key.
+- `verify()` returns the claims, or `null` when the signature, the algorithm or the claims are not right: `exp` and
+  `nbf` (numbers) with up to `$leeway` seconds (0 to 300), an `iat` more than a minute ahead, `iss` when `$issuer` is
+  given, and `aud` (the string `$audience`, or a list that holds it). A token that has `aud` is refused when no
+  `$audience` is given: it was made for someone else.
+- `KeySet::of([...])` verifies with several keys (the old and the new while keys are replaced); the token's `kid`
+  picks the key. `KeySet::fromJson()` reads a JWKS document; `toJson()` writes the public keys of a set, to serve at
+  `/.well-known/jwks.json`. Keys of other kinds in a JWKS are skipped, and `oct` keys are never read from one.
+- `KeySet::fetch($service, $path)` gets a JWKS from an HTTP service of `[http]`, with its headers. Sets are kept for
+  the whole server process, and fetched again when they are older than their `Cache-Control: max-age` (1 minute to a
+  day; an hour without one) and when a token names a key id the set lacks: the first such token at once, later ones at
+  most every 30 seconds, so made-up key ids cannot make the server fetch it over and over. A set that cannot be fetched
+  again is used for up to a day and tried again every 30 seconds. A JWKS may be 512 KB; 64 of its keys are read, and
+  32 sets are kept.
+- `jwt_encode()` and `jwt_decode()` (HS256) remain as they are.
 
 ### Content-Security-Policy
 
@@ -1940,6 +2119,15 @@ store = "db:main"       # background jobs (see "Background jobs")
 [[schedule]]
 job = "cleanup"
 cron = "0 3 * * *"
+
+[oauth.google]
+issuer = "https://accounts.google.com"   # sign-in with OpenID Connect (see std.oauth)
+client_id_env = "GOOGLE_CLIENT_ID"
+client_secret_env = "GOOGLE_CLIENT_SECRET"
+redirect_uri = "https://example.com/auth/google"
+
+[telemetry]
+endpoint = "http://localhost:4318"   # send traces to an OpenTelemetry collector (see "Tracing")
 
 [fmt]
 width = 100             # phv fmt wraps longer lines
@@ -2398,6 +2586,12 @@ It then runs the type checker and shows the places that need manual work, such a
 | Keys of ended jobs a store remembers | 100,000 (the latest), each a day | the oldest are forgotten |
 | Output waiting to be sent (`serve`) | `workers` × `memory_limit_mb`, a quarter of it for event streams | 503; an event stream is ended or skips the event |
 | Request body bytes past the first 64 KB, received or held (`serve`) | `workers` × 8 MB | waits up to 10 seconds, then 503 |
+| A streamed response (`flush()`) | one chunk ahead of the client; 30 seconds without reading | `flush()` returns false |
+| A JSON Web Token (std.jwt) | 256 KB, its header 8 KB | `verify()` returns null |
+| A JWKS | 512 KB, 64 keys read; 32 sets kept per process | `NetworkError` (`fetch`), `ValueError` (`fromJson`) |
+| Sign-ins a session has started (std.oauth) | 4, each for 10 minutes | the oldest is forgotten |
+| Spans a script records (`[telemetry]`) | 1,000 | not recorded |
+| Spans waiting to be exported | 8,192 | dropped (`phv_telemetry_dropped_spans_total`) |
 | Source file (module, template, script) | 8 MB | Compile error (`phv lsp`: a larger open document is not checked or formatted, and renames are refused while it is open) |
 | Tokens of one source file (the code inside its strings included) | 1,000,000 | Compile error (the file is not parsed) |
 | All the files of one program (a page or script with what it imports and renders, std included) | 2,000,000 tokens, 32 MB of source, 2,000 files | Compile error (the program is not checked; `phv lsp` keeps no analysis of a program of more than 250,000 tokens between requests) |

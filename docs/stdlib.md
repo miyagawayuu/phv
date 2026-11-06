@@ -11,6 +11,8 @@
 - [std.time](#stdtime)
 - [std.ws](#stdws)
 - [std.jobs](#stdjobs)
+- [std.jwt](#stdjwt)
+- [std.oauth](#stdoauth)
 
 ## std.http
 
@@ -77,6 +79,7 @@ class Response
 - `public function redirectExternal(string $url, int $code = 302): void` — Redirects to an absolute http(s) URL on another site.
 - `public function file(string $path, string $type = ""): void` — Sends a file instead of the page output, for example an uploaded image kept in `data/`. The path needs [permissions].read or write. Without `$type` the Content-Type comes from the extension; HTML, SVG and unknown files are sent as `application/octet-stream`.
 - `public function json(any $value): void` — Sends `$value` as JSON.
+- `public function flush(): bool` — Sends the status, the headers and what the page has written so far, and keeps the response open: what it writes later is sent at the next flush() or when the page ends. Afterwards the status, headers, cookies and session can no longer change. Returns false once the visitor has gone away: stop the work then. Outside `phv serve` (scripts, `phv test`) it keeps the output and returns true.
 
 ### class Session
 
@@ -728,4 +731,150 @@ function job(): Job
 ```
 
 The job this script runs for. Only in a job.
+
+
+## std.jwt
+
+std.jwt — JSON Web Tokens signed with RS256, ES256, EdDSA or HS256, and key sets (JWKS).
+
+```phv
+import std.jwt.{JwtKey, KeySet};
+```
+
+
+```phv
+$key = JwtKey::fromPem(getenv("JWT_PRIVATE_KEY") ?? "", "2026-11");   // signs and verifies
+$token = $key->sign(["sub" => "7", "exp" => time() + 3600]);
+$claims = $key->verify($token);            // ?map<string, any>
+echo $key->publicJwk();                    // the public key, for others to verify with
+```
+
+
+```phv
+$keys = KeySet::fetch("auth", "/.well-known/jwks.json");   // [http.auth] in phv.toml
+$claims = $keys->verify($token, issuer: "https://auth.example.com/", audience: "my-api");
+```
+
+
+A key's type decides its algorithm: RSA keys sign with RS256, P-256 keys with ES256,
+Ed25519 keys with EdDSA, secrets with HS256. A token is checked only with keys of the
+algorithm its header names, so a token cannot choose another kind of key, or `none`.
+
+### abstract class Verifier
+
+```phv
+abstract class Verifier
+```
+
+Something that verifies tokens: a `JwtKey` or a `KeySet`.
+
+- `public function verify(string $token, ?string $issuer = null, ?string $audience = null, int $leeway = 0): ?map<string, any>` — The claims of `$token` if one of the keys signed it and it is valid now, or null. `exp` and `nbf` are checked, with `$leeway` seconds (0 to 300) for clocks that differ. With `$issuer`, `iss` must be it; with `$audience`, `aud` must be it or a list that holds it. Without `$audience`, a token that has `aud` is refused: it was made for someone else.
+
+### class JwtKey
+
+```phv
+final class JwtKey extends Verifier
+```
+
+One key: private (signs and verifies), public (verifies) or a secret (HS256).
+
+- `public readonly string $alg` — "RS256", "ES256", "EdDSA" or "HS256".
+- `public readonly ?string $kid` — The key id (`kid`) put in the header of the tokens it signs, or null.
+- `public readonly bool $canSign` — Whether it can sign: a private key or a secret.
+- `public static function fromPem(string $pem, ?string $kid = null): JwtKey` — A key in PEM form: a private key (`PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`) or a public one (`PUBLIC KEY`). RSA keys of 2048 to 4096 bits sign (up to 8192 verify), P-256 and Ed25519 keys both. Throws ValueError for other keys. Keep private keys in an environment variable.
+- `public static function fromJwk(string $jwk): JwtKey` — The public key of a JWK (JSON). Private members are not read.
+- `public static function secret(string $secret, ?string $kid = null): JwtKey` — An HS256 key: a secret of at least 32 bytes (`random_token()` makes one).
+- `public function sign(map<string, any> $claims): string` — A token with these claims. Throws ValueError for a public key.
+- `public function publicJwk(): string` — The public key as a JWK (JSON). Throws ValueError for a secret.
+
+### class KeySet
+
+```phv
+final class KeySet extends Verifier
+```
+
+Several keys, such as the JWKS an identity provider publishes.
+
+- `public static function of(list<JwtKey> $keys): KeySet` — The keys given (to accept tokens signed by an old key while a new one takes over).
+- `public static function fromJson(string $jwks): KeySet` — The signing keys of a JWKS document; keys of other kinds are skipped.
+- `public static function fetch(string $service, string $path): KeySet` — The JWKS at `$path` of the HTTP service `[http.<name>]`. Key sets are kept for the whole server, fetched again when they are older than their `Cache-Control: max-age` (an hour without one) and when a token names a key id the set does not have (at most every 30 seconds). Throws NetworkError when it cannot be fetched and none is kept.
+- `public function toJson(): string` — The public keys as a JWKS document, to publish (secrets are left out).
+
+
+## std.oauth
+
+std.oauth — sign-in with OAuth 2.0 and OpenID Connect (`[oauth.<name>]` in phv.toml).
+
+```phv
+// public/login/google.phv: send the visitor to the provider
+import std.oauth.OAuth;
+OAuth::provider("google")->redirect();
+```
+
+
+```phv
+// public/auth/google.phv: the redirect URI, where the provider sends the visitor back
+import std.http.{response, session};
+import std.oauth.{OAuth, OAuthError};
+try {
+$signIn = OAuth::provider("google")->callback();
+} catch (OAuthError $e) {
+response()->status(400);
+echo "Sign-in failed: ", $e->getMessage();
+return;
+}
+session()->regenerate();
+session()->set("user", $signIn->subject() ?? "");
+response()->redirect("/");
+```
+
+
+The authorization code flow with PKCE: the state, the nonce and the code verifier are
+kept in the visitor's session for 10 minutes and one use, so a sign-in cannot be
+finished in another browser. With OpenID Connect (`issuer`), the ID token's signature,
+issuer, audience, nonce and expiry are checked before callback() returns.
+
+### class OAuthError
+
+```phv
+class OAuthError extends Exception
+```
+
+A sign-in that failed: the visitor refused it, it expired, or the provider's answer was not valid.
+
+- `public readonly string $error` — The OAuth error code: `access_denied`, `invalid_state`, `invalid_id_token`, ...
+- `public function __construct(string $message, public readonly string $error)`
+
+### class SignIn
+
+```phv
+class SignIn
+```
+
+A finished sign-in.
+
+- `public readonly string $provider` — The name of the provider in phv.toml.
+- `public readonly string $accessToken` — For calls to the provider's API (`Authorization: Bearer ...`). Keep it on the server.
+- `public readonly ?string $refreshToken`
+- `public readonly ?int $expiresIn` — Seconds the access token lasts, if the provider said.
+- `public readonly ?string $scope` — The scopes granted, if the provider said (space-separated).
+- `public readonly ?string $idToken` — The ID token (OpenID Connect), already verified.
+- `public readonly map<string, any> $claims` — The claims of the ID token; empty without OpenID Connect.
+- `public function __construct(public readonly string $provider, public readonly string $accessToken, public readonly ?string $refreshToken, public readonly ?int $expiresIn, public readonly ?string $scope, public readonly ?string $idToken, public readonly map<string, any> $claims)`
+- `public function subject(): ?string` — The visitor's id at the provider (`sub`): stable, unlike the e-mail address. Null without OpenID Connect.
+- `public function claim(string $name): ?string` — A claim of the ID token that is a string (`name`, `picture`, ...), or null.
+- `public function verifiedEmail(): ?string` — The e-mail address, only when the provider says it verified it (`email_verified` is true). Null otherwise.
+
+### class OAuth
+
+```phv
+class OAuth
+```
+
+A sign-in provider named `[oauth.<name>]` in phv.toml.
+
+- `public static function provider(string $name): OAuth`
+- `public function authorizationUrl(map<string, string> $params = []): string` — The provider's URL that starts a sign-in, with extra parameters such as `["prompt" => "select_account"]` or `["login_hint" => $email]` (the ones of the flow itself are set by PHV). Each call starts a new sign-in in the session.
+- `public function redirect(map<string, string> $params = []): void` — Sends the visitor to the provider (a 302 response).
+- `public function callback(): SignIn` — Finishes the sign-in on the redirect URI: checks the answer, exchanges the code for tokens and verifies the ID token. Throws OAuthError when the sign-in failed, NetworkError when the provider cannot be reached. Call `session()->regenerate()` before you store who signed in.
 

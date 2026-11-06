@@ -20,6 +20,7 @@ argon2.workspace = true
 base64.workspace = true
 rusqlite.workspace = true
 percent-encoding.workspace = true
+form_urlencoded.workspace = true
 bytes.workspace = true
 postgres.workspace = true
 tokio-postgres-rustls.workspace = true

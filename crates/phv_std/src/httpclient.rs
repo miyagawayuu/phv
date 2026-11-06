@@ -174,6 +174,13 @@ pub fn check_http_url(url: &str) -> Result<(), String> {
     parse_base(url).map(|_| ())
 }
 
+/// Checks a URL of `[oauth]` in phv.toml: https, unless the host is this
+/// machine or `tls` is false.
+pub fn check_oauth_url(url: &str, tls: Option<bool>) -> Result<(), String> {
+    let base = parse_base(url)?;
+    check_plain(&base.host, base.tls, tls, "https://")
+}
+
 fn is_token(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
@@ -273,6 +280,19 @@ pub(crate) struct Response {
 }
 
 impl Response {
+    pub(crate) fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// A header's value (the first, any case).
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+
+    pub(crate) fn body(&self) -> &[u8] {
+        &self.body
+    }
+
     /// The bytes it holds on the heap.
     pub(crate) fn heap_size(&self) -> usize {
         self.body.capacity() + self.headers.iter().map(|(k, v)| k.capacity() + v.capacity() + 48).sum::<usize>()
@@ -561,8 +581,10 @@ fn send(
 /// `__http_request(name, method, path, query, headers, body)`: sends a request
 /// to `[http.<name>]` and returns `["status" => int, "headers" => map, "body" => string]`.
 pub fn request(vm: &mut Vm, a: &[Value]) -> R {
-    let (base, req, fail) = prepare(vm, a)?;
+    let (base, mut req, fail) = prepare(vm, a)?;
+    let span = ClientSpan::open(vm, &base, &mut req, Some(s(&a[0])));
     let result = exchange(&base, &req, until(vm, REQUEST_TIMEOUT), MAX_BODY);
+    ClientSpan::close(span, &result);
     vm.check_limits()?;
     match result {
         Ok(r) => Ok(response_value(r)),
@@ -574,11 +596,14 @@ pub fn request(vm: &mut Vm, a: &[Value]) -> R {
 /// the same map. The response may take a sixteenth of the memory left to the
 /// script (other work may run at the same time), and at most 16 MB.
 pub fn start(vm: &mut Vm, a: &[Value]) -> R {
-    let (base, req, fail) = prepare(vm, a)?;
+    let (base, mut req, fail) = prepare(vm, a)?;
+    let span = ClientSpan::open(vm, &base, &mut req, Some(s(&a[0])));
     let limit = (vm.memory_left() / 16).clamp(64 << 10, MAX_BODY);
     let until = until(vm, REQUEST_TIMEOUT);
     crate::asyncio::start(vm, until, None, move || {
-        crate::asyncio::Outcome::Http(exchange(&base, &req, until, limit).map_err(|e| format!("{fail}{e}")))
+        let result = exchange(&base, &req, until, limit);
+        ClientSpan::close(span, &result);
+        crate::asyncio::Outcome::Http(result.map_err(|e| format!("{fail}{e}")))
     })
 }
 
@@ -683,6 +708,163 @@ fn prepare(vm: &mut Vm, a: &[Value]) -> Result<(Base, Request, String), VmError>
     let fail = format!("HTTP service \"{name}\": {method} {path}: ");
     let req = Request { method, target, headers, body };
     Ok((base, req, fail))
+}
+
+/// A GET of `path` from `[http.<name>]`, as a script's request would be
+/// prepared (its configured headers included).
+fn service_get(vm: &mut Vm, name: &str, path: &str) -> Result<(Base, Request, String), VmError> {
+    let empty = Value::map(IndexMap::new());
+    prepare(vm, &[Value::str(name), Value::str("GET"), Value::str(path), empty.clone(), empty, Value::str("")])
+}
+
+fn url_of(base: &Base, req: &Request) -> String {
+    format!("{}://{}{}", if base.tls { "https" } else { "http" }, base.authority, req.target)
+}
+
+/// The URL a GET of `path` from `[http.<name>]` goes to (to name what it
+/// fetched in a cache; never shown).
+pub(crate) fn service_url(vm: &mut Vm, name: &str, path: &str) -> Result<String, VmError> {
+    let (base, req, _) = service_get(vm, name, path)?;
+    Ok(url_of(&base, &req))
+}
+
+/// Sends a GET of `path` to `[http.<name>]`; the outer error is one of the
+/// script (an unknown service), the inner one a network error.
+pub(crate) fn get_service(
+    vm: &mut Vm,
+    name: &str,
+    path: &str,
+    limit: usize,
+) -> Result<Result<Response, String>, VmError> {
+    let (base, mut req, _) = service_get(vm, name, path)?;
+    let span = ClientSpan::open(vm, &base, &mut req, Some(name));
+    let result = exchange(&base, &req, until(vm, REQUEST_TIMEOUT), limit);
+    ClientSpan::close(span, &result);
+    Ok(result)
+}
+
+/// Sends a request to a URL that PHV itself was given (an OAuth provider's
+/// endpoints), not one a script wrote: TLS unless the host is this machine
+/// or `tls` is false, the URL's path and query sent as they are.
+pub(crate) fn send_url(
+    vm: &Vm,
+    method: &str,
+    url: &str,
+    tls: Option<bool>,
+    mut headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    limit: usize,
+) -> Result<Response, String> {
+    let base = parse_base(url)?;
+    check_plain(&base.host, base.tls, tls, "https://")?;
+    let scheme_len = if base.tls { 8 } else { 7 };
+    let tail = &url[scheme_len + base.authority.len()..];
+    let target = if tail.is_empty() || tail.starts_with('?') { format!("/{tail}") } else { tail.to_string() };
+    let has = |headers: &[(String, String)], n: &str| headers.iter().any(|(h, _)| h.eq_ignore_ascii_case(n));
+    if !has(&headers, "user-agent") {
+        headers.push(("User-Agent".into(), concat!("phv/", env!("CARGO_PKG_VERSION")).into()));
+    }
+    headers.push(("Accept-Encoding".into(), "identity".into()));
+    if let Some(tp) = &vm.http.traceparent {
+        headers.push(("traceparent".into(), tp.clone()));
+    }
+    let mut req = Request { method: method.to_string(), target, headers, body };
+    let span = ClientSpan::open(vm, &base, &mut req, None);
+    let result = exchange(&base, &req, until(vm, REQUEST_TIMEOUT), limit);
+    ClientSpan::close(span, &result);
+    result
+}
+
+/// Spans a script may add to its trace; more are not recorded.
+const MAX_SPANS: usize = 1000;
+
+/// A request being sent within a recorded trace (`[telemetry]`): it carries a
+/// `traceparent` naming its own span, recorded when the answer comes.
+pub(crate) struct ClientSpan {
+    span: phv_vm::Span,
+    spans: std::sync::Arc<Mutex<Vec<phv_vm::Span>>>,
+}
+
+impl ClientSpan {
+    fn open(vm: &Vm, base: &Base, req: &mut Request, service: Option<&str>) -> Option<ClientSpan> {
+        let trace = vm.http.trace.as_ref()?;
+        let span_id = crate::random_hex(8);
+        let flags = if trace.sampled { "01" } else { "00" };
+        if !req.headers.iter().any(|(h, _)| h.eq_ignore_ascii_case("traceparent")) {
+            req.headers.push(("traceparent".into(), format!("00-{}-{span_id}-{flags}", trace.trace_id)));
+        }
+        if !trace.sampled {
+            return None;
+        }
+        let mut attributes = vec![
+            ("http.request.method", phv_vm::SpanValue::Str(req.method.clone())),
+            (
+                "server.address",
+                phv_vm::SpanValue::Str(base.host.trim_start_matches('[').trim_end_matches(']').to_string()),
+            ),
+            ("server.port", phv_vm::SpanValue::Int(base.port as i64)),
+        ];
+        if let Some(name) = service {
+            attributes.push(("phv.http.service", phv_vm::SpanValue::Str(name.to_string())));
+        }
+        let now = std::time::SystemTime::now();
+        Some(ClientSpan {
+            span: phv_vm::Span {
+                trace_id: trace.trace_id.clone(),
+                span_id,
+                parent_id: Some(trace.span_id.clone()),
+                name: req.method.clone(),
+                kind: phv_vm::SpanKind::Client,
+                start: now,
+                end: now,
+                attributes,
+                error: false,
+            },
+            spans: trace.spans.clone(),
+        })
+    }
+
+    fn close(this: Option<ClientSpan>, result: &Result<Response, String>) {
+        let Some(ClientSpan { mut span, spans }) = this else { return };
+        span.end = std::time::SystemTime::now();
+        match result {
+            Ok(r) => {
+                span.attributes.push(("http.response.status_code", phv_vm::SpanValue::Int(r.status as i64)));
+                span.error = r.status >= 400;
+                if span.error {
+                    span.attributes.push(("error.type", phv_vm::SpanValue::Str(r.status.to_string())));
+                }
+            }
+            Err(_) => {
+                span.error = true;
+                span.attributes.push(("error.type", phv_vm::SpanValue::Str("network".into())));
+            }
+        }
+        let mut list = spans.lock().unwrap_or_else(|e| e.into_inner());
+        if list.len() < MAX_SPANS {
+            list.push(span);
+        }
+    }
+}
+
+/// Sends spans to an OpenTelemetry collector (`[telemetry]`): a POST outside
+/// any script, at most `timeout`. The status, or a network error.
+pub fn post_telemetry(
+    url: &str,
+    tls: Option<bool>,
+    mut headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    timeout: Duration,
+) -> Result<u16, String> {
+    let base = parse_base(url)?;
+    check_plain(&base.host, base.tls, tls, "https://")?;
+    let scheme_len = if base.tls { 8 } else { 7 };
+    let tail = &url[scheme_len + base.authority.len()..];
+    let target = if tail.is_empty() || tail.starts_with('?') { format!("/{tail}") } else { tail.to_string() };
+    headers.push(("User-Agent".into(), concat!("phv/", env!("CARGO_PKG_VERSION")).into()));
+    headers.push(("Accept-Encoding".into(), "identity".into()));
+    let req = Request { method: "POST".into(), target, headers, body };
+    exchange(&base, &req, Instant::now() + timeout, 64 << 10).map(|r| r.status)
 }
 
 pub fn lookup(name: &str) -> Option<phv_vm::BuiltinFn> {

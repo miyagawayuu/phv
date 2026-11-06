@@ -228,8 +228,16 @@ impl State {
             max_memory: Some(self.config.memory_limit_mb as usize * 1024 * 1024),
             ..Limits::default()
         };
+        // [telemetry]: each run is a trace of its own.
+        let trace = self.telemetry.as_ref().map(|e| phv_vm::TraceCtx {
+            trace_id: phv_std::random_hex(16),
+            span_id: phv_std::random_hex(8),
+            sampled: e.sample(),
+            spans: Default::default(),
+        });
         let ctx = HttpCtx {
             can_publish: true,
+            trace: trace.clone(),
             job: Some(JobCtx {
                 name: job.name.clone(),
                 id: job.id.clone(),
@@ -239,7 +247,33 @@ impl State {
             ..HttpCtx::default()
         };
         let host = Some(self.config.host.clone());
+        let started = std::time::SystemTime::now();
         let mut outcome = run(&compiled, RunOptions { html: false, limits, http: Some(ctx), host });
+        if let (Some(exporter), Some(t)) = (&self.telemetry, &trace) {
+            let mut spans = std::mem::take(&mut *t.spans.lock().unwrap_or_else(|e| e.into_inner()));
+            if t.sampled {
+                let mut attributes = vec![
+                    ("phv.job.name", phv_vm::SpanValue::Str(job.name.clone())),
+                    ("phv.job.id", phv_vm::SpanValue::Str(job.id.clone())),
+                    ("phv.job.attempt", phv_vm::SpanValue::Int(job.attempts as i64)),
+                ];
+                if outcome.error.is_some() {
+                    attributes.push(("error.type", phv_vm::SpanValue::Str("exception".into())));
+                }
+                spans.push(phv_vm::Span {
+                    trace_id: t.trace_id.clone(),
+                    span_id: t.span_id.clone(),
+                    parent_id: None,
+                    name: format!("job {}", job.name),
+                    kind: phv_vm::SpanKind::Consumer,
+                    start: started,
+                    end: std::time::SystemTime::now(),
+                    attributes,
+                    error: outcome.error.is_some(),
+                });
+            }
+            exporter.send(spans);
+        }
         if let Some(err) = &outcome.error {
             self.metrics.failure(crate::metrics::Failure::of(&err.message));
             let text = err.render();

@@ -936,6 +936,41 @@ trust_request_id = false    # true: 前にいるプロキシが送る ID とト�
   `traceparent` のトレース(バージョン `00`、小文字の 16 進数)を、形が正しければそのまま使う。正しくなければ新しく作る。
   これらのヘッダーを設定または削除するプロキシの後ろでだけ有効にすること。それ以外ではクライアントが書いた文字列である。
 
+### トレース(OpenTelemetry)
+
+```toml
+[telemetry]
+endpoint = "http://localhost:4318"              # OpenTelemetry のコレクター(OTLP/HTTP)。または endpoint_env
+headers_env = { Authorization = "OTEL_AUTH" }   # 環境変数から取るヘッダー(トレースのサービスの鍵など)
+service_name = "blog"                           # 既定: [project] name、なければ "phv"
+sample = 1.0                                    # 新しいトレースを記録する割合、0〜1(既定 1)
+# tls = false                                   # ほかのマシンへの http:// を許す(推奨しない)
+```
+
+- `[telemetry]` を書くと、`phv serve` と `phv jobs run` はトレースを OTLP over HTTP(JSON の本文)でコレクターに送る
+  (`POST <endpoint>/v1/traces`。endpoint が `/v1/traces` で終わるときはそのまま)。
+- スパン: リクエストごとのサーバースパン。名前はメソッドとページのルート(`GET /posts/[id]`。静的ファイルは
+  `GET static`)で、要求されたパスやクエリは決して入らない(属性は `http.request.method`、`http.route`、
+  `http.response.status_code`、`url.scheme`、`network.protocol.version`、`phv.kind`)。その下に、スクリプトが
+  `HttpClient` で送るリクエスト(バックグラウンドのものも)と、std.oauth・std.jwt が送るリクエストごとのクライアントスパン
+  (`server.address`、`server.port`、`phv.http.service`、`http.response.status_code`)。バックグラウンドジョブの実行ごとに、
+  それ自身のトレースのスパン(`job send_welcome`。`phv.job.name`、`phv.job.id`、`phv.job.attempt`)。5xx のサーバースパン、
+  4xx・5xx またはネットワークエラーのクライアントスパン、失敗したジョブの実行はエラーとして記録する。1 つのスクリプトが
+  記録するスパンは 1,000 個まで。データベースのクエリはトレースしない。
+- スクリプトが送るリクエストには、トレースとそのクライアントスパンを示す `traceparent` が付くので、呼ばれたサービスも
+  同じトレースに加わる(`[telemetry]` がなければ、上の「リクエスト ID」のとおり `[server] request_ids` が `traceparent` を
+  送る)。
+- `request_ids` がなくても、すべてのリクエストにトレースを作る(`X-Request-Id` ヘッダー、ログの `id`、`request_id()` には
+  これまでどおり `request_ids` が必要)。`trust_request_id` のときは、前にいるプロキシからの正しい `traceparent` の
+  トレースを続け(そのスパンがリクエストのスパンの親になる)、その sampled フラグでトレースを記録するかを決める。
+  新しいトレースは確率 `sample` で記録する。記録しないトレースも、フラグを立てない `traceparent` を送り先に渡す。
+- スパンはキューに入れ、専用のスレッドが最大 512 個ずつ 5 秒ごとに、またサーバーが止まるときに送る。キューは
+  8,192 スパンまで: コレクターが遅いか止まっているときは、それ以上のスパンを捨てて `phv_telemetry_dropped_spans_total` で
+  数える。送信に失敗したスパンも捨て、報告は 1 分に 1 回まで。リクエストがコレクターを待つことはない。
+- リクエストのスパンは、レスポンスのヘッダーを送った時点で終わる(`flush()` でストリーミングするページはその後も続く)。
+- `headers_env` は、`[http]` と同じく、スクリプトが読めない環境変数から値を取る。`headers` は固定の値。`endpoint_env` の
+  変数が設定されていなければトレースは送らず、サーバーの起動時に警告する。
+
 ### ヘルスチェックとメトリクス
 
 ```toml
@@ -964,7 +999,8 @@ token_env = "PHV_ADMIN_TOKEN"    # listen がループバック以外なら必�
   要求されたパスは決して入らない。ルートは 1,000 個までで、残りは `other`。静的ファイルは `static`)、
   `worker_wait_seconds`、`rejected_total{reason}`(`busy`、`output`、`body`、`rate_limit`、`too_large`)、`events_waiting_bytes`、
   `script_failures_total{kind}`(`exception`、`time`、`memory`、`compile`、`other`)、`ws_messages_total{dir}`、
-  `publish_total{result}`、`jobs_total{result}`、`job_duration_seconds`、`store_errors_total{store}`、およびゲージ
+  `publish_total{result}`、`jobs_total{result}`、`job_duration_seconds`、`store_errors_total{store}`、
+  `telemetry_dropped_spans_total`、およびゲージ
   `up`、`ready`、`uptime_seconds`、`workers`、`workers_busy`、`connections`、`websockets`、`output_waiting_bytes`、
   `async_running`、`build_info{version}`。数えるときにロックを取るのはページのヒストグラムだけである。
 
@@ -1000,7 +1036,41 @@ response()->redirect("/login");                       // サイト内のパス�
 response()->redirectExternal("https://example.com/");  // 外部の URL
 response()->json($value);
 response()->file("data/photos/1.jpg");                // 出力の代わりにファイルを送る
+response()->flush();                                  // それまでの出力を送る(「ストリーミングレスポンス」)
 ```
+
+### ストリーミングレスポンス
+
+```phv
+import std.http.response;
+
+response()->type("text/csv; charset=utf-8")->header("Content-Disposition", "attachment; filename=\"orders.csv\"");
+foreach ($db->query(sql"SELECT id, total FROM orders") as $i => $row) {
+    echo $row->int("id") ?? 0, ",", $row->float("total") ?? 0.0, "\n";
+    if ($i % 1000 == 999 && !response()->flush()) {
+        return;                                   // 訪問者が去った
+    }
+}
+```
+
+- `response()->flush()` は、ステータス・ヘッダーと、ページがそれまでに書いた出力を送り、レスポンスを開いたままにする
+  (HTTP/1.1 では chunked、HTTP/2 ではストリーム)。その後に書いた出力は、次の `flush()` か、ページが終わったときに送る。
+  長いエクスポートやレポート、少しずつ届く応答に向く。ページから Server-Sent Events を書くこともできる
+  (`text/event-stream`)。
+- 最初の `flush()` の後は、ステータス・ヘッダー・Cookie・セッションを変えられない(`ValueError`)。セッションはヘッダーと
+  一緒に保存し、その Cookie を送る。セッションを読むことはできる。`csrf_token()` には訪問者の CSRF Cookie が必要だが、
+  それはもう送れない: 訪問者の最初のページでは `flush()` の前に呼ぶこと。
+- `flush()` は前のチャンクを接続が受け取るまで待つので、ページが訪問者より 1 チャンクより先に進むことはない。送った出力は
+  ページのメモリの上限ではなく、サーバーの出力の合計に数える。訪問者が去ったか、30 秒間何も読まないと `false` を返し、
+  その後に書いた出力は捨てる。ページは終わるまでワーカーを使い、時間の上限はほかのページと同じである。
+- `flush()` の後に失敗したページはエラーページを出せない: レスポンスは途中で切れる(HTTP/1.1 は最後のチャンクを送らずに
+  接続を閉じ、HTTP/2 はストリームをリセットする)ので、クライアントは完全でないと分かる。エラーはいつもどおりログに出る。
+- ストリーミングするレスポンスは圧縮しない。出力を取り込んでいる間(`layout()` を使うページやテンプレートの中)、
+  WebSocket のスクリプト、`response()->file()` の後では `flush()` を呼べない(`ValueError`)。`flush()` を呼んだ
+  ミドルウェアはリクエストに答えたことになる。`phv serve` の外(`phv run`、`phv test`)では出力をそのまま持ち、`true` を
+  返す。
+- ストリーミングするレスポンスのアクセスログ、`phv_request_duration_seconds`、トレースのスパンは、ヘッダーを送った時点で
+  終わる。
 
 ### セッション
 
@@ -1503,6 +1573,73 @@ echo $res->status, " ", $res->header("content-type") ?? "", "\n", $res->body;
   `url_env` や `headers_env` の環境変数が設定されていないことはリクエストを送るときに報告するので、`phv check` は本番の
   キーなしで使える。
 
+### OAuth 2.0 と OpenID Connect によるサインイン(std.oauth)
+
+```toml
+[oauth.google]
+issuer = "https://accounts.google.com"            # OpenID Connect: エンドポイントは issuer のディスカバリー文書から
+client_id_env = "GOOGLE_CLIENT_ID"                # または client_id
+client_secret_env = "GOOGLE_CLIENT_SECRET"        # パブリッククライアント(PKCE だけ)なら書かない
+redirect_uri = "https://example.com/auth/google"  # または redirect_uri_env。プロバイダーに登録したもの
+scopes = ["openid", "email", "profile"]           # 既定 ["openid"]
+
+[oauth.github]                                    # OpenID Connect のない OAuth 2.0
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url = "https://github.com/login/oauth/access_token"
+client_id_env = "GITHUB_CLIENT_ID"
+client_secret_env = "GITHUB_CLIENT_SECRET"
+client_auth = "post"                              # シークレットをリクエストの本文で送る("basic": HTTP Basic)
+redirect_uri = "https://example.com/auth/github"
+scopes = ["read:user"]
+```
+
+```phv
+// public/login/google.phv
+import std.oauth.OAuth;
+OAuth::provider("google")->redirect();               // プロバイダーへ(302)
+
+// public/auth/google.phv: リダイレクト URI
+import std.http.{response, session};
+import std.oauth.{OAuth, OAuthError};
+try {
+    $signIn = OAuth::provider("google")->callback();
+} catch (OAuthError $e) {
+    response()->status(400);
+    echo "サインインできませんでした: ", $e->getMessage();   // $e->error: "access_denied"、"invalid_state" など
+    return;
+}
+session()->regenerate();
+session()->set("user", "google:" . ($signIn->subject() ?? ""));   // プロバイダーでの訪問者の変わらない ID
+$email = $signIn->verifiedEmail();                                // ?string: プロバイダーが確認したときだけ
+response()->redirect("/");
+```
+
+- PKCE(S256)付きの認可コードフロー。`redirect()`(または URL を返す `authorizationUrl()`)は、ランダムな `state`、
+  OpenID Connect の `nonce`、PKCE の verifier を訪問者のセッションに 10 分間・1 回限りで保存する。1 つのセッションで
+  同時に始められるサインインは 4 つまで(タブ)。`["prompt" => "select_account"]` のような追加のパラメータを渡せるが、
+  フローそのもののパラメータは渡せない。
+- `callback()` は、このセッションがこのプロバイダーに対して始めた `state` だけを受け付ける。そのため別のブラウザで
+  サインインを終えることはできず、ほかのサイトが訪問者をそのサイト自身のアカウントでサインインさせることもできない。
+  プロバイダーのエラー(`?error=access_denied`)は `OAuthError` として渡し、別の issuer を名乗る `iss` パラメータは
+  拒否し(RFC 9207)、コードをトークンエンドポイントで verifier とクライアントシークレットとともにトークンに交換する
+  (HTTP Basic。`client_auth = "post"` のとき、またはディスカバリー文書が `client_secret_post` だけを許すときは本文)。
+- OpenID Connect では、ID トークンは、プロバイダーの JWKS の鍵(RS256・ES256・EdDSA。std.jwt の `KeySet::fetch()` と同じく
+  保持する)で署名され、issuer をそのまま、このクライアントを audience として(audience が複数なら `azp` としても)名乗り、
+  サインインの nonce・`sub`・`exp`・`iat` を持ち、いま有効(60 秒の猶予)でなければならない。そうでなければ `callback()` は
+  `invalid_id_token` の `OAuthError` を投げる。`SignIn` には `claims`、`subject()`、`claim($name)`、`verifiedEmail()`、
+  `accessToken`、`refreshToken`、`expiresIn`、`scope`、`idToken` がある。OpenID Connect がなければ `claims` は空:
+  アクセストークンでプロバイダーの API に問い合わせる(`Authorization: Bearer` ヘッダーを付けた `HttpClient`)。
+- 利用者はメールアドレスではなく、プロバイダーと `subject()` で識別すること: アドレスは別の人に渡ることがあり、
+  プロバイダーが確認したと分かるのは `verifiedEmail()` だけである。ほかのログインと同じく、サインインの後には
+  `session()->regenerate()` を呼ぶ。
+- ディスカバリー文書(`<issuer>/.well-known/openid-configuration`)は、設定した issuer をそのまま名乗らなければならない。
+  1 時間保持する(取り直せないときは最大 1 日、30 秒ごとに再試行)。エンドポイントは、このマシンにあるか `tls = false` で
+  なければ TLS が必要。リダイレクト URI は、このマシンになければ TLS が必要。クライアントシークレットは環境変数
+  (スクリプトからは読めない)から読み、決して表示しない。変数が設定されていなければ、サインインを始めたときに報告する。
+- プロバイダーや訪問者による失敗は `OAuthError`(`$e->error` は OAuth のエラーコード。プロバイダーからの文字列は
+  表示できる ASCII に切り詰める)、プロバイダーに届かないときは `NetworkError`、phv.toml やスクリプトの誤りは
+  `ValueError` を投げる。`redirect()` と `callback()` はページの中でだけ使える。
+
 ### 入力の検証(std.validate)
 
 ```phv
@@ -1759,11 +1896,47 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
 | `json_decode($s): any` | 深さ 128 まで |
 | `encrypt($text, $key)`、`decrypt($box, $key): ?string` | ChaCha20-Poly1305。メッセージごとに鍵を導出し(ランダムな salt で HKDF-SHA256)、nonce もランダム。結果は base64url のテキスト。`decrypt` は、テキストが変えられていたり暗号化したときと鍵が違ったりすると `null` |
 | `sign_token($data, $key)`、`sign_token($data, $key, $seconds)`、`verify_token($token, $key): ?string` | HMAC-SHA256 の署名付きのデータ。`$seconds` を渡すとその秒数だけ有効(パスワード再設定などメールのリンク用)。データは base64url にしただけで読めるので、秘密にするものは暗号化する。`verify_token` はデータを返し、トークンが変えられている、別の鍵で署名されている、期限切れのときは `null` |
-| `jwt_encode($claims, $key)`、`jwt_decode($token, $key): ?map<string, any>` | HS256 だけの JSON Web Token。ほかのアルゴリズム(`none` を含む)を名乗るトークンは拒否する。`exp` と `nbf` を検査する。鍵は(ほかの JWT のライブラリと同じく)そのまま使うので、同じ鍵を `hash_hmac()` に使わない: 訪問者のテキストの HMAC が正しい署名になってしまう |
+| `jwt_encode($claims, $key)`、`jwt_decode($token, $key): ?map<string, any>` | HS256 だけの JSON Web Token(RS256・ES256・EdDSA と鍵セットは std.jwt)。ほかのアルゴリズム(`none` を含む)を名乗るトークンは拒否する。`exp` と `nbf` を検査する。鍵は(ほかの JWT のライブラリと同じく)そのまま使うので、同じ鍵を `hash_hmac()` に使わない: 訪問者のテキストの HMAC が正しい署名になってしまう |
 
 `encrypt`、`sign_token`、JWT の関数の鍵は 32 バイト以上の秘密の文字列(`random_token()` で作れる)。コードには書かず、
 環境変数に入れて `getenv` で読む。`encrypt` と `sign_token` は渡された鍵からそれぞれ別の鍵を導出するので、1 つの鍵を
 両方に使ってよい。トークンはそのまま比べるので、前後に空白があると無効。
+
+### JSON Web Token(std.jwt)
+
+```phv
+import std.jwt.{JwtKey, KeySet};
+
+$key = JwtKey::fromPem(getenv("JWT_PRIVATE_KEY") ?? "", "2026-11");   // 秘密鍵と、その鍵 ID
+$token = $key->sign(["sub" => "7", "exp" => time() + 3600]);
+$claims = $key->verify($token);                                      // ?map<string, any>
+echo $key->publicJwk();                                              // 公開する公開鍵(JWK)
+
+$auth = KeySet::fetch("auth", "/.well-known/jwks.json");             // [http.auth] の JWKS
+$claims = $auth->verify($token, issuer: "https://auth.example.com/", audience: "my-api", leeway: 30);
+```
+
+- 鍵の種類がアルゴリズムを決める: RSA の鍵は RS256、P-256 の鍵は ES256、Ed25519 の鍵は EdDSA、
+  `JwtKey::secret($secret)`(32 バイト以上)は HS256 で署名する。トークンは、そのヘッダーが名乗るアルゴリズムの鍵でだけ
+  検査するので、トークンが別の種類の鍵(HMAC のシークレットとして使う公開鍵など)や `none` を選ぶことはできない。
+  `crit` を持つトークンは拒否し、ほかの鍵を指すヘッダーのパラメータ(`jku`、`x5u`、`jwk`、`x5c`)は無視する。
+- `JwtKey::fromPem()` は秘密鍵(`PRIVATE KEY`(PKCS#8)、`RSA PRIVATE KEY`、`EC PRIVATE KEY`)と公開鍵(`PUBLIC KEY`、
+  `RSA PUBLIC KEY`)を読む。RSA の鍵は 2048〜4096 ビットで署名、8192 ビットまで検証できる。暗号化された鍵やほかの種類の
+  鍵は拒否する(`ValueError`)。`JwtKey::fromJwk()` は JWK の公開鍵を読む。`alg`、`kid`、`canSign` で鍵の種類が分かる。
+  鍵は実行環境の中にだけあり、スクリプトが持つ値にも `dump()` にも秘密鍵は現れない。
+- `verify()` はクレームを返す。署名・アルゴリズム・クレームが正しくなければ `null`: `exp` と `nbf`(数値)は `$leeway` 秒
+  (0〜300)の猶予付きで検査し、1 分より先の `iat`、`$issuer` を渡したときの `iss`、`aud`(文字列 `$audience`、または
+  それを含むリスト)も検査する。`$audience` を渡さないと、`aud` を持つトークンは拒否する: ほかの誰かのために作られた
+  トークンである。
+- `KeySet::of([...])` は複数の鍵で検証する(鍵を入れ替える間の古い鍵と新しい鍵)。トークンの `kid` で鍵を選ぶ。
+  `KeySet::fromJson()` は JWKS の文書を読み、`toJson()` は鍵セットの公開鍵を書く(`/.well-known/jwks.json` で配るため)。
+  JWKS のほかの種類の鍵は飛ばし、`oct` の鍵は決して読まない。
+- `KeySet::fetch($service, $path)` は `[http]` の HTTP サービスから(そのヘッダーを付けて)JWKS を取得する。鍵セットは
+  サーバープロセス全体で保持し、`Cache-Control: max-age`(1 分〜1 日。なければ 1 時間)より古くなったとき、また
+  トークンが鍵セットにない鍵 ID を名乗ったときに取り直す。後者は最初のトークンですぐ、その後は 30 秒に 1 回までなので、
+  でっち上げた鍵 ID でサーバーに何度も取得させることはできない。取り直せない鍵セットは最大 1 日使い、30 秒ごとに
+  再試行する。JWKS は 512 KB まで、読む鍵は 64 個まで、保持する鍵セットは 32 個まで。
+- `jwt_encode()` と `jwt_decode()`(HS256)はそのまま使える。
 
 ### Content-Security-Policy
 
@@ -1897,6 +2070,15 @@ store = "db:main"       # バックグラウンドジョブ(「バックグラ�
 [[schedule]]
 job = "cleanup"
 cron = "0 3 * * *"
+
+[oauth.google]
+issuer = "https://accounts.google.com"   # OpenID Connect によるサインイン(std.oauth)
+client_id_env = "GOOGLE_CLIENT_ID"
+client_secret_env = "GOOGLE_CLIENT_SECRET"
+redirect_uri = "https://example.com/auth/google"
+
+[telemetry]
+endpoint = "http://localhost:4318"   # OpenTelemetry のコレクターにトレースを送る(「トレース」)
 
 [fmt]
 width = 100             # phv fmt はこれより長い行を折り返す
@@ -2344,6 +2526,12 @@ phv migrate legacy/page.php      # page.phv を書き出す
 | ストアが覚えておく終わったジョブの key | 100,000(新しいもの)、それぞれ 1 日 | 古いものから忘れる |
 | 送信待ちの出力(`serve`) | `workers` × `memory_limit_mb`(その 4 分の 1 がイベントストリームの分) | 503。イベントストリームは終えるか、そのイベントを飛ばす |
 | 受信中・保持中のリクエスト本文の、最初の 64 KB より後のバイト(`serve`) | `workers` × 8 MB | 最大 10 秒待ち、その後 503 |
+| ストリーミングするレスポンス(`flush()`) | クライアントより 1 チャンク先まで。読まない時間は 30 秒まで | `flush()` が false を返す |
+| JSON Web Token(std.jwt) | 256 KB、ヘッダーは 8 KB | `verify()` が null を返す |
+| JWKS | 512 KB、読む鍵は 64 個。プロセスごとに保持する鍵セットは 32 個 | `NetworkError`(`fetch`)、`ValueError`(`fromJson`) |
+| セッションが始めたサインイン(std.oauth) | 4 つ、それぞれ 10 分 | いちばん古いものを忘れる |
+| スクリプトが記録するスパン(`[telemetry]`) | 1,000 | 記録しない |
+| 送信を待つスパン | 8,192 | 捨てる(`phv_telemetry_dropped_spans_total`) |
 | ソースファイル(モジュール、テンプレート、スクリプト) | 8 MB | コンパイルエラー(`phv lsp`: それより大きい開いた文書は検査も整形もせず、開いている間は名前の変更を拒む) |
 | 1 つのソースファイルのトークン(文字列の中のコードを含む) | 1,000,000 | コンパイルエラー(そのファイルは構文解析しない) |
 | 1 つのプログラムのすべてのファイル(ページかスクリプトと、それが import・描画するもの。std を含む) | トークン 2,000,000 個、ソース 32 MB、ファイル 2,000 個 | コンパイルエラー(そのプログラムは型検査しない。`phv lsp` はトークンが 250,000 個を超えるプログラムの解析結果をリクエストの間に保持しない) |

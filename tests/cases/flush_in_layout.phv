@@ -1,0 +1,12 @@
+<?phv
+// response()->flush() outside phv serve keeps the output; inside a layout it is refused.
+import std.http.response;
+layout("views/layout.phv.html", title: "Flush");
+
+echo "before ";
+try {
+    response()->flush();
+} catch (ValueError $e) {
+    echo $e->getMessage(), " ";
+}
+echo "after\n";

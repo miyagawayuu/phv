@@ -51,9 +51,19 @@
 //! [http.weather]
 //! url = "https://api.example.com/v1"
 //! headers_env = { Authorization = "WEATHER_AUTH" }
+//!
+//! [oauth.google]
+//! issuer = "https://accounts.google.com"   # OpenID Connect (or authorize_url and token_url)
+//! client_id_env = "GOOGLE_CLIENT_ID"
+//! client_secret_env = "GOOGLE_CLIENT_SECRET"
+//! redirect_uri = "https://example.com/auth/google"
+//! scopes = ["openid", "email"]
+//!
+//! [telemetry]
+//! endpoint = "http://localhost:4318"   # an OpenTelemetry collector (OTLP/HTTP)
 //! ```
 
-use phv_vm::{DatabaseSpec, Host, HttpSpec, MailSpec, Permissions, WebSocketSpec};
+use phv_vm::{DatabaseSpec, Host, HttpSpec, MailSpec, OAuthSpec, Permissions, WebSocketSpec};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -83,6 +93,8 @@ struct File {
     #[serde(default)]
     mail: BTreeMap<String, MailSection>,
     #[serde(default)]
+    oauth: BTreeMap<String, OAuthSection>,
+    #[serde(default)]
     fmt: FmtSection,
     #[serde(default)]
     admin: Option<AdminSection>,
@@ -90,6 +102,87 @@ struct File {
     jobs: Option<JobsSection>,
     #[serde(default)]
     schedule: Vec<ScheduleSection>,
+    #[serde(default)]
+    telemetry: Option<TelemetrySection>,
+}
+
+/// `[telemetry]`: traces sent to an OpenTelemetry collector.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TelemetrySection {
+    endpoint: Option<String>,
+    endpoint_env: Option<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    headers_env: BTreeMap<String, String>,
+    service_name: Option<String>,
+    sample: Option<f64>,
+    tls: Option<bool>,
+}
+
+/// `[telemetry]`, checked.
+#[derive(Clone)]
+pub struct Telemetry {
+    /// Where spans are sent (`<endpoint>/v1/traces`); None when `endpoint_env`
+    /// names a variable that is not set (traces are then not sent).
+    pub url: Option<String>,
+    pub endpoint_env: Option<String>,
+    /// Headers sent with each export (from `headers_env`: None when unset).
+    pub headers: Vec<(String, Option<String>)>,
+    pub service_name: String,
+    /// The share of new traces recorded, 0 to 1.
+    pub sample: f64,
+    pub tls: Option<bool>,
+}
+
+impl std::fmt::Debug for Telemetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Telemetry")
+            .field("endpoint_env", &self.endpoint_env)
+            .field("service_name", &self.service_name)
+            .field("sample", &self.sample)
+            .finish_non_exhaustive()
+    }
+}
+
+fn telemetry(t: TelemetrySection, project: Option<&str>) -> Result<Telemetry, String> {
+    let endpoint = value_or_env("telemetry", "endpoint", t.endpoint, &t.endpoint_env)?;
+    let url = match endpoint {
+        Some(e) => {
+            let from = t.endpoint_env.as_deref().map(|v| format!(" (from ${v})")).unwrap_or_default();
+            phv_std::check_oauth_url(&e, t.tls).map_err(|err| format!("[telemetry] endpoint{from}: {err}"))?;
+            if e.contains('?') || e.contains('#') {
+                return Err(format!("[telemetry] endpoint{from}: no query or fragment"));
+            }
+            let e = e.trim_end_matches('/');
+            Some(if e.ends_with("/v1/traces") { e.to_string() } else { format!("{e}/v1/traces") })
+        }
+        None => None,
+    };
+    let mut headers = Vec::new();
+    for (h, v) in t.headers {
+        phv_std::check_header_name(&h).map_err(|e| format!("[telemetry] headers: {e}"))?;
+        phv_std::check_header_value(&h, &v).map_err(|e| format!("[telemetry] headers: {e}"))?;
+        headers.push((h, Some(v)));
+    }
+    for (h, var) in t.headers_env {
+        phv_std::check_header_name(&h).map_err(|e| format!("[telemetry] headers_env: {e}"))?;
+        if headers.iter().any(|(n, _): &(String, Option<String>)| n.eq_ignore_ascii_case(&h)) {
+            return Err(format!("[telemetry]: {h} is in both headers and headers_env"));
+        }
+        let value = std::env::var(&var).ok().filter(|v| !v.is_empty() && phv_std::check_header_value(&h, v).is_ok());
+        headers.push((h, value));
+    }
+    let service_name = t.service_name.or_else(|| project.map(str::to_string)).unwrap_or_else(|| "phv".into());
+    if service_name.is_empty() || service_name.len() > 128 || service_name.chars().any(|c| c.is_control()) {
+        return Err("[telemetry] service_name: 1 to 128 characters, no control characters".into());
+    }
+    let sample = t.sample.unwrap_or(1.0);
+    if !(0.0..=1.0).contains(&sample) {
+        return Err("[telemetry] sample: a share from 0 to 1".into());
+    }
+    Ok(Telemetry { url, endpoint_env: t.endpoint_env, headers, service_name, sample, tls: t.tls })
 }
 
 /// `[jobs]`: background jobs, run by `phv serve` and `phv jobs run`.
@@ -365,6 +458,112 @@ struct HttpSection {
     /// Headers whose values come from environment variables (API keys).
     #[serde(default)]
     headers_env: BTreeMap<String, String>,
+}
+
+/// `[oauth.<name>]`: a sign-in provider of std.oauth.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OAuthSection {
+    issuer: Option<String>,
+    authorize_url: Option<String>,
+    token_url: Option<String>,
+    client_id: Option<String>,
+    client_id_env: Option<String>,
+    client_secret_env: Option<String>,
+    redirect_uri: Option<String>,
+    redirect_uri_env: Option<String>,
+    scopes: Option<Vec<String>>,
+    /// "basic" or "post".
+    client_auth: Option<String>,
+    tls: Option<bool>,
+}
+
+/// One of `value` or the value of the variable `env` (None when it is not set).
+fn value_or_env(
+    section: &str,
+    key: &str,
+    value: Option<String>,
+    env: &Option<String>,
+) -> Result<Option<String>, String> {
+    match (value, env) {
+        (Some(v), None) => Ok(Some(v)),
+        (None, Some(var)) => Ok(std::env::var(var).ok().filter(|v| !v.is_empty())),
+        _ => Err(format!("[{section}]: give exactly one of `{key}` or `{key}_env`")),
+    }
+}
+
+fn oauth_spec(name: &str, o: OAuthSection) -> Result<OAuthSpec, String> {
+    if !valid_server_name(name) {
+        return Err(format!("[oauth]: invalid name \"{name}\" (letters, digits, `_` and `-`)"));
+    }
+    let section = format!("oauth.{name}");
+    let url = |key: &str, u: &str| -> Result<(), String> {
+        phv_std::check_oauth_url(u, o.tls).map_err(|e| format!("[{section}] {key}: {e}"))
+    };
+    match (&o.issuer, &o.authorize_url, &o.token_url) {
+        (Some(i), None, None) => {
+            url("issuer", i)?;
+            if i.contains('?') || i.contains('#') {
+                return Err(format!("[{section}] issuer: an issuer has no query or fragment"));
+            }
+        }
+        (None, Some(a), Some(t)) => {
+            url("authorize_url", a)?;
+            url("token_url", t)?;
+        }
+        _ => {
+            return Err(format!(
+                "[{section}]: give `issuer` (OpenID Connect), or `authorize_url` and `token_url` (OAuth 2.0), not both"
+            ))
+        }
+    }
+    let client_id = value_or_env(&section, "client_id", o.client_id, &o.client_id_env)?;
+    let client_secret = o.client_secret_env.as_ref().and_then(|v| std::env::var(v).ok()).filter(|v| !v.is_empty());
+    let redirect_uri = value_or_env(&section, "redirect_uri", o.redirect_uri, &o.redirect_uri_env)?;
+    if let Some(r) = &redirect_uri {
+        let from = o.redirect_uri_env.as_deref().map(|v| format!(" (from ${v})")).unwrap_or_default();
+        phv_std::check_oauth_url(r, None).map_err(|e| format!("[{section}] redirect_uri{from}: {e}"))?;
+        if r.contains('#') {
+            return Err(format!("[{section}] redirect_uri{from}: a redirect URI has no fragment"));
+        }
+    }
+    let oidc = o.issuer.is_some();
+    let scopes = o.scopes.unwrap_or_else(|| if oidc { vec!["openid".to_string()] } else { Vec::new() });
+    for s in &scopes {
+        let ok =
+            !s.is_empty() && s.bytes().all(|b| b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b));
+        if !ok {
+            return Err(format!("[{section}] scopes: invalid scope \"{}\"", s.escape_debug()));
+        }
+    }
+    if oidc && !scopes.iter().any(|s| s == "openid") {
+        return Err(format!("[{section}] scopes: OpenID Connect needs the \"openid\" scope"));
+    }
+    let secret_in_body = match o.client_auth.as_deref() {
+        None => None,
+        Some("basic") => Some(false),
+        Some("post") => Some(true),
+        Some(other) => {
+            return Err(format!("[{section}] client_auth: \"{}\" is not \"basic\" or \"post\"", other.escape_debug()))
+        }
+    };
+    if secret_in_body.is_some() && o.client_secret_env.is_none() {
+        return Err(format!("[{section}] client_auth: there is no client_secret_env to send"));
+    }
+    Ok(OAuthSpec {
+        issuer: o.issuer,
+        authorize_url: o.authorize_url,
+        token_url: o.token_url,
+        client_id,
+        client_id_env: o.client_id_env,
+        client_secret,
+        client_secret_env: o.client_secret_env,
+        redirect_uri,
+        redirect_uri_env: o.redirect_uri_env,
+        scopes,
+        secret_in_body,
+        tls: o.tls,
+    })
 }
 
 fn http_spec(name: &str, h: HttpSection) -> Result<HttpSpec, String> {
@@ -766,6 +965,8 @@ pub struct Config {
     /// `[jobs]` and `[[schedule]]`.
     pub jobs: Option<Jobs>,
     pub schedules: Vec<Schedule>,
+    /// `[telemetry]`: traces sent to an OpenTelemetry collector.
+    pub telemetry: Option<Telemetry>,
 }
 
 /// `[server] tls_cert` / `tls_key`, resolved against the project root.
@@ -807,6 +1008,7 @@ impl Config {
             publish_store: None,
             jobs: None,
             schedules: Vec::new(),
+            telemetry: None,
         }
     }
 }
@@ -1257,6 +1459,11 @@ pub fn parse_config_with_jobs(root: &Path, text: &str, jobs_given: Option<Vec<St
         let spec = http_spec(&name, h)?;
         http.insert(name, spec);
     }
+    let mut oauth = BTreeMap::new();
+    for (name, o) in file.oauth {
+        let spec = oauth_spec(&name, o)?;
+        oauth.insert(name, spec);
+    }
     // The site's namespace in shared stores: `[security] store_namespace`, or
     // the project's name (found by the 1.1 audit: sites sharing a database
     // shared sessions, rate limits and jobs). Hashed: it names tables and keys.
@@ -1278,6 +1485,15 @@ pub fn parse_config_with_jobs(root: &Path, text: &str, jobs_given: Option<Vec<St
         hidden.extend(h.url_env.iter().cloned());
         hidden.extend(h.headers_env.iter().map(|(_, var)| var.clone()));
     }
+    hidden.extend(oauth.values().filter_map(|o| o.client_secret_env.clone()));
+    let telemetry = match file.telemetry {
+        Some(t) => {
+            hidden.extend(t.endpoint_env.iter().cloned());
+            hidden.extend(t.headers_env.values().cloned());
+            Some(telemetry(t, file.project.name.as_deref())?)
+        }
+        None => None,
+    };
     Ok(Config {
         name: file.project.name,
         host: Arc::new(Host {
@@ -1293,6 +1509,7 @@ pub fn parse_config_with_jobs(root: &Path, text: &str, jobs_given: Option<Vec<St
             no_stdin: false,
             args: Vec::new(),
             store_namespace,
+            oauth,
             jobs: jobs.as_ref().map(|j| phv_vm::JobsSpec {
                 store: j.store.clone(),
                 names: job_names.clone(),
@@ -1327,6 +1544,7 @@ pub fn parse_config_with_jobs(root: &Path, text: &str, jobs_given: Option<Vec<St
         publish_store,
         jobs,
         schedules,
+        telemetry,
     })
 }
 
@@ -1679,6 +1897,89 @@ headers_env = { Authorization = \"PHV_TEST_HTTP_KEY\", X-Missing = \"PHV_TEST_HT
             "[http.api]\nurl = \"https://a/\"\nheaders = { X = \"1\" }\nheaders_env = { x = \"V\" }\n",
             "[http.api]\nurl = \"https://a/\"\ntimeout = 3\n",
             "[http.\"a b\"]\nurl = \"https://a/\"\n",
+        ] {
+            assert!(load(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn oauth_providers() {
+        std::env::set_var("PHV_TEST_OAUTH_SECRET_1", "very-secret");
+        let c = load(
+            "[oauth.google]
+issuer = \"https://accounts.google.com\"
+client_id = \"123.apps\"
+client_secret_env = \"PHV_TEST_OAUTH_SECRET_1\"
+redirect_uri = \"https://example.com/auth/google\"
+
+[oauth.github]
+authorize_url = \"https://github.com/login/oauth/authorize\"
+token_url = \"https://github.com/login/oauth/access_token\"
+client_id_env = \"PHV_TEST_OAUTH_UNSET\"
+client_secret_env = \"PHV_TEST_OAUTH_SECRET_1\"
+client_auth = \"post\"
+redirect_uri = \"http://localhost:8080/auth/github\"
+scopes = [\"read:user\"]
+",
+        )
+        .unwrap();
+        let g = &c.host.oauth["google"];
+        assert_eq!(g.scopes, ["openid"]);
+        assert_eq!(g.client_secret.as_deref(), Some("very-secret"));
+        assert_eq!(g.secret_in_body, None);
+        let shown = format!("{g:?}");
+        assert!(!shown.contains("very-secret"), "{shown}");
+        let gh = &c.host.oauth["github"];
+        assert_eq!(gh.client_id, None, "an unset variable is reported when used");
+        assert_eq!(gh.secret_in_body, Some(true));
+        assert!(c.host.permissions.hidden_env.contains(&"PHV_TEST_OAUTH_SECRET_1".to_string()));
+        let ok = "client_id = \"a\"\nredirect_uri = \"https://e.com/cb\"\n";
+        for bad in [
+            format!("[oauth.x]\n{ok}"),
+            format!("[oauth.x]\nissuer = \"http://id.example\"\n{ok}"),
+            format!("[oauth.x]\nissuer = \"https://id.example?x=1\"\n{ok}"),
+            format!("[oauth.x]\nissuer = \"https://id.example\"\nauthorize_url = \"https://id.example/a\"\n{ok}"),
+            format!("[oauth.x]\nauthorize_url = \"https://id.example/a\"\n{ok}"),
+            format!("[oauth.x]\nissuer = \"https://id.example\"\nscopes = [\"email\"]\n{ok}"),
+            format!("[oauth.x]\nissuer = \"https://id.example\"\nscopes = [\"a b\"]\n{ok}"),
+            format!("[oauth.x]\nissuer = \"https://id.example\"\nclient_auth = \"post\"\n{ok}"),
+            format!("[oauth.x]\nissuer = \"https://id.example\"\nclient_secret = \"inline\"\n{ok}"),
+            "[oauth.x]\nissuer = \"https://id.example\"\nclient_id = \"a\"\nredirect_uri = \"http://e.com/cb\"\n"
+                .into(),
+            "[oauth.x]\nissuer = \"https://id.example\"\nclient_id = \"a\"\nredirect_uri = \"https://e.com/cb#x\"\n"
+                .into(),
+            "[oauth.x]\nissuer = \"https://id.example\"\nredirect_uri = \"https://e.com/cb\"\n".into(),
+        ] {
+            assert!(load(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn telemetry() {
+        std::env::set_var("PHV_TEST_OTEL_KEY", "api-key-1");
+        let c = load(
+            "[project]\nname = \"shop\"\n\n[telemetry]\nendpoint = \"https://otel.example.com/\"\n\
+             headers_env = { \"X-Key\" = \"PHV_TEST_OTEL_KEY\" }\nsample = 0.25\n",
+        )
+        .unwrap();
+        let t = c.telemetry.as_ref().unwrap();
+        assert_eq!(t.url.as_deref(), Some("https://otel.example.com/v1/traces"));
+        assert_eq!(t.service_name, "shop");
+        assert_eq!(t.sample, 0.25);
+        assert_eq!(t.headers, [("X-Key".to_string(), Some("api-key-1".to_string()))]);
+        assert!(!format!("{t:?}").contains("api-key-1"));
+        assert!(c.host.permissions.hidden_env.contains(&"PHV_TEST_OTEL_KEY".to_string()));
+        let c = load("[telemetry]\nendpoint = \"http://localhost:4318/v1/traces\"\n").unwrap();
+        let t = c.telemetry.as_ref().unwrap();
+        assert_eq!(t.url.as_deref(), Some("http://localhost:4318/v1/traces"));
+        assert_eq!(t.service_name, "phv");
+        for bad in [
+            "[telemetry]\n",
+            "[telemetry]\nendpoint = \"http://otel.example.com\"\n",
+            "[telemetry]\nendpoint = \"https://otel.example.com?x=1\"\n",
+            "[telemetry]\nendpoint = \"https://otel.example.com\"\nsample = 1.5\n",
+            "[telemetry]\nendpoint = \"https://otel.example.com\"\nheaders = { Host = \"x\" }\n",
+            "[telemetry]\nendpoint = \"https://otel.example.com\"\nservice_name = \"\"\n",
         ] {
             assert!(load(bad).is_err(), "{bad}");
         }

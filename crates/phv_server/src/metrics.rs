@@ -24,6 +24,13 @@ pub enum Kind {
 const KINDS: [(Kind, &str); 5] =
     [(Kind::Page, "page"), (Kind::Static, "static"), (Kind::Ws, "ws"), (Kind::Sse, "sse"), (Kind::Other, "other")];
 
+impl Kind {
+    /// The `kind` label of `phv_requests_total`.
+    pub fn label(self) -> &'static str {
+        KINDS.iter().find(|(k, _)| *k == self).map_or("other", |(_, l)| l)
+    }
+}
+
 /// Why a request was turned away before a script ran.
 #[derive(Clone, Copy, Debug)]
 pub enum Reject {
@@ -186,6 +193,8 @@ pub struct Metrics {
     pub jobs_dead: AtomicU64,
     pub job_duration: Histogram,
     pub health: Arc<Health>,
+    /// `[telemetry]`: spans dropped because the export queue was full.
+    pub telemetry_dropped: Arc<AtomicU64>,
 }
 
 impl Metrics {
@@ -296,6 +305,13 @@ impl Metrics {
         }
         head(&mut out, "phv_job_duration_seconds", "histogram", "Time a job ran.");
         self.job_duration.write(&mut out, "phv_job_duration_seconds", "");
+        head(
+            &mut out,
+            "phv_telemetry_dropped_spans_total",
+            "counter",
+            "Spans not exported because the queue was full.",
+        );
+        let _ = writeln!(out, "phv_telemetry_dropped_spans_total {}", self.telemetry_dropped.load(Ordering::Relaxed));
         head(&mut out, "phv_store_errors_total", "counter", "Failures of the stores the server uses.");
         for (i, s) in STORES.iter().enumerate() {
             let n = self.health.errors[i].load(Ordering::Relaxed);

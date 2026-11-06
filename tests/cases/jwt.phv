@@ -1,0 +1,224 @@
+// std.jwt: RS256, ES256 and EdDSA keys from PEM and JWK, key sets, and the checks of verify().
+// (The keys are test keys made for this file.)
+import std.jwt.{JwtKey, KeySet, Verifier};
+
+$rsa = JwtKey::fromPem(<<<'PEM'
+-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC/XI3TtZdxWv80
+CG5Yz+0wfp+JgCuxXsgKZlKEjQP5kz5j/wED7UcGkdN50Mz0aWC67PhnCn3UwV0M
+cAjmgCVOeaXFZky8TpRWC4KY4U03UV2jPagHnHfOY8NkxQIx1IS4BAIujotK93gA
+QIpnwpCLCBaayFahY6yr9GWqVvVvxOAAVy81hohe6k8SnzVC5121z52jcWnOzVvg
+9POVSrd8DTlVQq9K/wv3OW9lVB7ZA6vm6VRVWM/V/iBGQbuX0rPpVVDK4P8NU3vt
+D7TyYICeto/+DvACWAU8UFM4rlMVFwdUErFQe+05EE0HOSjtSYLxp0cxyfNGTuP8
+XCH0rA0BAgMBAAECggEAAiVolcpAk43gtNWvXyGd2GBjK6ibVNbqSWuSW1g1hjQH
+jBmNCl074a/6/i/ATLFt20rTElzEwoEUqRIMl4EyaenlWQxnqej7sudYJJzKP+eS
+tET5wHQZx9/IjjXDa4mln2a0G4+PslyKJP6UTsuY0WZa0ouSpSa4Bgmspjdpc0Ju
+BYJ4pgXOrbbGWvlLtXFVVlUDJxigN4Ef48F/YkC0C4p7oyQD7HQ2B0fUag/Zw39t
+KkQJCspXl/srpKn2ihSDOcykXgKG9/ueyE9Ge7SLpCGgO/dJ/rYEdShnJXX5Y5oG
+eo2eIYtejvAIvSUU9tdbcHx9ckM8ijcDJRt45WpEAQKBgQDhxYk3QNabEUyEIiq4
+rjohAQhCnI04u+XfDOWw5Xq07O8w1SiutuA3sIxwCCNWMGStO6y5BMwGUoh9TBkB
+K2TIL+cmImjwtrG3wyynnM7LY/iXL0hJEDqCjp/XY5xhEp2ytOjnemp5+UwvJtGp
++28PxJd97Ak0EZiznJxKsvOMYQKBgQDY+5c7AWpfA/ehOxzTZf1sMP/1ok9b3opa
+vJazRj9crvoYpztqpX0M4KxoPWct5HZcd/eJQ4dtzFYSfZrmS1Klm4XK/zt1mwqv
+o2xaqdj9F3iIcv2ycIsqf2oFdT7toSdzxGXOTsD1Dsw9gm0H2mfC/bewoR4o7oLd
+Fr1my5dEoQKBgQCA9i/R8uRjATeexlF22nZzwb4xJnF4dcPxa9GMARjdXfWnBCtP
+2UAsL1mY6N0eb1gip9KagMX12pECWURzKZFQ1CQJ4V/mF8Vd/Ut1lpl9DmbCHQ0C
+RxXU25ksFEcQH+0aVkIvbvqBH8jHqjnbCbc/34DVOc1sA50hA5U3Cg8aIQKBgHg+
+RDpguG/bJPlmZr0Hwf6Y0N9wiQXiN029QM4sWaSlGtdapWSePMRMJX7GuE0IVEc9
+/CFHGN/R4sjwbky85Rn9K5GpC2xK9QsMR1me0i6/OP50qv6du6FbZoeLx8msCs7u
+wXQo1Gl5P9m+U2mMsP+v1oG9Z5dLRZ37og47OKLBAoGAC3HJGwOlNzUEnGtlIZZZ
+xK/JUoy5+/W2HHgBMV/MG/4UfluT32e9W3Xp/6B1o6+8LbTW1vi3Rll73WUNuhwb
+0DVC5rYdBVXHw9iCMgnS/0DYXMFvNyCzq14XtAvVslrXPqqkRKtaMIUYLaXxTzOO
+fxDEkR1oi5iYCjC+3Lclu4c=
+-----END PRIVATE KEY-----
+PEM, "rsa-1");
+$rsa1 = JwtKey::fromPem(<<<'PEM'
+-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAv1yN07WXcVr/NAhuWM/tMH6fiYArsV7ICmZShI0D+ZM+Y/8B
+A+1HBpHTedDM9Glguuz4Zwp91MFdDHAI5oAlTnmlxWZMvE6UVguCmOFNN1Fdoz2o
+B5x3zmPDZMUCMdSEuAQCLo6LSvd4AECKZ8KQiwgWmshWoWOsq/Rlqlb1b8TgAFcv
+NYaIXupPEp81Quddtc+do3Fpzs1b4PTzlUq3fA05VUKvSv8L9zlvZVQe2QOr5ulU
+VVjP1f4gRkG7l9Kz6VVQyuD/DVN77Q+08mCAnraP/g7wAlgFPFBTOK5TFRcHVBKx
+UHvtORBNBzko7UmC8adHMcnzRk7j/Fwh9KwNAQIDAQABAoIBAAIlaJXKQJON4LTV
+r18hndhgYyuom1TW6klrkltYNYY0B4wZjQpdO+Gv+v4vwEyxbdtK0xJcxMKBFKkS
+DJeBMmnp5VkMZ6no+7LnWCScyj/nkrRE+cB0GcffyI41w2uJpZ9mtBuPj7JciiT+
+lE7LmNFmWtKLkqUmuAYJrKY3aXNCbgWCeKYFzq22xlr5S7VxVVZVAycYoDeBH+PB
+f2JAtAuKe6MkA+x0NgdH1GoP2cN/bSpECQrKV5f7K6Sp9ooUgznMpF4Chvf7nshP
+Rnu0i6QhoDv3Sf62BHUoZyV1+WOaBnqNniGLXo7wCL0lFPbXW3B8fXJDPIo3AyUb
+eOVqRAECgYEA4cWJN0DWmxFMhCIquK46IQEIQpyNOLvl3wzlsOV6tOzvMNUorrbg
+N7CMcAgjVjBkrTusuQTMBlKIfUwZAStkyC/nJiJo8Laxt8Msp5zOy2P4ly9ISRA6
+go6f12OcYRKdsrTo53pqeflMLybRqftvD8SXfewJNBGYs5ycSrLzjGECgYEA2PuX
+OwFqXwP3oTsc02X9bDD/9aJPW96KWryWs0Y/XK76GKc7aqV9DOCsaD1nLeR2XHf3
+iUOHbcxWEn2a5ktSpZuFyv87dZsKr6NsWqnY/Rd4iHL9snCLKn9qBXU+7aEnc8Rl
+zk7A9Q7MPYJtB9pnwv23sKEeKO6C3Ra9ZsuXRKECgYEAgPYv0fLkYwE3nsZRdtp2
+c8G+MSZxeHXD8WvRjAEY3V31pwQrT9lALC9ZmOjdHm9YIqfSmoDF9dqRAllEcymR
+UNQkCeFf5hfFXf1LdZaZfQ5mwh0NAkcV1NuZLBRHEB/tGlZCL276gR/Ix6o52wm3
+P9+A1TnNbAOdIQOVNwoPGiECgYB4PkQ6YLhv2yT5Zma9B8H+mNDfcIkF4jdNvUDO
+LFmkpRrXWqVknjzETCV+xrhNCFRHPfwhRxjf0eLI8G5MvOUZ/SuRqQtsSvULDEdZ
+ntIuvzj+dKr+nbuhW2aHi8fJrArO7sF0KNRpeT/ZvlNpjLD/r9aBvWeXS0Wd+6IO
+OziiwQKBgAtxyRsDpTc1BJxrZSGWWcSvyVKMufv1thx4ATFfzBv+FH5bk99nvVt1
+6f+gdaOvvC201tb4t0ZZe91lDbocG9A1Qua2HQVVx8PYgjIJ0v9A2FzBbzcgs6te
+F7QL1bJa1z6qpESrWjCFGC2l8U8zjn8QxJEdaIuYmAowvty3JbuH
+-----END RSA PRIVATE KEY-----
+PEM);
+$rsaPublic = JwtKey::fromPem(<<<'PEM'
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAv1yN07WXcVr/NAhuWM/t
+MH6fiYArsV7ICmZShI0D+ZM+Y/8BA+1HBpHTedDM9Glguuz4Zwp91MFdDHAI5oAl
+TnmlxWZMvE6UVguCmOFNN1Fdoz2oB5x3zmPDZMUCMdSEuAQCLo6LSvd4AECKZ8KQ
+iwgWmshWoWOsq/Rlqlb1b8TgAFcvNYaIXupPEp81Quddtc+do3Fpzs1b4PTzlUq3
+fA05VUKvSv8L9zlvZVQe2QOr5ulUVVjP1f4gRkG7l9Kz6VVQyuD/DVN77Q+08mCA
+nraP/g7wAlgFPFBTOK5TFRcHVBKxUHvtORBNBzko7UmC8adHMcnzRk7j/Fwh9KwN
+AQIDAQAB
+-----END PUBLIC KEY-----
+PEM, "rsa-1");
+$ec = JwtKey::fromPem(<<<'PEM'
+-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIOUKJVuOXIQpvfvsvk32BsyjDtGg3owXA7+bXRBCOGqjoAoGCCqGSM49
+AwEHoUQDQgAE0NkL9/wi28tJRrrt4MrK7KUYqaH+U9w+ckGoyOQ5uHws/pDDbsDk
+GmvjACb2GoiHYgf/Ejup8kvI6WkIlW/p9A==
+-----END EC PRIVATE KEY-----
+PEM, "ec-1");
+$ec8 = JwtKey::fromPem(<<<'PEM'
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg5QolW45chCm9++y+
+TfYGzKMO0aDejBcDv5tdEEI4aqOhRANCAATQ2Qv3/CLby0lGuu3gysrspRipof5T
+3D5yQajI5Dm4fCz+kMNuwOQaa+MAJvYaiIdiB/8SO6nyS8jpaQiVb+n0
+-----END PRIVATE KEY-----
+PEM);
+$ecPublic = JwtKey::fromPem(<<<'PEM'
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0NkL9/wi28tJRrrt4MrK7KUYqaH+
+U9w+ckGoyOQ5uHws/pDDbsDkGmvjACb2GoiHYgf/Ejup8kvI6WkIlW/p9A==
+-----END PUBLIC KEY-----
+PEM);
+$ed = JwtKey::fromPem(<<<'PEM'
+-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIGkr/9MmpIUPR4PUt7qYkjFbw/2J4snf4iTZnnLI40hs
+-----END PRIVATE KEY-----
+PEM, "ed-1");
+$edPublic = JwtKey::fromPem(<<<'PEM'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAQLxFI3QAj40kqjoHZDk8fy2DlqkNMWmecyiARk5BIUY=
+-----END PUBLIC KEY-----
+PEM);
+
+foreach ([$rsa, $rsa1, $rsaPublic, $ec, $ec8, $ecPublic, $ed, $edPublic] as $k) {
+    echo $k->alg, " ", $k->kid ?? "-", " ", $k->canSign ? "private" : "public", "\n";
+}
+
+/** A claim of verified claims as text, or "refused". */
+function field(?map<string, any> $claims, string $name): string {
+    if ($claims == null) {
+        return "refused";
+    }
+    $v = $claims[$name] ?? null;
+    return $v is string ? $v : json_encode($v);
+}
+
+map<string, any> $claims = ["sub" => "7", "name" => "Ann", "exp" => time() + 60];
+foreach ([[$rsa, $rsaPublic], [$rsa1, $rsaPublic], [$ec, $ecPublic], [$ec8, $ecPublic], [$ed, $edPublic]] as $pair) {
+    $t = $pair[0]->sign($claims);
+    echo $pair[0]->alg, ": ", field($pair[1]->verify($t), "name"), "\n";
+}
+
+// Public keys cannot sign.
+try {
+    $ecPublic->sign($claims);
+} catch (ValueError $e) {
+    echo "ValueError: ", $e->getMessage(), "\n";
+}
+
+// A key of another kind does not verify.
+echo $ecPublic->verify($rsa->sign($claims)) == null ? "refused" : "accepted", "\n";
+echo $edPublic->verify($ec->sign($claims)) == null ? "refused" : "accepted", "\n";
+
+// The public JWK verifies what the private key signed.
+$jwk = JwtKey::fromJwk($ec->publicJwk());
+echo $jwk->alg, " ", $jwk->kid ?? "-", " ", $jwk->canSign ? "private" : "public", "\n";
+echo field($jwk->verify($ec->sign($claims)), "sub"), "\n";
+
+// A set picks the key by the token's kid.
+$set = KeySet::of([$rsaPublic, $jwk, JwtKey::fromJwk($ed->publicJwk())]);
+foreach ([$rsa, $ec, $ed] as $k) {
+    echo $k->kid ?? "-", ": ", field($set->verify($k->sign($claims)), "sub"), "\n";
+}
+$published = KeySet::fromJson($set->toJson());
+echo field($published->verify($ed->sign($claims)), "sub"), "\n";
+echo count($set->toJson()->split("\"kty\"")) - 1, " keys\n";
+
+// Expiry, not-before, issuer and audience.
+$now = time();
+function show(Verifier $v, string $token, ?string $iss = null, ?string $aud = null, int $leeway = 0): string {
+    return $v->verify($token, issuer: $iss, audience: $aud, leeway: $leeway) == null ? "refused" : "ok";
+}
+echo "expired: ", show($ecPublic, $ec->sign(["exp" => $now - 10])), "\n";
+echo "expired, leeway 30: ", show($ecPublic, $ec->sign(["exp" => $now - 10]), leeway: 30), "\n";
+echo "not yet: ", show($ecPublic, $ec->sign(["nbf" => $now + 100])), "\n";
+echo "exp as text: ", show($ecPublic, $ec->sign(["exp" => "9999999999"])), "\n";
+$t = $ec->sign(["iss" => "https://id.example", "aud" => ["web", "api"]]);
+echo "iss and aud: ", show($ecPublic, $t, "https://id.example", "api"), "\n";
+echo "other iss: ", show($ecPublic, $t, "https://evil.example", "api"), "\n";
+echo "other aud: ", show($ecPublic, $t, "https://id.example", "admin"), "\n";
+echo "aud not asked for: ", show($ecPublic, $t, "https://id.example"), "\n";
+echo "aud missing: ", show($ecPublic, $ec->sign(["sub" => "1"]), null, "api"), "\n";
+
+// HS256 secrets.
+$secret = JwtKey::secret("0123456789abcdef0123456789abcdef", "s1");
+echo $secret->alg, " ", $secret->canSign ? "signs" : "-", " ", field($secret->verify($secret->sign(["a" => 1])), "a"), "\n";
+try {
+    $secret->publicJwk();
+} catch (ValueError $e) {
+    echo "ValueError: ", $e->getMessage(), "\n";
+}
+// A token signed with HS256 using a public key as the secret is refused.
+$forged = JwtKey::secret($ec->publicJwk(), "ec-1")->sign(["sub" => "admin"]);
+echo "forged: ", show($set, $forged), "\n";
+
+// Tampered and malformed tokens.
+$t = $ec->sign(["role" => "user"]);
+$parts = $t->split(".");
+$evil = $parts[0] . "." . base64_encode(json_encode(["role" => "admin"]))->replace("=", "") . "." . $parts[2];
+echo "tampered: ", show($ecPublic, $evil), "\n";
+echo "garbage: ", show($ecPublic, "a.b.c"), "\n";
+echo "none: ", show($ecPublic, "eyJhbGciOiJub25lIn0.e30."), "\n";
+
+// Bad keys.
+foreach (["not a key", "-----BEGIN CERTIFICATE-----
+AAAA
+-----END CERTIFICATE-----", "-----BEGIN ENCRYPTED PRIVATE KEY-----
+AAAA
+-----END ENCRYPTED PRIVATE KEY-----"] as $bad) {
+    try {
+        JwtKey::fromPem($bad);
+    } catch (ValueError $e) {
+        echo "ValueError: ", $e->getMessage(), "\n";
+    }
+}
+foreach (['{"kty":"oct","k":"AAAA"}', '{"kty":"EC","crv":"P-384","x":"AA","y":"AA"}', '{"kty":"RSA","n":"AQAB","e":"AQAB"}', '{"kty":"OKP","crv":"Ed25519","x":"AAAA","use":"enc"}'] as $bad) {
+    try {
+        JwtKey::fromJwk($bad);
+    } catch (ValueError $e) {
+        echo "ValueError: ", $e->getMessage(), "\n";
+    }
+}
+try {
+    JwtKey::secret("short");
+} catch (ValueError $e) {
+    echo "ValueError: ", $e->getMessage(), "\n";
+}
+try {
+    KeySet::fromJson('{"keys":[{"kty":"oct","k":"AAAA"}]}');
+} catch (ValueError $e) {
+    echo "ValueError: ", $e->getMessage(), "\n";
+}
+try {
+    $ecPublic->verify("x", leeway: 1000);
+} catch (ValueError $e) {
+    echo "ValueError: ", $e->getMessage(), "\n";
+}
+try {
+    KeySet::fetch("nowhere", "/jwks.json");
+} catch (NetworkError $e) {
+    echo "NetworkError: ", $e->getMessage(), "\n";
+}

@@ -1622,6 +1622,7 @@ dependencies = [
 name = "phv_server"
 version = "1.1.1"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "flate2",
@@ -1639,9 +1640,11 @@ dependencies = [
  "phv_syntax",
  "phv_vm",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -1657,6 +1660,7 @@ dependencies = [
  "bytes",
  "chrono",
  "chrono-tz",
+ "form_urlencoded",
  "futures-util",
  "getrandom 0.3.4",
  "hmac 0.12.1",
