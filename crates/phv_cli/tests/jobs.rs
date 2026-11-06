@@ -58,7 +58,8 @@ fn a_built_site_runs_its_jobs() {
         "<?phv\nimport std.jobs.enqueue;\nenqueue(\"note\", \"from the page\");\necho \"ok\";\n",
     );
     write(&site, "jobs/note.phv", JOB);
-    let exe = dir.join(if cfg!(windows) { "site.exe" } else { "site" });
+    // Not `site`: on Unix that is the directory of the sources.
+    let exe = dir.join(if cfg!(windows) { "server.exe" } else { "server" });
     let (ok, out) = phv(&["build", &site.to_string_lossy(), "-o", &exe.to_string_lossy()]);
     assert!(ok, "{out}");
     std::fs::remove_dir_all(&site).unwrap();
