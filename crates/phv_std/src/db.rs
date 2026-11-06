@@ -16,9 +16,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+mod mem;
 mod vfs;
 
 type R = Result<Value, VmError>;
+
+/// SQLite databases a script may have open at once (each holds files and memory).
+const MAX_OPEN: usize = 64;
 
 /// Marks a bound parameter in `Sql` text (see the type checker).
 pub(crate) const PARAM: char = '\u{E000}';
@@ -135,6 +139,10 @@ impl Drop for Db {
 //   statements and page cache are dropped.
 // - An idle connection is closed after `KEPT_IDLE`, and when a script deletes
 //   or renames its file. `:memory:` databases are never kept.
+// - SQLite's memory is counted as the thread's (`mem`). The memory a kept
+//   connection holds is taken off the thread that gives it back and counted
+//   again on the thread that takes it (or closes it), so a script is charged
+//   for the connections it holds, kept or new.
 
 /// Idle connections kept per database file, and in all.
 const KEPT_PER_FILE: usize = 64;
@@ -158,12 +166,60 @@ struct Lease {
     key: PathBuf,
     id: FileId,
     tainted: Arc<AtomicBool>,
+    /// The memory the connection took when it was opened (see `held`).
+    base: usize,
 }
 
 struct Idle {
-    conn: Connection,
+    /// Always there until it is taken (`into_conn`).
+    conn: Option<Connection>,
     id: FileId,
     since: Instant,
+    base: usize,
+    /// The memory it holds, taken off the thread that gave it back.
+    held: usize,
+}
+
+impl Idle {
+    /// A connection going into the pool: the memory it holds is no longer
+    /// this thread's.
+    fn new(conn: Connection, id: FileId, base: usize) -> Idle {
+        let held = held(&conn, base);
+        phv_vm::alloc::uncharge_thread(held);
+        Idle { conn: Some(conn), id, since: Instant::now(), base, held }
+    }
+
+    fn into_conn(mut self) -> Connection {
+        self.conn.take().expect("an idle connection has its connection")
+    }
+}
+
+impl Drop for Idle {
+    /// Taken or closed: the memory is the current thread's again (closing it
+    /// frees it from this thread's count).
+    fn drop(&mut self) {
+        phv_vm::alloc::charge_thread(self.held);
+    }
+}
+
+/// The memory connection `c` holds: what opening it took (`base`), and its
+/// page cache, schema and statements.
+fn held(c: &Connection, base: usize) -> usize {
+    // SAFETY: the handle is the open connection's.
+    let db = unsafe { c.handle() };
+    let mut sum = base;
+    for op in [
+        rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED,
+        rusqlite::ffi::SQLITE_DBSTATUS_SCHEMA_USED,
+        rusqlite::ffi::SQLITE_DBSTATUS_STMT_USED,
+    ] {
+        let (mut now, mut high) = (0, 0);
+        // SAFETY: as above; the out pointers are valid.
+        if unsafe { rusqlite::ffi::sqlite3_db_status(db, op, &mut now, &mut high, 0) } == rusqlite::ffi::SQLITE_OK {
+            sum = sum.saturating_add(now.max(0) as usize);
+        }
+    }
+    sum
 }
 
 static KEPT: LazyLock<Mutex<HashMap<PathBuf, Vec<Idle>>>> = LazyLock::new(Default::default);
@@ -182,7 +238,7 @@ fn kept() -> MutexGuard<'static, HashMap<PathBuf, Vec<Idle>>> {
 
 /// An idle connection to the file `key` whose identity is `id`. Connections
 /// to another file of that name, or idle for too long, are closed.
-fn take(key: &Path, id: FileId) -> Option<Connection> {
+fn take(key: &Path, id: FileId) -> Option<(Connection, usize)> {
     let mut closing = Vec::new();
     let found = {
         let mut map = kept();
@@ -191,7 +247,8 @@ fn take(key: &Path, id: FileId) -> Option<Connection> {
         while let Some(idle) = list.pop() {
             if idle.id == id && idle.since.elapsed() < kept_idle() {
                 REUSED.fetch_add(1, Ordering::SeqCst);
-                found = Some(idle.conn);
+                let base = idle.base;
+                found = Some((idle.into_conn(), base));
                 break;
             }
             closing.push(idle);
@@ -209,7 +266,7 @@ fn take(key: &Path, id: FileId) -> Option<Connection> {
 /// Takes back a connection a script is done with, if it can be reused.
 fn give_back(c: Connection, lease: Lease) {
     let Some(c) = reusable(c, &lease.tainted) else { return };
-    let idle = Idle { conn: c, id: lease.id, since: Instant::now() };
+    let idle = Idle::new(c, lease.id, lease.base);
     let refused = {
         let mut map = kept();
         let all: usize = map.values().map(Vec::len).sum();
@@ -385,6 +442,11 @@ fn db_of<'v>(vm: &'v Vm, h: &Value) -> Result<&'v Db, VmError> {
 }
 
 fn db_error(vm: &Vm, e: rusqlite::Error) -> VmError {
+    // SQLite was refused memory past the script's limit (see `mem`).
+    let no_memory = matches!(&e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::OutOfMemory);
+    if no_memory && mem::Budget::refused() {
+        return vm.reserve(usize::MAX).err().unwrap_or_else(|| vm.throw("DatabaseError", e.to_string()));
+    }
     // `LIKE` and `GLOB` stop at the time limit with an error of their own.
     if vm.deadline().is_some_and(|d| std::time::Instant::now() > d) {
         return VmError::Fatal("database query stopped: the time limit was reached".into());
@@ -445,6 +507,7 @@ fn query(vm: &mut Vm, a: &[Value]) -> R {
     }
     let (text, params) = parts(&a[1]);
     let text = render_sql(text, Dialect::Sqlite);
+    let _budget = mem::Budget::enter(vm);
     let db = db_of(vm, &a[0])?;
     // Kept prepared for the next run of the same text (`prepare_cached`).
     let mut stmt = db.conn().prepare_cached(&text).map_err(|e| db.fail(vm, e))?;
@@ -485,6 +548,7 @@ fn execute(vm: &mut Vm, a: &[Value]) -> R {
     }
     let (text, params) = parts(&a[1]);
     let text = render_sql(text, Dialect::Sqlite);
+    let _budget = mem::Budget::enter(vm);
     let db = db_of(vm, &a[0])?;
     let bound: Vec<Param> = params.iter().map(Param).collect();
     let mut stmt = db.conn().prepare_cached(&text).map_err(|e| db.fail(vm, e))?;
@@ -498,9 +562,20 @@ fn execute(vm: &mut Vm, a: &[Value]) -> R {
 }
 
 fn open(vm: &mut Vm, a: &[Value]) -> R {
+    // Each connection holds files and memory: a script that opens a database
+    // in a loop without `close()` is stopped (found by the 1.1.1 audit: 5,000
+    // connections to one file held 935 MB under a 16 MB limit).
+    let open = vm.resources.iter().flatten().filter(|r| r.is::<Db>()).count();
+    if open >= MAX_OPEN {
+        return Err(vm.throw(
+            "DatabaseError",
+            format!("this script already has {MAX_OPEN} SQLite databases open: close() the ones it no longer uses"),
+        ));
+    }
     let rel = s(&a[0]).to_string();
+    let budget = mem::Budget::enter(vm);
     if rel == ":memory:" {
-        return open_memory(vm);
+        return open_memory(vm, budget);
     }
     let (dir, name) = crate::sys::resolve_path(vm, &rel, true)?;
     let file_error = |vm: &Vm, e| crate::sys::fs_error(vm, &rel, "", e);
@@ -509,34 +584,56 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
     check_journals(&dir, &name).map_err(|e| file_error(vm, e))?;
     let now = dir.plain_file_id(&name).map_err(|e| file_error(vm, e))?;
     let key = dir.path().join(&name);
-    let (c, id) = match now.and_then(|id| take(&key, id).map(|c| (c, id))) {
+    let (c, id, base) = match now.and_then(|id| take(&key, id).map(|(c, base)| (c, id, base))) {
         Some(kept) => kept,
         None => {
+            // SQLite starts (once, for good) before the connection is measured.
+            vfs::register();
+            let before = phv_vm::alloc::thread_allocated();
             let (c, id) = open_in(&dir, &name).map_err(|e| match e {
                 OpenError::File(_, e) => file_error(vm, e),
                 OpenError::NoFileSystem => vm.throw("DatabaseError", NO_FILE_SYSTEM),
                 OpenError::Sqlite(e) => db_error(vm, e),
             })?;
-            harden(&c).map_err(|e| db_error(vm, e))?;
-            (c, id)
+            let base = (phv_vm::alloc::thread_allocated() - before).max(0) as usize;
+            harden(&c).and_then(|()| script_settings(&c)).map_err(|e| db_error(vm, e))?;
+            (c, id, base)
         }
     };
     let tainted = Arc::new(AtomicBool::new(false));
+    // A kept connection's memory counts from here (its `Idle` was dropped):
+    // a failure below closes it on this thread.
     for_script(&c, vm, Some(tainted.clone())).map_err(|e| db_error(vm, e))?;
-    let lease = Lease { key, id, tainted };
+    drop(budget);
+    let lease = Lease { key, id, tainted, base };
     let db = Db { conn: Some(c), _dir: Some(dir), depth: Cell::new(0), pages: 0, pooled: Some(lease) };
     vm.resources.push(Some(Box::new(db)));
     Ok(Value::Int(vm.resources.len() as i64 - 1))
 }
 
+/// The settings of a script's connection beyond `harden`: temporary tables,
+/// indexes and sorts are kept in memory, so they count against the script's
+/// memory limit (found by the 1.1.1 audit: they went to temporary files,
+/// which no limit bounded, also for `:memory:` databases without permissions).
+fn script_settings(c: &Connection) -> rusqlite::Result<()> {
+    c.execute_batch("PRAGMA temp_store = MEMORY")
+}
+
 /// `Database::open(":memory:")`: a database of the script's own, never kept.
-fn open_memory(vm: &mut Vm) -> R {
+fn open_memory(vm: &mut Vm, _budget: mem::Budget) -> R {
+    let counted = mem::init();
     let c = Connection::open_in_memory().map_err(|e| db_error(vm, e))?;
-    harden(&c).map_err(|e| db_error(vm, e))?;
-    // The in-memory databases of a script share its memory limit (found by
-    // the 1.0 audit: each one had all of it, and SQLite's memory is not the VM's).
+    harden(&c).and_then(|()| script_settings(&c)).map_err(|e| db_error(vm, e))?;
+    // An in-memory database has at most the script's memory limit in pages
+    // (found by the 1.0 audit: it had all of SQLite's). Its pages count as
+    // the script's memory (`mem`), so several share the limit; only if
+    // SQLite's memory were not counted do they split it.
     let total = vm.memory_limit().unwrap_or(128 << 20) / 4096;
-    let used: usize = vm.resources.iter().flatten().filter_map(|r| r.downcast_ref::<Db>()).map(|d| d.pages).sum();
+    let used: usize = if counted {
+        0
+    } else {
+        vm.resources.iter().flatten().filter_map(|r| r.downcast_ref::<Db>()).map(|d| d.pages).sum()
+    };
     let pages = total.saturating_sub(used);
     if pages < 16 {
         return Err(
@@ -623,10 +720,11 @@ pub(crate) fn harden(c: &Connection) -> rusqlite::Result<()> {
     c.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 1024 * 1024)?;
     // A process-wide cap on SQLite's own memory (set by the first connection;
     // no connection can change it, see `sqlite_authorizer`), and per
-    // connection a small page cache. An in-memory database lives entirely in
-    // memory, so it is bounded by the script's memory limit.
+    // connection a small page cache. A script's share is bounded by its
+    // memory limit (`mem`). Past the soft limit, page caches stop growing
+    // (they reuse their pages) before the hard limit fails other requests.
     if !HEAP_LIMIT_SET.load(std::sync::atomic::Ordering::Acquire) {
-        c.execute_batch("PRAGMA hard_heap_limit = 536870912")?;
+        c.execute_batch("PRAGMA hard_heap_limit = 536870912; PRAGMA soft_heap_limit = 402653184")?;
         HEAP_LIMIT_SET.store(true, std::sync::atomic::Ordering::Release);
     }
     c.execute_batch("PRAGMA cache_size = -2000")?;
@@ -970,6 +1068,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             if !is_sqlite(vm, &a[0]) {
                 return crate::netdb::raw(vm, a);
             }
+            let _budget = mem::Budget::enter(vm);
             let db = db_of(vm, &a[0])?;
             let (sqls, depth) = transaction_sql(cmd, db.depth.get());
             if cmd == "ROLLBACK" {

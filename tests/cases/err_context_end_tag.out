@@ -1,22 +1,22 @@
-error: code right after `<` or `</` in a comment, an attribute value or raw text inside `<noscript>`, `<svg>` or `<math>`
+error: code right after `<` or `</` in a comment, an attribute value or raw text, where it could complete `</noscript>` (or, inside `<noscript>`, `<svg>` or `<math>`, another raw-text element's end tag)
  --> err_context_end_tag.phv:6:23
   |
 6 | <noscript><!--</<?phv f(); ?>--></noscript>
   |                       ^
-  = note: it could complete the end tag of a raw-text element (such as `</noscript>`), which a browser would read there; put a space after `<`, or move the code
+  = note: a browser would read that end tag there (this template or function may be written inside a `<noscript>`); put a space after `<`, or move the code
 
-error: code right after `<` or `</` in a comment, an attribute value or raw text inside `<noscript>`, `<svg>` or `<math>`
+error: code right after `<` or `</` in a comment, an attribute value or raw text, where it could complete `</noscript>` (or, inside `<noscript>`, `<svg>` or `<math>`, another raw-text element's end tag)
  --> err_context_end_tag.phv:7:24
   |
 7 | <svg><p title="</<?phv f(); ?>"></p></svg>
   |                        ^
-  = note: it could complete the end tag of a raw-text element (such as `</noscript>`), which a browser would read there; put a space after `<`, or move the code
+  = note: a browser would read that end tag there (this template or function may be written inside a `<noscript>`); put a space after `<`, or move the code
 
-error: code right after `<` or `</` in a comment, an attribute value or raw text inside `<noscript>`, `<svg>` or `<math>`
+error: code right after `<` or `</` in a comment, an attribute value or raw text, where it could complete `</noscript>` (or, inside `<noscript>`, `<svg>` or `<math>`, another raw-text element's end tag)
  --> err_context_end_tag.phv:8:19
   |
 8 | <math><!--</<?phv f(); ?>--></math>
   |                   ^
-  = note: it could complete the end tag of a raw-text element (such as `</noscript>`), which a browser would read there; put a space after `<`, or move the code
+  = note: a browser would read that end tag there (this template or function may be written inside a `<noscript>`); put a space after `<`, or move the code
 
 3 errors found

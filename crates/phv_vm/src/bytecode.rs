@@ -186,7 +186,9 @@ pub enum Instr {
         catch: u32,
         exc: Reg,
     },
-    TryEnd,
+    /// Removes the `n` exception handlers installed last (one instruction
+    /// however many `try` statements a `break` or `return` leaves).
+    TryEnd(u32),
     InstanceOf(Reg, Reg, u32),
     IsType(Reg, Reg, TypeTag),
     MatchError(Reg),

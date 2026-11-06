@@ -33,6 +33,8 @@ static BASE: AtomicPtr<ffi::sqlite3_vfs> = AtomicPtr::new(ptr::null_mut());
 pub(super) fn register() -> bool {
     static DONE: OnceLock<bool> = OnceLock::new();
     *DONE.get_or_init(|| {
+        // Before SQLite is first used (`sqlite3_vfs_find` starts it).
+        super::mem::init();
         // SAFETY (this module): calls into SQLite's C API with pointers it
         // handed out. `File` is laid out over memory SQLite allocates
         // (`szOsFile` bytes), followed by the default VFS's own file.

@@ -321,7 +321,8 @@ impl<'a> Checker<'a> {
                 "`json_html()` is for `<script>`; its quotes would end the attribute",
                 "in an attribute, write `escape(json_encode($value))` (e.g. in a `data-*` attribute)",
             ),
-            Text | Attr => return,
+            // `Html` is checked when it is inserted (`html_inside`).
+            Text | Attr | ForeignText | RawText(_) | Comment(_) => return,
             Unquoted => (
                 "values in attributes must be quoted",
                 "write `attr=\"<?= $value ?>\"`: escaping does not protect unquoted attribute values",

@@ -1,0 +1,9 @@
+<?phv
+// Functions called inside `<svg>`/`<math>` or the text of a `<textarea>` may
+// not write output: their markup was checked as HTML, outside those (found by
+// the 1.1.1 audit). Return `Html` and insert it as a value instead.
+function dot(int $r): void { ?><circle r="<?= $r ?>"/><?phv }
+dot(1);
+?>
+<svg><?phv dot(2); ?></svg>
+not reached

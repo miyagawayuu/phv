@@ -1,0 +1,28 @@
+ [f1][f2][f3]r0
+ [f1][f2][f3]caught e1 end
+ [f1][f2][f3]f1 returns
+ [f1][f2][f3]f2 returns
+ [f1][f2][f3]body end
+inner x=2 outer x=3 1
+(inner) swallowed
+caught: from finally (last) 2
+a b | late a b end 
+1a <1a> {1a} <1b> {1b} 1c <1c> {1c} / 2a <2a> {2a} <2b> {2b} / 3a <3a> {3a} <3b> {3b} 4a <4a> {4a} 4b <4b> {4b} <4c> {4c} 
+1:10 (stay) 1:30 2:10 (stay) 2:30 rounds=6
+loop left after 3
+f0 odd 1 f1 f2 odd 3 f3 
+inner-finally after body
+inner-finally inner try
+caught inner-finally after body
+17 i i o 
+[f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3][f1][f2][f3]
+sum=430
+110 111 w 110 111 w 110 111 w | 210 310 311 312 320 321 322 [f] again11 again21 again31 
+1:10 f1 2:10 f2 3:10 f3 
+100 0 1 15 29 
+one two
+
+--- runtime error ---
+Uncaught RuntimeException: out
+  at uncaught (finally_nested.phv:347)
+  at {main} (finally_nested.phv:350)

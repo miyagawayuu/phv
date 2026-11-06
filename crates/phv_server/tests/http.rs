@@ -227,6 +227,38 @@ fn scripts_cannot_write_source_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn trace_and_connect_are_refused() {
+    let dir = std::env::temp_dir().join(format!("phv-http-trace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phv.toml", "[security]\ncsrf = false\n[permissions]\nwrite = [\"data/\"]\n");
+    write(
+        &dir,
+        "public/index.phv",
+        "<?phv\nimport std.http.request;\nfile_put_contents(\"data/ran\", request()->method);\necho \"ran\";\n",
+    );
+    write(&dir, "public/style.css", "body { color: red; }");
+    write(&dir, "data/.keep", "");
+    let addr = start(&dir);
+    // Found by the 1.1.1 audit: `TRACE` ran the page and answered 200.
+    for raw in [
+        "TRACE / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+        "TRACE /style.css HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+        "TRACE /missing HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+        "CONNECT test:443 HTTP/1.1\r\nHost: test:443\r\nConnection: close\r\n\r\n",
+    ] {
+        let r = request(addr, raw);
+        assert_eq!(r.status, 405, "{raw}");
+        assert!(!r.body.contains("ran"), "{raw}");
+        assert_eq!(r.header("x-content-type-options"), Some("nosniff"), "{raw}");
+    }
+    assert!(!dir.join("data/ran").exists());
+    // Other methods still reach the page (PUT and DELETE are for scripts to answer).
+    let r = request(addr, "PUT / HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    assert_eq!((r.status, r.body.as_str()), (200, "ran"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The raw response: status line and headers as text, the body as bytes.
 fn get_bytes(addr: SocketAddr, path: &str) -> (String, Vec<u8>) {
     let mut s = TcpStream::connect(addr).unwrap();

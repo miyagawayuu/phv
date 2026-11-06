@@ -16,6 +16,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The tests that fill a job store or time it run one at a time: the 97,000
+/// jobs of one would slow the server under the timing of another.
+static HEAVY_JOB_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn heavy() -> std::sync::MutexGuard<'static, ()> {
+    HEAVY_JOB_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // Memory limits are enforced through the counting allocator.
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
@@ -363,9 +371,116 @@ fn check_job_cap(url: &str) {
 
 #[test]
 fn concurrent_transactions_keep_the_job_cap() {
+    let _one_at_a_time = heavy();
     for var in ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
         if let Some(url) = server(var) {
             check_job_cap(&url);
+        }
+    }
+}
+
+/// A host whose job store is the table `phv_jobs_<ns>` of `url`.
+fn jobs_host(url: &str, ns: &str, names: &[&str]) -> Arc<Host> {
+    let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 4 };
+    Arc::new(Host {
+        root: root(),
+        databases: BTreeMap::from([("main".to_string(), spec)]),
+        store_namespace: Some(ns.into()),
+        jobs: Some(phv_vm::JobsSpec {
+            store: Some("main".into()),
+            names: Some(names.iter().map(|n| n.to_string()).collect()),
+            memory_key: String::new(),
+        }),
+        ..Host::default()
+    })
+}
+
+/// A job added with a key that another open transaction has added waits for
+/// that transaction no longer than the page's time limit, on the server too
+/// (nothing is left waiting there once the page gave up), and such waits do
+/// not hold the connections other jobs are added on (found by the 1.1.1 audit:
+/// MySQL answered after 40 s under a 2 s limit, PostgreSQL left the statements
+/// waiting on the server, and four waits took every connection of the store).
+fn check_keyed_wait(url: &str) {
+    let host = jobs_host(url, "f1f1f1f1f1f1f1f1", &["k"]);
+    let limit = Some(Duration::from_secs(2));
+    std::thread::scope(|s| {
+        // Holds the key ten seconds.
+        let holder = s.spawn(|| run_script(&host, "jobs_key_hold", Some(Duration::from_secs(60))));
+        std::thread::sleep(Duration::from_secs(2));
+        let waiting: Vec<_> = (0..6)
+            .map(|_| {
+                s.spawn(|| {
+                    let start = Instant::now();
+                    let out = run_script(&host, "jobs_key_add", limit);
+                    (start.elapsed(), out)
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(500));
+        let plain: Vec<_> = (0..4).map(|_| s.spawn(|| run_script(&host, "jobs_plain_add", limit))).collect();
+        for p in plain {
+            assert_eq!(p.join().unwrap(), "yes", "{url}: a job without a key");
+        }
+        for w in waiting {
+            let (took, out) = w.join().unwrap();
+            assert!(took < Duration::from_millis(3500), "{url}: took {took:?}: {out}");
+        }
+        assert!(!holder.is_finished(), "{url}: the key is no longer held");
+        assert_eq!(run_script(&host, "jobs_key_waits", limit), "0", "{url}: statements left waiting on the server");
+        assert_eq!(holder.join().unwrap(), "rolled back", "{url}");
+    });
+}
+
+#[test]
+fn keyed_jobs_wait_no_longer_than_the_time_limit() {
+    let _one_at_a_time = heavy();
+    for var in ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
+        if let Some(url) = server(var) {
+            check_keyed_wait(&url);
+        }
+    }
+}
+
+/// Near the cap, adding jobs costs a few times what it costs far below it,
+/// outside a transaction and inside one (found by the 1.1.1 audit: each job
+/// counted the table twice, and each `enqueue()` of a transaction once). The
+/// two stores are used in turn, so a busy server slows both alike.
+fn check_near_cap(url: &str) {
+    let limit = Some(Duration::from_secs(300));
+    let near = jobs_host(url, "f2f2f2f2f2f2f2f2", &["burst", "k"]);
+    let far = jobs_host(url, "f2f2f2f2f2f2f2f3", &["burst", "k"]);
+    assert_eq!(run_script(&far, "jobs_plain_add", limit), "yes", "{url}");
+    assert_eq!(run_script(&near, "jobs_near_fill", limit), "filled", "{url}");
+    // The counts of this process are a second old at most.
+    std::thread::sleep(Duration::from_millis(1100));
+    let times = |host: &Arc<Host>| -> [u64; 2] {
+        let out = run_script(host, "jobs_near_cap", limit);
+        let ms: Vec<u64> = out.split(' ').map(|n| n.trim().parse().unwrap_or(u64::MAX / 100)).collect();
+        [ms[0], *ms.get(1).unwrap_or(&(u64::MAX / 100))]
+    };
+    let (mut far_ms, mut near_ms) = ([0, 0], [0, 0]);
+    for _ in 0..10 {
+        let [a, b] = times(&far);
+        let [c, d] = times(&near);
+        far_ms = [far_ms[0] + a, far_ms[1] + b];
+        near_ms = [near_ms[0] + c, near_ms[1] + d];
+    }
+    assert_eq!(run_script(&near, "jobs_near_clear", limit), "cleared", "{url}");
+    eprintln!(
+        "{url}: 200 jobs far below the cap {far_ms:?} ms, near it {near_ms:?} ms (outside, inside a transaction)"
+    );
+    for i in 0..2 {
+        assert!(near_ms[i] <= far_ms[i].max(100) * 4, "{url}: far {far_ms:?} ms, near {near_ms:?} ms");
+    }
+}
+
+#[test]
+fn adding_jobs_near_the_cap_stays_cheap() {
+    let _one_at_a_time = heavy();
+    for var in ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
+        if let Some(url) = server(var) {
+            check_near_cap(&url);
         }
     }
 }

@@ -551,6 +551,10 @@ pub struct HtmlTracker {
     /// Depth of `<noscript>` (outside foreign content). Browsers with scripting
     /// on read its content as raw text, up to the first `</noscript`.
     noscript: u32,
+    /// A value was inserted into a comment and no literal text came after it
+    /// yet: the value may end with `-`, `--` or `--!`, so the text that follows
+    /// may not complete `-->` or `--!>` with it (see `feed`).
+    after_comment_value: bool,
 }
 
 /// JavaScript written directly in template HTML, which a Content-Security-Policy
@@ -572,6 +576,10 @@ pub enum InlineCode {
     /// comment or an attribute value (an error: where a browser reads that
     /// element's text differently, it ends there and what follows is markup).
     HiddenEndTag,
+    /// Text after a value in a comment that starts with `>`, `!>`, `->` or
+    /// `-!>` (an error: a value ending with `--`, `--!` or `-` would end the
+    /// comment there, where this tracker reads on).
+    CommentEnd,
 }
 
 impl Default for HtmlTracker {
@@ -589,6 +597,7 @@ impl Default for HtmlTracker {
             carry: String::new(),
             tail: String::new(),
             noscript: 0,
+            after_comment_value: false,
         }
     }
 }
@@ -643,6 +652,18 @@ fn hidden_end_tag_start(tail: &str) -> bool {
         && RAW_TAGS.iter().chain(std::iter::once(&"noscript")).any(|t| t.starts_with(name))
 }
 
+/// `hidden_end_tag_start` for `</noscript` alone: after `<`, or `</` and the
+/// start of `noscript`.
+fn hidden_noscript_start(tail: &str) -> bool {
+    if tail.ends_with('<') {
+        return true;
+    }
+    let lower = tail.to_ascii_lowercase();
+    let Some(at) = lower.rfind("</") else { return false };
+    let name = &lower[at + 2..];
+    name.bytes().all(|b| b.is_ascii_alphabetic()) && "noscript".starts_with(name)
+}
+
 /// Decides a URL from the literal text at its start. Browsers strip leading
 /// spaces and controls and decode character references, so `&` leaves it
 /// undecided (`&#106;avascript:` is `javascript:`).
@@ -681,16 +702,16 @@ fn html_space(c: char) -> bool {
 }
 
 impl HtmlTracker {
-    /// Where an end tag hidden from this tracker is watched (inside
-    /// `<noscript>`, `<svg>` or `<math>`), the literal text ends where code
-    /// could complete one: after `<`, or `</` and the start of a raw-text
-    /// element's name.
+    /// Where an end tag hidden from this tracker is watched (see `hides`), the
+    /// literal text ends where code could complete one: after `<`, or `</`
+    /// and the start of a raw-text element's name (inside `<noscript>`,
+    /// `<svg>` or `<math>`) or of `noscript` (anywhere).
     pub fn watched_end_tag_start(&self) -> bool {
         let in_comment_or_value =
             matches!(self.state, State::Comment | State::Bogus | State::Quoted { .. } | State::Unquoted { .. });
         let in_text = matches!(self.state, State::Text);
         let watched = (in_comment_or_value && self.out_of_step_possible()) || (self.noscript > 0 && !in_text);
-        watched && hidden_end_tag_start(&self.tail)
+        (watched && hidden_end_tag_start(&self.tail)) || (!in_text && hidden_noscript_start(&self.tail))
     }
 
     /// The context a value inserted at the current position lands in.
@@ -705,7 +726,14 @@ impl HtmlTracker {
             return EchoContext::AfterMarkup;
         }
         match &self.state {
-            State::Text | State::Comment | State::Bogus => EchoContext::Text,
+            // In a comment, inserted `Html` may not end it (found by the 1.1.1 audit).
+            State::Comment => EchoContext::Comment(false),
+            State::Bogus => EchoContext::Comment(true),
+            // Inside SVG or MathML, browsers read inserted markup in foreign
+            // content, where this tracker read it (in its own template or
+            // function) as HTML (found by the 1.1.1 audit).
+            State::Text if !self.foreign.is_empty() => EchoContext::ForeignText,
+            State::Text => EchoContext::Text,
             State::Raw { tag, js, .. } if tag == "script" => {
                 if js.in_code() {
                     EchoContext::Script
@@ -714,7 +742,12 @@ impl HtmlTracker {
                 }
             }
             State::Raw { tag, .. } if tag == "style" => EchoContext::Style,
-            State::Raw { .. } => EchoContext::Text,
+            // The text of `<textarea>`, `<title>`...: inserted markup ends it at
+            // the element's end tag (`plaintext` has none).
+            State::Raw { tag, .. } => match RAW_TAGS.iter().find(|t| **t == tag && **t != "plaintext") {
+                Some(t) => EchoContext::RawText(t),
+                None => EchoContext::Text,
+            },
             State::Tag { .. } | State::AttrName { .. } => EchoContext::Tag,
             State::BeforeValue { .. } | State::Unquoted { .. } => EchoContext::Unquoted,
             State::Quoted { tag, name, .. }
@@ -773,6 +806,9 @@ impl HtmlTracker {
             if tag == "script" {
                 js.inserted();
             }
+        }
+        if self.state == State::Comment {
+            self.after_comment_value = true;
         }
     }
 
@@ -870,14 +906,18 @@ impl HtmlTracker {
         // Where a hidden end tag is watched, a block may not begin or end inside
         // one (`</` + `if {no} else {xy}` + `script>`: the ways are read one
         // after the other, not as the page is written; found by the 1.0.0 audit).
-        let split =
-            self.out_of_step_possible() && (hidden_end_tag_start(&entry.tail) || hidden_end_tag_start(&self.tail));
+        let split = (self.out_of_step_possible()
+            && (hidden_end_tag_start(&entry.tail) || hidden_end_tag_start(&self.tail)))
+            || (entry.state != State::Text && hidden_noscript_start(&entry.tail))
+            || (self.state != State::Text && hidden_noscript_start(&self.tail));
         let same = same
             && !split
             && self.pending == entry.pending
             && self.foreign == entry.foreign
             && self.noscript == entry.noscript
             && self.carry == entry.carry;
+        // A value may or may not be the last thing written before what follows.
+        self.after_comment_value |= entry.after_comment_value;
         if same && self.in_tag() {
             // The attributes of the current tag on either way: a `<meta>` is
             // checked as acting (`http-equiv`, or no `name`) if one way makes
@@ -907,11 +947,17 @@ impl HtmlTracker {
 
     /// Whether the end tag `name` here could end an element for a browser
     /// while this tracker reads on: a raw-text element's in a comment or an
-    /// attribute value where the two may disagree; and inside `<noscript>`,
-    /// `</noscript` anywhere but in text (where this tracker ends it too).
+    /// attribute value where the two may disagree; and `</noscript` anywhere
+    /// but in text (where this tracker ends a `<noscript>` too).
+    ///
+    /// The last holds outside a `<noscript>` too: any template or function
+    /// may write inside one (`<noscript><?= render(...) ?>`, a layout's body,
+    /// a call), while it is checked on its own (found by the 1.1.1 audit: a
+    /// partial with `<!--</<?= $v ?>` passed). Inside `<svg>` or `<math>`,
+    /// what a template or function writes is checked as it is written (see
+    /// `EchoContext::ForeignText`).
     fn hides(&self, in_comment_or_value: bool, in_text: bool, name: &str) -> bool {
-        (in_comment_or_value && self.out_of_step_possible() && hides_end_tag(name))
-            || (self.noscript > 0 && !in_text && name == "noscript")
+        (in_comment_or_value && self.out_of_step_possible() && hides_end_tag(name)) || (!in_text && name == "noscript")
     }
 
     fn end_tag(&mut self, tag: String, closing: bool, self_closing: bool) {
@@ -950,7 +996,7 @@ impl HtmlTracker {
     /// statement or an empty block between them: `<!--</` + `noscript>`) is
     /// checked as one (found by the 1.0.0 audit).
     fn check_across_pieces(&mut self, text: &str) {
-        if self.tail.is_empty() || !self.out_of_step_possible() {
+        if self.tail.is_empty() {
             return;
         }
         let in_comment_or_value =
@@ -977,6 +1023,15 @@ impl HtmlTracker {
     /// Advances over literal HTML. Returns the byte offsets just after the
     /// name of each opening `<script` tag, where the server's CSP nonce goes.
     pub fn feed(&mut self, text: &str) -> Vec<usize> {
+        // After a value in a comment, text that a value ending with `-`, `--` or
+        // `--!` would make `-->` or `--!>` (found by the 1.1.1 audit: `<!-- `,
+        // a value `--`, then `>` ended the comment for browsers, not here).
+        if std::mem::take(&mut self.after_comment_value)
+            && self.state == State::Comment
+            && [">", "!>", "->", "-!>"].iter().any(|h| text.starts_with(h))
+        {
+            self.found.push((0, InlineCode::CommentEnd));
+        }
         if self.carry.is_empty() {
             return self.feed_text(text);
         }
@@ -1009,6 +1064,8 @@ impl HtmlTracker {
         };
         let mut scripts = Vec::new();
         let mut i = 0;
+        // Where the last comment opened in this text began (its `<!--`).
+        let mut comment_open = None;
         self.mark = None;
         while i < chars.len() {
             let c = chars[i];
@@ -1041,7 +1098,7 @@ impl HtmlTracker {
             let (from, in_script) = (i, matches!(&state, State::Raw { tag, .. } if tag == "script"));
             let in_comment_or_value =
                 matches!(state, State::Comment | State::Bogus | State::Quoted { .. } | State::Unquoted { .. });
-            if c == '<' && chars.get(i + 1) == Some(&'/') && self.out_of_step_possible() {
+            if c == '<' && chars.get(i + 1) == Some(&'/') {
                 let name: String = chars[i + 2..]
                     .iter()
                     .take_while(|c| c.is_ascii_alphabetic())
@@ -1065,6 +1122,7 @@ impl HtmlTracker {
                             i += 5;
                             State::Text
                         } else {
+                            comment_open = Some(i);
                             i += 3;
                             State::Comment
                         }
@@ -1346,6 +1404,21 @@ impl HtmlTracker {
             }
             i += 1;
         }
+        // A comment's text that ends where what follows could end it: `<!--` or
+        // `<!---` (then `>` or `->`), and `-`, `--` or `--!` (then `->`, `>`...).
+        // It is read again in front of the next text, so a statement or empty
+        // block between them does not hide the end, and a value may not follow
+        // (found by the 1.1.1 audit).
+        if self.state == State::Comment && self.carry.is_empty() {
+            let body = comment_open.map_or(0, |k| k + 4);
+            let rest: String = chars[body.min(chars.len())..].iter().collect();
+            if let Some(k) = comment_open.filter(|_| rest.is_empty() || rest == "-") {
+                self.carry = chars[k..].iter().collect();
+                self.state = State::Text;
+            } else if let Some(end) = ["--!", "--", "-"].iter().find(|e| rest.ends_with(**e)) {
+                self.carry = (*end).to_string();
+            }
+        }
         // The end of the text so far, across pieces (a short piece keeps what came
         // before it), for a value inserted after it (`hidden_end_tag_start`) and
         // for an end tag split across pieces (`check_across_pieces`).
@@ -1415,7 +1488,7 @@ mod tests {
     /// the same for the tracker and the browser.
     #[test]
     fn foreign_content_follows_the_open_elements() {
-        assert_eq!(ctx("<svg/><textarea>"), EchoContext::Text);
+        assert_eq!(ctx("<svg/><textarea>"), EchoContext::RawText("textarea"));
         let mut t = HtmlTracker::default();
         t.feed("<svg/><textarea><!--</textarea><p>");
         assert!(t.at_top_level(), "the textarea ended for the tracker as it does for the browser");
@@ -1448,7 +1521,9 @@ mod tests {
         assert_eq!(ctx("<svg><p title=\"</"), EchoContext::AfterMarkup);
         assert_eq!(ctx("<noscript><!-- <"), EchoContext::AfterMarkup);
         assert_eq!(ctx("<svg><p title=\"</b"), EchoContext::Attr);
-        assert_eq!(ctx("<!-- </noscr"), EchoContext::Text);
+        // Outside them, only `</noscript` is watched (see `hides_noscript_outside_one`).
+        assert_eq!(ctx("<!-- </noscr"), EchoContext::AfterMarkup);
+        assert_eq!(ctx("<!-- </scr"), EchoContext::Comment(false));
         // Split between pieces of literal text (statements between them), also
         // through short pieces.
         for pieces in [
@@ -1500,6 +1575,10 @@ mod tests {
             "<svg><!--</<?phv f(); ?>--></svg>",
             "<math><!--</<?phv f(); ?>--></math>",
             "<math><mi title='</ti<?phv f(); ?>'></mi></math>",
+            // Outside them, before what could complete `</noscript` (the
+            // template may be rendered inside one; found by the 1.1.1 audit).
+            "<p><!--</<?phv f(); ?>--></p>",
+            "<p title=\"</nos<?phv f(); ?>\"></p>",
         ] {
             let diags = parse(src);
             assert!(
@@ -1509,7 +1588,7 @@ mod tests {
         }
         // Elsewhere, and after other text, statements are fine.
         for src in [
-            "<p><!--</<?phv f(); ?>--></p>",
+            "<p><!--</b<?phv f(); ?>--></p>",
             "<noscript><!--</b <?phv f(); ?>--></noscript>",
             "<noscript><!-- <?phv f(); ?> --></noscript>",
             "<svg><p title=\"</b<?phv f(); ?>\"></p></svg>",
@@ -1517,6 +1596,90 @@ mod tests {
         ] {
             assert!(parse(src).iter().all(|d| !d.is_error()), "{src}");
         }
+    }
+
+    /// Found by the 1.1.1 audit: a template or function is checked on its own,
+    /// but may write inside a `<noscript>` (`render()`, a layout's body, a
+    /// call), where browsers with scripting on read raw text up to the first
+    /// `</noscript`. So that end tag is watched everywhere: in a comment, an
+    /// attribute value or raw text, and before a value or statement there.
+    #[test]
+    fn hides_noscript_outside_one() {
+        for html in [
+            "<!--</noscript><a href=\"-->",
+            "<p title=\"</NoScript >\">",
+            "<textarea></noscript></textarea>",
+            "<script>var s = \"</noscript>\";</script>",
+            "<!x </noscript>",
+        ] {
+            assert!(found(html).contains(&InlineCode::HiddenEndTag), "{html}");
+        }
+        for html in ["<!--</", "<!--<", "<p title=\"</no", "<textarea></noscrip", "<!-- </NOSCRIPT"] {
+            assert_eq!(ctx(html), EchoContext::AfterMarkup, "{html}");
+        }
+        let mut seen = Vec::new();
+        let mut t = HtmlTracker::default();
+        for p in ["<!--</nos", "cript>-->"] {
+            t.feed(p);
+            seen.extend(t.take_inline_code());
+        }
+        assert!(seen.iter().any(|(_, c)| *c == InlineCode::HiddenEndTag));
+        let parse = |src: &str| crate::parse_module(src, 0, true).1;
+        assert!(parse("<!--</no<?phv if ($b) { ?>script<?phv } ?>>-->").iter().any(|d| d.is_error()));
+        // Other end tags there, and `</noscript>` in text, are fine.
+        for html in [
+            "<!-- <script src=\"/old.js\"></script> -->",
+            "<p title=\"</b>\" data-x=\"<textarea></textarea>\">",
+            "<noscript><p>Turn on JavaScript.</p></noscript>",
+            "</noscript>",
+        ] {
+            assert!(found(html).is_empty(), "{html}");
+        }
+        assert_eq!(ctx("<!--</scr"), EchoContext::Comment(false));
+        assert_eq!(ctx("<p title=\"a < "), EchoContext::Attr);
+    }
+
+    /// Found by the 1.1.1 audit: a value ending with `--` before a literal `>`
+    /// ended a comment for browsers while this tracker read on, and so did
+    /// `-` + `->` split by a statement.
+    #[test]
+    fn values_and_statements_cannot_end_a_comment() {
+        let parse = |src: &str| crate::parse_module(src, 0, true).1;
+        let errors = |src: &str| parse(src).iter().filter(|d| d.is_error()).count();
+        for src in [
+            // Text after a value that a value's `-`, `--` or `--!` would complete.
+            "<!-- <?= $v ?>> <a href=x> -->",
+            "<!-- <?= $v ?>!> -->",
+            "<!-- a<?= $v ?>-> -->",
+            "<!-- <?= $v ?>-!> -->",
+            "<!-- <?= $a ?><?= $b ?>> -->",
+            // A block may or may not run between the value and the text.
+            "<!-- <?= $v ?><?phv if ($c) { ?> x<?phv } ?>> -->",
+            // A comment's start or a `-` before a block.
+            "<!-- a-<?phv if ($c) { ?>-<?phv } ?>> -->",
+            "<!--<?phv if ($c) { ?>-<?phv } ?>> -->",
+        ] {
+            assert!(errors(src) > 0, "{src}");
+        }
+        // Nor a value there (the type checker refuses `AfterMarkup`).
+        for html in ["<!--", "<!---", "<!-- a-", "<!-- a--", "<!-- a--!"] {
+            assert_eq!(ctx(html), EchoContext::AfterMarkup, "{html}");
+        }
+        // Read across a statement: `-` + `->` ends the comment, as for browsers.
+        let mut t = HtmlTracker::default();
+        t.feed("<!-- a -");
+        t.feed("-> <p>");
+        assert!(t.at_top_level());
+        let mut t = HtmlTracker::default();
+        t.feed("<!--");
+        t.feed(">");
+        assert!(t.at_top_level(), "`<!--` + `>` is an empty comment");
+        for src in ["<!-- <?= $v ?> --> <p>", "<!-- <?= $v ?>--> <p>", "<!-- a <?= $v ?> - <?= $w ?> -->"] {
+            assert_eq!(errors(src), 0, "{src}");
+        }
+        assert_eq!(ctx("<!-- a "), EchoContext::Comment(false));
+        assert_eq!(ctx("<!x a "), EchoContext::Comment(true));
+        assert_eq!(ctx("<!-- a-"), EchoContext::AfterMarkup);
     }
 
     /// Found by the 1.0.0 audit: spaces after an attribute name were looked
@@ -1579,7 +1742,7 @@ mod tests {
         assert_eq!(ctx("<title><p title=\"</title><p>"), EchoContext::Text);
         // In SVG, <title> is parsed as markup.
         assert_eq!(ctx("<svg><title><script>var g = "), EchoContext::Script);
-        assert_eq!(ctx("<svg></svg><title><script>"), EchoContext::Text);
+        assert_eq!(ctx("<svg></svg><title><script>"), EchoContext::RawText("title"));
         // Bogus comments end at the first `>`.
         assert_eq!(ctx("<!DOCTYPE html><p>"), EchoContext::Text);
         assert_eq!(ctx("<? x ><script>var h = "), EchoContext::Script);

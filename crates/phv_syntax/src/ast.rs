@@ -105,7 +105,7 @@ pub enum StmtKind {
 /// Where in an HTML document a `<?= ?>` value is inserted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EchoContext {
-    /// Element content, or a comment.
+    /// Element content.
     Text,
     /// A quoted attribute value.
     Attr,
@@ -140,6 +140,19 @@ pub enum EchoContext {
     /// `content` of a `<meta>` that is not a `name`/`property`/`itemprop`
     /// meta, such as `http-equiv="refresh"` (`content="0;url=..."` redirects).
     MetaContent,
+    /// Element content or a comment inside `<svg>` or `<math>`. Browsers read
+    /// markup there as foreign content, while a template's or function's
+    /// output was checked as HTML: `Html` is checked when it is inserted, and
+    /// functions called there may not write output.
+    ForeignText,
+    /// The text of a raw-text element such as `<textarea>` or `<title>` (its
+    /// name): `Html` inserted there may not hold its end tag, and functions
+    /// called there may not write output.
+    RawText(&'static str),
+    /// A comment (`true`: a bogus comment such as `<!x ...>`, which ends at
+    /// the first `>`): `Html` inserted there may not end it, and functions
+    /// called there may not write output.
+    Comment(bool),
 }
 
 #[derive(Debug, Clone)]

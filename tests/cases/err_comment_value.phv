@@ -1,0 +1,11 @@
+<?phv
+// A value right after `<!--`, `<!---` or a `-` in a comment could make it end
+// with the text that follows (`<!--` + `` + `>`, `-` + `-` + `>`; found by the
+// 1.1.1 audit). Every line is an error but the last.
+$v = "-";
+?>
+<!--<?= $v ?>> -->
+<!---<?= $v ?> -->
+<!-- a-<?= $v ?> -->
+<!-- a--!<?= $v ?> -->
+<!-- a - <?= $v ?> -->

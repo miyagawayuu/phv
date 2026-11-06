@@ -1,0 +1,10 @@
+<?phv
+// Inside `<svg>` or `<math>`, browsers read a template's markup as foreign
+// content, where a `<textarea>`'s text is markup (it was checked as raw text):
+// here the link would take the unchecked URL. `Html` that browsers would read
+// in another way there stops the page (found by the 1.1.1 audit).
+$u = "javascript:alert(1)";
+?>
+<svg><?= render("views/svg_bar.phv.html", n: 1) ?></svg>
+<svg><?= render("views/svg_textarea.phv.html", u: $u) ?></svg>
+not reached

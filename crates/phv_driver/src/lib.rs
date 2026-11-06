@@ -8,7 +8,7 @@ pub mod config;
 pub use cache::compile_cached;
 pub use config::{load_config, Config, Csp, DEFAULT_CSP};
 use phv_syntax::ast::{Module, StmtKind};
-use phv_syntax::{diag, parse_module, Diagnostic, SourceMap, Span};
+use phv_syntax::{diag, parse_module_within, Diagnostic, SourceMap, Span};
 use phv_types::{CheckInput, ModuleInput, ModuleKind};
 use phv_vm::{BuiltinFn, Host, HttpCtx, Limits, Program, TraceLine, Vm, VmError};
 use std::collections::{HashMap, HashSet};
@@ -151,6 +151,11 @@ fn now_secs() -> u64 {
 }
 
 fn stat(p: &Path) -> Option<(Option<(u64, u32)>, u64)> {
+    // A file that has become a link to another machine is not followed: it
+    // counts as missing, so the program is loaded (and refused) again.
+    if final_link_to_another_machine(p) {
+        return None;
+    }
     let m = std::fs::metadata(p).ok()?;
     let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
     Some((t.map(|d| (d.as_secs(), d.subsec_nanos())), m.len()))
@@ -245,7 +250,7 @@ fn find_root_in(cwd: &Path, entry: &Path) -> PathBuf {
     // A relative path runs out before the current directory and the ones above
     // it (`public/index.phv` stops at `public`), so go on along the absolute path.
     if entry.is_relative() {
-        if let Ok(abs) = cwd.join(&start).canonicalize() {
+        if let Ok(abs) = resolve_here(&cwd.join(&start)) {
             if let Some(dir) = abs.ancestors().find(|d| trusted_config(d)) {
                 return dir.to_path_buf();
             }
@@ -285,6 +290,9 @@ pub fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// block forever), of at most `MAX_SOURCE` bytes.
 pub fn read_source(path: &Path) -> std::io::Result<String> {
     use std::io::{Error, ErrorKind, Read};
+    if final_link_to_another_machine(path) {
+        return Err(Error::new(ErrorKind::PermissionDenied, "it is a link to another machine"));
+    }
     let file = std::fs::File::open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
@@ -301,6 +309,24 @@ pub fn read_source(path: &Path) -> std::io::Result<String> {
     Ok(text)
 }
 
+/// The canonical form of `path`, or, when a link on the way leads to another
+/// machine, its absolute spelling: resolving such a link would contact the
+/// host (see `safefs::on_another_machine`).
+fn resolve_here(path: &Path) -> std::io::Result<PathBuf> {
+    if phv_std::safefs::on_another_machine(path) {
+        std::path::absolute(path)
+    } else {
+        path.canonicalize()
+    }
+}
+
+/// Whether `path` itself is a link or junction that leads to another machine
+/// (see `safefs::on_another_machine`): the link is read, not followed.
+fn final_link_to_another_machine(path: &Path) -> bool {
+    let parent = path.parent().unwrap_or(Path::new(""));
+    phv_std::safefs::on_another_machine_below(parent, path)
+}
+
 /// Whether `dir` holds a `phv.toml` that may be used when it is found by
 /// walking up from a script. A project file decides what scripts may read,
 /// write and connect to, so one that another user could have put there is
@@ -313,7 +339,7 @@ fn trusted_config(dir: &Path) -> bool {
     if !meta.is_file() {
         return false;
     }
-    let abs = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let abs = resolve_here(dir).unwrap_or_else(|_| dir.to_path_buf());
     if abs.parent().is_none() {
         return false;
     }
@@ -356,8 +382,22 @@ fn safe_relative(p: &str) -> bool {
     !p.is_empty() && path.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
-/// A parsed module and the diagnostics of parsing it.
-type Parsed = (Arc<Module>, Arc<Vec<Diagnostic>>);
+/// A parsed module, the diagnostics of parsing it, and its number of tokens.
+type Parsed = (Arc<Module>, Arc<Vec<Diagnostic>>, usize);
+
+/// The most tokens of all the files of one program together (its pages,
+/// modules, templates and packages, and std). Each file has at most
+/// `lexer::MAX_TOKENS`; without this a program of many such files took
+/// gigabytes to check (found by the 15th assessment: 24 files, 4.7 GB). The
+/// examples of the repository have about 30,000 together.
+pub const MAX_PROGRAM_TOKENS: usize = 2_000_000;
+
+/// The most bytes of source text of one program (see `MAX_PROGRAM_TOKENS`):
+/// a file of one long comment or string has few tokens.
+pub const MAX_PROGRAM_TEXT: usize = 32 << 20;
+
+/// The most files one program may load (std's included).
+pub const MAX_PROGRAM_FILES: usize = 2_000;
 
 /// Modules parsed in this process, by file id, kind and content, and the
 /// bytes of their text: a module loaded again with the same text and id (std
@@ -377,23 +417,32 @@ const PARSED_KEEP: usize = 64 << 20;
 /// Sources longer than this are parsed each time, never kept.
 const PARSED_TEXT_MAX: usize = 1 << 20;
 
-fn parsed(text: &str, file: u32, template: bool) -> Parsed {
+/// Parses a module of at most `limit` tokens: None when it has more and
+/// `limit` is below `lexer::MAX_TOKENS` (the program's budget would be passed;
+/// above that, the file itself is too large, which its diagnostics report).
+fn parsed(text: &str, file: u32, template: bool, limit: usize) -> Option<Parsed> {
     let keep = text.len() <= PARSED_TEXT_MAX;
     let key = (file, template, sha256(text.as_bytes()));
     if keep {
         if let Some(p) = PARSED.lock().unwrap_or_else(|e| e.into_inner()).0.get(&key) {
-            return p.clone();
+            return (p.2 <= limit).then(|| p.clone());
         }
     }
     let before = phv_vm::alloc::thread_allocated();
-    let (module, diags) = parse_module(text, file, template);
-    let p: Parsed = (Arc::new(module), Arc::new(diags));
+    let (module, diags, tokens) = parse_module_within(text, file, template, limit);
+    let tokens = match tokens {
+        Some(n) => n,
+        None if limit < phv_syntax::lexer::MAX_TOKENS => return None,
+        // Too large on its own: nothing of it was kept, only the error.
+        None => 0,
+    };
+    let p: Parsed = (Arc::new(module), Arc::new(diags), tokens);
     // Without the counting allocator (a program that embeds this crate), a
     // generous estimate.
     let measured = (phv_vm::alloc::thread_allocated() - before).max(0) as usize;
     let size = if measured > 0 { measured } else { text.len().saturating_mul(64) };
     if !keep || size > PARSED_KEEP / 4 {
-        return p;
+        return Some(p);
     }
     let mut cache = PARSED.lock().unwrap_or_else(|e| e.into_inner());
     if cache.1 + size > PARSED_KEEP {
@@ -402,7 +451,7 @@ fn parsed(text: &str, file: u32, template: bool) -> Parsed {
     if cache.0.insert(key, p.clone()).is_none() {
         cache.1 += size;
     }
-    p
+    Some(p)
 }
 
 struct Loader {
@@ -428,15 +477,69 @@ struct Loader {
     templates: HashMap<String, usize>,
     by_path: HashMap<PathBuf, usize>,
     deps: Vec<Dep>,
+    /// Tokens and bytes of source of the files loaded so far (see `MAX_PROGRAM_TOKENS`).
+    tokens: usize,
+    text: usize,
+    /// Set when the program passed a budget: nothing more is loaded, and it is not checked.
+    too_large: bool,
 }
 
 impl Loader {
-    fn add(&mut self, name: String, path: Option<PathBuf>, text: String, kind: ModuleKind) -> usize {
+    /// Refuses the program for passing a budget (`what` it has more of), at `span`.
+    fn refuse_too_large(&mut self, what: String, span: Span) {
+        if !self.too_large {
+            self.too_large = true;
+            self.diags.push(Diagnostic::error(format!("this program is too large: {what}"), span).note(
+                "a program is a page or script with every file it imports or renders; split it into smaller ones",
+            ));
+        }
+    }
+
+    /// Whether `path` is on another machine (a network share or drive, or a
+    /// link to one), reported at `span`. Such a file is not opened or resolved:
+    /// Windows would contact its host with the user's credentials (found by the
+    /// 15th assessment: a link to a share was followed before the check that
+    /// it is inside the project). Only the part below the project is looked at.
+    fn remote(&mut self, path: &Path, span: Span, what: &str) -> bool {
+        if !phv_std::safefs::on_another_machine_below(&self.root, path) {
+            return false;
+        }
+        let shown = display_name(&self.root, path);
+        self.diags.push(
+            Diagnostic::error(
+                format!("{what} {shown} resolves to a file outside the project, on another machine"),
+                span,
+            )
+            .note("it is a network share or drive, or a link to one; sources are read only from this machine"),
+        );
+        true
+    }
+
+    fn add(
+        &mut self,
+        name: String,
+        path: Option<PathBuf>,
+        text: String,
+        kind: ModuleKind,
+        span: Option<Span>,
+    ) -> usize {
         if let Some(p) = &path {
             self.deps.push(Dep::new(p, Some(text.as_bytes())));
         }
+        self.text += text.len();
         let file = self.sources.add(name.clone(), path.clone(), text);
-        let (module, diags) = parsed(&self.sources.get(file).text, file, kind == ModuleKind::Template);
+        let limit = MAX_PROGRAM_TOKENS.saturating_sub(self.tokens);
+        let template = kind == ModuleKind::Template;
+        let (module, diags, tokens) = match parsed(&self.sources.get(file).text, file, template, limit) {
+            Some(p) => p,
+            None => {
+                let at = span.unwrap_or(Span::new(file, 0, 0));
+                self.refuse_too_large(format!("its files have more than {MAX_PROGRAM_TOKENS} tokens in all"), at);
+                let empty = Module { file, is_template: template, stmts: Vec::new(), template_refs: Vec::new() };
+                (Arc::new(empty), Arc::new(Vec::new()), 0)
+            }
+        };
+        self.tokens += tokens;
         self.diags.extend(diags.iter().cloned());
         self.modules.push((module, kind, name));
         let idx = self.modules.len() - 1;
@@ -459,6 +562,16 @@ impl Loader {
     fn load_file(&mut self, path: PathBuf, kind: ModuleKind, span: Span, what: &str) -> Option<usize> {
         if let Some(&i) = self.by_path.get(&path) {
             return Some(i);
+        }
+        if self.too_large {
+            return None;
+        }
+        if self.modules.len() >= MAX_PROGRAM_FILES {
+            self.refuse_too_large(format!("it has more than {MAX_PROGRAM_FILES} files"), span);
+            return None;
+        }
+        if self.remote(&path, span, what) {
+            return None;
         }
         // Symlinks and junctions must not pull in files from outside the project. A path
         // that cannot be resolved (missing, or a device name such as `CON`) is not read.
@@ -493,9 +606,14 @@ impl Loader {
             }
         });
         match overlaid.unwrap_or_else(|| read_source(&path)) {
+            Ok(text) if self.text + text.len() > MAX_PROGRAM_TEXT => {
+                let mb = MAX_PROGRAM_TEXT >> 20;
+                self.refuse_too_large(format!("its files have more than {mb} MB of source in all"), span);
+                None
+            }
             Ok(text) => {
                 let name = display_name(&self.root, &path);
-                Some(self.add(name, Some(path), text, kind))
+                Some(self.add(name, Some(path), text, kind, Some(span)))
             }
             Err(e) => {
                 let shown = display_name(&self.root, &path);
@@ -521,6 +639,9 @@ impl Loader {
             })
             .collect();
         for (name, span) in imports {
+            if self.too_large {
+                return;
+            }
             if self.imports.contains_key(&name) {
                 continue;
             }
@@ -530,7 +651,7 @@ impl Loader {
                         let file = format!("<std>/{}.phv", name.trim_start_matches("std."));
                         // Reserve the name first so import cycles terminate.
                         self.imports.insert(name.clone(), usize::MAX);
-                        let i = self.add(file, None, src.to_string(), ModuleKind::Std);
+                        let i = self.add(file, None, src.to_string(), ModuleKind::Std, Some(span));
                         self.imports.insert(name, i);
                     }
                     None => self.diags.push(Diagnostic::error(format!("unknown standard module `{name}`"), span)),
@@ -596,6 +717,9 @@ impl Loader {
             }
             let rel: PathBuf = rest.iter().collect::<PathBuf>().with_extension("phv");
             let path = base.join(rel);
+            if self.remote(&path, span, &format!("module `{name}`")) {
+                continue;
+            }
             // A package's module must really be inside the package (not a link out of it).
             let root_of = self.package_roots.iter().find(|(n, _)| n == segments[0]).map(|(_, d)| d.clone());
             if let (Some(pr), Ok(c)) = (root_of, path.canonicalize()) {
@@ -619,6 +743,9 @@ impl Loader {
         }
         let refs = self.modules[idx].0.template_refs.clone();
         for (rel, span) in refs {
+            if self.too_large {
+                return;
+            }
             if self.templates.contains_key(&rel) {
                 continue;
             }
@@ -657,6 +784,8 @@ pub struct Analysis {
     pub messages: Vec<String>,
     /// Only from `analyze_for_editor`.
     pub index: Option<phv_types::index::EditorIndex>,
+    /// The tokens of all its files (see `MAX_PROGRAM_TOKENS`).
+    pub tokens: usize,
     deps: Vec<Dep>,
 }
 
@@ -684,7 +813,7 @@ pub fn package_graph(root: &Path, config: &Config) -> (HashMap<String, PathBuf>,
         if deps.contains_key(&name) {
             continue;
         }
-        let names = package_dependencies(&dirs[&name]);
+        let names = package_dependencies(root, &dirs[&name]);
         for n in &names {
             if !dirs.contains_key(n) {
                 dirs.insert(n.clone(), root.join("vendor").join(n));
@@ -696,9 +825,14 @@ pub fn package_graph(root: &Path, config: &Config) -> (HashMap<String, PathBuf>,
     (dirs, deps)
 }
 
-/// The names in the `[dependencies]` of the package in `dir` (none if it has no phv.toml).
-fn package_dependencies(dir: &Path) -> Vec<String> {
-    let Ok(text) = read_source(&dir.join("phv.toml")) else { return Vec::new() };
+/// The names in the `[dependencies]` of the package in `dir` (none if it has
+/// no phv.toml, or is on another machine: see `Loader::remote`).
+fn package_dependencies(root: &Path, dir: &Path) -> Vec<String> {
+    let manifest = dir.join("phv.toml");
+    if phv_std::safefs::on_another_machine_below(root, &manifest) {
+        return Vec::new();
+    }
+    let Ok(text) = read_source(&manifest) else { return Vec::new() };
     let Ok(t) = toml::from_str::<toml::Table>(&text) else { return Vec::new() };
     let Some(table) = t.get("dependencies").and_then(|d| d.as_table()) else { return Vec::new() };
     table.keys().filter(|k| config::valid_package_name(k)).cloned().collect()
@@ -723,7 +857,18 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
         messages.push(e);
         Config::default_for(root)
     });
-    let (packages, package_deps) = package_graph(root, &config);
+    let (mut packages, package_deps) = package_graph(root, &config);
+    // A package on another machine is not used (see `Loader::remote`).
+    let remote = |p: &Path| phv_std::safefs::on_another_machine_below(root, p);
+    let mut far: Vec<String> = packages.iter().filter(|(_, d)| remote(d)).map(|(n, _)| n.clone()).collect();
+    far.sort();
+    for n in far {
+        packages.remove(&n);
+        messages.push(format!(
+            "the package `{n}` is on another machine (a network share or drive, or a link to one); \
+             packages are read only from this machine"
+        ));
+    }
     let package_roots: Vec<(String, PathBuf)> =
         packages.iter().filter_map(|(n, d)| Some((n.clone(), d.canonicalize().ok()?))).collect();
     // Imports are known by name in the whole program, so a package may not
@@ -733,8 +878,12 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
         .iter()
         .filter(|(n, dir)| {
             let own = root.join(n.as_str());
+            let module = root.join(format!("{n}.phv"));
+            if remote(&own) || remote(&module) {
+                return true;
+            }
             let same = own.canonicalize().ok().is_some_and(|o| dir.canonicalize().ok() == Some(o));
-            (own.is_dir() && !same) || root.join(format!("{n}.phv")).is_file()
+            (own.is_dir() && !same) || module.is_file()
         })
         .map(|(n, _)| n)
         .collect();
@@ -762,6 +911,9 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
         templates: HashMap::new(),
         by_path: HashMap::new(),
         deps: Vec::new(),
+        tokens: 0,
+        text: 0,
+        too_large: false,
     };
     let toml = root.join("phv.toml");
     // Bounded like every source file (a huge phv.toml would be read whole on each keystroke).
@@ -774,17 +926,29 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
             loader.deps.push(Dep::new(&m, Some(text.as_bytes())));
         }
     }
-    loader.add("<std>/prelude.phv".into(), None, phv_std::PRELUDE.to_string(), ModuleKind::Prelude);
-    // The editor's text of the document has the limit of files read from disk
-    // (found by the 1.0.0 audit).
-    let overlaid = entry.canonicalize().ok().and_then(|c| loader.overlay.get(&c).cloned()).map(|t| {
-        if t.len() as u64 > MAX_SOURCE {
-            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("larger than {} MB", MAX_SOURCE >> 20)))
-        } else {
-            Ok(t)
-        }
-    });
-    let text = match overlaid.unwrap_or_else(|| read_source(entry)) {
+    loader.add("<std>/prelude.phv".into(), None, phv_std::PRELUDE.to_string(), ModuleKind::Prelude, None);
+    // The entry is looked at like the files it imports (see `Loader::remote`).
+    let read = if remote(entry) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "it is on another machine (a network share or drive, or a link to one)",
+        ))
+    } else {
+        // The editor's text of the document has the limit of files read from disk
+        // (found by the 1.0.0 audit).
+        let overlaid = entry.canonicalize().ok().and_then(|c| loader.overlay.get(&c).cloned()).map(|t| {
+            if t.len() as u64 > MAX_SOURCE {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("larger than {} MB", MAX_SOURCE >> 20),
+                ))
+            } else {
+                Ok(t)
+            }
+        });
+        overlaid.unwrap_or_else(|| read_source(entry))
+    };
+    let text = match read {
         Ok(t) => t,
         Err(e) => {
             messages.push(format!("cannot read {}: {e}", entry.display()));
@@ -796,6 +960,7 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
                 messages,
                 index: None,
                 deps: Vec::new(),
+                tokens: 0,
             };
         }
     };
@@ -803,8 +968,23 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
     // An editor can open a template on its own; it is checked as a template.
     let template = editor && entry.to_string_lossy().ends_with(".phv.html");
     let kind = if template { ModuleKind::Template } else { ModuleKind::Entry };
-    let entry_module = loader.add(name, Some(entry.to_path_buf()), text, kind);
+    let entry_module = loader.add(name, Some(entry.to_path_buf()), text, kind, None);
     let entry_file = Some(loader.modules[entry_module].0.file);
+    // A program past a budget is not checked: checking is what takes the most
+    // memory (found by the 15th assessment). Its trees are dropped first.
+    if loader.too_large {
+        drop(std::mem::take(&mut loader.modules));
+        return Analysis {
+            sources: loader.sources,
+            diags: loader.diags,
+            hir: None,
+            entry_file,
+            messages,
+            index: None,
+            deps: loader.deps,
+            tokens: loader.tokens,
+        };
+    }
     // With syntax or loading errors the program cannot run, but the files that
     // loaded cleanly are still checked, so their type errors show up as well.
     let broken = !editor && loader.diags.iter().any(|d| d.is_error());
@@ -847,6 +1027,7 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
         messages,
         index,
         deps: loader.deps,
+        tokens: loader.tokens,
     }
 }
 
@@ -1156,5 +1337,65 @@ mod tests {
         assert_eq!(find_root_in(Path::new("/"), &public.join("index.phv")), public.parent().unwrap());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Found by the 15th assessment: a source was resolved (`canonicalize`,
+    /// which opens a link's target) before the check that it is inside the
+    /// project, so a link to a share made `phv check` contact the host. Making
+    /// a link needs Developer Mode or the privilege: skipped without.
+    #[cfg(windows)]
+    #[test]
+    fn sources_behind_a_link_to_a_share_are_refused_unresolved() {
+        let dir = std::env::temp_dir().join(format!("phv-remote-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::create_dir_all(dir.join("vendor")).unwrap();
+        std::fs::write(dir.join("phv.toml"), "[project]\nname = \"t\"\n").unwrap();
+        let page = dir.join("page.phv");
+        let refused = |src: &str| {
+            std::fs::write(&page, src).unwrap();
+            let start = std::time::Instant::now();
+            let a = analyze(&dir, &page, HashMap::new());
+            let messages: Vec<String> = a.diags.iter().map(|d| d.message.clone()).chain(a.messages).collect();
+            (messages.join("\n"), start.elapsed())
+        };
+        let share = r"\\phv-test.invalid\share\m.phv";
+        if std::os::windows::fs::symlink_file(share, dir.join("lib/m.phv")).is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        // An import, a template, an import through a link to a folder on the
+        // share, and the same in the object manager's spelling.
+        std::os::windows::fs::symlink_dir(r"\\phv-test.invalid\share", dir.join("far")).unwrap();
+        std::os::windows::fs::symlink_file(r"\GLOBAL??\UNC\phv-test.invalid\share\n.phv", dir.join("lib/n.phv"))
+            .unwrap();
+        std::os::windows::fs::symlink_file(r"\\phv-test.invalid\share\v.phv.html", dir.join("v.phv.html")).unwrap();
+        for (src, shown) in [
+            ("<?phv\nimport lib.m.{f};\necho f();\n", "lib/m.phv"),
+            ("<?phv\nimport far.m.{f};\necho f();\n", "far/m.phv"),
+            ("<?phv\nimport lib.n.{f};\necho f();\n", "lib/n.phv"),
+            ("<?phv\necho render(\"v.phv.html\", []);\n", "v.phv.html"),
+        ] {
+            let (messages, took) = refused(src);
+            assert!(
+                messages.contains(&format!("{shown} resolves to a file outside the project, on another machine")),
+                "{messages}"
+            );
+            // Resolving the name of a host that does not exist takes seconds.
+            assert!(took < std::time::Duration::from_secs(2), "{shown}: {took:?}");
+        }
+        // The entry itself, a package folder, and a phv.toml that are such links.
+        std::os::windows::fs::symlink_file(share, dir.join("link.phv")).unwrap();
+        let a = analyze(&dir, &dir.join("link.phv"), HashMap::new());
+        assert!(a.messages.iter().any(|m| m.contains("on another machine")), "{:?}", a.messages);
+        std::os::windows::fs::symlink_dir(r"\\phv-test.invalid\share", dir.join("vendor/far")).unwrap();
+        std::fs::write(dir.join("phv.toml"), "[project]\nname = \"t\"\n[dependencies]\nfar = \"1\"\n").unwrap();
+        let (messages, _) = refused("<?phv\nimport far.main.{f};\necho f();\n");
+        assert!(messages.contains("the package `far` is on another machine"), "{messages}");
+        std::fs::remove_file(dir.join("phv.toml")).unwrap();
+        std::os::windows::fs::symlink_file(r"\\phv-test.invalid\share\phv.toml", dir.join("phv.toml")).unwrap();
+        let e = load_config(&dir).err().unwrap_or_default();
+        assert!(e.contains("link to another machine"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

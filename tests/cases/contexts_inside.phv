@@ -1,0 +1,14 @@
+<?phv
+// Ordinary templates, values and statements still work inside `<noscript>`,
+// `<svg>` and the text of a `<textarea>` or `<title>` (what browsers would read
+// in another way there is refused: see err_context_noscript_partial.phv,
+// err_html_in_svg.phv, err_html_in_textarea.phv and err_output_in_svg.phv).
+function label(): string { return "x < y"; }
+?>
+<noscript><?= render("views/noscript_ok.phv.html", msg: "Turn on JavaScript") ?></noscript>
+<svg><?= render("views/svg_bar.phv.html", n: 3) ?></svg>
+<textarea><?= escape("</textarea> stays text") ?> <?= render("views/plain.phv.html") ?></textarea>
+<title><?= nl2br("a") ?> <?= label() ?></title>
+<svg><?phv foreach ([1, 2] as $i) { ?><circle r="<?= $i ?>"/><?phv } ?></svg>
+<noscript><?phv foreach ([1] as $i) { ?><p><?= label() ?></p><?phv } ?></noscript>
+<!--</b<?= "x" ?> --><!--</ <?= "noscript" ?> -->

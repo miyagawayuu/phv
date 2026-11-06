@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub use netdb::{JobEnd as End, JobInfo as Info, JobRow as Row, JOB_MAX_DEAD};
+pub use netdb::{JobCap, JobEnd as End, JobInfo as Info, JobRow as Row, JOB_MAX_DEAD, JOB_MAX_KEPT};
 
 /// The largest payload of a job.
 pub const MAX_PAYLOAD: usize = 64 * 1024;
@@ -23,8 +23,12 @@ pub const MAX_PAYLOAD: usize = 64 * 1024;
 pub const MAX_DELAY: i64 = 30 * 24 * 3600;
 /// The longest key.
 pub const MAX_KEY: usize = 200;
-/// Waiting and running jobs a database store holds at most.
+/// Waiting and running jobs a database store holds at most, and the bytes of
+/// their payloads (found by the 1.1.1 audit: only the jobs were counted).
 pub const MAX_JOBS: usize = 100_000;
+pub const MAX_JOB_BYTES: usize = 1 << 30;
+/// The caps of a database store.
+pub const DB_CAP: JobCap = JobCap { jobs: MAX_JOBS, bytes: MAX_JOB_BYTES };
 /// Waiting and running jobs, and their bytes, the memory store holds at most.
 pub const MAX_MEMORY_JOBS: usize = 10_000;
 pub const MAX_MEMORY_BYTES: usize = 64 << 20;
@@ -217,8 +221,7 @@ impl Store {
         let run_at = now + delay_secs * 1000;
         let r = match self {
             Store::Db(spec, ns) => {
-                netdb::job_add(spec, ns.as_deref(), (&id, name, payload), run_at, uniq, MAX_JOBS, deadline)?
-                    .map(|()| id)
+                netdb::job_add(spec, ns.as_deref(), (&id, name, payload), run_at, uniq, DB_CAP, deadline)?.map(|()| id)
             }
             Store::Memory(key) => {
                 let mut all = lock(&MEMORY);
@@ -456,7 +459,7 @@ fn add(vm: &mut Vm, a: &[Value]) -> R {
             return Err(vm.throw("DatabaseError", format!("enqueue(): {e}")));
         }
         let job = (id.as_str(), name.as_str(), payload.as_str());
-        match netdb::job_add_in_transaction(vm, db, db_name, job, run_at, uniq.as_deref(), MAX_JOBS) {
+        match netdb::job_add_in_transaction(vm, db, db_name, job, run_at, uniq.as_deref(), DB_CAP) {
             Some(Ok(Some(()))) => {
                 added(&store);
                 return Ok(Value::str(id));

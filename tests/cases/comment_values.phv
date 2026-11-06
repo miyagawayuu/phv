@@ -1,0 +1,13 @@
+<?phv
+// Values and statements in comments still work when nothing next to them
+// could end the comment (see err_comment_end.phv, err_html_in_comment.phv and
+// err_output_in_comment.phv for what is refused).
+$v = "--";
+$n = 3;
+?>
+<!-- <?= $v ?> --> <p>after the comment</p>
+<!-- <?= $v ?>--> <p>after another</p>
+<!-- build <?= $n ?> - <?= render("views/plain.phv.html") ?> -->
+<!-- <?phv for ($i = 0; $i < 2; $i++) { ?>item <?= $i ?> <?phv } ?>-->
+<!-- a -<?phv $n++; ?>-> <p>the comment ended at `-->`</p>
+<!x <?= $v ?> > <p>after a bogus comment</p>

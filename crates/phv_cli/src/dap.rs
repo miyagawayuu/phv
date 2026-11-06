@@ -128,6 +128,8 @@ fn rel_name(root: &Path, path: &Path) -> Option<String> {
     let rel = match path.strip_prefix(root) {
         Ok(rel) => rel.to_path_buf(),
         // The editor may spell the path differently (case, links, short names).
+        // A link to another machine is not resolved (that would contact the host).
+        Err(_) if phv_std::safefs::on_another_machine(path) => return None,
         Err(_) => path.canonicalize().ok()?.strip_prefix(root.canonicalize().ok()?).ok()?.to_path_buf(),
     };
     Some(rel.to_string_lossy().replace('\\', "/"))

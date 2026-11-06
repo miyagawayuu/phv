@@ -2,7 +2,7 @@
 //! counting alone would leak them, request after request).
 
 use phv_driver::{compile, run, RunOptions};
-use phv_vm::alloc::{thread_allocated, CountingAlloc};
+use phv_vm::alloc::{reset_thread_peak, thread_allocated, thread_peak, CountingAlloc};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
@@ -155,4 +155,56 @@ fn cycles_are_collected_when_memory_runs_short() {
     let (out, err) = run_src("pressure_live", &src, limits);
     assert_eq!(out, "");
     assert!(err.as_deref().is_some_and(|e| e.contains("allowed memory size of 32 MB exhausted")), "{err:?}");
+}
+
+/// Runs `src` under `limits`; returns its output, its error, and the most
+/// memory the run held at once.
+fn run_peak(name: &str, src: &str, limits: phv_vm::Limits) -> (String, Option<String>, usize) {
+    let dir = std::env::temp_dir().join(format!("phv-cycles-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.phv");
+    std::fs::write(&file, src).unwrap();
+    let c = compile(&dir, &file).unwrap_or_else(|e| panic!("{}", e.render(false)));
+    let base = thread_allocated();
+    reset_thread_peak();
+    let outcome = run(&c, RunOptions { html: false, limits, http: None, host: None });
+    let peak = (thread_peak() - base).max(0) as usize;
+    let _ = std::fs::remove_dir_all(&dir);
+    (outcome.output, outcome.error.map(|e| e.render()), peak)
+}
+
+/// Found by the 1.1.1 audit: the collector's own memory (over 100 bytes for
+/// each object it walks) was not counted, so a long list of live objects
+/// held 321 MB under a 128 MB limit (2.5 times the limit). It is counted now.
+#[test]
+fn the_collector_stays_within_the_memory_limit() {
+    const LIMIT: usize = 32 << 20;
+    let limits = phv_vm::Limits { max_memory: Some(LIMIT), ..Default::default() };
+    for (name, src) in [
+        // A linked list: every object is live.
+        (
+            "linked",
+            "<?phv\nclass E { public function __construct(public ?E $n) {} }\n?E $l = null;\n\
+             for ($i = 0; $i < 10000000; $i++) { $l = new E($l); }\necho \"done\";\n",
+        ),
+        // A list of objects.
+        ("listed", "<?phv\nclass E {}\nlist<E> $l = [];\nfor ($i = 0; $i < 10000000; $i++) { $l[] = new E(); }\n"),
+    ] {
+        let (out, err, peak) = run_peak(name, src, limits);
+        assert_eq!(out, "", "{name}");
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("allowed memory size of 32 MB exhausted")),
+            "{name}: {err:?}"
+        );
+        assert!(peak < LIMIT * 3 / 2, "{name} held {} MB", peak >> 20);
+    }
+    // Many live objects, and cycles made after them: the newest objects (where
+    // the cycles are) are walked when all of them would not fit, and freed.
+    let src = "<?phv\nclass E { public ?E $n = null; }\nlist<E> $keep = [];\n\
+               for ($i = 0; $i < 150000; $i++) { $keep[] = new E(); }\n\
+               for ($i = 0; $i < 300000; $i++) { $a = new E(); $b = new E(); $a->n = $b; $b->n = $a; }\n\
+               echo count($keep);\n";
+    let (out, err, peak) = run_peak("churn_beside_live", src, limits);
+    assert_eq!((out.as_str(), err), ("150000", None));
+    assert!(peak < LIMIT * 3 / 2, "held {} MB", peak >> 20);
 }

@@ -41,6 +41,15 @@ struct Entry<P = Program> {
     program: P,
 }
 
+/// The first fields of an `Entry`, read first: an entry another binary (or
+/// for another script) wrote is not decoded whole.
+#[derive(Deserialize)]
+struct Head {
+    stamp: String,
+    entry: String,
+    root: String,
+}
+
 /// Cache files larger than this are not read.
 const MAX_ENTRY: u64 = 256 * 1024 * 1024;
 const MAC_LEN: usize = 32;
@@ -135,9 +144,19 @@ fn load(root: &Path, entry: &Path, key: &[u8; 32], stamp: &str) -> Option<Compil
     if !phv_std::constant_time_eq(&mac(key, body), tag) {
         return None;
     }
+    let (head, _) = postcard::take_from_bytes::<Head>(body).ok()?;
+    if head.stamp != stamp {
+        return None;
+    }
     let e: Entry = postcard::from_bytes(body).ok()?;
+    // A file that has become a link to another machine (or lies behind one) is
+    // not resolved or read: that would contact the host. It is compiled again,
+    // which refuses it.
+    if e.deps.iter().any(|d| phv_std::safefs::on_another_machine_below(root, &d.path)) {
+        return None;
+    }
     let here = (canonical(entry)?, canonical(root)?);
-    if e.stamp != stamp || (e.entry.as_str(), e.root.as_str()) != (here.0.as_str(), here.1.as_str()) {
+    if (head.entry.as_str(), head.root.as_str()) != (here.0.as_str(), here.1.as_str()) {
         return None;
     }
     // The entry script must be among the dependencies, and every dependency
@@ -190,6 +209,10 @@ fn store(root: &Path, entry: &Path, key: &[u8; 32], e: &Entry<&Program>) -> Opti
 /// Like `compile`, but reuses (and refreshes) the on-disk cache.
 pub fn compile_cached(root: &Path, entry: &Path) -> Result<Compiled, CompileError> {
     let Some(key) = key() else { return compile(root, entry) };
+    // An entry behind a link to another machine is not resolved here; `compile` refuses it.
+    if phv_std::safefs::on_another_machine_below(root, entry) {
+        return compile(root, entry);
+    }
     let stamp = stamp();
     if let Some(c) = load(root, entry, key, &stamp) {
         return Ok(c);

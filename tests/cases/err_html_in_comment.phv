@@ -1,0 +1,8 @@
+<?phv
+// `Html` inserted into a comment may not hold `-->` (or `--!>`), which would end
+// it there and turn the rest into markup (found by the 1.1.1 audit): the page
+// stops.
+?>
+<!-- <?= render("views/plain.phv.html") ?> -->
+<!-- <?= render("views/noscript_ok.phv.html", msg: "x") ?> -->
+not reached

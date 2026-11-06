@@ -1,0 +1,8 @@
+<?phv
+// Functions called inside a comment may not write output: it could end the
+// comment (`-->`) where the template does not (found by the 1.1.1 audit).
+function dashes(): void { echo "--"; }
+dashes();
+?>
+<!-- <?phv dashes(); ?>> <p>after</p> -->
+not reached

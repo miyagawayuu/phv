@@ -1,0 +1,22 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: empties the job stores of the
+// test's two namespaces (phv_jobs_f2f2f2f2f2f2f2f2 and ..f3, which must exist)
+// and fills the first with 95,000 waiting jobs, 5,000 below the cap.
+import std.db.Database;
+import std.jobs.enqueue;
+
+$db = Database::connect("main");
+enqueue("burst", "setup");
+$pg = ($db->first(sql"SELECT version() AS v")?->string("v") ?? "")->startsWith("PostgreSQL");
+$db->execute(sql"DELETE FROM phv_jobs_f2f2f2f2f2f2f2f3");
+$db->execute(sql"DELETE FROM phv_jobs_f2f2f2f2f2f2f2f2");
+if ($pg) {
+    $db->execute(sql"INSERT INTO phv_jobs_f2f2f2f2f2f2f2f2 (id, name, payload, run_at, attempts, state, created)
+        SELECT md5(g::text), 'burst', '', 0, 0, 0, 0 FROM generate_series(1, 95000) g");
+} else {
+    $db->execute(sql"SET SESSION cte_max_recursion_depth = 100000");
+    $db->execute(sql"INSERT INTO phv_jobs_f2f2f2f2f2f2f2f2 (id, name, payload, run_at, attempts, state, created)
+        WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < 95000)
+        SELECT md5(n), 'burst', '', 0, 0, 0, 0 FROM g");
+}
+echo "filled";

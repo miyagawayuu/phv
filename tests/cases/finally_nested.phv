@@ -1,0 +1,350 @@
+<?phv
+// Nested `finally` blocks with `return`, `break`, `continue` and exceptions
+// passing through them: each block runs once, innermost first, and a block
+// that leaves itself overrides the way out it was entered for.
+
+function depth3(int $mode): string {
+    $log = "";
+    try {
+        try {
+            try {
+                if ($mode == 0) {
+                    return "r0";
+                }
+                if ($mode == 1) {
+                    throw new RuntimeException("e1");
+                }
+                $log .= "body ";
+            } finally {
+                echo "[f1]";
+                if ($mode == 2) {
+                    return "f1 returns";
+                }
+            }
+        } finally {
+            echo "[f2]";
+            if ($mode == 3) {
+                return "f2 returns";
+            }
+        }
+    } catch (RuntimeException $e) {
+        $log .= "caught " . $e->getMessage() . " ";
+    } finally {
+        echo "[f3]";
+    }
+    return $log . "end";
+}
+foreach ([0, 1, 2, 3, 4] as $m) {
+    echo " ", depth3($m), "\n";
+}
+
+// The value is computed before the blocks run; they cannot change it.
+function value_first(): int {
+    $x = 1;
+    try {
+        try {
+            return $x;
+        } finally {
+            $x = 2;
+            echo "inner x=$x ";
+        }
+    } finally {
+        $x = 3;
+        echo "outer x=$x ";
+    }
+}
+echo value_first(), "\n";
+
+// A `return` in a `finally` block entered by an exception swallows it.
+function swallow(): string {
+    try {
+        try {
+            throw new LogicException("lost");
+        } finally {
+            echo "(inner) ";
+        }
+    } finally {
+        return "swallowed";
+    }
+}
+echo swallow(), "\n";
+
+// An exception thrown by a `finally` block replaces the `return`.
+function replaced(): int {
+    try {
+        try {
+            return 1;
+        } finally {
+            throw new RuntimeException("from finally");
+        }
+    } catch (RuntimeException $e) {
+        echo "caught: ", $e->getMessage(), " ";
+        return 2;
+    } finally {
+        echo "(last) ";
+    }
+}
+echo replaced(), "\n";
+
+// `return;` from a void function through two blocks.
+function void_ret(bool $early): void {
+    try {
+        try {
+            if ($early) {
+                return;
+            }
+            echo "late ";
+        } finally {
+            echo "a ";
+        }
+    } finally {
+        echo "b ";
+    }
+    echo "end ";
+}
+void_ret(true);
+echo "| ";
+void_ret(false);
+echo "\n";
+
+// `break` and `continue` through nested blocks, at several loop levels.
+foreach ([1, 2, 3, 4] as $i) {
+    foreach (["a", "b", "c"] as $s) {
+        try {
+            try {
+                if ($s == "b" && $i == 1) {
+                    continue;
+                }
+                if ($s == "b" && $i == 2) {
+                    break;
+                }
+                if ($s == "b" && $i == 3) {
+                    continue 2;
+                }
+                if ($s == "c" && $i == 4) {
+                    break 2;
+                }
+                echo "$i$s ";
+            } finally {
+                echo "<$i$s> ";
+            }
+        } finally {
+            echo "{" . $i . $s . "} ";
+        }
+    }
+    echo "/ ";
+}
+echo "\n";
+
+// A `continue` in a `finally` block overrides the `break 2` it was entered for.
+$rounds = 0;
+foreach ([1, 2] as $i) {
+    foreach ([10, 20, 30] as $j) {
+        $rounds++;
+        try {
+            if ($j == 20) {
+                break 2;
+            }
+            echo "$i:$j ";
+        } finally {
+            if ($j == 20) {
+                echo "(stay) ";
+                continue;
+            }
+        }
+    }
+}
+echo "rounds=$rounds\n";
+
+// A `break` in a `finally` block overrides a `return`.
+function break_wins(): string {
+    $n = 0;
+    while (true) {
+        $n++;
+        try {
+            return "returned";
+        } finally {
+            if ($n < 3) {
+                continue;
+            }
+            break;
+        }
+    }
+    return "loop left after $n";
+}
+echo break_wins(), "\n";
+
+// `for` with `continue` through a block still runs the step.
+for ($i = 0; $i < 4; $i++) {
+    try {
+        if ($i % 2 == 0) {
+            continue;
+        }
+        echo "odd $i ";
+    } finally {
+        echo "f$i ";
+    }
+}
+echo "\n";
+
+// A `try` inside a `finally` block, with its own `finally`.
+function inside(int $mode): string {
+    try {
+        return "body";
+    } finally {
+        try {
+            if ($mode == 1) {
+                return "inner try";
+            }
+            if ($mode == 2) {
+                throw new RuntimeException("x");
+            }
+        } catch (RuntimeException) {
+            echo "caught ";
+        } finally {
+            echo "inner-finally ";
+        }
+        echo "after ";
+    }
+}
+echo inside(0), "\n", inside(1), "\n", inside(2), "\n";
+
+// Loops inside a `try` whose `finally` is crossed by a `break` from the inner loop.
+function loops_in_try(): string {
+    $out = "";
+    foreach ([1, 2, 3] as $a) {
+        try {
+            foreach ([7, 8, 9] as $b) {
+                try {
+                    if ($b == 8) {
+                        break 2;
+                    }
+                    $out .= "$a$b ";
+                } finally {
+                    $out .= "i ";
+                }
+            }
+        } finally {
+            $out .= "o ";
+        }
+    }
+    return $out;
+}
+echo loops_in_try(), "\n";
+
+// The same function called many times: nothing left over between calls.
+$sum = 0;
+for ($k = 0; $k < 50; $k++) {
+    $sum += strlen(depth3($k % 5));
+}
+echo "\nsum=$sum\n";
+
+// `break N` and `continue N` across several kinds of loops, with and
+// without blocks on the way; the collections are walked again after.
+function far(list<int> $xs): string {
+    $out = "";
+    foreach ($xs as $a) {
+        $n = 0;
+        while ($n < 3) {
+            $n++;
+            foreach ($xs as $b) {
+                for ($c = 0; $c < 3; $c++) {
+                    try {
+                        if ($a == 1 && $b == 2) {
+                            continue 3;
+                        }
+                        if ($a == 2 && $c == 1) {
+                            continue 4;
+                        }
+                        if ($a == 3 && $b == 3) {
+                            break 4;
+                        }
+                        if ($c == 2 && $a != 3) {
+                            break 2;
+                        }
+                        $out .= "$a$b$c ";
+                    } finally {
+                        if ($a == 3 && $b == 3) {
+                            $out .= "[f] ";
+                        }
+                    }
+                }
+            }
+            $out .= "w ";
+        }
+        $out .= "| ";
+    }
+    foreach ($xs as $a) {
+        foreach ($xs as $b) {
+            if ($b == 2) {
+                continue 2;
+            }
+            $out .= "again$a$b ";
+        }
+    }
+    return $out;
+}
+echo far([1, 2, 3]), "\n";
+
+// A `continue` in `finally` goes to the loop around the `try`, also when the
+// way out started in a loop inside the `try` (it used to go to that inner
+// loop, and the block ran twice).
+$out = "";
+foreach ([1, 2, 3] as $a) {
+    try {
+        foreach ([10, 20] as $b) {
+            if ($b == 20) {
+                break 2;
+            }
+            $out .= "$a:$b ";
+        }
+    } finally {
+        $out .= "f$a ";
+        if ($a < 3) {
+            continue;
+        }
+    }
+    $out .= "after$a ";
+}
+echo $out, "\n";
+
+// 30 nested blocks, each of which may return.
+function deep(int $at): int {
+    try { try { try { try { try { try { try { try { try { try {
+    try { try { try { try { try { try { try { try { try { try {
+    try { try { try { try { try { try { try { try { try { try {
+        return 100;
+    } finally { if ($at == 29) { return 29; } } } finally { if ($at == 28) { return 28; } }
+    } finally { if ($at == 27) { return 27; } } } finally { if ($at == 26) { return 26; } }
+    } finally { if ($at == 25) { return 25; } } } finally { if ($at == 24) { return 24; } }
+    } finally { if ($at == 23) { return 23; } } } finally { if ($at == 22) { return 22; } }
+    } finally { if ($at == 21) { return 21; } } } finally { if ($at == 20) { return 20; } }
+    } finally { if ($at == 19) { return 19; } } } finally { if ($at == 18) { return 18; } }
+    } finally { if ($at == 17) { return 17; } } } finally { if ($at == 16) { return 16; } }
+    } finally { if ($at == 15) { return 15; } } } finally { if ($at == 14) { return 14; } }
+    } finally { if ($at == 13) { return 13; } } } finally { if ($at == 12) { return 12; } }
+    } finally { if ($at == 11) { return 11; } } } finally { if ($at == 10) { return 10; } }
+    } finally { if ($at == 9) { return 9; } } } finally { if ($at == 8) { return 8; } }
+    } finally { if ($at == 7) { return 7; } } } finally { if ($at == 6) { return 6; } }
+    } finally { if ($at == 5) { return 5; } } } finally { if ($at == 4) { return 4; } }
+    } finally { if ($at == 3) { return 3; } } } finally { if ($at == 2) { return 2; } }
+    } finally { if ($at == 1) { return 1; } } } finally { if ($at == 0) { return 0; } }
+}
+foreach ([-1, 0, 1, 15, 29] as $at) {
+    echo deep($at), " ";
+}
+echo "\n";
+
+// An exception not caught anywhere still runs every block on the way out.
+function uncaught(): void {
+    try {
+        try {
+            throw new RuntimeException("out");
+        } finally {
+            echo "one ";
+        }
+    } finally {
+        echo "two\n";
+    }
+}
+uncaught();

@@ -458,6 +458,10 @@ struct PgConn {
     in_own_transaction: bool,
     /// The jobs the script's open transaction added (`job_add_in_transaction`).
     jobs_tx: Option<JobsTx>,
+    /// The deadline of an operation of PHV's own stores (sessions, jobs) on
+    /// this connection: each of its statements is sent with a
+    /// `statement_timeout` that ends there (see `store_prelude`).
+    store_until: Option<Instant>,
 }
 
 /// Clears what a script can leave on a session, in one round trip. This is
@@ -579,6 +583,8 @@ impl PgConn {
         prelude: Option<&str>,
         run: RunStatement<'_, T>,
     ) -> Result<T, postgres::Error> {
+        let store = if prelude.is_none() { self.store_prelude() } else { None };
+        let prelude = prelude.or(store.as_deref());
         if let Some(stmt) = keep.then(|| self.kept(text, in_transaction)).flatten() {
             match run(&self.client, &stmt, prelude) {
                 Err(e) if stale(&e) => {
@@ -605,8 +611,27 @@ impl PgConn {
     }
 }
 
-/// PHV's own statements (sessions), through the kept statements.
+/// PHV's own statements (sessions, jobs), through the kept statements. During
+/// an operation of a store each goes with a `statement_timeout` that ends at
+/// the operation's deadline, so the server stops it there, lock waits
+/// included (found by the 1.1.1 audit: a job added with a key that an open
+/// transaction had added waited on the server for as long as that transaction
+/// lasted, after the client had given up).
 impl PgConn {
+    fn store_prelude(&self) -> Option<String> {
+        let until = self.store_until?;
+        let ms = until.saturating_duration_since(Instant::now()).as_millis().clamp(1, i32::MAX as u128);
+        Some(format!("SET statement_timeout = {ms}"))
+    }
+
+    /// Runs `sql` (simple statements) after the store's `statement_timeout`.
+    fn store_batch(&self, sql: &str) -> Result<(), postgres::Error> {
+        match self.store_prelude() {
+            Some(set) => self.client.batch_execute(&format!("{set}; {sql}")),
+            None => self.client.batch_execute(sql),
+        }
+    }
+
     fn query_kept(
         &mut self,
         text: &str,
@@ -632,6 +657,7 @@ impl Driver for PgConn {
         self.timeout_ms = None;
         self.in_own_transaction = false;
         self.jobs_tx = None;
+        self.store_until = None;
         self.epoch += 1;
         self.meter_internal();
         let ok = self.reset_session();
@@ -669,7 +695,16 @@ fn pg_connect(url: &str, spec: &DatabaseSpec, timeout: Duration) -> Result<PgCon
     let make_tls = || tokio_postgres_rustls::MakeRustlsConnect::new((*crate::netio::tls_config()).clone());
     let client = PgClient::connect(&config, tls.then(make_tls), timeout, meter.clone())?;
     meter.set(None, RESET_BUDGET);
-    Ok(PgConn { client, timeout_ms: None, meter, kept: Vec::new(), epoch: 0, in_own_transaction: false, jobs_tx: None })
+    Ok(PgConn {
+        client,
+        timeout_ms: None,
+        meter,
+        kept: Vec::new(),
+        epoch: 0,
+        in_own_transaction: false,
+        jobs_tx: None,
+        store_until: None,
+    })
 }
 
 pub(crate) fn pg_message(e: &postgres::Error) -> String {
@@ -1192,6 +1227,38 @@ struct MyConn {
     opts: Arc<mysql::Opts>,
     /// The jobs the script's open transaction added (`job_add_in_transaction`).
     jobs_tx: Option<JobsTx>,
+    /// Stops the statement of an operation of PHV's own stores at its
+    /// deadline (see `my_store_limits`).
+    store_kill: Option<KillAt>,
+    /// Set when a statement of a store failed other than with the server's
+    /// own error (a network error, a read that timed out): the connection may
+    /// be out of step and is not reused (found by the 1.1.1 audit: resetting
+    /// it waited for the read timeout again).
+    failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl MyConn {
+    /// Notes the errors of a store's statements (see `failed`).
+    fn watch(&self) -> MyWatch {
+        MyWatch(self.failed.clone())
+    }
+}
+
+/// Marks a MySQL connection as not to be reused after an error other than the
+/// server's own (see `MyConn::failed`).
+struct MyWatch(Arc<std::sync::atomic::AtomicBool>);
+
+impl MyWatch {
+    fn raw(&self, e: mysql::Error) -> mysql::Error {
+        if !matches!(e, mysql::Error::MySqlError(_)) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        e
+    }
+
+    fn msg(&self, e: mysql::Error) -> String {
+        my_message(&self.raw(e))
+    }
 }
 
 impl Driver for MyConn {
@@ -1199,6 +1266,12 @@ impl Driver for MyConn {
         use mysql::prelude::Queryable;
         self.timeout_ms = None;
         self.jobs_tx = None;
+        // A KILL QUERY sent (or being sent) at the deadline could stop the
+        // next statement on the connection.
+        let killed = self.store_kill.take().is_some_and(KillAt::disarm);
+        if killed || self.failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
         // Rolls back an open transaction and clears session variables and temporary tables.
         if self.conn.reset().is_err() {
             return false;
@@ -1257,7 +1330,7 @@ fn my_connect(
     let conn =
         crate::netio::with_deadline_in(&MY_CONNECTING, Instant::now() + timeout, move || mysql::Conn::new(builder))?
             .map_err(|e| my_message(&e))?;
-    Ok(MyConn { conn, timeout_ms: None, opts, jobs_tx: None })
+    Ok(MyConn { conn, timeout_ms: None, opts, jobs_tx: None, store_kill: None, failed: Default::default() })
 }
 
 fn my_message(e: &mysql::Error) -> String {
@@ -2037,6 +2110,58 @@ enum SessionConn {
     Redis(Pooled<RedisConn>),
 }
 
+/// How long after an operation's deadline a store's statement is given up on
+/// the client side. The server stops it at the deadline itself (PostgreSQL's
+/// `statement_timeout`, MySQL's lock wait timeouts and `KILL QUERY`), so its
+/// answer normally comes first and the connection is reused.
+const STORE_MARGIN: Duration = Duration::from_millis(500);
+
+/// A connection of PHV's own stores (sessions, jobs) for one operation that
+/// must end by `until`: every statement on it stops there, lock waits
+/// included, on the server as well as on the client (found by the 1.1.1
+/// audit: a job added with a key another open transaction had added waited
+/// on that transaction's row past the page's time limit).
+fn store_conn(
+    spec: &DatabaseSpec,
+    url: &str,
+    use_: PoolUse,
+    until: Instant,
+    wait: Duration,
+) -> Result<SessionConn, String> {
+    Ok(match kind_of(url) {
+        Kind::Redis => SessionConn::Redis(redis_conn(spec, use_, until)?),
+        Kind::Postgres => {
+            let mut c = detached_conn(&PG_POOLS, spec, url, use_, until, |t| pg_connect(url, spec, t))?;
+            let conn = c.get();
+            conn.meter.set(Some(until + STORE_MARGIN), 8 << 20);
+            conn.store_until = Some(until);
+            SessionConn::Pg(Box::new(c))
+        }
+        Kind::MySql => {
+            let mut c = detached_conn(&MY_POOLS, spec, url, use_, until, |t| {
+                my_connect(url, spec, t, Some(8 << 20), Some(wait))
+            })?;
+            my_store_limits(c.get(), until)?;
+            SessionConn::My(Box::new(c))
+        }
+    })
+}
+
+/// Bounds the statements of a store's operation on a MySQL connection: row
+/// and metadata lock waits end at `until` (rounded up to a second, the
+/// server's unit), and whatever still runs a moment after it is stopped with
+/// `KILL QUERY` (the connection is then not reused).
+fn my_store_limits(conn: &mut MyConn, until: Instant) -> Result<(), String> {
+    use mysql::prelude::Queryable;
+    let id = conn.conn.connection_id();
+    conn.store_kill = Some(KillAt::arm(&conn.opts, id, Some(until + STORE_MARGIN)));
+    let secs = until.saturating_duration_since(Instant::now()).as_secs_f64().ceil().max(1.0) as u64;
+    let w = conn.watch();
+    conn.conn
+        .query_drop(format!("SET SESSION innodb_lock_wait_timeout = {secs}, lock_wait_timeout = {secs}"))
+        .map_err(|e| w.msg(e))
+}
+
 /// A connection for the sessions of the site with namespace `ns`, and the
 /// site's table (created once per process and database).
 fn session_conn(spec: &DatabaseSpec, ns: Option<&str>) -> Result<(SessionConn, Instant, String), String> {
@@ -2045,18 +2170,7 @@ fn session_conn(spec: &DatabaseSpec, ns: Option<&str>) -> Result<(SessionConn, I
     };
     tls_init();
     let until = Instant::now() + SESSION_WAIT;
-    let use_ = PoolUse::Sessions;
-    let mut conn = match kind_of(&url) {
-        Kind::Redis => SessionConn::Redis(redis_conn(spec, use_, until)?),
-        Kind::Postgres => {
-            let mut c = detached_conn(&PG_POOLS, spec, &url, use_, until, |t| pg_connect(&url, spec, t))?;
-            c.get().meter.set(Some(until), 8 << 20);
-            SessionConn::Pg(Box::new(c))
-        }
-        Kind::MySql => SessionConn::My(Box::new(detached_conn(&MY_POOLS, spec, &url, use_, until, |t| {
-            my_connect(&url, spec, t, Some(8 << 20), Some(SESSION_WAIT))
-        })?)),
-    };
+    let mut conn = store_conn(spec, &url, PoolUse::Sessions, until, SESSION_WAIT)?;
     let t = sessions_table(ns);
     let made = format!("{url}|{t}");
     if !matches!(conn, SessionConn::Redis(_)) && !lock(&SESSION_TABLES).contains(&made) {
@@ -2065,10 +2179,11 @@ fn session_conn(spec: &DatabaseSpec, ns: Option<&str>) -> Result<(SessionConn, I
              created bigint NOT NULL, last bigint NOT NULL, returned smallint NOT NULL)"
         );
         match &mut conn {
-            SessionConn::Pg(c) => c.get().client.batch_execute(&sql).map_err(|e| pg_message(&e))?,
+            SessionConn::Pg(c) => c.get().store_batch(&sql).map_err(|e| pg_message(&e))?,
             SessionConn::My(c) => {
                 use mysql::prelude::Queryable;
-                c.get().conn.query_drop(sql).map_err(|e| my_message(&e))?
+                let w = c.get().watch();
+                c.get().conn.query_drop(sql).map_err(|e| w.msg(e))?
             }
             SessionConn::Redis(_) => {}
         }
@@ -2320,14 +2435,15 @@ pub fn session_read(spec: &DatabaseSpec, ns: Option<&str>, key: &str) -> Result<
             }
         }
         SessionConn::My(c) => {
+            let w = c.get().watch();
             let conn = &mut c.get().conn;
-            if let Some(row) = my_session_row(conn, &t, key).map_err(|e| my_message(&e))? {
+            if let Some(row) = my_session_row(conn, &t, key).map_err(|e| w.msg(e))? {
                 return Ok(Some(row));
             }
             if t == SESSIONS_SHARED {
                 return Ok(None);
             }
-            match my_session_row(conn, SESSIONS_SHARED, key) {
+            match my_session_row(conn, SESSIONS_SHARED, key).map_err(|e| w.raw(e)) {
                 Err(e) if my_no_table(&e) => Ok(None),
                 r => r.map_err(|e| my_message(&e)),
             }
@@ -2456,7 +2572,8 @@ fn session_store(
         }
         SessionConn::My(c) => {
             use mysql::prelude::Queryable;
-            let my = |e: mysql::Error| my_message(&e);
+            let w = c.get().watch();
+            let my = |e: mysql::Error| w.msg(e);
             let conn = &mut c.get().conn;
             if insert {
                 conn.exec_drop(
@@ -2472,9 +2589,9 @@ fn session_store(
             if t == SESSIONS_SHARED {
                 return Ok(false);
             }
-            match my_session_update(conn, SESSIONS_SHARED, key, row) {
+            match my_session_update(conn, SESSIONS_SHARED, key, row).map_err(|e| w.raw(e)) {
                 Err(e) if my_no_table(&e) => Ok(false),
-                r => r.map_err(my),
+                r => r.map_err(|e| my_message(&e)),
             }
         }
     }
@@ -2506,12 +2623,16 @@ pub fn session_remove(spec: &DatabaseSpec, ns: Option<&str>, key: &str) -> Resul
         }
         SessionConn::My(c) => {
             use mysql::prelude::Queryable;
+            let w = c.get().watch();
             let my = |e: mysql::Error| my_message(&e);
             let conn = &mut c.get().conn;
-            conn.exec_drop(format!("DELETE FROM {t} WHERE id = ?"), (key,)).map_err(my)?;
+            conn.exec_drop(format!("DELETE FROM {t} WHERE id = ?"), (key,)).map_err(|e| w.msg(e))?;
             let mut n = conn.affected_rows();
             if t != SESSIONS_SHARED {
-                match conn.exec_drop(format!("DELETE FROM {SESSIONS_SHARED} WHERE id = ?"), (key,)) {
+                match conn
+                    .exec_drop(format!("DELETE FROM {SESSIONS_SHARED} WHERE id = ?"), (key,))
+                    .map_err(|e| w.raw(e))
+                {
                     Err(e) if my_no_table(&e) => {}
                     r => {
                         r.map_err(my)?;
@@ -2527,32 +2648,21 @@ pub fn session_remove(spec: &DatabaseSpec, ns: Option<&str>, key: &str) -> Resul
 /// Removes the site's sessions unused for `ttl` or older than `max_lifetime`,
 /// and, when more than `max_sessions` (or `max_bytes` of data) are left, those
 /// whose visitor never came back first, then the least recently used, down to
-/// 90%. Sessions 1.1 kept in the shared table are removed only once older than
-/// `max_lifetime`: the other sites there may keep theirs longer. (Redis keeps
-/// within its limits as sessions are written.)
+/// 90%. (Redis keeps within its limits as sessions are written.)
+///
+/// A site with a namespace also clears what 1.1 left in the shared store,
+/// without touching a session that is still alive for any site (found by the
+/// 1.1.1 audit: only sites without a namespace swept it): rows of the shared
+/// table older than `max_lifetime`, which every site has expired, and in
+/// Redis the shared bookkeeping of sessions Redis has expired since. Both in
+/// bounded batches.
 pub fn session_sweep(spec: &DatabaseSpec, ns: Option<&str>, limits: &SessionLimits) -> Result<(), String> {
-    let (mut conn, _, t) = session_conn(spec, ns)?;
+    let (mut conn, until, t) = session_conn(spec, ns)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let (idle, old) = (now - limits.ttl.as_secs() as i64, now - limits.max_lifetime.as_secs() as i64);
     let (max_n, max_b) = (limits.max_sessions as i64, limits.max_bytes as i64);
     if t != SESSIONS_SHARED {
-        let shared = format!("DELETE FROM {SESSIONS_SHARED} WHERE created < ");
-        match &mut conn {
-            SessionConn::Redis(_) => return Ok(()),
-            SessionConn::Pg(c) => match c.get().execute_kept(&format!("{shared}$1"), &[&old]) {
-                Err(e) if pg_no_table(&e) => {}
-                r => {
-                    r.map_err(|e| pg_message(&e))?;
-                }
-            },
-            SessionConn::My(c) => {
-                use mysql::prelude::Queryable;
-                match c.get().conn.exec_drop(format!("{shared}?"), (old,)) {
-                    Err(e) if my_no_table(&e) => {}
-                    r => r.map_err(|e| my_message(&e))?,
-                }
-            }
-        }
+        sweep_shared_sessions(&mut conn, old, until)?;
     }
     // Deleting a tenth at a time until both limits hold (each pass is bounded).
     for _ in 0..20 {
@@ -2570,7 +2680,8 @@ pub fn session_sweep(spec: &DatabaseSpec, ns: Option<&str>, limits: &SessionLimi
             }
             SessionConn::My(c) => {
                 use mysql::prelude::Queryable;
-                let my = |e: mysql::Error| my_message(&e);
+                let w = c.get().watch();
+                let my = |e: mysql::Error| w.msg(e);
                 let conn = &mut c.get().conn;
                 conn.exec_drop(format!("DELETE FROM {t} WHERE last < ? OR created < ?"), (idle, old)).map_err(my)?;
                 let r: Option<(i64, i64)> = conn
@@ -2597,6 +2708,7 @@ pub fn session_sweep(spec: &DatabaseSpec, ns: Option<&str>, limits: &SessionLimi
             }
             SessionConn::My(c) => {
                 use mysql::prelude::Queryable;
+                let w = c.get().watch();
                 c.get()
                     .conn
                     .exec_drop(
@@ -2606,9 +2718,78 @@ pub fn session_sweep(spec: &DatabaseSpec, ns: Option<&str>, limits: &SessionLimi
                         ),
                         (excess,),
                     )
-                    .map_err(|e| my_message(&e))?;
+                    .map_err(|e| w.msg(e))?;
             }
             SessionConn::Redis(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Rows of the shared table (or entries of the shared Redis bookkeeping) that
+/// one pass of `sweep_shared_sessions` looks at, and passes at most.
+const SHARED_SWEEP_BATCH: i64 = 1000;
+const SHARED_SWEEP_PASSES: usize = 20;
+
+/// Forgets, under the shared prefix of 1.1 (KEYS[1]), sessions Redis no
+/// longer has: the oldest ARGV[1] of each set are looked at. A session that
+/// still exists is left alone, whichever site it is of. The number forgotten.
+static REDIS_SESSION_SWEEP_SHARED: LazyLock<LuaScript> = LazyLock::new(|| {
+    LuaScript::owned(format!(
+        "{REDIS_SESSION_FORGET}{}",
+        r#"
+local o, n, gone = KEYS[1], tonumber(ARGV[1]), 0
+for _, z in ipairs({'new', 'back'}) do
+  for _, x in ipairs(redis.call('ZRANGE', o .. z, 0, n - 1)) do
+    if redis.call('EXISTS', 'phv:session:' .. x) == 0 then
+      forget(o, x)
+      gone = gone + 1
+    end
+  end
+end
+return gone
+"#
+    ))
+});
+
+/// For a site with a namespace: removes, in bounded batches, what 1.1 left in
+/// the shared store and no site can still use (see `session_sweep`).
+fn sweep_shared_sessions(conn: &mut SessionConn, old: i64, until: Instant) -> Result<(), String> {
+    let batch = SHARED_SWEEP_BATCH;
+    for _ in 0..SHARED_SWEEP_PASSES {
+        let gone = match conn {
+            SessionConn::Redis(c) => {
+                let n = batch.to_string();
+                let args: [&[u8]; 3] = [b"1", REDIS_SESSIONS_SHARED.as_bytes(), n.as_bytes()];
+                match redis_script(c, &REDIS_SESSION_SWEEP_SHARED, &args, until)? {
+                    Reply::Int(n) => n,
+                    _ => return Err("the server sent an invalid reply".into()),
+                }
+            }
+            SessionConn::Pg(c) => {
+                let sql = format!(
+                    "DELETE FROM {SESSIONS_SHARED} WHERE id IN \
+                     (SELECT id FROM {SESSIONS_SHARED} WHERE created < $1 LIMIT $2)"
+                );
+                match c.get().execute_kept(&sql, &[&old, &batch]) {
+                    Err(e) if pg_no_table(&e) => return Ok(()),
+                    r => r.map_err(|e| pg_message(&e))? as i64,
+                }
+            }
+            SessionConn::My(c) => {
+                use mysql::prelude::Queryable;
+                let w = c.get().watch();
+                let conn = &mut c.get().conn;
+                let sql = format!("DELETE FROM {SESSIONS_SHARED} WHERE created < ? LIMIT ?");
+                match conn.exec_drop(sql, (old, batch)).map_err(|e| w.raw(e)) {
+                    Err(e) if my_no_table(&e) => return Ok(()),
+                    r => r.map_err(|e| my_message(&e))?,
+                }
+                conn.affected_rows() as i64
+            }
+        };
+        if gone < batch {
+            break;
         }
     }
     Ok(())
@@ -2665,19 +2846,96 @@ pub struct JobInfo {
     pub error: String,
 }
 
-/// Below the cap by more than this, the count of jobs may be a second old.
+/// Below the caps by more than these, the count of jobs may be a second old:
+/// jobs are added without the store's lock.
 const JOB_COUNT_MARGIN: i64 = 10_000;
+const JOB_BYTES_MARGIN: i64 = 256 << 20;
+/// A count of a store taken (exactly) less than this long ago stands, with the
+/// jobs added under the store's lock since (see `phv_jobs_counts`).
+const JOB_COUNT_FRESH_MS: i64 = 1000;
 
 /// How long one operation on the job store may take.
 const JOB_WAIT: Duration = Duration::from_secs(10);
-/// Jobs that ended with a key are kept this long (so the key is not used again).
+/// Jobs that ended with a key are kept this long (so the key is not used
+/// again), and at most `JOB_MAX_KEPT` of them (the latest).
 const JOB_KEEP_DONE_MS: i64 = 24 * 3600 * 1000;
+pub const JOB_MAX_KEPT: usize = 100_000;
 /// Jobs given up are kept this long, and at most `JOB_MAX_DEAD` of them.
 const JOB_KEEP_DEAD_MS: i64 = 7 * 24 * 3600 * 1000;
 pub const JOB_MAX_DEAD: usize = 10_000;
+/// Rows one statement of a sweep removes at most (found by the 1.1.1 audit:
+/// MySQL removed them in one statement however many there were).
+const JOB_SWEEP_BATCH: i64 = 10_000;
 
-/// Databases whose jobs table this process has created (by URL and table).
+/// What a job store holds at most: waiting and running jobs, and the bytes of
+/// their payloads (found by the 1.1.1 audit: only the jobs were counted, so a
+/// store could hold 6.4 GB of payloads).
+#[derive(Clone, Copy, Debug)]
+pub struct JobCap {
+    pub jobs: usize,
+    pub bytes: usize,
+}
+
+impl JobCap {
+    /// The error of a full store (`std.jobs` makes it a RuntimeException).
+    pub fn full(&self) -> String {
+        format!("the job queue holds {} jobs or {} MB already", self.jobs, self.bytes >> 20)
+    }
+}
+
+/// What a store holds: waiting and running jobs, and their payload bytes.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct JobLoad {
+    n: i64,
+    bytes: i64,
+}
+
+impl JobLoad {
+    fn plus(self, other: JobLoad) -> JobLoad {
+        JobLoad { n: self.n + other.n, bytes: self.bytes + other.bytes }
+    }
+
+    fn one(size: usize) -> JobLoad {
+        JobLoad { n: 1, bytes: size as i64 }
+    }
+
+    /// Whether a job of `size` bytes no longer fits.
+    fn full(&self, cap: JobCap, size: usize) -> bool {
+        self.n >= cap.jobs as i64 || self.bytes + size as i64 > cap.bytes as i64
+    }
+
+    /// Whether it is so far below both caps that a count a second old says the same.
+    fn far(&self, cap: JobCap) -> bool {
+        self.n + JOB_COUNT_MARGIN < cap.jobs as i64 && self.bytes + JOB_BYTES_MARGIN < cap.bytes as i64
+    }
+}
+
+/// Databases whose jobs tables this process has made ready (by URL and table).
 static JOB_TABLES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+/// Jobs tables made before 1.1.1 whose `size` column could not be added yet
+/// (another transaction held the table), and when that was last tried: the
+/// bytes of their jobs are not counted until it is added. Adding it waits
+/// for the table this long at most (every statement on the table waits
+/// behind it meanwhile), and is tried again after `JOB_SIZE_RETRY`.
+static JOB_UNSIZED: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
+const JOB_ALTER_WAIT_MS: u64 = 200;
+const JOB_SIZE_RETRY: Duration = Duration::from_secs(60);
+
+/// Whether table `t` has the `size` column (see `JOB_UNSIZED`).
+fn job_sized(t: &str) -> bool {
+    !lock(&JOB_UNSIZED).contains_key(t)
+}
+
+/// Notes whether adding the `size` column to `t` worked.
+fn note_sized(t: &str, sized: bool) {
+    let mut pending = lock(&JOB_UNSIZED);
+    if sized {
+        pending.remove(t);
+    } else {
+        pending.insert(t.to_string(), Instant::now());
+    }
+}
 
 /// The table of a site's jobs: one of its own when it has a namespace
 /// (`Host::store_namespace`, hex digits), so sites sharing a database do not
@@ -2710,6 +2968,8 @@ fn job_conn_before(
     job_conn_for(spec, ns, deadline, PoolUse::Jobs)
 }
 
+/// A connection of the job store for one operation (see `store_conn`), with
+/// the store's tables made ready once per process.
 fn job_conn_for(
     spec: &DatabaseSpec,
     ns: Option<&str>,
@@ -2724,51 +2984,109 @@ fn job_conn_for(
     // No longer than the script may still run (found by the 1.1 audit: a store
     // that did not answer held a page for 10 s, whatever its time limit).
     let until = deadline.map_or(Instant::now() + JOB_WAIT, |d| d.min(Instant::now() + JOB_WAIT));
-    let mut conn = match kind_of(&url) {
-        Kind::Redis => SessionConn::Redis(redis_conn(spec, use_, until)?),
-        Kind::Postgres => {
-            let mut c = detached_conn(&PG_POOLS, spec, &url, use_, until, |t| pg_connect(&url, spec, t))?;
-            c.get().meter.set(Some(until), 8 << 20);
-            SessionConn::Pg(Box::new(c))
-        }
-        Kind::MySql => SessionConn::My(Box::new(detached_conn(&MY_POOLS, spec, &url, use_, until, |t| {
-            my_connect(&url, spec, t, Some(8 << 20), Some(JOB_WAIT))
-        })?)),
-    };
+    let mut conn = store_conn(spec, &url, use_, until, JOB_WAIT)?;
     let made = format!("{url}|{t}");
-    if !matches!(conn, SessionConn::Redis(_)) && !lock(&JOB_TABLES).contains(&made) {
+    let retry = lock(&JOB_UNSIZED).get(&t).is_some_and(|at| at.elapsed() >= JOB_SIZE_RETRY);
+    if !matches!(conn, SessionConn::Redis(_)) && (retry || !lock(&JOB_TABLES).contains(&made)) {
         match &mut conn {
-            SessionConn::Pg(c) => c
-                .get()
-                .client
-                .batch_execute(
-                    &format!("CREATE TABLE IF NOT EXISTS {t} (id varchar(32) PRIMARY KEY, name varchar(64) NOT NULL, \
-                     payload text NOT NULL, run_at bigint NOT NULL, attempts integer NOT NULL, state smallint NOT NULL, \
-                     lease varchar(32), lease_until bigint, uniq varchar(64) UNIQUE, error text, created bigint NOT NULL); \
-                     CREATE INDEX IF NOT EXISTS {t}_due ON {t} (state, run_at)"),
-                )
-                .map_err(|e| pg_message(&e))?,
-            SessionConn::My(c) => {
-                use mysql::prelude::Queryable;
-                c.get()
-                    .conn
-                    .query_drop(
-                        format!("CREATE TABLE IF NOT EXISTS {t} (id varchar(32) PRIMARY KEY, name varchar(64) NOT NULL, \
-                         payload mediumtext NOT NULL, run_at bigint NOT NULL, attempts integer NOT NULL, \
-                         state smallint NOT NULL, lease varchar(32), lease_until bigint, uniq varchar(64) UNIQUE, \
-                         error text, created bigint NOT NULL, INDEX {t}_due (state, run_at))"),
-                    )
-                    .map_err(|e| my_message(&e))?;
-                // The row that transactions adding jobs lock (see `my_job_lock`).
-                let conn = &mut c.get().conn;
-                conn.query_drop(MY_JOBS_LOCK_TABLE).map_err(|e| my_message(&e))?;
-                conn.exec_drop("INSERT IGNORE INTO phv_jobs_lock (t) VALUES (?)", (&t,)).map_err(|e| my_message(&e))?;
-            }
+            SessionConn::Pg(c) => pg_job_tables(c.get(), &t).map_err(|e| pg_message(&e))?,
+            SessionConn::My(c) => my_job_tables(c.get(), &t)?,
             SessionConn::Redis(_) => {}
         }
         lock(&JOB_TABLES).insert(made);
     }
     Ok((conn, until))
+}
+
+/// The count of each store's jobs kept by those that add jobs under the
+/// store's lock (`job_add_locked`): the jobs and bytes counted at `at` (Unix
+/// ms), with the jobs added under the lock since. A transaction that adds jobs
+/// sets `at` to 0 (see `job_tx_load`), so the next to take the lock counts again.
+const JOBS_COUNTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS phv_jobs_counts (t varchar(64) PRIMARY KEY, \
+    n bigint NOT NULL, bytes bigint NOT NULL, at bigint NOT NULL)";
+
+/// Creates the jobs table `t` (PostgreSQL), with what later versions added to it.
+fn pg_job_tables(conn: &mut PgConn, t: &str) -> Result<(), postgres::Error> {
+    conn.store_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {t} (id varchar(32) PRIMARY KEY, name varchar(64) NOT NULL, \
+         payload text NOT NULL, run_at bigint NOT NULL, attempts integer NOT NULL, state smallint NOT NULL, \
+         lease varchar(32), lease_until bigint, uniq varchar(64) UNIQUE, error text, created bigint NOT NULL, \
+         size integer NOT NULL DEFAULT 0); {JOBS_COUNTS_TABLE}"
+    ))?;
+    // Only what is missing: CREATE INDEX and ALTER TABLE wait for every open
+    // transaction that added a job, even when there is nothing to do.
+    let index = format!("{t}_due");
+    let rows = conn.query_kept(
+        "SELECT (SELECT count(*) FROM information_schema.columns WHERE table_schema = current_schema() \
+         AND table_name = $1 AND column_name = 'size'), \
+         (SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema() AND indexname = $2)",
+        &[&t, &index],
+    )?;
+    let (sized, indexed): (i64, i64) = rows.first().map_or(Ok((0, 0)), |r| Ok((r.try_get(0)?, r.try_get(1)?)))?;
+    if indexed == 0 {
+        conn.store_batch(&format!("CREATE INDEX IF NOT EXISTS {index} ON {t} (state, run_at)"))?;
+    }
+    // The bytes of each job's payload (since 1.1.1); jobs added before count none.
+    if sized == 0 {
+        let alter = conn.store_batch(&format!(
+            "BEGIN; SET LOCAL lock_timeout = {JOB_ALTER_WAIT_MS}; \
+             ALTER TABLE {t} ADD COLUMN IF NOT EXISTS size integer NOT NULL DEFAULT 0; COMMIT"
+        ));
+        match alter {
+            Err(e) if e.code() == Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {
+                conn.client.batch_execute("ROLLBACK")?;
+                note_sized(t, false);
+            }
+            r => {
+                r?;
+                note_sized(t, true);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Creates the jobs table `t` (MySQL), with what later versions added to it.
+fn my_job_tables(conn: &mut MyConn, t: &str) -> Result<(), String> {
+    use mysql::prelude::Queryable;
+    let w = conn.watch();
+    let my = |e: mysql::Error| w.msg(e);
+    let c = &mut conn.conn;
+    c.query_drop(format!(
+        "CREATE TABLE IF NOT EXISTS {t} (id varchar(32) PRIMARY KEY, name varchar(64) NOT NULL, \
+         payload mediumtext NOT NULL, run_at bigint NOT NULL, attempts integer NOT NULL, \
+         state smallint NOT NULL, lease varchar(32), lease_until bigint, uniq varchar(64) UNIQUE, \
+         error text, created bigint NOT NULL, size integer NOT NULL DEFAULT 0, INDEX {t}_due (state, run_at))"
+    ))
+    .map_err(my)?;
+    let sized: Option<i64> = c
+        .exec_first(
+            "SELECT count(*) FROM information_schema.columns WHERE table_schema = DATABASE() \
+             AND table_name = ? AND column_name = 'size'",
+            (t,),
+        )
+        .map_err(my)?;
+    if sized == Some(0) {
+        c.query_drop(format!("SET SESSION lock_wait_timeout = {}", JOB_ALTER_WAIT_MS.div_ceil(1000))).map_err(my)?;
+        let alter = c.query_drop(format!("ALTER TABLE {t} ADD COLUMN size integer NOT NULL DEFAULT 0"));
+        c.query_drop(format!("SET SESSION lock_wait_timeout = {}", JOB_WAIT.as_secs())).map_err(my)?;
+        match alter {
+            Err(mysql::Error::MySqlError(e)) if e.code == 1205 => note_sized(t, false),
+            r => {
+                r.map_err(my)?;
+                note_sized(t, true);
+            }
+        }
+    }
+    // The row that transactions adding jobs lock (see `my_job_lock`): looked
+    // for without a lock first, as `INSERT IGNORE` of a row that is there waits
+    // for the transaction holding it.
+    c.query_drop(MY_JOBS_LOCK_TABLE).map_err(my)?;
+    if c.exec_first::<String, _, _>("SELECT t FROM phv_jobs_lock WHERE t = ?", (t,)).map_err(my)?.is_none() {
+        c.exec_drop("INSERT IGNORE INTO phv_jobs_lock (t) VALUES (?)", (t,)).map_err(my)?;
+    }
+    c.query_drop(JOBS_COUNTS_TABLE).map_err(my)?;
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -2808,18 +3126,24 @@ fn job_redis(
     job_redis_result(c, r)
 }
 
-/// ARGV: id, name, payload, run_at, uniq ("" for none), cap, now.
+// In Redis, `bytes` is the size of the payloads of the waiting and running
+// jobs, and `kept` the keys of jobs that ended, by when they ended.
+
+/// ARGV: id, name, payload, run_at, uniq ("" for none), cap, now, cap of bytes.
 /// 1 added, 0 the key is taken, -1 the queue is full.
 static REDIS_JOB_ADD: LuaScript = LuaScript::new(
     r#"
 local p = KEYS[1]
 if ARGV[5] ~= '' and redis.call('SET', p .. 'key:' .. ARGV[5], ARGV[1], 'NX') == false then return 0 end
-if redis.call('ZCARD', p .. 'due') + redis.call('ZCARD', p .. 'running') >= tonumber(ARGV[6]) then
+local bytes = math.max(tonumber(redis.call('GET', p .. 'bytes') or '0'), 0)
+if redis.call('ZCARD', p .. 'due') + redis.call('ZCARD', p .. 'running') >= tonumber(ARGV[6])
+  or bytes + #ARGV[3] > tonumber(ARGV[8]) then
   if ARGV[5] ~= '' then redis.call('DEL', p .. 'key:' .. ARGV[5]) end
   return -1
 end
 redis.call('HSET', p .. 'job:' .. ARGV[1], 'name', ARGV[2], 'payload', ARGV[3], 'attempts', 0, 'uniq', ARGV[5], 'created', ARGV[7])
 redis.call('ZADD', p .. 'due', ARGV[4], ARGV[1])
+redis.call('SET', p .. 'bytes', bytes + #ARGV[3])
 return 1
 "#,
 );
@@ -2846,7 +3170,8 @@ return {id, f[1], f[2], n}
 "#,
 );
 
-/// ARGV: id, token, "done" | "retry" | "dead", time, error, most jobs given up kept.
+/// ARGV: id, token, "done" | "retry" | "dead", time, error, most jobs given
+/// up kept, most keys of ended jobs kept.
 static REDIS_JOB_END: LuaScript = LuaScript::new(
     r#"
 local p = KEYS[1]
@@ -2855,9 +3180,23 @@ if redis.call('HGET', k, 'lease') ~= ARGV[2] then return 0 end
 redis.call('ZREM', p .. 'running', ARGV[1])
 redis.call('HDEL', k, 'lease')
 local uniq = redis.call('HGET', k, 'uniq')
+if ARGV[3] ~= 'retry' then
+  redis.call('DECRBY', p .. 'bytes', redis.call('HSTRLEN', k, 'payload'))
+end
 if ARGV[3] == 'done' then
   redis.call('DEL', k)
-  if uniq and uniq ~= '' then redis.call('EXPIRE', p .. 'key:' .. uniq, 86400) end
+  if uniq and uniq ~= '' then
+    redis.call('EXPIRE', p .. 'key:' .. uniq, 86400)
+    redis.call('ZADD', p .. 'kept', ARGV[4], uniq)
+    local over = redis.call('ZCARD', p .. 'kept') - tonumber(ARGV[7])
+    if over > 0 then
+      -- The oldest go first; a key a waiting job took again (no expiry) stays.
+      for _, u in ipairs(redis.call('ZRANGE', p .. 'kept', 0, over - 1)) do
+        if redis.call('PTTL', p .. 'key:' .. u) > 0 then redis.call('DEL', p .. 'key:' .. u) end
+      end
+      redis.call('ZREMRANGEBYRANK', p .. 'kept', 0, over - 1)
+    end
+  end
 elseif ARGV[3] == 'retry' then
   redis.call('HSET', k, 'error', ARGV[5])
   redis.call('ZADD', p .. 'due', ARGV[4], ARGV[1])
@@ -2878,7 +3217,9 @@ return 1
 "#,
 );
 
-/// ARGV: before (jobs given up before it are removed).
+/// ARGV: before (jobs given up before it are removed), kept before (keys of
+/// ended jobs, which Redis expires itself, are forgotten). The byte count is
+/// set right when no job waits or runs (jobs added before 1.1.1 were not counted).
 static REDIS_JOB_SWEEP: LuaScript = LuaScript::new(
     r#"
 local p = KEYS[1]
@@ -2888,6 +3229,11 @@ for _, id in ipairs(old) do
   if u and u ~= '' then redis.call('DEL', p .. 'key:' .. u) end
   redis.call('DEL', p .. 'job:' .. id)
   redis.call('ZREM', p .. 'dead', id)
+end
+redis.call('ZREMRANGEBYSCORE', p .. 'kept', '-inf', ARGV[2])
+if redis.call('ZCARD', p .. 'due') + redis.call('ZCARD', p .. 'running') == 0
+  or tonumber(redis.call('GET', p .. 'bytes') or '0') < 0 then
+  redis.call('SET', p .. 'bytes', 0)
 end
 return #old
 "#,
@@ -2920,30 +3266,50 @@ if redis.call('ZREM', p .. 'dead', ARGV[1]) == 0 then return 0 end
 redis.call('HSET', p .. 'job:' .. ARGV[1], 'attempts', 0)
 redis.call('HDEL', p .. 'job:' .. ARGV[1], 'error')
 redis.call('ZADD', p .. 'due', ARGV[2], ARGV[1])
+redis.call('INCRBY', p .. 'bytes', redis.call('HSTRLEN', p .. 'job:' .. ARGV[1], 'payload'))
 return 1
 "#,
 );
 
 /// Adds a job; `Ok(None)` when its key is taken, an error when the store
-/// holds `cap` waiting and running jobs already.
+/// holds `cap` already.
+///
+/// Far below the caps the job is added at once, with a count of the store at
+/// most a second old (one per process); near them it is added under the
+/// store's lock (`job_add_locked`), and counted there only (found by the 1.1.1
+/// audit: near the cap each job counted the table twice).
 pub fn job_add(
     spec: &DatabaseSpec,
     ns: Option<&str>,
     job: (&str, &str, &str),
     run_at: i64,
     uniq: Option<&str>,
-    cap: usize,
+    cap: JobCap,
     deadline: Option<Instant>,
 ) -> Result<Option<()>, String> {
     let (id, name, payload) = job;
     let t = jobs_table(ns);
-    let (mut conn, until) = job_conn_before(spec, ns, deadline)?;
+    let size = payload.len();
+    let count_key = job_count_key(spec, &t);
+    // Near the caps by this process's count of the last second: straight to the lock.
+    let redis = spec.url.as_deref().is_some_and(|u| kind_of(u) == Kind::Redis);
+    if let Some(load) = cached_job_load(&count_key).filter(|l| !redis && !l.far(cap)) {
+        if load.full(cap, size) {
+            return Err(cap.full());
+        }
+        return job_add_locked(spec, ns, job, run_at, uniq, cap, deadline);
+    }
+    // A job with a key may wait for the row of a transaction that added the
+    // same key: on connections apart, so such waits never hold those that the
+    // job runners and the other jobs use (found by the 1.1.1 audit).
+    let use_ = if uniq.is_some() { PoolUse::JobLock } else { PoolUse::Jobs };
+    let (mut conn, until) = job_conn_for(spec, ns, deadline, use_)?;
     let now = now_ms();
-    let full = || format!("the job queue holds {cap} jobs already");
-    match &mut conn {
+    let load = match &mut conn {
         SessionConn::Redis(c) => {
-            let (run_at, cap_s, now_s) = (run_at.to_string(), cap.to_string(), now.to_string());
-            let args: [&[u8]; 8] = [
+            let (run_at, cap_s, now_s, bytes_s) =
+                (run_at.to_string(), cap.jobs.to_string(), now.to_string(), cap.bytes.to_string());
+            let args: [&[u8]; 9] = [
                 b"0",
                 id.as_bytes(),
                 name.as_bytes(),
@@ -2952,101 +3318,159 @@ pub fn job_add(
                 uniq.unwrap_or("").as_bytes(),
                 cap_s.as_bytes(),
                 now_s.as_bytes(),
+                bytes_s.as_bytes(),
             ];
             return match job_redis(c, &REDIS_JOB_ADD, &jobs_prefix(ns), &args, until)? {
                 Reply::Int(1) => Ok(Some(())),
                 Reply::Int(0) => Ok(None),
-                Reply::Int(_) => Err(full()),
+                Reply::Int(_) => Err(cap.full()),
                 _ => Err("the server sent an invalid reply".into()),
             };
         }
-        SessionConn::Pg(c) => {
-            let n = job_count_cached(spec, &t, cap, 0, false, || pg_job_count(c.get(), &t, false))?;
-            if n >= cap as i64 {
-                return Err(full());
+        SessionConn::Pg(c) => match cached_job_load(&count_key) {
+            Some(l) => l,
+            None => pg_job_load(c.get(), &t, false)?,
+        },
+        SessionConn::My(c) => match cached_job_load(&count_key) {
+            Some(l) => l,
+            None => my_job_load(c.get(), &t)?,
+        },
+    };
+    cache_job_load(&count_key, load, now, false);
+    if load.full(cap, size) {
+        return Err(cap.full());
+    }
+    if load.far(cap) {
+        return match &mut conn {
+            SessionConn::Pg(c) => {
+                pg_job_insert(c.get(), &t, false, job, run_at, uniq, now, None).map_err(|e| pg_message(&e))
             }
-            if n + JOB_COUNT_MARGIN < cap as i64 {
-                return pg_job_insert(c.get(), &t, false, (id, name, payload), run_at, uniq, now, None)
-                    .map_err(|e| pg_message(&e));
-            }
-        }
-        SessionConn::My(c) => {
-            let n = job_count_cached(spec, &t, cap, 0, false, || my_job_count(&mut c.get().conn, &t))?;
-            if n >= cap as i64 {
-                return Err(full());
-            }
-            if n + JOB_COUNT_MARGIN < cap as i64 {
-                return my_job_insert(&mut c.get().conn, &t, (id, name, payload), run_at, uniq, now)
-                    .map_err(|e| my_message(&e));
-            }
-        }
+            SessionConn::My(c) => my_job_insert(c.get(), &t, job, run_at, uniq, now, until),
+            SessionConn::Redis(_) => unreachable!("Redis added the job above"),
+        };
     }
     drop(conn);
     job_add_locked(spec, ns, job, run_at, uniq, cap, deadline)
 }
 
-/// `job_add` near the cap: in a transaction of its own that takes the store's
+/// `job_add` near the caps: in a transaction of its own that takes the store's
 /// lock first, as transactions that add jobs do (see `job_add_in_transaction`),
-/// so jobs are counted and added one at a time and none goes past the cap.
+/// so jobs are counted and added one at a time and none goes past the caps.
+/// The count is the one kept in `phv_jobs_counts` while it is fresh, so a
+/// burst of jobs near the cap does not count the table for each.
 fn job_add_locked(
     spec: &DatabaseSpec,
     ns: Option<&str>,
     job: (&str, &str, &str),
     run_at: i64,
     uniq: Option<&str>,
-    cap: usize,
+    cap: JobCap,
     deadline: Option<Instant>,
 ) -> Result<Option<()>, String> {
     use mysql::prelude::Queryable;
     let t = jobs_table(ns);
     let (mut conn, until) = job_conn_for(spec, ns, deadline, PoolUse::JobLock)?;
     let now = now_ms();
-    let full = || format!("the job queue holds {cap} jobs already");
+    let size = job.2.len();
+    let count_key = job_count_key(spec, &t);
     // Waits for the lock no longer than the operation may take.
     let wait_ms = until.saturating_duration_since(Instant::now()).as_millis().max(1);
-    match &mut conn {
+    let (added, load, at) = match &mut conn {
         SessionConn::Redis(_) => unreachable!("Redis adds jobs in one script"),
         SessionConn::Pg(c) => {
             let conn = c.get();
-            let pg = |e: postgres::Error| pg_message(&e);
-            // Read committed: the count after the lock sees every job committed before it.
-            conn.client
-                .batch_execute(&format!("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = {wait_ms}"))
-                .map_err(pg)?;
-            conn.epoch += 1;
-            pg_job_lock(conn, &t, None).map_err(pg)?;
-            let n = job_count_cached(spec, &t, cap, 0, true, || pg_job_count(conn, &t, true))?;
-            if n >= cap as i64 {
-                return Err(full());
+            // A statement kept from before may have been made stale by a
+            // change of the table (its error ends the transaction): once
+            // more, then with statements prepared in the transaction.
+            match pg_job_add_locked(conn, &t, (job, run_at, uniq, now), cap, wait_ms, true) {
+                Err(e) if stale(&e) => {
+                    let _ = conn.client.batch_execute("ROLLBACK");
+                    conn.forget_statements();
+                    pg_job_add_locked(conn, &t, (job, run_at, uniq, now), cap, wait_ms, false)
+                }
+                r => r,
             }
-            let added = pg_job_insert(conn, &t, true, job, run_at, uniq, now, None).map_err(pg)?;
-            conn.client.batch_execute("COMMIT").map_err(pg)?;
-            conn.epoch += 1;
-            forget_job_count(&job_count_key(spec, &t));
-            Ok(added)
+            .map_err(|e| pg_message(&e))?
         }
         SessionConn::My(c) => {
-            let my = |e: mysql::Error| my_message(&e);
-            let conn = &mut c.get().conn;
-            let secs = wait_ms.div_ceil(1000).max(1);
-            conn.query_drop(format!("SET SESSION innodb_lock_wait_timeout = {secs}")).map_err(my)?;
-            conn.query_drop("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").map_err(my)?;
-            conn.query_drop("START TRANSACTION").map_err(my)?;
-            my_job_lock(conn, &t).map_err(my)?;
-            let n = job_count_cached(spec, &t, cap, 0, true, || my_job_count(conn, &t))?;
-            if n >= cap as i64 {
-                return Err(full());
-            }
-            let added = my_job_insert(conn, &t, job, run_at, uniq, now).map_err(my)?;
-            conn.query_drop("COMMIT").map_err(my)?;
-            forget_job_count(&job_count_key(spec, &t));
-            Ok(added)
+            let conn = c.get();
+            let w = conn.watch();
+            let my = |e: mysql::Error| w.msg(e);
+            conn.conn.query_drop("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").map_err(my)?;
+            conn.conn.query_drop("START TRANSACTION").map_err(my)?;
+            my_job_lock(&mut conn.conn, &t).map_err(my)?;
+            let (load, at) = match my_job_counted(&mut conn.conn, &t, now).map_err(my)? {
+                Some(kept) => kept,
+                None => (my_job_load(conn, &t)?, now),
+            };
+            let added =
+                if load.full(cap, size) { None } else { Some(my_job_insert(conn, &t, job, run_at, uniq, now, until)?) };
+            let load = if let Some(Some(())) = added { load.plus(JobLoad::one(size)) } else { load };
+            my_job_note(&mut conn.conn, &t, load, at).map_err(my)?;
+            conn.conn.query_drop("COMMIT").map_err(my)?;
+            (added, load, at)
         }
-    }
+    };
+    cache_job_load(&count_key, load, at, true);
+    added.ok_or_else(|| cap.full())
 }
 
-/// Counts of waiting and running jobs, by `job_count_key`, and when they were counted.
-static JOB_COUNTS: LazyLock<Mutex<HashMap<String, (Instant, i64)>>> = LazyLock::new(Default::default);
+/// A job, when it runs, its key and the time it was added.
+type NewJob<'a> = ((&'a str, &'a str, &'a str), i64, Option<&'a str>, i64);
+
+/// `job_add_locked` on PostgreSQL, in three round trips: the transaction, the
+/// lock and the kept count; the job (through a kept statement when
+/// `use_kept`, even one prepared before the transaction); the new count and
+/// the commit. What was added (`None` when the store is full), what the
+/// store holds, and when it was counted.
+fn pg_job_add_locked(
+    conn: &mut PgConn,
+    t: &str,
+    new: NewJob<'_>,
+    cap: JobCap,
+    wait_ms: u128,
+    use_kept: bool,
+) -> Result<(Option<Option<()>>, JobLoad, i64), postgres::Error> {
+    let (job, run_at, uniq, now) = new;
+    let size = job.2.len();
+    // Read committed: the count after the lock sees every job committed before it.
+    let set = conn.store_prelude().map(|s| format!("{s}; ")).unwrap_or_default();
+    let sql = format!(
+        "{set}BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = {wait_ms}; \
+         SELECT pg_advisory_xact_lock({}); SELECT n, bytes, at FROM phv_jobs_counts WHERE t = '{t}'",
+        job_lock_key(t)
+    );
+    let messages = conn.client.run(None, conn.client.client().simple_query(&sql))?;
+    conn.epoch += 1;
+    let kept = messages
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) if r.len() == 3 => Some(r),
+            _ => None,
+        })
+        .next_back()
+        .and_then(|r| Some((r.get(0)?.parse().ok()?, r.get(1)?.parse().ok()?, r.get(2)?.parse().ok()?)));
+    let (load, at) = match fresh_count(kept, now) {
+        Some(kept) => kept,
+        None => (pg_job_load_raw(conn, t, true)?, now),
+    };
+    let added = if load.full(cap, size) {
+        None
+    } else {
+        Some(pg_job_insert(conn, t, !use_kept, job, run_at, uniq, now, None)?)
+    };
+    let load = if let Some(Some(())) = added { load.plus(JobLoad::one(size)) } else { load };
+    conn.store_batch(&format!(
+        "INSERT INTO phv_jobs_counts (t, n, bytes, at) VALUES ('{t}', {}, {}, {at}) \
+         ON CONFLICT (t) DO UPDATE SET n = EXCLUDED.n, bytes = EXCLUDED.bytes, at = EXCLUDED.at; COMMIT",
+        load.n, load.bytes
+    ))?;
+    conn.epoch += 1;
+    Ok((added, load, at))
+}
+
+/// What each store held, by `job_count_key`, and when it was counted.
+static JOB_COUNTS: LazyLock<Mutex<HashMap<String, (Instant, JobLoad)>>> = LazyLock::new(Default::default);
 
 fn job_count_key(spec: &DatabaseSpec, table: &str) -> String {
     format!("{}|{table}", spec.url.as_deref().unwrap_or_default())
@@ -3057,53 +3481,113 @@ fn forget_job_count(key: &str) {
     lock(&JOB_COUNTS).remove(key);
 }
 
-/// The number of waiting and running jobs committed, counted at most once a
-/// second per store in this process (counting a large table on every job would
-/// be slow). Near `cap`, with the `extra` jobs the caller's transaction added
-/// so far, it is counted every time (found by the 1.1 audit: each process went
-/// past the cap by a second of jobs); `fresh` counts it in any case.
-fn job_count_cached(
-    spec: &DatabaseSpec,
-    table: &str,
-    cap: usize,
-    extra: i64,
-    fresh: bool,
-    count: impl FnOnce() -> Result<i64, String>,
-) -> Result<i64, String> {
-    let key = job_count_key(spec, table);
-    if let Some((at, n)) = lock(&JOB_COUNTS).get(&key) {
-        // Far below the cap, or full: a second-old count says the same (found by
-        // the 1.1 audit: near a full cap every refused job counted the table).
-        let (n, cap) = (*n + extra, cap as i64);
-        if !fresh && at.elapsed() < Duration::from_secs(1) && (n + JOB_COUNT_MARGIN < cap || n >= cap) {
-            return Ok(n - extra);
-        }
+/// What the store held when this process last counted it, if that was less
+/// than a second ago.
+fn cached_job_load(key: &str) -> Option<JobLoad> {
+    lock(&JOB_COUNTS)
+        .get(key)
+        .filter(|(when, _)| when.elapsed() < Duration::from_millis(JOB_COUNT_FRESH_MS as u64))
+        .map(|(_, l)| *l)
+}
+
+/// Notes what the store held at `at` (Unix ms); a count already noted is kept
+/// unless `replace` (one taken under the store's lock).
+fn cache_job_load(key: &str, load: JobLoad, at: i64, replace: bool) {
+    let age = Duration::from_millis((now_ms() - at).clamp(0, JOB_COUNT_FRESH_MS) as u64);
+    let when = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+    let mut counts = lock(&JOB_COUNTS);
+    if replace || counts.get(key).is_none_or(|(w, _)| w.elapsed() >= Duration::from_millis(JOB_COUNT_FRESH_MS as u64)) {
+        counts.insert(key.to_string(), (when, load));
     }
-    let n = count()?;
-    lock(&JOB_COUNTS).insert(key, (Instant::now(), n));
-    Ok(n)
 }
 
-/// The waiting and running jobs of table `t` (inside a transaction, through
-/// the statements kept for it: see `PgConn::kept`).
-fn pg_job_count(conn: &mut PgConn, t: &str, in_transaction: bool) -> Result<i64, String> {
-    let rows = conn
-        .with_statement(
-            &format!("SELECT count(*) FROM {t} WHERE state IN (0, 1)"),
-            true,
-            in_transaction,
-            None,
-            &mut |client, stmt, prelude| client.run(prelude, client.client().query(stmt, &[])),
-        )
-        .map_err(|e| pg_message(&e))?;
-    Ok(rows.first().and_then(|r| r.try_get::<_, i64>(0).ok()).unwrap_or(0))
+/// The waiting and running jobs of table `t` and their bytes, counted now
+/// (inside a transaction, through the statements kept for it: see `PgConn::kept`).
+fn pg_job_load(conn: &mut PgConn, t: &str, in_transaction: bool) -> Result<JobLoad, String> {
+    pg_job_load_raw(conn, t, in_transaction).map_err(|e| pg_message(&e))
 }
 
-fn my_job_count(conn: &mut mysql::Conn, t: &str) -> Result<i64, String> {
+fn pg_job_load_raw(conn: &mut PgConn, t: &str, in_transaction: bool) -> Result<JobLoad, postgres::Error> {
+    let bytes = if job_sized(t) { "coalesce(sum(size), 0)::bigint" } else { "0::bigint" };
+    let rows = conn.with_statement(
+        &format!("SELECT count(*), {bytes} FROM {t} WHERE state IN (0, 1)"),
+        true,
+        in_transaction,
+        None,
+        &mut |client, stmt, prelude| client.run(prelude, client.client().query(stmt, &[])),
+    )?;
+    let get = |i: usize| rows.first().and_then(|r| r.try_get::<_, i64>(i).ok()).unwrap_or(0);
+    Ok(JobLoad { n: get(0), bytes: get(1) })
+}
+
+fn my_job_load(conn: &mut MyConn, t: &str) -> Result<JobLoad, String> {
     use mysql::prelude::Queryable;
-    let n: Option<i64> =
-        conn.query_first(format!("SELECT count(*) FROM {t} WHERE state IN (0, 1)")).map_err(|e| my_message(&e))?;
-    Ok(n.unwrap_or(0))
+    let w = conn.watch();
+    let r: Option<(i64, i64)> = conn
+        .conn
+        .query_first(format!(
+            "SELECT count(*), {} FROM {t} WHERE state IN (0, 1)",
+            if job_sized(t) { "CAST(coalesce(sum(size), 0) AS SIGNED)" } else { "0" }
+        ))
+        .map_err(|e| w.msg(e))?;
+    let (n, bytes) = r.unwrap_or((0, 0));
+    Ok(JobLoad { n, bytes })
+}
+
+/// The count kept in `phv_jobs_counts` for table `t`, and when it was taken,
+/// if that was less than `JOB_COUNT_FRESH_MS` before `now`.
+fn fresh_count(row: Option<(i64, i64, i64)>, now: i64) -> Option<(JobLoad, i64)> {
+    let (n, bytes, at) = row?;
+    (at > now - JOB_COUNT_FRESH_MS && at <= now + JOB_COUNT_FRESH_MS).then_some((JobLoad { n, bytes }, at))
+}
+
+fn pg_job_counted(
+    conn: &mut PgConn,
+    t: &str,
+    in_tx: bool,
+    now: i64,
+) -> Result<Option<(JobLoad, i64)>, postgres::Error> {
+    let rows = conn.with_statement(
+        "SELECT n, bytes, at FROM phv_jobs_counts WHERE t = $1",
+        true,
+        in_tx,
+        None,
+        &mut |client, stmt, prelude| client.run(prelude, client.client().query(stmt, &[&t])),
+    )?;
+    let row = match rows.first() {
+        Some(r) => Some((r.try_get(0)?, r.try_get(1)?, r.try_get(2)?)),
+        None => None,
+    };
+    Ok(fresh_count(row, now))
+}
+
+fn pg_job_note(conn: &mut PgConn, t: &str, in_tx: bool, load: JobLoad, at: i64) -> Result<(), postgres::Error> {
+    conn.with_statement(
+        "INSERT INTO phv_jobs_counts (t, n, bytes, at) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (t) DO UPDATE SET n = EXCLUDED.n, bytes = EXCLUDED.bytes, at = EXCLUDED.at",
+        true,
+        in_tx,
+        None,
+        &mut |client, stmt, prelude| {
+            client.run(prelude, client.client().execute(stmt, &[&t, &load.n, &load.bytes, &at]))
+        },
+    )
+    .map(|_| ())
+}
+
+fn my_job_counted(conn: &mut mysql::Conn, t: &str, now: i64) -> Result<Option<(JobLoad, i64)>, mysql::Error> {
+    use mysql::prelude::Queryable;
+    let row: Option<(i64, i64, i64)> = conn.exec_first("SELECT n, bytes, at FROM phv_jobs_counts WHERE t = ?", (t,))?;
+    Ok(fresh_count(row, now))
+}
+
+fn my_job_note(conn: &mut mysql::Conn, t: &str, load: JobLoad, at: i64) -> Result<(), mysql::Error> {
+    use mysql::prelude::Queryable;
+    conn.exec_drop(
+        "INSERT INTO phv_jobs_counts (t, n, bytes, at) VALUES (?, ?, ?, ?) \
+         ON DUPLICATE KEY UPDATE n = VALUES(n), bytes = VALUES(bytes), at = VALUES(at)",
+        (t, load.n, load.bytes, at),
+    )
 }
 
 /// The key of the advisory lock of a jobs table (PostgreSQL).
@@ -3152,17 +3636,64 @@ fn pg_job_insert(
     prelude: Option<&str>,
 ) -> Result<Option<()>, postgres::Error> {
     let (id, name, payload) = job;
+    let size = payload.len() as i32;
+    let sized = job_sized(t);
     let sql = &format!(
-        "INSERT INTO {t} (id, name, payload, run_at, attempts, state, uniq, created) \
-               VALUES ($1, $2, $3, $4, 0, 0, $5, $6) ON CONFLICT (uniq) DO NOTHING"
+        "INSERT INTO {t} (id, name, payload, run_at, attempts, state, uniq, created{}) \
+               VALUES ($1, $2, $3, $4, 0, 0, $5, $6{}) ON CONFLICT (uniq) DO NOTHING",
+        if sized { ", size" } else { "" },
+        if sized { ", $7" } else { "" }
     );
     let n = conn.with_statement(sql, true, in_transaction, prelude, &mut |client, stmt, prelude| {
-        client.run(prelude, client.client().execute(stmt, &[&id, &name, &payload, &run_at, &uniq, &now]))
+        let params: [&(dyn ToSql + Sync); 7] = [&id, &name, &payload, &run_at, &uniq, &now, &size];
+        client.run(prelude, client.client().execute(stmt, &params[..if sized { 7 } else { 6 }]))
     })?;
     Ok((n > 0).then_some(()))
 }
 
+/// Adds a job on a connection of the store, by `until`.
+///
+/// A job with a key first looks for the key without waiting (`NOWAIT`), and
+/// while another transaction holds it (added it, not yet ended), looks again
+/// a little later. An `INSERT` would wait in the server's queue for that row,
+/// and while it waits InnoDB also locks the gap before the row, where jobs
+/// without a key go when the key is the lowest: every other job would wait
+/// too (found by the 1.1.1 audit).
+#[allow(clippy::too_many_arguments)]
 fn my_job_insert(
+    conn: &mut MyConn,
+    t: &str,
+    job: (&str, &str, &str),
+    run_at: i64,
+    uniq: Option<&str>,
+    now: i64,
+    until: Instant,
+) -> Result<Option<()>, String> {
+    use mysql::prelude::Queryable;
+    let w = conn.watch();
+    if let Some(u) = uniq {
+        let mut pause = Duration::from_millis(10);
+        loop {
+            let probe = format!("SELECT id FROM {t} WHERE uniq = ? FOR UPDATE NOWAIT");
+            match conn.conn.exec_first::<String, _, _>(probe, (u,)) {
+                Ok(Some(_)) => return Ok(None),
+                Ok(None) => break,
+                // 3572: the row is locked (MySQL); 1205: the same in MariaDB.
+                Err(mysql::Error::MySqlError(e)) if e.code == 3572 || e.code == 1205 => {
+                    if Instant::now() + pause >= until {
+                        return Err("the key is held by a transaction that has not ended".into());
+                    }
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(Duration::from_millis(200));
+                }
+                Err(e) => return Err(w.msg(e)),
+            }
+        }
+    }
+    my_job_insert_on(&mut conn.conn, t, job, run_at, uniq, now).map_err(|e| w.msg(e))
+}
+
+fn my_job_insert_on(
     conn: &mut mysql::Conn,
     t: &str,
     job: (&str, &str, &str),
@@ -3172,30 +3703,88 @@ fn my_job_insert(
 ) -> Result<Option<()>, mysql::Error> {
     use mysql::prelude::Queryable;
     let (id, name, payload) = job;
-    conn.exec_drop(
-        format!(
-            "INSERT IGNORE INTO {t} (id, name, payload, run_at, attempts, state, uniq, created) \
-         VALUES (?, ?, ?, ?, 0, 0, ?, ?)"
-        ),
-        (id, name, payload, run_at, uniq, now),
-    )?;
+    if job_sized(t) {
+        conn.exec_drop(
+            format!(
+                "INSERT IGNORE INTO {t} (id, name, payload, run_at, attempts, state, uniq, created, size) \
+                 VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?)"
+            ),
+            (id, name, payload, run_at, uniq, now, payload.len() as i64),
+        )?;
+    } else {
+        conn.exec_drop(
+            format!(
+                "INSERT IGNORE INTO {t} (id, name, payload, run_at, attempts, state, uniq, created) \
+                 VALUES (?, ?, ?, ?, 0, 0, ?, ?)"
+            ),
+            (id, name, payload, run_at, uniq, now),
+        )?;
+    }
     Ok((conn.affected_rows() > 0).then_some(()))
 }
 
-/// The jobs a script's open transaction added, counted with those committed
-/// (which a transaction may not see: they are counted on a connection of the
-/// store, outside it).
+/// The jobs a script's open transaction added, counted with those the store
+/// held when the transaction took the store's lock (which a transaction may
+/// not see: they are counted on a connection of the store, outside it).
 struct JobsTx {
-    added: i64,
+    held: JobLoad,
+    added: JobLoad,
     /// The count to forget when the transaction ends (`forget_job_count`).
     count_key: String,
 }
 
 impl JobsTx {
     fn ended(self) {
-        if self.added > 0 {
+        if self.added.n > 0 {
             forget_job_count(&self.count_key);
         }
+    }
+}
+
+/// For a script's transaction that has just taken the store's lock, which it
+/// holds until it ends: what the store holds, on a connection of the store
+/// (far below the caps, this process's count of the last second; else the
+/// count kept in `phv_jobs_counts` while it is fresh, or a count taken now).
+/// The kept count is then marked as stale, as what the transaction adds is
+/// known only when it ends: the next to take the lock counts again.
+fn job_tx_load(
+    spec: &DatabaseSpec,
+    ns: Option<&str>,
+    t: &str,
+    cap: JobCap,
+    deadline: Option<Instant>,
+) -> Result<JobLoad, String> {
+    let far = cached_job_load(&job_count_key(spec, t)).filter(|l| l.far(cap));
+    let (mut conn, _) = job_conn_before(spec, ns, deadline)?;
+    let now = now_ms();
+    match &mut conn {
+        SessionConn::Pg(c) => {
+            let conn = c.get();
+            let pg = |e: postgres::Error| pg_message(&e);
+            let load = match far {
+                Some(load) => load,
+                None => match pg_job_counted(conn, t, false, now).map_err(pg)? {
+                    Some((load, _)) => load,
+                    None => pg_job_load(conn, t, false)?,
+                },
+            };
+            pg_job_note(conn, t, false, load, 0).map_err(pg)?;
+            Ok(load)
+        }
+        SessionConn::My(c) => {
+            let conn = c.get();
+            let w = conn.watch();
+            let load = match far {
+                Some(load) => load,
+                None => match my_job_counted(&mut conn.conn, t, now).map_err(|e| w.msg(e))? {
+                    Some((load, _)) => load,
+                    None => my_job_load(conn, t)?,
+                },
+            };
+            my_job_note(&mut conn.conn, t, load, 0).map_err(|e| w.msg(e))?;
+            Ok(load)
+        }
+        SessionConn::Redis(_) => Ok(JobLoad::default()),
     }
 }
 
@@ -3203,13 +3792,14 @@ impl JobsTx {
 /// a `transaction()` on it (PostgreSQL, MySQL): the job is added only if the
 /// transaction commits. `None` when the script has no such transaction.
 ///
-/// The cap holds for transactions running at once too (found by the 1.1
+/// The caps hold for transactions running at once too (found by the 1.1
 /// audit: each counted only what it could see, and passed the cap by what it
 /// added): each `enqueue()` first takes the store's lock, which the
 /// transaction holds until it ends, so transactions that add jobs to a store
-/// run their `enqueue()`s one after the other; the jobs others committed are
-/// counted on a connection of the store (whatever the transaction's isolation
-/// level), and those this one added are added to them.
+/// run their `enqueue()`s one after the other. What the store held is counted
+/// once, when the transaction first takes the lock (`job_tx_load`), and what
+/// it adds is added to it (found by the 1.1.1 audit: near the cap each
+/// `enqueue()` of a transaction counted the table again).
 pub(crate) fn job_add_in_transaction(
     vm: &mut Vm,
     spec: &DatabaseSpec,
@@ -3217,7 +3807,7 @@ pub(crate) fn job_add_in_transaction(
     job: (&str, &str, &str),
     run_at: i64,
     uniq: Option<&str>,
-    cap: usize,
+    cap: JobCap,
 ) -> Option<Result<Option<()>, VmError>> {
     let ns = vm.host.store_namespace.clone();
     let t = jobs_table(ns.as_deref());
@@ -3230,23 +3820,16 @@ pub(crate) fn job_add_in_transaction(
         .map(|d| d.link.clone())?;
     let mut link = link.borrow_mut();
     let now = now_ms();
+    let size = job.2.len();
     let vm: &Vm = vm;
-    let full = || vm.throw("RuntimeException", format!("enqueue(): the job queue holds {cap} jobs already"));
-    // The jobs committed (counted when this transaction first takes the lock),
-    // and those it added.
-    let count = |first: bool, added: i64| -> Result<i64, VmError> {
-        job_count_cached(spec, &t, cap, added, first, || {
-            let (mut conn, _) = job_conn_before(spec, ns.as_deref(), vm.deadline())?;
-            match &mut conn {
-                SessionConn::Pg(c) => pg_job_count(c.get(), &t, false),
-                SessionConn::My(c) => my_job_count(&mut c.get().conn, &t),
-                SessionConn::Redis(_) => Ok(0),
-            }
-        })
-        .map(|n| n + added)
-        .map_err(|e| vm.throw("DatabaseError", format!("enqueue(): {e}")))
+    let full = || vm.throw("RuntimeException", format!("enqueue(): {}", cap.full()));
+    let held = || {
+        job_tx_load(spec, ns.as_deref(), &t, cap, vm.deadline())
+            .map_err(|e| vm.throw("DatabaseError", format!("enqueue(): {e}")))
     };
     let count_key = job_count_key(spec, &t);
+    // Whether the job fits, with what the transaction added so far.
+    let fits = |tx: &JobsTx| !tx.held.plus(tx.added).full(cap, size);
     let r = match &mut *link {
         Link::Pg(c) => {
             if !(c.depth > 0 || c.get().in_own_transaction) {
@@ -3254,14 +3837,16 @@ pub(crate) fn job_add_in_transaction(
             }
             (|| {
                 pg_run(vm, c, |c, prelude| pg_job_lock(c.get(), &t, prelude))?;
-                let tx = &mut c.get().jobs_tx;
-                if count(tx.is_none(), tx.as_ref().map_or(0, |j| j.added))? >= cap as i64 {
+                if c.get().jobs_tx.is_none() {
+                    let held = held()?;
+                    c.get().jobs_tx = Some(JobsTx { held, added: JobLoad::default(), count_key });
+                }
+                if !c.get().jobs_tx.as_ref().is_some_and(fits) {
                     return Err(full());
                 }
-                tx.get_or_insert(JobsTx { added: 0, count_key });
                 let r = pg_run(vm, c, |c, prelude| pg_job_insert(c.get(), &t, true, job, run_at, uniq, now, prelude))?;
                 if let (Some(()), Some(tx)) = (r, c.get().jobs_tx.as_mut()) {
-                    tx.added += 1;
+                    tx.added = tx.added.plus(JobLoad::one(size));
                 }
                 Ok(r)
             })()
@@ -3274,20 +3859,22 @@ pub(crate) fn job_add_in_transaction(
                 c.broken = true;
             }
             r.map_err(|e| my_error(vm, c, e))?;
-            let tx = &mut c.get().jobs_tx;
-            if count(tx.is_none(), tx.as_ref().map_or(0, |j| j.added))? >= cap as i64 {
+            if c.get().jobs_tx.is_none() {
+                let held = held()?;
+                c.get().jobs_tx = Some(JobsTx { held, added: JobLoad::default(), count_key });
+            }
+            if !c.get().jobs_tx.as_ref().is_some_and(fits) {
                 return Err(full());
             }
-            tx.get_or_insert(JobsTx { added: 0, count_key });
             my_limit_time(vm, c)?;
             let kill = my_kill_at(vm, c);
-            let r = my_job_insert(&mut c.get().conn, &t, job, run_at, uniq, now);
+            let r = my_job_insert_on(&mut c.get().conn, &t, job, run_at, uniq, now);
             if kill.disarm() {
                 c.broken = true;
             }
             let r = r.map_err(|e| my_error(vm, c, e))?;
             if let (Some(()), Some(tx)) = (r, c.get().jobs_tx.as_mut()) {
-                tx.added += 1;
+                tx.added = tx.added.plus(JobLoad::one(size));
             }
             Ok(r)
         })(),
@@ -3298,7 +3885,13 @@ pub(crate) fn job_add_in_transaction(
 
 /// Makes sure the store's table exists (before a script's transaction adds to it:
 /// MySQL would commit the transaction to create it).
+/// Once they are, it takes no connection (Redis needs no table).
 pub fn job_store_ready(spec: &DatabaseSpec, ns: Option<&str>, deadline: Option<Instant>) -> Result<(), String> {
+    if let Some(url) = &spec.url {
+        if kind_of(url) == Kind::Redis || lock(&JOB_TABLES).contains(&format!("{url}|{}", jobs_table(ns))) {
+            return Ok(());
+        }
+    }
     job_conn_before(spec, ns, deadline).map(|_| ())
 }
 
@@ -3357,7 +3950,8 @@ pub fn job_take(spec: &DatabaseSpec, ns: Option<&str>, lease_ms: i64) -> Result<
         }
         SessionConn::My(c) => {
             use mysql::prelude::Queryable;
-            let my = |e: mysql::Error| my_message(&e);
+            let w = c.get().watch();
+            let my = |e: mysql::Error| w.msg(e);
             let conn = &mut c.get().conn;
             conn.query_drop("START TRANSACTION").map_err(my)?;
             let found: Option<(String, String, String, i64)> = conn
@@ -3399,6 +3993,7 @@ pub fn job_end(spec: &DatabaseSpec, ns: Option<&str>, job: &JobRow, end: JobEnd)
     let t = jobs_table(ns);
     let (mut conn, until) = job_conn(spec, ns)?;
     let now = now_ms();
+    let zero = if job_sized(&t) { ", size = 0" } else { "" };
     match &mut conn {
         SessionConn::Redis(c) => {
             let (mode, at, error) = match &end {
@@ -3406,8 +4001,8 @@ pub fn job_end(spec: &DatabaseSpec, ns: Option<&str>, job: &JobRow, end: JobEnd)
                 JobEnd::Retry { at, error } => ("retry", *at, *error),
                 JobEnd::Dead { error } => ("dead", now, *error),
             };
-            let (at, cap) = (at.to_string(), JOB_MAX_DEAD.to_string());
-            let args: [&[u8]; 7] = [
+            let (at, cap, kept) = (at.to_string(), JOB_MAX_DEAD.to_string(), JOB_MAX_KEPT.to_string());
+            let args: [&[u8]; 8] = [
                 b"0",
                 job.id.as_bytes(),
                 job.lease.as_bytes(),
@@ -3415,6 +4010,7 @@ pub fn job_end(spec: &DatabaseSpec, ns: Option<&str>, job: &JobRow, end: JobEnd)
                 at.as_bytes(),
                 error.as_bytes(),
                 cap.as_bytes(),
+                kept.as_bytes(),
             ];
             match job_redis(c, &REDIS_JOB_END, &jobs_prefix(ns), &args, until)? {
                 Reply::Int(n) => Ok(n == 1),
@@ -3433,7 +4029,7 @@ pub fn job_end(spec: &DatabaseSpec, ns: Option<&str>, job: &JobRow, end: JobEnd)
                 JobEnd::Done { keyed: true } => conn
                     .execute_kept(
                         &format!(
-                            "UPDATE {t} SET state = 3, run_at = $3, payload = '', lease = NULL \
+                            "UPDATE {t} SET state = 3, run_at = $3, payload = ''{zero}, lease = NULL \
                              WHERE id = $1 AND lease = $2 AND uniq IS NOT NULL"
                         ),
                         &[id, lease, &now],
@@ -3459,6 +4055,7 @@ pub fn job_end(spec: &DatabaseSpec, ns: Option<&str>, job: &JobRow, end: JobEnd)
         }
         SessionConn::My(c) => {
             use mysql::prelude::Queryable;
+            let w = c.get().watch();
             let conn = &mut c.get().conn;
             let (id, lease) = (&job.id, &job.lease);
             let r = match end {
@@ -3468,7 +4065,7 @@ pub fn job_end(spec: &DatabaseSpec, ns: Option<&str>, job: &JobRow, end: JobEnd)
                 JobEnd::Done { keyed: true } => conn
                     .exec_drop(
                         format!(
-                            "UPDATE {t} SET state = 3, run_at = ?, payload = '', lease = NULL \
+                            "UPDATE {t} SET state = 3, run_at = ?, payload = ''{zero}, lease = NULL \
                              WHERE id = ? AND lease = ? AND uniq IS NOT NULL"
                         ),
                         (now, id, lease),
@@ -3486,60 +4083,83 @@ pub fn job_end(spec: &DatabaseSpec, ns: Option<&str>, job: &JobRow, end: JobEnd)
                     (now, error, id, lease),
                 ),
             };
-            r.map_err(|e| my_message(&e))?;
+            r.map_err(|e| w.msg(e))?;
             Ok(conn.affected_rows() > 0)
         }
     }
 }
 
 /// Removes jobs given up more than a week ago (and past `JOB_MAX_DEAD`), and
-/// the kept rows of keyed jobs after a day.
+/// the kept rows of keyed jobs after a day (and past `JOB_MAX_KEPT`), at most
+/// `JOB_SWEEP_BATCH` rows per statement; what is left when the operation's
+/// time is up is removed by the next sweep.
 pub fn job_sweep(spec: &DatabaseSpec, ns: Option<&str>) -> Result<(), String> {
     let t = jobs_table(ns);
     let (mut conn, until) = job_conn(spec, ns)?;
     let now = now_ms();
     let (done_before, dead_before) = (now - JOB_KEEP_DONE_MS, now - JOB_KEEP_DEAD_MS);
+    let batch = JOB_SWEEP_BATCH;
+    // Runs one batch after another while each removes a full batch and time is left.
+    let in_batches = |run: &mut dyn FnMut() -> Result<i64, String>| -> Result<(), String> {
+        while until.saturating_duration_since(Instant::now()) > JOB_WAIT / 4 {
+            if run()? < batch {
+                break;
+            }
+        }
+        Ok(())
+    };
     match &mut conn {
         SessionConn::Redis(c) => {
-            let before = dead_before.to_string();
-            job_redis(c, &REDIS_JOB_SWEEP, &jobs_prefix(ns), &[b"0", before.as_bytes()], until).map(|_| ())
+            let (before, kept_before) = (dead_before.to_string(), done_before.to_string());
+            let args: [&[u8]; 3] = [b"0", before.as_bytes(), kept_before.as_bytes()];
+            job_redis(c, &REDIS_JOB_SWEEP, &jobs_prefix(ns), &args, until).map(|_| ())
         }
         SessionConn::Pg(c) => {
             let conn = c.get();
             let pg = |e: postgres::Error| pg_message(&e);
-            conn.execute_kept(
-                &format!("DELETE FROM {t} WHERE (state = 3 AND run_at < $1) OR (state = 2 AND run_at < $2)"),
-                &[&done_before, &dead_before],
-            )
-            .map_err(pg)?;
-            let keep = JOB_MAX_DEAD as i64;
-            conn.execute_kept(
-                &format!(
-                    "DELETE FROM {t} WHERE state = 2 AND id IN \
-                 (SELECT id FROM {t} WHERE state = 2 ORDER BY run_at DESC OFFSET $1)"
-                ),
-                &[&keep],
-            )
-            .map_err(pg)?;
+            for (state, before) in [(3, done_before), (2, dead_before)] {
+                let sql = format!(
+                    "DELETE FROM {t} WHERE id IN (SELECT id FROM {t} WHERE state = {state} AND run_at < $1 LIMIT $2)"
+                );
+                in_batches(&mut || conn.execute_kept(&sql, &[&before, &batch]).map(|n| n as i64).map_err(pg))?;
+            }
+            for (state, keep) in [(2, JOB_MAX_DEAD), (3, JOB_MAX_KEPT)] {
+                let sql = format!(
+                    "DELETE FROM {t} WHERE id IN (SELECT id FROM {t} WHERE state = {state} \
+                     ORDER BY run_at DESC OFFSET $1 LIMIT $2)"
+                );
+                let keep = keep as i64;
+                in_batches(&mut || conn.execute_kept(&sql, &[&keep, &batch]).map(|n| n as i64).map_err(pg))?;
+            }
             Ok(())
         }
         SessionConn::My(c) => {
             use mysql::prelude::Queryable;
-            let my = |e: mysql::Error| my_message(&e);
+            let w = c.get().watch();
             let conn = &mut c.get().conn;
-            conn.exec_drop(
-                format!("DELETE FROM {t} WHERE (state = 3 AND run_at < ?) OR (state = 2 AND run_at < ?)"),
-                (done_before, dead_before),
-            )
-            .map_err(my)?;
-            let cut: Option<i64> = conn
-                .exec_first(
-                    format!("SELECT run_at FROM {t} WHERE state = 2 ORDER BY run_at DESC LIMIT 1 OFFSET ?"),
-                    (JOB_MAX_DEAD as i64,),
-                )
-                .map_err(my)?;
-            if let Some(cut) = cut {
-                conn.exec_drop(format!("DELETE FROM {t} WHERE state = 2 AND run_at <= ?"), (cut,)).map_err(my)?;
+            let mut delete = |sql: &str, at: i64| -> Result<i64, String> {
+                conn.exec_drop(sql, (at, batch)).map_err(|e| w.msg(e))?;
+                Ok(conn.affected_rows() as i64)
+            };
+            for (state, before) in [(3, done_before), (2, dead_before)] {
+                let sql = format!("DELETE FROM {t} WHERE state = {state} AND run_at < ? LIMIT ?");
+                in_batches(&mut || delete(&sql, before))?;
+            }
+            for (state, keep) in [(2, JOB_MAX_DEAD), (3, JOB_MAX_KEPT)] {
+                let cut: Option<i64> = conn
+                    .exec_first(
+                        format!("SELECT run_at FROM {t} WHERE state = {state} ORDER BY run_at DESC LIMIT 1 OFFSET ?"),
+                        (keep as i64,),
+                    )
+                    .map_err(|e| w.msg(e))?;
+                if let Some(cut) = cut {
+                    let sql = format!("DELETE FROM {t} WHERE state = {state} AND run_at <= ? LIMIT ?");
+                    let mut delete = |at: i64| -> Result<i64, String> {
+                        conn.exec_drop(&sql, (at, batch)).map_err(|e| w.msg(e))?;
+                        Ok(conn.affected_rows() as i64)
+                    };
+                    in_batches(&mut || delete(cut))?;
+                }
             }
             Ok(())
         }
@@ -3605,8 +4225,8 @@ pub fn job_list(spec: &DatabaseSpec, ns: Option<&str>, failed_only: bool) -> Res
         }
         SessionConn::My(c) => {
             use mysql::prelude::Queryable;
-            let rows: Vec<(String, String, i64, i64, i64, String)> =
-                c.get().conn.query(&sql).map_err(|e| my_message(&e))?;
+            let w = c.get().watch();
+            let rows: Vec<(String, String, i64, i64, i64, String)> = c.get().conn.query(&sql).map_err(|e| w.msg(e))?;
             Ok(rows
                 .into_iter()
                 .map(|(id, name, state, attempts, at, error)| JobInfo {
@@ -3648,12 +4268,13 @@ pub fn job_requeue(spec: &DatabaseSpec, ns: Option<&str>, id: &str) -> Result<bo
             .map_err(|e| pg_message(&e)),
         SessionConn::My(c) => {
             use mysql::prelude::Queryable;
+            let w = c.get().watch();
             let conn = &mut c.get().conn;
             conn.exec_drop(
                 format!("UPDATE {t} SET state = 0, attempts = 0, run_at = ?, error = NULL WHERE id = ? AND state = 2"),
                 (now, id),
             )
-            .map_err(|e| my_message(&e))?;
+            .map_err(|e| w.msg(e))?;
             Ok(conn.affected_rows() > 0)
         }
     }
@@ -4149,6 +4770,167 @@ mod tests {
             ("", PgText::Other),
         ] {
             assert_eq!(pg_text(text), kind, "{text}");
+        }
+    }
+
+    /// The servers of the database tests (see crates/phv_driver/tests/databases.rs), when set.
+    fn test_servers() -> Vec<(&'static str, DatabaseSpec)> {
+        ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL", "PHV_TEST_REDIS_URL"]
+            .into_iter()
+            .filter_map(|var| {
+                let url = std::env::var(var).ok().filter(|u| !u.is_empty());
+                if url.is_none() {
+                    eprintln!("skipped: {var} is not set");
+                }
+                Some((var, DatabaseSpec { url: Some(url?), url_env: None, tls: None, pool_size: 4 }))
+            })
+            .collect()
+    }
+
+    /// A database job store holds at most `JobCap::bytes` of payloads, as the
+    /// memory store does, and ending a job makes room again (found by the 1.1.1
+    /// audit: only the jobs were counted, so a store could hold 6.4 GB).
+    #[test]
+    fn job_stores_cap_the_bytes_of_payloads() {
+        let ns = Some("f3f3f3f3f3f3f3f3");
+        for (var, spec) in test_servers() {
+            let clear = || {
+                while let Some(j) = job_take(&spec, ns, 60_000).unwrap() {
+                    job_end(&spec, ns, &j, JobEnd::Done { keyed: false }).unwrap();
+                }
+                job_sweep(&spec, ns).unwrap();
+            };
+            clear();
+            let cap = JobCap { jobs: 1000, bytes: 100_000 };
+            let add = |size: usize| {
+                let (id, payload) = (crate::random_hex(16), "x".repeat(size));
+                job_add(&spec, ns, (&id, "big", &payload), now_ms(), None, cap, None)
+            };
+            for _ in 0..3 {
+                assert_eq!(add(30_000), Ok(Some(())), "{var}");
+            }
+            let err = add(30_000).unwrap_err();
+            assert!(err.starts_with("the job queue holds 1000 jobs or 0 MB"), "{var}: {err}");
+            assert_eq!(add(1_000), Ok(Some(())), "{var}: a small job still fits");
+            let j = job_take(&spec, ns, 60_000).unwrap().unwrap();
+            assert!(job_end(&spec, ns, &j, JobEnd::Done { keyed: false }).unwrap());
+            // Counts of the database are a second old at most.
+            std::thread::sleep(Duration::from_millis(1100));
+            assert_eq!(add(30_000), Ok(Some(())), "{var}: no room after a job ended");
+            clear();
+        }
+    }
+
+    /// A jobs table made before 1.1.1 gets its `size` column when first used;
+    /// while another transaction holds the table, the store goes on without
+    /// it (the bytes are not counted) instead of waiting, and adds it later.
+    #[test]
+    fn a_jobs_table_of_1_1_gets_its_size_column_later_when_held() {
+        let ns = Some("f4f4f4f4f4f4f4f4");
+        let t = jobs_table(ns);
+        for (var, spec) in test_servers() {
+            if var == "PHV_TEST_REDIS_URL" {
+                continue;
+            }
+            let url = spec.url.clone().unwrap();
+            let old = format!(
+                "CREATE TABLE {t} (id varchar(32) PRIMARY KEY, name varchar(64) NOT NULL, payload text NOT NULL, \
+                 run_at bigint NOT NULL, attempts integer NOT NULL, state smallint NOT NULL, lease varchar(32), \
+                 lease_until bigint, uniq varchar(64) UNIQUE, error text, created bigint NOT NULL)"
+            );
+            let has_size = |spec: &DatabaseSpec| -> bool {
+                let (mut conn, _) = job_conn(spec, ns).unwrap();
+                let sql = format!(
+                    "SELECT count(*) FROM information_schema.columns WHERE table_name = '{t}' \
+                                   AND column_name = 'size'"
+                );
+                match &mut conn {
+                    SessionConn::Pg(c) => c.get().client.query(&sql, &[]).unwrap()[0].get::<_, i64>(0) > 0,
+                    SessionConn::My(c) => {
+                        use mysql::prelude::Queryable;
+                        c.get().conn.query_first::<i64, _>(sql).unwrap().unwrap() > 0
+                    }
+                    SessionConn::Redis(_) => unreachable!(),
+                }
+            };
+            let wait = Duration::from_secs(5);
+            // The table as 1.1 made it, held by an open transaction.
+            let mut holder: Box<dyn FnMut(&str)> = if var == "PHV_TEST_POSTGRES_URL" {
+                let c = pg_connect(&url, &spec, wait).unwrap();
+                c.client.batch_execute(&format!("DROP TABLE IF EXISTS {t}; {old}")).unwrap();
+                c.client.batch_execute(&format!("BEGIN; LOCK TABLE {t} IN ACCESS SHARE MODE")).unwrap();
+                Box::new(move |sql| c.client.batch_execute(sql).unwrap())
+            } else {
+                use mysql::prelude::Queryable;
+                let mut c = my_connect(&url, &spec, wait, None, None).unwrap();
+                c.conn.query_drop(format!("DROP TABLE IF EXISTS {t}")).unwrap();
+                c.conn.query_drop(&old).unwrap();
+                c.conn.query_drop("START TRANSACTION").unwrap();
+                c.conn.query_drop(format!("SELECT * FROM {t} LIMIT 1")).unwrap();
+                Box::new(move |sql| c.conn.query_drop(sql).unwrap())
+            };
+            lock(&JOB_TABLES).remove(&format!("{url}|{t}"));
+            lock(&JOB_UNSIZED).remove(&t);
+            let started = Instant::now();
+            let cap = JobCap { jobs: 1000, bytes: 1 << 20 };
+            let add = || job_add(&spec, ns, (&crate::random_hex(16), "j", "payload"), now_ms(), None, cap, None);
+            assert_eq!(add(), Ok(Some(())), "{var}");
+            assert!(started.elapsed() < Duration::from_secs(3), "{var}: waited {:?}", started.elapsed());
+            assert!(!job_sized(&t), "{var}: the column was added under the open transaction");
+            let j = job_take(&spec, ns, 60_000).unwrap().unwrap();
+            assert!(job_end(&spec, ns, &j, JobEnd::Done { keyed: false }).unwrap(), "{var}");
+            // Once the transaction ended, the next try adds it.
+            holder("COMMIT");
+            lock(&JOB_UNSIZED).insert(t.clone(), Instant::now() - JOB_SIZE_RETRY);
+            assert_eq!(add(), Ok(Some(())), "{var}");
+            assert!(job_sized(&t) && has_size(&spec), "{var}: the column was not added");
+            holder(&format!("DROP TABLE {t}"));
+            lock(&JOB_TABLES).remove(&format!("{url}|{t}"));
+        }
+    }
+
+    /// A site with a namespace also clears what 1.1 left in the shared session
+    /// store once no site can use it, and nothing that is still alive (found
+    /// by the 1.1.1 audit: only sites without a namespace swept it).
+    #[test]
+    fn sites_with_a_namespace_sweep_what_1_1_left() {
+        let limits = SessionLimits {
+            ttl: Duration::from_secs(3600),
+            max_lifetime: Duration::from_secs(24 * 3600),
+            max_sessions: 50_000,
+            max_bytes: 256 << 20,
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let row = |created: u64, last: u64| SessionRow { data: "{}".into(), created, last, returned: true };
+        for (var, spec) in test_servers() {
+            let dead = format!("a-i2-dead-{}", crate::random_hex(8));
+            let alive = format!("a-i2-alive-{}", crate::random_hex(8));
+            if var == "PHV_TEST_REDIS_URL" {
+                // As 1.1 stored them: the dead one has a second of its lifetime left.
+                let lifetime = limits.max_lifetime.as_secs();
+                assert!(session_insert(&spec, None, &dead, &row(now - lifetime + 1, now), &limits).unwrap());
+                assert!(session_insert(&spec, None, &alive, &row(now, now), &limits).unwrap());
+                std::thread::sleep(Duration::from_millis(2100));
+                let until = Instant::now() + Duration::from_secs(5);
+                let mut c = redis_conn(&spec, PoolUse::Sessions, until).unwrap();
+                let mut counted = |key: &str| {
+                    let r = redis_run(&mut c, &[b"ZSCORE", b"phv:sessions:back", key.as_bytes()], until).unwrap();
+                    !matches!(r, Reply::Nil)
+                };
+                assert!(session_read(&spec, None, &dead).unwrap().is_none(), "Redis expired it");
+                assert!(counted(&dead), "still counted in the shared bookkeeping");
+                session_sweep(&spec, Some("a12a12a12a12"), &limits).unwrap();
+                assert!(!counted(&dead), "{var}: the shared bookkeeping of an expired session was kept");
+                assert!(counted(&alive), "{var}: a live session was forgotten");
+            } else {
+                let day = 24 * 3600;
+                assert!(session_insert(&spec, None, &dead, &row(now - day - 60, now - day - 60), &limits).unwrap());
+                assert!(session_insert(&spec, None, &alive, &row(now - 100, now - 100), &limits).unwrap());
+                session_sweep(&spec, Some("a12a12a12a12"), &limits).unwrap();
+                assert!(session_read(&spec, None, &dead).unwrap().is_none(), "{var}: an expired session was kept");
+                assert!(session_read(&spec, None, &alive).unwrap().is_some(), "{var}: a live session was removed");
+            }
+            session_remove(&spec, None, &alive).unwrap();
         }
     }
 

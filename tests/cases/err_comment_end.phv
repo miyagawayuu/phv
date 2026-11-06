@@ -1,0 +1,14 @@
+<?phv
+// A value in a comment may end with `--` (or `-`, `--!`): text right after it
+// that would then end the comment (`>`, `!>`, `->`, `-!>`) is an error (found
+// by the 1.1.1 audit: with `$v = "--"`, the first line wrote a live
+// `javascript:` link). Every line is an error but the last. Values right
+// after `<!--` or a `-`: see err_comment_value.phv.
+$v = "--";
+$u = "javascript:alert(1)";
+?>
+<!-- <?= $v ?>> <a title="-->" href="<?= safe_url($u) ?>">x</a> -->
+<!-- <?= $v ?>!> -->
+<!-- a<?= $v ?>-> -->
+<!-- <?= $v ?><?phv if ($u != "") { ?> x<?phv } ?>> -->
+<!-- <?= $v ?> -->

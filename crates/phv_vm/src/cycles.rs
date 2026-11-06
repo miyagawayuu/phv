@@ -16,6 +16,14 @@
 //! The walk is conservative: an object the VM did not record, or one that is
 //! borrowed at the moment, is treated as held from outside and is not looked
 //! into, so a value can be kept too long but is never freed while in use.
+//!
+//! The walk's own memory counts against the script's memory limit (found by
+//! the 1.1.1 audit: a list of 1.5 million objects took 190 MB more to walk,
+//! 321 MB under a 128 MB limit). It is given a budget: when the walk of every
+//! object would not fit, it walks the newest ones that do (those made since
+//! the last walk, where new garbage is); an object outside the walk is held
+//! from outside, as above. A walk that outgrows its budget (the lists and maps
+//! it reaches) stops and frees nothing.
 
 use crate::value::{Closure, Key, Map, Object, Value};
 use std::cell::{Ref, RefCell};
@@ -65,9 +73,25 @@ enum Node<'a> {
 struct Entry<'a> {
     node: Node<'a>,
     /// References to this value (`Rc::strong_count`), minus the collector's own.
-    strong: usize,
+    strong: u32,
     /// References to it from values in the graph.
-    internal: usize,
+    internal: u32,
+}
+
+/// The most the walk allocates for each recorded object it looks at: its
+/// strong reference (8 bytes) and borrow (16), its entry (32), its place in
+/// the index (about 40 with the table's spare room), its mark (1), and its
+/// place on the marking stack (8) and in the list of garbage (8).
+pub(crate) const BYTES_PER_OBJECT: usize = 120;
+
+/// The most the walk allocates for each list, map or closure it adds as it
+/// goes (the same, without the strong reference and the borrow).
+const BYTES_PER_VALUE: usize = 96;
+
+/// A count of references as an entry holds it. More than `u32::MAX` would take
+/// 64 GB of values; a count cut to it still reads as held from outside.
+fn count(n: usize) -> u32 {
+    n.min(u32::MAX as usize) as u32
 }
 
 /// The values inside a node that can take part in a cycle.
@@ -122,19 +146,29 @@ fn node_of(v: &Value) -> Node<'_> {
 pub(crate) struct Collected {
     /// Objects whose fields were cleared.
     pub freed: usize,
-    /// Values looked at inside live values: the part of the walk that the
-    /// next one repeats (garbage is walked once, then freed).
+    /// Values looked at inside live values, and the records of the objects:
+    /// the part of the walk that the next one repeats (garbage is walked
+    /// once, then freed).
     pub visited: usize,
 }
 
 /// Clears the fields of every recorded object that is reachable only through
 /// a cycle. `objects` is the VM's record of the objects it made; entries for
-/// objects that are gone are dropped.
-pub(crate) fn collect(objects: &mut Vec<Weak<RefCell<Object>>>) -> Collected {
-    let mut visited = 0;
+/// objects that are gone are dropped. The walk allocates at most `budget`
+/// bytes (see the module's notes).
+pub(crate) fn collect(objects: &mut Vec<Weak<RefCell<Object>>>, budget: usize) -> Collected {
+    // The record is looked at whole, however few objects are walked.
+    let mut visited = objects.len();
     objects.retain(|w| w.strong_count() > 0);
-    let live: Vec<Rc<RefCell<Object>>> = objects.iter().filter_map(Weak::upgrade).collect();
-    let garbage: Vec<usize> = {
+    // The newest objects the budget allows (the record is in the order they were made).
+    let from = objects.len() - objects.len().min(budget / BYTES_PER_OBJECT);
+    let start = crate::alloc::thread_allocated();
+    // Whether `more` bytes still fit in the budget, with what the walk holds now.
+    let fits =
+        |more: usize| ((crate::alloc::thread_allocated() - start).max(0) as usize).saturating_add(more) <= budget;
+    let mut live: Vec<Rc<RefCell<Object>>> = Vec::with_capacity(objects.len() - from);
+    live.extend(objects[from..].iter().filter_map(Weak::upgrade));
+    let garbage: Option<Vec<usize>> = 'walk: {
         // Borrow every object for the whole walk; one that is borrowed mutably
         // right now is opaque.
         let guards: Vec<Option<Ref<'_, Object>>> = live.iter().map(|o| o.try_borrow().ok()).collect();
@@ -147,7 +181,7 @@ pub(crate) fn collect(objects: &mut Vec<Weak<RefCell<Object>>>) -> Collected {
                 None => Node::Opaque,
             };
             // `live` holds one reference of its own.
-            entries.push(Entry { node, strong: Rc::strong_count(o) - 1, internal: 0 });
+            entries.push(Entry { node, strong: count(Rc::strong_count(o) - 1), internal: 0 });
         }
 
         // Count the references from inside the graph, adding the lists, maps
@@ -159,22 +193,33 @@ pub(crate) fn collect(objects: &mut Vec<Weak<RefCell<Object>>>) -> Collected {
                 let Some((ptr, strong)) = identity(v) else { continue };
                 let i = match index.get(&ptr) {
                     Some(&i) => i,
-                    // An object the VM did not record is held from outside.
+                    // An object the VM did not record (or not in this walk) is held from outside.
                     None if matches!(v, Value::Object(_)) => continue,
                     None => {
+                        // The entries and the index grow to twice their size.
+                        let full = entries.len() == entries.capacity() || index.len() == index.capacity();
+                        if full && !fits(entries.len().saturating_mul(2 * BYTES_PER_VALUE)) {
+                            break 'walk None;
+                        }
                         index.insert(ptr, entries.len());
-                        entries.push(Entry { node: node_of(v), strong, internal: 0 });
+                        entries.push(Entry { node: node_of(v), strong: count(strong), internal: 0 });
                         entries.len() - 1
                     }
                 };
-                entries[i].internal += 1;
+                entries[i].internal = entries[i].internal.saturating_add(1);
             }
             next += 1;
         }
 
+        // The marks, the marking stack and the list of garbage.
+        // (Each is allocated at its full size at once: growing one would hold
+        // the old and the new allocation.)
+        if !fits(entries.len().saturating_mul(1 + 8 + 8)) {
+            break 'walk None;
+        }
         // Everything reachable from a value held from outside is live.
         let mut live_mark = vec![false; entries.len()];
-        let mut stack: Vec<usize> = Vec::new();
+        let mut stack: Vec<usize> = Vec::with_capacity(entries.len());
         for (i, e) in entries.iter().enumerate() {
             if e.strong > e.internal || matches!(e.node, Node::Opaque) {
                 live_mark[i] = true;
@@ -194,8 +239,12 @@ pub(crate) fn collect(objects: &mut Vec<Weak<RefCell<Object>>>) -> Collected {
             }
         }
         // The recorded objects come first in `entries`, in the order of `live`.
-        (0..live.len()).filter(|&i| !live_mark[i]).collect()
+        let mut garbage = Vec::with_capacity(live_mark[..live.len()].iter().filter(|m| !**m).count());
+        garbage.extend((0..live.len()).filter(|&i| !live_mark[i]));
+        Some(garbage)
     };
+    // A walk that did not fit frees nothing.
+    let garbage = garbage.unwrap_or_default();
 
     // The borrows have ended. Take the fields out first and drop them after,
     // so that no object is borrowed while values are freed.

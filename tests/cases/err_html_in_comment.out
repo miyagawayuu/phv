@@ -1,0 +1,5 @@
+<!-- plain text
+ -->
+<!-- 
+--- runtime error ---
+Fatal error: `Html` inserted into a comment holds what ends it (`-->`), which would turn the rest into markup; insert a string (it is escaped) instead

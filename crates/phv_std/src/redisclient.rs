@@ -413,11 +413,23 @@ impl RedisConn {
                     }
                     self.budget -= cost;
                     let mut items = Vec::with_capacity(len.min(1024));
+                    // An error element (`EXEC`, `EVAL`) is the reply's error,
+                    // but the elements after it are read too: left unread,
+                    // they would be taken for the next command's reply on a
+                    // pooled connection (found by the 1.1.1 audit).
+                    let mut error = None;
                     for _ in 0..len {
                         match self.reply(depth + 1)? {
-                            Ok(r) => items.push(r),
-                            Err(m) => return Ok(Err(m)),
+                            Ok(r) if error.is_none() => items.push(r),
+                            Ok(_) => {}
+                            Err(m) => {
+                                error.get_or_insert(m);
+                                items = Vec::new();
+                            }
                         }
+                    }
+                    if let Some(m) = error {
+                        return Ok(Err(m));
                     }
                     Reply::Array(items)
                 }
@@ -446,6 +458,55 @@ mod tests {
         for bad in ["http://a", "redis://", "redis://a:x", "redis://a/x"] {
             assert!(parse_url(bad).is_err(), "{bad}");
         }
+    }
+
+    /// An error inside an array reply is the command's error, and the rest of
+    /// the array is read with it: the next command gets its own reply (found by
+    /// the 1.1.1 audit: the elements after the error were left for it).
+    #[test]
+    fn an_error_in_an_array_reply_reads_the_whole_reply() {
+        use std::io::{BufRead as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut s = s;
+            // Each command is `*1\r\n$N\r\nNAME\r\n`: three lines.
+            let mut command = || {
+                let mut line = String::new();
+                for _ in 0..3 {
+                    line.clear();
+                    r.read_line(&mut line).unwrap();
+                }
+                line.trim().to_string()
+            };
+            assert_eq!(command(), "EXEC");
+            // The elements after the error come a moment later.
+            s.write_all(b"*4\r\n:1\r\n-ERR first\r\n").unwrap();
+            s.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            s.write_all(b"*2\r\n-WRONGTYPE second\r\n:2\r\n:3\r\n").unwrap();
+            assert_eq!(command(), "PING");
+            s.write_all(b"+PONG\r\n").unwrap();
+            assert_eq!(command(), "PING");
+            s.write_all(b"*3\r\n-ERR late\r\n").unwrap();
+            s.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            s.write_all(b":1\r\n:2\r\n+PONG\r\n").unwrap();
+        });
+        let until = || Instant::now() + std::time::Duration::from_secs(5);
+        let mut c = RedisConn::connect(&format!("redis://127.0.0.1:{port}"), None, until()).unwrap();
+        let budget = 1 << 20;
+        assert!(
+            matches!(c.command(&[b"EXEC"], until(), budget), Err(RedisError::Server(m)) if m == "ResponseError: first")
+        );
+        assert!(matches!(c.command(&[b"PING"], until(), budget), Ok(Reply::Simple(m)) if m == "PONG"));
+        // Pipelined: each reply is read whole, the next one is the next command's.
+        assert!(c.send(&[b"PING"], until()).is_ok());
+        assert!(matches!(c.next_reply(until(), budget), Err(RedisError::Server(m)) if m == "ResponseError: late"));
+        assert!(matches!(c.next_reply(until(), budget), Ok(Reply::Simple(m)) if m == "PONG"));
+        server.join().unwrap();
     }
 
     /// A subscribed connection reads pushed messages; one longer than allowed

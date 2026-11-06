@@ -16,8 +16,11 @@ fn breaks_out(stmts: &[Stmt], nest: u32) -> bool {
                 || els.as_ref().is_some_and(|b| breaks_out(b, nest))
         }
         StmtKind::Block(b) => breaks_out(b, nest),
-        StmtKind::Try { body, catches, .. } => {
-            breaks_out(body, nest) || catches.iter().any(|c| breaks_out(&c.body, nest))
+        // A `break` in `finally` also leaves the loop (even one that ran into a `return`).
+        StmtKind::Try { body, catches, finally } => {
+            breaks_out(body, nest)
+                || catches.iter().any(|c| breaks_out(&c.body, nest))
+                || finally.as_ref().is_some_and(|f| breaks_out(f, nest))
         }
         StmtKind::While { body, .. }
         | StmtKind::DoWhile { body, .. }
@@ -25,6 +28,30 @@ fn breaks_out(stmts: &[Stmt], nest: u32) -> bool {
         | StmtKind::Foreach { body, .. } => breaks_out(body, nest + 1),
         _ => false,
     })
+}
+
+/// A value inserted inside `<svg>`/`<math>`, into the text of a raw-text
+/// element or into a comment: `Html` (a template's output, a layout's body,
+/// `raw()`) was checked as HTML on its own, so it is looked at when it is
+/// inserted (`__html_inside` refuses markup that browsers would read in
+/// another way there, or that ends the comment; found by the 1.1.1 audit).
+/// Strings and numbers are escaped and need no look.
+fn html_inside(h: HExpr, ctx: phv_syntax::ast::EchoContext) -> HExpr {
+    use phv_syntax::ast::EchoContext;
+    let place = match ctx {
+        EchoContext::ForeignText => "foreign",
+        EchoContext::RawText(tag) => tag,
+        EchoContext::Comment(false) => "comment",
+        EchoContext::Comment(true) => "bogus comment",
+        _ => return h,
+    };
+    let plain = |t: &Type| matches!(t, Type::Int | Type::Float | Type::Bool | Type::Str | Type::Null | Type::Error);
+    if h.ty.members().iter().all(plain) {
+        return h;
+    }
+    let (ty, span) = (h.ty.clone(), h.span);
+    let place = HExpr { kind: HExprKind::Const(HConst::Str(place.into())), ty: Type::Str, span };
+    HExpr { kind: HExprKind::CallBuiltin("__html_inside".into(), vec![h, place]), ty, span }
 }
 
 impl Checker<'_> {
@@ -68,6 +95,7 @@ impl Checker<'_> {
                     let h = self.expr(e, None);
                     self.check_printable(&h, "echo");
                     self.check_html_context(&h, *ctx);
+                    let h = html_inside(h, *ctx);
                     if matches!(
                         ctx,
                         EchoContext::Attr | EchoContext::Url | EchoContext::UrlReference | EchoContext::MetaContent
@@ -406,7 +434,7 @@ impl Checker<'_> {
     pub(crate) fn set_local(&mut self, id: LocalId, declared: &Type, value_ty: Type) {
         let cx = self.cx();
         cx.flow.mark(id);
-        cx.flow.prop_narrowed.retain(|(l, _), _| *l != id);
+        cx.flow.prop_narrowed.remove_range((id, 0), (id, u32::MAX));
         if value_ty != *declared && value_ty != Type::Error && value_ty != Type::Never {
             cx.flow.narrowed.insert(id, value_ty);
         } else {

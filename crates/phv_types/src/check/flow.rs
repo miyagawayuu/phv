@@ -1,5 +1,6 @@
 //! Per-function state: locals, definite assignment and type narrowing.
 
+use super::pmap::PMap;
 use super::Checker;
 use crate::hir::{FuncKind, HLocal};
 use crate::types::{ClassId, LocalId, Type};
@@ -7,30 +8,30 @@ use phv_syntax::ast::{Stmt, StmtKind};
 use phv_syntax::Span;
 use std::collections::{HashMap, HashSet};
 
+/// What is known at one point of a function. The maps are persistent: the
+/// checker copies this at each branch and joins the copies after it, which
+/// then costs in proportion to what the branches changed, not to the number
+/// of variables in scope.
 #[derive(Clone, Default)]
 pub(crate) struct Flow {
     /// Definitely assigned at this point.
-    pub assigned: Vec<bool>,
+    assigned: PMap<LocalId, ()>,
     /// Narrower types proven by conditions or assignments.
-    pub narrowed: HashMap<LocalId, Type>,
+    pub narrowed: PMap<LocalId, Type>,
     /// Narrowed property types (`$x->p != null`), keyed by local and field
     /// slot. Cleared by any call or property assignment.
-    pub prop_narrowed: HashMap<(LocalId, u32), Type>,
+    pub prop_narrowed: PMap<(LocalId, u32), Type>,
     /// This point is unreachable (after return/throw/break/continue).
     pub dead: bool,
 }
 
 impl Flow {
     pub fn is_assigned(&self, id: LocalId) -> bool {
-        self.assigned.get(id as usize).copied().unwrap_or(false)
+        self.assigned.contains_key(&id)
     }
 
     pub fn mark(&mut self, id: LocalId) {
-        let i = id as usize;
-        if self.assigned.len() <= i {
-            self.assigned.resize(i + 1, false);
-        }
-        self.assigned[i] = true;
+        self.assigned.insert(id, ());
     }
 
     /// Joins two control-flow paths.
@@ -41,21 +42,13 @@ impl Flow {
         if b.dead {
             return a;
         }
-        let len = a.assigned.len().max(b.assigned.len());
-        let assigned = (0..len).map(|i| a.is_assigned(i as LocalId) && b.is_assigned(i as LocalId)).collect();
-        let mut narrowed = HashMap::new();
-        for (id, ta) in &a.narrowed {
-            if let Some(tb) = b.narrowed.get(id) {
-                narrowed.insert(*id, Type::union(vec![ta.clone(), tb.clone()]));
-            }
+        let join = |ta: &Type, tb: &Type| Type::union(vec![ta.clone(), tb.clone()]);
+        Flow {
+            assigned: PMap::intersect(&a.assigned, &b.assigned, |_, _| ()),
+            narrowed: PMap::intersect(&a.narrowed, &b.narrowed, join),
+            prop_narrowed: PMap::intersect(&a.prop_narrowed, &b.prop_narrowed, join),
+            dead: false,
         }
-        let mut prop_narrowed = HashMap::new();
-        for (k, ta) in &a.prop_narrowed {
-            if let Some(tb) = b.prop_narrowed.get(k) {
-                prop_narrowed.insert(*k, Type::union(vec![ta.clone(), tb.clone()]));
-            }
-        }
-        Flow { assigned, narrowed, prop_narrowed, dead: false }
     }
 }
 
@@ -160,8 +153,16 @@ impl FnCtx {
         let mut saved = Vec::new();
         for (key, ty) in facts {
             let old = match key {
-                FactKey::Local(id) => self.flow.narrowed.insert(*id, ty.clone()),
-                FactKey::Prop(id, slot) => self.flow.prop_narrowed.insert((*id, *slot), ty.clone()),
+                FactKey::Local(id) => {
+                    let old = self.flow.narrowed.get(id).cloned();
+                    self.flow.narrowed.insert(*id, ty.clone());
+                    old
+                }
+                FactKey::Prop(id, slot) => {
+                    let old = self.flow.prop_narrowed.get(&(*id, *slot)).cloned();
+                    self.flow.prop_narrowed.insert((*id, *slot), ty.clone());
+                    old
+                }
             };
             saved.push((*key, old));
         }

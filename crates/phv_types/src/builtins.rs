@@ -332,6 +332,7 @@ pub static BUILTINS: &[BuiltinSig] = &[
     internal("__mail_send", "fn(string, list<string>, string, string, Html, string): void"),
     internal("__site_request", "fn(string, string, map<string, string>, string): list<string>"),
     internal("__capture_end", "fn(): Html"),
+    internal("__html_inside", "fn(any, string): any"),
     internal("__locals_get", "fn(string): ?string"),
     internal("__request_id", "fn(): ?string"),
     internal("__exc_trace", "fn(any): string"),

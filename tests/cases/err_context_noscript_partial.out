@@ -1,0 +1,29 @@
+error: a value cannot follow `<` (or `</`, `<!`, `-`) here: it would be read with it
+ --> err_context_noscript_partial.phv:9:46
+  |
+9 | function note(string $v): void { ?><!--</<?= $v ?> --><?phv }
+  |                                              ^^
+  = note: it could start a tag, comment or end tag; put a space between them (`a < <?= $n ?>`)
+
+error: a value cannot follow `<` (or `</`, `<!`, `-`) here: it would be read with it
+  --> err_context_noscript_partial.phv:11:66
+   |
+11 |     public function show(string $v): void { ?><textarea></nos<?= $v ?></textarea><?phv }
+   |                                                                  ^^
+   = note: it could start a tag, comment or end tag; put a space between them (`a < <?= $n ?>`)
+
+error: a value cannot follow `<` (or `</`, `<!`, `-`) here: it would be read with it
+  --> err_context_noscript_partial.phv:13:52
+   |
+13 | $c = function (string $v): void { ?><p title="<<?= $v ?>"></p><?phv };
+   |                                                    ^^
+   = note: it could start a tag, comment or end tag; put a space between them (`a < <?= $n ?>`)
+
+error: a value cannot follow `<` (or `</`, `<!`, `-`) here: it would be read with it
+ --> views/noscript_value.phv.html:2:11
+  |
+2 | <!--</<?= $v ?> mk2-->
+  |           ^^
+  = note: it could start a tag, comment or end tag; put a space between them (`a < <?= $n ?>`)
+
+4 errors found

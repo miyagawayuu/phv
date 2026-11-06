@@ -242,11 +242,26 @@ pub fn opened_at(f: &File, path: &Path) -> Result<(), FsError> {
 /// administrator: false.
 #[cfg(windows)]
 pub fn on_another_machine(path: &Path) -> bool {
-    imp::on_another_machine(path)
+    imp::on_another_machine(None, path)
 }
 
 #[cfg(unix)]
 pub fn on_another_machine(_path: &Path) -> bool {
+    false
+}
+
+/// Like `on_another_machine` for a path below `base` (a project's directory,
+/// which the user chose and may be anywhere): only the part of `path` below
+/// `base` is looked at, and where its links lead. A link that leads back
+/// below `base` is fine; one that leads elsewhere is looked at whole. A path
+/// not below `base` is looked at whole.
+#[cfg(windows)]
+pub fn on_another_machine_below(base: &Path, path: &Path) -> bool {
+    imp::on_another_machine(Some(base), path)
+}
+
+#[cfg(unix)]
+pub fn on_another_machine_below(_base: &Path, _path: &Path) -> bool {
     false
 }
 
@@ -755,16 +770,23 @@ mod imp {
     const DRIVE_REMOTE: u32 = 4;
 
     /// Whether the spelling of `p` leaves the machine: a UNC path (`\\host`,
-    /// `\\?\UNC\host`), a device or object path (`\\.\`, `\\?\GLOBALROOT`), or
-    /// a path on a network drive. Nothing is opened.
+    /// `\\?\UNC\host`), a device or object path (`\\.\`, `\\?\GLOBALROOT`,
+    /// `\Device\Mup\host`), the same in the object manager's spellings that a
+    /// link's target can have (`\??\`, `\GLOBAL??\`, `\DosDevices\`), or a
+    /// path on a network drive. Nothing is opened.
     pub fn spelled_remote(p: &Path) -> bool {
         let s = p.as_os_str().to_string_lossy().replace('/', "\\").to_ascii_lowercase();
-        let rest = match s.strip_prefix(r"\\?\").or_else(|| s.strip_prefix(r"\??\")) {
+        // All of these lead to the names of the DOS devices, as `\\?\` does
+        // (found by the 15th assessment: `\GLOBAL??\UNC\host` passed as local).
+        let named = [r"\\?\", r"\??\", r"\global??\", r"\dosdevices\"];
+        let rest = match named.iter().find_map(|n| s.strip_prefix(n)) {
             Some(rest) if rest.starts_with(r"unc\") => return true,
             // A local volume by its name (mount points lead there).
             Some(rest) if rest.starts_with("volume{") => return false,
             Some(rest) => rest,
             None if s.starts_with(r"\\") => return true,
+            // `\Device\Mup\host\share`, `\Device\HarddiskVolume1\`...: devices.
+            None if s.starts_with(r"\device\") => return true,
             None => s.as_str(),
         };
         let b = rest.as_bytes();
@@ -777,20 +799,40 @@ mod imp {
         rest.len() != s.len()
     }
 
-    pub fn on_another_machine(path: &Path) -> bool {
+    /// Whether a link's `target` may leave the machine: as `spelled_remote`,
+    /// and any target that starts with a single `\` and has no drive. That is
+    /// an object manager's path (`\GLOBAL??\UNC\host\share`, `\Device\Mup\...`),
+    /// or a folder of the drive the link is on: it is refused rather than
+    /// guessed (found by the 15th assessment).
+    pub fn remote_link_target(target: &Path) -> bool {
+        let s = target.as_os_str().to_string_lossy();
+        let mut c = s.chars();
+        let rooted = matches!((c.next(), c.next()), (Some('\\' | '/'), second) if !matches!(second, Some('\\' | '/')));
+        rooted || spelled_remote(target)
+    }
+
+    /// See `super::on_another_machine_below`; `base` None: the whole path.
+    pub fn on_another_machine(base: Option<&Path>, path: &Path) -> bool {
         use std::path::Component;
         let mut p = path.to_path_buf();
         // As many links in a row as Windows follows.
         for _ in 0..63 {
-            if spelled_remote(&p) {
-                return true;
-            }
+            // The components of `base` are not looked at.
+            let known = match base {
+                Some(b) if p.starts_with(b) => b.components().count(),
+                _ => {
+                    if spelled_remote(&p) {
+                        return true;
+                    }
+                    0
+                }
+            };
             let comps: Vec<Component> = p.components().collect();
             let mut at = PathBuf::new();
             let mut next = None;
             for (i, c) in comps.iter().enumerate() {
                 at.push(c.as_os_str());
-                if !matches!(c, Component::Normal(_)) {
+                if i < known || !matches!(c, Component::Normal(_)) {
                     continue;
                 }
                 // Read without following it (FILE_FLAG_OPEN_REPARSE_POINT).
@@ -798,6 +840,9 @@ mod imp {
                     // A symbolic link or a junction: where it leads, then the rest.
                     Ok(m) if m.file_type().is_symlink() => {
                         let Ok(target) = std::fs::read_link(&at) else { return true };
+                        if remote_link_target(&target) {
+                            return true;
+                        }
                         let mut t = at.parent().unwrap_or(Path::new("")).join(target);
                         for rest in &comps[i + 1..] {
                             t.push(rest.as_os_str());
@@ -969,6 +1014,75 @@ mod tests {
         if made {
             assert!(!on_another_machine(&d.join("j/secret.txt")));
             let _ = std::fs::remove_dir(d.join("j"));
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Found by the 15th assessment: a link's target in the object manager's
+    /// spellings (one `\`, no drive) was taken for a folder of this machine.
+    #[cfg(windows)]
+    #[test]
+    fn object_manager_spellings_of_shares_are_remote() {
+        use imp::{remote_link_target, spelled_remote};
+        let remote = [
+            r"\GLOBAL??\UNC\host\share\m.phv",
+            r"\global??\unc\host\share",
+            r"\DosDevices\UNC\host\share\m.phv",
+            r"\??\UNC\host\share\m.phv",
+            r"\Device\Mup\host\share\m.phv",
+            r"\Device\LanmanRedirector\host\share",
+            r"\Device\HarddiskVolume1\x",
+            r"\GLOBAL??\GLOBALROOT\Device\Mup\host\share",
+            r"\\?\UNC\host\share",
+            r"\\host\share",
+        ];
+        for p in remote {
+            assert!(spelled_remote(Path::new(p)), "{p}");
+            assert!(remote_link_target(Path::new(p)), "{p}");
+        }
+        // A drive or a volume of this machine in the same spellings is local as
+        // a name, but a link's target spelled so is refused all the same (reading
+        // a link gives a local drive as `C:\`).
+        let drive = std::env::temp_dir().to_string_lossy()[..2].to_string();
+        for p in [format!(r"\GLOBAL??\{drive}\x"), format!(r"\DosDevices\{drive}\x"), format!(r"\??\{drive}\x")] {
+            assert!(!spelled_remote(Path::new(&p)), "{p}");
+            assert!(remote_link_target(Path::new(&p)), "{p}");
+        }
+        assert!(!spelled_remote(Path::new(r"\??\Volume{0e5ad7f2-0000-0000-0000-100000000000}\x")));
+        // Any other target with one `\` and no drive is refused as a link's target.
+        for p in [r"\Users\x\m.phv", r"\RPC Control\x", "/srv/m.phv"] {
+            assert!(remote_link_target(Path::new(p)), "{p}");
+        }
+        for p in [r"..\outside\m.phv", r"lib\m.phv", r"C:\Users\x\m.phv"] {
+            assert!(!remote_link_target(Path::new(p)), "{p}");
+        }
+        // Behind a link, without opening it (needs Developer Mode or the privilege).
+        let d = tmp("ntlink");
+        let link = d.join("data/m.phv");
+        if std::os::windows::fs::symlink_file(r"\GLOBAL??\UNC\phv-test.invalid\share\m.phv", &link).is_ok() {
+            assert!(on_another_machine(&link));
+            assert!(on_another_machine_below(&d, &link));
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `on_another_machine_below` looks only below the base, and at where links lead.
+    #[cfg(windows)]
+    #[test]
+    fn only_the_part_below_the_base_is_looked_at() {
+        let d = tmp("below");
+        // The base itself may be anywhere (a project on a share): not looked at.
+        assert!(!on_another_machine_below(
+            Path::new(r"\\phv-test.invalid\share"),
+            Path::new(r"\\phv-test.invalid\share\m.phv")
+        ));
+        assert!(on_another_machine_below(Path::new(r"C:\proj"), Path::new(r"\\phv-test.invalid\share\m.phv")));
+        assert!(!on_another_machine_below(&d, &d.join("data/x.phv")));
+        if std::os::windows::fs::symlink_file(r"\\phv-test.invalid\share\m.phv", d.join("data/m.phv")).is_ok() {
+            assert!(on_another_machine_below(&d, &d.join("data/m.phv")));
+            // A relative link that stays below the base is fine.
+            std::os::windows::fs::symlink_file(r"..\outside\secret.txt", d.join("data/ok.txt")).unwrap();
+            assert!(!on_another_machine_below(&d, &d.join("data/ok.txt")));
         }
         let _ = std::fs::remove_dir_all(&d);
     }

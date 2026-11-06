@@ -375,3 +375,69 @@ fn enum_lookups_are_timed() {
     assert!(out.contains("maximum execution time"), "{out}");
     assert!(start.elapsed() < Duration::from_secs(10), "took {:?}", start.elapsed());
 }
+
+/// A project whose page imports `n` modules of just under the limit of tokens
+/// of a file (1,000,000) each, as the 15th assessment built it.
+fn many_large_modules(name: &str, n: usize) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("phv-limits-test-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::write(dir.join("phv.toml"), "[project]\nname = \"many\"\n").unwrap();
+    let mut page = String::from("<?phv\n");
+    for i in 0..n {
+        // Six tokens a statement.
+        let body = "$a=$a+1;".repeat(166_600);
+        let text = format!("<?phv\nexport function f{i}(): int {{ $a = 0; {body} return $a; }}\n");
+        std::fs::write(dir.join(format!("lib/m{i}.phv")), text).unwrap();
+        page.push_str(&format!("import lib.m{i}.{{f{i}}};\necho f{i}();\n"));
+    }
+    std::fs::write(dir.join("page.phv"), page).unwrap();
+    dir
+}
+
+/// Found by the 15th assessment: each file had a limit of tokens, but nothing
+/// limited a program of many such files: 24 took 4.7 GB to check. A program
+/// past the budget of all its files is refused before it is checked.
+#[test]
+fn a_program_of_many_large_files_is_refused_before_it_is_checked() {
+    let dir = many_large_modules("many", 8);
+    let base = thread_allocated();
+    reset_thread_peak();
+    let e = compile(&dir, &dir.join("page.phv")).err().expect("refused");
+    let peak = (thread_peak() - base).max(0) as usize;
+    let text = e.render(false);
+    assert!(text.contains("this program is too large: its files have more than 2000000 tokens in all"), "{text}");
+    // Reported at the import that passed the budget: two such files fit, the third does not.
+    assert!(text.contains("page.phv:6:"), "{text}");
+    // Checking all eight took 1.6 to 2.2 GB.
+    assert!(peak < 600 << 20, "held {} MB", peak >> 20);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same for files of few tokens: their number and their bytes are limited too.
+#[test]
+fn a_program_of_too_many_files_or_bytes_is_refused() {
+    let dir = std::env::temp_dir().join(format!("phv-limits-test-{}-files", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::write(dir.join("phv.toml"), "[project]\nname = \"files\"\n").unwrap();
+    let mut page = String::from("<?phv\n");
+    for i in 0..2_100 {
+        std::fs::write(dir.join(format!("lib/m{i}.phv")), format!("<?phv\nexport const A{i} = {i};\n")).unwrap();
+        page.push_str(&format!("import lib.m{i}.{{A{i}}};\necho A{i};\n"));
+    }
+    std::fs::write(dir.join("page.phv"), page).unwrap();
+    let text = compile(&dir, &dir.join("page.phv")).err().expect("refused").render(false);
+    assert!(text.contains("this program is too large: it has more than 2000 files"), "{text}");
+    // Five files of a comment of almost 8 MB each: a few tokens apiece.
+    let comment = format!("<?phv\n/*{}*/\nexport const A = 1;\n", "x".repeat((8 << 20) - 64));
+    let mut page = String::from("<?phv\n");
+    for i in 0..5 {
+        std::fs::write(dir.join(format!("lib/big{i}.phv")), &comment).unwrap();
+        page.push_str(&format!("import lib.big{i}.{{A}};\necho A;\n"));
+    }
+    std::fs::write(dir.join("page.phv"), page).unwrap();
+    let text = compile(&dir, &dir.join("page.phv")).err().expect("refused").render(false);
+    assert!(text.contains("this program is too large: its files have more than 32 MB of source in all"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

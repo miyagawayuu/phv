@@ -33,6 +33,12 @@ pub fn charge_thread(bytes: usize) {
     add(bytes.min(isize::MAX as usize) as isize);
 }
 
+/// The reverse of `charge_thread`: `bytes` this thread held and hands on
+/// without freeing them (a kept SQLite connection going back to its pool).
+pub fn uncharge_thread(bytes: usize) {
+    add(-(bytes.min(isize::MAX as usize) as isize));
+}
+
 /// Bytes currently allocated (minus freed) by this thread.
 pub fn thread_allocated() -> isize {
     ALLOCATED.try_with(|a| a.get()).unwrap_or(0)

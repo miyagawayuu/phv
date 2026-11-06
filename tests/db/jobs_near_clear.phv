@@ -1,0 +1,9 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: empties the job stores of the
+// test's two namespaces.
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->execute(sql"DELETE FROM phv_jobs_f2f2f2f2f2f2f2f2");
+$db->execute(sql"DELETE FROM phv_jobs_f2f2f2f2f2f2f2f3");
+echo "cleared";

@@ -1,0 +1,5 @@
+<textarea>plain text
+</textarea>
+<textarea>
+--- runtime error ---
+Fatal error: `Html` inserted into a `<textarea>` holds its end tag `</textarea`, which would end the element there; insert a string (it is escaped) instead

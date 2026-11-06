@@ -281,6 +281,10 @@ try {
 }
 ```
 
+Nested `finally` blocks run innermost first. A `return`, `break`, `continue` or `throw` inside a `finally` block
+replaces the way out it was entered for (the value returned, or the exception): a `break` there leaves the loop even
+after a `return`, so a loop like `while (true)` with such a `break` can end.
+
 Only `Exception` and its subclasses can be thrown. A `catch` that does not need the exception leaves the variable
 out: `catch (ValueError) { ... }`.
 
@@ -634,6 +638,13 @@ import lib.legacy.render as render_legacy;
 - `std.*` are the standard modules (`std.http`, `std.db`, `std.net`, `std.async`, `std.validate`, `std.mail`,
   `std.testing`, `std.regex`, `std.time`, `std.ws`, `std.jobs`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
 - Only files inside the project and package directories can be loaded (symbolic links cannot be used to escape them).
+  A module, template, package or `phv.toml` that is a symbolic link or junction to another machine (a network share
+  such as `\\host\share`, a network drive, or an object path such as `\GLOBAL??\UNC\host\share`), or lies behind one,
+  is refused without being resolved, so its host is never contacted. The project itself may be on a share. `phv lsp`
+  does not resolve an open document behind such a link, and `phv serve` serves no page or file behind one.
+- A program (a page or script with every module, template and package it uses, std included) may have up to
+  2,000,000 tokens, 32 MB of source and 2,000 files in all. One past them is refused with "this program is too large"
+  before it is checked, at the import or template that passed the limit. Split it into smaller pages.
 
 ## 12. Templates
 
@@ -718,15 +729,21 @@ the content of `<textarea>`, `<title>`, and similar elements, `<!--` inside `<sc
 and `<math>` (where any markup, such as a tag, comment or CDATA section, in a `<script>` or `<style>` is an error; a self-closed `<svg/>`
 opens nothing, and `</math>` does not close an `<svg>`), markup inside `<noscript>` (checked as markup), a `<` written just
 before a value or block (a value there would name a tag: an error),
-and text such as `</scripts>` that looks like an end tag but is not one. The end tag of an element whose text a browser may read as raw
-text (`</textarea>`, `</noscript>`, `</xmp>`...) inside a comment or an attribute value is an error, and so is a value right after `</`
-and the start of such a name there, or any other statement there (`</<?phv f(); ?>`: a function could write the rest): where a
-browser reads the element differently (`<noscript>` with scripting on, `<foreignObject>`), that end tag would end it and turn what
-follows into markup.
+and text such as `</scripts>` that looks like an end tag but is not one. Inside `<noscript>`, `<svg>` and `<math>`, the end tag of an
+element whose text a browser may read as raw text (`</textarea>`, `</noscript>`, `</xmp>`...) inside a comment or an attribute value
+is an error, and so is a value right after `</` and the start of such a name there, or any other statement there
+(`</<?phv f(); ?>`: a function could write the rest): where a browser reads the element differently (`<noscript>` with scripting
+on, `<foreignObject>`), that end tag would end it and turn what follows into markup. `</noscript` is watched in this way in every
+template and function, inside a `<noscript>` or not, in comments, attribute values and raw text (`<script>`, `<textarea>`...): any
+template or function may be written inside a `<noscript>` (`<noscript><?= render(...) ?></noscript>`, a layout's body, a call),
+while it is checked on its own. So `<!--</<?= $v ?>-->` and `title="</nos<?phv f(); ?>"` are errors in every template.
 
 | Location | Example | Treatment |
 |---|---|---|
 | Element content, quoted attribute value | `<p><?= $s ?></p>`, `title="<?= $s ?>"` | Escaped and output. `Html` is output as it is, except that in an attribute value its `"` and `'` are written as `&quot;` and `&#039;`, so no `Html` can end the attribute |
+| Comment | `<!-- <?= $s ?> -->` | As element content, but a value may not come right after `<!--`, `<!---` or a `-` (`<!-- a-<?= $s ?>`), and the text right after a value may not start with `>`, `!>`, `->` or `-!>` (`<!-- <?= $s ?>> -->`): a value ending with `--` would end the comment there. `Html` that holds `-->` or `--!>` (in a bogus comment such as `<!x ...>`, `>`) stops the script with a runtime error. A `-` at the end of a comment's text is read with the text after a statement (`-<?phv f(); ?>->` ends the comment) |
+| Text of `<textarea>`, `<title>`, `<xmp>`, `<iframe>`, `<noembed>`, `<noframes>` | `<textarea><?= $s ?></textarea>` | As element content. `Html` that holds the element's end tag (`</textarea`) stops the script with a runtime error: it would end the element there |
+| Element content or a comment inside `<svg>` or `<math>` | `<svg><?= render("bar.phv.html") ?></svg>` | As element content. Browsers read markup there as foreign content, while a template was checked as HTML: `Html` that holds a CDATA section, the end tag of a raw-text element it did not open, or a raw-text element (`<title>`, `<style>`, `<textarea>`...) whose text holds `<` or does not end, stops the script with a runtime error (an SVG `<title>Bar 3</title>` or `<style>.a{fill:red}</style>` is fine) |
 | Unquoted attribute value | `href=<?= $u ?>` | Error (add quotes) |
 | Inside a tag (between attributes) | `<div <?= $attrs ?>>` | Error |
 | Start of a URL attribute | `href="<?= $u ?>"`, `src="<?= $u ?>"` | Only `SafeUrl` (`safe_url($u)`) and numbers. If the preceding text contains `/` `?` `#` `:`, it is not the start (`href="/post?id=<?= $id ?>"` is allowed). `href="j<?= ?>"` still counts as the start. After a `&` at the start (`href="&<?= ?>"`, `&#106;`) only numbers are allowed, `SafeUrl` included: the value would continue a character reference (`&` and `#x6a;avascript:` make `javascript:`). and so does the text after an inserted value (`safe_url("")` is empty): `href="<?= safe_url($a) ?><?= $b ?>"` is an error; check the whole URL with `safe_url($a . $b)` |
@@ -747,8 +764,11 @@ follows into markup.
   `try` began (or at the start of the function), and `return` at the start of the function: `<a href="<?phv if ($x)
   { break; } ?>...` is an error, since the output after the jump would land inside the attribute.
 - A function's body is checked as element text, wherever it is called. So a function (or closure or method) that
-  writes output may not be called where its output would land elsewhere: `<script><?phv show($s); ?></script>` or
-  `title="<?phv show($s); ?>"` stops the script with a runtime error, as does `dump()` there. Return the value (or
+  writes output may not be called where its output would land elsewhere: `<script><?phv show($s); ?></script>`,
+  `title="<?phv show($s); ?>"`, `<!-- <?phv show($s); ?> -->`, `<svg><?phv dot($p); ?></svg>` (inside `<svg>` or
+  `<math>`, where browsers read its markup as foreign content) or `<textarea><?phv show($s); ?></textarea>` (the text
+  of a raw-text element) stops the
+  script with a runtime error, as does `dump()` there. Return the value (or
   `Html`) instead and insert it with `<?= ?>`. Output into a template being rendered, or other captured output, is
   not affected.
 - When an exception thrown inside a `<script>`, a tag or an attribute is caught, what the `try` block wrote is
@@ -801,6 +821,8 @@ phv serve examples/site --port 8080
   HSTS if `secure_cookies = true` (always over HTTPS). `Cache-Control: private, no-store` on responses that use sessions or cookies, or
   that carry a CSRF token (`csrf_field()`, `csrf_token()`).
   Version information such as `Server` / `X-Powered-By` is not sent. Scripts cannot set transport headers such as `Content-Length`.
+- A page runs for any request method (it reads it from `request()->method`) but `TRACE` and `CONNECT`, which get
+  `405 Method Not Allowed` without running a page. Static files answer only `GET` and `HEAD` (others get 405).
 - In development mode, the details of compile errors and runtime errors are shown in the browser. Development mode is the default only
   when listening on `127.0.0.1` / `localhost` (it can be set explicitly with `--dev` / `--prod`). **Behind a reverse proxy, which
   reaches the server on `127.0.0.1`, use `--prod`**: otherwise visitors see the details (the server prints a note at startup).
@@ -1034,9 +1056,10 @@ session()->destroy();                 // log out
   that share a database share only its capacity.
 - Sessions that 1.1 stored for a site with a namespace in the shared table `phv_sessions` (PostgreSQL, MySQL), or
   counted under the shared keys `phv:sessions:new`, `back`, `keep`, `size` and `bytes` (Redis), are still read,
-  updated where they are and logged out, so upgrading from 1.1 signs no one out. They last at most 24 hours. Once no
-  1.1 process uses the database, that table and those keys may be removed, unless a site without a namespace uses
-  them.
+  updated where they are and logged out, so upgrading from 1.1 signs no one out. They last at most 24 hours: the sweep
+  of every site, with a namespace or not, removes them after that (and, in Redis, their counts once Redis has expired
+  them), never one that is still alive for any site. Once no 1.1 process uses the database, that table and those keys
+  may be removed, unless a site without a namespace uses them.
 - In every store, a session is saved only while it still exists (a new or regenerated id only if it is new), each as
   one atomic step: a request that finishes after a logout, in this process or another, cannot bring the session back,
   and of two requests that regenerate the same session only one gets it.
@@ -1205,6 +1228,11 @@ only its own changes are undone, and nothing is committed until the outermost on
   from zero. When a script is done, an open transaction is rolled back; a connection is closed instead of kept after a
   failed statement, after any `PRAGMA`, or when a temporary table, view, index or trigger exists. `unlink()` and
   `rename()` close the idle connections of the file first.
+- SQLite's memory counts toward the script's memory limit: the page cache of each connection (up to 2 MB), its
+  schema and statements, in-memory databases, and temporary tables, indexes and sorts, which are kept in memory
+  (never in temporary files). A kept connection counts while the script holds it. A statement that would pass the
+  limit stops with the memory limit's fatal error. A script may have at most 64 SQLite databases open at once
+  (`close()` the ones it no longer uses); the 65th `Database::open()` raises `DatabaseError`.
 
 #### PostgreSQL and MySQL
 
@@ -1666,10 +1694,12 @@ $data = json_decode($j->payload);
 
 - A job is the script `<dir>/<name>.phv`; names are lowercase letters, digits and `_`. `enqueue()` throws `ValueError`
   for a job that does not exist, a payload over 64 KB, a delay over 30 days or a key over 200 bytes, and
-  `RuntimeException` when the store holds 100,000 waiting and running jobs (10,000 or 64 MB in memory), also inside a
-  `transaction()`. It throws `RuntimeException` too in a project without `[jobs]`. It waits for the store no longer
-  than the script may still run. `dir` must be a directory of the project, not a link. The memory store also keeps at
-  most 16 MB of jobs given up and 100,000 keys of ended jobs.
+  `RuntimeException` when the store holds 100,000 waiting and running jobs or 1 GB of their payloads (10,000 or 64 MB
+  in memory), also inside a `transaction()`. It throws `RuntimeException` too in a project without `[jobs]`. It waits
+  for the store no longer than the script may still run (and 10 seconds at most), on the database server too: a
+  statement of the store, a wait for a lock included, is stopped there (PostgreSQL `statement_timeout`; MySQL
+  `innodb_lock_wait_timeout` and `KILL QUERY`). `dir` must be a directory of the project, not a link. The memory store
+  also keeps at most 16 MB of jobs given up and 100,000 keys of ended jobs.
 - `phv serve` runs `[jobs] workers` jobs at once in each process, on threads of their own: jobs never take the
   workers of pages. Each run gets a fresh VM, `time_limit` and `[security] memory_limit_mb`, and the permissions of
   phv.toml, as a page does. `request()` and `session()` are empty, and `job()` works only in a job. A job may
@@ -1679,7 +1709,10 @@ $data = json_decode($j->payload);
   given up and kept for a week (at most 10,000), with its error. A job whose process stopped while it ran is taken
   again when its lease runs out. So write jobs that may run twice without harm (or give them a `key`).
 - A `key` adds a job once: while a job of the same name and key waits, runs or was given up, and for a day after it
-  ended, `enqueue()` returns `null`.
+  ended, `enqueue()` returns `null`. A store remembers the keys of at most 100,000 ended jobs (the latest). While
+  another open transaction has added a job with the same key, `enqueue()` waits for it to end, and no longer than the
+  script may still run; such waits are kept apart from the connections that other jobs are added on and that run
+  jobs.
 - With PostgreSQL or MySQL, `enqueue()` inside a `transaction()` on the store's database adds the job with the
   transaction: only if it commits (with MySQL, only `transaction()` ties them: a `BEGIN` sent as SQL does not). Jobs
   are kept in a table `phv_jobs_<hash>` of the site's namespace (see "Sessions"; `phv_jobs` for a site without one),
@@ -1689,9 +1722,14 @@ $data = json_decode($j->payload);
   100,000 hold for transactions running at the same time too: `enqueue()` in a transaction takes a lock of the site's
   jobs that the transaction holds until it ends (PostgreSQL an advisory lock, MySQL a row of a table
   `phv_jobs_lock`), so transactions that add jobs to the same site wait for one another, and so does an `enqueue()`
-  outside a transaction when the queue is within 10,000 jobs of the cap. Farther from the cap it does not wait: a
-  transaction that adds more than 10,000 jobs while others are added outside can still pass the cap by its jobs
-  beyond 10,000. With `store = "memory"` the jobs live in the server process and are lost when it stops.
+  outside a transaction when the queue is within 10,000 jobs (or 256 MB) of the caps. Farther from the caps it does
+  not wait: a transaction that adds more than 10,000 jobs while others are added outside can still pass the cap by its
+  jobs beyond 10,000. Near the caps, a transaction that has added a job holds up every other job added to the site
+  until it ends, so call `enqueue()` last in a transaction. The store is counted when a transaction first adds to it,
+  and outside transactions once a second; the count is kept in a table `phv_jobs_counts`. A jobs table made before
+  1.1.1 gets a column `size` (the bytes of each payload) when a process first uses it; if another transaction holds
+  the table then, the process tries again a minute later, and until then the bytes of its jobs are not counted. With
+  `store = "memory"` the jobs live in the server process and are lost when it stops.
 - **Schedules**: each `[[schedule]]` adds its job (with an empty payload) in the minutes its `cron` expression
   matches, in `timezone`. Fields are `*`, numbers, ranges `a-b`, steps `*/n` and lists `a,b`; days of the week are 0
   to 7 (Sunday is 0 and 7); when the day of the month and the day of the week are both given, either one matches. Each
@@ -2306,6 +2344,10 @@ It then runs the type checker and shows the places that need manual work, such a
      objects has doubled since its last run (first at 4,096), and it looks at no more than 16 values per object made
      since then. It also runs when the memory in use passes three quarters of the limit, and once more before a script
      is stopped at the limit, if objects were made since its last run (still within the 16 values per object made).
+     The collector's own memory (about 120 bytes for each object it looks at) counts against the memory limit: when
+     a walk of every object would not fit in what is left, it walks the newest objects that fit (those made since its
+     last run, where new cycles are; older ones are kept until a walk takes them all), and a walk that outgrows that
+     room stops and frees nothing. Before a script is stopped at the limit, it may use an eighth of the limit more.
      Native code cannot run it: when native code runs out of memory and the collector frees cycles made before the
      call, the interpreter runs the call again. Objects that are still reachable from a variable, a list, a map, a
      closure or another live object are never freed. When a run ends, the fields of every object left are cleared. Objects of a class whose properties all
@@ -2346,17 +2388,23 @@ It then runs the type checker and shows the places that need manual work, such a
 |---|---|---|
 | Execution time | `serve`: 30 seconds (`--time-limit`), `run`: none | Fatal error (cannot be caught) |
 | Memory | 128 MB (`[security] memory_limit_mb`) | Fatal error |
+| SQLite databases a script has open at once | 64 | `DatabaseError` |
 | Call depth | 10,000 (callbacks of builtins inside each other: 200, each only while 512 KB of the thread's stack is left) | Fatal error |
 | Request body | 8 MB | 413 |
 | Scripts running at once (`serve`) | two per CPU, at least 8 (`[server] workers`) | waits up to 10 seconds, then 503 |
 | Jobs running at once (`serve`, `phv jobs run`) | 2 per process (`[jobs] workers`), each with `[jobs] time_limit` (300 s) and `memory_limit_mb`, besides the scripts of pages | the job waits in the store |
-| Jobs waiting and running in the store | 100,000 (memory: 10,000 or 64 MB); a payload 64 KB | `enqueue()` throws |
+| Jobs waiting and running in the store | 100,000 or 1 GB of payloads (memory: 10,000 or 64 MB); a payload 64 KB | `enqueue()` throws |
+| Keys of ended jobs a store remembers | 100,000 (the latest), each a day | the oldest are forgotten |
 | Output waiting to be sent (`serve`) | `workers` × `memory_limit_mb`, a quarter of it for event streams | 503; an event stream is ended or skips the event |
 | Request body bytes past the first 64 KB, received or held (`serve`) | `workers` × 8 MB | waits up to 10 seconds, then 503 |
 | Source file (module, template, script) | 8 MB | Compile error (`phv lsp`: a larger open document is not checked or formatted, and renames are refused while it is open) |
 | Tokens of one source file (the code inside its strings included) | 1,000,000 | Compile error (the file is not parsed) |
+| All the files of one program (a page or script with what it imports and renders, std included) | 2,000,000 tokens, 32 MB of source, 2,000 files | Compile error (the program is not checked; `phv lsp` keeps no analysis of a program of more than 250,000 tokens between requests) |
 | Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits) |
+| Levels of classes and interfaces above a class (`extends`, `implements`) | 256 | Compile error |
+| Ancestors, interfaces and the type arguments given to them, all classes together | 2,000,000 (a type argument given to an ancestor: 10,000 type nodes) | Compile error (each class lists all of its ancestors) |
 | Variables and temporary values of one function | 65,534 | Compile error (split the function) |
+| Instructions of one function | 8,388,608 | Compile error (split the function) |
 | Properties of one class (inherited ones included) | 65,535 | Compile error |
 | A string built by a constant expression | 1 MiB (16 MiB for all of a program's) | Compile error |
 | Type aliases resolved inside each other | 64 | Compile error |
@@ -2366,8 +2414,9 @@ It then runs the type checker and shows the places that need manual work, such a
 
 `unsafe` is used only in the allocator that counts memory usage (`phv_vm/src/alloc.rs`), in the JIT
 (`phv_jit`, for calling generated code, and the helpers it calls in `phv_vm/src/jit.rs`), in asking the OS where a thread's
-stack ends (`phv_vm/src/stack.rs`), in calls to OS file APIs (`phv_std/src/safefs.rs`) and in the SQLite VFS
-that checks journal files (`phv_std/src/db/vfs.rs`).
+stack ends (`phv_vm/src/stack.rs`), in calls to OS file APIs (`phv_std/src/safefs.rs`), in the SQLite VFS
+that checks journal files (`phv_std/src/db/vfs.rs`) and in the allocator SQLite uses, which counts its memory
+(`phv_std/src/db/mem.rs`).
 
 ## 18. Compatibility and versions
 

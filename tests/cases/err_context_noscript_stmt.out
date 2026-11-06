@@ -1,0 +1,29 @@
+error: code right after `<` or `</` in a comment, an attribute value or raw text, where it could complete `</noscript>` (or, inside `<noscript>`, `<svg>` or `<math>`, another raw-text element's end tag)
+ --> err_context_noscript_stmt.phv:8:45
+  |
+8 | function call(): void { ?><p title="</<?phv rest(); ?>"></p><?phv }
+  |                                             ^^^^
+  = note: a browser would read that end tag there (this template or function may be written inside a `<noscript>`); put a space after `<`, or move the code
+
+error: code right after `<` or `</` in a comment, an attribute value or raw text, where it could complete `</noscript>` (or, inside `<noscript>`, `<svg>` or `<math>`, another raw-text element's end tag)
+ --> err_context_noscript_stmt.phv:9:42
+  |
+9 | $c = function (): void { ?><!--</no<?phv rest(); ?>--><?phv };
+  |                                          ^^^^
+  = note: a browser would read that end tag there (this template or function may be written inside a `<noscript>`); put a space after `<`, or move the code
+
+error: code right after `<` or `</` in a comment, an attribute value or raw text, where it could complete `</noscript>` (or, inside `<noscript>`, `<svg>` or `<math>`, another raw-text element's end tag)
+  --> err_context_noscript_stmt.phv:14:19
+   |
+14 | <textarea></<?phv rest(); ?></textarea>
+   |                   ^^^^
+   = note: a browser would read that end tag there (this template or function may be written inside a `<noscript>`); put a space after `<`, or move the code
+
+error: code right after `<` or `</` in a comment, an attribute value or raw text, where it could complete `</noscript>` (or, inside `<noscript>`, `<svg>` or `<math>`, another raw-text element's end tag)
+ --> views/noscript_stmt.phv.html:1:19
+  |
+1 | <a title="</<?phv $n = count([1]); ?>">x</a>
+  |                   ^^
+  = note: a browser would read that end tag there (this template or function may be written inside a `<noscript>`); put a space after `<`, or move the code
+
+4 errors found

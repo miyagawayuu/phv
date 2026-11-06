@@ -1,0 +1,20 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: 20 enqueue()s outside a
+// transaction, then 20 in one. Prints the two times in milliseconds.
+import std.db.Database;
+import std.jobs.enqueue;
+
+$db = Database::connect("main");
+$t = microtime();
+for ($i = 0; $i < 20; $i++) {
+    enqueue("burst", "b");
+}
+$plain = round((microtime() - $t) * 1000);
+$t = microtime();
+$db->transaction(function (): void {
+    for ($i = 0; $i < 20; $i++) {
+        enqueue("burst", "b");
+    }
+});
+$tx = round((microtime() - $t) * 1000);
+echo $plain, " ", $tx;

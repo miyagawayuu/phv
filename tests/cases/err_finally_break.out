@@ -1,0 +1,7 @@
+error: `f` must return a value of type `int` on every path
+ --> err_finally_break.phv:4:10
+  |
+4 | function f(): int {
+  |          ^
+
+1 error found

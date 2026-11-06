@@ -102,9 +102,15 @@ pub fn reset(key: &str) {
 /// allowed and the seconds until the window ends. When the Redis server cannot
 /// be reached, the error says why.
 /// A key in the shared store: in this site's namespace when it has one.
+/// A namespace (32 hex digits) is never empty and has no NUL, so a key in one
+/// starts with a character other than NUL and has one. A key without a
+/// namespace stays as it is unless it has a NUL: then it starts with one, so
+/// it cannot be any site's key (found by the 1.1.1 audit: `"{ns}\0login:x"`
+/// from a site without a namespace counted as that site's `login:x`).
 fn shared_key(host: &phv_vm::Host, key: &str) -> String {
     match &host.store_namespace {
         Some(ns) => format!("{ns}\0{key}"),
+        None if key.contains('\0') => format!("\0{key}"),
         None => key.to_string(),
     }
 }
@@ -196,6 +202,12 @@ mod tests {
         assert_eq!(shared_key(&plain, "login:x"), "login:x");
         assert_ne!(shared_key(&a, "login:x"), shared_key(&b, "login:x"));
         assert_ne!(shared_key(&a, "login:x"), "login:x");
+        // A site without a namespace cannot name another site's key (1.1.1 audit).
+        assert_ne!(shared_key(&plain, "a\0login:x"), shared_key(&a, "login:x"));
+        let ns_a = a.store_namespace.clone().unwrap();
+        assert_ne!(shared_key(&plain, &format!("{ns_a}\0login:x")), shared_key(&a, "login:x"));
+        // Keys without a NUL are unchanged.
+        assert_eq!(shared_key(&plain, "login:a\u{1}b"), "login:a\u{1}b");
     }
 
     /// A store that cannot be reached is not asked again for a few seconds:

@@ -338,6 +338,21 @@ const ANALYSIS_AGE: std::time::Duration = std::time::Duration::from_secs(2);
 /// An analysis kept for later requests: the generation and time it was made.
 type Kept = (u64, std::time::Instant, std::rc::Rc<Analysis>);
 
+/// The analysis of a program with more tokens than this (all its files
+/// together, see `phv_driver::MAX_PROGRAM_TOKENS`) is not kept for later
+/// requests; the examples of the repository have about 30,000.
+const KEEP_TOKENS: usize = 250_000;
+
+/// The canonical path of open document `p`. A document behind a link to
+/// another machine is not resolved (that would contact the host; found by the
+/// 15th assessment), and its text is not used.
+fn canonical_doc(p: &Path) -> Option<PathBuf> {
+    if phv_std::safefs::on_another_machine_below(&find_root(p), p) {
+        return None;
+    }
+    p.canonicalize().ok()
+}
+
 struct Server {
     open: HashMap<PathBuf, String>,
     /// The canonical path of each open document, found when it was opened.
@@ -390,7 +405,7 @@ impl Server {
         self.open
             .iter()
             .filter_map(|(p, t)| {
-                let c = self.canonical.get(p).cloned().or_else(|| p.canonicalize().ok())?;
+                let c = self.canonical.get(p).cloned().or_else(|| canonical_doc(p))?;
                 Some((c, t.clone()))
             })
             .collect()
@@ -406,14 +421,19 @@ impl Server {
         }
         let text = self.open.get(path).cloned().unwrap_or_default();
         let a = std::rc::Rc::new(self.analyze_text(path, text));
-        self.analyses.borrow_mut().insert(path.to_path_buf(), (self.generation, std::time::Instant::now(), a.clone()));
+        // The analysis of a large program is not kept after the requests that
+        // need it (found by the 15th assessment: 1.95 GB held between edits).
+        if a.tokens <= KEEP_TOKENS {
+            let kept = (self.generation, std::time::Instant::now(), a.clone());
+            self.analyses.borrow_mut().insert(path.to_path_buf(), kept);
+        }
         a
     }
 
     /// Analyzes `path` as if its text were `text`.
     fn analyze_text(&self, path: &Path, text: String) -> Analysis {
         let mut overlay = self.overlay();
-        if let Ok(c) = path.canonicalize() {
+        if let Some(c) = canonical_doc(path) {
             overlay.insert(c, text);
         }
         analyze_for_editor(&find_root(path), path, overlay)
@@ -680,7 +700,7 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                         doc_path(params).filter(|p| server.open.contains_key(p) || server.open.len() < MAX_OPEN)
                     {
                         let text = params["textDocument"]["text"].as_str().unwrap_or("");
-                        if let Ok(c) = p.canonicalize() {
+                        if let Some(c) = canonical_doc(&p) {
                             server.canonical.insert(p.clone(), c);
                         }
                         let text = server.admit(&p, text);
@@ -1354,5 +1374,59 @@ mod tests {
         // Its 6 million tokens alone would take about 300 MB, and their tree far more.
         assert!(peak < 128 << 20, "held {} MB", peak >> 20);
         let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    /// Found by the 15th assessment: a page that imports many modules of just
+    /// under the limit of tokens took 4.73 GB to analyse, and 1.95 GB stayed
+    /// kept between edits. Past the budget of a program it is not checked, and
+    /// the analysis of a large program is not kept.
+    #[test]
+    fn programs_past_the_budget_are_not_checked_or_kept() {
+        use phv_vm::alloc::{reset_thread_peak, thread_allocated, thread_peak};
+        let p = Project::new("program-budget");
+        let mut page = String::from("<?phv\n");
+        for i in 0..8 {
+            let body = "$a=$a+1;".repeat(166_600);
+            let text = format!("<?phv\nexport function f{i}(): int {{ $a = 0; {body} return $a; }}\n");
+            std::fs::write(p.dir.join(format!("lib/m{i}.phv")), text).unwrap();
+            page.push_str(&format!("import lib.m{i}.{{f{i}}};\necho f{i}();\n"));
+        }
+        let (mut server, path, _, _) = p.open("page.phv", "|");
+        server.open.insert(path.clone(), page);
+        let base = thread_allocated();
+        reset_thread_peak();
+        let a = server.analysis(&path);
+        let peak = (thread_peak() - base).max(0) as usize;
+        let messages: Vec<&str> = a.diags.iter().map(|d| d.message.as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("this program is too large")), "{messages:?}");
+        assert!(peak < 600 << 20, "held {} MB", peak >> 20);
+        assert!(server.analyses.borrow().is_empty());
+        drop(a);
+        // A small program's analysis is kept for the next requests.
+        server.open.insert(path.clone(), "<?phv\necho 1;\n".into());
+        server.changed();
+        let _ = server.analysis(&path);
+        assert_eq!(server.analyses.borrow().len(), 1);
+    }
+
+    /// Found by the 15th assessment: an open document was resolved (which
+    /// opens a link's target) before anything looked at where it leads.
+    /// Making a link needs Developer Mode or the privilege: skipped without.
+    #[cfg(windows)]
+    #[test]
+    fn documents_behind_a_link_to_a_share_are_not_resolved() {
+        let p = Project::new("remote-doc");
+        let link = p.dir.join("far.phv");
+        if std::os::windows::fs::symlink_file(r"\\phv-test.invalid\share\far.phv", &link).is_err() {
+            return;
+        }
+        assert_eq!(canonical_doc(&link), None);
+        assert!(canonical_doc(&p.dir.join("page.phv")).is_some());
+        let (mut server, _, _, _) = p.open("page.phv", "|");
+        server.open.insert(link.clone(), "<?phv\necho 1;\n".into());
+        let start = std::time::Instant::now();
+        let a = server.analysis(&link);
+        assert!(a.messages.iter().any(|m| m.contains("on another machine")), "{:?}", a.messages);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
     }
 }

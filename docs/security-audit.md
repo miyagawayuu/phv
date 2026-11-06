@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates fourteen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, and §24 an assessment of the whole implementation before 1.1.0.
+This report consolidates fifteen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, §24 an assessment of the whole implementation before 1.1.0, and §25 an assessment of the whole implementation before 1.1.1.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§24: 2026-11-06)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§25: 2026-11-06)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -1444,3 +1444,156 @@ namespace in `databases` (phv_driver); `server_variables_are_hidden_from_scripts
 (the configuration); `namespaces_keep_sites_apart` (rate limits); `what_the_memory_store_keeps_is_bounded` (jobs); and
 `phv migrate -o` in the junction test (phv_cli). All tests pass on Windows, with PostgreSQL 17, MySQL 8.4 and Redis 7,
 and with clippy (`-D warnings`) and rustfmt.
+
+## 25. Fifteenth Assessment: the Whole Implementation (before 1.1.1)
+
+Date: 2026-11-06. Scope: everything at 4542e43. That is 1.1.0 plus the work of 1.1.1 on the residual risks of §22–§24,
+listed under "The residual risks of §22–§24" below. Every earlier fix was attacked again. Six reviewers each took one
+area: the web server; the standard library and the bus; the compiler, the type checker, the VM and the JIT; templates,
+the website and the examples; the tools and their supply chain; and background jobs. They attacked a release build
+locally, and Unix-only code in a Linux container. Each finding was confirmed with a PoC, and the main session ran most
+of them again before any fix. Five groups then fixed the findings, each with its regression tests. One of those groups
+found two more problems of the same kinds as it worked (R18-2, and the SVG and `<textarea>` cases of R18-1), and fixed
+them too.
+
+Three reviewers were stopped part of the way through by safety checks: templates and the website, the tools, and the
+compiler and VM. The main session then covered what they had not reached, in a smaller form with harmless marker values:
+- the website's headers and scripts, and the demo served locally;
+- `phv install`, `phv new`, `phv migrate -o` and `phv jobs retry` with hostile arguments;
+- a tampered bytecode cache;
+- integer and float edge cases in code the JIT compiles.
+
+These checks found nothing beyond a cosmetic `number_format(-INF)`, which is fixed.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| Critical | 0 | — |
+| High | 0 | — |
+| Medium | 8 | Fixed |
+| Low | 5 | Fixed |
+| Info | 7 | Fixed |
+
+### The residual risks of §22–§24 (fixed in 1.1.1)
+
+| Residual risk | Fix |
+|---|---|
+| Event streams that do not read made readers miss events until they were dropped (R17-28), and kept 2 MB each for hours by reading a little at a time | Each connection can be aborted. A stream that ends holding output loses its connection, and one that cannot send what it holds within 30 seconds is ended. A stream that has held output for over a second is pushed out to make room for readers. The events' budget is a quarter of the output cap, and pages check both budgets. 80 streams that do not read held 64 MB that was never given back; now it returns to 0. A reader misses events for at most about a second |
+| Concurrent transactions passed the job cap (R17-29: 111,000 with a cap of 100,000) | Adding to a store near its cap takes a lock: 100,000 on PostgreSQL, 99,000 on MySQL |
+| Sites on one session database shared its limits and its shortest `session_ttl` (R17-30), and on Redis its bookkeeping keys | Each namespace has a table (`phv_sessions_<ns>`) and Redis keys of its own. Sessions stored by 1.1 are still read, so the upgrade signs no one out |
+| A `</` hidden in a comment or attribute could still end an element early when a statement followed (§23) | A compile error |
+| `==` on deep values used about twice the memory limit | The comparison reserves its memory first. The peak went from 214–241 MB to 113–138 MB under 128 MB |
+| The JIT's stack limit was measured from where it was entered | It is measured from the real end of the thread's stack |
+| A static file on Unix was opened by name and checked by two more lookups, and a FIFO put in its place stopped a thread | Opened one directory at a time from `public/`, without following links and without blocking |
+| TLS files could be read through a link to a share or from a network drive | Refused |
+| The demo's image and release archive were fetched by name | Pinned by digest and SHA-256. Dependabot proposes only new digests of Ubuntu 24.04 |
+| Cycles were collected only every so many allocations | Also at 75% of the memory limit and before a memory error |
+| One 8 MB source took about 1 GB to parse | At most 1,000,000 tokens per file. The peak went from 1,068 MB to 81 MB |
+| A statement prepared again inside a transaction could abort it (PostgreSQL) | It commits |
+| A SQLite connection set aside was closed up to 45 seconds later | 30 seconds |
+| A bus message sent again after a reconnect arrived twice; refusals for the clock were silent | Dropped; counted (`phv_publish_total{result="clock"}`), with one warning per sender |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R18-1 | The rule against a hidden `</` worked within one file only. A partial with `<!--</<?= $v ?>`, rendered inside `<noscript>`, passed the check, and the visitor's value came right after a literal `</` that browsers end the element with. The same held for functions, methods and closures. HTML inserted inside `<svg>` or `<math>`, where `<textarea>` text is live markup, could hold a working `javascript:` link, and HTML inserted into `<textarea>` or `<title>` could end the element | `</noscript` is watched in every template and function. HTML inserted inside SVG, MathML, raw-text elements and comments is checked when it is inserted. Functions that write output there stop the page |
+| R18-2 | A value ending in `--` before a literal `>` ended an HTML comment that the check thought was still open: `<!-- <?= $v ?>> <a title="-->" href=<?= $u ?>> -->` with `$v = "--"` gave a live `javascript:` link | Text right after a value in a comment may not start with `>`, `!>`, `->` or `-!>`. A comment ending is read across statements. HTML inserted into a comment may not end it |
+| R18-3 | Each `finally` was compiled twice, and again at each `return`, `break` and `continue`: 1 KB of nested `try`/`finally` took 7.7 GB and 22 seconds to compile, in `phv check` and the editor too | Each `finally` is compiled once. An exit leaving several `try` blocks pops them in one step. At most 8,388,608 instructions per function |
+| R18-4 | Each class kept a copy of all its ancestors: a chain of 16,000 empty classes took 1.6 GB and wrote a 254 MB cache entry, and 75,000 passed 19 GB. Type arguments of ancestors could double at each level (`class C<T> extends B<fn(T): T>`: 23 lines, 1.7 GB) | At most 256 levels of `extends` and `implements`, 2,000,000 entries for all classes together, and 10,000 nodes per inherited type argument |
+| R18-5 | The type checker copied and merged every narrowed variable at each branch: 8,000 variables × 16,000 branches took 27 seconds, and 20,000 × 40,000 over 120 | Narrowing is kept in a shared tree that a branch copies in one step. A join costs what the branches changed |
+| R18-6 | Each file was limited, but not a program: 24 imported files just under the token limit took 4.7 GB in `phv check` and in the editor, which held 1.9 GB between edits (also in VS Code's Restricted Mode) | A program may have 2,000,000 tokens, 32 MB of source and 2,000 files. The editor keeps no analysis of more than 250,000 tokens |
+| R18-7 | A script could open SQLite databases without limit, each with a 2 MB cache that no limit counted: 400 opens took 602 MB under 16 MB, and a few such pages filled SQLite's 512 MB for the whole process | SQLite allocates through the program's allocator, so its caches, schemas, statements, temporary tables and sorts count against the script's memory. At most 64 databases are open per script |
+| R18-8 | `enqueue()` with a key that another open transaction had added waited for that transaction: 40 seconds under a 2-second limit on MySQL. On PostgreSQL the page returned, but the wait went on in the database (20 backends after 5 rounds). Four such waits took every jobs connection of the process | Every statement of the job and session stores ends at the caller's deadline (`statement_timeout`, or the lock timeouts and `KILL QUERY` on MySQL). A connection that timed out is not reused. Keyed adds have connections of their own and do not queue for the key on MySQL |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R18-9 | The cycle collector's own memory was not counted: 321 MB under 128 MB | It works within the memory left. When even part of the walk does not fit, it frees nothing |
+| R18-10 | Temporary tables and large sorts were written to disk, even for `:memory:`, which needs no permission: 2.4 GB of disk in 8 seconds under 16 MB | They are kept in memory and counted |
+| R18-11 | Near the job cap, each `enqueue()` counted the table twice and one at a time, and each transaction counted it again: 5–10 times slower, and one open transaction held up every add | A transaction counts once. Near the cap a count kept in the store is used, recounted at most once a second |
+| R18-12 | Sources were resolved before the check that they lie in the project: on Windows, a link to `\\host\share\m.phv` made `phv check` and the editor connect to that host | Links to other machines are refused unresolved: modules, templates, packages, `phv.toml`, cache entries, the editor's documents, and pages and static files |
+| R18-13 | Found in the fixes. A `continue` in a `finally` went to the wrong loop. A `break` in a `finally` of an `int` function passed the check, and the function then returned null | Compiled correctly; "must return a value" |
+
+### Info
+
+| # | Finding | Fix |
+|---|---|---|
+| R18-14 | `TRACE` ran the page (without echoing the request) | 405, with `CONNECT` |
+| R18-15 | Sessions stored by 1.1 stayed in Redis's shared bookkeeping after a site had a namespace | A site's sweep removes those that Redis has expired |
+| R18-16 | The SQL and Redis job stores capped the number of jobs but not their bytes (6.4 GB of 64 KB payloads); keys of ended jobs were kept a day without a cap; MySQL swept them in one `DELETE` | At most 1 GB of payloads and 100,000 kept keys; sweeps take 10,000 rows at a time |
+| R18-17 | Link targets in the NT namespace (`\GLOBAL??\UNC\`, `\Device\Mup\`) were taken as local | Taken as remote, as any target starting with a single `\` |
+| R18-18 | An error inside a Redis array reply left the rest unread on a pooled connection. A rate-limit key with a NUL character could match another site's key | The whole reply is read. Such keys get a prefix of their own |
+| R18-19 | A second `:memory:` database could not be opened. A stale cache entry of another binary was decoded whole (1.9 GB) | Each in-memory database has the whole limit (counted). The entry's stamp is read first |
+| R18-20 | `number_format(-INF)` printed `inf` | `-inf` |
+
+### Residual Risks
+
+- A program just under the per-program budget, such as two files of 1,000,000 tokens, can take about 415 MB to check.
+- The type checker reads a loop or `try` body again for each enclosing one. This is bounded by the nesting limit of 500
+  (5 seconds for 200 levels around 100,000 assignments).
+- When even part of its walk does not fit in the memory left, the cycle collector leaves the cycles of older objects
+  until the script ends. Its last try before a memory error can pass the limit by an eighth of it.
+- SQLite's memory for a kept connection is an estimate, off by a few KB. Several workers with large limits can still
+  reach SQLite's 512 MB for the whole process (it starts freeing caches at 384 MB).
+- `enqueue()` with a key inside the script's own MySQL transaction can wait for another transaction's key, as long as the
+  script may run. Near the cap, an add can be refused for up to a second while there is room. A transaction that adds
+  more than 10,000 jobs while others add can pass the cap by that many.
+- Inside SVG, a value that completes the end tag of a raw-text element other than `<noscript>` is caught when the page
+  runs, not by `phv check`. A value right after `<!--` needs a space between them.
+- A directory link to a share on the way to a document the editor opens is still looked at (the editor already
+  contacted the host to open the file).
+- §24's residual risks remain, apart from those fixed above.
+
+### Verification
+
+The PoCs were run again against the fixed build (before → after):
+- the partial in `<noscript>` is refused at check (it printed `<noscript><!--</mk1 mk2-->`). The comment ended by `--`
+  is refused at check (it printed a live link);
+- nested `finally`: 1.75 GB and 3.7 seconds → 2 MB and 0.02 (7.7 GB → 2 MB at 24 levels);
+- class chains: 16,000 classes 1.6 GB and 8.2 seconds → 52 MB and 0.19, refused for depth. 75,000 → 198 MB;
+- narrowing: 30 seconds → 0.22, and over 120 → 0.5;
+- 24 large modules: 4.7 GB → 314 MB, refused. In the editor, 4.7 GB peak and 1.9 GB held → 314 MB and 7–9 MB, with
+  diagnostics in 0.5 seconds (11);
+- SQLite: 400 opens 572 MB → a memory error at 16 MB (28 MB peak). Six pages at once: 567 MB, with other pages refused
+  → 119 MB, each stopped at its own limit. A 200 MB temporary table and a 100 MB `ORDER BY` stop at the limit instead
+  of using disk;
+- a keyed `enqueue()` behind an open transaction: MySQL 40 seconds → 2.1, with an error the page can catch. PostgreSQL
+  leaves 0 waits in the database (20). Plain adds meanwhile answer in 0.02 seconds;
+- near the cap, adds are 2.2–2.3 times slower than far from it (5.6–8). In a transaction there is no difference (5–6.3);
+- the cycle collector: 306 MB → 195 MB (the allocator's own floor at 128 MB counted);
+- a link to `\\localhost\C$` is refused without a connection. A TLS file behind a junction to `\GLOBAL??\UNC\…` is refused;
+- `TRACE` answers 405.
+
+All 203 templates in the repository (tests, examples, website, standard library) check as before. The differential
+check of §24 (854 templates against html5lib) gave the same results with the new rules. Ordinary programs compile and
+run at the same speed: 120 files checked, ratio 1.008; 89 run, ratio 0.994. A loop that does almost nothing but pass
+through `finally` is about 13% slower.
+
+Regression tests:
+- **phv_syntax:** `hides_noscript_outside_one`, `values_and_statements_cannot_end_a_comment`.
+- **tests/cases:** the cases `err_context_noscript_partial`, `err_context_noscript_stmt`, `err_html_in_svg`,
+  `err_html_in_textarea`, `err_output_in_svg`, `err_comment_end`, `err_comment_value`, `err_html_in_comment`,
+  `err_output_in_comment`, `err_finally_break`, `contexts_inside`, `comment_values` and `finally_nested`.
+- **phv_types:** `pmap::agrees_with_a_btreemap`, `pmap::joins_follow_the_changes`.
+- **phv_driver (compile_cost):** `nested_finally_blocks_are_compiled_once`, `deep_exits_are_short`,
+  `class_chains_are_limited`, `type_arguments_of_ancestors_stay_small`, `narrowing_costs_what_branches_change`.
+- **phv_driver (limits):** `a_program_of_many_large_files_is_refused_before_it_is_checked`,
+  `a_program_of_too_many_files_or_bytes_is_refused`.
+- **phv_driver (other):** `sources_behind_a_link_to_a_share_are_refused_unresolved`;
+  `the_collector_stays_within_the_memory_limit` (cycles); `page_caches_count_against_the_memory_limit`,
+  `a_script_holds_at_most_64_databases`, `temporary_tables_count_against_the_memory_limit` and
+  `sorts_count_against_the_memory_limit` (sqlite_limits); `keyed_jobs_wait_no_longer_than_the_time_limit` and
+  `adding_jobs_near_the_cap_stays_cheap` (databases).
+- **phv_cli (the editor):** `programs_past_the_budget_are_not_checked_or_kept`,
+  `documents_behind_a_link_to_a_share_are_not_resolved`.
+- **phv_std:** `object_manager_spellings_of_shares_are_remote`, `only_the_part_below_the_base_is_looked_at`,
+  `an_error_in_an_array_reply_reads_the_whole_reply`, `job_stores_cap_the_bytes_of_payloads`,
+  `a_jobs_table_of_1_1_gets_its_size_column_later_when_held` and `sites_with_a_namespace_sweep_what_1_1_left`; the
+  rate-limit keys in `namespaces_keep_sites_apart`.
+- **phv_server:** `trace_and_connect_are_refused`.
+
+All tests pass on Windows and on Linux, with PostgreSQL 17, MySQL 8.4 and Redis 7, and with clippy (`-D warnings`) and
+rustfmt.

@@ -1,0 +1,29 @@
+error: text right after a value in a comment starts with `>`, `!>`, `->` or `-!>`
+  --> err_comment_end.phv:10:15
+   |
+10 | <!-- <?= $v ?>> <a title="-->" href="<?= safe_url($u) ?>">x</a> -->
+   |               ^
+   = note: a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; put a space after the value
+
+error: text right after a value in a comment starts with `>`, `!>`, `->` or `-!>`
+  --> err_comment_end.phv:11:15
+   |
+11 | <!-- <?= $v ?>!> -->
+   |               ^
+   = note: a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; put a space after the value
+
+error: text right after a value in a comment starts with `>`, `!>`, `->` or `-!>`
+  --> err_comment_end.phv:12:16
+   |
+12 | <!-- a<?= $v ?>-> -->
+   |                ^
+   = note: a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; put a space after the value
+
+error: text right after a value in a comment starts with `>`, `!>`, `->` or `-!>`
+  --> err_comment_end.phv:13:51
+   |
+13 | <!-- <?= $v ?><?phv if ($u != "") { ?> x<?phv } ?>> -->
+   |                                                   ^
+   = note: a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; put a space after the value
+
+4 errors found

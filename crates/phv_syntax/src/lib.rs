@@ -11,5 +11,5 @@ pub mod span;
 pub mod token;
 
 pub use diag::{Diagnostic, Severity};
-pub use parser::{normalize_template_path, parse_module, parse_type_str};
+pub use parser::{normalize_template_path, parse_module, parse_module_within, parse_type_str};
 pub use span::{SourceFile, SourceMap, Span};

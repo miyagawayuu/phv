@@ -5,9 +5,26 @@ use crate::span::Span;
 use crate::token::{StrPart, Tok, Token};
 
 pub fn parse_module(src: &str, file: u32, is_template: bool) -> (Module, Vec<Diagnostic>) {
+    let (module, diags, _) = parse_module_within(src, file, is_template, MAX_TOKENS);
+    (module, diags)
+}
+
+/// Like `parse_module`, reading at most `limit` tokens (at most `MAX_TOKENS`;
+/// those of the code in strings included), and also returning how many the
+/// file has: `None` when it has more, and then nothing of it is parsed. Past
+/// a `limit` below `MAX_TOKENS` no error is reported: the caller, which keeps
+/// a budget for a whole program, reports it.
+pub fn parse_module_within(
+    src: &str,
+    file: u32,
+    is_template: bool,
+    limit: usize,
+) -> (Module, Vec<Diagnostic>, Option<usize>) {
+    let limit = limit.min(MAX_TOKENS);
     let mode = if is_template { Mode::Html } else { Mode::Code };
-    let (toks, mut diags, too_large) = lex_counted(src, file, 0, mode);
+    let (toks, mut diags, too_large) = lex_counted(src, file, 0, mode, limit);
     let mut p = Parser::new(toks, file, is_template);
+    p.limit = limit;
     // Past the limit of tokens, nothing of the file is parsed: it is refused.
     p.tokens = p.toks.len() - 1;
     p.halted = too_large;
@@ -24,8 +41,10 @@ pub fn parse_module(src: &str, file: u32, is_template: bool) -> (Module, Vec<Dia
         p.diags.push(d);
     }
     diags.append(&mut p.diags);
+    let over = too_large || p.tokens > limit;
+    let tokens = (!over).then_some(p.tokens);
     let module = Module { file, is_template, stmts, template_refs: p.template_refs };
-    (module, diags)
+    (module, diags, tokens)
 }
 
 /// Parses a standalone type such as `fn(list<T>, fn(T): U): list<U>`.
@@ -70,6 +89,8 @@ struct Parser {
     /// Tokens of the file so far, those of interpolated expressions included
     /// (see `lexer::MAX_TOKENS`).
     tokens: usize,
+    /// The most tokens the file may have (see `parse_module_within`).
+    limit: usize,
     /// Tokens that `expect_gt` split (`>>` into `>` `>`), with their original
     /// form, so a parse that backtracks can put them back.
     splits: Vec<(usize, Token)>,
@@ -149,6 +170,7 @@ impl Parser {
             depth: 0,
             halted: false,
             tokens: 0,
+            limit: MAX_TOKENS,
             splits: Vec::new(),
             exits: Vec::new(),
         }
@@ -341,10 +363,19 @@ impl Parser {
             }
             InlineCode::HiddenEndTag => {
                 let mut d = Diagnostic::error(
-                    "the end tag of a raw-text element (such as `</textarea>` or `</noscript>`) inside `<noscript>`, `<svg>` or `<math>`, in a comment, an attribute value or raw text",
+                    "`</noscript` (or, inside `<noscript>`, `<svg>` or `<math>`, the end tag of another raw-text element such as `</textarea>`) in a comment, an attribute value or raw text",
                     span,
                 );
-                d.add_note("where a browser reads that element's text as raw text, the end tag ends it there and what follows becomes markup; remove it, or write `&lt;/` in an attribute");
+                d.add_note("where a browser reads that element's text as raw text (any template or function may be written inside a `<noscript>`), the end tag ends it there and what follows becomes markup; remove it, or write `&lt;/` in an attribute");
+                self.diags.push(d);
+                return;
+            }
+            InlineCode::CommentEnd => {
+                let mut d = Diagnostic::error(
+                    "text right after a value in a comment starts with `>`, `!>`, `->` or `-!>`",
+                    span,
+                );
+                d.add_note("a value ending with `--` (or `-`, `--!`) would end the comment there and turn what follows into markup; put a space after the value");
                 self.diags.push(d);
                 return;
             }
@@ -506,10 +537,10 @@ impl Parser {
             && !matches!(s.kind, StmtKind::InlineHtml(..) | StmtKind::Echo(..) | StmtKind::HtmlEcho(..))
         {
             let mut d = Diagnostic::error(
-                "code right after `<` or `</` in a comment, an attribute value or raw text inside `<noscript>`, `<svg>` or `<math>`",
+                "code right after `<` or `</` in a comment, an attribute value or raw text, where it could complete `</noscript>` (or, inside `<noscript>`, `<svg>` or `<math>`, another raw-text element's end tag)",
                 start,
             );
-            d.add_note("it could complete the end tag of a raw-text element (such as `</noscript>`), which a browser would read there; put a space after `<`, or move the code");
+            d.add_note("a browser would read that end tag there (this template or function may be written inside a `<noscript>`); put a space after `<`, or move the code");
             self.diags.push(d);
         }
         if ctx != EchoContext::Text && !matches!(s.kind, StmtKind::InlineHtml(..)) {
@@ -531,7 +562,8 @@ impl Parser {
                         crate::htmlctx::InlineCode::ScriptUrl
                         | crate::htmlctx::InlineCode::MetaHttpEquiv
                         | crate::htmlctx::InlineCode::ForeignCdata
-                        | crate::htmlctx::InlineCode::HiddenEndTag => 1,
+                        | crate::htmlctx::InlineCode::HiddenEndTag
+                        | crate::htmlctx::InlineCode::CommentEnd => 1,
                     };
                     self.inline_code_warning(Span { start: pos, end: pos + len, ..start }, what);
                 }
@@ -1838,16 +1870,22 @@ impl Parser {
         self.diags.extend(diags);
         // The code inside strings counts toward the file's tokens.
         self.tokens += toks.len() - 1;
-        if self.tokens > MAX_TOKENS {
-            let span = Span::new(self.file, offset, offset);
-            self.diags.push(too_many_tokens(span));
+        if self.tokens > self.limit {
+            if self.limit == MAX_TOKENS {
+                let span = Span::new(self.file, offset, offset);
+                self.diags.push(too_many_tokens(span));
+            }
             self.halted = true;
             self.pos = self.toks.len() - 1;
             return Err(PErr);
         }
         let mut p = Parser::new(toks, self.file, false);
         p.depth = self.depth;
+        // Strings inside the expression count toward the file's tokens too.
+        p.tokens = self.tokens;
+        p.limit = self.limit;
         let e = p.expr();
+        self.tokens = p.tokens;
         if p.halted {
             self.halted = true;
             self.pos = self.toks.len() - 1;

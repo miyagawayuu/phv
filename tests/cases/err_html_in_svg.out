@@ -1,0 +1,6 @@
+<svg><rect width="1"><title>Bar 1</title></rect>
+<style>.bar { fill: red }</style>
+</svg>
+<svg>
+--- runtime error ---
+Fatal error: `Html` inserted inside `<svg>` or `<math>` holds a `<textarea>` whose text holds `<` (or does not end), which browsers read as markup there (it was checked as HTML); insert it outside the SVG or MathML, or write the element's text without `<`

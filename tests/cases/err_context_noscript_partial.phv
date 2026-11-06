@@ -1,0 +1,19 @@
+<?phv
+// A template or function is checked on its own, but may be written inside a
+// `<noscript>` (or `<svg>`, `<math>`). There, a value right after `</` in a
+// comment, an attribute value or raw text could complete `</noscript>`:
+// refused everywhere (found by the 1.1.1 audit: `<noscript>` around
+// `render()` let a value end it early). Every value here is an error, but the
+// last two (after a space, or another end tag). Statements: see
+// err_context_noscript_stmt.phv.
+function note(string $v): void { ?><!--</<?= $v ?> --><?phv }
+class Box {
+    public function show(string $v): void { ?><textarea></nos<?= $v ?></textarea><?phv }
+}
+$c = function (string $v): void { ?><p title="<<?= $v ?>"></p><?phv };
+?>
+<noscript><?= render("views/noscript_value.phv.html", v: "noscript x") ?></noscript>
+<svg><?= render("views/noscript_value.phv.html", v: "noscript x") ?></svg>
+<noscript><?phv note("noscript x"); (new Box())->show("cript"); $c("/noscript"); ?></noscript>
+<!--</ <?= "noscript" ?> -->
+<!--</b<?= "x" ?> -->

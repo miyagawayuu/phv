@@ -1,0 +1,5 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: adds a job without a key.
+import std.jobs.enqueue;
+
+echo enqueue("k", "plain") == null ? "no" : "yes";

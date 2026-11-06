@@ -38,14 +38,25 @@ pub fn lex_with_comments(src: &str, file: u32, base: u32, mode: Mode) -> (Vec<To
     (lx.toks, lx.comments, lx.diags)
 }
 
-/// Like `lex`, also telling whether the file had more than `MAX_TOKENS`
-/// tokens (then only those before were read).
-pub(crate) fn lex_counted(src: &str, file: u32, base: u32, mode: Mode) -> (Vec<Token>, Vec<Diagnostic>, bool) {
-    let lx = lex_all(src, file, base, mode);
+/// Like `lex`, with at most `limit` tokens (at most `MAX_TOKENS`), also
+/// telling whether the file had more (then only those before were read). Past
+/// a `limit` below `MAX_TOKENS` no error is reported: the caller reports it.
+pub(crate) fn lex_counted(
+    src: &str,
+    file: u32,
+    base: u32,
+    mode: Mode,
+    limit: usize,
+) -> (Vec<Token>, Vec<Diagnostic>, bool) {
+    let lx = lex_limited(src, file, base, mode, limit.min(MAX_TOKENS));
     (lx.toks, lx.diags, lx.too_large)
 }
 
 fn lex_all(src: &str, file: u32, base: u32, mode: Mode) -> Lexer<'_> {
+    lex_limited(src, file, base, mode, MAX_TOKENS)
+}
+
+fn lex_limited(src: &str, file: u32, base: u32, mode: Mode, limit: usize) -> Lexer<'_> {
     let mut lx = Lexer {
         src,
         bytes: src.as_bytes(),
@@ -57,6 +68,7 @@ fn lex_all(src: &str, file: u32, base: u32, mode: Mode) -> Lexer<'_> {
         comments: Vec::new(),
         stopped: false,
         too_large: false,
+        limit,
     };
     lx.run(mode);
     lx
@@ -74,8 +86,11 @@ struct Lexer<'a> {
     /// Set after `MAX_ERRORS` errors: the rest of the file is not read (a file
     /// of junk would otherwise give one error per byte).
     stopped: bool,
-    /// Set at more than `MAX_TOKENS` tokens: the rest of the file is not read.
+    /// Set at more than `limit` tokens: the rest of the file is not read.
     too_large: bool,
+    /// The most tokens read: `MAX_TOKENS`, or less for a file of a program
+    /// that has used part of its budget (see `parser::parse_module_within`).
+    limit: usize,
 }
 
 /// Errors reported for one file before the lexer gives up on it.
@@ -96,10 +111,12 @@ impl<'a> Lexer<'a> {
 
     fn push(&mut self, tok: Tok, start: usize) {
         let span = self.span(start, self.pos);
-        if self.toks.len() >= MAX_TOKENS && !matches!(tok, Tok::Eof) {
+        if self.toks.len() >= self.limit && !matches!(tok, Tok::Eof) {
             if !self.too_large {
                 self.too_large = true;
-                self.diags.push(too_many_tokens(span));
+                if self.limit == MAX_TOKENS {
+                    self.diags.push(too_many_tokens(span));
+                }
             }
             self.stopped = true;
             self.pos = self.bytes.len();

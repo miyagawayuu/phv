@@ -535,8 +535,9 @@ struct Handler {
 }
 
 /// Why output was refused (see `Vm::guards`).
-const GUARDED_OUTPUT: &str = "a function wrote output inside a `<script>`, an attribute, a URL or CSS, where HTML \
-    escaping does not protect it; return the value (or `Html`) from the function and insert it with `<?= ?>`";
+const GUARDED_OUTPUT: &str = "a function wrote output inside a `<script>`, an attribute, a URL, CSS, a comment, \
+    `<svg>`/`<math>` or the text of an element such as `<textarea>`, where HTML escaping does not protect it (or \
+    browsers read its markup in another way); return the value (or `Html`) from the function and insert it with `<?= ?>`";
 
 pub struct Vm {
     pub prog: Arc<Program>,
@@ -1125,8 +1126,27 @@ impl Vm {
     /// walk was long (a large list held by a live object is walked each
     /// time): at most `GC_WORK` values are looked at per object made.
     pub fn collect_cycles(&mut self) -> usize {
+        self.collect_within(false)
+    }
+
+    /// `collect_cycles`, with the collector's own memory counted against the
+    /// script's limit (see `cycles`). When the limit has been reached
+    /// (`last`: the script stops unless memory is freed), it may still use an
+    /// eighth of the limit, so that a few objects holding much can be freed.
+    fn collect_within(&mut self, last: bool) -> usize {
+        let budget = match self.limits.max_memory {
+            None => usize::MAX,
+            Some(max) => {
+                let left = max.saturating_sub(self.mem().used().max(0) as usize);
+                if last {
+                    left.max(max / 8)
+                } else {
+                    left
+                }
+            }
+        };
         self.gc_due.set(false);
-        let done = crate::cycles::collect(self.objects.get_mut());
+        let done = crate::cycles::collect(self.objects.get_mut(), budget);
         self.gc_visited.set(done.visited);
         let objects = self.objects.get_mut();
         let live = objects.len();
@@ -1523,7 +1543,7 @@ impl Vm {
             // Native code cannot run the cycle collector: when cycles made
             // before this call held the memory, the interpreter runs the call
             // again once they are freed.
-            again = self.collect_cycles() > 0 && self.check_memory().is_ok();
+            again = self.collect_within(true) > 0 && self.check_memory().is_ok();
         }
         // The kept arguments are dropped now, so that they do not keep the
         // values shared; only a rerun takes them back.
@@ -1654,7 +1674,7 @@ impl Vm {
             if self.made_since_collection() == 0 {
                 return Err(e);
             }
-            self.collect_cycles();
+            self.collect_within(true);
             self.check_memory()?;
         }
         {
@@ -2412,8 +2432,9 @@ impl Vm {
                             guards,
                         });
                     }
-                    Instr::TryEnd => {
-                        self.handlers.pop();
+                    Instr::TryEnd(n) => {
+                        let keep = self.handlers.len().saturating_sub(*n as usize);
+                        self.handlers.truncate(keep);
                     }
                     Instr::InstanceOf(d, s, class) => {
                         let v = match &reg!(*s) {

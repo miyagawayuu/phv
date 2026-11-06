@@ -328,7 +328,12 @@ impl State {
         if let Some(e) = &self.embedded {
             return e.pages.contains_key(rel).then(|| self.public.join(rel));
         }
-        let c = self.public.join(rel).canonicalize().ok()?;
+        let path = self.public.join(rel);
+        // A link to another machine is not resolved (see `resolve`).
+        if phv_std::safefs::on_another_machine_below(&self.public, &path) {
+            return None;
+        }
+        let c = path.canonicalize().ok()?;
         let inner = c.strip_prefix(&self.public).ok()?;
         let same = inner.components().map(|x| x.as_os_str().to_str()).eq(rel.split('/').map(Some));
         (same && c.is_file()).then_some(c)
@@ -1510,7 +1515,13 @@ fn resolve(state: &State, url_path: &str) -> Option<Target> {
     let candidates = page_candidates(&rel, ".phv");
     // The file `rel` names, only if its canonical path inside public/ is spelled exactly `rel`.
     let exact = |rel: &str| -> Option<PathBuf> {
-        let c = state.public.join(rel).canonicalize().ok()?;
+        let path = state.public.join(rel);
+        // A link to another machine is not resolved: that would contact the
+        // host at each request (found by the 15th assessment).
+        if phv_std::safefs::on_another_machine_below(&state.public, &path) {
+            return None;
+        }
+        let c = path.canonicalize().ok()?;
         let inner = c.strip_prefix(&state.public).ok()?;
         let same = inner.components().map(|x| x.as_os_str().to_str()).eq(rel.split('/').map(Some));
         (same && c.is_file()).then_some(c)
@@ -1668,6 +1679,12 @@ async fn route(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
 }
 
 async fn route_inner(state: &Arc<State>, ip: String, req: Request<Incoming>) -> Resp {
+    // `TRACE` (an echo of the request, for debugging) and `CONNECT` (a tunnel)
+    // are not for pages: they are refused before any page runs (found by the
+    // 1.1.1 audit: `TRACE` ran the page and answered 200).
+    if matches!(*req.method(), Method::TRACE | Method::CONNECT) {
+        return method_not_allowed();
+    }
     let gzip_ok = state.config.compress && static_files::accepts_gzip(req.headers());
     let get = req.method() == Method::GET || req.method() == Method::HEAD;
     let as_static = |mut r: Resp| {

@@ -122,8 +122,9 @@ impl Reloading {
 /// be under `public/`, where the server would hand the key to anyone.
 pub fn acceptor(tls: &Tls, public: &Path) -> Result<TlsAcceptor, String> {
     if let Ok(public) = public.canonicalize() {
-        for (what, p) in [("tls_cert", &tls.cert), ("tls_key", &tls.key)] {
-            if p.canonicalize().is_ok_and(|p| p.starts_with(&public)) {
+        for (what, name, p) in [("tls_cert", "certificate", &tls.cert), ("tls_key", "key", &tls.key)] {
+            // Looked at for another machine before it is resolved (`local_file`).
+            if local_file(name, p).is_ok_and(|p| p.starts_with(&public)) {
                 return Err(format!("[server].{what}: {} is inside public/", p.display()));
             }
         }

@@ -1,0 +1,13 @@
+<?phv
+// A `break` in `finally` leaves the loop even after a `return`: the loop can
+// end, so the function needs a `return` after it (it used to return null).
+function f(): int {
+    while (true) {
+        try {
+            return 1;
+        } finally {
+            break;
+        }
+    }
+}
+echo f() + 1;

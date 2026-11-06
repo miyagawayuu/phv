@@ -10,6 +10,7 @@
 
 mod expr;
 mod flow;
+mod pmap;
 mod stmt;
 
 use crate::builtins::{BuiltinSig, Recv, BUILTINS};
@@ -134,6 +135,8 @@ struct ClassInfo<'a> {
     ifaces: Vec<ClassId>,
     /// Itself, ancestors and all interfaces; filled when the class is resolved.
     supers: HashSet<ClassId>,
+    /// Levels of `extends` and `implements` above it (see `MAX_CLASS_DEPTH`).
+    depth: usize,
     fields: Vec<FieldInfo>,
     /// The slot of each field in `fields`, by name.
     field_slots: HashMap<String, u32>,
@@ -213,6 +216,10 @@ pub(crate) struct Checker<'a> {
     /// Members copied into subclasses so far (see `MAX_INHERITED_MEMBERS`).
     inherited_members: usize,
     reported_hierarchy: bool,
+    /// Ancestors, interfaces and their type arguments all classes hold so far
+    /// (see `MAX_HIERARCHY`).
+    hierarchy_size: usize,
+    reported_hierarchy_size: bool,
     /// What `#[Deprecated]` says about functions, classes and properties
     /// (`(owner, name)`); using them gives a warning.
     deprecated_funcs: HashMap<FuncId, String>,
@@ -269,6 +276,18 @@ const ANNOTATIONS: &str = "Deprecated, Override, Test, Skip, Before, After";
 
 /// Members (fields, methods, constants) all classes may inherit together.
 const MAX_INHERITED_MEMBERS: usize = 200_000;
+
+/// Levels of `extends` and `implements` above a class or interface.
+const MAX_CLASS_DEPTH: usize = 256;
+
+/// Each class lists its ancestors and interfaces, and the type arguments it
+/// gives the generic ones: entries and type nodes all classes may hold
+/// together (a chain of classes holds the square of its length).
+const MAX_HIERARCHY: usize = 2_000_000;
+
+/// Nodes of a type argument a class gives one of its ancestors
+/// (`class B<T> extends A<fn(T): T>` doubles it with each level).
+const MAX_SUPER_ARG_SIZE: usize = 10_000;
 
 /// Bytes of a string built in a constant expression (`A . A` doubles it).
 const MAX_CONST_STR: usize = 1 << 20;
@@ -355,6 +374,8 @@ impl<'a> Checker<'a> {
             index: None,
             inherited_members: 0,
             reported_hierarchy: false,
+            hierarchy_size: 0,
+            reported_hierarchy_size: false,
             deprecated_funcs: HashMap::new(),
             deprecated_classes: HashMap::new(),
             deprecated_fields: HashMap::new(),
@@ -1066,7 +1087,22 @@ impl<'a> Checker<'a> {
         if !ci.supers.is_empty() {
             return ci.supers.contains(&target);
         }
-        ci.parent.is_some_and(|p| self.is_subclass(p, target)) || ci.ifaces.iter().any(|i| self.is_subclass(*i, target))
+        // Not resolved yet: walk the parents and interfaces, each once (a
+        // diamond of interfaces would otherwise be walked once per path).
+        let mut seen = HashSet::from([c]);
+        let mut stack = vec![c];
+        while let Some(c) = stack.pop() {
+            let ci = &self.classes[c as usize];
+            for s in ci.parent.iter().chain(&ci.ifaces) {
+                if *s == target {
+                    return true;
+                }
+                if seen.insert(*s) {
+                    stack.push(*s);
+                }
+            }
+        }
+        false
     }
 
     pub(crate) fn lookup_const(&self, name: &str) -> Option<(HConst, Type)> {
@@ -1681,6 +1717,7 @@ impl<'a> Checker<'a> {
                             parent: None,
                             ifaces: Vec::new(),
                             supers: HashSet::new(),
+                            depth: 0,
                             fields: Vec::new(),
                             field_slots: HashMap::new(),
                             methods: HashMap::new(),
@@ -1881,28 +1918,42 @@ impl<'a> Checker<'a> {
         order
     }
 
-    fn visit_class(&mut self, cid: ClassId, state: &mut [u8], order: &mut Vec<ClassId>) {
-        match state[cid as usize] {
-            2 => return,
-            1 => {
-                let span = self.classes[cid as usize].span;
-                let name = self.classes[cid as usize].name.clone();
-                self.error(format!("`{name}` inherits from itself"), span);
-                self.classes[cid as usize].parent = None;
-                self.classes[cid as usize].ifaces.clear();
-                return;
+    /// Puts `root` after its parent and interfaces in `order`. Iterative: a
+    /// long chain of classes must not overflow the stack.
+    fn visit_class(&mut self, root: ClassId, state: &mut [u8], order: &mut Vec<ClassId>) {
+        // (class, its interfaces once the parent is done, how many of them are done)
+        let mut stack: Vec<(ClassId, Option<Vec<ClassId>>, usize)> = Vec::new();
+        let mut next = Some(root);
+        loop {
+            if let Some(cid) = next.take() {
+                match state[cid as usize] {
+                    2 => {}
+                    1 => {
+                        let span = self.classes[cid as usize].span;
+                        let name = self.classes[cid as usize].name.clone();
+                        self.error(format!("`{name}` inherits from itself"), span);
+                        self.classes[cid as usize].parent = None;
+                        self.classes[cid as usize].ifaces.clear();
+                    }
+                    _ => {
+                        state[cid as usize] = 1;
+                        stack.push((cid, None, 0));
+                        next = self.classes[cid as usize].parent;
+                        continue;
+                    }
+                }
             }
-            _ => {}
+            let Some((cid, ifaces, done)) = stack.last_mut() else { break };
+            let ifaces = ifaces.get_or_insert_with(|| self.classes[*cid as usize].ifaces.clone());
+            if let Some(&i) = ifaces.get(*done) {
+                *done += 1;
+                next = Some(i);
+            } else {
+                state[*cid as usize] = 2;
+                order.push(*cid);
+                stack.pop();
+            }
         }
-        state[cid as usize] = 1;
-        if let Some(p) = self.classes[cid as usize].parent {
-            self.visit_class(p, state, order);
-        }
-        for i in self.classes[cid as usize].ifaces.clone() {
-            self.visit_class(i, state, order);
-        }
-        state[cid as usize] = 2;
-        order.push(cid);
     }
 
     /// Whether method `sub` can stand in for `base` (same parameters, compatible
@@ -1953,6 +2004,24 @@ impl<'a> Checker<'a> {
         true
     }
 
+    /// Counts `n` more entries of the class hierarchy; true (after reporting it
+    /// once) when that goes over `MAX_HIERARCHY`, and they are then not kept.
+    fn over_hierarchy_limit(&mut self, n: usize, decl: &ClassDecl) -> bool {
+        self.hierarchy_size = self.hierarchy_size.saturating_add(n);
+        if self.hierarchy_size <= MAX_HIERARCHY {
+            return false;
+        }
+        if !self.reported_hierarchy_size {
+            self.reported_hierarchy_size = true;
+            self.error(
+                format!("the classes have more than {MAX_HIERARCHY} ancestors, interfaces and their type arguments in total"),
+                decl.name_span,
+            )
+            .add_note("split the program into smaller class hierarchies");
+        }
+        true
+    }
+
     /// Copies what class `ci` inherits from its parent `p` (already resolved).
     fn inherit_from(&mut self, ci: usize, p: ClassId) {
         let parent = &self.classes[p as usize];
@@ -1994,6 +2063,23 @@ impl<'a> Checker<'a> {
                     self.error(format!("type parameter `{n}` is declared more than once"), *s);
                 }
             }
+            // Each class lists all of its ancestors and interfaces: a long chain
+            // would take memory and time in proportion to the square of its length.
+            let c = &self.classes[ci];
+            let depth =
+                c.parent.iter().chain(&c.ifaces).map(|s| self.classes[*s as usize].depth + 1).max().unwrap_or(0);
+            let too_deep = depth > MAX_CLASS_DEPTH;
+            if too_deep {
+                self.error(
+                    format!("`{class_name}` has more than {MAX_CLASS_DEPTH} levels of classes and interfaces above it"),
+                    decl.name_span,
+                )
+                .add_note("use fewer levels of `extends` and `implements`");
+                // Checked as if it had no parent and no interfaces; the error stops the program anyway.
+                self.classes[ci].parent = None;
+                self.classes[ci].ifaces.clear();
+            }
+            self.classes[ci].depth = if too_deep { 0 } else { depth };
             // Type arguments of the parent and interfaces, in terms of this class's parameters.
             self.type_params = class_tps.clone();
             self.set_bounds(Some(cid), &[], &[]);
@@ -2003,13 +2089,40 @@ impl<'a> Checker<'a> {
                 supers_written.push((p, &decl.parent_args, *pspan));
             }
             for ((iname, ispan), iargs) in decl.interfaces.iter().zip(&decl.interface_args) {
-                if let Some(i) = self.lookup_class(iname) {
+                if let Some(i) = self.lookup_class(iname).filter(|_| !too_deep) {
                     supers_written.push((i, iargs, *ispan));
                 }
             }
             for (s, written, span) in supers_written {
                 let args = self.class_args(s, written, Some(cid), span);
                 let stps = self.classes[s as usize].type_params.clone();
+                if args.is_empty() && self.classes[s as usize].super_args.is_empty() {
+                    continue;
+                }
+                // The sizes first: substituting `args` can double a type at each level.
+                if self.hierarchy_size > MAX_HIERARCHY {
+                    continue;
+                }
+                let arg_sizes: Vec<usize> = args.iter().map(|a| type_size(a, MAX_SUPER_ARG_SIZE)).collect();
+                let sizes: Vec<usize> = self.classes[s as usize]
+                    .super_args
+                    .values()
+                    .flatten()
+                    .map(|t| subst_size(t, &stps, &arg_sizes))
+                    .chain(arg_sizes.iter().copied())
+                    .collect();
+                if sizes.iter().any(|n| *n > MAX_SUPER_ARG_SIZE) {
+                    let name = self.classes[s as usize].name.clone();
+                    self.error(
+                        format!("the type arguments `{class_name}` gives `{name}` and its ancestors are too large (more than {MAX_SUPER_ARG_SIZE} type nodes)"),
+                        span,
+                    )
+                    .add_note("a type parameter used twice in a type argument doubles it at each level of inheritance");
+                    continue;
+                }
+                if self.over_hierarchy_limit(sizes.iter().sum(), decl) {
+                    continue;
+                }
                 let mut reached: Vec<(ClassId, Vec<Type>)> = self.classes[s as usize]
                     .super_args
                     .iter()
@@ -2070,7 +2183,12 @@ impl<'a> Checker<'a> {
                 }
             }
             let mut supers: HashSet<ClassId> = HashSet::from([cid]);
-            if let Some(p) = self.classes[ci].parent {
+            // Past the limit, a class lists only itself (the error stops the program).
+            let listed = |c: &ClassInfo| c.supers.len();
+            let c = &self.classes[ci];
+            let n = c.parent.iter().chain(&c.ifaces).map(|s| listed(&self.classes[*s as usize])).sum::<usize>();
+            let keep = !self.over_hierarchy_limit(n + 1, decl);
+            if let Some(p) = self.classes[ci].parent.filter(|_| keep) {
                 supers.extend(self.classes[p as usize].supers.iter().copied());
             }
             for (i, (_, ispan)) in self.classes[ci].ifaces.clone().into_iter().zip(&decl.interfaces) {
@@ -2079,7 +2197,9 @@ impl<'a> Checker<'a> {
                     self.error(format!("`{iname}` is not an interface"), *ispan);
                     continue;
                 }
-                supers.extend(self.classes[i as usize].supers.iter().copied());
+                if keep {
+                    supers.extend(self.classes[i as usize].supers.iter().copied());
+                }
                 for (k, v) in self.classes[i as usize].consts.clone() {
                     self.classes[ci].consts.entry(k).or_insert(v);
                 }
@@ -2890,6 +3010,42 @@ fn param_text(p: &ParamInfo, show: impl Fn(&Type) -> String) -> String {
         (Type::List(elem), true) => format!("{} ...${}", show(elem), p.name),
         (t, _) => format!("{} ${}", show(t), p.name),
     }
+}
+
+/// The number of nodes `subst_params(t, names, args)` would have (at most),
+/// where `sizes` are the numbers of nodes of `args`.
+fn subst_size(t: &Type, names: &[Name], sizes: &[usize]) -> usize {
+    let mut n = 0usize;
+    let mut stack = vec![t];
+    while let Some(t) = stack.pop() {
+        let own = match t {
+            Type::Param(p) => names.iter().position(|x| x == p).map_or(1, |i| sizes.get(i).copied().unwrap_or(1)),
+            Type::List(e) | Type::Set(e) => {
+                stack.push(e);
+                1
+            }
+            Type::Map(k, v) => {
+                stack.extend([&**k, &**v]);
+                1
+            }
+            Type::Func(ps, r) => {
+                stack.extend(ps.iter());
+                stack.push(r);
+                1
+            }
+            Type::Union(ms) => {
+                stack.extend(ms.iter());
+                1
+            }
+            Type::Class(_, args) => {
+                stack.extend(args.iter());
+                1
+            }
+            _ => 1,
+        };
+        n = n.saturating_add(own);
+    }
+    n
 }
 
 /// The number of nodes in `t`, counting stopped past `limit`.

@@ -85,15 +85,20 @@ pub fn compile_with(h: &HProgram, sources: &SourceMap, opts: Options) -> Result<
     })
 }
 
-fn too_large(f: &HFunc) -> Diagnostic {
+fn too_large(f: &HFunc, too_long: bool) -> Diagnostic {
     let what = match f.kind {
         FuncKind::Main => "this script".to_string(),
         FuncKind::Template => "this template".to_string(),
         FuncKind::Closure => "this closure".to_string(),
         _ => format!("`{}`", f.name),
     };
+    let why = if too_long {
+        format!("its code would be more than {MAX_CODE} instructions")
+    } else {
+        format!("it needs more than {} registers for its variables and temporary values", NO_REG - 1)
+    };
     Diagnostic::error(format!("{what} is too large to compile"), f.span)
-        .note(format!("it needs more than {} registers for its variables and temporary values", NO_REG - 1))
+        .note(why)
         .note("split it into smaller functions")
 }
 
@@ -170,14 +175,70 @@ struct LoopCtx {
     /// the loop is left, so it does not keep the collection alive (or shared,
     /// which would make the next change of it copy it whole).
     iter: Option<Reg>,
+    /// `break N` and `continue N` (N > 1) from loops inside this one: they go
+    /// through code emitted once at its end, which clears the collections of
+    /// the loops they leave (`left_iters`). Clearing them at each jump made
+    /// the code grow with the number of jumps times the depth of the loops.
+    far_breaks: Vec<usize>,
+    far_continues: Vec<usize>,
+    left_iters: Vec<Reg>,
+    /// The loops outside this one (by index) that such jumps from it or from
+    /// inside it go to.
+    left_to: Vec<usize>,
+}
+
+impl LoopCtx {
+    fn new(tries: usize, iter: Option<Reg>) -> LoopCtx {
+        LoopCtx {
+            breaks: Vec::new(),
+            continues: Vec::new(),
+            tries,
+            iter,
+            far_breaks: Vec::new(),
+            far_continues: Vec::new(),
+            left_iters: Vec::new(),
+            left_to: Vec::new(),
+        }
+    }
 }
 
 /// An enclosing `try` statement while its body or catches are compiled.
 struct TryCtx {
     /// Exception handlers of this statement that are currently installed.
     active: u32,
-    finally: Option<Vec<HStmt>>,
+    finally: Option<FinallyCtx>,
 }
+
+/// The `finally` block of an enclosing `try`. Its code is emitted once: every
+/// way into it sets `why` (0: the end of the body or a catch, 1: an exception,
+/// 2 and up: an entry of `exits`), and the code after the block continues
+/// from there. Inlining the block at each `return`, `break` and `continue`
+/// instead made nested `finally` blocks grow exponentially.
+struct FinallyCtx {
+    why: Reg,
+    /// The exception (`why` 1) or the value returned (`Exit::Ret`).
+    val: Reg,
+    /// Jumps to the start of the block, patched when it is emitted.
+    entries: Vec<usize>,
+    /// The ways out of the statement that pass through the block.
+    exits: Vec<Exit>,
+}
+
+/// A jump out of `try` statements, continued after each `finally` block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    /// `return` with the value in a register.
+    Ret,
+    RetNull,
+    /// `break` and `continue`, by index in `loops`; true when they leave
+    /// loops inside that one (`LoopCtx::far_breaks`).
+    Break(usize, bool),
+    Continue(usize, bool),
+}
+
+/// Instructions one function may have. Code grows in proportion to the
+/// source, so this is far above what a function of `MAX_TOKENS` tokens needs.
+const MAX_CODE: usize = 1 << 23;
 
 struct FnC<'a> {
     pc: &'a mut ProgCtx,
@@ -192,6 +253,8 @@ struct FnC<'a> {
     off: u32,
     /// Set when a register beyond the register file was asked for; the code is then discarded.
     too_big: bool,
+    /// Set (with `too_big`) when the code went past `MAX_CODE` instructions.
+    too_long: bool,
     /// The function's source file (statements from other files are not covered).
     file: u32,
     /// Inside statements that refuse output from the functions they call.
@@ -201,7 +264,7 @@ struct FnC<'a> {
 impl<'a> FnC<'a> {
     fn compile(pc: &'a mut ProgCtx, f: &HFunc) -> Result<Function, Diagnostic> {
         if f.locals.len() >= NO_REG as usize {
-            return Err(too_large(f));
+            return Err(too_large(f, false));
         }
         // Register layout: captures, params, then the remaining locals.
         let mut reg_of = vec![Reg::MAX; f.locals.len()];
@@ -228,6 +291,7 @@ impl<'a> FnC<'a> {
             tries: Vec::new(),
             off: f.span.start,
             too_big: false,
+            too_long: false,
             file: f.span.file,
             guarded: false,
         };
@@ -258,7 +322,7 @@ impl<'a> FnC<'a> {
             }
         }
         if c.too_big {
-            return Err(too_large(f));
+            return Err(too_large(f, c.too_long));
         }
         // Variables as the source names them (temporaries have other names).
         let locals = f
@@ -283,7 +347,14 @@ impl<'a> FnC<'a> {
 
     // ----- helpers -------------------------------------------------------
 
+    /// Past `MAX_CODE` instructions the function is reported as too large;
+    /// the code is not kept growing meanwhile (and is discarded).
     fn emit(&mut self, i: Instr) -> usize {
+        if self.code.len() >= MAX_CODE {
+            self.too_long = true;
+            self.too_big = true;
+            return 0;
+        }
         self.code.push(i);
         self.offsets.push(self.off);
         self.code.len() - 1
@@ -332,6 +403,9 @@ impl<'a> FnC<'a> {
     }
 
     fn patch(&mut self, at: usize, target: u32) {
+        if self.too_long {
+            return;
+        }
         match &mut self.code[at] {
             Instr::Jump(t)
             | Instr::JumpIfFalse(_, t)
@@ -899,6 +973,9 @@ impl<'a> FnC<'a> {
     }
 
     fn stmt(&mut self, s: &HStmt) {
+        if self.too_big {
+            return;
+        }
         if self.pc.coverage {
             if let Some(span) = stmt_span(s).filter(|sp| sp.file == self.file) {
                 self.emit(Instr::Cover(span.start));
@@ -1030,12 +1107,7 @@ impl<'a> FnC<'a> {
             }
             HStmt::Loop { cond, body, step, do_while } => {
                 let top = self.here();
-                self.loops.push(LoopCtx {
-                    breaks: Vec::new(),
-                    continues: Vec::new(),
-                    tries: self.tries.len(),
-                    iter: None,
-                });
+                self.loops.push(LoopCtx::new(self.tries.len(), None));
                 if *do_while {
                     self.block(body);
                     let cont = self.here();
@@ -1044,8 +1116,7 @@ impl<'a> FnC<'a> {
                     let end = self.here();
                     let lp = self.loops.pop().unwrap();
                     self.patch_all(exits, end);
-                    self.patch_all(lp.breaks, end);
-                    self.patch_all(lp.continues, cont);
+                    self.end_loop(lp, end, cont);
                 } else {
                     // Rotated: the condition is tested once before the loop,
                     // then at the end of each pass, by a jump back to the start
@@ -1053,12 +1124,7 @@ impl<'a> FnC<'a> {
                     self.loops.pop();
                     let exits = cond.as_ref().map(|c| self.cond_false(c)).unwrap_or_default();
                     let top = self.here();
-                    self.loops.push(LoopCtx {
-                        breaks: Vec::new(),
-                        continues: Vec::new(),
-                        tries: self.tries.len(),
-                        iter: None,
-                    });
+                    self.loops.push(LoopCtx::new(self.tries.len(), None));
                     self.block(body);
                     let cont = self.here();
                     self.block(step);
@@ -1074,8 +1140,7 @@ impl<'a> FnC<'a> {
                     let end = self.here();
                     let lp = self.loops.pop().unwrap();
                     self.patch_all(exits, end);
-                    self.patch_all(lp.breaks, end);
-                    self.patch_all(lp.continues, cont);
+                    self.end_loop(lp, end, cont);
                 }
             }
             HStmt::ForRange { var, from, to, inclusive, body } => {
@@ -1089,12 +1154,7 @@ impl<'a> FnC<'a> {
                     self.emit(Instr::JumpIfNotLtI(v, end_reg, 0))
                 };
                 let top = self.here();
-                self.loops.push(LoopCtx {
-                    breaks: Vec::new(),
-                    continues: Vec::new(),
-                    tries: self.tries.len(),
-                    iter: None,
-                });
+                self.loops.push(LoopCtx::new(self.tries.len(), None));
                 self.block(body);
                 let cont = self.here();
                 self.emit(Instr::IncI(v, 1));
@@ -1107,8 +1167,7 @@ impl<'a> FnC<'a> {
                 let end = self.here();
                 let lp = self.loops.pop().unwrap();
                 self.patch(exit, end);
-                self.patch_all(lp.breaks, end);
-                self.patch_all(lp.continues, cont);
+                self.end_loop(lp, end, cont);
             }
             HStmt::Foreach { subject, key, val, body } => {
                 let it = self.alloc_n(2);
@@ -1119,58 +1178,43 @@ impl<'a> FnC<'a> {
                 let key = key.map(|k| self.reg(k)).unwrap_or(NO_REG);
                 let val = self.reg(*val);
                 let next = self.emit(Instr::IterNext { it, key, val, end: 0 });
-                self.loops.push(LoopCtx {
-                    breaks: Vec::new(),
-                    continues: Vec::new(),
-                    tries: self.tries.len(),
-                    iter: Some(it),
-                });
+                self.loops.push(LoopCtx::new(self.tries.len(), Some(it)));
                 self.block(body);
                 self.emit(Instr::Jump(top));
                 let end = self.here();
                 let lp = self.loops.pop().unwrap();
                 self.patch(next, end);
-                self.patch_all(lp.breaks, end);
-                self.patch_all(lp.continues, top);
                 self.emit(Instr::Null(it));
+                self.end_loop(lp, end, top);
             }
             HStmt::Break(level) | HStmt::Continue(level) => {
-                let is_break = matches!(s, HStmt::Break(_));
                 let idx = self.loops.len() - *level as usize;
-                let down_to = self.loops[idx].tries;
-                self.unwind_tries(down_to);
-                // The loops inside the one left or continued are left.
-                let inner: Vec<Reg> = self.loops[idx + 1..].iter().filter_map(|l| l.iter).collect();
-                for it in inner {
-                    self.emit(Instr::Null(it));
+                let far = idx + 1 < self.loops.len();
+                if far {
+                    self.note_left_loops(idx);
                 }
-                let j = self.emit(Instr::Jump(0));
-                if is_break {
-                    self.loops[idx].breaks.push(j);
-                } else {
-                    self.loops[idx].continues.push(j);
-                }
+                let exit = if matches!(s, HStmt::Break(_)) { Exit::Break(idx, far) } else { Exit::Continue(idx, far) };
+                self.leave(exit, 0);
             }
             HStmt::Return(value, span) => {
                 self.off = span.start;
                 match value {
                     Some(e) if !self.tries.is_empty() => {
-                        // The value is computed before `finally` blocks run.
-                        let t = self.alloc();
+                        // The value is computed before `finally` blocks run, into
+                        // the register of the first block it passes, if any.
+                        let t = match self.tries.iter().rev().find_map(|t| t.finally.as_ref()) {
+                            Some(fin) => fin.val,
+                            None => self.alloc(),
+                        };
                         self.expr_into(e, t);
-                        self.unwind_tries(0);
                         self.off = span.start;
-                        self.emit(Instr::Ret(t));
+                        self.leave(Exit::Ret, t);
                     }
                     Some(e) => {
                         let r = self.operand(e);
                         self.emit(Instr::Ret(r));
                     }
-                    None => {
-                        self.unwind_tries(0);
-                        self.off = span.start;
-                        self.emit(Instr::RetNull);
-                    }
+                    None => self.leave(Exit::RetNull, 0),
                 }
             }
             HStmt::Throw(e) => {
@@ -1181,21 +1225,22 @@ impl<'a> FnC<'a> {
             HStmt::Try { body, catches, finally } => {
                 let has_catch = !catches.is_empty();
                 // Layout: [TryBegin finally] [TryBegin catch] body ...
-                let (exc_f, begin_f) = match finally {
+                let (fin, begin_f) = match finally {
                     Some(_) => {
-                        let r = self.alloc();
-                        (r, Some(self.emit(Instr::TryBegin { catch: 0, exc: r })))
+                        let val = self.alloc();
+                        let why = self.alloc();
+                        let fin = FinallyCtx { why, val, entries: Vec::new(), exits: Vec::new() };
+                        (Some(fin), Some(self.emit(Instr::TryBegin { catch: 0, exc: val })))
                     }
-                    None => (0, None),
+                    None => (None, None),
                 };
                 let exc = self.alloc();
                 let begin_c = if has_catch { Some(self.emit(Instr::TryBegin { catch: 0, exc })) } else { None };
-                self.tries
-                    .push(TryCtx { active: has_catch as u32 + finally.is_some() as u32, finally: finally.clone() });
+                self.tries.push(TryCtx { active: has_catch as u32 + finally.is_some() as u32, finally: fin });
                 self.block(body);
                 let mut ends = Vec::new();
                 if let Some(begin) = begin_c {
-                    self.emit(Instr::TryEnd);
+                    self.emit(Instr::TryEnd(1));
                     self.tries.last_mut().unwrap().active -= 1;
                     ends.push(self.emit(Instr::Jump(0)));
                     let catch_at = self.here();
@@ -1224,37 +1269,152 @@ impl<'a> FnC<'a> {
                 }
                 let after = self.here();
                 self.patch_all(ends, after);
-                self.tries.pop();
-                if let (Some(begin), Some(f)) = (begin_f, finally) {
-                    self.emit(Instr::TryEnd);
+                let ctx = self.tries.pop().unwrap();
+                if let (Some(begin), Some(f), Some(fin)) = (begin_f, finally, ctx.finally) {
+                    // TryEnd, why = 0; start: the block; then by `why`: on (0),
+                    // rethrow (1), or continue an exit (2 and up). The handler sets 1.
+                    let FinallyCtx { why, val, entries, exits } = fin;
+                    self.emit(Instr::TryEnd(1));
+                    self.emit(Instr::Int(why, 0));
+                    let start = self.here();
+                    self.patch_all(entries, start);
                     self.block(f);
-                    let j = self.emit(Instr::Jump(0));
+                    let on = self.emit(Instr::JumpIfLtIImm(why, 1, 0));
+                    let to_exits =
+                        if exits.is_empty() { None } else { Some(self.emit(Instr::JumpIfNotLtIImm(why, 2, 0))) };
+                    self.emit(Instr::Throw(val));
+                    if let Some(j) = to_exits {
+                        let at = self.here();
+                        self.patch(j, at);
+                    }
+                    let n = exits.len();
+                    for (k, exit) in exits.into_iter().enumerate() {
+                        // `why` is at least k + 2 here.
+                        let next = (k + 1 < n).then(|| self.emit(Instr::JumpIfNotLtIImm(why, k as i32 + 3, 0)));
+                        self.leave(exit, val);
+                        if let Some(j) = next {
+                            let at = self.here();
+                            self.patch(j, at);
+                        }
+                    }
                     let handler = self.here();
                     self.patch(begin, handler);
-                    self.block(f);
-                    self.emit(Instr::Throw(exc_f));
+                    self.emit(Instr::Int(why, 1));
+                    self.emit(Instr::Jump(start));
                     let end = self.here();
-                    self.patch(j, end);
+                    self.patch(on, end);
                 }
             }
         }
     }
 
-    /// Before leaving enclosing `try` statements with `return`, `break` or
-    /// `continue`: removes their handlers and runs their `finally` blocks.
-    fn unwind_tries(&mut self, down_to: usize) {
+    /// Leaves enclosing `try` statements with `return` (the value in `val`),
+    /// `break` or `continue`: removes their handlers, and goes through the
+    /// innermost `finally` block on the way, whose code continues from there.
+    fn leave(&mut self, exit: Exit, val: Reg) {
+        let down_to = match exit {
+            Exit::Ret | Exit::RetNull => 0,
+            Exit::Break(l, _) | Exit::Continue(l, _) => self.loops[l].tries,
+        };
+        let mut handlers = 0;
         let mut i = self.tries.len();
         while i > down_to {
             i -= 1;
-            for _ in 0..self.tries[i].active {
-                self.emit(Instr::TryEnd);
+            handlers += self.tries[i].active;
+            if self.tries[i].finally.is_none() {
+                continue;
             }
-            if let Some(f) = self.tries[i].finally.clone() {
-                let outer = self.tries.split_off(i);
-                self.block(&f);
-                self.tries.extend(outer);
+            if handlers > 0 {
+                self.emit(Instr::TryEnd(handlers));
+            }
+            let fin = self.tries[i].finally.as_mut().unwrap();
+            let (why, fval) = (fin.why, fin.val);
+            let k = match fin.exits.iter().position(|e| *e == exit) {
+                Some(k) => k,
+                None => {
+                    fin.exits.push(exit);
+                    fin.exits.len() - 1
+                }
+            };
+            if exit == Exit::Ret && fval != val {
+                self.emit(Instr::Move(fval, val));
+            }
+            self.emit(Instr::Int(why, k as i64 + 2));
+            let j = self.emit(Instr::Jump(0));
+            self.tries[i].finally.as_mut().unwrap().entries.push(j);
+            return;
+        }
+        // Returning removes the function's handlers anyway.
+        if handlers > 0 && !matches!(exit, Exit::Ret | Exit::RetNull) {
+            self.emit(Instr::TryEnd(handlers));
+        }
+        match exit {
+            Exit::Ret => {
+                self.emit(Instr::Ret(val));
+            }
+            Exit::RetNull => {
+                self.emit(Instr::RetNull);
+            }
+            Exit::Break(l, far) | Exit::Continue(l, far) => {
+                let j = self.emit(Instr::Jump(0));
+                let lp = &mut self.loops[l];
+                match (exit, far) {
+                    (Exit::Break(..), false) => lp.breaks.push(j),
+                    (Exit::Break(..), true) => lp.far_breaks.push(j),
+                    (_, false) => lp.continues.push(j),
+                    (_, true) => lp.far_continues.push(j),
+                }
             }
         }
+    }
+
+    /// Notes that a `break` or `continue` goes from the innermost loop to
+    /// `loops[idx]`, leaving the loops in between. Each loop is noted once
+    /// for each loop outside it that is jumped to.
+    fn note_left_loops(&mut self, idx: usize) {
+        for j in (idx + 1..self.loops.len()).rev() {
+            if self.loops[j].left_to.contains(&idx) {
+                // So are the loops outside it, up to `idx`.
+                break;
+            }
+            self.loops[j].left_to.push(idx);
+            if let Some(it) = self.loops[j].iter {
+                if !self.loops[idx].left_iters.contains(&it) {
+                    self.loops[idx].left_iters.push(it);
+                }
+            }
+        }
+    }
+
+    /// Patches the jumps out of a loop, now that `end` and `cont` (where
+    /// `continue` goes) are known. `break N` and `continue N` from loops
+    /// inside it go through code that clears the collections of the loops
+    /// they leave (their registers are not used after the loop's body).
+    fn end_loop(&mut self, lp: LoopCtx, end: u32, cont: u32) {
+        self.patch_all(lp.breaks, end);
+        self.patch_all(lp.continues, cont);
+        if lp.left_iters.is_empty() {
+            self.patch_all(lp.far_breaks, end);
+            self.patch_all(lp.far_continues, cont);
+            return;
+        }
+        if lp.far_breaks.is_empty() && lp.far_continues.is_empty() {
+            return;
+        }
+        let skip = self.emit(Instr::Jump(0));
+        for (jumps, target) in [(lp.far_breaks, end), (lp.far_continues, cont)] {
+            if jumps.is_empty() {
+                continue;
+            }
+            let at = self.here();
+            self.patch_all(jumps, at);
+            for it in &lp.left_iters {
+                self.emit(Instr::Null(*it));
+            }
+            self.emit(Instr::Jump(target));
+        }
+        let after = self.here();
+        self.patch(skip, after);
     }
 }
 

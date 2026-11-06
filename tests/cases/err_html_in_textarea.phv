@@ -1,0 +1,8 @@
+<?phv
+// `Html` inserted into the text of a `<textarea>` (or `<title>`...) may not
+// hold the element's end tag, which would end it there (found by the 1.1.1
+// audit): the page stops.
+?>
+<textarea><?= render("views/plain.phv.html") ?></textarea>
+<textarea><?= render("views/ends_textarea.phv.html") ?></textarea>
+not reached

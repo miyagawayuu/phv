@@ -1,0 +1,12 @@
+<noscript><p class="warn">Turn on JavaScript</p>
+<!-- <script src="/old.js"></script> is fine in a comment -->
+</noscript>
+<svg><rect width="3"><title>Bar 3</title></rect>
+<style>.bar { fill: red }</style>
+</svg>
+<textarea>&lt;/textarea&gt; stays text plain text
+</textarea>
+<title>a x < y</title>
+<svg><circle r="1"/><circle r="2"/></svg>
+<noscript><p>x < y</p></noscript>
+<!--</bx --><!--</ noscript -->

@@ -1,0 +1,15 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: statements on the server that
+// wait for a lock of the test's jobs table.
+import std.db.Database;
+
+$db = Database::connect("main");
+$pg = ($db->first(sql"SELECT version() AS v")?->string("v") ?? "")->startsWith("PostgreSQL");
+if ($pg) {
+    $n = $db->first(sql"SELECT count(*) AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock'
+        AND query LIKE '%phv_jobs_f1f1f1f1f1f1f1f1%'")?->int("n");
+} else {
+    $n = $db->first(sql"SELECT count(*) AS n FROM information_schema.innodb_trx WHERE trx_state = 'LOCK WAIT'
+        AND trx_query LIKE '%phv_jobs_f1f1f1f1f1f1f1f1%'")?->int("n");
+}
+echo $n ?? -1;

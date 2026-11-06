@@ -1,0 +1,15 @@
+<?phv
+// As err_context_noscript_partial.phv, for statements: a statement right
+// after `</` in a comment, an attribute value or raw text could call code
+// that writes the rest of `</noscript>`, in a template or function that may
+// be written inside a `<noscript>` (found by the 1.1.1 audit). All but the
+// last line are errors.
+function rest(): void { echo "noscript x"; }
+function call(): void { ?><p title="</<?phv rest(); ?>"></p><?phv }
+$c = function (): void { ?><!--</no<?phv rest(); ?>--><?phv };
+?>
+<noscript><?= render("views/noscript_stmt.phv.html") ?></noscript>
+<math><?= render("views/noscript_stmt.phv.html") ?></math>
+<noscript><?phv call(); $c(); ?></noscript>
+<textarea></<?phv rest(); ?></textarea>
+<!--</b<?phv rest(); ?> -->

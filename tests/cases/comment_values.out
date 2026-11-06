@@ -1,0 +1,7 @@
+<!-- -- --> <p>after the comment</p>
+<!-- ----> <p>after another</p>
+<!-- build 3 - plain text
+ -->
+<!-- item 0 item 1 -->
+<!-- a --> <p>the comment ended at `-->`</p>
+<!x -- > <p>after a bogus comment</p>

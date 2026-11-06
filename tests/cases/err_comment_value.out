@@ -1,0 +1,29 @@
+error: a value cannot follow `<` (or `</`, `<!`, `-`) here: it would be read with it
+ --> err_comment_value.phv:7:9
+  |
+7 | <!--<?= $v ?>> -->
+  |         ^^
+  = note: it could start a tag, comment or end tag; put a space between them (`a < <?= $n ?>`)
+
+error: a value cannot follow `<` (or `</`, `<!`, `-`) here: it would be read with it
+ --> err_comment_value.phv:8:10
+  |
+8 | <!---<?= $v ?> -->
+  |          ^^
+  = note: it could start a tag, comment or end tag; put a space between them (`a < <?= $n ?>`)
+
+error: a value cannot follow `<` (or `</`, `<!`, `-`) here: it would be read with it
+ --> err_comment_value.phv:9:12
+  |
+9 | <!-- a-<?= $v ?> -->
+  |            ^^
+  = note: it could start a tag, comment or end tag; put a space between them (`a < <?= $n ?>`)
+
+error: a value cannot follow `<` (or `</`, `<!`, `-`) here: it would be read with it
+  --> err_comment_value.phv:10:14
+   |
+10 | <!-- a--!<?= $v ?> -->
+   |              ^^
+   = note: it could start a tag, comment or end tag; put a space between them (`a < <?= $n ?>`)
+
+4 errors found

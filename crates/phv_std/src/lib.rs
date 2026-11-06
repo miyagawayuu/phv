@@ -99,6 +99,87 @@ fn s(v: &Value) -> &str {
     }
 }
 
+/// HTML elements whose text browsers read as raw text (in HTML, not in SVG or MathML).
+const RAW_TEXT_TAGS: &[&str] =
+    &["script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "plaintext"];
+
+/// Whether the tag name `name` is at `at` in `b` (in any ASCII case), ended
+/// as browsers end one: by whitespace, `/`, `>`, or the end of the text
+/// (what follows it in the page may end it).
+fn tag_name_at(b: &[u8], at: usize, name: &str) -> bool {
+    b.get(at..at + name.len()).is_some_and(|s| s.eq_ignore_ascii_case(name.as_bytes()))
+        && b.get(at + name.len()).is_none_or(|c| matches!(c, b'\t' | b'\n' | b'\x0c' | b'\r' | b' ' | b'/' | b'>'))
+}
+
+/// Why `Html` cannot be inserted at `place` (see `__html_inside`), if it cannot.
+///
+/// In a `comment` or `bogus comment`: what ends it.
+///
+/// In the text of the raw-text element `place` (`textarea`...): its end tag,
+/// which would end the element there.
+///
+/// Inside SVG or MathML (`foreign`), browsers read markup as foreign content,
+/// while the template that made the `Html` was checked as HTML. The two read
+/// it alike but for raw-text elements (`<title>`, `<style>`...), whose text
+/// is markup there, and CDATA sections. So such an element may hold no `<`,
+/// and there may be no CDATA section, and no end tag of a raw-text element
+/// that the `Html` did not open (one may be open around it, in HTML that this
+/// SVG or MathML holds, such as a `<foreignObject>`).
+fn html_inside(html: &str, place: &str) -> Option<String> {
+    let b = html.as_bytes();
+    // In a comment: what ends it (`-->`, `--!>`; a bogus comment such as
+    // `<!x ...>` ends at the first `>`). A value next to it cannot add a `>`
+    // (strings are escaped), and the text after it is checked when compiled.
+    if place == "comment" || place == "bogus comment" {
+        let ends = if place == "comment" { html.contains("-->") || html.contains("--!>") } else { html.contains('>') };
+        return ends.then(|| {
+            format!(
+                "`Html` inserted into a {place} holds what ends it (`{}`), which would turn the rest into \
+                 markup; insert a string (it is escaped) instead",
+                if place == "comment" { "-->" } else { ">" }
+            )
+        });
+    }
+    if place != "foreign" {
+        let at = html.match_indices("</").find(|&(i, _)| tag_name_at(b, i + 2, place));
+        return at.map(|_| {
+            format!(
+                "`Html` inserted into a `<{place}>` holds its end tag `</{place}`, which would end the element \
+                 there; insert a string (it is escaped) instead"
+            )
+        });
+    }
+    let refused = |what: &str| {
+        Some(format!(
+            "`Html` inserted inside `<svg>` or `<math>` holds {what}, which browsers read as markup there (it \
+             was checked as HTML); insert it outside the SVG or MathML, or write the element's text without `<`"
+        ))
+    };
+    let mut i = 0;
+    while let Some(off) = html[i..].find('<') {
+        i += off;
+        if b[i + 1..].starts_with(b"![CDATA[") {
+            return refused("a CDATA section");
+        }
+        if b.get(i + 1) == Some(&b'/') {
+            if let Some(t) = RAW_TEXT_TAGS.iter().find(|t| tag_name_at(b, i + 2, t)) {
+                return refused(&format!("the end tag `</{t}` of an element it did not open"));
+            }
+        } else if let Some(t) = RAW_TEXT_TAGS.iter().find(|t| tag_name_at(b, i + 1, t)) {
+            // Its text, up to its end tag, may hold no `<`.
+            let text = i + 1 + t.len();
+            let end = html[text..].find('<').map(|o| text + o);
+            match end {
+                Some(e) if b.get(e + 1) == Some(&b'/') && tag_name_at(b, e + 2, t) => i = e + 2 + t.len(),
+                _ => return refused(&format!("a `<{t}>` whose text holds `<` (or does not end)")),
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 fn int(v: &Value) -> i64 {
     match v {
         Value::Int(i) => *i,
@@ -187,6 +268,10 @@ fn char_slice(text: &str, start: i64, len: Option<i64>) -> String {
 }
 
 fn number_format(f: f64, decimals: usize) -> String {
+    // The sign of an infinity is kept (it has no digits to tell it by below).
+    if f.is_infinite() {
+        return if f < 0.0 { "-inf" } else { "inf" }.to_string();
+    }
     // Round half away from zero like PHP (Rust's formatting rounds half to even).
     let p = 10f64.powi(decimals as i32);
     let rounded = (f.abs() * p).round() / p;
@@ -1220,6 +1305,14 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             let body = if vm.out.len() > 1 { vm.out.pop().map(|o| o.buf).unwrap_or_default() } else { String::new() };
             Ok(Value::html(body))
         },
+        "__html_inside" => |_, a| {
+            if let Value::Html(h) = &a[0] {
+                if let Some(msg) = html_inside(h, s(&a[1])) {
+                    return Err(VmError::Fatal(msg));
+                }
+            }
+            Ok(a[0].clone())
+        },
         "__locals_get" => |vm, a| {
             let key = s(&a[0]);
             Ok(vm
@@ -1334,6 +1427,8 @@ mod tests {
     fn formats_numbers() {
         assert_eq!(number_format(1234567.891, 2), "1,234,567.89");
         assert_eq!(number_format(-1234.5, 0), "-1,235");
+        assert_eq!(number_format(f64::NEG_INFINITY, 2), "-inf");
+        assert_eq!(number_format(f64::INFINITY, 0), "inf");
         assert_eq!(number_format(999.0, 0), "999");
         assert_eq!(char_slice("こんにちは", 1, Some(2)), "んに");
         assert_eq!(char_slice("hello", -3, None), "llo");
