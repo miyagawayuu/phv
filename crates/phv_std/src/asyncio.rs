@@ -156,7 +156,7 @@ pub fn wait(vm: &mut Vm, a: &[Value]) -> R {
                 }
                 Err(_) => {
                     vm.check_limits()?;
-                    Err(("NetworkError", "the operation timed out".to_string()))
+                    Err(("NetworkError", crate::netio::TIME_LIMIT.to_string()))
                 }
             }
         }

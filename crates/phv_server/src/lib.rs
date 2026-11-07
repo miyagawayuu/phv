@@ -1876,10 +1876,30 @@ async fn route_inner(state: &Arc<State>, ip: String, req: Request<Incoming>) -> 
 const FOUND_KEEP: usize = 10_000;
 
 /// What a request path led to, and when that was last found: milliseconds
-/// since `State::started`.
+/// since `State::started`. The entry is keyed by the path alone: an upgrade
+/// request to the same path takes the same entry, and what it leads to is
+/// kept with it once one asked.
 struct FoundEntry {
+    /// What a plain request to the path leads to.
     found: Found,
+    /// What an upgrade request to the path leads to, once one asked: its
+    /// WebSocket script, or `None` when it has none (then `found` answers
+    /// it, as `find` does). Looked at again with `found`.
+    ws: std::sync::OnceLock<WsScript>,
     checked: AtomicU64,
+}
+
+/// The WebSocket script of a path and the parameters of its path, or `None`
+/// when the path has none (see `resolve_ws`).
+type WsScript = Option<(PathBuf, Vec<(String, String)>)>;
+
+/// The answer for an upgrade request to a path, from what the path led to
+/// (`found`) and its WebSocket script (`ws`), as `find` answers it.
+fn for_upgrade(found: &Found, ws: &WsScript) -> Found {
+    match ws {
+        Some((script, params)) => Found::Ws(script.clone(), params.clone()),
+        None => found.clone(),
+    }
 }
 
 /// The most special pages a production server remembers having looked for
@@ -1903,35 +1923,70 @@ async fn locate(state: &Arc<State>, url_path: &str, upgrade: bool) -> Found {
     if state.embedded.is_some() {
         return find(state, url_path, upgrade);
     }
+    let could_not = || Found::RouteError("the request could not be routed".into());
     // Long paths are not remembered (found by the 1.0.0 audit: 10,000 paths of
     // 64 KB each held 680 MB).
-    let key = (!state.dev && url_path.len() <= FOUND_KEY_MAX)
-        .then(|| format!("{}{url_path}", if upgrade { "ws " } else { "" }));
-    if let Some(k) = &key {
-        let known = state.found_cache.lock().unwrap().get(k).cloned();
-        if let Some(e) = known {
-            let (now, last) = (state.now_ms(), e.checked.load(Ordering::Relaxed));
-            let due = now.saturating_sub(last) >= RECHECK.as_millis() as u64;
-            if !due || e.checked.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+    if state.dev || url_path.len() > FOUND_KEY_MAX {
+        let (st, path) = (state.clone(), url_path.to_string());
+        return tokio::task::spawn_blocking(move || find(&st, &path, upgrade)).await.unwrap_or_else(|_| could_not());
+    }
+    // The key is the path as the request spells it (its exact bytes: two
+    // spellings are two entries, as they may be two files), and nothing else:
+    // an upgrade request shares the entry of a plain one.
+    let known = state.found_cache.lock().unwrap().get(url_path).cloned();
+    if let Some(e) = known {
+        let (now, last) = (state.now_ms(), e.checked.load(Ordering::Relaxed));
+        let due = now.saturating_sub(last) >= RECHECK.as_millis() as u64;
+        if !due || e.checked.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            if !upgrade {
                 return e.found.clone();
             }
-        }
-    }
-    let (st, path) = (state.clone(), url_path.to_string());
-    let found = match tokio::task::spawn_blocking(move || find(&st, &path, upgrade)).await {
-        Ok(found) => found,
-        Err(_) => return Found::RouteError("the request could not be routed".into()),
-    };
-    if let Some(k) = key {
-        if !matches!(found, Found::RouteError(_)) {
-            let mut cache = state.found_cache.lock().unwrap();
-            if cache.len() >= FOUND_KEEP {
-                cache.clear();
+            if let Some(ws) = e.ws.get() {
+                return for_upgrade(&e.found, ws);
             }
-            cache.insert(k, Arc::new(FoundEntry { found: found.clone(), checked: state.now_ms().into() }));
+            // The first upgrade request to the path since it was looked at:
+            // looks for its WebSocket script and keeps the answer with the entry.
+            let (st, path) = (state.clone(), url_path.to_string());
+            return match tokio::task::spawn_blocking(move || find_ws(&st, &path)).await {
+                Ok(Ok(ws)) => for_upgrade(&e.found, e.ws.get_or_init(|| ws)),
+                Ok(Err(e)) => Found::RouteError(e),
+                Err(_) => could_not(),
+            };
         }
     }
-    found
+    // Not remembered, or due to be looked at again: what the path leads to,
+    // and its WebSocket script when an upgrade asks.
+    let (st, path) = (state.clone(), url_path.to_string());
+    let looked = tokio::task::spawn_blocking(move || {
+        let found = find(&st, &path, false);
+        let ws = (upgrade && !matches!(found, Found::RouteError(_))).then(|| resolve_ws(&st, &path));
+        (found, ws)
+    });
+    let Ok((found, ws)) = looked.await else { return could_not() };
+    if matches!(found, Found::RouteError(_)) {
+        return found;
+    }
+    let entry = FoundEntry { found: found.clone(), ws: std::sync::OnceLock::new(), checked: state.now_ms().into() };
+    if let Some(ws) = &ws {
+        let _ = entry.ws.set(ws.clone());
+    }
+    let mut cache = state.found_cache.lock().unwrap();
+    if cache.len() >= FOUND_KEEP {
+        cache.clear();
+    }
+    cache.insert(url_path.to_string(), Arc::new(entry));
+    drop(cache);
+    match ws {
+        Some(ws) => for_upgrade(&found, &ws),
+        None => found,
+    }
+}
+
+/// The WebSocket script of `url_path` for an upgrade request (`None` when it
+/// has none), or the error of the routes of `public/`. Looks at files, like `find`.
+fn find_ws(state: &State, url_path: &str) -> Result<WsScript, String> {
+    state.routes()?;
+    Ok(resolve_ws(state, url_path))
 }
 
 fn method_not_allowed() -> Resp {

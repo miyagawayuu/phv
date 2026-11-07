@@ -10,7 +10,15 @@ the page (from sending the edit; the server answers the completion first, so
 this includes it). Their median and p99 (nearest rank: with 20 edits, the
 slowest one) go under "lsp" in bench/results/<short-sha>.json.
 
-    python bench/lsp.py [--edits 20] [--phv target/release/phv] [--out bench/results/<sha>.json]
+With --keystrokes K (more than 1), each edit types the line's start (`$editN =
+$req->`) in K didChange notifications --interval-ms apart, as someone typing
+does, and the completion request follows the last keystroke. The diagnostics
+latency is then taken from the last keystroke to the last publishDiagnostics
+the edit caused (the server is given a quiet moment to show there are no
+more), and "checks" counts those publishDiagnostics per edit: one when the
+server waits for the typing to pause, up to K when it checks every keystroke.
+
+    python bench/lsp.py [--edits 20] [--keystrokes 1] [--interval-ms 50] [--phv target/release/phv] [--out bench/results/<sha>.json]
 """
 
 import argparse
@@ -115,6 +123,18 @@ class Client:
                 return at, msg
             self.pending.append((at, msg))
 
+    def wait_until_quiet(self, matches, quiet: float, timeout: float = 60.0) -> tuple[float, dict, int]:
+        """The last message `matches` accepts (the first within `timeout`), once none
+        came for `quiet` seconds, with the time it arrived and how many were accepted."""
+        at, msg = self.wait(matches, timeout)
+        count = 1
+        while True:
+            try:
+                at, msg = self.wait(matches, quiet)
+            except TimeoutError:
+                return at, msg, count
+            count += 1
+
     def close(self) -> None:
         try:
             rid, _ = self.request("shutdown", {})
@@ -132,9 +152,14 @@ def is_diagnostics_for(uri: str):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--edits", type=int, default=20)
+    ap.add_argument("--keystrokes", type=int, default=1, help="didChange notifications per edit (typing)")
+    ap.add_argument("--interval-ms", type=float, default=50.0, help="between keystrokes")
     ap.add_argument("--phv", type=Path, default=None)
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
+    if args.keystrokes < 1:
+        print("error: --keystrokes must be at least 1", file=sys.stderr)
+        return 1
     phv = args.phv or default_phv()
     if not phv.exists():
         print(f"error: {phv} does not exist; build it with: cargo build --release -p phv_cli", file=sys.stderr)
@@ -166,15 +191,27 @@ def main() -> int:
 
         diagnostics_ms: list[float] = []
         completion_ms: list[float] = []
+        checks: list[int] = []
         items = 0
+        keystrokes = args.keystrokes
+        # Long enough for a check that is under way to end: a few times one check.
+        quiet = max(0.3, 3 * open_ms / 1000)
+        version = 0
         for i in range(1, args.edits + 1):
             prefix = f"$edit{i} = $req->"
-            line = f'{prefix}query("q{i}");\n'
-            new_text = base + line
-            sent_edit = client.notify(
-                "textDocument/didChange",
-                {"textDocument": {"uri": uri, "version": i}, "contentChanges": [{"text": new_text}]},
-            )
+            if keystrokes == 1:
+                typed = [f'{prefix}query("q{i}");\n']
+            else:
+                # The line's start, a few characters per keystroke; the last one types `>`.
+                typed = [prefix[: -(-len(prefix) * j // keystrokes)] + "\n" for j in range(1, keystrokes + 1)]
+            for j, text_now in enumerate(typed):
+                if j:
+                    time.sleep(args.interval_ms / 1000)
+                version += 1
+                sent_edit = client.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": uri, "version": version}, "contentChanges": [{"text": base + text_now}]},
+                )
             rid, sent_completion = client.request(
                 "textDocument/completion",
                 {
@@ -186,7 +223,11 @@ def main() -> int:
             at, reply = client.wait(lambda m, rid=rid: m.get("id") == rid)
             completion_ms.append((at - sent_completion) * 1000)
             items += len(reply.get("result") or [])
-            at, _ = client.wait(is_diagnostics_for(uri))
+            if keystrokes == 1:
+                at, _ = client.wait(is_diagnostics_for(uri))
+            else:
+                at, _, count = client.wait_until_quiet(is_diagnostics_for(uri), quiet)
+                checks.append(count)
             diagnostics_ms.append((at - sent_edit) * 1000)
     finally:
         client.close()
@@ -207,16 +248,24 @@ def main() -> int:
             "p99": round(percentile(completion_ms, 0.99), 3),
         },
     }
+    if keystrokes > 1:
+        section["keystrokes"] = keystrokes
+        section["interval_ms"] = args.interval_ms
+        section["checks_per_edit"] = round(statistics.mean(checks), 2)
     doc = json.loads(out.read_text(encoding="utf-8")) if out.exists() else {"commit": sha}
-    doc["lsp"] = section
+    # A typing session is a measurement of its own, beside the plain one.
+    doc["lsp_typing" if keystrokes > 1 else "lsp"] = section
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8", newline="") as f:
         json.dump(doc, f, indent=2)
         f.write("\n")
-    print(f"{section['document']}: open {open_ms:.1f} ms; over {args.edits} edits:")
+    typing = f", {keystrokes} keystrokes {args.interval_ms:g} ms apart" if keystrokes > 1 else ""
+    print(f"{section['document']}: open {open_ms:.1f} ms; over {args.edits} edits{typing}:")
     print(f"  diagnostics  median {section['diagnostics_ms']['median']:.2f} ms  p99 {section['diagnostics_ms']['p99']:.2f} ms")
     print(f"  completion   median {section['completion_ms']['median']:.2f} ms  p99 {section['completion_ms']['p99']:.2f} ms")
-    print(f"Wrote the lsp section of {out}")
+    if keystrokes > 1:
+        print(f"  checks       {section['checks_per_edit']:.2f} per edit")
+    print(f"Wrote the {'lsp_typing' if keystrokes > 1 else 'lsp'} section of {out}")
     return 0
 
 

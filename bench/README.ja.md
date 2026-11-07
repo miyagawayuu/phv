@@ -67,6 +67,13 @@ JIT ありで `runs` 回(既定で 5 回)、JIT なし(`PHV_JIT=0`)で `runs` �
 補完を先に答えるので、その時間を含みます)。`median` と `p99` は 20 回の編集に対するもので、20 個の
 標本では p99 はいちばん遅い 1 回です。`open_ms` は `didOpen` から最初の診断までの時間です。
 
+`--keystrokes K`(2 以上)を付けると、編集ごとに行の先頭(`$editN = $req->`)を `K` 回の `didChange` に
+分けて `--interval-ms`(50)の間隔で送り、人が打つのと同じ形にして、最後のキーの直後に補完リクエストを
+送ります。このとき `diagnostics_ms` は最後のキーから、その編集で出た最後の `publishDiagnostics` までの
+時間です(もう来ないことを確かめるために少し待ちます)。`checks_per_edit` はその `publishDiagnostics` の
+数で、サーバーが入力の切れ目を待ってから検査すれば 1、キーごとに検査すれば最大 `K` です。これらは `lsp` の
+横の `lsp_typing` に入ります。
+
 ## 2 つのコミットを比べる
 
 ```powershell

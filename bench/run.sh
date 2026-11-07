@@ -148,13 +148,13 @@ size="$(binary_bytes "$phv")"
     printf '  ]\n'
     printf '}\n'
 } >"$out.new"
-# Keep the serve / lsp sections of an earlier run of the same commit.
+# Keep the serve / lsp / lsp_typing sections of an earlier run of the same commit.
 if [ -f "$out" ] && have_python; then
     "$(python_bin)" -I - "$out" "$out.new" <<'EOF'
 import json, sys
 old = json.load(open(sys.argv[1], encoding="utf-8"))
 new = json.load(open(sys.argv[2], encoding="utf-8"))
-for section in ("serve", "lsp"):
+for section in ("serve", "lsp", "lsp_typing"):
     if section in old:
         new[section] = old[section]
 with open(sys.argv[2], "w", encoding="utf-8", newline="") as f:

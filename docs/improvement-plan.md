@@ -19,8 +19,6 @@ before the release.
 
 | Item | Code | Change | Risk | Measure | Size |
 |---|---|---|---|---|---|
-| PostgreSQL reset without `DISCARD PLANS` | `crates/phv_std/src/netdb.rs` (`PG_RESET`) | Drop `DISCARD PLANS` from the reset: the server invalidates cached plans itself when the schema changes, so the statement only costs a round trip | None for correctness; check that a schema change by one page is seen by the next on the same connection (a test exists for the kept statements) | PostgreSQL page p50 after the response (teardown time in `phv_workers_busy`) | S |
-| MySQL reset in one round trip | `crates/phv_std/src/netdb.rs` (`MyConn::reset`) | Send `COM_RESET_CONNECTION` and the settings that follow it as one pipelined exchange | The order of the replies must be checked as now | Same | S |
 | Lazy session values | `crates/phv_server/src/session.rs` | Read and promote the session record as now, but decode its values only at the first `session()` call of the page | The `last` update, the promotion and the cookie must stay eager, or sessions expire differently | Home page p50 with a session cookie | M |
 | Redis pipelining | `crates/phv_std/src/redisclient.rs`, `netdb.rs`, the spec | A `pipeline()` on the Redis client that sends several commands and reads their replies together; the job and session stores use it where they send more than one command | A new API: needs its section in the spec and the reference, and the reply limits apply per command | Jobs added per second in `databases.rs` | M |
 | `phv jobs adopt` | `crates/phv_cli/src/jobs.rs`, `netdb.rs`, the spec | Move the jobs a site left in the shared store before it had a namespace (`phv jobs list` counts them) into the site's own table or keys | Must not take another site's jobs: only rows whose site name matches, with a dry run first | The test of `left_in_shared` extended | M |
@@ -31,21 +29,13 @@ before the release.
 |---|---|---|---|---|---|
 | mimalloc under the counting allocator | `crates/phv_vm/src/alloc.rs`, `Cargo.toml` | Put mimalloc under `CountingAlloc` as the system allocator; the counting and the per-thread charging stay | A new C dependency in the supply chain (pinned, audited); Windows and musl builds must link it | `bench/run.*` rows (object creation, strings) | S |
 | Lazy JIT | `crates/phv_jit/src/lib.rs`, `phv_vm` | Compile a function at its Nth call instead of at load, and share the compiled code of the standard library between scripts of a process | The eligibility test and `step()` do not change; a function must run identically before and after it is compiled (the differential test) | Compile time of a page (`phv_workers_busy` at the first requests), the micro-benchmarks unchanged | M |
-| Lazy exception traces | `crates/phv_vm/src/vm.rs` | Build the trace of an exception when it is read (`getTrace()`, an uncaught exception), not when it is thrown | The trace must be the same as now; the frames must be captured cheaply at the throw | "Throwing and catching 100,000 exceptions" | S |
 | Callback fast path | `crates/phv_std/src/lists.rs`, `phv_vm` | `map()`, `filter()` and their kind call a closure without a full frame when it has no `finally` and no captures by the VM | Error positions and traces must not change | "map / filter / sum" | M |
-| Bytecode cache freshness | `crates/phv_compiler/src/cache.rs` | Compare size as well as modification time, so a file rewritten within the same second is seen | None | A test with a file changed within one second | S |
-| Smaller gzip level for streamed pages | `crates/phv_server/src/lib.rs` | Level 1 for responses that stream, as the time per chunk matters more than the size | None | p50 of a flushed page | S |
-| Metrics and rate-limit locks | `crates/phv_server/src/metrics.rs`, `crates/phv_std/src/ratelimit.rs` | Shard the maps by key so that requests do not contend on one lock | The counts must still be exact | Requests per second at 16 connections | S |
-| `locate` keyed by the request's path only | `crates/phv_server/src/lib.rs` | The route cache's key does not include what cannot change the result | Must not merge two paths that differ in case on a case-sensitive file system | Deep page p50 | S |
 
 ### Tools
 
 | Item | Code | Change | Risk | Measure | Size |
 |---|---|---|---|---|---|
-| Editor debounce and reuse | `crates/phv_cli/src/lsp.rs` | Wait 150 ms of quiet before re-checking a changed document, and reuse the parse of the last check for completion | Diagnostics must still appear within a second of the last keystroke | `bench/lsp.py` | S |
 | Split `netdb.rs` | `crates/phv_std/src/netdb.rs` (5,767 lines) → `netdb/{pool,pg,my,redis,jobs,publish,ratelimit,migrate}.rs` | A mechanical split: no code changes, the tests stay where they are | None if mechanical; review the diff with `--color-moved` | The tests pass; `git log --follow` works per file | S |
-| One wording for time-outs | 22 places in `crates/phv_std` and `crates/phv_server` | The errors that say a script or a connection ran out of time use one sentence | §18 allows the wording to change; the golden tests change with it | The golden tests | S |
-| HTTP client connection reuse for POST and PUT | `crates/phv_std/src/httpclient.rs` | Keep the connection after a request with a body, as after GET | The response must be read to its end first, or the connection is closed as now | HTTP client calls per second in its tests | S |
 
 ## 1.3 (the next minor release)
 

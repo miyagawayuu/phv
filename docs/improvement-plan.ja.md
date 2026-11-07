@@ -17,8 +17,6 @@
 
 | 項目 | コード | 変更 | リスク | 測り方 | 規模 |
 |---|---|---|---|---|---|
-| PostgreSQL のリセットから `DISCARD PLANS` を外す | `crates/phv_std/src/netdb.rs`(`PG_RESET`) | スキーマが変わればサーバーがキャッシュした計画を自分で無効にするので、この文は往復 1 回ぶんの費用しかない | 正しさには影響なし。あるページのスキーマ変更が同じ接続の次のページに見えることを確かめる(保持する文のテストがある) | 応答のあとの PostgreSQL のページの p50(`phv_workers_busy` に出る片付けの時間) | S |
-| MySQL のリセットを 1 往復に | `crates/phv_std/src/netdb.rs`(`MyConn::reset`) | `COM_RESET_CONNECTION` とそれに続く設定を 1 つのパイプラインで送る | 返事の順序は今と同じく確かめること | 同上 | S |
 | セッションの値の遅延読み込み | `crates/phv_server/src/session.rs` | セッションのレコードの読み込みと昇格は今のまま、値の復号はページの最初の `session()` まで遅らせる | `last` の更新・昇格・Cookie は eager のままにしないと、期限の切れ方が変わる | セッション Cookie つきのトップページの p50 | M |
 | Redis のパイプライン | `crates/phv_std/src/redisclient.rs`、`netdb.rs`、仕様 | 複数のコマンドを送って返事をまとめて読む `pipeline()` を Redis クライアントに加え、ジョブとセッションのストアで 2 つ以上のコマンドを送る場所で使う | 新しい API: 仕様とリファレンスに節が要る。返事の上限はコマンドごとに適用する | `databases.rs` での毎秒のジョブの追加数 | M |
 | `phv jobs adopt` | `crates/phv_cli/src/jobs.rs`、`netdb.rs`、仕様 | 名前空間を持つ前にサイトが共有ストアに残したジョブ(`phv jobs list` が数える)を、サイト自身のテーブルやキーに移す | 別のサイトのジョブを取らないこと: サイト名が一致する行だけ、最初はドライラン | `left_in_shared` のテストを広げる | M |
@@ -29,21 +27,13 @@
 |---|---|---|---|---|---|
 | 計数する割り当て器の下に mimalloc | `crates/phv_vm/src/alloc.rs`、`Cargo.toml` | システムの割り当て器として `CountingAlloc` の下に mimalloc を置く。計数とスレッドごとの計上はそのまま | サプライチェーンに新しい C の依存(固定し、監査する)。Windows と musl のビルドでリンクできること | `bench/run.*` の行(オブジェクト生成、文字列) | S |
 | 遅延 JIT | `crates/phv_jit/src/lib.rs`、`phv_vm` | 関数を読み込み時ではなく N 回目の呼び出しでコンパイルし、標準ライブラリのコンパイル済みコードをプロセスのスクリプト間で共有する | 対象の判定と `step()` は変えない。コンパイルの前後で関数は同じに動くこと(差分テスト) | ページのコンパイル時間(最初のリクエストでの `phv_workers_busy`)。マイクロベンチマークは変わらない | M |
-| 例外のトレースの遅延 | `crates/phv_vm/src/vm.rs` | 例外のトレースを投げたときではなく読んだとき(`getTrace()`、捕まえられなかった例外)に組み立てる | トレースは今と同じであること。投げるときのフレームの記録は安く済ませる | 「Throwing and catching 100,000 exceptions」 | S |
 | コールバックの高速経路 | `crates/phv_std/src/lists.rs`、`phv_vm` | `map()`・`filter()` の類は、`finally` もキャプチャもないクロージャーを完全なフレームなしで呼ぶ | エラーの位置とトレースが変わらないこと | 「map / filter / sum」 | M |
-| バイトコードキャッシュの新しさ | `crates/phv_compiler/src/cache.rs` | 更新時刻に加えてサイズも比べ、同じ秒の中で書き換えたファイルも見える | なし | 1 秒の中で変えたファイルのテスト | S |
-| ストリーミングのページの gzip レベルを下げる | `crates/phv_server/src/lib.rs` | ストリーミングする応答はレベル 1。チャンクごとの時間のほうがサイズより大事 | なし | flush するページの p50 | S |
-| メトリクスとレート制限のロック | `crates/phv_server/src/metrics.rs`、`crates/phv_std/src/ratelimit.rs` | マップをキーで分割し、リクエストが 1 つのロックで競合しないようにする | 数は引き続き正確であること | 16 接続での毎秒のリクエスト数 | S |
-| `locate` のキーをリクエストのパスだけに | `crates/phv_server/src/lib.rs` | ルートのキャッシュのキーに、結果を変えないものを含めない | 大文字小文字を区別するファイルシステムで、大文字小文字だけが違う 2 つのパスをまとめないこと | 深いページの p50 | S |
 
 ### ツール
 
 | 項目 | コード | 変更 | リスク | 測り方 | 規模 |
 |---|---|---|---|---|---|
-| エディターのデバウンスと再利用 | `crates/phv_cli/src/lsp.rs` | 変わった文書を検査し直す前に 150 ms の静けさを待ち、補完では最後の検査の構文解析を使い回す | 最後の入力から 1 秒以内に診断が出ること | `bench/lsp.py` | S |
 | `netdb.rs` の分割 | `crates/phv_std/src/netdb.rs`(5,767 行)→ `netdb/{pool,pg,my,redis,jobs,publish,ratelimit,migrate}.rs` | 機械的な分割: コードは変えず、テストはそのまま | 機械的ならなし。差分は `--color-moved` で見る | テストが通る。ファイルごとの `git log --follow` が効く | S |
-| 時間切れの文言を 1 つに | `crates/phv_std` と `crates/phv_server` の 22 か所 | スクリプトや接続の時間切れを言うエラーを 1 つの文にする | §18 は文言の変更を許す。ゴールデンテストも一緒に変わる | ゴールデンテスト | S |
-| HTTP クライアントの POST・PUT での接続の再利用 | `crates/phv_std/src/httpclient.rs` | ボディのあるリクエストのあとも GET のあとと同じく接続を保つ | 応答を最後まで読んでからにすること。でなければ今と同じく閉じる | そのテストでの毎秒の呼び出し数 | S |
 
 ## 1.3(次のマイナーリリース)
 

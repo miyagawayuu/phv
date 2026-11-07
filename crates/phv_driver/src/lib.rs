@@ -1316,9 +1316,10 @@ fn call_caught(vm: &mut Vm, func: u32) -> Option<RuntimeError> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.call_function(func, &[]).map(|_| ())));
     match result {
         Ok(Ok(())) => None,
-        Ok(Err(VmError::Exception(e))) => {
-            Some(RuntimeError { message: format!("Uncaught {}", vm.describe_exception(&e)), trace: e.trace })
-        }
+        Ok(Err(VmError::Exception(e))) => Some(RuntimeError {
+            message: format!("Uncaught {}", vm.describe_exception(&e)),
+            trace: vm.exception_trace_lines(&e),
+        }),
         Ok(Err(VmError::Fatal(m))) => Some(RuntimeError { message: format!("Fatal error: {m}"), trace: Vec::new() }),
         Err(panic) => {
             let msg = panic

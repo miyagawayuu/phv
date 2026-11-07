@@ -1,0 +1,54 @@
+same before and after
+at bottom (lib/trace.phv:6)
+at bottom (lib/trace.phv:8)
+at readEarly (exceptions_trace_lazy.phv:11)
+at {main} (exceptions_trace_lazy.phv:32)
+[finally 1]
+-- 0: bottom
+at bottom (lib/trace.phv:6)
+at bottom (lib/trace.phv:8)
+at bottom (lib/trace.phv:8)
+at {closure} (exceptions_trace_lazy.phv:43)
+at keep (exceptions_trace_lazy.phv:23)
+at {main} (exceptions_trace_lazy.phv:43)
+-- 1: bottom
+at bottom (lib/trace.phv:6)
+at bottom (lib/trace.phv:8)
+at {closure} (lib/trace.phv:22)
+at throughClosure (lib/trace.phv:23)
+at {closure} (exceptions_trace_lazy.phv:44)
+at keep (exceptions_trace_lazy.phv:23)
+at {main} (exceptions_trace_lazy.phv:44)
+-- 2: bottom
+at bottom (lib/trace.phv:6)
+at Repo::fetch (lib/trace.phv:17)
+at Repo::load (lib/trace.phv:13)
+at {closure} (exceptions_trace_lazy.phv:45)
+at keep (exceptions_trace_lazy.phv:23)
+at {main} (exceptions_trace_lazy.phv:45)
+-- 3: bottom
+at bottom (lib/trace.phv:6)
+at bottom (lib/trace.phv:8)
+at template views/trace.phv.html (views/trace.phv.html:5)
+at {closure} (exceptions_trace_lazy.phv:47)
+at keep (exceptions_trace_lazy.phv:23)
+at {main} (exceptions_trace_lazy.phv:46)
+-- 4: bottom
+at bottom (lib/trace.phv:6)
+at bottom (lib/trace.phv:8)
+at throughFinally (lib/trace.phv:28)
+at {closure} (exceptions_trace_lazy.phv:50)
+at keep (exceptions_trace_lazy.phv:23)
+at {main} (exceptions_trace_lazy.phv:50)
+stable
+[outer finally]
+at bottom (lib/trace.phv:6)
+at {main} (exceptions_trace_lazy.phv:72)
+[]
+[finally 0]
+
+--- runtime error ---
+Uncaught RuntimeException: bottom
+  at throughFinally (lib/trace.phv:30)
+  at {closure} (exceptions_trace_lazy.phv:84)
+  at {main} (exceptions_trace_lazy.phv:85)

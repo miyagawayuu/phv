@@ -1,11 +1,25 @@
 import std.net.HttpClient;
 
-// Requests to one host share a connection; a POST does not take a kept one.
+// Requests to one host share a connection, with or without a body.
 $api = HttpClient::connect("api");
 for ($i = 0; $i < 5; $i++) {
     echo $api->get("/n/{$i}")->body, "\n";
 }
 echo $api->post("/p", "x")->body, "\n";
+echo $api->put("/q", "y")->body, "\n";
 echo $api->get("/n/9")->body, "\n";
+// A response that asked to close, or that did not end where its framing
+// said: the connection is not used again.
 echo $api->get("/close")->body, "\n";
-echo $api->get("/n/10")->body, "\n";
+echo $api->post("/extra", "z")->body, "\n";
+echo $api->post("/n/10", "w")->body, "\n";
+// A connection idle for more than a second is taken by a GET, not by a POST.
+$t = microtime();
+while (microtime() - $t < 1.1) {
+}
+echo $api->get("/n/11")->body, "\n";
+$t = microtime();
+while (microtime() - $t < 1.1) {
+}
+echo $api->post("/n/12", "v")->body, "\n";
+echo $api->post("/n/13", "u")->body, "\n";

@@ -147,6 +147,9 @@ fn server() -> String {
                         )
                     }
                 };
+                // The connection is closed after the answer, so the answer says so
+                // (a POST on a kept connection the server closed is not sent again).
+                let reply = reply.replacen("\r\n", "\r\nConnection: close\r\n", 1);
                 let _ = s.write_all(reply.as_bytes());
             });
         }
@@ -191,10 +194,12 @@ fn requests() {
     golden("requests", &actual);
 }
 
-/// Connections are kept between requests to one host: a server that keeps
-/// them open sees one connection for the GETs and a new one for the POST
-/// (which takes no kept connection); the most recent one kept is used first,
-/// and one whose response asked to close is not used again.
+/// Connections are kept between requests to one host, with or without a
+/// body: a server that keeps them open sees one connection for the GETs, the
+/// POST and the PUT; the most recent one kept is used first; one whose
+/// response asked to close, or did not end where its framing said (bytes
+/// after the body), is not used again; and one idle for more than a second
+/// is taken by a GET but not by a POST.
 #[test]
 fn connections_are_kept_between_requests() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -211,7 +216,9 @@ fn connections_are_kept_between_requests() {
                     let close = r.target.ends_with("/close");
                     let body = format!("{} {} on connection {conn}", r.method, r.target);
                     let extra = if close { "Connection: close\r\n" } else { "" };
-                    let reply = format!("HTTP/1.1 200 OK\r\n{extra}Content-Length: {}\r\n\r\n{body}", body.len());
+                    let after = if r.target.ends_with("/extra") { "xyz" } else { "" };
+                    let reply =
+                        format!("HTTP/1.1 200 OK\r\n{extra}Content-Length: {}\r\n\r\n{body}{after}", body.len());
                     if s.write_all(reply.as_bytes()).is_err() || close {
                         return;
                     }
@@ -224,10 +231,52 @@ fn connections_are_kept_between_requests() {
     assert_eq!(
         out,
         "GET /v1/n/0 on connection 1\nGET /v1/n/1 on connection 1\nGET /v1/n/2 on connection 1\n\
-         GET /v1/n/3 on connection 1\nGET /v1/n/4 on connection 1\nPOST /v1/p on connection 2\n\
-         GET /v1/n/9 on connection 2\nGET /v1/close on connection 2\nGET /v1/n/10 on connection 1\n"
+         GET /v1/n/3 on connection 1\nGET /v1/n/4 on connection 1\nPOST /v1/p on connection 1\n\
+         PUT /v1/q on connection 1\nGET /v1/n/9 on connection 1\nGET /v1/close on connection 1\n\
+         POST /v1/extra on connection 2\nPOST /v1/n/10 on connection 3\nGET /v1/n/11 on connection 3\n\
+         POST /v1/n/12 on connection 4\nPOST /v1/n/13 on connection 4\n"
     );
-    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    assert_eq!(accepted.load(Ordering::SeqCst), 4);
+}
+
+/// A kept connection the server closed meanwhile: a GET is sent again on a
+/// new connection (`late_answers` above), a POST only when it was not
+/// written whole. A server that got the whole POST and closed without
+/// answering may have acted on it: the script gets the error, and the POST
+/// is not sent again.
+#[test]
+fn requests_with_side_effects_are_not_repeated_on_a_closed_connection() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let seen = posts.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                while let Some(r) = read_request(&mut s) {
+                    if r.method == "POST" {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if r.target.ends_with("/drop") {
+                        // Closed without an answer, after the whole request came.
+                        return;
+                    }
+                    let body = format!("{} {}", r.method, r.target);
+                    let reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                    if s.write_all(reply.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let url = format!("http://{addr}/v1");
+    let out = run_script(&host(&url, None), "post_closed", Some(Duration::from_secs(30)));
+    assert_eq!(out, "GET /v1/warm\nNetworkError\nGET /v1/after\n", "{out}");
+    assert_eq!(posts.load(Ordering::SeqCst), 1, "the POST was sent again");
 }
 
 /// Found by the 1.0.0 audit: a kept connection on which bytes arrived while

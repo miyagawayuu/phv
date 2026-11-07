@@ -88,7 +88,7 @@ fn open(url: &str, tls_setting: Option<bool>, until: Instant) -> Result<WebSocke
     let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
     match tungstenite::client::client_with_config(request, stream, Some(config)) {
         Ok((ws, _)) => Ok(ws),
-        Err(HandshakeError::Interrupted(_)) => Err("timed out".into()),
+        Err(HandshakeError::Interrupted(_)) => Err(crate::netio::TIME_LIMIT.into()),
         Err(HandshakeError::Failure(tungstenite::Error::Http(response))) => {
             Err(format!("the server answered HTTP {} instead of accepting the WebSocket", response.status().as_u16()))
         }

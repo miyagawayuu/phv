@@ -1,0 +1,32 @@
+// Functions that throw, for the trace tests (exceptions_trace_lazy.phv): from
+// a template, a closure, a method, a `finally` and nested calls.
+
+export function bottom(int $n): int {
+    if ($n == 0) {
+        throw new RuntimeException("bottom");
+    }
+    return bottom($n - 1) + 1;
+}
+
+export class Repo {
+    public function load(int $id): int {
+        return $this->fetch($id);
+    }
+
+    private function fetch(int $id): int {
+        return bottom($id);
+    }
+}
+
+export function throughClosure(int $n): int {
+    $f = fn(int $x): int => bottom($x);
+    return $f($n);
+}
+
+export function throughFinally(int $n): int {
+    try {
+        return bottom($n);
+    } finally {
+        echo "[finally $n]\n";
+    }
+}

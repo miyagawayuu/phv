@@ -62,7 +62,7 @@ impl Meter {
     fn trip(&self, why: Trip) -> io::Error {
         self.state().tripped = Some(why);
         match why {
-            Trip::Deadline => io::Error::new(io::ErrorKind::TimedOut, "the time limit was reached"),
+            Trip::Deadline => io::Error::new(io::ErrorKind::TimedOut, crate::netio::TIME_LIMIT),
             Trip::Budget => io::Error::other("the result is larger than the memory left to the script"),
         }
     }
@@ -192,7 +192,7 @@ impl PgClient {
         let (client, driver) = rt.block_on(async {
             match tokio::time::timeout(timeout, open(config, tls, meter, until)).await {
                 Ok(r) => r,
-                Err(_) => Err("timed out".to_string()),
+                Err(_) => Err(crate::netio::TIME_LIMIT.to_string()),
             }
         })?;
         Ok(PgClient { client, driver })

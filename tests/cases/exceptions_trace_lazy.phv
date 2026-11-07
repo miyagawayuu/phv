@@ -1,0 +1,85 @@
+<?phv
+// The text of a trace is made when it is read, from the calls recorded when
+// the exception was thrown. Read while those calls are still on the stack or
+// after they returned, read once or again, read after a rethrow, or from an
+// exception kept while thousands of others were thrown: the text is the same.
+// Thrown from nested calls, a closure, a method, a template and a `finally`.
+import lib.trace.{bottom, Repo, throughClosure, throughFinally};
+
+function readEarly(): string {
+    try {
+        bottom(1);
+    } catch (RuntimeException $e) {
+        // Read in the frame that threw, before it returns (the calls are live).
+        $early = $e->getTraceAsString();
+        // Rethrown: it keeps the place it was first thrown, read later.
+        throw new LogicException($early, previous: $e);
+    }
+    return "";
+}
+
+function keep(fn(): int $f): RuntimeException {
+    try {
+        $f();
+    } catch (RuntimeException $e) {
+        return $e;
+    }
+    return new RuntimeException("not thrown");
+}
+
+// Before (in the frame that threw) and after (the frames returned, rethrown).
+try {
+    readEarly();
+} catch (LogicException $e) {
+    $before = $e->getMessage();
+    $after = $e->getPrevious()?->getTraceAsString() ?? "";
+    echo $before == $after ? "same before and after\n" : "DIFFERENT:\n$before\n--\n$after\n";
+    echo $after, "\n";
+}
+
+// Nested calls, a closure, a method, a template and a `finally`: the traces
+// are read after every frame between the throw and here returned.
+list<RuntimeException> $kept = [
+    keep(fn() => bottom(2)),
+    keep(fn() => throughClosure(1)),
+    keep(fn() => (new Repo())->load(0)),
+    keep(function (): int {
+        render("views/trace.phv.html", n: 1);
+        return 0;
+    }),
+    keep(fn() => throughFinally(1)),
+];
+// Thousands of other exceptions thrown and freed in between.
+for ($i = 0; $i < 3000; $i++) {
+    try {
+        bottom(0);
+    } catch (RuntimeException $e) {
+    }
+}
+foreach ($kept as $k => $e) {
+    echo "-- $k: ", $e->getMessage(), "\n", $e->getTraceAsString(), "\n";
+}
+// Read again: the same text.
+$again = true;
+foreach ($kept as $e) {
+    $again = $again && $e->getTraceAsString() == $e->getTraceAsString();
+}
+echo $again ? "stable\n" : "changed\n";
+
+// Caught, rethrown through a `finally`, caught again: the first place.
+try {
+    try {
+        bottom(0);
+    } finally {
+        echo "[outer finally]\n";
+    }
+} catch (RuntimeException $e) {
+    echo $e->getTraceAsString(), "\n";
+}
+
+// An exception never thrown has no trace.
+echo "[", (new RuntimeException("unthrown"))->getTraceAsString(), "]\n";
+
+// Uncaught, through a closure and a `finally`: the trace of the error.
+$last = fn(): int => throughFinally(0);
+$last();

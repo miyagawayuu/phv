@@ -18,7 +18,8 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
 
 /// Messages on the stream, with the length of their body: `None` means the
 /// stream ended or its framing is broken (nothing more can be read); a message
@@ -85,19 +86,45 @@ struct Inbox {
 }
 
 impl Inbox {
-    /// Waits for a message, then takes every one already waiting with it.
-    /// Empty once the stream has ended.
-    fn batch(&self) -> Vec<Option<Value>> {
-        let Ok(first) = self.rx.recv() else { return Vec::new() };
+    /// Waits for a message, at most until `until`, then takes every one
+    /// already waiting with it. Empty when `until` came first; `None` once the
+    /// stream has ended.
+    fn batch(&self, until: Option<Instant>) -> Option<Vec<Option<Value>>> {
+        let first = match until {
+            None => self.rx.recv().ok()?,
+            Some(at) => match self.rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(first) => first,
+                Err(RecvTimeoutError::Timeout) => return Some(Vec::new()),
+                Err(RecvTimeoutError::Disconnected) => return None,
+            },
+        };
         let mut batch = vec![first];
         batch.extend(self.rx.try_iter());
-        batch
-            .into_iter()
-            .map(|(msg, cost)| {
-                let _ = self.taken.send(cost);
-                msg
-            })
-            .collect()
+        Some(
+            batch
+                .into_iter()
+                .map(|(msg, cost)| {
+                    let _ = self.taken.send(cost);
+                    msg
+                })
+                .collect(),
+        )
+    }
+}
+
+/// How long after the last change of a document its check waits for the next
+/// one: an editor sends a change per keystroke, and checking each would fall
+/// behind a fast typist (the check of a half-typed line is not wanted anyway).
+/// A document that was opened or saved is checked at once.
+const DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Puts `p` on the list of documents to check, at `at`. A change replaces
+/// the time (the pending check waits for the next change); an open or a
+/// save never delays one.
+fn schedule(due: &mut Vec<(PathBuf, Instant)>, p: PathBuf, at: Instant, replace: bool) {
+    match due.iter_mut().find(|(d, _)| *d == p) {
+        Some((_, t)) => *t = if replace { at } else { (*t).min(at) },
+        None => due.push((p, at)),
     }
 }
 
@@ -386,6 +413,10 @@ struct Server {
     analyses: std::cell::RefCell<HashMap<PathBuf, Kept>>,
     /// Counts the uses of kept analyses (the least recently used is dropped).
     uses: std::cell::Cell<u64>,
+    /// The generation and time of the last check of each open document: a
+    /// save right after it (no change since, within `ANALYSIS_AGE`) does not
+    /// check it again.
+    checked: HashMap<PathBuf, (u64, Instant)>,
 }
 
 impl Server {
@@ -398,6 +429,7 @@ impl Server {
             generation: 0,
             analyses: Default::default(),
             uses: Default::default(),
+            checked: HashMap::new(),
         }
     }
 
@@ -615,8 +647,14 @@ impl Server {
         if path.to_string_lossy().ends_with(".phv.html") {
             return; // templates are checked through the pages that render them
         }
+        // Checked already as it is now (a save right after the check of the
+        // last change): the diagnostics published stand.
+        if self.checked.get(path).is_some_and(|(g, at)| *g == self.generation && at.elapsed() < ANALYSIS_AGE) {
+            return;
+        }
         let root = find_root(path);
         let a = analyze(&root, path, self.overlay());
+        self.checked.insert(path.to_path_buf(), (self.generation, Instant::now()));
         let mut by_file: HashMap<String, Vec<Value>> = HashMap::new();
         let entry_uri = path_to_uri(path);
         by_file.entry(entry_uri.clone()).or_default();
@@ -729,19 +767,18 @@ fn doc_path(params: &Value) -> Option<PathBuf> {
 
 /// Answers messages until the stream ends (`None`) or `exit` arrives (its exit code).
 /// Every message already waiting is taken at once: text changes first, then the
-/// rest in the order they came (so requests see the newest text), then one check
-/// per document that changed, however many edits arrived during the last check.
+/// rest in the order they came (so requests see the newest text), then the checks
+/// that are due: one per document that was opened or saved, and one per changed
+/// document `DEBOUNCE` after its last change, however many edits arrived
+/// meanwhile. The wait for the next message ends when a check comes due.
 fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
     let mut server = Server::new();
     let mut shutting_down = false;
     let mut cancelled: VecDeque<Value> = VecDeque::new();
+    // Documents to check and when, in the order they were put there.
+    let mut due: Vec<(PathBuf, Instant)> = Vec::new();
     loop {
-        let batch = inbox.batch();
-        if batch.is_empty() {
-            return None;
-        }
-        // Documents to check once the batch is answered, in the order they changed.
-        let mut changed: Vec<PathBuf> = Vec::new();
+        let batch = inbox.batch(due.iter().map(|(_, at)| *at).min())?;
         for msg in batch.iter().flatten() {
             let params = &msg["params"];
             guarded(out, None, |_| match msg["method"].as_str().unwrap_or("") {
@@ -756,9 +793,7 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                         let text = server.admit(&p, text);
                         server.open.insert(p.clone(), text);
                         server.changed();
-                        if !changed.contains(&p) {
-                            changed.push(p);
-                        }
+                        schedule(&mut due, p, Instant::now(), false);
                     }
                 }
                 "textDocument/didChange" => {
@@ -770,9 +805,7 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                             server.open.insert(p.clone(), text);
                         }
                         server.changed();
-                        if !changed.contains(&p) {
-                            changed.push(p);
-                        }
+                        schedule(&mut due, p, Instant::now() + DEBOUNCE, true);
                     }
                 }
                 "textDocument/didClose" => {
@@ -781,8 +814,9 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                         server.too_large.remove(&p);
                         server.canonical.remove(&p);
                         server.reported.remove(&p);
+                        server.checked.remove(&p);
                         server.changed();
-                        changed.retain(|c| *c != p);
+                        due.retain(|(d, _)| *d != p);
                     }
                 }
                 "$/cancelRequest" => {
@@ -855,9 +889,7 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                 "textDocument/didSave" => {
                     // Only documents the editor opened are checked.
                     if let Some(p) = doc_path(params).filter(|p| server.open.contains_key(p)) {
-                        if !changed.contains(&p) {
-                            changed.push(p);
-                        }
+                        schedule(&mut due, p, Instant::now(), false);
                     }
                     None
                 }
@@ -946,9 +978,16 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                 send(out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
             }
         }
-        for p in changed {
-            guarded(out, None, |out| server.check(&p, out));
+        let now = Instant::now();
+        let mut later = Vec::new();
+        for (p, at) in std::mem::take(&mut due) {
+            if at <= now {
+                guarded(out, None, |out| server.check(&p, out));
+            } else {
+                later.push((p, at));
+            }
         }
+        due = later;
     }
 }
 
@@ -1034,30 +1073,103 @@ mod tests {
         json!({ "jsonrpc": "2.0", "method": method, "params": params })
     }
 
+    /// What the server writes, one frame per message, with the time of each.
+    struct Timed {
+        buf: Vec<u8>,
+        frames: Vec<(Instant, Vec<u8>)>,
+    }
+
+    impl Write for Timed {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.buf.extend_from_slice(b);
+            Ok(b.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if !self.buf.is_empty() {
+                self.frames.push((Instant::now(), std::mem::take(&mut self.buf)));
+            }
+            Ok(())
+        }
+    }
+
+    /// Runs the server on its own thread and sends it `msgs`, each after its
+    /// delay (from the one before), then ends the stream `settle` after the
+    /// last: what it wrote, with the time of each message, and when each
+    /// message was sent.
+    fn serve_timed(msgs: Vec<(Duration, Value)>, settle: Duration) -> (Vec<(Instant, Value)>, Vec<Instant>) {
+        let (tx, rx) = mpsc::channel();
+        let (taken, _) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut out = Timed { buf: Vec::new(), frames: Vec::new() };
+            assert_eq!(serve(&Inbox { rx, taken }, &mut out), None);
+            out.frames
+        });
+        let mut sent = Vec::new();
+        for (delay, msg) in msgs {
+            std::thread::sleep(delay);
+            sent.push(Instant::now());
+            tx.send((Some(msg), 0)).unwrap();
+        }
+        std::thread::sleep(settle);
+        drop(tx);
+        let frames = server.join().unwrap();
+        let got =
+            frames.into_iter().map(|(at, bytes)| (at, read_message(&mut &bytes[..]).unwrap().0.unwrap())).collect();
+        (got, sent)
+    }
+
+    /// A burst of changes (20, 10 ms apart, as typing) is checked once,
+    /// `DEBOUNCE` after the last one and within a second of it, and a save
+    /// right after a check does not check the document again.
     #[test]
     fn checks_a_burst_of_edits_once() {
         let p = Project::new("burst");
         let uri = path_to_uri(&p.dir.join("page.phv"));
-        let mut msgs = vec![notification(
-            "textDocument/didOpen",
-            json!({ "textDocument": { "uri": uri, "languageId": "phv", "version": 0, "text": "" } }),
+        let mut msgs = vec![(
+            Duration::ZERO,
+            notification(
+                "textDocument/didOpen",
+                json!({ "textDocument": { "uri": uri, "languageId": "phv", "version": 0, "text": "" } }),
+            ),
         )];
-        for i in 1..=100 {
-            msgs.push(notification(
-                "textDocument/didChange",
-                json!({
-                    "textDocument": { "uri": uri, "version": i },
-                    "contentChanges": [{ "text": format!("<?phv\necho $missing{i};\n") }],
-                }),
+        for i in 1..=20 {
+            msgs.push((
+                Duration::from_millis(10),
+                notification(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": { "uri": uri, "version": i },
+                        "contentChanges": [{ "text": format!("<?phv\necho $missing{i};\n") }],
+                    }),
+                ),
             ));
         }
-        let got = serve_batch(msgs);
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0]["method"], "textDocument/publishDiagnostics");
-        assert_eq!(got[0]["params"]["uri"], uri);
-        let diags = got[0]["params"]["diagnostics"].as_array().unwrap();
+        msgs.push((
+            Duration::from_millis(600),
+            notification("textDocument/didSave", json!({ "textDocument": { "uri": uri } })),
+        ));
+        let (got, sent) = serve_timed(msgs, Duration::from_millis(400));
+        let published: Vec<&(Instant, Value)> =
+            got.iter().filter(|(_, m)| m["method"] == "textDocument/publishDiagnostics").collect();
+        // The open at once, the burst once (a gap that a loaded machine stretched
+        // past DEBOUNCE adds a check), and nothing for the save.
+        let stretched = sent[1..21].windows(2).filter(|w| w[1] - w[0] >= DEBOUNCE).count();
+        assert_eq!(published.len(), 2 + stretched, "{got:?}");
+        // (That the open is checked at once, not after DEBOUNCE, is seen in
+        // `answers_cancelled_requests_with_an_error`: the stream ends right away.)
+        let (opened, _) = published[0];
+        let (at, msg) = published.last().unwrap();
+        assert_eq!(msg["params"]["uri"], uri);
+        let diags = msg["params"]["diagnostics"].as_array().unwrap();
         assert_eq!(diags.len(), 1, "{diags:?}");
-        assert!(diags[0]["message"].as_str().unwrap().contains("$missing100"), "{diags:?}");
+        assert!(diags[0]["message"].as_str().unwrap().contains("$missing20"), "{diags:?}");
+        let last_change = sent[20];
+        assert!(*at >= last_change + DEBOUNCE, "checked {:?} after the last change", *at - last_change);
+        // Within a second (a debug build on a loaded machine: a few checks' worth).
+        let one_check = *opened - sent[0];
+        assert!(*at - last_change < Duration::from_secs(1).max(one_check * 4), "took {:?}", *at - last_change);
+        assert!(*at < sent[21], "the save came before the check");
     }
 
     #[test]

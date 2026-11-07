@@ -38,14 +38,22 @@ const KEEP_PER_HOST: usize = 8;
 const KEEP_TOTAL: usize = 256;
 const KEEP_IDLE: Duration = Duration::from_secs(30);
 
+/// A request with side effects (`POST`, `PUT`, `PATCH`, `DELETE`) takes a kept
+/// connection only when it was idle for less than this: servers close idle
+/// connections after a few seconds (Apache, Node: 5; Gunicorn: 2), and such a
+/// request cannot be sent again when the connection turns out closed (see
+/// `exchange`). A connection idle for longer waits for a request without
+/// side effects.
+const KEEP_IDLE_UNSAFE: Duration = Duration::from_secs(1);
+
 /// Connections whose last response ended exactly where its framing said
 /// (`Content-Length`, or a chunked body with nothing after it), kept for the
 /// next request to the same host, port and scheme: the TCP and TLS handshakes
 /// are not made again. The connection goes to the address the host name was
 /// looked up to when it was made, as any connection to that host would.
-/// Only requests without side effects (`GET`, `HEAD`, `OPTIONS`) take one: a
-/// kept connection the server has closed meanwhile is retried once on a new
-/// one, which only such a request may be.
+/// Every request takes one; a kept connection the server has closed meanwhile
+/// is retried once on a new one when the request has no side effects (`GET`,
+/// `HEAD`, `OPTIONS`), or when it was not written whole (see `exchange`).
 struct Pool {
     idle: HashMap<(String, u16, bool), Vec<(Stream, Instant)>>,
     count: usize,
@@ -57,16 +65,23 @@ fn pool_key(base: &Base) -> (String, u16, bool) {
     (base.host.to_ascii_lowercase(), base.port, base.tls)
 }
 
-/// An idle connection to `base`, if one was kept, is not too old and has
-/// received nothing since its last response (found by the 1.0.0 audit: a
-/// response the server sent later was read by the next request, another
-/// visitor's, as its own).
-fn take(base: &Base) -> Option<Stream> {
+/// An idle connection to `base`, if one was kept, was idle for less than
+/// `max_idle` and has received nothing since its last response (found by the
+/// 1.0.0 audit: a response the server sent later was read by the next
+/// request, another visitor's, as its own). The most recently kept is taken
+/// first; one idle for longer than `max_idle` (but not yet `KEEP_IDLE`) stays
+/// for a request that may take it.
+fn take(base: &Base, max_idle: Duration) -> Option<Stream> {
     loop {
         let (mut stream, since) = {
             let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
             let Pool { idle, count } = &mut *pool;
-            let kept = idle.get_mut(&pool_key(base))?.pop()?;
+            let list = idle.get_mut(&pool_key(base))?;
+            let idle_for = list.last()?.1.elapsed();
+            if idle_for >= max_idle && idle_for < KEEP_IDLE {
+                return None;
+            }
+            let kept = list.pop()?;
             *count -= 1;
             kept
         };
@@ -559,36 +574,44 @@ fn read_chunked(
     }
 }
 
-/// Sends `req` to `base` and reads the answer, on a kept connection when the
-/// request has no side effects and one is idle (see `Pool`).
+/// Sends `req` to `base` and reads the answer, on a kept connection when one
+/// is idle (see `Pool`).
 fn exchange(base: &Base, req: &Request, until: Instant, limit: usize) -> Result<Response, String> {
     let safe = matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS");
-    if safe {
-        if let Some(mut stream) = take(base) {
-            stream.set_deadline(until);
-            // A kept connection may have been closed by the server: the request
-            // is sent again on a new one, but only when no byte of an answer
-            // came (found by the 1.0.0 audit: an answer refused as too large
-            // was asked for again).
-            let mut received = 0;
-            match send(&mut stream, base, req, limit, &mut received) {
-                Ok((resp, keep)) => {
-                    if keep {
-                        give(base, stream);
-                    }
-                    return Ok(resp);
+    if let Some(mut stream) = take(base, if safe { KEEP_IDLE } else { KEEP_IDLE_UNSAFE }) {
+        stream.set_deadline(until);
+        // A kept connection may have been closed by the server: the request is
+        // sent again on a new one, but only when no byte of an answer came
+        // (found by the 1.0.0 audit: an answer refused as too large was asked
+        // for again), and a request with side effects only when it was not
+        // written whole (a server that got it whole may have acted on it;
+        // one that got part of it cannot have).
+        let mut progress = Progress::default();
+        match send(&mut stream, base, req, limit, &mut progress) {
+            Ok((resp, keep)) => {
+                if keep {
+                    give(base, stream);
                 }
-                Err(e) if received > 0 => return Err(e),
-                Err(_) => {}
+                return Ok(resp);
             }
+            Err(e) if progress.received > 0 || (!safe && progress.written) => return Err(e),
+            Err(_) => {}
         }
     }
     let mut stream = dial(&base.host, base.port, base.tls, until)?;
-    let (resp, keep) = send(&mut stream, base, req, limit, &mut 0)?;
+    let (resp, keep) = send(&mut stream, base, req, limit, &mut Progress::default())?;
     if keep {
         give(base, stream);
     }
     Ok(resp)
+}
+
+/// How far an exchange on a connection got: whether the whole request was
+/// written, and the bytes of the response that came.
+#[derive(Default)]
+struct Progress {
+    written: bool,
+    received: usize,
 }
 
 /// Counts the bytes read through it.
@@ -606,13 +629,13 @@ impl Read for Counting<'_> {
 }
 
 /// Writes `req` on `stream` and reads the response (see `read_response`),
-/// counting in `received` the bytes of it that came.
+/// recording in `progress` how far it got.
 fn send(
     stream: &mut Stream,
     base: &Base,
     req: &Request,
     limit: usize,
-    received: &mut usize,
+    progress: &mut Progress,
 ) -> Result<(Response, bool), String> {
     let mut head = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", req.method, req.target, base.authority);
     for (name, value) in &req.headers {
@@ -627,7 +650,8 @@ fn send(
     stream.write_all(head.as_bytes()).map_err(io)?;
     stream.write_all(&req.body).map_err(io)?;
     stream.flush().map_err(io)?;
-    read_response(&mut Counting { inner: stream, read: received }, req.method == "HEAD", limit)
+    progress.written = true;
+    read_response(&mut Counting { inner: stream, read: &mut progress.received }, req.method == "HEAD", limit)
 }
 
 /// `__http_request(name, method, path, query, headers, body)`: sends a request

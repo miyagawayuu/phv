@@ -24,25 +24,27 @@ pub struct TraceLine {
 
 pub struct Exc {
     pub value: Value,
-    /// Where the exception was first thrown, innermost call first. Filled in
-    /// when it leaves the outermost call (`Vm::call_function`); until then
-    /// only `at` is kept.
-    pub trace: Vec<TraceLine>,
-    at: Option<Box<ThrownAt>>,
+    /// Where this exception was thrown (`Vm::thrown_at`), once it was. Only
+    /// the identities of the calls are kept; the lines of the trace are made
+    /// when they are read (`Vm::exception_trace_lines`).
+    at: Option<ThrownAt>,
 }
 
 impl Exc {
     /// An exception carrying `value`, not thrown yet.
     pub fn new(value: Value) -> Exc {
-        Exc { value, trace: Vec::new(), at: None }
+        Exc { value, at: None }
     }
 }
 
-/// The calls on the stack where an exception was first thrown: `(function,
-/// pc)` of each call kept, innermost first, and how many calls there were.
+/// The calls on the stack where an exception was thrown: `(function, pc)` of
+/// each call kept, innermost first, and how many calls there were. It does
+/// not refer to the stack: the trace can be made after the calls returned.
+/// The calls are shared between the exception and the record by object
+/// (`Traces`), so a throw allocates them once.
 #[derive(Clone)]
 struct ThrownAt {
-    calls: Vec<(u32, u32)>,
+    calls: Rc<[(u32, u32)]>,
     depth: usize,
 }
 
@@ -50,9 +52,44 @@ struct ThrownAt {
 /// text of a trace is made only when `getTraceAsString()` asks for it.
 #[derive(Default)]
 struct Traces {
-    by_object: std::collections::HashMap<usize, (std::rc::Weak<RefCell<Object>>, ThrownAt)>,
+    by_object: std::collections::HashMap<usize, (std::rc::Weak<RefCell<Object>>, ThrownAt), PtrHash>,
     /// Entries of objects that are gone are dropped when there are this many.
     prune_at: usize,
+    /// By class: the slot of its `trace` field (`Exception`), or `u32::MAX`.
+    /// Filled at the first throw, so a throw does not look the field up by name.
+    trace_slot: Vec<u32>,
+}
+
+/// Hashes the address of an object (`Traces::by_object`): a multiply and a
+/// fold, which spread an aligned pointer over the low bits the table uses.
+#[derive(Default, Clone)]
+struct PtrHash;
+
+impl std::hash::BuildHasher for PtrHash {
+    type Hasher = PtrHasher;
+    fn build_hasher(&self) -> PtrHasher {
+        PtrHasher(0)
+    }
+}
+
+struct PtrHasher(u64);
+
+impl std::hash::Hasher for PtrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+    fn write_u64(&mut self, i: u64) {
+        let h = (self.0 ^ i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 29);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
 }
 
 pub enum VmError {
@@ -1211,12 +1248,8 @@ impl Vm {
         }
         self.frames.push(Frame { func, pc: 0, base, ret: 0, stop: true });
         self.native_depth += 1;
-        let mut r = self.exec();
+        let r = self.exec();
         self.native_depth -= 1;
-        if let (Err(VmError::Exception(e)), true) = (&mut r, self.frames.is_empty()) {
-            // Leaving the outermost call: the trace is read now.
-            self.fill_trace(e);
-        }
         r
     }
 
@@ -1454,14 +1487,13 @@ impl Vm {
     /// hundreds of MB for one exception.
     fn thrown_at(&self) -> ThrownAt {
         let n = self.frames.len();
-        let calls = self
-            .frames
-            .iter()
-            .rev()
-            .enumerate()
-            .filter(|(i, _)| *i < TRACE_ENDS || *i >= n.saturating_sub(TRACE_ENDS))
-            .map(|(_, f)| (f.func, f.pc))
-            .collect();
+        let call = |f: &Frame| (f.func, f.pc);
+        let calls: Rc<[(u32, u32)]> = if n <= 2 * TRACE_ENDS {
+            self.frames.iter().rev().map(call).collect()
+        } else {
+            let (outer, inner) = (&self.frames[..TRACE_ENDS], &self.frames[n - TRACE_ENDS..]);
+            inner.iter().rev().chain(outer.iter().rev()).map(call).collect()
+        };
         ThrownAt { calls, depth: n }
     }
 
@@ -1489,15 +1521,16 @@ impl Vm {
         }
     }
 
-    /// Fills in `e.trace` from where it was first thrown.
-    fn fill_trace(&self, e: &mut Exc) {
-        if let Some(at) = &e.at {
-            let mut lines = Vec::with_capacity(at.calls.len() + 1);
-            self.trace_lines(at, |func, file, line| {
-                lines.push(TraceLine { func: func.to_string(), file: file.to_string(), line })
-            });
-            e.trace = lines;
-        }
+    /// The trace of an exception that left the script (an uncaught one): one
+    /// line per call of where it was thrown, innermost first. Made when it is
+    /// read; empty for an exception that was never thrown.
+    pub fn exception_trace_lines(&self, e: &Exc) -> Vec<TraceLine> {
+        let Some(at) = &e.at else { return Vec::new() };
+        let mut lines = Vec::with_capacity(at.calls.len() + 1);
+        self.trace_lines(at, |func, file, line| {
+            lines.push(TraceLine { func: func.to_string(), file: file.to_string(), line })
+        });
+        lines
     }
 
     /// Notes where an exception was first thrown, for `getTraceAsString()`
@@ -1514,9 +1547,12 @@ impl Vm {
         }
         {
             let ob = o.borrow();
-            let cls = &self.prog.classes[ob.class as usize];
-            let Some(i) = cls.fields.iter().position(|f| f.name == "trace") else { return };
-            if !matches!(&ob.fields[i], Value::Str(s) if s.is_empty()) {
+            if traces.trace_slot.is_empty() {
+                let slot = |c: &Class| c.fields.iter().position(|f| f.name == "trace").map_or(u32::MAX, |i| i as u32);
+                traces.trace_slot = self.prog.classes.iter().map(slot).collect();
+            }
+            let i = traces.trace_slot.get(ob.class as usize).copied().unwrap_or(u32::MAX);
+            if i == u32::MAX || !matches!(&ob.fields[i as usize], Value::Str(s) if s.is_empty()) {
                 return;
             }
         }
@@ -1530,7 +1566,7 @@ impl Vm {
             traces.by_object.retain(|_, (w, _)| w.strong_count() > 0);
             traces.prune_at = traces.by_object.len() * 2;
         }
-        traces.by_object.insert(key, (Rc::downgrade(o), (**at).clone()));
+        traces.by_object.insert(key, (Rc::downgrade(o), at.clone()));
     }
 
     /// The text of the trace of exception object `o` (`getTraceAsString()`):
@@ -1836,7 +1872,7 @@ impl Vm {
                 Ok(v) => return Ok(v),
                 Err(VmError::Exception(mut e)) => {
                     if e.at.is_none() {
-                        e.at = Some(Box::new(self.thrown_at()));
+                        e.at = Some(self.thrown_at());
                         self.record_trace(&e);
                     }
                     match self.handlers.last() {

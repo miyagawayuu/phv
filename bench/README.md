@@ -71,6 +71,14 @@ to the `publishDiagnostics` for the page (the server answers the completion firs
 it). `median` and `p99` are over the 20 edits; with 20 samples the p99 is the slowest one.
 `open_ms` is the time to the first diagnostics after `didOpen`.
 
+With `--keystrokes K` (more than 1), each edit instead types the start of the line (`$editN = $req->`)
+in `K` `didChange` notifications `--interval-ms` apart (50), as someone typing does, and the
+completion request follows the last keystroke. `diagnostics_ms` is then taken from the last
+keystroke to the last `publishDiagnostics` the edit caused (the script waits for a quiet moment to
+be sure none follows), and `checks_per_edit` counts those `publishDiagnostics`: 1 when the server
+waits for the typing to pause before checking, up to `K` when it checks every keystroke. These
+numbers go under `lsp_typing`, beside `lsp`.
+
 ## Comparing two commits
 
 ```powershell

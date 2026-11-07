@@ -5,14 +5,26 @@
 //! only then the oldest limited ones, so flooding the table with new keys
 //! does not lift an active limit.
 //!
+//! The table is split by key into `SHARDS` maps, each under a lock of its
+//! own, so requests with different keys do not wait for one another. The
+//! bound and the eviction are those of the whole table: the number of windows
+//! is counted across the shards, and making room locks them all and chooses
+//! what goes over all of them together, so the table refuses exactly what one
+//! map would.
+//!
 //! With `[security] rate_limit_store`, the counters live on a Redis server
 //! instead, shared by every server process (`hit_shared`, `reset_shared`).
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::hash::{BuildHasher, RandomState};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const MAX_KEYS: usize = 100_000;
+
+/// The maps the table is split into.
+const SHARDS: usize = 32;
 
 struct Window {
     start: Instant,
@@ -34,7 +46,78 @@ impl Window {
 /// string, and resetting `k` also reset every key that starts with `k\0`).
 type TableKey = (String, u128);
 
-static TABLE: LazyLock<Mutex<HashMap<TableKey, Window>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+type Map = HashMap<TableKey, Window>;
+
+/// The table: its shards, and the number of windows in all of them.
+struct Table {
+    shards: Vec<Mutex<Map>>,
+    /// Exact: a window is counted under its shard's lock, before it is
+    /// inserted (`reserve`), and the count is set again under every lock when
+    /// room is made.
+    len: AtomicUsize,
+    /// Chooses a key's shard (keyed at random, like the maps, so a flood of
+    /// keys cannot be aimed at one shard).
+    hasher: RandomState,
+}
+
+static TABLE: LazyLock<Table> = LazyLock::new(|| Table {
+    shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+    len: AtomicUsize::new(0),
+    hasher: RandomState::new(),
+});
+
+impl Table {
+    /// The shard of the windows of a key (every window of one key is in the
+    /// same shard, so `reset` looks in one).
+    fn shard_of(&self, base: &str) -> usize {
+        (self.hasher.hash_one(base) % SHARDS as u64) as usize
+    }
+
+    fn lock(&self, shard: usize) -> MutexGuard<'_, Map> {
+        self.shards[shard].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Counts one more window, unless the table is full.
+    fn reserve(&self) -> bool {
+        reserve(&self.len, MAX_KEYS)
+    }
+
+    /// Makes room for more keys, in amortized O(1): each pass frees a tenth.
+    /// Expired windows go first, then windows that are not at their limit,
+    /// then the oldest limited ones, chosen over every shard together.
+    fn make_room(&self) {
+        let mut shards: Vec<MutexGuard<'_, Map>> = (0..SHARDS).map(|i| self.lock(i)).collect();
+        for t in shards.iter_mut() {
+            t.retain(|_, w| !w.expired());
+        }
+        let len: usize = shards.iter().map(|t| t.len()).sum();
+        let target = MAX_KEYS * 9 / 10;
+        if len > target {
+            let mut order: Vec<(bool, Instant, TableKey)> =
+                shards.iter().flat_map(|t| t.iter().map(|(k, w)| (w.hits >= w.max, w.start, k.clone()))).collect();
+            // Not-limited before limited, then oldest first.
+            order.sort();
+            for (_, _, k) in order.into_iter().take(len - target) {
+                shards[self.shard_of(&k.0)].remove(&k);
+            }
+        }
+        self.len.store(shards.iter().map(|t| t.len()).sum(), Ordering::SeqCst);
+    }
+}
+
+/// Counts one more in `n`, unless it is at `max` already.
+fn reserve(n: &AtomicUsize, max: usize) -> bool {
+    let mut current = n.load(Ordering::SeqCst);
+    loop {
+        if current >= max {
+            return false;
+        }
+        match n.compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(seen) => current = seen,
+        }
+    }
+}
 
 fn key_of(key: &str, window: Duration) -> TableKey {
     (base_of(key), window.as_millis())
@@ -52,33 +135,9 @@ fn base_of(key: &str) -> String {
     }
 }
 
-/// Makes room for one more key, in amortized O(1): each pass frees a tenth.
-fn make_room(t: &mut HashMap<TableKey, Window>) {
-    t.retain(|_, w| !w.expired());
-    let target = MAX_KEYS * 9 / 10;
-    if t.len() <= target {
-        return;
-    }
-    let mut order: Vec<(bool, Instant, TableKey)> =
-        t.iter().map(|(k, w)| (w.hits >= w.max, w.start, k.clone())).collect();
-    // Not-limited before limited, then oldest first.
-    order.sort();
-    let excess = t.len() - target;
-    for (_, _, k) in order.into_iter().take(excess) {
-        t.remove(&k);
-    }
-}
-
-/// Counts a hit for `key`. Returns false (and does not count) when `max`
-/// hits have already happened in the current window of `window`.
-pub fn hit(key: &str, max: u32, window: Duration) -> bool {
-    let mut t = TABLE.lock().unwrap_or_else(|e| e.into_inner());
-    let key = key_of(key, window);
-    if !t.contains_key(&key) && t.len() >= MAX_KEYS {
-        make_room(&mut t);
-    }
-    let now = Instant::now();
-    let w = t.entry(key).or_insert(Window { start: now, length: window, hits: 0, max });
+/// Counts a hit in `w` (a window of `window`, at `now`), unless `max` hits
+/// have already happened in it.
+fn count(w: &mut Window, now: Instant, max: u32, window: Duration) -> bool {
     if w.expired() {
         *w = Window { start: now, length: window, hits: 0, max };
     }
@@ -90,17 +149,52 @@ pub fn hit(key: &str, max: u32, window: Duration) -> bool {
     true
 }
 
+/// Counts a hit for `key`. Returns false (and does not count) when `max`
+/// hits have already happened in the current window of `window`.
+pub fn hit(key: &str, max: u32, window: Duration) -> bool {
+    let key = key_of(key, window);
+    let shard = TABLE.shard_of(&key.0);
+    loop {
+        let mut t = TABLE.lock(shard);
+        let now = Instant::now();
+        if let Some(w) = t.get_mut(&key) {
+            return count(w, now, max, window);
+        }
+        if TABLE.reserve() {
+            let w = t.entry(key).or_insert(Window { start: now, length: window, hits: 0, max });
+            return count(w, now, max, window);
+        }
+        // The table is full: room is made under every shard's lock, so this
+        // one is let go first.
+        drop(t);
+        TABLE.make_room();
+    }
+}
+
 /// Seconds until the window of `key` ends (0 if it has none).
 pub fn retry_after(key: &str, window: Duration) -> u64 {
-    let t = TABLE.lock().unwrap_or_else(|e| e.into_inner());
-    t.get(&key_of(key, window)).map(|w| w.length.saturating_sub(w.start.elapsed()).as_secs() + 1).unwrap_or(0)
+    let key = key_of(key, window);
+    let t = TABLE.lock(TABLE.shard_of(&key.0));
+    t.get(&key).map(|w| w.length.saturating_sub(w.start.elapsed()).as_secs() + 1).unwrap_or(0)
 }
 
 /// Forgets the hits of `key` in every window (e.g. after a successful login).
 pub fn reset(key: &str) {
-    let mut t = TABLE.lock().unwrap_or_else(|e| e.into_inner());
     let base = base_of(key);
+    let mut t = TABLE.lock(TABLE.shard_of(&base));
+    let before = t.len();
     t.retain(|(k, _), _| *k != base);
+    TABLE.len.fetch_sub(before - t.len(), Ordering::SeqCst);
+}
+
+/// For the tests: the number of windows in the table, checked against the
+/// count the shards keep (under every lock, so nothing changes meanwhile).
+#[cfg(test)]
+fn exact_len() -> usize {
+    let shards: Vec<MutexGuard<'_, Map>> = (0..SHARDS).map(|i| TABLE.lock(i)).collect();
+    let len: usize = shards.iter().map(|t| t.len()).sum();
+    assert_eq!(len, TABLE.len.load(Ordering::SeqCst), "the count of windows is exact");
+    len
 }
 
 /// Counts a hit in the store phv.toml names: the Redis database of
@@ -222,6 +316,58 @@ mod tests {
             hit(&format!("test:flood-{i}"), 5, day);
         }
         assert!(!hit("test:flood-victim", 1, day), "still limited after the flood");
+        // The table never holds more than its bound, counted over every shard.
+        assert!(exact_len() <= MAX_KEYS);
+    }
+
+    /// The bound and the eviction are those of the whole table, not of a
+    /// shard: a flood past the bound keeps every limited window of the
+    /// victims (there is room for them among the not-limited ones that go
+    /// first), and a reset takes its windows out of the count.
+    #[test]
+    fn the_bound_is_counted_over_every_shard() {
+        let day = Duration::from_secs(86_400);
+        let victims: Vec<String> = (0..500).map(|i| format!("test:shard-victim-{i}")).collect();
+        for v in &victims {
+            assert!(hit(v, 1, day));
+            assert!(!hit(v, 1, day));
+        }
+        for i in 0..MAX_KEYS + 10 {
+            hit(&format!("test:shard-flood-{i}"), 5, day);
+        }
+        assert!(exact_len() <= MAX_KEYS);
+        for v in &victims {
+            assert!(!hit(v, 1, day), "{v} is still limited after the flood");
+        }
+        // A reset takes the key's windows out of the table (and the count stays
+        // exact; other tests add keys meanwhile, so only that is checked).
+        assert!(retry_after(&victims[0], day) > 0);
+        reset(&victims[0]);
+        assert_eq!(retry_after(&victims[0], day), 0);
+        assert!(exact_len() <= MAX_KEYS);
+        assert!(hit(&victims[0], 1, day));
+        assert!(exact_len() <= MAX_KEYS);
+    }
+
+    /// Hits on one key from many threads at once: exactly `max` of them count.
+    #[test]
+    fn concurrent_hits_on_one_key_count_exactly() {
+        let minute = Duration::from_secs(60);
+        let allowed = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..1000 {
+                        if hit("test:concurrent", 2500, minute) {
+                            allowed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(allowed.load(Ordering::Relaxed), 2500);
+        assert!(!hit("test:concurrent", 2500, minute));
+        assert!(retry_after("test:concurrent", minute) > 0);
     }
 
     /// Sites with a namespace count apart in a shared store (found by the 1.1

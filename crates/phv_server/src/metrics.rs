@@ -1,12 +1,15 @@
 //! What the server counts, for `/metrics` on the admin port (`[admin]`), in
 //! the Prometheus text format. Counters are atomics: counting costs a few
 //! nanoseconds a request and takes no lock, except the histogram of a page's
-//! route, found in a map under a mutex. Labels never hold text from a request:
-//! routes are the names of the site's files (at most `MAX_ROUTES` of them).
+//! route, found in a map under a mutex (split by route into `ROUTE_SHARDS`
+//! maps, so requests for different routes do not wait for one another).
+//! Labels never hold text from a request: routes are the names of the site's
+//! files (at most `MAX_ROUTES` of them, counted over every shard).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::hash::{BuildHasher, RandomState};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -167,10 +170,19 @@ impl Histogram {
 /// Routes with a histogram of their own; the rest share `other`.
 pub const MAX_ROUTES: usize = 1000;
 
+/// The maps the histograms of routes are split into.
+const ROUTE_SHARDS: usize = 16;
+
 #[derive(Default)]
 pub struct Metrics {
     requests: [[AtomicU64; 5]; KINDS.len()],
-    routes: Mutex<HashMap<String, Arc<Histogram>>>,
+    /// The histogram of each route, in the shard its name chooses.
+    routes: [Mutex<HashMap<String, Arc<Histogram>>>; ROUTE_SHARDS],
+    /// Routes with a histogram, over every shard. Exact: a route is counted
+    /// under its shard's lock, before its histogram is made.
+    route_count: AtomicUsize,
+    /// Chooses a route's shard.
+    route_hasher: RandomState,
     other_route: Arc<Histogram>,
     worker_wait: Histogram,
     rejected: [AtomicU64; REJECTS.len()],
@@ -211,10 +223,13 @@ impl Metrics {
             _ => return,
         };
         let h = {
-            let mut routes = self.routes.lock().unwrap_or_else(|e| e.into_inner());
+            let mut routes = self.routes[self.shard_of(label)].lock().unwrap_or_else(|e| e.into_inner());
             match routes.get(label) {
                 Some(h) => h.clone(),
-                None if routes.len() < MAX_ROUTES => {
+                // One more route, unless `MAX_ROUTES` have a histogram already
+                // (counted over every shard; a route is in one shard only, so
+                // it is counted once).
+                None if self.reserve_route() => {
                     let h = Arc::new(Histogram::default());
                     routes.insert(label.to_string(), h.clone());
                     h
@@ -223,6 +238,42 @@ impl Metrics {
             }
         };
         h.observe(took);
+    }
+
+    fn shard_of(&self, route: &str) -> usize {
+        (self.route_hasher.hash_one(route) % ROUTE_SHARDS as u64) as usize
+    }
+
+    /// Counts one more route with a histogram, unless `MAX_ROUTES` have one.
+    fn reserve_route(&self) -> bool {
+        let mut current = self.route_count.load(Ordering::SeqCst);
+        loop {
+            if current >= MAX_ROUTES {
+                return false;
+            }
+            match self.route_count.compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(seen) => current = seen,
+            }
+        }
+    }
+
+    /// The histogram of every route, by name.
+    fn routes(&self) -> Vec<(String, Arc<Histogram>)> {
+        let mut routes: Vec<(String, Arc<Histogram>)> = self
+            .routes
+            .iter()
+            .flat_map(|shard| {
+                shard
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        routes.sort_by(|a, b| a.0.cmp(&b.0));
+        routes
     }
 
     pub fn reject(&self, why: Reject) {
@@ -262,10 +313,7 @@ impl Metrics {
             "histogram",
             "Time to answer, by page route (a file of public/), static files, and other pages.",
         );
-        let mut routes: Vec<(String, Arc<Histogram>)> =
-            self.routes.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        routes.sort_by(|a, b| a.0.cmp(&b.0));
-        for (route, h) in &routes {
+        for (route, h) in &self.routes() {
             h.write(&mut out, "phv_request_duration_seconds", &format!("route=\"{}\"", label_value(route)));
         }
         if self.other_route.count.load(Ordering::Relaxed) > 0 {
@@ -367,12 +415,64 @@ mod tests {
         for i in 0..MAX_ROUTES + 10 {
             m.request(Kind::Page, Some(&format!("/r{i}")), 200, Duration::from_millis(3));
         }
-        assert_eq!(m.routes.lock().unwrap().len(), MAX_ROUTES);
+        assert_eq!(m.routes().len(), MAX_ROUTES);
+        assert_eq!(m.route_count.load(Ordering::SeqCst), MAX_ROUTES);
         assert_eq!(m.other_route.count.load(Ordering::Relaxed), 10);
         let text = m.render(&[("phv_workers", "Workers.", 8.0)]);
         assert!(text.contains("phv_requests_total{kind=\"page\",code=\"2xx\"} 1010"), "{text}");
         assert!(text.contains("phv_request_duration_seconds_bucket{route=\"other\",le=\"0.005\"} 10"));
         assert!(text.contains("phv_workers 8\n"));
+    }
+
+    /// The routes are split over shards by name: the output is the same for
+    /// the same requests, whichever order they came in, with each route once
+    /// and in order; the cap is counted over every shard, from many threads at
+    /// once; and every observation is in its route's histogram.
+    #[test]
+    fn routes_are_sharded_but_counted_and_written_as_one() {
+        let labels: Vec<String> = (0..300).map(|i| format!("/page{i}")).collect();
+        let forward = Metrics::default();
+        let backward = Metrics::default();
+        for (i, l) in labels.iter().enumerate() {
+            forward.request(Kind::Page, Some(l), 200, Duration::from_millis(i as u64 % 7));
+        }
+        for (i, l) in labels.iter().enumerate().rev() {
+            backward.request(Kind::Page, Some(l), 200, Duration::from_millis(i as u64 % 7));
+        }
+        let text = forward.render(&[]);
+        assert_eq!(text, backward.render(&[]));
+        let mut seen: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("phv_request_duration_seconds_count{route=\""))
+            .map(|l| l.split('"').next().unwrap())
+            .collect();
+        assert_eq!(seen.len(), labels.len());
+        seen.dedup();
+        assert_eq!(seen.len(), labels.len());
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(seen, sorted);
+
+        let m = Metrics::default();
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let m = &m;
+                s.spawn(move || {
+                    for i in 0..400 {
+                        // 3,200 names from 8 threads: more than the cap, in an order of their own.
+                        m.request(Kind::Page, Some(&format!("/t{t}/{i}")), 200, Duration::from_millis(1));
+                        m.request(Kind::Page, Some("/shared"), 200, Duration::from_millis(1));
+                    }
+                });
+            }
+        });
+        let routes = m.routes();
+        assert_eq!(routes.len(), MAX_ROUTES);
+        assert_eq!(m.route_count.load(Ordering::SeqCst), MAX_ROUTES);
+        let own: u64 = routes.iter().map(|(_, h)| h.count.load(Ordering::Relaxed)).sum();
+        assert_eq!(own + m.other_route.count.load(Ordering::Relaxed), 8 * 400 * 2);
+        let shared = routes.iter().find(|(r, _)| r == "/shared").map(|(_, h)| h.count.load(Ordering::Relaxed));
+        assert_eq!(shared, Some(8 * 400));
     }
 
     #[test]

@@ -18,6 +18,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+/// What every error that ran out of time says, from the network clients to
+/// the databases: one sentence, so a script sees the same words whichever
+/// connection or statement reached the script's time limit (or the wait's cap).
+pub(crate) const TIME_LIMIT: &str = "the time limit was reached";
+
 /// A TCP connection whose reads and writes stop at `until`.
 pub(crate) struct Socket {
     tcp: TcpStream,
@@ -29,7 +34,7 @@ impl Socket {
     fn left(&self) -> std::io::Result<Duration> {
         let now = Instant::now();
         if now >= self.until {
-            return Err(Error::new(ErrorKind::TimedOut, "timed out"));
+            return Err(Error::new(ErrorKind::TimedOut, TIME_LIMIT));
         }
         Ok((self.until - now).max(Duration::from_millis(1)))
     }
@@ -38,24 +43,43 @@ impl Socket {
 /// A socket timeout is `WouldBlock` on Unix and `TimedOut` on Windows; it is `TimedOut` here.
 fn timed_out<T>(r: std::io::Result<T>) -> std::io::Result<T> {
     match r {
-        Err(e) if e.kind() == ErrorKind::WouldBlock => Err(Error::new(ErrorKind::TimedOut, "timed out")),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => Err(Error::new(ErrorKind::TimedOut, TIME_LIMIT)),
         r => r,
     }
 }
 
+/// Whether the OS gave up on a read or write before `until`: a socket timeout
+/// is whole milliseconds (Windows), so it can end a little early. The deadline
+/// is then checked again (`left`), so that a script's time limit is seen as
+/// its own limit, not as a network error, by the caller that compares the
+/// two instants.
+fn early(r: &std::io::Result<usize>) -> bool {
+    matches!(r, Err(e) if e.kind() == ErrorKind::TimedOut)
+}
+
 impl Read for Socket {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let left = self.left()?;
-        self.tcp.set_read_timeout(Some(left))?;
-        timed_out(self.tcp.read(buf))
+        loop {
+            let left = self.left()?;
+            self.tcp.set_read_timeout(Some(left))?;
+            let r = timed_out(self.tcp.read(buf));
+            if !early(&r) {
+                return r;
+            }
+        }
     }
 }
 
 impl Write for Socket {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let left = self.left()?;
-        self.tcp.set_write_timeout(Some(left))?;
-        timed_out(self.tcp.write(buf))
+        loop {
+            let left = self.left()?;
+            self.tcp.set_write_timeout(Some(left))?;
+            let r = timed_out(self.tcp.write(buf));
+            if !early(&r) {
+                return r;
+            }
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -175,7 +199,7 @@ pub(crate) fn describe(e: &Error) -> String {
         };
     }
     match e.kind() {
-        ErrorKind::WouldBlock | ErrorKind::TimedOut => "timed out".into(),
+        ErrorKind::WouldBlock | ErrorKind::TimedOut => TIME_LIMIT.into(),
         ErrorKind::ConnectionRefused => "the connection was refused".into(),
         ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => "the connection was reset".into(),
         ErrorKind::UnexpectedEof => "the server closed the connection".into(),
@@ -225,7 +249,7 @@ pub(crate) fn with_deadline_in<T: Send + 'static>(
         pending.fetch_sub(1, Ordering::SeqCst);
         return Err("cannot start the connection".into());
     }
-    recv.recv_timeout(until.saturating_duration_since(Instant::now())).map_err(|_| "timed out".to_string())
+    recv.recv_timeout(until.saturating_duration_since(Instant::now())).map_err(|_| TIME_LIMIT.to_string())
 }
 
 /// How long looked-up addresses are kept.
@@ -303,7 +327,7 @@ impl Names {
             }
             let now = Instant::now();
             if now >= until {
-                return Err("timed out".into());
+                return Err(TIME_LIMIT.into());
             }
             found = flight.done.wait_timeout(found, until - now).unwrap_or_else(|e| e.into_inner()).0;
         }
@@ -375,7 +399,7 @@ pub(crate) fn dial(host: &str, port: u16, tls: bool, until: Instant) -> Result<S
     let mut tcp = None;
     for addr in addrs {
         if Instant::now() >= until {
-            last = "timed out".into();
+            last = TIME_LIMIT.into();
             break;
         }
         match TcpStream::connect_timeout(&addr, left()) {
@@ -456,7 +480,21 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_millis(1500), "took {:?}", start.elapsed());
         assert!(!got.is_empty() && got.len() < 10, "{got:?}");
-        assert_eq!(describe(&err), "timed out");
+        assert_eq!(describe(&err), "the time limit was reached");
+    }
+
+    /// Every way a connection runs out of time says the one sentence: a
+    /// socket timeout of the OS (`WouldBlock` on Unix, `TimedOut` on Windows),
+    /// and a dial whose deadline has passed before it starts.
+    #[test]
+    fn running_out_of_time_has_one_wording() {
+        let os = Error::new(ErrorKind::WouldBlock, "Resource temporarily unavailable");
+        let err = timed_out::<()>(Err(os)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        assert_eq!(err.to_string(), "the time limit was reached");
+        assert_eq!(describe(&Error::new(ErrorKind::TimedOut, "connection timed out")), "the time limit was reached");
+        let past = Instant::now() - Duration::from_millis(1);
+        assert_eq!(dial("127.0.0.1", 9, false, past).err(), Some("the time limit was reached".to_string()));
     }
 
     /// Work that never finishes (a resolver that does not answer) is given up
@@ -466,7 +504,7 @@ mod tests {
         let _slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
         let start = Instant::now();
         let r = with_deadline(start + Duration::from_millis(200), || std::thread::sleep(Duration::from_secs(3)));
-        assert_eq!(r, Err("timed out".to_string()));
+        assert_eq!(r, Err("the time limit was reached".to_string()));
         assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
         assert_eq!(with_deadline(Instant::now() + Duration::from_secs(1), || 7), Ok(7));
 
@@ -540,7 +578,7 @@ mod tests {
 
         // A caller whose deadline passes stops waiting; the lookup still fills the entry.
         let other = names.find("slow.example", Instant::now() + Duration::from_millis(10));
-        assert_eq!(other, Err("timed out".to_string()));
+        assert_eq!(other, Err("the time limit was reached".to_string()));
         assert_eq!(&*names.find("slow.example", until()).unwrap(), &[IpAddr::from([192, 0, 2, 3])]);
 
         let failing = Arc::new(Names { entries: Mutex::default(), ttl, lookup: failing_lookup });

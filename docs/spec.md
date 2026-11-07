@@ -1687,8 +1687,12 @@ when the body is not JSON).
 - Connections are kept open between requests to the same host (at most 8 per host and 256 in all, closed after 30
   idle seconds): one is kept only when its response ended where its framing said (`Content-Length`, or a chunked body
   with nothing after it) and the server did not ask to close it, and it is used again only if nothing arrived on it
-  while it was idle. Only `GET`, `HEAD` and `OPTIONS` requests take a kept connection; one the server closed meanwhile
-  is retried once on a new connection, only when no byte of an answer came.
+  while it was idle. Every request takes a kept connection; one the server closed meanwhile is retried once on a
+  new connection, only when no byte of an answer came, and for a request with side effects (`POST`, `PUT`, `PATCH`,
+  `DELETE`) only when the request had not been written whole (the server may have acted on one it got whole: the
+  script gets `NetworkError`). Such a request takes a kept connection only when it was idle for less than a second,
+  since servers close idle connections after a few seconds; a connection idle for longer waits for a `GET`, `HEAD`
+  or `OPTIONS`.
 - Each request waits at most until the script's time limit (30 seconds when it has none),
   whatever the server sends: the name lookup, every read and every write stop at that deadline, and at most 10
   interim (`1xx`) responses are skipped. The addresses a host name was looked up to are kept for 30 seconds (a
@@ -2394,7 +2398,9 @@ When code uses a PHP function name, the error message suggests the alternative
 
 `phv lsp` is a Language Server, used by the VS Code extension (`editors/vscode`) and any editor that speaks LSP:
 
-- errors and warnings as you type, the type of an expression on hover, completion, go to definition;
+- errors and warnings as you type (a document is checked 150 ms after its last change, so a burst of keystrokes is
+  checked once; one just opened or saved is checked at once), the type of an expression on hover, completion, go
+  to definition;
 - find references and rename across the project's files. Renaming a method also renames the methods that override
   it (or that it overrides), so that overriding still works; names of the standard library cannot be renamed;
 - formatting (as `phv fmt`, with `[fmt] width`), and the parameters of the function being called (signature help);

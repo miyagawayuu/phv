@@ -174,6 +174,37 @@ fn bytecode_cache_round_trip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A file rewritten within the second it was compiled in, so that its
+/// modification time is the same (set back explicitly here: a file system
+/// may keep seconds), is seen by its size: the disk cache and the quick check
+/// of a compiled program (`is_stale`) both compile it again.
+#[test]
+fn cache_sees_a_file_rewritten_within_the_same_second() {
+    let dir = std::env::temp_dir().join(format!("phv-cache-same-second-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("main.phv");
+    std::fs::write(&entry, "<?phv\necho 1;\n").unwrap();
+    let first = phv_driver::compile_cached(&dir, &entry).ok().unwrap();
+    assert_eq!(run_out(&first), "1");
+    assert!(phv_driver::compile_cached(&dir, &entry).ok().unwrap().from_cache);
+    assert!(!first.is_stale());
+
+    let mtime = std::fs::metadata(&entry).unwrap().modified().unwrap();
+    std::fs::write(&entry, "<?phv\necho 22;\n").unwrap();
+    std::fs::File::options().write(true).open(&entry).unwrap().set_modified(mtime).unwrap();
+    assert_eq!(std::fs::metadata(&entry).unwrap().modified().unwrap(), mtime);
+    assert!(first.is_stale(), "a different size with the same time is a change");
+    let second = phv_driver::compile_cached(&dir, &entry).ok().unwrap();
+    assert!(!second.from_cache);
+    assert_eq!(run_out(&second), "22");
+    // The entry written for the new content is used again.
+    let third = phv_driver::compile_cached(&dir, &entry).ok().unwrap();
+    assert!(third.from_cache);
+    assert_eq!(run_out(&third), "22");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn run_out(c: &phv_driver::Compiled) -> String {
     run(c, RunOptions { html: false, limits: Default::default(), http: None, host: None }).output
 }

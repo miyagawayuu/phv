@@ -117,10 +117,10 @@ for ($k = 0; $k -lt $rows.Count; $k++) {
     }
 }
 
-# Keep the serve / lsp sections of an earlier run of the same commit.
+# Keep the serve / lsp / lsp_typing sections of an earlier run of the same commit.
 if (Test-Path $out) {
     $old = Read-Json $out
-    foreach ($section in @("serve", "lsp")) {
+    foreach ($section in @("serve", "lsp", "lsp_typing")) {
         if ($old.PSObject.Properties[$section]) { $result[$section] = $old.$section }
     }
 }

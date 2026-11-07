@@ -237,6 +237,52 @@ fn two_host_fields_are_refused() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A production server remembers what a path leads to by the path alone: a
+/// page and the WebSocket script of the same path are found from one entry,
+/// in either order and again from memory; a path spelled with another case is
+/// another entry (and another file, or none); and a script added next to a
+/// page is seen within a second.
+#[test]
+fn a_page_and_its_websocket_script_are_remembered_together() {
+    let dir = site("page-and-ws");
+    write(&dir, "public/chat.phv", "<?phv\necho \"the page\";\n");
+    write(&dir, "public/only.phv", "<?phv\necho \"only a page\";\n");
+    let addr = start(&dir);
+    for _ in 0..2 {
+        // The page first, then the script (the entry made by the page gets it).
+        assert!(http_get(addr, "/chat").ends_with("the page"));
+        let mut ws = open(addr, "/chat?name=ann", None).unwrap();
+        assert_eq!(text(&mut ws), "welcome ann");
+        // The script first, then the page (the entry made by the upgrade holds both).
+        let mut ws = open(addr, "/rooms/blue", None).unwrap();
+        assert_eq!(text(&mut ws), "room blue");
+        assert!(http_get(addr, "/rooms/blue").contains("HTTP/1.1 404"));
+        // A page without a script: an upgrade gets the page's answer, remembered with it.
+        assert!(http_get(addr, "/only").ends_with("only a page"));
+        assert_eq!(open(addr, "/only", None).err(), Some(200));
+    }
+    // Another spelling is another path: not the entry of `/chat`.
+    assert!(http_get(addr, "/Chat").contains("HTTP/1.1 404"));
+    assert_eq!(open(addr, "/Chat?name=ann", None).err(), Some(404));
+    assert!(http_get(addr, "/chat").ends_with("the page"));
+
+    // A script added next to a remembered page is seen once the server looks again.
+    write(&dir, "public/only.ws.phv", CHAT);
+    let until = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match open(addr, "/only?name=bob", None) {
+            Ok(mut ws) => {
+                assert_eq!(text(&mut ws), "welcome bob");
+                break;
+            }
+            Err(200) if std::time::Instant::now() < until => std::thread::sleep(Duration::from_millis(100)),
+            Err(status) => panic!("the new script was not seen: {status}"),
+        }
+    }
+    assert!(http_get(addr, "/only").ends_with("only a page"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Sends PUBLISH to the Redis server at `url` (`redis://host[:port]`) as
 /// anyone with access to it could.
 fn redis_publish(url: &str, channel: &str, payload: &[u8]) {

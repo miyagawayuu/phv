@@ -1,0 +1,13 @@
+import std.net.HttpClient;
+
+// A POST on a kept connection that the server closes without answering is
+// not sent again: the server may have acted on it.
+$api = HttpClient::connect("api");
+echo $api->get("/warm")->body, "\n";
+try {
+    $api->post("/drop", "once");
+    echo "answered\n";
+} catch (NetworkError $e) {
+    echo "NetworkError\n";
+}
+echo $api->get("/after")->body, "\n";

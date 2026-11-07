@@ -508,8 +508,13 @@ struct PgConn {
 /// (found by the 1.2 audit: the sentinel was looked for by its text, which a
 /// script could prepare again, and a script could deallocate the type
 /// lookups alone).
+///
+/// `DISCARD PLANS` is left out: the server drops a cached plan itself when
+/// a table or type it uses changes, and plans the statement again from its
+/// text, so a kept statement sees the schema the next script finds (see
+/// `a_schema_change_is_seen_through_a_kept_statement_after_the_reset`).
 const PG_RESET: &str = "ROLLBACK; CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; \
-    SELECT pg_advisory_unlock_all(); DISCARD PLANS; DISCARD TEMP; DISCARD SEQUENCES; \
+    SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES; \
     SELECT CASE WHEN from_sql THEN 'sql ' ELSE 'own ' END || name FROM pg_prepared_statements";
 
 /// What a statement's text is, for the kept statements: only plain data
@@ -896,7 +901,7 @@ fn pg_error(vm: &Vm, c: &mut Pooled<PgConn>, e: postgres::Error) -> VmError {
             if let Err(fatal) = vm.check_limits() {
                 return fatal;
             }
-            vm.throw("DatabaseError", "the statement ran out of time")
+            vm.throw("DatabaseError", crate::netio::TIME_LIMIT)
         }
         PgFailure::Canceled => {
             if let Err(fatal) = vm.check_limits() {
@@ -1483,7 +1488,6 @@ impl MyWatch {
 
 impl Driver for MyConn {
     fn reset(&mut self) -> bool {
-        use mysql::prelude::Queryable;
         self.timeout_ms = None;
         self.jobs_tx = None;
         // A KILL QUERY sent (or being sent) at the deadline could stop the
@@ -1496,21 +1500,40 @@ impl Driver for MyConn {
         if self.conn.reset().is_err() {
             return false;
         }
-        // COM_RESET_CONNECTION keeps the active role and the current database.
-        if self.conn.query_drop("SET ROLE DEFAULT").is_err() {
-            return false;
-        }
+        // COM_RESET_CONNECTION keeps the active role and the current database:
+        // both are put back with one query of two statements (one round trip
+        // instead of two), whose replies are checked in order. The command
+        // itself cannot go in the same round trip: the client keeps the
+        // functions that write a command and read a packet to itself.
         match self.opts.get_db_name() {
-            Some(db) => self.conn.select_db(db).is_ok(),
+            Some(db) => {
+                my_statements(&mut self.conn, &format!("SET ROLE DEFAULT; USE `{}`", db.replace('`', "``"))).is_ok()
+            }
             // Without a database in the URL there is none to go back to: a script that
             // chose one leaves a connection that is not reused.
-            None => matches!(self.conn.query_first::<Option<String>, _>("SELECT DATABASE()"), Ok(Some(None))),
+            None => matches!(
+                my_statements(&mut self.conn, "SET ROLE DEFAULT; SELECT DATABASE()").as_deref(),
+                Ok([row]) if row.get::<Option<String>, _>(0) == Some(None)
+            ),
         }
     }
 
     fn check(&mut self) -> bool {
         self.conn.ping().is_ok()
     }
+}
+
+/// Runs `sql`, several statements in one round trip, and returns the rows of
+/// the last. The replies are read in order; the first statement that fails
+/// gives its error (the server runs none after it), whichever it is.
+fn my_statements(conn: &mut mysql::Conn, sql: &str) -> Result<Vec<mysql::Row>, mysql::Error> {
+    use mysql::prelude::Queryable;
+    let mut result = conn.query_iter(sql)?;
+    let mut last = Vec::new();
+    while let Some(set) = result.iter() {
+        last = set.collect::<Result<Vec<_>, _>>()?;
+    }
+    Ok(last)
 }
 
 /// MySQL connects still running (see `netio::with_deadline_in`).
@@ -2217,7 +2240,7 @@ fn pg_detached(
     }
     let r = r.map_err(|e| match pg_failure(&mut c, &e) {
         PgFailure::Budget => OVER_BUDGET.to_string(),
-        PgFailure::Deadline | PgFailure::Canceled => "the statement ran out of time".to_string(),
+        PgFailure::Deadline | PgFailure::Canceled => crate::netio::TIME_LIMIT.to_string(),
         PgFailure::Other => pg_message(&e),
     })?;
     if let Some((_, ms)) = set {
@@ -2247,7 +2270,7 @@ fn my_detached(
     let error = |c: &mut Pooled<MyConn>, e: mysql::Error| -> String {
         match &e {
             mysql::Error::MySqlError(m) if m.code == 3024 || m.code == 1317 => {
-                return "the statement ran out of time".to_string();
+                return crate::netio::TIME_LIMIT.to_string();
             }
             mysql::Error::MySqlError(_) => {}
             _ => c.broken = true,
@@ -5702,6 +5725,114 @@ mod tests {
         assert!(listed.contains(&name) && listed.contains(&c.own[0]), "{listed:?}");
         assert!(c.reset(), "a reset of a sound connection");
         assert_eq!(c.own.len(), 1, "a kept statement is not one of the client's own");
+    }
+
+    /// A schema change made by one script is seen by the next script on the
+    /// same connection through a kept statement, with no `DISCARD PLANS` in
+    /// the reset: the server drops the plan itself when a table the statement
+    /// uses changes, and plans it again from its text (a table dropped and
+    /// made again), or the statement fails as stale and is prepared again (a
+    /// column added or changed, which changes the rows' shape).
+    #[test]
+    fn a_schema_change_is_seen_through_a_kept_statement_after_the_reset() {
+        let Some(url) = std::env::var("PHV_TEST_POSTGRES_URL").ok().filter(|u| !u.is_empty()) else { return };
+        let spec = DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 2 };
+        let wait = Duration::from_secs(10);
+        let mut c = pg_connect(&url, &spec, wait).unwrap();
+        // Another process's connection.
+        let other = pg_connect(&url, &spec, wait).unwrap();
+        let t = format!("phv_{}_plans", crate::testing::run_id());
+        let select = format!("SELECT * FROM {t}");
+        c.client
+            .batch_execute(&format!("DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (a int); INSERT INTO {t} VALUES (1)"))
+            .unwrap();
+        assert_eq!(c.query_kept(&select, &[]).unwrap()[0].get::<_, i32>("a"), 1);
+        let prepared_as =
+            |c: &PgConn| c.kept.iter().find(|k| k.text == select).and_then(|k| k.name.clone()).expect("kept");
+        let first = prepared_as(&c);
+
+        // The script adds a column; the next script sees it. The kept
+        // statement, whose rows changed shape, was prepared again.
+        c.client.batch_execute(&format!("ALTER TABLE {t} ADD COLUMN b text DEFAULT 'x'")).unwrap();
+        assert!(c.reset());
+        let rows = c.query_kept(&select, &[]).unwrap();
+        assert_eq!((rows[0].get::<_, i32>("a"), rows[0].get::<_, String>("b")), (1, "x".into()), "the column added");
+        let second = prepared_as(&c);
+        assert_ne!(second, first, "prepared again");
+
+        // Another process drops the table and makes it again with the same
+        // shape: the server plans the kept statement again, on the new table.
+        other
+            .client
+            .batch_execute(&format!(
+                "DROP TABLE {t}; CREATE TABLE {t} (a int, b text); INSERT INTO {t} VALUES (2, 'y')"
+            ))
+            .unwrap();
+        assert!(c.reset());
+        let rows = c.query_kept(&select, &[]).unwrap();
+        assert_eq!((rows[0].get::<_, i32>("a"), rows[0].get::<_, String>("b")), (2, "y".into()), "the new table");
+        assert_eq!(prepared_as(&c), second, "the same statement, planned again by the server");
+
+        // Another process changes a column's type: the rows' shape changed.
+        other.client.batch_execute(&format!("ALTER TABLE {t} ALTER COLUMN a TYPE bigint")).unwrap();
+        assert!(c.reset());
+        let rows = c.query_kept(&select, &[]).unwrap();
+        assert_eq!(rows[0].get::<_, i64>("a"), 2, "the new type");
+        assert_ne!(prepared_as(&c), second, "prepared again");
+        c.client.batch_execute(&format!("DROP TABLE {t}")).unwrap();
+    }
+
+    /// The MySQL reset puts the role and the database back with one query
+    /// of two statements, whose replies are checked in order: an error in
+    /// either (the server runs nothing after it) means the connection is
+    /// not reused, and the connection is in step after an error.
+    #[test]
+    fn the_mysql_reset_checks_its_settings_in_order() {
+        use mysql::prelude::Queryable;
+        let Some(url) = std::env::var("PHV_TEST_MYSQL_URL").ok().filter(|u| !u.is_empty()) else { return };
+        let spec = DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 2 };
+        let wait = Duration::from_secs(10);
+        let mut c = my_connect(&url, &spec, wait, None, None).unwrap();
+        let Some(db) = c.opts.get_db_name().map(str::to_string) else { panic!("the test URL names a database") };
+        let missing = format!("phv_{}_missing", crate::testing::run_id());
+        let value = |rows: &[mysql::Row]| rows.first().and_then(|r| r.get::<Option<String>, _>(0)).flatten();
+
+        // The replies of several statements come in order; the rows are the last's.
+        let rows = my_statements(&mut c.conn, "SET @phv_p = 1; SELECT @phv_p + 1").unwrap();
+        assert_eq!(value(&rows), Some("2".into()));
+        // The second statement fails: its error, and the connection is in step after it.
+        assert!(my_statements(&mut c.conn, &format!("SELECT 1; SELECT * FROM {missing}")).is_err());
+        assert_eq!(value(&my_statements(&mut c.conn, "SELECT 3").unwrap()), Some("3".into()));
+        // The first fails: the second does not run.
+        assert!(my_statements(&mut c.conn, &format!("SELECT * FROM {missing}; SET @phv_p = 9")).is_err());
+        assert_eq!(value(&my_statements(&mut c.conn, "SELECT @phv_p").unwrap()), Some("1".into()));
+
+        // A script that took a role and changed the database: both are put back.
+        let role = format!("phv_{}_role", crate::testing::run_id());
+        c.conn.query_drop(format!("CREATE ROLE IF NOT EXISTS {role}")).unwrap();
+        c.conn.query_drop(format!("GRANT {role} TO CURRENT_USER()")).unwrap();
+        c.conn.query_drop(format!("SET ROLE {role}")).unwrap();
+        c.conn.query_drop("USE information_schema").unwrap();
+        assert!(c.reset());
+        let rows = my_statements(&mut c.conn, "SELECT CONCAT(CURRENT_ROLE(), ' ', DATABASE())").unwrap();
+        assert_eq!(value(&rows), Some(format!("NONE {db}")));
+        c.conn.query_drop(format!("DROP ROLE {role}")).unwrap();
+
+        // The URL names a database the server does not have: the second
+        // statement fails, and the connection is not reused.
+        c.opts = Arc::new(mysql::OptsBuilder::from_opts((*c.opts).clone()).db_name(Some(&missing)).into());
+        assert!(!c.reset());
+        c.opts = Arc::new(mysql::OptsBuilder::from_opts((*c.opts).clone()).db_name(Some(&db)).into());
+        assert!(c.reset(), "in step after the failed reset");
+
+        // A URL without a database: a script that chose one leaves a
+        // connection that is not reused.
+        let no_db = url.rsplit_once('/').map(|(before, _)| before.to_string()).unwrap();
+        let mut d = my_connect(&no_db, &spec, wait, None, None).unwrap();
+        assert_eq!(d.opts.get_db_name(), None);
+        assert!(d.reset());
+        d.conn.query_drop(format!("USE {db}")).unwrap();
+        assert!(!d.reset());
     }
 
     #[test]
