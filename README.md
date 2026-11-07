@@ -203,6 +203,8 @@ published.
 ## Benchmarks
 
 `examples/bench/bench.phv` compared with the equivalent `bench.py` (Windows 11, release build; indicative only).
+The harness in [bench/](bench/README.md) reproduces these numbers (min of 5 runs) and measures the server and the
+language server too; a change that touches performance comes with its before/after `bench/results/*.json`.
 
 | Benchmark | PHV (JIT) | PHV (interpreter) | CPython 3.13 |
 |---|---:|---:|---:|

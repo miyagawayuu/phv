@@ -196,6 +196,8 @@ CI(`.github/workflows/ci.yml`)は Linux / Windows / macOS でこれらと clippy
 ## ベンチマーク
 
 `examples/bench/bench.phv` と同じ内容の `bench.py` を比べた結果です(Windows 11、リリースビルド、参考値)。
+[bench/](bench/README.ja.md) のハーネスでこの数値を再現でき(5 回の最小値)、サーバーと言語サーバーも測れます。
+性能に関わる変更には、変更前と変更後の `bench/results/*.json` を添えます。
 
 | 項目 | PHV (JIT) | PHV (インタプリタ) | CPython 3.13 |
 |---|---:|---:|---:|

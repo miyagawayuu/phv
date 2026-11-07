@@ -26,7 +26,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use phv_driver::config::LogFormat;
-use phv_driver::{compile_cached, load_config, run, Compiled, Config, RunOptions};
+use phv_driver::{compile_cached, load_config, run, Compiled, Config, RunOptions, Teardown};
 use phv_vm::value::html_escape;
 use phv_vm::{FlushSink, HttpCtx, Limits, SessionData, WsCtx};
 use static_files::Validators;
@@ -169,6 +169,9 @@ struct State {
     static_cache: Mutex<(HashMap<String, Arc<StaticEntry>>, usize)>,
     /// What request paths led to, for a production server (see `locate`).
     found_cache: Mutex<HashMap<String, Arc<FoundEntry>>>,
+    /// Where the special pages a production server asked for are, by the
+    /// name asked for (`admin/_middleware.phv`, `_404.phv`; see `special`).
+    specials: Mutex<HashMap<String, Arc<SpecialEntry>>>,
     /// Tags of the static files of a built site, by path.
     embedded_tags: HashMap<String, String>,
     /// Compressed static files by `ETag`, and their total size.
@@ -245,6 +248,7 @@ impl State {
             csp_plain,
             static_cache: Mutex::new((HashMap::new(), 0)),
             found_cache: Mutex::new(HashMap::new()),
+            specials: Mutex::new(HashMap::new()),
             embedded_tags: HashMap::new(),
             gz_cache: Mutex::new((HashMap::new(), 0)),
             gz_flight: Mutex::new(HashMap::new()),
@@ -332,10 +336,40 @@ impl State {
     }
 
     /// A special page under `public/` (`_404.phv`, `_middleware.phv`, ...), if the site has it.
+    /// A production server remembers the answer and looks again at most every
+    /// `RECHECK` (one request looks when that is due; the others take the last
+    /// answer meanwhile), as it does for pages: every page asks for the
+    /// `_middleware.phv` of each directory above it, and looking at files is
+    /// slow (and serializes requests on Windows). A development server looks
+    /// every time.
     fn special(&self, rel: &str) -> Option<PathBuf> {
         if let Some(e) = &self.embedded {
             return e.pages.contains_key(rel).then(|| self.public.join(rel));
         }
+        // Long names (from a WebSocket request's path) are not remembered,
+        // as `locate` does not remember long paths.
+        if self.dev || rel.len() > FOUND_KEY_MAX {
+            return self.look_for_special(rel);
+        }
+        let known = self.specials.lock().unwrap().get(rel).cloned();
+        if let Some(e) = known {
+            let (now, last) = (self.now_ms(), e.checked.load(Ordering::Relaxed));
+            let due = now.saturating_sub(last) >= RECHECK.as_millis() as u64;
+            if !due || e.checked.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+                return e.path.clone();
+            }
+        }
+        let path = self.look_for_special(rel);
+        let mut cache = self.specials.lock().unwrap();
+        if cache.len() >= SPECIAL_KEEP {
+            cache.clear();
+        }
+        cache.insert(rel.to_string(), Arc::new(SpecialEntry { path: path.clone(), checked: self.now_ms().into() }));
+        path
+    }
+
+    /// Looks for a special page on disk (see `special`).
+    fn look_for_special(&self, rel: &str) -> Option<PathBuf> {
         let path = self.public.join(rel);
         // A link to another machine is not resolved (see `resolve`).
         if phv_std::safefs::on_another_machine_below(&self.public, &path) {
@@ -1562,18 +1596,17 @@ fn not_found() -> Resp {
 
 fn add_security_headers(state: &State, resp: &mut Resp) {
     let h = resp.headers_mut();
-    let mut set = |name: &'static str, value: &str| {
+    // Constant values are not parsed per response.
+    let mut set = |name: &'static str, value: HeaderValue| {
         if !h.contains_key(name) {
-            if let Ok(v) = HeaderValue::from_str(value) {
-                h.insert(name, v);
-            }
+            h.insert(name, value);
         }
     };
-    set("x-content-type-options", "nosniff");
-    set("x-frame-options", "SAMEORIGIN");
-    set("referrer-policy", "strict-origin-when-cross-origin");
+    set("x-content-type-options", HeaderValue::from_static("nosniff"));
+    set("x-frame-options", HeaderValue::from_static("SAMEORIGIN"));
+    set("referrer-policy", HeaderValue::from_static("strict-origin-when-cross-origin"));
     if state.config.secure_cookies {
-        set("strict-transport-security", "max-age=31536000");
+        set("strict-transport-security", HeaderValue::from_static("max-age=31536000"));
     }
     // Pages set their own policy with a nonce; everything else gets one without.
     if let Some(csp) = &state.csp_plain {
@@ -1831,6 +1864,18 @@ const FOUND_KEEP: usize = 10_000;
 /// since `State::started`.
 struct FoundEntry {
     found: Found,
+    checked: AtomicU64,
+}
+
+/// The most special pages a production server remembers having looked for
+/// (forgotten all at once when full: the names come from the directories of
+/// the site's pages, but the map must not grow without bound).
+const SPECIAL_KEEP: usize = 4096;
+
+/// Where a special page was (or that there was none), and when that was last
+/// looked at: milliseconds since `State::started`.
+struct SpecialEntry {
+    path: Option<PathBuf>,
     checked: AtomicU64,
 }
 
@@ -2263,6 +2308,12 @@ impl State {
 
     /// Parses the request, checks CSRF, runs the page and builds the response.
     /// Runs on a blocking thread: everything here may take CPU time.
+    ///
+    /// With the response comes the teardown of the script that made it (the
+    /// page, or the middleware or error page that answered), if a script did:
+    /// what remains of its VM, whose drop returns its database connections.
+    /// The caller sends the response first and drops the teardown after, on
+    /// this same thread (see `phv_driver::Teardown`).
     // The request's parts, and what kind of run it is (a page, an error page,
     // a WebSocket event with its connection).
     #[allow(clippy::too_many_arguments)]
@@ -2276,13 +2327,13 @@ impl State {
         kind: Page,
         ws: Option<WsCtx>,
         stream: Option<Box<dyn FlushSink>>,
-    ) -> Resp {
+    ) -> (Resp, Option<Teardown>) {
         let headers: Vec<(String, String)> = parts
             .headers
             .iter()
             .map(|(k, v)| (k.as_str().to_ascii_lowercase(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
             .collect();
-        let too_many = || simple(StatusCode::BAD_REQUEST, "text/plain", "bad request: too many fields".into());
+        let too_many = || (simple(StatusCode::BAD_REQUEST, "text/plain", "bad request: too many fields".into()), None);
         let Some(query) = fields(parts.uri.query().unwrap_or("").as_bytes()) else { return too_many() };
         let raw_content_type = parts.headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
         let content_type = raw_content_type.to_ascii_lowercase();
@@ -2299,7 +2350,7 @@ impl State {
                     form = f;
                     files = up;
                 }
-                Err(e) => return simple(StatusCode::BAD_REQUEST, "text/plain", format!("bad request: {e}")),
+                Err(e) => return (simple(StatusCode::BAD_REQUEST, "text/plain", format!("bad request: {e}")), None),
             }
         }
         if form.len() > MAX_FIELDS {
@@ -2344,7 +2395,7 @@ impl State {
                 let body = format!(
                     "<p>The form has expired or did not come from this site. Reload the page and try again.</p>{hint}"
                 );
-                return page(StatusCode::FORBIDDEN, "403 Forbidden", &body);
+                return (page(StatusCode::FORBIDDEN, "403 Forbidden", &body), None);
             }
         }
 
@@ -2402,7 +2453,7 @@ impl State {
             ..HttpCtx::default()
         };
         // In production, a failing page is answered by `_500.phv` when the site has one.
-        let failed = |title: &str, detail: &str| -> Resp {
+        let failed = |title: &str, detail: &str| -> (Resp, Option<Teardown>) {
             if !self.dev && kind != Page::Error {
                 if let Some(page) = self.special("_500.phv") {
                     if let Some(r) = self.run_page(&page, error_ctx(), false) {
@@ -2410,11 +2461,11 @@ impl State {
                     }
                 }
             }
-            self.error_page(title, detail)
+            (self.error_page(title, detail), None)
         };
         // A page that failed after flush() sent its response: the response is
         // cut off (when its stream is dropped); this answer goes nowhere.
-        let stopped = || simple(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", String::new());
+        let stopped = || (simple(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", String::new()), None);
 
         // Middleware runs first, outermost first; one that answers (writes
         // output, sets a status, redirects or sends a file) ends the request.
@@ -2423,21 +2474,30 @@ impl State {
                 match self.run_one(&mw, ctx) {
                     Err((_, _, true)) => return stopped(),
                     Err((title, detail, _)) => return failed(&title, &detail),
-                    Ok(outcome) => {
+                    Ok(mut outcome) => {
                         let answered = !outcome.output.is_empty()
                             || outcome.http.status != 200
                             || outcome.http.body_file.is_some()
                             || outcome.http.flushed;
                         if answered {
-                            return self.respond(outcome, had_session);
+                            let teardown = outcome.teardown.take();
+                            return (self.respond(outcome, had_session), teardown);
                         }
+                        // The rest of its VM goes now, before the page runs: a
+                        // connection it held goes back to its pool, where the
+                        // page may need it (a pool of `pool_size` serves every
+                        // worker; held through the page, the page would wait
+                        // for its own thread).
                         ctx = outcome.http;
                     }
                 }
             }
         }
         match self.run_one(script, ctx) {
-            Ok(outcome) => self.respond(outcome, had_session),
+            Ok(mut outcome) => {
+                let teardown = outcome.teardown.take();
+                (self.respond(outcome, had_session), teardown)
+            }
             Err((_, _, true)) => stopped(),
             Err((title, detail, _)) => failed(&title, &detail),
         }
@@ -2481,9 +2541,12 @@ impl State {
         }
     }
 
-    /// Runs an error page; `None` if it fails too (the built-in page is used then).
-    fn run_page(&self, script: &Path, ctx: HttpCtx, had_session: bool) -> Option<Resp> {
-        self.run_one(script, ctx).ok().map(|o| self.respond(o, had_session))
+    /// Runs an error page; `None` if it fails too (the built-in page is used
+    /// then). With the response, the page's teardown (as `execute` gives it).
+    fn run_page(&self, script: &Path, ctx: HttpCtx, had_session: bool) -> Option<(Resp, Option<Teardown>)> {
+        let mut outcome = self.run_one(script, ctx).ok()?;
+        let teardown = outcome.teardown.take();
+        Some((self.respond(outcome, had_session), teardown))
     }
 
     /// The response for what a script did: status, headers, cookies and body.
@@ -2730,10 +2793,18 @@ async fn run_script(
     let sink: Option<Box<dyn FlushSink>> = (kind == Page::Normal).then(|| {
         Box::new(PageStream::new(state.clone(), head_tx, Instant::now() + state.time_limit)) as Box<dyn FlushSink>
     });
+    // The response is handed over as soon as the page made it; the end of its
+    // VM (its database connections rolling back and going back to their pools:
+    // round trips) comes after, on the same thread, while the worker is still
+    // held, so no more pages run at once than `workers` allows.
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
     let mut task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _reserved = reserved;
-        st.execute(&script, params, ip, parts, body, kind, None, sink)
+        let (resp, teardown) = st.execute(&script, params, ip, parts, body, kind, None, sink);
+        // Not received: the request is gone (its connection closed).
+        let _ = done_tx.send(resp);
+        drop(teardown);
     });
     let done = tokio::select! {
         biased;
@@ -2741,7 +2812,20 @@ async fn run_script(
             head.extensions_mut().insert(served);
             return head;
         }
-        done = &mut task => done,
+        Ok(resp) = &mut done_rx => {
+            // The teardown goes on; a panic in it is still seen and logged.
+            tokio::spawn(async move {
+                if let Err(e) = task.await {
+                    eprintln!("internal error: {e}");
+                }
+            });
+            Ok(resp)
+        }
+        done = &mut task => match done {
+            // The response was sent just before the task ended (or never: a bug).
+            Ok(()) => done_rx.try_recv().map_err(|_| "the page gave no response".to_string()),
+            Err(e) => Err(e.to_string()),
+        },
     };
     // The head may have been sent just before the page ended.
     if let Ok(mut head) = head_rx.try_recv() {
@@ -2934,11 +3018,12 @@ impl State {
             return self.error_page("Route error", &e);
         }
         match resolve(self, parts.uri.path()) {
+            // (The teardown is dropped at once: the test waits for the response anyway.)
             None => match self.special("_404.phv") {
-                Some(page) => self.execute(&page, Vec::new(), ip, parts, body, Page::NotFound, None, None),
+                Some(page) => self.execute(&page, Vec::new(), ip, parts, body, Page::NotFound, None, None).0,
                 None => not_found(),
             },
-            Some(Target::Script(p, params)) => self.execute(&p, params, ip, parts, body, Page::Normal, None, None),
+            Some(Target::Script(p, params)) => self.execute(&p, params, ip, parts, body, Page::Normal, None, None).0,
             // Static files get the server's checks and headers (read whole: the
             // test reads the body at once).
             Some(Target::Static(p)) => match open_static(&self.public, &p, MAX_STATIC) {

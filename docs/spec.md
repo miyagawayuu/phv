@@ -815,8 +815,10 @@ phv serve examples/site --port 8080
 - Each request runs in a new VM (a new heap). Only the compiled bytecode is shared.
 - When a file is saved, it is recompiled on the next request (the modification times of all the files it depends on are checked).
   A production server (`--prod`) looks at the files at most once a second: what a request path leads to, the files a
-  compiled page was built from, and the small static files it keeps in memory. A change shows within a second. A
-  development server looks at every request.
+  compiled page was built from, the small static files it keeps in memory, and whether each directory has a
+  `_middleware.phv` (and the site a `_404.phv` or `_500.phv`). A change shows within a second: a middleware or error
+  page added, removed or swapped for a link is seen up to a second late, as a page is. A development server looks at
+  every request.
 - Limits: execution time 30 seconds (`--time-limit`), memory 128 MB (`[security] memory_limit_mb`), body 8 MB, receiving headers 10 seconds,
   receiving the body 30 seconds, 1024 concurrent connections, 1000 query and form fields. A connection is closed when the
   client accepts no data for 30 seconds. Static files (and `response()->file()`) are sent from disk as they are read,
@@ -1343,7 +1345,11 @@ only its own changes are undone, and nothing is committed until the outermost on
   Each open checks the path as before: no link on the way, the journal files missing or plain files, and the
   database a plain file with one link that is the very file the kept connection has open (otherwise a new connection
   is opened). The new script gets its own time limit, and `lastInsertId()`, `changes()` and `total_changes()` start
-  from zero. When a script is done, an open transaction is rolled back; a connection is closed instead of kept after a
+  from zero. A kept connection also keeps its prepared statements (the 32 texts run last), so a script that runs the
+  same texts as the one before neither compiles nor weighs them again; a kept statement whose schema changed meanwhile
+  is compiled again at its first step, and weighed again when its program is then longer than 200 steps. The values
+  bound to a statement are cleared when its run is done. When a script is done, an open transaction is rolled back; a
+  connection is closed instead of kept after a
   failed statement, after any `PRAGMA`, or when a temporary table, view, index or trigger exists. `unlink()` and
   `rename()` close the idle connections of the file first.
 - SQLite's memory counts toward the script's memory limit: the page cache of each connection (up to 2 MB), its
@@ -1386,6 +1392,10 @@ The methods are the same as for SQLite (`query`, `first`, `execute`, `transactio
   statements; MySQL `COM_RESET_CONNECTION`, the active role and the database of the URL). Connecting to the same name
   twice in one script gives the same connection. When every connection is in use, `connect()` waits up to the
   script's time limit (30 seconds at most) and then raises `DatabaseError`.
+- On the server, the reset and return (also of a SQLite or Redis connection) happen after the page's response has
+  been handed over, so the visitor does not wait for them; the page's worker is held until they are done (the
+  `workers` limit counts such pages), and the response time in the access log ends when the response is handed over.
+  Middleware that passes the request on gives its connections back before the page runs.
 - A PostgreSQL connection keeps the 64 statements it ran last prepared (SQLite: the statements of the script's
   connection), so a statement run again skips that step. Only `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `WITH` and
   `VALUES` are kept; any other statement (`ALTER TABLE`, `DEALLOCATE`, `SET`, ...) drops them. A kept statement is
@@ -1922,7 +1932,9 @@ $data = json_decode($j->payload);
   are kept in a table `phv_jobs_<hash>` of the site's namespace (see "Sessions"; `phv_jobs` for a site without one),
   created when first needed and taken with `SELECT ... FOR UPDATE SKIP LOCKED`; Redis keeps them under
   `phv:jobs:<hash>:`. Every server process and machine of the site using the same store shares the jobs; other sites
-  on the same database do not see them; jobs left in the shared table when a site gets a name are not taken. The
+  on the same database do not see them. Jobs left in the shared table when a site gets a name are not taken: they stay
+  in `phv_jobs` (Redis: under `phv:jobs:`), `phv jobs list` says how many waiting, running and failed jobs are there,
+  and a later release adds a command that moves them to the site's own table. The
   100,000 hold for transactions running at the same time too: `enqueue()` in a transaction takes a lock of the site's
   jobs that the transaction holds until it ends (PostgreSQL an advisory lock, MySQL a row of a table
   `phv_jobs_lock`), so transactions that add jobs to the same site wait for one another, and so does an `enqueue()`

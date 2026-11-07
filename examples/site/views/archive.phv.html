@@ -1,0 +1,13 @@
+<?phv
+import lib.posts.Post;
+params(string $month, list<Post> $posts);
+?>
+<h1>Archive: <?= $month ?></h1>
+<?phv foreach ($posts as $post): ?>
+<article class="card">
+  <h3><a href="/post?id=<?= $post->id ?>"><?= $post->title ?></a></h3>
+  <p><?= $post->excerpt() ?></p>
+  <p class="tags"><?phv foreach ($post->tags as $tag): ?><span>#<?= $tag ?></span><?phv endforeach; ?></p>
+</article>
+<?phv endforeach; ?>
+<p><a href="/">← All posts</a></p>

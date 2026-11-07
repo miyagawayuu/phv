@@ -121,17 +121,22 @@ fn jobs_run_list_and_retry_with_redis() {
         return;
     };
     let dir = base("redis");
+    // A store namespace of this test run: other test processes use the server too.
+    let site = phv_std::testing::run_id();
     write(
         &dir,
         "phv.toml",
-        &format!("[permissions]\nwrite = [\"data/\"]\n[databases.q]\nurl = \"{url}\"\n[jobs]\nstore = \"db:q\"\nmax_attempts = 1\n"),
+        &format!(
+            "[permissions]\nwrite = [\"data/\"]\n[databases.q]\nurl = \"{url}\"\n[security]\nstore_namespace = \"{site}\"\n\
+             [jobs]\nstore = \"db:q\"\nmax_attempts = 1\n"
+        ),
     );
     write(&dir, "public/index.phv", "<?phv echo 1;");
     write(&dir, "jobs/note.phv", JOB);
     write(&dir, "jobs/fail.phv", "<?phv\nthrow new RuntimeException(\"broken on purpose\");\n");
     std::fs::create_dir_all(dir.join("data")).unwrap();
     let spec = phv_vm::DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 2 };
-    let store = phv_std::jobs::Store::Db(spec, None);
+    let store = phv_std::jobs::Store::Db(spec, Some(phv_std::store_namespace(site)));
     // Clear what earlier runs left.
     while let Some(j) = store.take(Duration::from_secs(60)).unwrap() {
         store.end(&j, phv_std::jobs::End::Done { keyed: false }).unwrap();
@@ -171,4 +176,103 @@ fn jobs_run_list_and_retry_with_redis() {
     let (ok, out) = phv(&["jobs", "list", &dir.to_string_lossy()]);
     assert!(ok && out.contains("waiting"), "{out}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tag no other run of these tests has.
+fn run_tag() -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    format!("{}_{nanos}", std::process::id())
+}
+
+/// `phv jobs list` of a site with a namespace says how many jobs are left in
+/// the shared store (`phv_jobs`, `phv:jobs:`) of 1.1, which the site does not
+/// run; a site without a namespace lists them as its own, with no note. The
+/// shared store of `url` is this test's alone.
+fn check_left_in_shared(name: &str, url: &str) {
+    use phv_std::jobs::{End, Store};
+    let dir = base(name);
+    let site = format!("left-{}", run_tag());
+    let toml = |project: &str| {
+        format!("{project}[databases.q]\nurl = \"{url}\"\n[jobs]\nstore = \"db:q\"\nmax_attempts = 1\n")
+    };
+    let named = toml(&format!("[project]\nname = \"{site}\"\n"));
+    write(&dir, "phv.toml", &named);
+    write(&dir, "public/index.phv", "<?phv echo 1;");
+    let spec = phv_vm::DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 2 };
+    let shared = Store::Db(spec.clone(), None);
+    // Clear what earlier runs left.
+    while let Some(j) = shared.take(Duration::from_secs(60)).unwrap() {
+        shared.end(&j, End::Done { keyed: false }).unwrap();
+    }
+    for j in shared.list(true).unwrap() {
+        shared.requeue(&j.id).unwrap();
+        let t = shared.take(Duration::from_secs(60)).unwrap().unwrap();
+        shared.end(&t, End::Done { keyed: false }).unwrap();
+    }
+    // The site's own store is empty, and the shared one too: no note.
+    let (ok, out) = phv(&["jobs", "list", &dir.to_string_lossy()]);
+    assert!(ok && out.contains("no jobs") && !out.contains("note:"), "{out}");
+    // Two jobs in the shared store: waiting ones, as 1.1 left them.
+    shared.add("left", "one", 0, None).unwrap().unwrap();
+    shared.add("left", "two", 0, None).unwrap().unwrap();
+    let note = "note: 2 jobs added before this site had a namespace are still in the shared store and not run";
+    let (ok, out) = phv(&["jobs", "list", &dir.to_string_lossy()]);
+    assert!(ok && out.contains("no jobs") && out.contains(note), "{out}");
+    assert!(out.contains("a later release will add a command to move them"), "{out}");
+    // The site's own jobs are listed, and the note counts the shared ones only.
+    let own = Store::Db(spec.clone(), Some(phv_std::store_namespace(&site)));
+    let own_id = own.add("mine", "", 0, None).unwrap().unwrap();
+    let (ok, out) = phv(&["jobs", "list", &dir.to_string_lossy()]);
+    assert!(ok && out.contains(&own_id) && out.contains("waiting") && out.contains(note), "{out}");
+    // A failed job counts too; one that ended does not (and one is "job ... is").
+    let t = shared.take(Duration::from_secs(60)).unwrap().unwrap();
+    shared.end(&t, End::Done { keyed: false }).unwrap();
+    let t = shared.take(Duration::from_secs(60)).unwrap().unwrap();
+    shared.end(&t, End::Dead { error: "left behind" }).unwrap();
+    let (ok, out) = phv(&["jobs", "list", &dir.to_string_lossy()]);
+    assert!(ok && out.contains("note: 1 job added before this site had a namespace is still"), "{out}");
+    // A site without a namespace has the shared store as its own: it lists
+    // the job, and nothing is noted.
+    write(&dir, "phv.toml", &toml(""));
+    let (ok, out) = phv(&["jobs", "list", "--failed", &dir.to_string_lossy()]);
+    assert!(ok && out.contains("left behind") && !out.contains("note:"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Needs `PHV_TEST_REDIS_URL`; uses database 11 of the server (the shared
+/// keys have one name, so another database keeps this test apart from the others).
+#[test]
+fn list_counts_the_jobs_left_in_the_shared_store_with_redis() {
+    let Ok(url) = std::env::var("PHV_TEST_REDIS_URL") else {
+        eprintln!("PHV_TEST_REDIS_URL is not set: skipped");
+        return;
+    };
+    let url = match url.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('/') {
+            Some((server, _)) => format!("{scheme}://{server}/11"),
+            None => format!("{url}/11"),
+        },
+        None => format!("{url}/11"),
+    };
+    check_left_in_shared("left-redis", &url);
+}
+
+/// Needs `PHV_TEST_POSTGRES_URL`; makes a schema of its own and puts it in
+/// the URL's `search_path` (the shared table has one name, so the schema
+/// keeps this test apart from the others), and drops it at the end.
+#[test]
+fn list_counts_the_jobs_left_in_the_shared_store_with_postgres() {
+    use phv_std::migrate::{Conn, Target};
+    let Ok(url) = std::env::var("PHV_TEST_POSTGRES_URL") else {
+        eprintln!("PHV_TEST_POSTGRES_URL is not set: skipped");
+        return;
+    };
+    let tag = run_tag();
+    let schema = format!("phv_left_{tag}");
+    let spec = phv_vm::DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 1 };
+    let mut admin = Conn::open(&Target::Server(&spec)).unwrap();
+    admin.apply(&format!("9100_left_{tag}.sql"), &format!("CREATE SCHEMA {schema}")).unwrap();
+    let sep = if url.contains('?') { '&' } else { '?' };
+    check_left_in_shared("left-pg", &format!("{url}{sep}options=-c%20search_path%3D{schema}"));
+    admin.apply(&format!("9101_left_{tag}.sql"), &format!("DROP SCHEMA {schema} CASCADE")).unwrap();
 }

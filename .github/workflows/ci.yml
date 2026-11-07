@@ -12,6 +12,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # A test that aborts (a panic where it cannot unwind) then leaves a trace.
+  RUST_BACKTRACE: 1
 
 jobs:
   databases:
@@ -55,9 +57,7 @@ jobs:
           PHV_TEST_POSTGRES_URL: postgres://postgres:phv@127.0.0.1/postgres
           PHV_TEST_MYSQL_URL: mysql://root:phv@127.0.0.1/phv
           PHV_TEST_REDIS_URL: redis://127.0.0.1
-        run: |
-          cargo test -p phv_driver --test databases -- --nocapture
-          cargo test -p phv_server database_stores -- --nocapture
+        run: cargo test --workspace -- --nocapture
 
   test:
     name: test (${{ matrix.os }})

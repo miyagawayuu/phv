@@ -14,6 +14,7 @@ mod collections;
 pub mod cron;
 mod crypt;
 mod db;
+pub(crate) mod deadline;
 mod httpclient;
 pub mod jobs;
 mod jsonas;
@@ -31,6 +32,8 @@ mod redisclient;
 pub mod safefs;
 mod sets;
 mod sys;
+#[doc(hidden)]
+pub mod testing;
 mod textio;
 mod timez;
 mod twofactor;
@@ -38,10 +41,11 @@ mod web;
 mod websocket;
 mod workers;
 
-/// SQLite connections kept between scripts: idle ones, and opens served by
-/// one so far. For tests.
+/// SQLite connections kept between scripts: idle ones, opens served by one
+/// so far, runs of scripts' statements that compiled something so far, and
+/// the memory the idle ones hold. For tests.
 #[doc(hidden)]
-pub fn sqlite_kept_stats() -> (usize, u64) {
+pub fn sqlite_kept_stats() -> (usize, u64, u64, usize) {
     db::kept_stats()
 }
 
@@ -231,12 +235,9 @@ fn int(v: &Value) -> i64 {
     }
 }
 
-/// How long a shared rate limit waits for its store: at most 2 seconds, and
-/// never past the script's deadline.
-fn shared_until(vm: &Vm) -> std::time::Instant {
-    let cap = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    vm.deadline().map_or(cap, |d| d.min(cap))
-}
+/// How long a shared rate limit waits for its store at most (and never past
+/// the script's deadline: `deadline::until`).
+const SHARED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn float(v: &Value) -> f64 {
     match v {
@@ -1306,7 +1307,7 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             }
             let key = format!("app:{}", s(&a[0]));
             let window = std::time::Duration::from_secs(secs as u64);
-            match ratelimit::hit_shared(&vm.host, &key, max as u32, window, shared_until(vm)) {
+            match ratelimit::hit_shared(&vm.host, &key, max as u32, window, deadline::until(vm, SHARED_WAIT)) {
                 Ok((allowed, _)) => Ok(Value::Bool(allowed)),
                 // A limit that cannot be counted refuses: it usually guards logins and the like.
                 Err(e) => {
@@ -1317,7 +1318,7 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         },
         "rate_limit_reset" => |vm, a| {
             let key = format!("app:{}", s(&a[0]));
-            if let Err(e) = ratelimit::reset_shared(&vm.host, &key, shared_until(vm)) {
+            if let Err(e) = ratelimit::reset_shared(&vm.host, &key, deadline::until(vm, SHARED_WAIT)) {
                 return Err(vm.throw("DatabaseError", format!("rate_limit_reset(): {e}")));
             }
             Ok(Value::Null)
@@ -1492,6 +1493,38 @@ mod tests {
             let n = PROVIDERS.iter().filter(|p| p(sig).is_some()).count();
             assert!(n <= 1, "builtin `{sig}` is implemented by {n} modules");
         }
+    }
+
+    /// SQLite is opened only where `db::mem::init` has run first: it switches
+    /// SQLite's allocator and starts SQLite in one step, and a database
+    /// opened past it by another thread while SQLite started left memory of
+    /// the default allocator for ours to free (found by CI on macOS: an
+    /// abort in the tests).
+    #[test]
+    fn sqlite_is_opened_through_init() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src];
+        let mut opened = Vec::new();
+        // Joined so that this test does not find itself.
+        let needle = ["Connection::", "open"].concat();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && std::fs::read_to_string(&path).unwrap().contains(&needle)
+                {
+                    opened.push(
+                        path.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap().to_string_lossy().replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        opened.sort();
+        // db.rs opens after `vfs::register` or `mem::init`; the VFS tests
+        // after `register`; the cost and mem tests after `mem::init`.
+        assert_eq!(opened, ["src/db.rs", "src/db/cost.rs", "src/db/mem.rs", "src/db/vfs.rs"]);
     }
 
     // The signature table lives in phv_types; keep this list in sync by

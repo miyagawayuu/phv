@@ -6,7 +6,8 @@
 //! calls `close()` or ends, so nothing received for one request can reach the
 //! next. Only text messages are exchanged; pings are answered while reading.
 
-use crate::netio::{check_plain, describe, dial, until, Stream};
+use crate::deadline::until;
+use crate::netio::{check_plain, describe, dial, Stream};
 use crate::{float, int, s};
 use phv_vm::{Value, Vm, VmError};
 use std::io::ErrorKind;
@@ -148,13 +149,12 @@ pub fn receive(vm: &mut Vm, a: &[Value]) -> R {
     if !(0.0..=86_400.0).contains(&seconds) {
         return Err(vm.throw("ValueError", "the timeout must be between 0 and 86400 seconds"));
     }
-    let wait_until = Instant::now() + Duration::from_secs_f64(seconds);
+    // `seconds` from now, or the script's deadline when that comes first.
+    let stop = until(vm, Duration::from_secs_f64(seconds));
     with_conn(vm, &a[0], |vm, c| loop {
-        let now = Instant::now();
-        let stop = vm.deadline().map_or(wait_until, |d| d.min(wait_until));
         // A zero timeout still picks up a message that has already arrived.
         // Every socket read and write (also the pongs sent while reading) stops at `stop`.
-        c.ws.get_mut().set_deadline(stop.max(now + Duration::from_millis(1)));
+        c.ws.get_mut().set_deadline(stop.max(Instant::now() + Duration::from_millis(1)));
         match c.ws.read() {
             Ok(Message::Text(t)) => return Ok((Ok(Value::str(t.as_str())), false)),
             Ok(Message::Binary(_)) => {

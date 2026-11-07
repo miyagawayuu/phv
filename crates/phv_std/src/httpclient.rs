@@ -8,7 +8,8 @@
 //! the same host (see `Pool`). Redirects are not followed: a 3xx response is
 //! returned to the script.
 
-use crate::netio::{check_plain, describe, dial, until, Stream};
+use crate::deadline::until;
+use crate::netio::{check_plain, describe, dial, Stream};
 use crate::{map, s};
 use indexmap::IndexMap;
 use phv_vm::{Key, Value, Vm, VmError};

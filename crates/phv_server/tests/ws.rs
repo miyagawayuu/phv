@@ -266,9 +266,11 @@ fn publish_reaches_the_other_server_processes() {
         eprintln!("PHV_TEST_REDIS_URL is not set: skipped");
         return;
     };
-    let secret = "s".repeat(40);
+    // The channel is named by the secret: one of this test run, so other test
+    // processes on the same server do not hear these messages.
+    let secret = format!("{}{}", phv_std::testing::run_id(), "s".repeat(24));
     std::env::set_var("PHV_TEST_WS_SECRET", &secret);
-    std::env::set_var("PHV_TEST_WS_OTHER", "o".repeat(40));
+    std::env::set_var("PHV_TEST_WS_OTHER", format!("{}{}", phv_std::testing::run_id(), "o".repeat(24)));
     let toml = |var: &str| {
         format!(
             "[databases.bus]\nurl = \"{url}\"\n[security]\nsecret_env = \"{var}\"\n[server]\npublish_store = \"bus\"\n"

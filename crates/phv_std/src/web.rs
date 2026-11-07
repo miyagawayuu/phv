@@ -312,7 +312,18 @@ fn set_cookie(vm: &mut Vm, a: &[Value]) -> R {
 pub fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     getrandom::fill(&mut buf).expect("operating system random number generator failed");
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    hex_of(&buf)
+}
+
+/// `bytes` as lowercase hex (every page makes a few ids this way).
+pub fn hex_of(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(DIGITS[(b >> 4) as usize] as char);
+        out.push(DIGITS[(b & 15) as usize] as char);
+    }
+    out
 }
 
 /// Refuses a change to what flush() has already sent: the status, headers,
@@ -512,6 +523,17 @@ mod tests {
         assert!(json_decode("{\"a\":1} x").is_err());
         assert!(json_decode(&"[".repeat(1000)).is_err());
         assert!(matches!(json_decode("12345678901234567890").unwrap(), Value::Float(_)));
+    }
+
+    /// The hex table gives what formatting each byte gave.
+    #[test]
+    fn hex_matches_formatting() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let formatted: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex_of(&bytes), formatted);
+        assert_eq!(hex_of(&[]), "");
+        assert_eq!(random_hex(16).len(), 32);
+        assert!(random_hex(16).bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
     }
 }
 

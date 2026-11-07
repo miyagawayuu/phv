@@ -1,0 +1,6 @@
+<?phv
+import lib.posts.all_posts;
+
+// The posts of one month, three directories deep: /archive/2026/11
+$body = render("views/archive.phv.html", month: "November 2026", posts: all_posts());
+echo render("views/layout.phv.html", title: "Archive: November 2026", body: $body);

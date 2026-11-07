@@ -93,9 +93,8 @@ struct Db {
     pages: usize,
     /// For a database file: the pool the connection goes back to.
     pooled: Option<Lease>,
-    /// Counts the calls of the authorizer, which SQLite makes while it
-    /// compiles a statement (see `statement`).
-    compiles: Arc<AtomicU64>,
+    /// What the connection's authorizer and functions know of this script.
+    session: Arc<Session>,
 }
 
 impl Db {
@@ -113,13 +112,36 @@ impl Db {
     /// view it reads, say) is compiled again by `sqlite3_step` without being
     /// weighed, so it may not be large (`query` and `execute` then prepare and
     /// weigh it again).
+    ///
+    /// A kept connection keeps its statements between scripts (`reusable`),
+    /// and the weighing holds across them as within one script: a statement
+    /// comes out of the cache only if SQLite compiled it on this connection
+    /// (`prepare_cached` compiles a text it does not hold), and it was weighed
+    /// then, whichever script ran it. When the schema changed since, by
+    /// another connection or by this one (a `CREATE` or `ALTER` of this or an
+    /// earlier script; those do not taint the connection), the statement's
+    /// `OP_Transaction` step finds the schema cookie changed, or the statement
+    /// expired, and `sqlite3_step` compiles it again under `RUN_OPS`: a larger
+    /// program fails as out of memory, `refused_recompile` tells, and the text
+    /// is prepared and weighed again here, after `discard` dropped the kept
+    /// one. So no program that was never weighed runs from the cache with more
+    /// than `RUN_OPS` steps. A statement that reads no table carries no schema
+    /// and is not compiled again, and need not be. The memory the kept
+    /// statements take moves with the connection (`held`), and the values a
+    /// run bound are cleared when the statement goes back to the cache (see
+    /// `reusable`).
     fn statement(&self, vm: &Vm, text: &str) -> Result<rusqlite::CachedStatement<'_>, VmError> {
         use rusqlite::limits::Limit;
         let c = self.conn();
         let _ = c.set_limit(Limit::SQLITE_LIMIT_VDBE_OP, PREPARE_OPS);
-        let before = self.compiles.load(Ordering::SeqCst);
+        let before = self.session.compiles.load(Ordering::SeqCst);
         let prepared = c.prepare_cached(text).and_then(|st| {
-            if self.compiles.load(Ordering::SeqCst) == before || st.is_explain() != 0 {
+            if self.session.compiles.load(Ordering::SeqCst) == before {
+                // Kept from an earlier run, and weighed then (see above).
+                return Ok(Ok(st));
+            }
+            COMPILED.fetch_add(1, Ordering::SeqCst);
+            if st.is_explain() != 0 {
                 return Ok(Ok(st));
             }
             // Not kept unless it passes: the next prepare of the text compiles
@@ -167,14 +189,21 @@ impl Db {
         matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::OutOfMemory)
             && !mem::Budget::refused()
             && !mem::Budget::late()
-            && self.compiles.load(Ordering::SeqCst) != before
+            && self.session.compiles.load(Ordering::SeqCst) != before
+    }
+
+    /// Counts a run of a statement during which SQLite compiled something
+    /// (the authorizer count moved from `before`): the statement itself,
+    /// again, after a schema change. For tests.
+    fn ran(&self, before: u64) {
+        if self.session.compiles.load(Ordering::SeqCst) != before {
+            COMPILED.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// The error of a failed statement; the connection is then not reused.
     fn fail(&self, vm: &Vm, e: rusqlite::Error) -> VmError {
-        if let Some(lease) = &self.pooled {
-            lease.tainted.store(true, Ordering::SeqCst);
-        }
+        self.session.tainted.store(true, Ordering::SeqCst);
         db_error(vm, e)
     }
 }
@@ -199,15 +228,19 @@ impl Drop for Db {
 //   database's name must still be a plain file with one link and the very
 //   file the kept connection has open (its identity). Otherwise the
 //   connection is not used. Files SQLite opens later are checked by `vfs`.
-// - The script's own settings are installed every time: the progress handler
-//   with its deadline, `LIKE`/`GLOB` with its deadline, the counters
-//   (`changes()`, `total_changes()`, `last_insert_rowid()`) and the
-//   authorizer.
+// - The authorizer and PHV's SQL functions (`LIKE`/`GLOB`, `changes()`...)
+//   are registered once, when the connection is opened: registering a
+//   function or the authorizer again expires every prepared statement
+//   (SQLite's `sqlite3ExpirePreparedStatements`), which `sqlite3_step` then
+//   compiles again. What they know of the script (its deadline, the counters'
+//   base, whether a statement tainted the connection) is a `Session` set at
+//   every open, with the progress handler and its deadline (`for_script`).
 // - When the script is done, an open transaction is rolled back. The
 //   connection is closed instead of kept after a failed statement, any
 //   `PRAGMA` (the session settings it may change), or when a temporary table,
-//   view, index or trigger exists; also when the rollback fails. Its cached
-//   statements and page cache are dropped.
+//   view, index or trigger exists; also when the rollback fails. Its page
+//   cache is let go of; its prepared statements are kept, with their bound
+//   values cleared (see `Db::statement` and `reusable`).
 // - An idle connection is closed after `KEPT_IDLE`, and when a script deletes
 //   or renames its file. `:memory:` databases are never kept.
 // - SQLite's memory is counted as the thread's (`mem`). The memory a kept
@@ -232,11 +265,12 @@ pub fn set_kept_idle(idle: Option<Duration>) {
     KEPT_IDLE_MS.store(idle.unwrap_or(KEPT_IDLE).as_millis() as u64, Ordering::SeqCst);
 }
 
-/// A connection a script holds: the file it is for, and whether it may be kept.
+/// A connection a script holds: the file it is for, and its session (whose
+/// `tainted` says whether it may be kept).
 struct Lease {
     key: PathBuf,
     id: FileId,
-    tainted: Arc<AtomicBool>,
+    session: Arc<Session>,
     /// The memory the connection took when it was opened (see `held`).
     base: usize,
 }
@@ -249,19 +283,21 @@ struct Idle {
     base: usize,
     /// The memory it holds, taken off the thread that gave it back.
     held: usize,
+    session: Arc<Session>,
 }
 
 impl Idle {
     /// A connection going into the pool: the memory it holds is no longer
     /// this thread's.
-    fn new(conn: Connection, id: FileId, base: usize) -> Idle {
-        let held = held(&conn, base);
+    fn new(conn: Connection, lease: Lease) -> Idle {
+        let held = held(&conn, lease.base);
         phv_vm::alloc::uncharge_thread(held);
-        Idle { conn: Some(conn), id, since: Instant::now(), base, held }
+        Idle { conn: Some(conn), id: lease.id, since: Instant::now(), base: lease.base, held, session: lease.session }
     }
 
-    fn into_conn(mut self) -> Connection {
-        self.conn.take().expect("an idle connection has its connection")
+    fn into_conn(mut self) -> (Connection, usize, Arc<Session>) {
+        let conn = self.conn.take().expect("an idle connection has its connection");
+        (conn, self.base, self.session.clone())
     }
 }
 
@@ -274,7 +310,8 @@ impl Drop for Idle {
 }
 
 /// The memory connection `c` holds: what opening it took (`base`), and its
-/// page cache, schema and statements.
+/// page cache, schema and prepared statements (with the values bound to
+/// them, `SQLITE_DBSTATUS_STMT_USED` counts what finalizing them would free).
 fn held(c: &Connection, base: usize) -> usize {
     // SAFETY: the handle is the open connection's.
     let db = unsafe { c.handle() };
@@ -296,10 +333,17 @@ fn held(c: &Connection, base: usize) -> usize {
 static KEPT: LazyLock<Mutex<HashMap<PathBuf, Vec<Idle>>>> = LazyLock::new(Default::default);
 /// Opens served by a kept connection (for tests).
 static REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Runs of scripts' statements for which SQLite compiled something: at the
+/// prepare, or at the first step after a schema change (for tests).
+static COMPILED: AtomicU64 = AtomicU64::new(0);
 
-/// Idle connections kept, and opens served by one so far (for tests).
-pub fn kept_stats() -> (usize, u64) {
-    (kept().values().map(Vec::len).sum(), REUSED.load(Ordering::SeqCst))
+/// Idle connections kept, opens served by one so far, runs of scripts'
+/// statements that compiled something so far, and the memory the idle
+/// connections hold (for tests).
+pub fn kept_stats() -> (usize, u64, u64, usize) {
+    let map = kept();
+    let idle: Vec<&Idle> = map.values().flatten().collect();
+    (idle.len(), REUSED.load(Ordering::SeqCst), COMPILED.load(Ordering::SeqCst), idle.iter().map(|i| i.held).sum())
 }
 static SWEEPING: AtomicBool = AtomicBool::new(false);
 
@@ -309,7 +353,7 @@ fn kept() -> MutexGuard<'static, HashMap<PathBuf, Vec<Idle>>> {
 
 /// An idle connection to the file `key` whose identity is `id`. Connections
 /// to another file of that name, or idle for too long, are closed.
-fn take(key: &Path, id: FileId) -> Option<(Connection, usize)> {
+fn take(key: &Path, id: FileId) -> Option<(Connection, usize, Arc<Session>)> {
     let mut closing = Vec::new();
     let found = {
         let mut map = kept();
@@ -318,8 +362,7 @@ fn take(key: &Path, id: FileId) -> Option<(Connection, usize)> {
         while let Some(idle) = list.pop() {
             if idle.id == id && idle.since.elapsed() < kept_idle() {
                 REUSED.fetch_add(1, Ordering::SeqCst);
-                let base = idle.base;
-                found = Some((idle.into_conn(), base));
+                found = Some(idle.into_conn());
                 break;
             }
             closing.push(idle);
@@ -336,12 +379,13 @@ fn take(key: &Path, id: FileId) -> Option<(Connection, usize)> {
 
 /// Takes back a connection a script is done with, if it can be reused.
 fn give_back(c: Connection, lease: Lease) {
-    let Some(c) = reusable(c, &lease.tainted) else { return };
-    let idle = Idle::new(c, lease.id, lease.base);
+    let Some(c) = reusable(c, &lease.session) else { return };
+    let key = lease.key.clone();
+    let idle = Idle::new(c, lease);
     let refused = {
         let mut map = kept();
         let all: usize = map.values().map(Vec::len).sum();
-        let list = map.entry(lease.key).or_default();
+        let list = map.entry(key).or_default();
         if list.len() < KEPT_PER_FILE && all < KEPT_ALL {
             list.push(idle);
             None
@@ -354,22 +398,28 @@ fn give_back(c: Connection, lease: Lease) {
 }
 
 /// Rolls back what the script left and checks the connection can be kept.
-fn reusable(c: Connection, tainted: &AtomicBool) -> Option<Connection> {
+fn reusable(c: Connection, session: &Session) -> Option<Connection> {
     // Statements run here must not stop at the script's deadline.
     c.progress_handler(0, None::<fn() -> bool>);
-    if tainted.load(Ordering::SeqCst) {
+    session.set_deadline(None);
+    if session.tainted.load(Ordering::SeqCst) {
         return None;
     }
     if !c.is_autocommit() && c.execute_batch("ROLLBACK").is_err() {
         return None;
     }
     let temp: i64 = c.query_row("SELECT count(*) FROM sqlite_temp_master", [], |r| r.get(0)).ok()?;
-    if temp != 0 || !c.is_autocommit() || tainted.load(Ordering::SeqCst) {
+    if temp != 0 || !c.is_autocommit() || session.tainted.load(Ordering::SeqCst) {
         return None;
     }
-    // The cached statements were allocated by the script (and counted
-    // against its memory); the page cache is SQLite's memory.
-    c.flush_prepared_statement_cache();
+    // The page cache is let go of (it is SQLite's memory; `release_memory`
+    // leaves the statements alone). The prepared statements stay, so the next
+    // script runs the same texts without compiling or weighing them again
+    // (see `Db::statement`); their memory goes with the connection (`held`).
+    // None of this script's values is in them: rusqlite's `StatementCache`
+    // (0.37, `cache.rs`) takes a `CachedStatement` back at its drop, which
+    // comes after `Rows` or `execute` reset it (`sqlite3_reset`), and calls
+    // `sqlite3_clear_bindings` on it before it goes into the cache.
     c.release_memory().ok()?;
     Some(c)
 }
@@ -442,33 +492,50 @@ const PREPARE_OPS: std::ffi::c_int = 65_536;
 /// as for `VACUUM` or a full-text index); the largest is 168 steps.
 const RUN_OPS: std::ffi::c_int = 200;
 
-/// Installs what belongs to the script on a connection, new or kept: the
-/// progress handler and `LIKE`/`GLOB` with its deadline, counters that start
-/// from zero, the size of programs, and the authorizer (which counts the
-/// compiles in `compiles` and notes, in `tainted`, statements after which the
-/// connection is not kept).
-fn for_script(
-    c: &Connection,
-    vm: &Vm,
-    tainted: Option<Arc<AtomicBool>>,
-    compiles: Arc<AtomicU64>,
-) -> rusqlite::Result<()> {
-    // Queries stop when the script's time limit is reached.
-    match vm.deadline() {
-        Some(deadline) => c.progress_handler(PROGRESS_STEPS, Some(move || Instant::now() > deadline)),
-        None => c.progress_handler(0, None::<fn() -> bool>),
-    }
-    // SQLite runs one `LIKE` or `GLOB` as a single step, which the progress
-    // handler cannot stop (a long text and pattern take minutes): these do.
-    like_functions(c, vm.deadline())?;
-    counters(c)?;
-    c.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VDBE_OP, RUN_OPS)?;
-    // Last: the authorizer refuses the pragmas set before.
-    c.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
-        use rusqlite::hooks::AuthAction;
-        compiles.fetch_add(1, Ordering::SeqCst);
-        // A pragma may change the session; temporary objects stay in it.
-        if let Some(tainted) = &tainted {
+/// What a connection's authorizer and PHV's SQL functions know of the
+/// script that holds the connection. They are registered once, when the
+/// connection is opened (`install`), and read this at each call; `for_script`
+/// sets it for each script. Registering them again for each script would
+/// expire every prepared statement (SQLite compiles an expired statement
+/// again at its next step), and a kept connection keeps its statements
+/// between scripts.
+struct Session {
+    /// Set after a statement that keeps the connection from being kept (a
+    /// failed one, a `PRAGMA`, a temporary object).
+    tainted: AtomicBool,
+    /// Counts the calls of the authorizer, which SQLite makes while it
+    /// compiles a statement (see `Db::statement`).
+    compiles: AtomicU64,
+    /// The script's deadline, as nanoseconds after `EPOCH` plus one (0:
+    /// none); an atomic, as the functions read it at every call.
+    deadline: AtomicU64,
+    /// SQLite's count of changes when the script took the connection
+    /// (`changes()` and `total_changes()` count from there).
+    changes_base: AtomicU64,
+}
+
+/// The instant the sessions' deadlines count from.
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+impl Session {
+    /// Registers the authorizer and PHV's SQL functions on a new connection,
+    /// after the caller's own pragmas (the authorizer refuses them).
+    fn install(c: &Connection) -> rusqlite::Result<Arc<Session>> {
+        let session = Arc::new(Session {
+            tainted: AtomicBool::new(false),
+            compiles: AtomicU64::new(0),
+            deadline: AtomicU64::new(0),
+            changes_base: AtomicU64::new(0),
+        });
+        // SQLite runs one `LIKE` or `GLOB` as a single step, which the progress
+        // handler cannot stop (a long text and pattern take minutes): these do.
+        like_functions(c, session.clone())?;
+        counters(c, session.clone())?;
+        let auth = session.clone();
+        c.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+            use rusqlite::hooks::AuthAction;
+            auth.compiles.fetch_add(1, Ordering::SeqCst);
+            // A pragma may change the session; temporary objects stay in it.
             if matches!(
                 ctx.action,
                 AuthAction::Pragma { .. }
@@ -477,35 +544,70 @@ fn for_script(
                     | AuthAction::CreateTempTrigger { .. }
                     | AuthAction::CreateTempView { .. }
             ) {
-                tainted.store(true, Ordering::SeqCst);
+                auth.tainted.store(true, Ordering::SeqCst);
             }
+            sqlite_authorizer(ctx)
+        }));
+        Ok(session)
+    }
+
+    fn set_deadline(&self, deadline: Option<Instant>) {
+        let n = match deadline {
+            None => 0,
+            Some(d) => d.saturating_duration_since(*EPOCH).as_nanos().min(u64::MAX as u128 - 1) as u64 + 1,
+        };
+        self.deadline.store(n, Ordering::SeqCst);
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        match self.deadline.load(Ordering::SeqCst) {
+            0 => None,
+            n => Some(*EPOCH + Duration::from_nanos(n - 1)),
         }
-        sqlite_authorizer(ctx)
-    }));
+    }
+}
+
+/// Sets what belongs to the script on a connection, new or kept: the
+/// progress handler with its deadline, the session's deadline and taint,
+/// counters that start from zero, and the size of programs. Nothing here
+/// expires the connection's prepared statements.
+fn for_script(c: &Connection, vm: &Vm, session: &Session) -> rusqlite::Result<()> {
+    // Queries stop when the script's time limit is reached.
+    match vm.deadline() {
+        Some(deadline) => c.progress_handler(PROGRESS_STEPS, Some(move || Instant::now() > deadline)),
+        None => c.progress_handler(0, None::<fn() -> bool>),
+    }
+    session.set_deadline(vm.deadline());
+    session.tainted.store(false, Ordering::SeqCst);
+    // `last_insert_rowid()`, `changes()` and `total_changes()` count this
+    // script's statements only, as on a new connection.
+    // SAFETY: the handle is the open connection's.
+    unsafe { rusqlite::ffi::sqlite3_set_last_insert_rowid(c.handle(), 0) };
+    session.changes_base.store(c.total_changes(), Ordering::SeqCst);
+    c.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_VDBE_OP, RUN_OPS)?;
     Ok(())
 }
 
-/// `last_insert_rowid()`, `changes()` and `total_changes()` count this
-/// script's statements only, as on a new connection.
-fn counters(c: &Connection) -> rusqlite::Result<()> {
+/// `changes()` and `total_changes()` as the script's (from the session's
+/// base, see `for_script`).
+fn counters(c: &Connection, session: Arc<Session>) -> rusqlite::Result<()> {
     use rusqlite::functions::FunctionFlags;
     // SAFETY: the handle is the open connection's; the functions below are
     // owned by the connection, so it is open whenever they run.
-    let db = unsafe { c.handle() };
-    unsafe { rusqlite::ffi::sqlite3_set_last_insert_rowid(db, 0) };
-    let base = c.total_changes();
-    let db = db as usize;
+    let db = unsafe { c.handle() } as usize;
     let flags = FunctionFlags::SQLITE_UTF8;
+    let total_changes = session.clone();
     c.create_scalar_function("total_changes", 0, flags, move |_| {
         // SAFETY: see above.
         let total = unsafe { rusqlite::ffi::sqlite3_total_changes64(db as *mut rusqlite::ffi::sqlite3) } as u64;
-        Ok(total.saturating_sub(base) as i64)
+        Ok(total.saturating_sub(total_changes.changes_base.load(Ordering::SeqCst)) as i64)
     })?;
     c.create_scalar_function("changes", 0, flags, move |_| {
         // SAFETY: see above.
         let db = db as *mut rusqlite::ffi::sqlite3;
         // Until this script changes a row, the last change was another script's.
-        if (unsafe { rusqlite::ffi::sqlite3_total_changes64(db) } as u64) == base {
+        if (unsafe { rusqlite::ffi::sqlite3_total_changes64(db) } as u64) == session.changes_base.load(Ordering::SeqCst)
+        {
             return Ok(0);
         }
         Ok(unsafe { rusqlite::ffi::sqlite3_changes64(db) })
@@ -617,7 +719,7 @@ fn query(vm: &mut Vm, a: &[Value]) -> R {
     'run: loop {
         // Kept prepared for the next run of the same text (`prepare_cached`).
         let mut stmt = db.statement(vm, &text)?;
-        let before = db.compiles.load(Ordering::SeqCst);
+        let before = db.session.compiles.load(Ordering::SeqCst);
         let mut rows = stmt.query(rusqlite::params_from_iter(bound.iter())).map_err(|e| db.fail(vm, e))?;
         // Made once the first row is there: a kept statement is prepared again
         // by its first step when the schema changed, and its columns with it.
@@ -625,7 +727,10 @@ fn query(vm: &mut Vm, a: &[Value]) -> R {
         loop {
             let row = match rows.next() {
                 Ok(Some(row)) => row,
-                Ok(None) => break,
+                Ok(None) => {
+                    db.ran(before);
+                    break;
+                }
                 // Compiled again too large by its first step (see `Db::statement`):
                 // prepared and weighed once more.
                 Err(e) if again && out.is_none() && db.refused_recompile(&e, before) => {
@@ -680,9 +785,12 @@ fn execute(vm: &mut Vm, a: &[Value]) -> R {
     let mut again = true;
     let n = loop {
         let mut stmt = db.statement(vm, &text)?;
-        let compiles = db.compiles.load(Ordering::SeqCst);
+        let compiles = db.session.compiles.load(Ordering::SeqCst);
         match stmt.execute(rusqlite::params_from_iter(bound.iter())) {
-            Ok(n) => break n,
+            Ok(n) => {
+                db.ran(compiles);
+                break n;
+            }
             // Compiled again too large by its first step (see `Db::statement`):
             // prepared and weighed once more.
             Err(e) if again && db.refused_recompile(&e, compiles) => {
@@ -722,7 +830,7 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
     check_journals(&dir, &name).map_err(|e| file_error(vm, e))?;
     let now = dir.plain_file_id(&name).map_err(|e| file_error(vm, e))?;
     let key = dir.path().join(&name);
-    let (c, id, base) = match now.and_then(|id| take(&key, id).map(|(c, base)| (c, id, base))) {
+    let (c, id, base, session) = match now.and_then(|id| take(&key, id).map(|(c, base, s)| (c, id, base, s))) {
         Some(kept) => kept,
         None => {
             // SQLite starts (once, for good) before the connection is measured.
@@ -733,28 +841,35 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
                 OpenError::NoFileSystem => vm.throw("DatabaseError", NO_FILE_SYSTEM),
                 OpenError::Sqlite(e) => db_error(vm, e),
             })?;
+            let session = harden(&c)
+                .and_then(|()| script_settings(&c))
+                .and_then(|()| Session::install(&c))
+                .map_err(|e| db_error(vm, e))?;
             let base = (phv_vm::alloc::thread_allocated() - before).max(0) as usize;
-            harden(&c).and_then(|()| script_settings(&c)).map_err(|e| db_error(vm, e))?;
-            (c, id, base)
+            (c, id, base, session)
         }
     };
-    let tainted = Arc::new(AtomicBool::new(false));
     // A kept connection's memory counts from here (its `Idle` was dropped):
     // a failure below closes it on this thread.
-    let compiles = Arc::new(AtomicU64::new(0));
-    for_script(&c, vm, Some(tainted.clone()), compiles.clone()).map_err(|e| db_error(vm, e))?;
+    for_script(&c, vm, &session).map_err(|e| db_error(vm, e))?;
     drop(budget);
-    let lease = Lease { key, id, tainted, base };
-    let db = Db { conn: Some(c), _dir: Some(dir), depth: Cell::new(0), pages: 0, pooled: Some(lease), compiles };
+    let lease = Lease { key, id, session: session.clone(), base };
+    let db = Db { conn: Some(c), _dir: Some(dir), depth: Cell::new(0), pages: 0, pooled: Some(lease), session };
     vm.resources.push(Some(Box::new(db)));
     Ok(Value::Int(vm.resources.len() as i64 - 1))
 }
 
+/// The prepared statements a connection keeps (the texts run last; rusqlite
+/// keeps 16 by default): a page's statements, with room for a few more.
+const KEPT_STATEMENTS: usize = 32;
+
 /// The settings of a script's connection beyond `harden`: temporary tables,
 /// indexes and sorts are kept in memory, so they count against the script's
 /// memory limit (found by the 1.1.1 audit: they went to temporary files,
-/// which no limit bounded, also for `:memory:` databases without permissions).
+/// which no limit bounded, also for `:memory:` databases without permissions);
+/// and the statements it keeps.
 fn script_settings(c: &Connection) -> rusqlite::Result<()> {
+    c.set_prepared_statement_cache_capacity(KEPT_STATEMENTS);
     c.execute_batch("PRAGMA temp_store = MEMORY")
 }
 
@@ -781,9 +896,9 @@ fn open_memory(vm: &mut Vm, _budget: mem::Budget) -> R {
     }
     c.execute_batch(&format!("PRAGMA page_size = 4096; PRAGMA max_page_count = {pages}"))
         .map_err(|e| db_error(vm, e))?;
-    let compiles = Arc::new(AtomicU64::new(0));
-    for_script(&c, vm, None, compiles.clone()).map_err(|e| db_error(vm, e))?;
-    let db = Db { conn: Some(c), _dir: None, depth: Cell::new(0), pages, pooled: None, compiles };
+    let session = Session::install(&c).map_err(|e| db_error(vm, e))?;
+    for_script(&c, vm, &session).map_err(|e| db_error(vm, e))?;
+    let db = Db { conn: Some(c), _dir: None, depth: Cell::new(0), pages, pooled: None, session };
     vm.resources.push(Some(Box::new(db)));
     Ok(Value::Int(vm.resources.len() as i64 - 1))
 }
@@ -1077,11 +1192,12 @@ fn room(bytes: usize) -> rusqlite::Result<()> {
 ///
 /// SQLite does not call its progress handler while a function runs, nor
 /// between the functions of one row, so each of these looks at the deadline
-/// when it is called and, where its work can be long, as it goes. Their
-/// arguments are read in place, and what they allocate is counted against
-/// the script's memory limit before it is (found by the 1.2.0 audit: copies
-/// of 32 MB values passed the limit).
-fn like_functions(c: &Connection, deadline: Option<std::time::Instant>) -> rusqlite::Result<()> {
+/// (the session's: the script that holds the connection now) when it is
+/// called and, where its work can be long, as it goes. Their arguments are
+/// read in place, and what they allocate is counted against the script's
+/// memory limit before it is (found by the 1.2.0 audit: copies of 32 MB
+/// values passed the limit).
+fn like_functions(c: &Connection, session: Arc<Session>) -> rusqlite::Result<()> {
     use rusqlite::functions::{Context, FunctionFlags};
     use std::borrow::Cow;
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
@@ -1100,7 +1216,8 @@ fn like_functions(c: &Connection, deadline: Option<std::time::Instant>) -> rusql
             ValueRef::Real(f) => Some(Cow::Owned(real_text(f))),
         })
     }
-    let run = move |ctx: &Context, glob: bool| -> rusqlite::Result<Option<bool>> {
+    let run = move |session: &Session, ctx: &Context, glob: bool| -> rusqlite::Result<Option<bool>> {
+        let deadline = session.deadline();
         too_late(deadline)?;
         let (Some(p), Some(t)) = (text(ctx, 0)?, text(ctx, 1)?) else { return Ok(None) };
         if p.len() > MAX_PATTERN {
@@ -1129,19 +1246,24 @@ fn like_functions(c: &Connection, deadline: Option<std::time::Instant>) -> rusql
             None => Err(rusqlite::Error::UserFunctionError("the time limit was reached".into())),
         }
     };
-    c.create_scalar_function("like", 2, flags, move |ctx| run(ctx, false))?;
-    c.create_scalar_function("like", 3, flags, move |ctx| run(ctx, false))?;
-    c.create_scalar_function("glob", 2, flags, move |ctx| run(ctx, true))?;
+    let like = session.clone();
+    c.create_scalar_function("like", 2, flags, move |ctx| run(&like, ctx, false))?;
+    let like = session.clone();
+    c.create_scalar_function("like", 3, flags, move |ctx| run(&like, ctx, false))?;
+    let glob = session.clone();
+    c.create_scalar_function("glob", 2, flags, move |ctx| run(&glob, ctx, true))?;
 
     // SQLite's `instr()`, `replace()` and `trim(X, Y)` search naively (text × pattern
     // in one step, minutes on long values): these search in linear time.
+    let instr = session.clone();
     c.create_scalar_function("instr", 2, flags, move |ctx| {
-        too_late(deadline)?;
+        too_late(instr.deadline())?;
         let (Some(h), Some(n)) = (text(ctx, 0)?, text(ctx, 1)?) else { return Ok(None) };
         Ok(Some(h.find(&*n).map_or(0, |b| h[..b].chars().count() as i64 + 1)))
     })?;
+    let replace = session.clone();
     c.create_scalar_function("replace", 3, flags, move |ctx| {
-        too_late(deadline)?;
+        too_late(replace.deadline())?;
         let (Some(x), Some(y), Some(z)) = (text(ctx, 0)?, text(ctx, 1)?, text(ctx, 2)?) else {
             return Ok(None);
         };
@@ -1158,7 +1280,9 @@ fn like_functions(c: &Connection, deadline: Option<std::time::Instant>) -> rusql
         Ok(Some(x.replace(&*y, &z)))
     })?;
     for (name, left, right) in [("trim", true, true), ("ltrim", true, false), ("rtrim", false, true)] {
+        let trim = session.clone();
         c.create_scalar_function(name, 2, flags, move |ctx| {
+            let deadline = trim.deadline();
             too_late(deadline)?;
             let (Some(x), Some(y)) = (text(ctx, 0)?, text(ctx, 1)?) else { return Ok(None) };
             let set = CharSet::of(&y, deadline)?;

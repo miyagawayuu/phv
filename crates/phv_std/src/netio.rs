@@ -11,7 +11,6 @@
 //! same name at the same time share one lookup. Failed lookups are not kept.
 
 use crate::netdb::{is_local_host, tls_init};
-use phv_vm::Vm;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
@@ -155,12 +154,6 @@ static TLS: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
         .with_no_client_auth();
     Arc::new(config)
 });
-
-/// The script's deadline, or `cap` from now when it has none.
-pub(crate) fn until(vm: &Vm, cap: Duration) -> Instant {
-    let now = Instant::now();
-    vm.deadline().map_or(now + cap, |d| d.min(now + cap))
-}
 
 /// Refuses an unencrypted connection to another machine unless `tls = false`
 /// was set (`tls_setting` is the setting from phv.toml).

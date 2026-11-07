@@ -371,6 +371,17 @@ impl Store {
         }
     }
 
+    /// How many waiting, running and failed jobs the site left in the store
+    /// every site shared before 1.1 gave sites namespaces (the table
+    /// `phv_jobs`, the keys `phv:jobs:`). They are not run; `phv jobs list`
+    /// reports them. 0 for a site without a namespace, and for the memory store.
+    pub fn left_in_shared(&self) -> Result<i64, String> {
+        match self {
+            Store::Db(spec, ns) => netdb::job_count_shared(spec, ns.as_deref()),
+            Store::Memory(_) => Ok(0),
+        }
+    }
+
     /// The jobs of the store: all, or those given up.
     pub fn list(&self, failed_only: bool) -> Result<Vec<JobInfo>, String> {
         match self {

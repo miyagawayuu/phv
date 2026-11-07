@@ -66,4 +66,6 @@ httparse = "1.10"
 # Arithmetic bugs in the runtime become caught panics instead of silent wraps.
 overflow-checks = true
 codegen-units = 1
-lto = "thin"
+# Whole-program optimization; the symbols stay so a caught panic's trace has names.
+lto = "fat"
+strip = "debuginfo"

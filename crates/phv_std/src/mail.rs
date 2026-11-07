@@ -54,7 +54,7 @@ pub fn send(vm: &mut Vm, a: &[Value]) -> R {
         let var = spec.url_env.as_deref().unwrap_or("?");
         return Err(vm.throw("NetworkError", format!("mail: the environment variable {var} is not set")));
     };
-    let until = netio::until(vm, Duration::from_secs(30));
+    let until = crate::deadline::until(vm, Duration::from_secs(30));
     match deliver(&url, &spec, &to, &data, until) {
         Ok(()) => Ok(Value::Null),
         Err(e) => Err(vm.throw("NetworkError", format!("sending mail failed: {e}"))),

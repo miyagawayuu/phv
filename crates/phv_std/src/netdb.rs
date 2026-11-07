@@ -250,7 +250,7 @@ fn open(vm: &mut Vm, name: &str, want_redis: bool) -> R {
         return Err(wrong_kind(vm, name, kind == Kind::Redis));
     }
     tls_init();
-    let until = crate::netio::until(vm, MAX_WAIT);
+    let until = crate::deadline::until(vm, MAX_WAIT);
     let (memory, time_limit) = (vm.memory_limit(), vm.time_limit());
     let use_ = PoolUse::Scripts;
     let result = match kind {
@@ -394,15 +394,11 @@ fn read_budget(vm: &Vm) -> usize {
     (vm.memory_left() / 2).max(64 << 10)
 }
 
-/// When a statement must end on the client side: just after the script's deadline.
-fn statement_deadline(vm: &Vm) -> Option<Instant> {
-    vm.deadline().map(|d| d + Duration::from_millis(TIMEOUT_MARGIN_MS))
-}
-
-/// The time left before the script's limit, or None without a limit.
+/// The time left before the script's limit (at least a millisecond, so a
+/// server timeout set from it is never zero), or None without a limit.
 fn remaining(vm: &Vm) -> Result<Option<Duration>, VmError> {
     vm.check_limits()?;
-    Ok(vm.deadline().map(|d| d.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))))
+    Ok(crate::deadline::remaining(vm).map(|left| left.max(Duration::from_millis(1))))
 }
 
 /// Server timeouts end this long after the script's deadline, so the script's
@@ -1630,7 +1626,8 @@ impl Drop for KillAt {
 
 fn my_kill_at(vm: &Vm, c: &mut Pooled<MyConn>) -> KillAt {
     let id = c.get().conn.connection_id();
-    KillAt::arm(&c.get().opts, id, statement_deadline(vm))
+    // The statement ends on the client side just after the script's deadline.
+    KillAt::arm(&c.get().opts, id, crate::deadline::after(vm, Duration::from_millis(TIMEOUT_MARGIN_MS)))
 }
 
 fn my_error(vm: &Vm, c: &mut Pooled<MyConn>, e: mysql::Error) -> VmError {
@@ -1878,7 +1875,7 @@ pub fn start_query(vm: &mut Vm, a: &[Value]) -> R {
     let (spec, url) = spec_of(vm, &name)?;
     let (text, params) = parts(&a[1]);
     let execute = matches!(a[2], Value::Bool(true));
-    let until = crate::netio::until(vm, DETACHED_WAIT);
+    let until = crate::deadline::until(vm, DETACHED_WAIT);
     let budget = detached_budget(vm);
     let fail = format!("database \"{name}\": ");
     let pool = Some((name.clone(), spec.pool_size));
@@ -1917,7 +1914,7 @@ pub fn start_redis(vm: &mut Vm, a: &[Value]) -> R {
     if let Some(key) = args.first().filter(|k| k.starts_with(PHV_KEYS)) {
         return Err(vm.throw("ValueError", phv_key_error(key)));
     }
-    let until = crate::netio::until(vm, MAX_WAIT);
+    let until = crate::deadline::until(vm, MAX_WAIT);
     let budget = detached_budget(vm);
     let fail = format!("database \"{name}\": ");
     let pool = Some((name.clone(), spec.pool_size));
@@ -4559,6 +4556,51 @@ pub fn job_list(spec: &DatabaseSpec, ns: Option<&str>, failed_only: bool) -> Res
     }
 }
 
+/// The waiting, running and given-up jobs that a site with namespace `ns`
+/// left in the store every site shared before 1.1 gave sites namespaces
+/// (`jobs_table(None)`, `jobs_prefix(None)`): they are not taken, and
+/// `phv jobs list` says how many there are. One query, and nothing is made
+/// (a table that was never made is an error, as a store that does not
+/// answer is). 0 for a site whose store is the shared one itself.
+pub fn job_count_shared(spec: &DatabaseSpec, ns: Option<&str>) -> Result<i64, String> {
+    let t = jobs_table(None);
+    if jobs_table(ns) == t {
+        return Ok(0);
+    }
+    let Some(url) = spec.url.clone() else {
+        return Err(format!("the environment variable {} is not set", spec.url_env.as_deref().unwrap_or("?")));
+    };
+    tls_init();
+    let until = Instant::now() + JOB_WAIT;
+    let mut conn = store_conn(spec, &url, PoolUse::Jobs, until, JOB_WAIT)?;
+    let sql = format!("SELECT count(*) FROM {t} WHERE state IN (0, 1, 2)");
+    match &mut conn {
+        SessionConn::Redis(c) => {
+            let p = jobs_prefix(None);
+            let mut n = 0;
+            for set in ["due", "running", "dead"] {
+                let key = format!("{p}{set}");
+                let r = c.get().command(&[b"ZCARD", key.as_bytes()], until, 1024);
+                match job_redis_result(c, r)? {
+                    Reply::Int(k) => n += k,
+                    _ => return Err("the server sent an invalid reply".into()),
+                }
+            }
+            Ok(n)
+        }
+        SessionConn::Pg(c) => {
+            let rows = c.get().query_kept(&sql, &[]).map_err(|e| pg_message(&e))?;
+            rows.first().map_or(Ok(0), |r| r.try_get::<_, i64>(0).map_err(|e| pg_message(&e)))
+        }
+        SessionConn::My(c) => {
+            use mysql::prelude::Queryable;
+            let w = c.get().watch();
+            let n: Option<i64> = c.get().conn.query_first(&sql).map_err(|e| w.msg(e))?;
+            Ok(n.unwrap_or(0))
+        }
+    }
+}
+
 /// Puts a job that was given up back in the queue (with its runs counted
 /// from zero); `false` if there is no such job.
 pub fn job_requeue(spec: &DatabaseSpec, ns: Option<&str>, id: &str) -> Result<bool, String> {
@@ -5109,7 +5151,8 @@ mod tests {
     /// audit: only the jobs were counted, so a store could hold 6.4 GB).
     #[test]
     fn job_stores_cap_the_bytes_of_payloads() {
-        let ns = Some("f3f3f3f3f3f3f3f3");
+        let ns = crate::testing::namespace(0x30);
+        let ns = Some(ns.as_str());
         for (var, spec) in test_servers() {
             let clear = || {
                 while let Some(j) = job_take(&spec, ns, 60_000).unwrap() {
@@ -5143,7 +5186,8 @@ mod tests {
     /// it (the bytes are not counted) instead of waiting, and adds it later.
     #[test]
     fn a_jobs_table_of_1_1_gets_its_size_column_later_when_held() {
-        let ns = Some("f4f4f4f4f4f4f4f4");
+        let ns = crate::testing::namespace(0x31);
+        let ns = Some(ns.as_str());
         let t = jobs_table(ns);
         for (var, spec) in test_servers() {
             if var == "PHV_TEST_REDIS_URL" {
@@ -5211,6 +5255,9 @@ mod tests {
     /// by the 1.1.1 audit: only sites without a namespace swept it).
     #[test]
     fn sites_with_a_namespace_sweep_what_1_1_left() {
+        // The store every site shared in 1.1 is one for every test process.
+        let _unnamed = crate::testing::unnamed();
+        let sweeper = crate::testing::namespace(0x32);
         let limits = SessionLimits {
             ttl: Duration::from_secs(3600),
             max_lifetime: Duration::from_secs(24 * 3600),
@@ -5237,14 +5284,14 @@ mod tests {
                 };
                 assert!(session_read(&spec, old, &dead).unwrap().is_none(), "Redis expired it");
                 assert!(counted(&dead), "still counted in the shared bookkeeping");
-                session_sweep(&spec, Some("a12a12a12a12"), &limits).unwrap();
+                session_sweep(&spec, Some(&sweeper), &limits).unwrap();
                 assert!(!counted(&dead), "{var}: the shared bookkeeping of an expired session was kept");
                 assert!(counted(&alive), "{var}: a live session was forgotten");
             } else {
                 let day = 24 * 3600;
                 assert!(session_insert(&spec, old, &dead, &row(now - day - 60, now - day - 60), &limits).unwrap());
                 assert!(session_insert(&spec, old, &alive, &row(now - 100, now - 100), &limits).unwrap());
-                session_sweep(&spec, Some("a12a12a12a12"), &limits).unwrap();
+                session_sweep(&spec, Some(&sweeper), &limits).unwrap();
                 assert!(session_read(&spec, old, &dead).unwrap().is_none(), "{var}: an expired session was kept");
                 assert!(session_read(&spec, old, &alive).unwrap().is_some(), "{var}: a live session was removed");
             }
@@ -5275,6 +5322,8 @@ mod tests {
 
     #[test]
     fn a_site_without_a_namespace_keeps_to_its_own_sessions() {
+        // The stores of sites without a namespace are one for every test process.
+        let _unnamed = crate::testing::unnamed();
         let short = SessionLimits {
             ttl: Duration::from_secs(60),
             max_lifetime: Duration::from_secs(24 * 3600),

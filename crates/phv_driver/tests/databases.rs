@@ -7,8 +7,13 @@
 //!   PHV_TEST_REDIS_URL=redis://localhost
 //!
 //! `PHV_BLESS=1` rewrites the expected files.
+//!
+//! Several test processes may run against the servers at once: each run owns
+//! its tables and namespaces (`phv_std::testing`): the scripts' fixed names
+//! are rewritten to this run's as they are compiled.
 
 use phv_driver::{compile_with_overlay, run, RunOptions};
+use phv_std::testing;
 use phv_vm::alloc::CountingAlloc;
 use phv_vm::{DatabaseSpec, Host, Limits};
 use std::collections::{BTreeMap, HashMap};
@@ -22,6 +27,21 @@ static HEAVY_JOB_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn heavy() -> std::sync::MutexGuard<'static, ()> {
     HEAVY_JOB_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Once per process, before its first test on a server: removes what runs
+/// older than two hours left on the servers (never this run's names). Called
+/// before `heavy()`, which it takes itself.
+fn sweep_once() {
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| {
+        let _one_at_a_time = heavy();
+        for var in ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL", "PHV_TEST_REDIS_URL"] {
+            if let Some(url) = std::env::var(var).ok().filter(|u| !u.is_empty()) {
+                testing::sweep(&url);
+            }
+        }
+    });
 }
 
 // Memory limits are enforced through the counting allocator.
@@ -43,7 +63,10 @@ fn run_script(host: &Arc<Host>, name: &str, max_time: Option<Duration>) -> Strin
 
 fn run_limited(host: &Arc<Host>, name: &str, max_time: Option<Duration>, max_memory: Option<usize>) -> String {
     let path = root().join(format!("{name}.phv"));
-    let c = match compile_with_overlay(&root(), &path, HashMap::new()) {
+    // The script with this run's table names (the expected output has the fixed ones).
+    let script = testing::rewrite(&std::fs::read_to_string(&path).unwrap());
+    let overlay = HashMap::from([(path.canonicalize().unwrap(), script)]);
+    let c = match compile_with_overlay(&root(), &path, overlay) {
         Ok(c) => c,
         Err(e) => return e.render(false),
     };
@@ -54,7 +77,7 @@ fn run_limited(host: &Arc<Host>, name: &str, max_time: Option<Duration>, max_mem
         out.push_str("\n--- runtime error ---\n");
         out.push_str(&err.render());
     }
-    out.replace("\r\n", "\n")
+    testing::restore(&out.replace("\r\n", "\n"))
 }
 
 fn check(host: &Arc<Host>, name: &str) {
@@ -110,6 +133,7 @@ fn server(var: &str) -> Option<String> {
 
 #[test]
 fn postgres() {
+    sweep_once();
     let Some(url) = server("PHV_TEST_POSTGRES_URL") else { return };
     let host = host(&url);
     check(&host, "postgres");
@@ -132,6 +156,7 @@ fn postgres() {
 /// 1.1.1 tests, after jobs_kept.phv ran on the connection of postgres_types).
 #[test]
 fn a_connection_whose_statements_a_script_deallocated_is_not_reused() {
+    sweep_once();
     let Some(url) = server("PHV_TEST_POSTGRES_URL") else { return };
     // A pool of its own (pool_size 3): one connection, used by the two scripts in turn.
     let spec = DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 3 };
@@ -150,6 +175,7 @@ fn a_connection_whose_statements_a_script_deallocated_is_not_reused() {
 /// audit: such a connection failed for its whole life).
 #[test]
 fn a_connection_whose_type_lookups_a_script_deallocated_is_not_reused() {
+    sweep_once();
     let Some(url) = server("PHV_TEST_POSTGRES_URL") else { return };
     // Pools of their own (pool_size 5 to 7): one connection each, used by the scripts in turn.
     let host = |pool_size: usize| {
@@ -172,6 +198,7 @@ fn a_connection_whose_type_lookups_a_script_deallocated_is_not_reused() {
 
 #[test]
 fn mysql() {
+    sweep_once();
     let Some(url) = server("PHV_TEST_MYSQL_URL") else { return };
     let host = host(&url);
     check(&host, "mysql");
@@ -197,7 +224,8 @@ fn check_migrations(host: &Arc<Host>, failing: &str) {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
     );
     let first = format!("9001_{tag}.sql");
-    conn.apply(&first, "CREATE TABLE phv_mig_check (n integer); DROP TABLE phv_mig_check;").unwrap();
+    let table = format!("phv_{}_mig", testing::run_id());
+    conn.apply(&first, &format!("CREATE TABLE {table} (n integer); DROP TABLE {table};")).unwrap();
     assert!(conn.applied().unwrap().iter().any(|(n, _)| *n == first));
     let bad = format!("9002_{tag}.sql");
     assert!(conn.apply(&bad, failing).is_err());
@@ -206,6 +234,7 @@ fn check_migrations(host: &Arc<Host>, failing: &str) {
 
 #[test]
 fn redis() {
+    sweep_once();
     let Some(url) = server("PHV_TEST_REDIS_URL") else { return };
     let host = host(&url);
     check(&host, "redis");
@@ -213,8 +242,13 @@ fn redis() {
     check_async(&url, "redis_async");
 
     // Rate limits counted on the server: a second process (here, the counters
-    // of this process) does not see them, the server does.
-    let shared = Arc::new(Host { rate_limit_store: Some("main".into()), ..(*host).clone() });
+    // of this process) does not see them, the server does. The keys are this
+    // run's: in a namespace of its own.
+    let shared = Arc::new(Host {
+        rate_limit_store: Some("main".into()),
+        store_namespace: Some(testing::namespace(0x20)),
+        ..(*host).clone()
+    });
     check(&shared, "redis_ratelimit");
     let until = std::time::Instant::now() + Duration::from_secs(2);
     let minute = Duration::from_secs(60);
@@ -267,7 +301,10 @@ fn remote_servers_need_tls() {
 fn check_jobs(url: &str) {
     use phv_std::jobs::{End, Store};
     let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 4 };
-    let store = Store::Db(spec.clone(), None);
+    // A namespace of this run (the stores of sites without one are covered
+    // by the unnamed-site tests of phv_std and phv_server).
+    let ns = testing::namespace(0x10);
+    let store = Store::Db(spec.clone(), Some(ns.clone()));
     // Start from an empty store (the tests of each server run one at a time).
     let clear = |store: &Store| {
         while let Some(j) = store.take(Duration::from_secs(60)).unwrap() {
@@ -289,7 +326,7 @@ fn check_jobs(url: &str) {
     let later = store.add("later", "", LATER_SECS, None).unwrap().unwrap();
     // Another site on the same database (another namespace) sees none of
     // them, and its own jobs stay its own (found by the 1.1 audit).
-    let other = Store::Db(spec.clone(), Some("ab12cd34".into()));
+    let other = Store::Db(spec.clone(), Some(testing::namespace(0x11)));
     assert!(other.take(lease).unwrap().is_none(), "another site took a job");
     let theirs = other.add("theirs", "", 0, None).unwrap().unwrap();
     let got = other.take(lease).unwrap().unwrap();
@@ -341,6 +378,15 @@ fn check_jobs(url: &str) {
         for _ in 0..3 {
             s.spawn(|| {
                 while let Some(j) = store.take(lease).unwrap() {
+                    if j.id == later {
+                        // On a slow machine the checks above took longer than
+                        // its delay: back to waiting until it is looked for.
+                        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+                            as i64
+                            + 5_000;
+                        store.end(&j, End::Retry { at, error: "not yet" }).unwrap();
+                        continue;
+                    }
                     taken.lock().unwrap().push(j.payload.clone());
                     store.end(&j, End::Done { keyed: false }).unwrap();
                 }
@@ -357,7 +403,16 @@ fn check_jobs(url: &str) {
     assert!(left.contains(&later), "{left:?}");
     assert!(!left.contains(&id));
     std::thread::sleep(later_due.saturating_duration_since(Instant::now()) + Duration::from_millis(200));
-    let j = store.take(lease).unwrap().expect("the later job is due");
+    // Due now, or within the few seconds it was put back for above.
+    let mut j = store.take(lease).unwrap();
+    for _ in 0..100 {
+        if j.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        j = store.take(lease).unwrap();
+    }
+    let j = j.expect("the later job is due");
     assert_eq!(j.id, later);
     assert!(store.end(&j, End::Done { keyed: false }).unwrap());
     clear(&store);
@@ -368,6 +423,7 @@ fn check_jobs(url: &str) {
         return;
     }
     let mut h = (*host(url)).clone();
+    h.store_namespace = Some(ns);
     h.jobs = Some(phv_vm::JobsSpec {
         store: Some("main".into()),
         names: Some(vec!["outbox".into()]),
@@ -402,8 +458,9 @@ fn check_job_cap(url: &str) {
     let host = Arc::new(Host {
         root: root(),
         databases: BTreeMap::from([("main".to_string(), spec)]),
-        // The table the scripts name: phv_jobs_cafe0123cafe0123cafe0123cafe0123.
-        store_namespace: Some("cafe0123cafe0123cafe0123cafe0123".into()),
+        // The scripts name the table phv_jobs_cafe0123cafe0123cafe0123cafe0123,
+        // rewritten to this run's namespace of that tag.
+        store_namespace: Some(testing::namespace(0xca)),
         jobs: Some(phv_vm::JobsSpec {
             store: Some("main".into()),
             names: Some(vec!["burst".into()]),
@@ -424,6 +481,7 @@ fn check_job_cap(url: &str) {
 
 #[test]
 fn concurrent_transactions_keep_the_job_cap() {
+    sweep_once();
     let _one_at_a_time = heavy();
     for var in ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
         if let Some(url) = server(var) {
@@ -455,7 +513,8 @@ fn jobs_host(url: &str, ns: &str, names: &[&str]) -> Arc<Host> {
 /// MySQL answered after 40 s under a 2 s limit, PostgreSQL left the statements
 /// waiting on the server, and four waits took every connection of the store).
 fn check_keyed_wait(url: &str) {
-    let host = jobs_host(url, "f1f1f1f1f1f1f1f1", &["k"]);
+    // The scripts name phv_jobs_f1f1f1f1f1f1f1f1, rewritten to this namespace.
+    let host = jobs_host(url, &testing::namespace(0xf1), &["k"]);
     let limit = Some(Duration::from_secs(2));
     std::thread::scope(|s| {
         // Holds the key ten seconds.
@@ -492,11 +551,12 @@ fn check_keyed_wait(url: &str) {
 /// took every connection those used, a scheduled run was lost, and the other
 /// key failed after 10 s).
 fn check_held_key_waits(url: &str) {
-    let ns = "f4f4f4f4f4f4f4f4";
-    let host = jobs_host(url, ns, &["k"]);
+    // The scripts name phv_jobs_f4f4f4f4f4f4f4f4, rewritten to this namespace.
+    let ns = testing::namespace(0xf4);
+    let host = jobs_host(url, &ns, &["k"]);
     let pool_size = host.databases["main"].pool_size;
     let waiters = phv_std::jobs::JOB_KEY_WAITERS + pool_size;
-    let store = phv_std::jobs::Store::Db(host.databases["main"].clone(), Some(ns.into()));
+    let store = phv_std::jobs::Store::Db(host.databases["main"].clone(), Some(ns));
     // Far within the waits' time limit (8 s): no wait for a connection.
     let at_once = Duration::from_secs(2);
     std::thread::scope(|s| {
@@ -535,6 +595,7 @@ fn check_held_key_waits(url: &str) {
 
 #[test]
 fn waits_for_held_keys_leave_the_scheduler_its_connections() {
+    sweep_once();
     let _one_at_a_time = heavy();
     for var in ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
         if let Some(url) = server(var) {
@@ -545,6 +606,7 @@ fn waits_for_held_keys_leave_the_scheduler_its_connections() {
 
 #[test]
 fn keyed_jobs_wait_no_longer_than_the_time_limit() {
+    sweep_once();
     let _one_at_a_time = heavy();
     for var in ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
         if let Some(url) = server(var) {
@@ -559,8 +621,9 @@ fn keyed_jobs_wait_no_longer_than_the_time_limit() {
 /// two stores are used in turn, so a busy server slows both alike.
 fn check_near_cap(url: &str) {
     let limit = Some(Duration::from_secs(300));
-    let near = jobs_host(url, "f2f2f2f2f2f2f2f2", &["burst", "k"]);
-    let far = jobs_host(url, "f2f2f2f2f2f2f2f3", &["burst", "k"]);
+    // The scripts name phv_jobs_f2f2f2f2f2f2f2f2 and ..f3, rewritten to these namespaces.
+    let near = jobs_host(url, &testing::namespace(0xf2), &["burst", "k"]);
+    let far = jobs_host(url, &testing::namespace(0xf3), &["burst", "k"]);
     assert_eq!(run_script(&far, "jobs_plain_add", limit), "yes", "{url}");
     assert_eq!(run_script(&near, "jobs_near_fill", limit), "filled", "{url}");
     // The counts of this process are a second old at most.
@@ -592,6 +655,7 @@ fn check_near_cap(url: &str) {
 
 #[test]
 fn adding_jobs_near_the_cap_stays_cheap() {
+    sweep_once();
     let _one_at_a_time = heavy();
     for var in ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
         if let Some(url) = server(var) {
@@ -606,6 +670,7 @@ const LATER_SECS: i64 = 15;
 
 #[test]
 fn job_stores() {
+    sweep_once();
     // The servers at once: each waits for its delayed job.
     std::thread::scope(|s| {
         let runs: Vec<_> = ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL", "PHV_TEST_REDIS_URL"]

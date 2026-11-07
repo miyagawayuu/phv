@@ -43,7 +43,14 @@ pub fn run(project: &Path, time_limit: f64) -> ExitCode {
 
 /// `phv jobs list`: the waiting, running and failed jobs (or only the failed).
 pub fn list(project: &Path, failed: bool) -> ExitCode {
-    let jobs = match store(project).and_then(|s| s.list(failed)) {
+    let store = match store(project) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let jobs = match store.list(failed) {
         Ok(j) => j,
         Err(e) => {
             eprintln!("error: {e}");
@@ -52,7 +59,6 @@ pub fn list(project: &Path, failed: bool) -> ExitCode {
     };
     if jobs.is_empty() {
         println!("no jobs");
-        return ExitCode::SUCCESS;
     }
     for j in &jobs {
         let at = chrono::DateTime::from_timestamp_millis(j.at)
@@ -67,6 +73,19 @@ pub fn list(project: &Path, failed: bool) -> ExitCode {
             // The first line of the error.
             println!("    {}", short(j.error.lines().next().unwrap_or("")));
         }
+    }
+    // A site that got a namespace (1.1) may have left jobs in the store every
+    // site shared before: they are not run, and nothing else shows them. A
+    // store that cannot be counted (or has no such table) adds nothing.
+    match store.left_in_shared() {
+        Ok(n) if n > 0 => {
+            let (jobs, are) = if n == 1 { ("job", "is") } else { ("jobs", "are") };
+            println!(
+                "note: {n} {jobs} added before this site had a namespace {are} still in the shared store and \
+                 not run; a later release will add a command to move them"
+            );
+        }
+        _ => {}
     }
     ExitCode::SUCCESS
 }

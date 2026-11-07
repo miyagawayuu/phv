@@ -532,6 +532,73 @@ fn routes_middleware_and_error_pages() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Asks every 50 ms, for up to `limit`, until `/admin/` answers `want`.
+fn admin_says(addr: SocketAddr, want: &str, limit: Duration) -> bool {
+    let until = std::time::Instant::now() + limit;
+    loop {
+        let body = get(addr, "/admin/", "").body;
+        assert!(!body.contains("LEAKED"), "a middleware outside public/ ran");
+        if body == want {
+            return true;
+        }
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A production server remembers for a second whether each directory has a
+/// `_middleware.phv` (as it remembers pages): one added or removed applies,
+/// or stops, within a second, and one swapped for a link to a file outside
+/// `public/` is refused once that second has passed. A development server
+/// sees each change at once.
+#[test]
+fn middleware_added_removed_or_linked_is_seen_within_a_second() {
+    for dev in [true, false] {
+        let dir = std::env::temp_dir().join(format!("phv-mw-cache-{dev}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let page = |body: &str| format!("<?phv\nimport std.http.{{locals}};\n{body}\n");
+        write(&dir, "phv.toml", "");
+        write(&dir, "public/admin/index.phv", &page("echo \"admin \", locals()->get(\"user\") ?? \"nobody\";"));
+        // A file outside the site (not only outside public/: pages cannot be
+        // compiled from outside the project, which would hide the lookup's own answer).
+        let outside = std::env::temp_dir().join(format!("phv-mw-outside-{dev}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        write(&outside, "_middleware.phv", "<?phv\necho \"LEAKED\";\n");
+        let addr = start_with(&dir, dev);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(admin_says(addr, "admin nobody", Duration::ZERO));
+        // At once in development; the window of the cache in production.
+        let limit = if dev { Duration::ZERO } else { Duration::from_secs(2) };
+
+        let mw = dir.join("public/admin/_middleware.phv");
+        write(&dir, "public/admin/_middleware.phv", &page("locals()->set(\"user\", \"ann\");"));
+        assert!(admin_says(addr, "admin ann", limit), "a new middleware applies (dev: {dev})");
+        std::fs::remove_file(&mw).unwrap();
+        assert!(admin_says(addr, "admin nobody", limit), "a removed middleware stops (dev: {dev})");
+
+        // The middleware swapped for a link to a file outside public/.
+        write(&dir, "public/admin/_middleware.phv", &page("locals()->set(\"user\", \"ann\");"));
+        assert!(admin_says(addr, "admin ann", limit));
+        std::fs::remove_file(&mw).unwrap();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(outside.join("_middleware.phv"), &mw).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(outside.join("_middleware.phv"), &mw).is_ok();
+        if linked {
+            assert!(admin_says(addr, "admin nobody", limit), "a linked middleware is refused (dev: {dev})");
+            // Still refused once the server has looked again.
+            std::thread::sleep(Duration::from_millis(1100));
+            assert!(admin_says(addr, "admin nobody", Duration::ZERO));
+        } else {
+            eprintln!("skipped the link: cannot create symbolic links here");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+}
+
 fn raw_bytes(addr: SocketAddr, raw: &str) -> (String, Vec<u8>) {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();

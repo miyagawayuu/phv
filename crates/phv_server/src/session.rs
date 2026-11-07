@@ -884,7 +884,9 @@ mod tests {
                 continue;
             };
             let spec = phv_vm::DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 2 };
-            let store = Store::with_database(Duration::from_secs(60), false, spec.clone(), Arc::default(), None);
+            // Namespaces of this test run: other test processes use the servers too.
+            let ns = |tag: u8| Some(phv_std::testing::namespace(tag));
+            let store = Store::with_database(Duration::from_secs(60), false, spec.clone(), Arc::default(), ns(0x40));
             let mut s = SessionData::default();
             s.values.insert("user".into(), "alice".into());
             s.changed = true;
@@ -893,8 +895,7 @@ mod tests {
             assert_eq!(store.load(Some(&header)).values.get("user").map(String::as_str), Some("alice"), "{var}");
             // Another site on the same database does not take the cookie
             // (found by the 1.1 audit).
-            let other =
-                Store::with_database(Duration::from_secs(60), false, spec.clone(), Arc::default(), Some("b".into()));
+            let other = Store::with_database(Duration::from_secs(60), false, spec.clone(), Arc::default(), ns(0x41));
             assert!(other.load(Some(&header)).id.is_none(), "{var}: another site took the session");
             // Logged out while a slow request still holds it: it stays gone.
             let mut slow = store.load(Some(&header));
@@ -929,9 +930,13 @@ mod tests {
             let row =
                 |last: u64, returned: bool| phv_std::SessionRow { data: "{}".into(), created: last, last, returned };
             // The limits below are a site's own (a namespace of the tests).
-            let ns = Some("5e55a1");
+            let site = ns(0x42);
+            let ns = site.as_deref();
+            // The session keys of this test run (a session's key is the same
+            // in every site's bookkeeping; the server derives it from the id).
+            let key = |k: &str| format!("{}-{k}", phv_std::testing::run_id());
             let left_of = |ns: Option<&str>, keys: &[&'static str]| -> Vec<&'static str> {
-                keys.iter().copied().filter(|k| phv_std::session_read(&spec, ns, k).unwrap().is_some()).collect()
+                keys.iter().copied().filter(|k| phv_std::session_read(&spec, ns, &key(k)).unwrap().is_some()).collect()
             };
             if var == "PHV_TEST_REDIS_URL" {
                 // Redis keeps within the limits as sessions are written: new
@@ -944,17 +949,18 @@ mod tests {
                 };
                 let keys = ["cap-back-1", "cap-back-2", "cap-new-1", "cap-new-2"];
                 for (i, k) in keys.iter().enumerate() {
-                    let _ = phv_std::session_remove(&spec, ns, k);
-                    assert!(phv_std::session_insert(&spec, ns, k, &row(now, i < 2), &limits).unwrap());
+                    let _ = phv_std::session_remove(&spec, ns, &key(k));
+                    assert!(phv_std::session_insert(&spec, ns, &key(k), &row(now, i < 2), &limits).unwrap());
                 }
-                assert!(!phv_std::session_insert(&spec, ns, "cap-new-2", &row(now, false), &limits).unwrap());
+                let new_2 = key("cap-new-2");
+                assert!(!phv_std::session_insert(&spec, ns, &new_2, &row(now, false), &limits).unwrap());
                 assert_eq!(left_of(ns, &keys), ["cap-back-1", "cap-back-2", "cap-new-2"]);
                 // A byte limit evicts the others, returning visitors' too.
                 let tiny = phv_std::SessionLimits { max_bytes: 1, ..limits };
-                assert!(phv_std::session_update(&spec, ns, "cap-new-2", &row(now, true), &tiny).unwrap());
+                assert!(phv_std::session_update(&spec, ns, &new_2, &row(now, true), &tiny).unwrap());
                 assert_eq!(left_of(ns, &keys), ["cap-new-2"]);
-                assert!(phv_std::session_remove(&spec, ns, "cap-new-2").unwrap());
-                assert!(!phv_std::session_update(&spec, ns, "cap-new-2", &row(now, true), &limits).unwrap());
+                assert!(phv_std::session_remove(&spec, ns, &new_2).unwrap());
+                assert!(!phv_std::session_update(&spec, ns, &new_2, &row(now, true), &limits).unwrap());
             } else {
                 // The sweep: one expired session, two returning and two new ones, room for three.
                 let ttl = Duration::from_secs(60);
@@ -969,14 +975,14 @@ mod tests {
                 let limits =
                     phv_std::SessionLimits { ttl, max_lifetime: MAX_LIFETIME, max_sessions: 3, max_bytes: MAX_BYTES };
                 for (k, r) in keys.iter().zip(&rows) {
-                    let _ = phv_std::session_remove(&spec, ns, k);
-                    assert!(phv_std::session_insert(&spec, ns, k, r, &limits).unwrap());
+                    let _ = phv_std::session_remove(&spec, ns, &key(k));
+                    assert!(phv_std::session_insert(&spec, ns, &key(k), r, &limits).unwrap());
                 }
                 phv_std::session_sweep(&spec, ns, &limits).unwrap();
                 // 90% of 3 is 2: the new ones go first.
                 assert_eq!(left_of(ns, &keys), ["sweep-back-1", "sweep-back-2"], "{var}");
                 for k in keys {
-                    phv_std::session_remove(&spec, ns, k).unwrap();
+                    phv_std::session_remove(&spec, ns, &key(k)).unwrap();
                 }
             }
 
@@ -984,7 +990,8 @@ mod tests {
             // room for two sessions: what it writes and sweeps never removes
             // the other site's sessions (found by the 1.1.1 audit: the shortest
             // ttl and the limits applied to every site).
-            let (long_ns, short_ns) = (Some("5e55b2"), Some("5e55c3"));
+            let (long_site, short_site) = (phv_std::testing::namespace(0x43), phv_std::testing::namespace(0x44));
+            let (long_ns, short_ns) = (Some(long_site.as_str()), Some(short_site.as_str()));
             let long = phv_std::SessionLimits {
                 ttl: Duration::from_secs(7200),
                 max_lifetime: MAX_LIFETIME,
@@ -1000,32 +1007,32 @@ mod tests {
             let theirs = ["site-long-back", "site-long-new"];
             let mine = ["site-short-1", "site-short-2", "site-short-3"];
             for k in theirs {
-                let _ = phv_std::session_remove(&spec, long_ns, k);
+                let _ = phv_std::session_remove(&spec, long_ns, &key(k));
             }
             for k in mine {
-                let _ = phv_std::session_remove(&spec, short_ns, k);
+                let _ = phv_std::session_remove(&spec, short_ns, &key(k));
             }
             // Idle for two minutes: past the short ttl, well within the long one.
             let idle = if var == "PHV_TEST_REDIS_URL" { now } else { now - 120 };
-            assert!(phv_std::session_insert(&spec, long_ns, theirs[0], &row(idle, true), &long).unwrap());
-            assert!(phv_std::session_insert(&spec, long_ns, theirs[1], &row(idle, false), &long).unwrap());
+            assert!(phv_std::session_insert(&spec, long_ns, &key(theirs[0]), &row(idle, true), &long).unwrap());
+            assert!(phv_std::session_insert(&spec, long_ns, &key(theirs[1]), &row(idle, false), &long).unwrap());
             if var == "PHV_TEST_REDIS_URL" {
                 // Redis takes the time of the last use from its own writes:
                 // wait past the short ttl (its times are in seconds).
                 std::thread::sleep(Duration::from_millis(2100));
             }
             for k in mine {
-                assert!(phv_std::session_insert(&spec, short_ns, k, &row(now_secs(), false), &short).unwrap());
+                assert!(phv_std::session_insert(&spec, short_ns, &key(k), &row(now_secs(), false), &short).unwrap());
             }
             phv_std::session_sweep(&spec, short_ns, &short).unwrap();
             assert_eq!(left_of(long_ns, &theirs), theirs, "{var}: the other site's sessions were removed");
             let kept = left_of(short_ns, &mine);
             assert!(kept.len() <= 2, "{var}: {kept:?}");
             for k in theirs {
-                phv_std::session_remove(&spec, long_ns, k).unwrap();
+                phv_std::session_remove(&spec, long_ns, &key(k)).unwrap();
             }
             for k in mine {
-                phv_std::session_remove(&spec, short_ns, k).unwrap();
+                phv_std::session_remove(&spec, short_ns, &key(k)).unwrap();
             }
         }
     }
@@ -1039,13 +1046,15 @@ mod tests {
     #[test]
     fn sessions_written_by_1_1_are_still_read() {
         let _one_at_a_time = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // The store every site shared in 1.1 is one for every test process.
+        let _unnamed = phv_std::testing::unnamed();
         for var in ["PHV_TEST_REDIS_URL", "PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
             let Some(url) = std::env::var(var).ok().filter(|u| !u.is_empty()) else {
                 eprintln!("skipped: {var} is not set");
                 continue;
             };
             let spec = phv_vm::DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 2 };
-            let ns = "5e55d4".to_string();
+            let ns = phv_std::testing::namespace(0x45);
             let limits = phv_std::SessionLimits {
                 ttl: Duration::from_secs(3600),
                 max_lifetime: MAX_LIFETIME,

@@ -37,9 +37,18 @@ thread_local! {
     static LATE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Makes SQLite allocate through the program's allocator. It must run before
-/// SQLite is first used; every use goes through `db.rs`, which calls it first.
-/// False if SQLite was already in use (its memory is then not counted).
+/// Makes SQLite allocate through the program's allocator, and starts SQLite.
+/// Every path that opens a database calls it first (`db.rs`, the VFS, and
+/// the tests: `tests::sqlite_is_opened_through_init` in `lib.rs` checks the
+/// sources), so SQLite is never started by anything else while the
+/// allocator is being switched. False if SQLite was already in use (its
+/// memory is then not counted).
+///
+/// Starting SQLite here matters: `sqlite3_config` refuses only once
+/// `sqlite3_initialize` has finished, so a switch while another thread was
+/// starting SQLite left memory of the default allocator for ours to free,
+/// which aborted the process (found by CI on macOS, where the thread timing
+/// differed: a test opened a database without calling this first).
 pub(super) fn init() -> bool {
     static DONE: OnceLock<bool> = OnceLock::new();
     *DONE.get_or_init(|| {
@@ -53,9 +62,21 @@ pub(super) fn init() -> bool {
             xShutdown: Some(shutdown),
             pAppData: std::ptr::null_mut(),
         };
-        // SAFETY: SQLite copies the methods; they are thread-safe.
-        unsafe { ffi::sqlite3_config(ffi::SQLITE_CONFIG_MALLOC, &raw const methods) == ffi::SQLITE_OK }
+        // SAFETY: SQLite copies the methods; they are thread-safe. Nothing
+        // else starts SQLite while this runs (see above), so the allocator
+        // is in place for every allocation SQLite ever makes.
+        unsafe {
+            ffi::sqlite3_config(ffi::SQLITE_CONFIG_MALLOC, &raw const methods) == ffi::SQLITE_OK
+                && ffi::sqlite3_initialize() == ffi::SQLITE_OK
+        }
     })
+}
+
+/// Ends the process with `what` on stderr: the allocator cannot unwind, and a
+/// panic in it would abort without a word.
+fn give_up(what: &str) -> ! {
+    eprintln!("phv: SQLite memory: {what}");
+    std::process::abort()
 }
 
 /// While it lives, SQLite's allocations on this thread fail once the script
@@ -179,7 +200,8 @@ unsafe extern "C" fn free(p: *mut c_void) {
     // SAFETY: `p` is one of ours; its layout is the one it was allocated with.
     unsafe {
         let (b, n) = base(p);
-        std::alloc::dealloc(b, layout(n).expect("an allocated size"));
+        let Some(l) = layout(n) else { give_up("freeing memory that was not allocated here") };
+        std::alloc::dealloc(b, l);
     }
 }
 
@@ -195,7 +217,8 @@ unsafe extern "C" fn realloc(p: *mut c_void, n: c_int) -> *mut c_void {
         if n > old && over(n - old) {
             return std::ptr::null_mut();
         }
-        let q = std::alloc::realloc(b, layout(old).expect("an allocated size"), new.size());
+        let Some(was) = layout(old) else { give_up("resizing memory that was not allocated here") };
+        let q = std::alloc::realloc(b, was, new.size());
         if q.is_null() {
             return q.cast();
         }
@@ -222,3 +245,30 @@ unsafe extern "C" fn init_methods(_: *mut c_void) -> c_int {
 }
 
 unsafe extern "C" fn shutdown(_: *mut c_void) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Many threads starting SQLite and switching its allocator at once:
+    /// `init` serializes them, so no database is opened while the allocator
+    /// changes (found by CI on macOS: an abort when a test opened a database
+    /// without `init` first).
+    #[test]
+    fn databases_opened_at_once_share_one_allocator() {
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                s.spawn(move || {
+                    for _ in 0..200 {
+                        if i % 2 == 0 {
+                            init();
+                        }
+                        init();
+                        let c = rusqlite::Connection::open_in_memory().unwrap();
+                        c.execute_batch("CREATE TABLE t (x TEXT); INSERT INTO t VALUES ('mk1'); DROP TABLE t").unwrap();
+                    }
+                });
+            }
+        });
+    }
+}

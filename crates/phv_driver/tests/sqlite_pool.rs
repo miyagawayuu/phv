@@ -54,6 +54,16 @@ fn reused() -> u64 {
     phv_std::sqlite_kept_stats().1
 }
 
+/// Runs of scripts' statements for which SQLite compiled something so far.
+fn compiled() -> u64 {
+    phv_std::sqlite_kept_stats().2
+}
+
+/// The memory the idle connections hold.
+fn held() -> usize {
+    phv_std::sqlite_kept_stats().3
+}
+
 /// Runs `src` and checks a kept connection served its open.
 fn run_reused(site: &Site, src: &str, max_time: Option<Duration>) -> String {
     let before = reused();
@@ -223,4 +233,137 @@ fn a_kept_connection_follows_its_file() {
     let out = site
         .run(&format!("{OPEN}echo count($db->query(sql\"SELECT name FROM sqlite_master WHERE name = 'old'\"));"), None);
     assert_eq!(out, "0");
+}
+
+/// A kept connection keeps the statements compiled on it: the next script
+/// runs the same texts without compiling (or weighing) them again, with its
+/// own values. SQLite would compile them all again if the authorizer or a
+/// function were registered again at the open, so those stay with the
+/// connection and only what they read about the script changes.
+#[test]
+fn kept_connections_keep_their_prepared_statements() {
+    let site = Site::new("statements");
+    let script = |x: i64, s: &str| {
+        format!(
+            "{OPEN}$x = {x}; $s = \"{s}\";
+             $db->execute(sql\"INSERT INTO t (a, b) VALUES ({{$x}}, {{$s}})\");
+             echo json_encode($db->query(sql\"SELECT a, b, {{$s}} || '!' AS c FROM t WHERE a = {{$x}}\")[0]->toMap());"
+        )
+    };
+    let create = format!("{OPEN}$db->execute(sql\"CREATE TABLE t (a INTEGER, b TEXT)\"); echo \"ok\";");
+    assert_eq!(site.run(&create, None), "ok");
+    assert_eq!(run_reused(&site, &script(1, "one"), None), "{\"a\":1,\"b\":\"one\",\"c\":\"one!\"}");
+    // The same two texts again: nothing is compiled, neither at the prepare
+    // nor at the first step (an expired statement is compiled again there).
+    let before = compiled();
+    assert_eq!(run_reused(&site, &script(2, "two"), None), "{\"a\":2,\"b\":\"two\",\"c\":\"two!\"}");
+    assert_eq!(compiled(), before, "a kept statement was compiled again");
+    // Still with the next script's own deadline, counters and taint: the
+    // functions read them from the connection's session.
+    let out = run_reused(
+        &site,
+        &format!(
+            "{OPEN}echo json_encode($db->query(sql\"SELECT changes() AS c, total_changes() AS t, 'ab' LIKE 'a%' AS l\")[0]->toMap());"
+        ),
+        None,
+    );
+    assert_eq!(out, "{\"c\":0,\"t\":0,\"l\":1}");
+    let out = run_reused(&site, &format!("{OPEN}{SLOW}"), Some(Duration::from_millis(100)));
+    assert!(out.contains("time limit"), "{out}");
+}
+
+/// A statement of 80 comparisons of a parameter with `b`: with `b` a `TEXT`
+/// column it weighs 5; with `b` an `INTEGER` column (the texts are turned into
+/// numbers), 240, over the limit of 128. Its program has more than 200 steps.
+const COMPARISONS: &str = "$x = \"7\"; $q = sql\"SELECT count(*) AS c FROM t WHERE 1\"; for ($i = 0; $i < 80; $i++) { $q = $q . sql\" AND b = {$x}\"; }";
+const COLUMN_TYPE: &str =
+    "$db->execute(sql\"ALTER TABLE t DROP COLUMN b\"); $db->execute(sql\"ALTER TABLE t RENAME COLUMN n TO b\");";
+
+/// A kept statement was weighed when it was compiled. When the schema changed
+/// since, by another connection or by this one in an earlier script, SQLite
+/// compiles it again at its first step, with at most 200 steps: a larger one
+/// is prepared and weighed again, and refused when it is now over the limit.
+#[test]
+fn kept_statements_are_weighed_again_after_a_schema_change() {
+    let site = Site::new("schema");
+    let setup = |file: &str| {
+        format!(
+            "$db = Database::open(\"{file}\"); $db->execute(sql\"CREATE TABLE t (b TEXT, n INTEGER)\");
+             $db->execute(sql\"INSERT INTO t VALUES ('7', 7)\"); {COMPARISONS}
+             echo $db->query($q)[0]->int(\"c\") ?? -1, $db->query(sql\"SELECT count(*) AS c FROM t\")[0]->int(\"c\") ?? -1;"
+        )
+    };
+    assert_eq!(site.run(&setup("data/t.db"), None), "11");
+    // Another connection changes the column's type; the kept connection's
+    // statement, compiled against the old schema, is refused.
+    let out = run_reused(
+        &site,
+        &format!(
+            "{OPEN}{COMPARISONS} $other = Database::open(\"data/t.db\"); {}
+             try {{ $db->query($q); echo \"ran\"; }} catch (DatabaseError $e) {{ echo $e->getMessage(); }}",
+            COLUMN_TYPE.replace("$db", "$other")
+        ),
+        None,
+    );
+    assert!(out.contains("could read long values 240 times") && out.contains("split it"), "{out}");
+    // The same connection changes it in a script of its own; the statement in
+    // its cache is refused by the next script, and a light one runs.
+    assert_eq!(site.run(&setup("data/s.db"), None), "11");
+    assert_eq!(
+        run_reused(&site, &format!("$db = Database::open(\"data/s.db\"); {COLUMN_TYPE} echo \"altered\";"), None),
+        "altered"
+    );
+    let out = run_reused(
+        &site,
+        &format!(
+            "$db = Database::open(\"data/s.db\"); {COMPARISONS}
+             try {{ $db->query($q); echo \"ran\"; }} catch (DatabaseError $e) {{ echo $e->getMessage(); }}
+             echo \" \", $db->query(sql\"SELECT count(*) AS c FROM t\")[0]->int(\"c\") ?? -1;"
+        ),
+        None,
+    );
+    assert!(out.contains("could read long values 240 times") && out.ends_with(" 1"), "{out}");
+}
+
+/// A statement's bound values are cleared when it goes back to the cache
+/// (rusqlite's `StatementCache` resets it and clears its bindings): none stays
+/// in the pool, and the next script's run of the text binds its own.
+#[test]
+fn kept_statements_hold_no_bound_values() {
+    let site = Site::new("bindings");
+    let script =
+        |v: &str| format!("{OPEN}$v = {v}; echo $db->query(sql\"SELECT length({{$v}}) AS n\")[0]->int(\"n\") ?? -1;");
+    let before = held();
+    assert_eq!(site.run(&script("str_repeat(\"x\", 4194304)"), None), "4194304");
+    let more = held() as i64 - before as i64;
+    assert!(more < 1 << 20, "the kept connection holds {more} more bytes");
+    let before = compiled();
+    assert_eq!(run_reused(&site, &script("\"ab\""), None), "2");
+    assert_eq!(compiled(), before, "the kept statement was compiled again");
+}
+
+/// A connection goes back to the pool when the run's teardown is dropped,
+/// not when the run ends: a server hands the response over first.
+#[test]
+fn the_teardown_returns_the_connection() {
+    let site = Site::new("teardown");
+    let entry = site.root.join("main.phv");
+    std::fs::write(
+        &entry,
+        format!(
+            "import std.db.Database;
+{OPEN}echo \"ok\";"
+        ),
+    )
+    .unwrap();
+    let c = compile(&site.root, &entry).unwrap_or_else(|e| panic!("{}", e.render(false)));
+    let kept = || phv_std::sqlite_kept_stats().0;
+    let before = kept();
+    let opts = RunOptions { html: false, limits: Limits::default(), http: None, host: Some(site.host.clone()) };
+    let mut outcome = run(&c, opts);
+    assert_eq!(outcome.output, "ok");
+    assert!(outcome.error.is_none());
+    assert_eq!(kept(), before, "the teardown still holds the connection");
+    drop(outcome.teardown.take());
+    assert_eq!(kept(), before + 1, "dropping the teardown gave the connection back");
 }

@@ -355,6 +355,8 @@ mod tests {
     use super::*;
 
     fn weigh_sql(setup: &str, sql: &str) -> u32 {
+        // The allocator is installed before SQLite starts (see `mem::init`).
+        super::super::mem::init();
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch(setup).unwrap();
         weigh(&c, sql).unwrap()

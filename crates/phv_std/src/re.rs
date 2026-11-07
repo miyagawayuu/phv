@@ -22,7 +22,6 @@ use phv_vm::{BuiltinFn, Value, Vm, VmError};
 use regex::{Regex, RegexBuilder};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
-use std::time::Instant;
 
 /// Longest pattern accepted.
 const MAX_PATTERN: usize = 64 * 1024;
@@ -138,8 +137,8 @@ fn regex(vm: &mut Vm, pattern: &Value) -> Result<Compiled, VmError> {
 
 /// Refuses a search whose worst case would not end in the time the run has left.
 fn budget(vm: &mut Vm, c: &Compiled, text: &str) -> Result<(), VmError> {
-    let Some(deadline) = vm.deadline() else { return Ok(()) };
-    let left = deadline.saturating_duration_since(Instant::now()).as_secs_f64();
+    let Some(left) = crate::deadline::remaining(vm) else { return Ok(()) };
+    let left = left.as_secs_f64();
     let worst = c.states as f64 * (text.len() as f64 + 1.0);
     if worst > left * STEPS_PER_SEC {
         return Err(vm.throw(

@@ -1193,6 +1193,30 @@ pub struct RunOutcome {
     pub output: String,
     pub error: Option<RuntimeError>,
     pub http: HttpCtx,
+    /// The rest of the run's VM; dropping it ends the run (see `Teardown`).
+    /// `None` once taken. Dropping the outcome drops it too.
+    pub teardown: Option<Teardown>,
+}
+
+/// What is left of a run once its output and `http` were taken: the VM's
+/// registers and heap, and the connections the script still held (a database
+/// handle in a variable, say). Dropping it ends the run: the objects are torn
+/// down, SQLite connections roll back and go back to the kept pool, and pooled
+/// PostgreSQL, MySQL and Redis connections are reset and returned (round trips
+/// to the server). That is the slow part of a request's end, so a server hands
+/// the response over first and drops this after.
+///
+/// Invariant: a `Teardown` is dropped on the thread that ran the VM, before
+/// that thread runs another script. The counting allocator (`phv_vm::alloc`)
+/// keeps a count per thread, and a run measures its memory against the count
+/// at its start: dropped on another thread, the run's memory would stay
+/// counted against the thread that ran it (and the other's count would go
+/// below zero); dropped after the next run on the thread began, it would be
+/// taken off that run's use, and the run could exceed its limit by that much.
+/// (The VM is not `Send`, so the first cannot happen by accident.)
+pub struct Teardown {
+    /// Only dropped (its registers, heap and resources are the run's leftovers).
+    _vm: Box<Vm>,
 }
 
 /// Runs a compiled program in a fresh VM (a fresh heap).
@@ -1204,9 +1228,15 @@ pub fn run(c: &Compiled, opts: RunOptions) -> RunOutcome {
 pub fn run_func(c: &Compiled, func: u32, opts: RunOptions) -> RunOutcome {
     let mut vm = new_vm(c, opts);
     let error = call_caught(&mut vm, func);
+    outcome(vm, error)
+}
+
+/// The outcome of a run of `vm` that ended with `error`: its output and
+/// `http` are taken; the VM itself goes into the outcome's teardown.
+fn outcome(mut vm: Vm, error: Option<RuntimeError>) -> RunOutcome {
     let output = vm.take_output();
     let http = std::mem::take(&mut vm.http);
-    RunOutcome { output, error, http }
+    RunOutcome { output, error, http, teardown: Some(Teardown { _vm: Box::new(vm) }) }
 }
 
 /// Runs test `test` with the `before` functions first and the `after` ones
@@ -1238,9 +1268,7 @@ pub fn run_test(
     if let (Some(all), Some(ran)) = (coverage, vm.coverage.take()) {
         all.extend(ran);
     }
-    let output = vm.take_output();
-    let http = std::mem::take(&mut vm.http);
-    RunOutcome { output, error, http }
+    outcome(vm, error)
 }
 
 /// Like `compile`, with a marker before each statement for the debugger (and
@@ -1256,9 +1284,7 @@ pub fn run_debug(c: &Compiled, opts: RunOptions, hook: Box<dyn phv_vm::vm::Debug
     vm.debug = Some(hook);
     let error = call_caught(&mut vm, c.program.main);
     vm.debug = None;
-    let output = vm.take_output();
-    let http = std::mem::take(&mut vm.http);
-    RunOutcome { output, error, http }
+    outcome(vm, error)
 }
 
 /// Runs the program as `run` does, measuring the calls and time of each function
@@ -1270,9 +1296,7 @@ pub fn run_profiled(c: &Compiled, opts: RunOptions) -> (RunOutcome, phv_vm::vm::
     vm.profile = Some(phv_vm::vm::Profile::new(c.program.funcs.len()));
     let error = call_caught(&mut vm, c.program.main);
     let profile = vm.profile.take().unwrap_or_default();
-    let output = vm.take_output();
-    let http = std::mem::take(&mut vm.http);
-    (RunOutcome { output, error, http }, profile)
+    (outcome(vm, error), profile)
 }
 
 fn new_vm(c: &Compiled, opts: RunOptions) -> Vm {
