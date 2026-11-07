@@ -193,7 +193,7 @@ impl DirGuard {
 
 /// Which file an entry is (device and inode, or volume and file index): the
 /// same identity means the same file, whatever its name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileId(u64, u64);
 
 /// Why a path was refused, for messages.

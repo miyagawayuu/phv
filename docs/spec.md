@@ -1365,7 +1365,10 @@ only its own changes are undone, and nothing is committed until the outermost on
   is opened). The new script gets its own time limit, and `lastInsertId()`, `changes()` and `total_changes()` start
   from zero. A kept connection also keeps its prepared statements (the 32 texts run last), so a script that runs the
   same texts as the one before neither compiles nor weighs them again; a kept statement whose schema changed meanwhile
-  is compiled again at its first step, and weighed again when its program is then longer than 200 steps. A statement
+  is compiled again at its first step, and weighed again when its program is then longer than 200 steps. A weight is
+  also kept per process by the database file, its schema version and the statement's text (at most 4,096 of them,
+  for texts up to 4 KB; an `ANALYZE` sets them aside), so the other connections of the file do not weigh a text one
+  of them weighed, at the same schema; each still refuses a statement over the limit. A statement
   whose program takes more than 1 MB (`IN` with about 7,000 values) runs but is not kept. The values
   bound to a statement are cleared when its run is done. When a script is done, an open transaction is rolled back; a
   connection is closed instead of kept after a

@@ -4,11 +4,285 @@
 //!
 //! The tracker follows the parts of the WHATWG tokenizer that decide where
 //! text ends up: raw-text elements and their end tags, the escaped states of
-//! `<script>`, comments (including `<!-->` and `--!>`), bogus comments, and
-//! foreign content (`<svg>`, `<math>`). When it cannot be sure, it reports
-//! the stricter context.
+//! `<script>`, comments (including `<!-->` and `--!>`), bogus comments, CDATA
+//! sections and foreign content (`<svg>`, `<math>`). When it cannot be sure,
+//! it reports the stricter context.
+//!
+//! # The tables
+//!
+//! The rules are tables; the code around them only applies them. A reader
+//! who wants to know what the tracker does reads the tables in this order:
+//!
+//! 1. [`ELEMENTS`]: one row per element name that matters, with flags (raw
+//!    text, void, breakout, integration point, `<select>`, `<noscript>`...).
+//!    An element not in the table has no flags.
+//! 2. [`URL_ATTRS`], [`ANIMATION_URL_ATTRS`], [`SCRIPT_SRC_ATTRS`],
+//!    [`DESCRIBING_ATTRS`], [`URL_LISTS`] and [`SCRIPT_SCHEMES`]: the
+//!    attributes whose values are URLs or otherwise special, and the schemes
+//!    that run code. `decide_url` (code) reads a URL's start by them.
+//! 3. [`RULES`]: the character rules, one table per context ([`Ctx`]). A row
+//!    says what the text at the current character must be ([`On`]), what
+//!    must hold around it ([`When`]), what to do ([`Then`]) and how many
+//!    characters that reads ([`Read`]). The first matching row of the
+//!    current context wins; the last row of every context matches anything.
+//!    `feed_text` is the interpreter.
+//! 4. [`START_RULES`] and [`END_RULES`]: what a start tag and an end tag do
+//!    to the elements open inside `<svg>` or `<math>` ([`HtmlTracker::open`]),
+//!    by what the innermost open element is ([`Top`]) and what the tag is
+//!    ([`TagIs`]). `open_start` and `open_end` are the interpreters.
+//! 5. [`COMMENT_ENDS_AFTER_VALUE`] and [`COMMENT_END_STARTS`]: the text that
+//!    ends a comment after a value (`comment_end_after`).
+//!
+//! What a tag does when its `>` is read (`close_tag`), what context a
+//! position reports (`context`), and what a block, loop or jump must keep
+//! (`end_block`, `end_loop`, `same_place`) are code, each a short list of
+//! steps that name the table they use. The JavaScript reader (`Js`,
+//! `Reading`) stays code: it follows several readings at once and merges
+//! them, which a row per character does not express.
+//!
+//! A comment on a row names the WHATWG rule it follows and, where there is
+//! one, the assessment that found the case (`docs/security-audit.md`).
 
 use crate::ast::EchoContext;
+
+// ---------------------------------------------------------------------------
+// 1. Elements
+// ---------------------------------------------------------------------------
+
+/// What an element is for the tracker: bits of `Element::flags`.
+type Flags = u32;
+/// Its text is read raw in HTML content, up to its end tag (the WHATWG
+/// RAWTEXT, RCDATA, script data and PLAINTEXT states).
+const RAW: Flags = 1 << 0;
+/// Its text is raw inside SVG and MathML too (the SVG `<script>` and
+/// `<style>`; browsers read their text as markup, see `ForeignCdata`).
+const RAW_IN_FOREIGN: Flags = 1 << 1;
+/// A browser may read its text as raw text where this tracker reads markup,
+/// so its end tag in a comment or an attribute value is watched (`RAW`, and
+/// `<noscript>` with scripting on; found by the 1.0.0 and 1.1.1 audits).
+const HIDES_END: Flags = 1 << 2;
+/// Its start tag inside `<select>` is ignored by older parsers, which then
+/// read its text as markup (R19-26).
+const IGNORED_IN_SELECT: Flags = 1 << 3;
+/// Has no end tag (`<plaintext>`): its text is reported as `Text`.
+const NO_END_TAG: Flags = 1 << 4;
+/// Never open after its start tag (the WHATWG void elements, and the obsolete
+/// ones browsers treat alike).
+const VOID: Flags = 1 << 5;
+/// A start tag that ends SVG or MathML content for browsers where it is not
+/// in an integration point (the WHATWG "in foreign content" list; R19-8).
+/// `<font>` only with `color`, `face` or `size`; it is counted always.
+const BREAKOUT: Flags = 1 << 6;
+/// `<svg>`: opens SVG content.
+const SVG_ROOT: Flags = 1 << 7;
+/// `<math>`: opens MathML content.
+const MATH_ROOT: Flags = 1 << 8;
+/// An SVG element whose content is HTML (an HTML integration point).
+const SVG_HTML_POINT: Flags = 1 << 9;
+/// A MathML element whose content is HTML but for `<mglyph>` and
+/// `<malignmark>` (a text integration point).
+const MATH_TEXT_POINT: Flags = 1 << 10;
+/// MathML `<annotation-xml>`: HTML or MathML by its `encoding`, which is not
+/// followed (R19-8).
+const ANNOTATION_XML: Flags = 1 << 11;
+/// Stays MathML inside a text integration point.
+const MGLYPH: Flags = 1 << 12;
+/// An SVG animation element, whose `to`, `from`, `values`, `by` and
+/// `attributeName` can set `href`.
+const ANIMATION: Flags = 1 << 13;
+/// `<select>`: see `IGNORED_IN_SELECT`.
+const SELECT: Flags = 1 << 14;
+/// `<noscript>`: raw text for browsers with scripting on.
+const NOSCRIPT: Flags = 1 << 15;
+/// `<meta>`: an undescribed one acts on its `content` (found by the 1.0 audit).
+const META: Flags = 1 << 16;
+/// `<script>`: its text is JavaScript, its URL attributes get the nonce.
+const SCRIPT: Flags = 1 << 17;
+/// `<style>`: its text is CSS.
+const STYLE: Flags = 1 << 18;
+/// `<svg>` or `<math>`.
+const FOREIGN_ROOT: Flags = SVG_ROOT | MATH_ROOT;
+
+struct Element {
+    name: &'static str,
+    flags: Flags,
+}
+
+/// The elements the tracker knows, by their lowercased name. The raw-text
+/// elements first, then the elements with a part in foreign content, then
+/// the void and breakout lists of the WHATWG specification.
+const ELEMENTS: &[Element] = &[
+    // Raw text (WHATWG 13.2.5: script data, RAWTEXT, RCDATA, PLAINTEXT).
+    Element { name: "script", flags: RAW | RAW_IN_FOREIGN | HIDES_END | SCRIPT },
+    Element { name: "style", flags: RAW | RAW_IN_FOREIGN | HIDES_END | IGNORED_IN_SELECT | STYLE },
+    Element { name: "textarea", flags: RAW | HIDES_END },
+    // `<title>` is RCDATA in HTML and an HTML integration point in SVG, where it is parsed as markup.
+    Element { name: "title", flags: RAW | HIDES_END | IGNORED_IN_SELECT | SVG_HTML_POINT },
+    Element { name: "xmp", flags: RAW | HIDES_END | IGNORED_IN_SELECT },
+    Element { name: "iframe", flags: RAW | HIDES_END | IGNORED_IN_SELECT },
+    Element { name: "noembed", flags: RAW | HIDES_END | IGNORED_IN_SELECT },
+    Element { name: "noframes", flags: RAW | HIDES_END | IGNORED_IN_SELECT },
+    Element { name: "plaintext", flags: RAW | HIDES_END | IGNORED_IN_SELECT | NO_END_TAG },
+    // Raw text when scripting is on (found by the 1.0.0 and 1.1.1 audits).
+    Element { name: "noscript", flags: HIDES_END | NOSCRIPT },
+    Element { name: "select", flags: SELECT },
+    // Foreign content (WHATWG 13.2.6.5 "in foreign content", 13.2.6.4 integration points).
+    Element { name: "svg", flags: SVG_ROOT },
+    Element { name: "math", flags: MATH_ROOT },
+    Element { name: "foreignobject", flags: SVG_HTML_POINT },
+    Element { name: "desc", flags: SVG_HTML_POINT },
+    Element { name: "mi", flags: MATH_TEXT_POINT },
+    Element { name: "mo", flags: MATH_TEXT_POINT },
+    Element { name: "mn", flags: MATH_TEXT_POINT },
+    Element { name: "ms", flags: MATH_TEXT_POINT },
+    Element { name: "mtext", flags: MATH_TEXT_POINT },
+    Element { name: "annotation-xml", flags: ANNOTATION_XML },
+    Element { name: "mglyph", flags: MGLYPH },
+    Element { name: "malignmark", flags: MGLYPH },
+    // SVG animation elements can set `href` to their `to`/`from`/`values`.
+    Element { name: "animate", flags: ANIMATION },
+    Element { name: "set", flags: ANIMATION },
+    Element { name: "animatemotion", flags: ANIMATION },
+    Element { name: "animatetransform", flags: ANIMATION },
+    // Void elements (WHATWG 13.1.2, plus the obsolete ones browsers treat alike).
+    Element { name: "area", flags: VOID },
+    Element { name: "base", flags: VOID },
+    Element { name: "basefont", flags: VOID },
+    Element { name: "bgsound", flags: VOID },
+    Element { name: "br", flags: VOID | BREAKOUT },
+    Element { name: "col", flags: VOID },
+    Element { name: "embed", flags: VOID | BREAKOUT },
+    Element { name: "frame", flags: VOID },
+    Element { name: "hr", flags: VOID | BREAKOUT },
+    Element { name: "image", flags: VOID },
+    Element { name: "img", flags: VOID | BREAKOUT },
+    Element { name: "input", flags: VOID },
+    Element { name: "keygen", flags: VOID },
+    Element { name: "link", flags: VOID },
+    Element { name: "meta", flags: VOID | BREAKOUT | META },
+    Element { name: "param", flags: VOID },
+    Element { name: "source", flags: VOID },
+    Element { name: "track", flags: VOID },
+    Element { name: "wbr", flags: VOID },
+    // Breakout start tags (WHATWG 13.2.6.5; R19-8): the rest of the list.
+    Element { name: "b", flags: BREAKOUT },
+    Element { name: "big", flags: BREAKOUT },
+    Element { name: "blockquote", flags: BREAKOUT },
+    Element { name: "body", flags: BREAKOUT },
+    Element { name: "center", flags: BREAKOUT },
+    Element { name: "code", flags: BREAKOUT },
+    Element { name: "dd", flags: BREAKOUT },
+    Element { name: "div", flags: BREAKOUT },
+    Element { name: "dl", flags: BREAKOUT },
+    Element { name: "dt", flags: BREAKOUT },
+    Element { name: "em", flags: BREAKOUT },
+    Element { name: "font", flags: BREAKOUT },
+    Element { name: "h1", flags: BREAKOUT },
+    Element { name: "h2", flags: BREAKOUT },
+    Element { name: "h3", flags: BREAKOUT },
+    Element { name: "h4", flags: BREAKOUT },
+    Element { name: "h5", flags: BREAKOUT },
+    Element { name: "h6", flags: BREAKOUT },
+    Element { name: "head", flags: BREAKOUT },
+    Element { name: "i", flags: BREAKOUT },
+    Element { name: "li", flags: BREAKOUT },
+    Element { name: "listing", flags: BREAKOUT },
+    Element { name: "menu", flags: BREAKOUT },
+    Element { name: "nobr", flags: BREAKOUT },
+    Element { name: "ol", flags: BREAKOUT },
+    Element { name: "p", flags: BREAKOUT },
+    Element { name: "pre", flags: BREAKOUT },
+    Element { name: "ruby", flags: BREAKOUT },
+    Element { name: "s", flags: BREAKOUT },
+    Element { name: "small", flags: BREAKOUT },
+    Element { name: "span", flags: BREAKOUT },
+    Element { name: "strike", flags: BREAKOUT },
+    Element { name: "strong", flags: BREAKOUT },
+    Element { name: "sub", flags: BREAKOUT },
+    Element { name: "sup", flags: BREAKOUT },
+    Element { name: "table", flags: BREAKOUT },
+    Element { name: "tt", flags: BREAKOUT },
+    Element { name: "u", flags: BREAKOUT },
+    Element { name: "ul", flags: BREAKOUT },
+    Element { name: "var", flags: BREAKOUT },
+];
+
+/// The flags of an element (none for one not in the table).
+fn flags(name: &str) -> Flags {
+    ELEMENTS.iter().find(|e| e.name == name).map_or(0, |e| e.flags)
+}
+
+/// Whether an element has every flag of `mask`.
+fn has(name: &str, mask: Flags) -> bool {
+    flags(name) & mask == mask
+}
+
+/// The raw-text element `tag` names, for `EchoContext::RawText` (not
+/// `<plaintext>`, which has no end tag).
+fn raw_text_name(tag: &str) -> Option<&'static str> {
+    ELEMENTS.iter().find(|e| e.name == tag && e.flags & RAW != 0 && e.flags & NO_END_TAG == 0).map(|e| e.name)
+}
+
+/// Whether `name` (lowercase letters) begins the name of an element with the flag.
+fn starts_element_with(name: &str, flag: Flags) -> bool {
+    ELEMENTS.iter().any(|e| e.flags & flag != 0 && e.name.starts_with(name))
+}
+
+/// The most elements followed inside SVG or MathML (see `HtmlTracker::open`).
+const MAX_OPEN: usize = 4096;
+
+// ---------------------------------------------------------------------------
+// 2. Attributes and URLs
+// ---------------------------------------------------------------------------
+
+/// Attributes whose value is a URL (the WHATWG ones and the legacy ones
+/// browsers still follow).
+const URL_ATTRS: &[&str] = &[
+    "href",
+    "src",
+    "action",
+    "formaction",
+    "xlink:href",
+    "poster",
+    "data",
+    "cite",
+    "background",
+    "ping",
+    "srcset",
+    "manifest",
+    "codebase",
+    "longdesc",
+    "lowsrc",
+    "dynsrc",
+];
+
+/// On an `ANIMATION` element, attributes that name or set `href`.
+const ANIMATION_URL_ATTRS: &[&str] = &["to", "from", "values", "by", "attributename"];
+
+/// On `<script>`, the script's URL (`src`; `href` in SVG): the tag gets the
+/// CSP nonce, so a URL inserted there would run as a trusted script.
+const SCRIPT_SRC_ATTRS: &[&str] = &["src", "href", "xlink:href"];
+
+/// A `<meta>` with one of these describes the page; its `content` is text.
+/// Without one (`http-equiv="refresh"`), `content` acts.
+const DESCRIBING_ATTRS: &[&str] = &["name", "property", "itemprop"];
+
+/// Attributes that hold a list of URLs: after the separator, a URL starts
+/// again (each candidate of `srcset`; each value of an animation's `values`).
+/// The element must have the flags (0: any element).
+const URL_LISTS: &[(&str, char, Flags)] = &[("srcset", ',', 0), ("values", ';', ANIMATION)];
+
+/// Schemes that run code or hold a document: a URL that starts with one is
+/// `ScriptUrl`. Only the first two are inline code for the CSP warning
+/// (`data:` is fine for images).
+const SCRIPT_SCHEMES: &[&str] = &["javascript:", "vbscript:", "data:"];
+
+/// How much of a URL's start is kept undecided (a prefix of a scheme, or `&`).
+const MAX_URL_PREFIX: usize = 256;
+
+fn is_url_attr(tag: &str, name: &str) -> bool {
+    URL_ATTRS.contains(&name) || (has(tag, ANIMATION) && ANIMATION_URL_ATTRS.contains(&name))
+}
 
 /// What is known about the start of a URL attribute's value.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,6 +305,37 @@ impl UrlState {
         }
     }
 }
+
+/// Decides a URL from the literal text at its start. Browsers strip leading
+/// spaces and controls and decode character references, so `&` leaves it
+/// undecided (`&#106;avascript:` is `javascript:`).
+fn decide_url(prefix: &str) -> Option<UrlState> {
+    let mut scheme = String::new();
+    for c in prefix.chars() {
+        if c.is_ascii_whitespace() || c.is_control() {
+            continue;
+        }
+        match c {
+            '/' | '?' | '#' => return Some(UrlState::Safe),
+            ':' => {
+                let s = format!("{}:", scheme.to_ascii_lowercase());
+                return Some(if SCRIPT_SCHEMES.contains(&s.as_str()) { UrlState::Script } else { UrlState::Safe });
+            }
+            '&' => return None,
+            c => scheme.push(c),
+        }
+    }
+    None
+}
+
+/// Whether `p` (lowercased, without spaces) may still become a script scheme.
+fn may_become_script_scheme(p: &str) -> bool {
+    SCRIPT_SCHEMES.iter().any(|s| s.starts_with(p))
+}
+
+// ---------------------------------------------------------------------------
+// 3. Contexts and the character rules
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
 enum State {
@@ -72,6 +377,8 @@ enum State {
     /// `</script>` does not end the script.
     Raw {
         tag: String,
+        /// The element's flags (`ELEMENTS`), looked up once.
+        flags: Flags,
         escape: u8,
         /// Where the script's JavaScript has reached (`<script>` only).
         js: Js,
@@ -83,6 +390,398 @@ enum State {
         brackets: u8,
     },
 }
+
+/// A context: a `State` without its data, and the tag name being read
+/// (`HtmlTracker::pending`). The order is that of `RULES`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ctx {
+    Text,
+    /// After `<` or `</` and a letter: the tag name.
+    TagName,
+    Tag,
+    AttrName,
+    BeforeValue,
+    Quoted,
+    Unquoted,
+    Comment,
+    Bogus,
+    Cdata,
+    Raw,
+}
+
+impl State {
+    fn ctx(&self) -> Ctx {
+        match self {
+            State::Text => Ctx::Text,
+            State::Comment => Ctx::Comment,
+            State::Bogus => Ctx::Bogus,
+            State::Tag { .. } => Ctx::Tag,
+            State::AttrName { .. } => Ctx::AttrName,
+            State::BeforeValue { .. } => Ctx::BeforeValue,
+            State::Quoted { .. } => Ctx::Quoted,
+            State::Unquoted { .. } => Ctx::Unquoted,
+            State::Raw { .. } => Ctx::Raw,
+            State::Cdata { .. } => Ctx::Cdata,
+        }
+    }
+
+    /// The tag and whether it is an end tag, inside one.
+    fn take_tag(self) -> (String, bool) {
+        match self {
+            State::Tag { name, closing } => (name, closing),
+            State::AttrName { tag, closing, .. }
+            | State::BeforeValue { tag, closing, .. }
+            | State::Quoted { tag, closing, .. }
+            | State::Unquoted { tag, closing, .. } => (tag, closing),
+            _ => (String::new(), false),
+        }
+    }
+}
+
+/// A class of characters, as the HTML tokenizer reads them.
+#[derive(Clone, Copy, Debug)]
+enum Class {
+    /// Tab, LF, FF, CR and space only (found by the 1.1 audit: U+3000 or
+    /// U+00A0 between attributes was taken for a separator, while browsers
+    /// read it as part of a name or value).
+    Space,
+    /// `Space`, or `/`.
+    SpaceOrSlash,
+    /// A character of a tag name: anything but `Space`, `/` and `>` (found by
+    /// the 1.1 audit: `<div\u{3000}title="` ended the name here, while
+    /// browsers read on).
+    NameChar,
+    /// An ASCII letter.
+    Alpha,
+    /// `"` or `'`.
+    Quote,
+    /// What may start markup after `<` in a foreign raw-text element: a
+    /// letter, `!`, `/` or `?`.
+    MarkupStart,
+}
+
+impl Class {
+    fn has(self, c: char) -> bool {
+        match self {
+            Class::Space => html_space(c),
+            Class::SpaceOrSlash => html_space(c) || c == '/',
+            Class::NameChar => !html_space(c) && c != '/' && c != '>',
+            Class::Alpha => c.is_ascii_alphabetic(),
+            Class::Quote => c == '"' || c == '\'',
+            Class::MarkupStart => c.is_ascii_alphabetic() || matches!(c, '!' | '/' | '?'),
+        }
+    }
+}
+
+/// What the text at the current character must be for a rule to apply.
+#[derive(Clone, Copy, Debug)]
+enum On {
+    Any,
+    Is(char),
+    Not(char),
+    In(Class),
+    /// This text, in any ASCII case.
+    Lit(&'static str),
+    /// This text, exactly.
+    Exact(&'static str),
+    /// The quote that opened the current attribute value.
+    TheQuote,
+    /// The raw-text element's end tag, `</name` and a delimiter (space, `/`
+    /// or `>`; `</scripts>` is not one).
+    EndTag,
+    /// The rest of the text is shorter than this and begins it (any ASCII
+    /// case): what follows (a value, a block) could complete it, so the rest
+    /// is read again in front of the next text.
+    RestStarts(&'static str),
+    /// The same, exactly.
+    RestStartsExact(&'static str),
+    /// The rest of the text is the raw-text element's `</name` or a start of it.
+    RestStartsEndTag,
+}
+
+/// What must hold around the match for a rule to apply.
+#[derive(Clone, Copy, Debug)]
+enum When {
+    /// The match ends the text.
+    AtEnd,
+    /// The character after the match is in the class.
+    Next(Class),
+    /// After the match: HTML whitespace, `/` or `>`.
+    DelimAfter,
+    /// After this character: HTML whitespace, then `=` (`name =value`).
+    SpacesThenEq,
+    /// After the match: `-`s, then `>` (`<!-->`, `<!--->` in a script).
+    DashesThenGt,
+    InForeign,
+    /// The raw-text element is `<script>`.
+    Script,
+    NotScript,
+    /// The script's escape state is this.
+    Escape(u8),
+    /// The script's escape state is 1 or 2.
+    Escaped,
+    /// This many `]` just came in a CDATA section.
+    Brackets(u8),
+}
+
+/// What a rule does.
+#[derive(Clone, Copy, Debug)]
+enum Then {
+    Stay,
+    Text,
+    /// Open a comment (its start is remembered for the end of the text).
+    Comment,
+    Bogus,
+    Cdata,
+    /// Start reading a tag name (`""`) or an end tag's name (`"/"`).
+    TagName(&'static str),
+    /// Keep the rest of the text for the next one (`carry`) and stop.
+    Carry,
+    /// Add the character to the tag or attribute name, lowercased.
+    NamePush,
+    /// The tag name is complete: into the tag (its attributes).
+    NameEnd,
+    /// `>`: the tag is complete (`close_tag`).
+    Close(SelfClosing),
+    /// Start an attribute name with this character.
+    AttrName,
+    /// `=`: the attribute has a value.
+    AttrValue,
+    /// The attribute has no value: back between attributes.
+    AttrDone,
+    /// A quoted value begins (a URL state for a URL attribute).
+    Quoted,
+    Unquoted,
+    /// Back between attributes after a value.
+    ToTag,
+    /// A character of a quoted value: the URL's start follows it (`url_char`).
+    UrlChar,
+    /// The script's escape state becomes this.
+    Escape(u8),
+    /// The raw-text element's end tag: into it.
+    CloseRaw,
+    /// Markup in a foreign raw-text element (`ForeignCdata`).
+    ForeignMarkup,
+    /// A `]` in a CDATA section.
+    Bracket,
+    /// Another character in a CDATA section.
+    Brackets0,
+    /// A `>` in a CDATA section that is not the end of `]]>` (`CdataEnd`).
+    CdataEnd,
+}
+
+/// Whether `<tag ... />` is self-closing when its `>` is read.
+#[derive(Clone, Copy, Debug)]
+enum SelfClosing {
+    /// Yes if the character before `>` is `/` (between attributes).
+    IfSlashBefore,
+    /// Never (`>` ends an unquoted value or follows `=`).
+    Never,
+}
+
+/// How many characters a rule reads.
+#[derive(Clone, Copy, Debug)]
+enum Read {
+    One,
+    /// None: the same character is read again in the new context.
+    Zero,
+    /// The matched text.
+    Match,
+    /// The run of HTML whitespace here (at least one character; found by the
+    /// 1.0.0 audit: looking ahead at each space was quadratic).
+    Spaces,
+    /// Through the `>` of `DashesThenGt`.
+    ThroughGt,
+    /// The rest of the text.
+    Rest,
+}
+
+/// A row of the character rules.
+struct Rule {
+    on: On,
+    when: &'static [When],
+    then: Then,
+    read: Read,
+}
+
+use Class::*;
+use Read::{Match, One, Rest, Zero};
+
+/// The character rules, one table per context, in the order of `Ctx`. The
+/// first matching row wins; the last row of each table matches anything.
+const RULES: &[(Ctx, &[Rule])] = &[
+    // Text (WHATWG data state and tag open state).
+    (
+        Ctx::Text,
+        &[
+            Rule { on: On::Not('<'), when: &[], then: Then::Stay, read: One },
+            // `<!-->` and `<!--->` are complete (empty) comments.
+            Rule { on: On::Lit("<!-->"), when: &[], then: Then::Text, read: Match },
+            Rule { on: On::Lit("<!--->"), when: &[], then: Then::Text, read: Match },
+            Rule { on: On::Lit("<!--"), when: &[], then: Then::Comment, read: Match },
+            // `<` at the end: what follows decides what it starts.
+            Rule { on: On::Is('<'), when: &[When::AtEnd], then: Then::Carry, read: Rest },
+            Rule { on: On::Is('<'), when: &[When::Next(Alpha)], then: Then::TagName(""), read: One },
+            Rule { on: On::Lit("</"), when: &[When::AtEnd], then: Then::Carry, read: Rest },
+            // `<!` or `<!-` at the end: a value or block could make a comment.
+            Rule { on: On::RestStartsExact("<!--"), when: &[], then: Then::Carry, read: Rest },
+            // In SVG and MathML, `<![CDATA[` (in this case only) starts a CDATA section
+            // (R19-9), so its start is read again with what follows too.
+            Rule { on: On::RestStartsExact("<![CDATA["), when: &[When::InForeign], then: Then::Carry, read: Rest },
+            Rule { on: On::Exact("<![CDATA["), when: &[When::InForeign], then: Then::Cdata, read: Match },
+            Rule { on: On::Lit("</"), when: &[When::Next(Alpha)], then: Then::TagName("/"), read: Match },
+            // `</>` is nothing; `</` and another character is a bogus comment.
+            Rule { on: On::Lit("</>"), when: &[], then: Then::Text, read: Match },
+            Rule { on: On::Lit("</"), when: &[], then: Then::Bogus, read: Match },
+            Rule { on: On::Lit("<!"), when: &[], then: Then::Bogus, read: One },
+            Rule { on: On::Lit("<?"), when: &[], then: Then::Bogus, read: One },
+            Rule { on: On::Any, when: &[], then: Then::Stay, read: One },
+        ],
+    ),
+    // A tag name goes on as browsers read it, up to HTML whitespace, `/` or `>`.
+    (
+        Ctx::TagName,
+        &[
+            Rule { on: On::In(NameChar), when: &[], then: Then::NamePush, read: One },
+            Rule { on: On::Any, when: &[], then: Then::NameEnd, read: Zero },
+        ],
+    ),
+    // Between attributes (WHATWG before attribute name state).
+    (
+        Ctx::Tag,
+        &[
+            Rule { on: On::Is('>'), when: &[], then: Then::Close(SelfClosing::IfSlashBefore), read: One },
+            Rule { on: On::In(SpaceOrSlash), when: &[], then: Then::Stay, read: One },
+            Rule { on: On::Any, when: &[], then: Then::AttrName, read: One },
+        ],
+    ),
+    // An attribute name (WHATWG attribute name and after attribute name states).
+    (
+        Ctx::AttrName,
+        &[
+            Rule { on: On::Is('='), when: &[], then: Then::AttrValue, read: One },
+            Rule { on: On::Is('>'), when: &[], then: Then::Close(SelfClosing::IfSlashBefore), read: One },
+            // `name =value` is rare; a space ends a valueless attribute unless `=` follows.
+            Rule { on: On::In(Space), when: &[When::SpacesThenEq], then: Then::Stay, read: Read::Spaces },
+            Rule { on: On::In(SpaceOrSlash), when: &[], then: Then::AttrDone, read: Read::Spaces },
+            Rule { on: On::Any, when: &[], then: Then::NamePush, read: One },
+        ],
+    ),
+    // After `name=` (WHATWG before attribute value state).
+    (
+        Ctx::BeforeValue,
+        &[
+            Rule { on: On::In(Quote), when: &[], then: Then::Quoted, read: One },
+            Rule { on: On::In(Space), when: &[], then: Then::Stay, read: One },
+            Rule { on: On::Is('>'), when: &[], then: Then::Close(SelfClosing::Never), read: One },
+            Rule { on: On::Any, when: &[], then: Then::Unquoted, read: One },
+        ],
+    ),
+    // A quoted value ends only at its quote.
+    (
+        Ctx::Quoted,
+        &[
+            Rule { on: On::TheQuote, when: &[], then: Then::ToTag, read: One },
+            Rule { on: On::Any, when: &[], then: Then::UrlChar, read: One },
+        ],
+    ),
+    // An unquoted value ends at HTML whitespace or `>`.
+    (
+        Ctx::Unquoted,
+        &[
+            Rule { on: On::In(Space), when: &[], then: Then::ToTag, read: One },
+            Rule { on: On::Is('>'), when: &[], then: Then::Close(SelfClosing::Never), read: One },
+            Rule { on: On::Any, when: &[], then: Then::Stay, read: One },
+        ],
+    ),
+    // A comment ends at `-->` or `--!>` (WHATWG comment end and comment end bang states).
+    (
+        Ctx::Comment,
+        &[
+            Rule { on: On::Lit("-->"), when: &[], then: Then::Text, read: Match },
+            Rule { on: On::Lit("--!>"), when: &[], then: Then::Text, read: Match },
+            Rule { on: On::Any, when: &[], then: Then::Stay, read: One },
+        ],
+    ),
+    // A bogus comment ends at the first `>`.
+    (
+        Ctx::Bogus,
+        &[
+            Rule { on: On::Is('>'), when: &[], then: Then::Text, read: One },
+            Rule { on: On::Any, when: &[], then: Then::Stay, read: One },
+        ],
+    ),
+    // A CDATA section ends at `]]>`; a `>` elsewhere is refused (R19-9).
+    (
+        Ctx::Cdata,
+        &[
+            Rule { on: On::Is(']'), when: &[], then: Then::Bracket, read: One },
+            Rule { on: On::Is('>'), when: &[When::Brackets(2)], then: Then::Text, read: One },
+            Rule { on: On::Is('>'), when: &[], then: Then::CdataEnd, read: One },
+            Rule { on: On::Any, when: &[], then: Then::Brackets0, read: One },
+        ],
+    ),
+    // Raw text (WHATWG RAWTEXT, RCDATA and script data states). In a script,
+    // the starts of `<!--`, `<script` and `-->` at the end of the text are
+    // carried too: they change its escape state.
+    (
+        Ctx::Raw,
+        &[
+            Rule { on: On::RestStarts("<!--"), when: &[When::Script, When::Escape(0)], then: Then::Carry, read: Rest },
+            Rule {
+                on: On::RestStarts("<script"),
+                when: &[When::Script, When::Escape(1)],
+                then: Then::Carry,
+                read: Rest,
+            },
+            Rule { on: On::RestStarts("-->"), when: &[When::Script, When::Escaped], then: Then::Carry, read: Rest },
+            // `</tex` + a value or block: it might end the element.
+            Rule { on: On::RestStartsEndTag, when: &[], then: Then::Carry, read: Rest },
+            // In the double escaped state, `</script>` returns to the escaped state.
+            Rule { on: On::EndTag, when: &[When::Script, When::Escape(2)], then: Then::Escape(1), read: Match },
+            Rule { on: On::EndTag, when: &[], then: Then::CloseRaw, read: Match },
+            // In SVG and MathML a script's text is markup: a tag, comment, CDATA
+            // section or bogus comment can hide its end tag from browsers but not from
+            // here (found by the 1.0 audit for CDATA and comments, by the 1.0.0 one for
+            // tags and bogus comments).
+            Rule {
+                on: On::Is('<'),
+                when: &[When::InForeign, When::Next(MarkupStart)],
+                then: Then::ForeignMarkup,
+                read: One,
+            },
+            Rule { on: On::Any, when: &[When::NotScript], then: Then::Stay, read: One },
+            // Script data escape states (WHATWG 13.2.5.18 to 13.2.5.29): `<!-->` and
+            // `<!--->` return to script data at once.
+            Rule {
+                on: On::Lit("<!--"),
+                when: &[When::Escape(0), When::DashesThenGt],
+                then: Then::Stay,
+                read: Read::ThroughGt,
+            },
+            Rule { on: On::Lit("<!--"), when: &[When::Escape(0)], then: Then::Escape(1), read: Match },
+            Rule { on: On::Lit("-->"), when: &[When::Escaped], then: Then::Escape(0), read: Match },
+            Rule {
+                on: On::Lit("<script"),
+                when: &[When::Escape(1), When::DelimAfter],
+                then: Then::Escape(2),
+                read: Match,
+            },
+            Rule { on: On::Any, when: &[], then: Then::Stay, read: One },
+        ],
+    ),
+];
+
+/// The rules of a context.
+fn rules(ctx: Ctx) -> &'static [Rule] {
+    let (c, rules) = RULES[ctx as usize];
+    debug_assert_eq!(c, ctx);
+    rules
+}
+
+// ---------------------------------------------------------------------------
+// 4. The open elements of foreign content
+// ---------------------------------------------------------------------------
 
 /// The namespace of an element open inside SVG or MathML.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -99,83 +798,188 @@ struct Open {
     ns: Ns,
 }
 
-impl Open {
-    /// SVG's HTML integration points: their content is HTML.
-    fn html_point(&self) -> bool {
-        self.ns == Ns::Svg && matches!(self.name.as_str(), "foreignobject" | "desc" | "title")
-    }
+/// What the innermost open element is for the tag inside it (WHATWG 13.2.6.4
+/// and 13.2.6.5: whether the tag is read as HTML or as foreign content).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Top {
+    /// No element open: HTML content outside `<svg>` and `<math>`.
+    None,
+    /// An HTML element, opened in an integration point.
+    Html,
+    /// An SVG HTML integration point (`<foreignObject>`, `<desc>`, `<title>`).
+    HtmlPoint,
+    /// A MathML text integration point (`<mi>`, `<mo>`, `<mn>`, `<ms>`, `<mtext>`).
+    TextPoint,
+    /// MathML `<annotation-xml>`.
+    AnnotationXml,
+    /// Any other SVG or MathML element.
+    Foreign,
+}
 
-    /// MathML's text integration points: their content is HTML but for
-    /// `<mglyph>` and `<malignmark>`.
-    fn text_point(&self) -> bool {
-        self.ns == Ns::Math && matches!(self.name.as_str(), "mi" | "mo" | "mn" | "ms" | "mtext")
+impl Open {
+    fn top(&self) -> Top {
+        match self.ns {
+            Ns::Html => Top::Html,
+            Ns::Svg if has(&self.name, SVG_HTML_POINT) => Top::HtmlPoint,
+            Ns::Math if has(&self.name, MATH_TEXT_POINT) => Top::TextPoint,
+            Ns::Math if has(&self.name, ANNOTATION_XML) => Top::AnnotationXml,
+            _ => Top::Foreign,
+        }
     }
 }
 
-/// Start tags that end SVG and MathML content where they are not in an
-/// integration point: browsers close the foreign elements and read them as
-/// HTML. (`<font>` only with `color`, `face` or `size`; it is counted always.)
-const BREAKOUT_TAGS: &[&str] = &[
-    "b",
-    "big",
-    "blockquote",
-    "body",
-    "br",
-    "center",
-    "code",
-    "dd",
-    "div",
-    "dl",
-    "dt",
-    "em",
-    "embed",
-    "font",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "h5",
-    "h6",
-    "head",
-    "hr",
-    "i",
-    "img",
-    "li",
-    "listing",
-    "menu",
-    "meta",
-    "nobr",
-    "ol",
-    "p",
-    "pre",
-    "ruby",
-    "s",
-    "small",
-    "span",
-    "strike",
-    "strong",
-    "sub",
-    "sup",
-    "table",
-    "tt",
-    "u",
-    "ul",
-    "var",
+/// The tops whose content browsers read as HTML.
+const HTML_CONTENT: &[Top] = &[Top::Html, Top::HtmlPoint, Top::TextPoint, Top::AnnotationXml];
+/// The tops inside SVG or MathML (an open element that is not HTML).
+const FOREIGN_TOPS: &[Top] = &[Top::HtmlPoint, Top::TextPoint, Top::AnnotationXml, Top::Foreign];
+
+/// A class of tag names in `START_RULES` and `END_RULES`.
+#[derive(Clone, Copy, Debug)]
+enum TagIs {
+    Any,
+    /// Has every flag of the mask.
+    Has(Flags),
+    /// Has a flag of the mask.
+    AnyOf(Flags),
+    /// Lacks every flag of the mask.
+    Lacks(Flags),
+    /// One of these names.
+    Named(&'static [&'static str]),
+    /// The name of the innermost open element.
+    TopName,
+    /// A foreign element of this name is open above the innermost HTML element.
+    ForeignOpenAbove,
+    /// An HTML element of this name is open.
+    HtmlOpen,
+}
+
+/// What a row does to the open elements.
+#[derive(Clone, Copy, Debug)]
+enum Stack {
+    Nothing,
+    /// Report the error, then go on to the next matching row.
+    Continue,
+    /// Open `<svg>` or `<math>` outside foreign content.
+    PushRoot,
+    PushSvg,
+    PushMath,
+    PushHtml,
+    /// Open the element in the namespace of the innermost open element.
+    PushSameNs,
+    /// Close the innermost open element.
+    Pop,
+    /// Close the innermost foreign element of this name, wherever it is.
+    CloseForeignNamed,
+    /// Close the innermost foreign element of this name above the innermost
+    /// HTML element.
+    CloseForeignAbove,
+    /// Close the innermost HTML element of this name.
+    CloseHtmlNamed,
+}
+
+/// What a row reports (`InlineCode::ForeignStructure`; the messages are in
+/// `report`), or nothing.
+#[derive(Clone, Copy, Debug)]
+enum Wrong {
+    None,
+    /// An element inside `<annotation-xml>` (R19-8).
+    AnnotationXml,
+    /// A breakout start tag directly in foreign content (R19-8).
+    Breakout,
+    /// `</svg>` or `</math>` that browsers ignore (R19-8).
+    IgnoredEnd,
+    /// `</p>` or `</br>` directly in foreign content.
+    BreakoutEnd,
+    /// An end tag inside foreign content that an HTML element around it is open for.
+    EndAround,
+}
+
+/// Whether `<tag ... />` was self-closing (start rules only).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Closed {
+    Any,
+    Yes,
+    No,
+}
+
+/// A row of `START_RULES` or `END_RULES`: what the innermost open element
+/// is, what the tag is, whether it is self-closing, what is reported, and
+/// what is done.
+struct OpenRule {
+    top: &'static [Top],
+    tag: TagIs,
+    self_closing: Closed,
+    wrong: Wrong,
+    then: Stack,
+}
+
+impl OpenRule {
+    const fn new(top: &'static [Top], tag: TagIs, self_closing: Closed, wrong: Wrong, then: Stack) -> OpenRule {
+        OpenRule { top, tag, self_closing, wrong, then }
+    }
+}
+
+/// What a start tag does to the open elements (`open_start`). Before the
+/// table: when `MAX_OPEN` elements are open, the tag is ignored (reported once).
+/// Columns: top, tag, self-closing, reported, done.
+const START_RULES: &[OpenRule] = &[
+    // Outside foreign content, `<svg>` and `<math>` open it; a self-closed one
+    // (`<svg/>`) opens nothing (found by the 1.0.0 audit).
+    OpenRule::new(&[Top::None], TagIs::AnyOf(FOREIGN_ROOT), Closed::No, Wrong::None, Stack::PushRoot),
+    OpenRule::new(&[Top::None], TagIs::Any, Closed::Any, Wrong::None, Stack::Nothing),
+    // In a text integration point, `<mglyph>` and `<malignmark>` stay MathML.
+    OpenRule::new(&[Top::TextPoint], TagIs::Has(MGLYPH), Closed::Yes, Wrong::None, Stack::Nothing),
+    OpenRule::new(&[Top::TextPoint], TagIs::Has(MGLYPH), Closed::No, Wrong::None, Stack::PushSameNs),
+    // `<annotation-xml>` holds HTML or MathML depending on its `encoding`, which is
+    // not followed here; `<svg>` is SVG either way (R19-8). Read on as HTML.
+    OpenRule::new(&[Top::AnnotationXml], TagIs::Lacks(SVG_ROOT), Closed::Any, Wrong::AnnotationXml, Stack::Continue),
+    // HTML content: `<svg>` and `<math>` nest (not when self-closed); browsers
+    // ignore `/>` on HTML elements, so only void elements stay closed.
+    OpenRule::new(HTML_CONTENT, TagIs::AnyOf(FOREIGN_ROOT), Closed::Yes, Wrong::None, Stack::Nothing),
+    OpenRule::new(HTML_CONTENT, TagIs::Has(SVG_ROOT), Closed::Any, Wrong::None, Stack::PushSvg),
+    OpenRule::new(HTML_CONTENT, TagIs::Has(MATH_ROOT), Closed::Any, Wrong::None, Stack::PushMath),
+    OpenRule::new(HTML_CONTENT, TagIs::Has(VOID), Closed::Any, Wrong::None, Stack::Nothing),
+    OpenRule::new(HTML_CONTENT, TagIs::Any, Closed::Any, Wrong::None, Stack::PushHtml),
+    // Foreign content: a breakout tag ends it for browsers (R19-8); it is refused,
+    // and read on as if it were in a `<foreignObject>`.
+    OpenRule::new(&[Top::Foreign], TagIs::Has(BREAKOUT | VOID), Closed::Any, Wrong::Breakout, Stack::Nothing),
+    OpenRule::new(&[Top::Foreign], TagIs::Has(BREAKOUT), Closed::Any, Wrong::Breakout, Stack::PushHtml),
+    // Other elements open in the namespace of their parent (`<path/>` opens nothing).
+    OpenRule::new(&[Top::Foreign], TagIs::Any, Closed::Yes, Wrong::None, Stack::Nothing),
+    OpenRule::new(&[Top::Foreign], TagIs::Any, Closed::No, Wrong::None, Stack::PushSameNs),
 ];
 
-/// The most elements followed inside SVG or MathML (see `HtmlTracker::open`).
-const MAX_OPEN: usize = 4096;
-
-/// HTML elements that stay open after their start tag in no browser.
-const VOID_TAGS: &[&str] = &[
-    "area", "base", "basefont", "bgsound", "br", "col", "embed", "frame", "hr", "image", "img", "input", "keygen",
-    "link", "meta", "param", "source", "track", "wbr",
+/// What an end tag does to the open elements (`open_end`). Columns: top,
+/// tag, self-closing (any), reported, done.
+const END_RULES: &[OpenRule] = &[
+    OpenRule::new(&[Top::None], TagIs::Any, Closed::Any, Wrong::None, Stack::Nothing),
+    // Browsers close an HTML element at its end tag; other end tags here (that
+    // browsers may or may not act on) leave it open, so a later `</svg>` is
+    // refused and read as if it closed (R19-8).
+    OpenRule::new(&[Top::Html], TagIs::TopName, Closed::Any, Wrong::None, Stack::Pop),
+    OpenRule::new(&[Top::Html], TagIs::AnyOf(FOREIGN_ROOT), Closed::Any, Wrong::IgnoredEnd, Stack::CloseForeignNamed),
+    OpenRule::new(&[Top::Html], TagIs::Any, Closed::Any, Wrong::None, Stack::Nothing),
+    // `</p>` and `</br>` directly in foreign content end it for browsers.
+    OpenRule::new(
+        &[Top::AnnotationXml, Top::Foreign],
+        TagIs::Named(&["p", "br"]),
+        Closed::Any,
+        Wrong::BreakoutEnd,
+        Stack::Nothing,
+    ),
+    // Browsers close the innermost SVG or MathML element of that name above the
+    // current HTML element (`</math>` in `<svg>` closes nothing; found by the
+    // 1.0.0 audit).
+    OpenRule::new(FOREIGN_TOPS, TagIs::ForeignOpenAbove, Closed::Any, Wrong::None, Stack::CloseForeignAbove),
+    // An HTML element of that name around it: browsers may close it, with the
+    // SVG or MathML inside it; refused, and read as if it closed.
+    OpenRule::new(FOREIGN_TOPS, TagIs::HtmlOpen, Closed::Any, Wrong::EndAround, Stack::CloseHtmlNamed),
+    OpenRule::new(FOREIGN_TOPS, TagIs::Any, Closed::Any, Wrong::None, Stack::Nothing),
 ];
 
-/// Raw-text elements that older browsers' `<select>` parsing ignores (its
-/// content is then read as markup), while this tracker and newer browsers
-/// read raw text (found by the 1.2 audit).
-const IGNORED_IN_SELECT: &[&str] = &["title", "style", "xmp", "iframe", "noembed", "noframes", "plaintext"];
+// ---------------------------------------------------------------------------
+// 5. Comments after a value
+// ---------------------------------------------------------------------------
 
 /// Text right after a value in a comment that would end it if the value ended
 /// with `--`, `--!` or `-`; and the starts of these (`""` too) that later
@@ -209,6 +1013,10 @@ pub struct LoopHead {
     head: u8,
     ends: bool,
 }
+
+// ---------------------------------------------------------------------------
+// 6. The JavaScript of a `<script>` (code, not a table)
+// ---------------------------------------------------------------------------
 
 /// Where inside a script's JavaScript the text has reached. Values are safe
 /// only where an expression goes: inside a string, template, comment or
@@ -648,6 +1456,10 @@ impl Reading {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 7. The tracker
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct HtmlTracker {
     state: State,
@@ -767,106 +1579,56 @@ impl Default for HtmlTracker {
     }
 }
 
-const URL_ATTRS: &[&str] = &[
-    "href",
-    "src",
-    "action",
-    "formaction",
-    "xlink:href",
-    "poster",
-    "data",
-    "cite",
-    "background",
-    "ping",
-    "srcset",
-    "manifest",
-    "codebase",
-    "longdesc",
-    "lowsrc",
-    "dynsrc",
-];
-
-/// SVG animation elements can set `href` to their `to`/`from`/`values`.
-const ANIMATION_TAGS: &[&str] = &["animate", "set", "animatemotion", "animatetransform"];
-
-fn is_url_attr(tag: &str, name: &str) -> bool {
-    URL_ATTRS.contains(&name)
-        || (ANIMATION_TAGS.contains(&tag) && matches!(name, "to" | "from" | "values" | "by" | "attributename"))
+/// Whether `tail` (literal text) ends where a value could complete the end
+/// tag of an element with `flag` (`HIDES_END`, or `NOSCRIPT` alone): after
+/// `<`, or `</` and the start of its name.
+fn hidden_end_tag_start_of(tail: &str, flag: Flags) -> bool {
+    if tail.ends_with('<') {
+        return true;
+    }
+    let lower = tail.to_ascii_lowercase();
+    let Some(at) = lower.rfind("</") else { return false };
+    let name = &lower[at + 2..];
+    name.bytes().all(|b| b.is_ascii_alphabetic()) && starts_element_with(name, flag)
 }
 
-/// Elements whose content is not parsed as markup, in HTML (not foreign) content.
-const RAW_TAGS: &[&str] =
-    &["script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "plaintext"];
-
-/// Elements a browser may read as raw text where this tracker reads markup:
-/// `RAW_TAGS`, and `<noscript>` (raw text when scripting is on).
-fn hides_end_tag(name: &str) -> bool {
-    name == "noscript" || RAW_TAGS.contains(&name)
-}
-
-/// Whether `tail` (literal text) ends where a value could complete such an
-/// element's end tag: after `<`, or `</` and the start of its name.
+/// Whether `tail` ends where a value could complete a hidden end tag.
 fn hidden_end_tag_start(tail: &str) -> bool {
-    if tail.ends_with('<') {
-        return true;
-    }
-    let lower = tail.to_ascii_lowercase();
-    let Some(at) = lower.rfind("</") else { return false };
-    let name = &lower[at + 2..];
-    name.bytes().all(|b| b.is_ascii_alphabetic())
-        && RAW_TAGS.iter().chain(std::iter::once(&"noscript")).any(|t| t.starts_with(name))
+    hidden_end_tag_start_of(tail, HIDES_END)
 }
 
-/// `hidden_end_tag_start` for `</noscript` alone: after `<`, or `</` and the
-/// start of `noscript`.
+/// `hidden_end_tag_start` for `</noscript` alone.
 fn hidden_noscript_start(tail: &str) -> bool {
-    if tail.ends_with('<') {
-        return true;
-    }
-    let lower = tail.to_ascii_lowercase();
-    let Some(at) = lower.rfind("</") else { return false };
-    let name = &lower[at + 2..];
-    name.bytes().all(|b| b.is_ascii_alphabetic()) && "noscript".starts_with(name)
+    hidden_end_tag_start_of(tail, NOSCRIPT)
 }
-
-/// Decides a URL from the literal text at its start. Browsers strip leading
-/// spaces and controls and decode character references, so `&` leaves it
-/// undecided (`&#106;avascript:` is `javascript:`).
-fn decide_url(prefix: &str) -> Option<UrlState> {
-    let mut scheme = String::new();
-    for c in prefix.chars() {
-        if c.is_ascii_whitespace() || c.is_control() {
-            continue;
-        }
-        match c {
-            '/' | '?' | '#' => return Some(UrlState::Safe),
-            ':' => {
-                let s = scheme.to_ascii_lowercase();
-                return Some(if matches!(s.as_str(), "javascript" | "vbscript" | "data") {
-                    UrlState::Script
-                } else {
-                    UrlState::Safe
-                });
-            }
-            '&' => return None,
-            c => scheme.push(c),
-        }
-    }
-    None
-}
-
-/// The start of a CDATA section (in SVG and MathML).
-const CDATA: &str = "<![CDATA[";
 
 fn is_delim(c: Option<&char>) -> bool {
     matches!(c, Some(c) if c.is_ascii_whitespace() || *c == '/' || *c == '>')
 }
 
-/// Whitespace as the HTML tokenizer reads it: tab, LF, FF, CR and space only
-/// (found by the 1.1 audit: U+3000 or U+00A0 between attributes was taken
-/// for a separator, while browsers read it as part of a name or value).
+/// Whitespace as the HTML tokenizer reads it: tab, LF, FF, CR and space only.
 fn html_space(c: char) -> bool {
     c.is_ascii_whitespace()
+}
+
+/// Whether `s` is at `i` in `chars`, in any ASCII case (compared in place).
+fn starts_ci(chars: &[char], i: usize, s: &str) -> bool {
+    let mut k = i;
+    for want in s.chars() {
+        match chars.get(k) {
+            Some(c) if c.eq_ignore_ascii_case(&want) => k += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether the rest of `chars` from `i` is shorter than `s` and begins it
+/// (any ASCII case, or exactly).
+fn rest_starts(chars: &[char], i: usize, s: &str, exact: bool) -> bool {
+    let left = chars.len() - i;
+    left < s.len()
+        && chars[i..].iter().zip(s.chars()).all(|(a, b)| if exact { *a == b } else { a.eq_ignore_ascii_case(&b) })
 }
 
 impl HtmlTracker {
@@ -905,55 +1667,53 @@ impl HtmlTracker {
             // function) as HTML (found by the 1.1.1 audit).
             State::Text if self.in_foreign() => EchoContext::ForeignText,
             State::Text => EchoContext::Text,
-            State::Raw { tag, js, .. } if tag == "script" => {
+            State::Raw { flags, js, .. } if flags & SCRIPT != 0 => {
                 if js.in_code() {
                     EchoContext::Script
                 } else {
                     EchoContext::ScriptLiteral
                 }
             }
-            State::Raw { tag, .. } if tag == "style" => EchoContext::Style,
+            State::Raw { flags, .. } if flags & STYLE != 0 => EchoContext::Style,
             // The text of `<textarea>`, `<title>`...: inserted markup ends it at
             // the element's end tag (`plaintext` has none).
-            State::Raw { tag, .. } => match RAW_TAGS.iter().find(|t| **t == tag && **t != "plaintext") {
+            State::Raw { tag, .. } => match raw_text_name(tag) {
                 Some(t) => EchoContext::RawText(t),
                 None => EchoContext::Text,
             },
             State::Tag { .. } | State::AttrName { .. } => EchoContext::Tag,
             State::BeforeValue { .. } | State::Unquoted { .. } => EchoContext::Unquoted,
-            State::Quoted { tag, name, .. }
-                if tag == "script" && matches!(name.as_str(), "src" | "href" | "xlink:href") =>
-            {
-                EchoContext::ScriptSrc
-            }
-            // A `<meta>` that describes the page (name, property, itemprop) may take any text;
-            // others, such as `http-equiv="refresh"`, act on their `content`.
-            State::Quoted { tag, name, .. }
-                if tag == "meta"
-                    && name == "content"
-                    && (self.attrs.iter().any(|a| a == "http-equiv")
-                        || self.maybe_undescribed
-                        || !self.described()) =>
-            {
-                EchoContext::MetaContent
-            }
-            State::Quoted { name, url, .. } => {
-                if name.starts_with("on") {
-                    EchoContext::Handler
-                } else if name == "style" {
-                    EchoContext::Style
-                } else if name == "srcdoc" {
-                    EchoContext::Srcdoc
-                } else {
-                    match url {
-                        // After a literal `&`, a value would continue a character
-                        // reference (`&` + `#x6a;avascript:`; found by the 1.0.0 audit).
-                        Some(UrlState::Undecided(ps)) if ps.iter().any(|p| p == "&") => EchoContext::UrlReference,
-                        Some(UrlState::Undecided(_)) => EchoContext::Url,
-                        Some(UrlState::Script) => EchoContext::ScriptUrl,
-                        _ => EchoContext::Attr,
-                    }
-                }
+            State::Quoted { tag, name, url, .. } => self.quoted_context(tag, name, url.as_ref()),
+        }
+    }
+
+    /// The context of a quoted attribute value, by the attribute tables.
+    fn quoted_context(&self, tag: &str, name: &str, url: Option<&UrlState>) -> EchoContext {
+        if has(tag, SCRIPT) && SCRIPT_SRC_ATTRS.contains(&name) {
+            return EchoContext::ScriptSrc;
+        }
+        // A `<meta>` that describes the page (name, property, itemprop) may take any text;
+        // others, such as `http-equiv="refresh"`, act on their `content`.
+        if has(tag, META)
+            && name == "content"
+            && (self.attrs.iter().any(|a| a == "http-equiv") || self.maybe_undescribed || !self.described())
+        {
+            return EchoContext::MetaContent;
+        }
+        if name.starts_with("on") {
+            EchoContext::Handler
+        } else if name == "style" {
+            EchoContext::Style
+        } else if name == "srcdoc" {
+            EchoContext::Srcdoc
+        } else {
+            match url {
+                // After a literal `&`, a value would continue a character
+                // reference (`&` + `#x6a;avascript:`; found by the 1.0.0 audit).
+                Some(UrlState::Undecided(ps)) if ps.iter().any(|p| p == "&") => EchoContext::UrlReference,
+                Some(UrlState::Undecided(_)) => EchoContext::Url,
+                Some(UrlState::Script) => EchoContext::ScriptUrl,
+                _ => EchoContext::Attr,
             }
         }
     }
@@ -970,11 +1730,11 @@ impl HtmlTracker {
     pub fn inserted(&mut self) {
         if self.context() == EchoContext::Attr {
             if let State::Quoted { tag, name, .. } = &self.state {
-                self.meta_text |= tag == "meta" && name == "content";
+                self.meta_text |= has(tag, META) && name == "content";
             }
         }
-        if let State::Raw { tag, js, .. } = &mut self.state {
-            if tag == "script" {
+        if let State::Raw { flags, js, .. } = &mut self.state {
+            if *flags & SCRIPT != 0 {
                 js.inserted();
             }
         }
@@ -1024,10 +1784,6 @@ impl HtmlTracker {
         self.after_comment_value
     }
 
-    /// True between elements of an HTML document: not inside a tag, comment,
-    /// raw-text element or foreign content. A template must end here, so that
-    /// joining its output with other `Html` values cannot move them into
-    /// another context.
     /// Whether the output is at exactly the same place as at `other`, with
     /// the same attributes of the current tag.
     pub fn same_place(&self, other: &HtmlTracker) -> bool {
@@ -1057,9 +1813,13 @@ impl HtmlTracker {
 
     /// The current tag has `name`, `property` or `itemprop` (a `<meta>` that describes the page).
     fn described(&self) -> bool {
-        self.attrs.iter().any(|a| matches!(a.as_str(), "name" | "property" | "itemprop"))
+        self.attrs.iter().any(|a| DESCRIBING_ATTRS.contains(&a.as_str()))
     }
 
+    /// True between elements of an HTML document: not inside a tag, comment,
+    /// raw-text element or foreign content. A template must end here, so that
+    /// joining its output with other `Html` values cannot move them into
+    /// another context.
     pub fn at_top_level(&self) -> bool {
         self.state == State::Text && self.pending.is_none() && !self.in_foreign() && self.carry.is_empty()
     }
@@ -1114,7 +1874,7 @@ impl HtmlTracker {
                 same
             }
             // A script continues after the block in every way it may have been read.
-            (State::Raw { tag: t1, escape: e1, js: j1 }, State::Raw { tag: t2, escape: e2, js: j2 }) => {
+            (State::Raw { tag: t1, escape: e1, js: j1, .. }, State::Raw { tag: t2, escape: e2, js: j2, .. }) => {
                 let same = t1 == t2 && e1 == e2 && j1.same_shape(j2);
                 if same {
                     j1.merge(j2);
@@ -1188,150 +1948,174 @@ impl HtmlTracker {
     /// what a template or function writes is checked as it is written (see
     /// `EchoContext::ForeignText`).
     fn hides(&self, in_comment_or_value: bool, in_text: bool, name: &str) -> bool {
-        (in_comment_or_value && self.out_of_step_possible() && hides_end_tag(name)) || (!in_text && name == "noscript")
+        (in_comment_or_value && self.out_of_step_possible() && has(name, HIDES_END))
+            || (!in_text && has(name, NOSCRIPT))
     }
 
-    fn end_tag(&mut self, tag: String, closing: bool, self_closing: bool) {
-        if std::mem::take(&mut self.meta_text) && tag == "meta" && self.attrs.iter().any(|a| a == "http-equiv") {
+    /// The `>` of a tag: what the tag does, in order.
+    fn close_tag(&mut self, tag: String, closing: bool, self_closing: bool) {
+        // 1. A `<meta>` whose `content` took a value as text may not have `http-equiv` (found by the 1.0 audit).
+        if std::mem::take(&mut self.meta_text) && has(&tag, META) && self.attrs.iter().any(|a| a == "http-equiv") {
             self.found.push((self.here, InlineCode::MetaHttpEquiv));
         }
+        // 2. The open elements of foreign content (`START_RULES`, `END_RULES`).
         if closing {
-            self.foreign_end(&tag);
+            self.open_end(&tag);
         } else {
-            self.foreign_start(&tag, self_closing);
+            self.open_start(&tag, self_closing);
         }
-        // Browsers ignore `/>` on HTML elements: `<noscript/>` opens one.
-        if !self.in_foreign() && tag == "noscript" {
+        // 3. `<noscript>` depth, outside foreign content. Browsers ignore `/>` on
+        //    HTML elements: `<noscript/>` opens one.
+        if !self.in_foreign() && has(&tag, NOSCRIPT) {
             if closing {
                 self.noscript = self.noscript.saturating_sub(1);
             } else {
                 self.noscript += 1;
             }
         }
-        if tag == "select" {
+        // 4. `<select>`, and the raw-text elements it hides from older parsers (R19-26).
+        if has(&tag, SELECT) {
             self.select = !closing;
-        } else if self.select && !closing && IGNORED_IN_SELECT.contains(&tag.as_str()) {
+        } else if self.select && !closing && has(&tag, IGNORED_IN_SELECT) {
             self.found.push((self.here, InlineCode::RawTextInSelect(tag.clone())));
         }
-        let raw = if self.in_foreign() { tag == "script" || tag == "style" } else { RAW_TAGS.contains(&tag.as_str()) };
-        self.state = if !closing && raw { State::Raw { tag, escape: 0, js: Js::default() } } else { State::Text };
+        // 5. A raw-text element's start tag opens its text (`RAW` in HTML content,
+        //    `RAW_IN_FOREIGN` inside SVG or MathML); anything else returns to text.
+        let flags = flags(&tag);
+        let raw = flags & if self.in_foreign() { RAW_IN_FOREIGN } else { RAW } != 0;
+        self.state =
+            if !closing && raw { State::Raw { tag, flags, escape: 0, js: Js::default() } } else { State::Text };
     }
 
-    fn foreign_error(&mut self, msg: String) {
+    fn report(&mut self, wrong: Wrong, tag: &str, top: Option<&Open>) {
+        let msg = match wrong {
+            Wrong::None => return,
+            Wrong::AnnotationXml => format!(
+                "the element `<{tag}>` inside MathML `<annotation-xml>`, which browsers read as HTML or as \
+                 MathML depending on its `encoding`"
+            ),
+            Wrong::Breakout => format!(
+                "the HTML element `<{tag}>` directly inside `<svg>` or `<math>`, where browsers end the SVG or \
+                 MathML before it"
+            ),
+            Wrong::IgnoredEnd => format!(
+                "`</{tag}>` while the HTML element `<{}>` opened inside SVG or MathML is still open, where \
+                 browsers ignore it",
+                top.map_or("", |t| t.name.as_str())
+            ),
+            Wrong::BreakoutEnd => {
+                format!(
+                    "`</{tag}>` directly inside `<svg>` or `<math>`, where browsers end the SVG or MathML before it"
+                )
+            }
+            Wrong::EndAround => format!(
+                "`</{tag}>` inside SVG or MathML that an HTML element `<{tag}>` around it is open for, where \
+                 browsers may close that element and the SVG or MathML inside it"
+            ),
+        };
         self.found.push((self.here, InlineCode::ForeignStructure(msg)));
     }
 
-    /// A start tag, in `open` (see there).
-    fn foreign_start(&mut self, tag: &str, self_closing: bool) {
-        let Some(top) = self.open.last().cloned() else {
-            if !self_closing && matches!(tag, "svg" | "math") {
-                let ns = if tag == "svg" { Ns::Svg } else { Ns::Math };
-                self.open.push(Open { name: tag.to_string(), ns });
-            }
-            return;
-        };
-        // Blocks copy and compare the open elements: their number is bounded
-        // (far above what SVG uses; unclosed elements such as `<path>` without
-        // `/>` nest).
-        if self.open.len() >= MAX_OPEN {
-            if !std::mem::replace(&mut self.too_deep, true) {
-                self.foreign_error(format!(
-                    "more than {MAX_OPEN} elements open inside `<svg>` or `<math>` (close them, e.g. `<path ... />`)"
-                ));
-            }
-            return;
-        }
-        // Whether browsers read the tag as HTML here (in an integration point).
-        let html = if top.ns == Ns::Html || top.html_point() {
-            true
-        } else if top.text_point() {
-            !matches!(tag, "mglyph" | "malignmark")
-        } else if top.ns == Ns::Math && top.name == "annotation-xml" {
-            // Its content is HTML or MathML depending on its `encoding`, which
-            // is not followed here; `<svg>` is SVG either way.
-            if tag != "svg" {
-                self.foreign_error(format!(
-                    "the element `<{tag}>` inside MathML `<annotation-xml>`, which browsers read as HTML or as \
-                     MathML depending on its `encoding`"
-                ));
-            }
-            true
-        } else {
-            false
-        };
-        let ns = top.ns;
-        if html {
-            match tag {
-                "svg" | "math" if self_closing => {}
-                "svg" => self.open.push(Open { name: tag.to_string(), ns: Ns::Svg }),
-                "math" => self.open.push(Open { name: tag.to_string(), ns: Ns::Math }),
-                // Browsers ignore `/>` on HTML elements.
-                t if VOID_TAGS.contains(&t) => {}
-                _ => self.open.push(Open { name: tag.to_string(), ns: Ns::Html }),
-            }
-        } else if BREAKOUT_TAGS.contains(&tag) {
-            self.foreign_error(format!(
-                "the HTML element `<{tag}>` directly inside `<svg>` or `<math>`, where browsers end the SVG or \
-                 MathML before it"
-            ));
-            // Read on as if it were in a `<foreignObject>` (the template is refused anyway).
-            if !VOID_TAGS.contains(&tag) {
-                self.open.push(Open { name: tag.to_string(), ns: Ns::Html });
-            }
-        } else if !self_closing {
-            self.open.push(Open { name: tag.to_string(), ns });
+    /// Whether `tag` is in the class, for the open elements as they are.
+    fn tag_is(&self, class: TagIs, tag: &str) -> bool {
+        match class {
+            TagIs::Any => true,
+            TagIs::Has(mask) => has(tag, mask),
+            TagIs::AnyOf(mask) => flags(tag) & mask != 0,
+            TagIs::Lacks(mask) => flags(tag) & mask == 0,
+            TagIs::Named(names) => names.contains(&tag),
+            TagIs::TopName => self.open.last().is_some_and(|t| t.name == tag),
+            TagIs::ForeignOpenAbove => self.open.iter().rev().take_while(|n| n.ns != Ns::Html).any(|n| n.name == tag),
+            TagIs::HtmlOpen => self.open.iter().any(|n| n.ns == Ns::Html && n.name == tag),
         }
     }
 
-    /// An end tag, in `open` (see there).
-    fn foreign_end(&mut self, tag: &str) {
-        let Some(top) = self.open.last().cloned() else { return };
-        if top.ns == Ns::Html {
-            // Browsers close an HTML element at its end tag; other end tags
-            // here (that browsers may or may not act on) leave it open, so a
-            // later `</svg>` is refused.
-            if top.name == tag {
-                self.open.pop();
-            } else if matches!(tag, "svg" | "math") {
-                self.foreign_error(format!(
-                    "`</{tag}>` while the HTML element `<{}>` opened inside SVG or MathML is still open, where \
-                     browsers ignore it",
-                    top.name
+    /// A start tag, in `open`: the first row of `START_RULES` that applies.
+    fn open_start(&mut self, tag: &str, self_closing: bool) {
+        let top = self.open.last().cloned();
+        // Blocks copy and compare the open elements: their number is bounded
+        // (far above what SVG uses; unclosed elements such as `<path>` without
+        // `/>` nest).
+        if top.is_some() && self.open.len() >= MAX_OPEN {
+            if !std::mem::replace(&mut self.too_deep, true) {
+                self.found.push((
+                    self.here,
+                    InlineCode::ForeignStructure(format!(
+                        "more than {MAX_OPEN} elements open inside `<svg>` or `<math>` (close them, e.g. `<path ... />`)"
+                    )),
                 ));
-                // Read on as if it closed (the template is refused anyway).
-                if let Some(at) = self.open.iter().rposition(|n| n.ns != Ns::Html && n.name == tag) {
-                    self.open.truncate(at);
+            }
+            return;
+        }
+        let kind = top.as_ref().map_or(Top::None, Open::top);
+        for rule in START_RULES {
+            if !rule.top.contains(&kind)
+                || !self.tag_is(rule.tag, tag)
+                || (rule.self_closing == Closed::Yes && !self_closing)
+                || (rule.self_closing == Closed::No && self_closing)
+            {
+                continue;
+            }
+            self.report(rule.wrong, tag, top.as_ref());
+            let ns = match rule.then {
+                Stack::Continue => continue,
+                Stack::Nothing => return,
+                Stack::PushRoot => {
+                    if has(tag, SVG_ROOT) {
+                        Ns::Svg
+                    } else {
+                        Ns::Math
+                    }
                 }
-            }
+                Stack::PushSvg => Ns::Svg,
+                Stack::PushMath => Ns::Math,
+                Stack::PushHtml => Ns::Html,
+                Stack::PushSameNs => top.as_ref().map_or(Ns::Html, |t| t.ns),
+                Stack::Pop | Stack::CloseForeignNamed | Stack::CloseForeignAbove | Stack::CloseHtmlNamed => return,
+            };
+            self.open.push(Open { name: tag.to_string(), ns });
             return;
         }
-        if matches!(tag, "p" | "br") && !top.html_point() && !top.text_point() {
-            self.foreign_error(format!(
-                "`</{tag}>` directly inside `<svg>` or `<math>`, where browsers end the SVG or MathML before it"
-            ));
+    }
+
+    /// An end tag, in `open`: the first row of `END_RULES` that applies.
+    fn open_end(&mut self, tag: &str) {
+        let top = self.open.last().cloned();
+        let kind = top.as_ref().map_or(Top::None, Open::top);
+        for rule in END_RULES {
+            if !rule.top.contains(&kind) || !self.tag_is(rule.tag, tag) {
+                continue;
+            }
+            self.report(rule.wrong, tag, top.as_ref());
+            match rule.then {
+                Stack::Continue => continue,
+                Stack::Pop => {
+                    self.open.pop();
+                }
+                Stack::CloseForeignNamed => {
+                    if let Some(at) = self.open.iter().rposition(|n| n.ns != Ns::Html && n.name == tag) {
+                        self.open.truncate(at);
+                    }
+                }
+                Stack::CloseForeignAbove => {
+                    let above = self.open.iter().rev().take_while(|n| n.ns != Ns::Html).count();
+                    if let Some(k) = self.open[self.open.len() - above..].iter().rposition(|n| n.name == tag) {
+                        self.open.truncate(self.open.len() - above + k);
+                    }
+                }
+                Stack::CloseHtmlNamed => {
+                    if let Some(at) = self.open.iter().rposition(|n| n.ns == Ns::Html && n.name == tag) {
+                        self.open.truncate(at);
+                    }
+                }
+                Stack::Nothing
+                | Stack::PushRoot
+                | Stack::PushSvg
+                | Stack::PushMath
+                | Stack::PushHtml
+                | Stack::PushSameNs => {}
+            }
             return;
-        }
-        // Browsers close the innermost SVG or MathML element of that name
-        // above the current HTML element (`</math>` in `<svg>` closes nothing;
-        // found by the 1.0.0 audit).
-        for at in (0..self.open.len()).rev() {
-            if self.open[at].ns == Ns::Html {
-                break;
-            }
-            if self.open[at].name == tag {
-                self.open.truncate(at);
-                return;
-            }
-        }
-        // An HTML element of that name around it: browsers may close it, with
-        // the SVG or MathML inside it.
-        if let Some(at) = self.open.iter().rposition(|n| n.ns == Ns::Html && n.name == tag) {
-            self.foreign_error(format!(
-                "`</{tag}>` inside SVG or MathML that an HTML element `<{tag}>` around it is open for, where \
-                 browsers may close that element and the SVG or MathML inside it"
-            ));
-            // Read on as if it closed (the template is refused anyway).
-            self.open.truncate(at);
         }
     }
 
@@ -1396,392 +2180,295 @@ impl HtmlTracker {
         scripts.into_iter().map(|s| s.saturating_sub(shift)).collect()
     }
 
+    /// The current context (`RULES` is indexed by it).
+    fn ctx(&self) -> Ctx {
+        if self.pending.is_some() {
+            Ctx::TagName
+        } else {
+            self.state.ctx()
+        }
+    }
+
+    /// Whether `on` matches at `i`: the number of characters it covers.
+    fn matched(&self, on: On, chars: &[char], i: usize) -> Option<usize> {
+        let c = chars[i];
+        match on {
+            On::Any => Some(1),
+            On::Is(want) => (c == want).then_some(1),
+            On::Not(want) => (c != want).then_some(1),
+            On::In(class) => class.has(c).then_some(1),
+            On::Lit(s) => starts_ci(chars, i, s).then_some(s.len()),
+            On::Exact(s) => chars[i..].iter().copied().take(s.len()).eq(s.chars()).then_some(s.len()),
+            On::TheQuote => match &self.state {
+                State::Quoted { quote, .. } if *quote == c => Some(1),
+                _ => None,
+            },
+            On::EndTag => {
+                let State::Raw { tag, .. } = &self.state else { return None };
+                let n = 2 + tag.len();
+                (c == '<'
+                    && chars.get(i + 1) == Some(&'/')
+                    && starts_ci(chars, i + 2, tag)
+                    && is_delim(chars.get(i + n)))
+                .then_some(n)
+            }
+            On::RestStarts(s) => rest_starts(chars, i, s, false).then_some(chars.len() - i),
+            On::RestStartsExact(s) => rest_starts(chars, i, s, true).then_some(chars.len() - i),
+            On::RestStartsEndTag => {
+                let State::Raw { tag, .. } = &self.state else { return None };
+                let left = chars.len() - i;
+                (c == '<'
+                    && left <= 2 + tag.len()
+                    && chars[i..].iter().zip("</".chars().chain(tag.chars())).all(|(a, b)| a.eq_ignore_ascii_case(&b)))
+                .then_some(left)
+            }
+        }
+    }
+
+    /// Whether `when` holds for a match of `len` characters at `i`.
+    fn holds(&self, when: When, chars: &[char], i: usize, len: usize) -> bool {
+        let (escape, script) = match &self.state {
+            State::Raw { flags, escape, .. } => (*escape, *flags & SCRIPT != 0),
+            _ => (0, false),
+        };
+        match when {
+            When::AtEnd => i + len == chars.len(),
+            When::Next(class) => chars.get(i + len).is_some_and(|c| class.has(*c)),
+            When::DelimAfter => is_delim(chars.get(i + len)),
+            When::SpacesThenEq => chars.get(spaces_end(chars, i)) == Some(&'='),
+            When::DashesThenGt => chars.get(dashes_end(chars, i + len)) == Some(&'>'),
+            When::InForeign => self.in_foreign(),
+            When::Script => script,
+            When::NotScript => !script,
+            When::Escape(n) => escape == n,
+            When::Escaped => escape > 0,
+            When::Brackets(n) => matches!(self.state, State::Cdata { brackets } if brackets == n),
+        }
+    }
+
+    /// Does what a rule says at `i`.
+    fn apply(
+        &mut self,
+        then: Then,
+        i: usize,
+        chars: &[char],
+        offset: usize,
+        scripts: &mut Vec<usize>,
+        comment_open: &mut Option<usize>,
+    ) {
+        let c = chars[i];
+        match then {
+            Then::Stay => {}
+            Then::Text => self.state = State::Text,
+            Then::Comment => {
+                *comment_open = Some(i);
+                self.state = State::Comment;
+            }
+            Then::Bogus => self.state = State::Bogus,
+            Then::Cdata => self.state = State::Cdata { brackets: 0 },
+            Then::TagName(prefix) => self.pending = Some(prefix.to_string()),
+            Then::Carry => self.carry = chars[i..].iter().collect(),
+            Then::NamePush => {
+                if let Some(name) = &mut self.pending {
+                    name.push(c.to_ascii_lowercase());
+                } else if let State::AttrName { name, .. } = &mut self.state {
+                    name.push(c.to_ascii_lowercase());
+                }
+            }
+            Then::NameEnd => {
+                let raw = self.pending.take().unwrap_or_default();
+                let (closing, tag) = match raw.strip_prefix('/') {
+                    Some(t) => (true, t.to_string()),
+                    None => (false, raw),
+                };
+                if !closing && has(&tag, SCRIPT) {
+                    scripts.push(offset);
+                }
+                self.attrs.clear();
+                self.meta_text = false;
+                self.maybe_undescribed = false;
+                self.state = State::Tag { name: tag, closing };
+            }
+            Then::Close(sc) => {
+                let self_closing = match sc {
+                    SelfClosing::IfSlashBefore => i > 0 && chars[i - 1] == '/',
+                    SelfClosing::Never => false,
+                };
+                let (tag, closing) = std::mem::replace(&mut self.state, State::Text).take_tag();
+                self.close_tag(tag, closing, self_closing);
+            }
+            Then::AttrName => {
+                self.mark = Some(offset);
+                let (tag, closing) = std::mem::replace(&mut self.state, State::Text).take_tag();
+                self.state = State::AttrName { tag, closing, name: c.to_ascii_lowercase().to_string() };
+            }
+            Then::AttrValue => {
+                if let State::AttrName { tag, closing, name } = std::mem::replace(&mut self.state, State::Text) {
+                    // Event handler names are letters only (`onclick`, not `onclick-free`).
+                    let handler =
+                        name.len() > 2 && name.starts_with("on") && name.bytes().all(|b| b.is_ascii_lowercase());
+                    if handler && !closing {
+                        self.found.push((self.mark.unwrap_or(self.here), InlineCode::Handler(name.clone())));
+                    }
+                    self.attrs.push(name.clone());
+                    self.state = State::BeforeValue { tag, closing, name };
+                }
+            }
+            Then::AttrDone => {
+                if let State::AttrName { tag, closing, name } = std::mem::replace(&mut self.state, State::Text) {
+                    self.attrs.push(name);
+                    self.state = State::Tag { name: tag, closing };
+                }
+            }
+            Then::ToTag => {
+                let (tag, closing) = std::mem::replace(&mut self.state, State::Text).take_tag();
+                self.state = State::Tag { name: tag, closing };
+            }
+            Then::Quoted => {
+                if let State::BeforeValue { tag, closing, name } = std::mem::replace(&mut self.state, State::Text) {
+                    let url = is_url_attr(&tag, &name).then(|| UrlState::Undecided(vec![String::new()]));
+                    self.mark = Some(offset);
+                    self.state = State::Quoted { tag, closing, name, quote: c, url };
+                }
+            }
+            Then::Unquoted => {
+                if let State::BeforeValue { tag, closing, name } = std::mem::replace(&mut self.state, State::Text) {
+                    self.state = State::Unquoted { tag, closing, name };
+                }
+            }
+            Then::UrlChar => self.url_char(c),
+            Then::Escape(n) => {
+                if let State::Raw { escape, .. } = &mut self.state {
+                    *escape = n;
+                }
+            }
+            Then::CloseRaw => {
+                if let State::Raw { tag, .. } = std::mem::replace(&mut self.state, State::Text) {
+                    self.state = State::Tag { name: tag, closing: true };
+                }
+            }
+            Then::ForeignMarkup => self.found.push((offset, InlineCode::ForeignCdata)),
+            Then::Bracket => {
+                if let State::Cdata { brackets } = &mut self.state {
+                    *brackets = (*brackets + 1).min(2);
+                }
+            }
+            Then::Brackets0 => self.state = State::Cdata { brackets: 0 },
+            Then::CdataEnd => {
+                self.found.push((offset, InlineCode::CdataEnd));
+                self.state = State::Text;
+            }
+        }
+    }
+
+    /// A character of a quoted attribute value: what it does to the URL's
+    /// start (the strictest of the ways the text may have begun).
+    fn url_char(&mut self, c: char) {
+        let at = self.mark.unwrap_or(self.here);
+        let mut inline = false;
+        if let State::Quoted { tag, name, url, .. } = &mut self.state {
+            if let Some(UrlState::Undecided(ps)) = url {
+                let mut script = false;
+                ps.retain_mut(|p| {
+                    // Browsers ignore whitespace and case in a scheme.
+                    if !c.is_ascii_whitespace() && !c.is_control() && p.len() < MAX_URL_PREFIX {
+                        p.push(c.to_ascii_lowercase());
+                    }
+                    match decide_url(p) {
+                        Some(UrlState::Script) => {
+                            // `data:` is fine for images; only script URLs are inline code.
+                            let scheme: String = p
+                                .chars()
+                                .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
+                                .collect::<String>()
+                                .to_ascii_lowercase();
+                            if scheme.starts_with("javascript:") || scheme.starts_with("vbscript:") {
+                                inline = true;
+                            }
+                            script = true;
+                            false
+                        }
+                        Some(_) => false,
+                        // Text that can no longer become a script scheme is a safe start;
+                        // a character reference (`&`) may be anything.
+                        None => p.contains('&') || may_become_script_scheme(p),
+                    }
+                });
+                for p in ps.iter_mut().filter(|p| p.contains('&')) {
+                    *p = "&".into();
+                }
+                ps.sort();
+                ps.dedup();
+                if script {
+                    *url = Some(UrlState::Script);
+                } else if ps.is_empty() {
+                    *url = Some(UrlState::Safe);
+                }
+            }
+            // A list of URLs (`URL_LISTS`): after the separator, a URL starts again.
+            let next_url = URL_LISTS.iter().any(|(attr, sep, needs)| name == attr && c == *sep && has(tag, *needs));
+            if next_url && !matches!(url, Some(UrlState::Script)) {
+                *url = Some(UrlState::Undecided(vec![String::new()]));
+            }
+        }
+        if inline {
+            self.found.push((at, InlineCode::ScriptUrl));
+        }
+    }
+
+    /// The interpreter of `RULES` over one piece of literal text.
     fn feed_text(&mut self, text: &str) -> Vec<usize> {
         self.check_across_pieces(text);
         let chars: Vec<char> = text.chars().collect();
         let offsets: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
-        // Whether `s` is at `i`, in any ASCII case (compared in place).
-        let starts = |i: usize, s: &str| -> bool {
-            let mut k = i;
-            for want in s.chars() {
-                match chars.get(k) {
-                    Some(c) if c.eq_ignore_ascii_case(&want) => k += 1,
-                    _ => return false,
-                }
-            }
-            true
-        };
         let mut scripts = Vec::new();
         let mut i = 0;
         // Where the last comment opened in this text began (its `<!--`).
         let mut comment_open = None;
         self.mark = None;
         while i < chars.len() {
-            let c = chars[i];
             self.here = offsets[i];
-            if let Some(name) = &mut self.pending {
-                // A tag name goes on as browsers read it, up to HTML whitespace,
-                // `/` or `>` (found by the 1.1 audit: `<div\u{3000}title="` ended
-                // the name here, while browsers read on).
-                if !html_space(c) && c != '/' && c != '>' {
-                    name.push(c.to_ascii_lowercase());
-                    i += 1;
-                    continue;
-                }
-                let raw = std::mem::take(name);
-                self.pending = None;
-                let (closing, tag) = match raw.strip_prefix('/') {
-                    Some(t) => (true, t.to_string()),
-                    None => (false, raw),
-                };
-                if !closing && tag == "script" {
-                    scripts.push(offsets[i]);
-                }
-                self.attrs.clear();
-                self.meta_text = false;
-                self.maybe_undescribed = false;
-                self.state = State::Tag { name: tag, closing };
-                continue;
-            }
-            let state = std::mem::replace(&mut self.state, State::Text);
-            let (from, in_script) = (i, matches!(&state, State::Raw { tag, .. } if tag == "script"));
-            let in_comment_or_value = matches!(
-                state,
-                State::Comment | State::Bogus | State::Cdata { .. } | State::Quoted { .. } | State::Unquoted { .. }
-            );
-            if c == '<' && chars.get(i + 1) == Some(&'/') {
+            let ctx = self.ctx();
+            // An end tag hidden from this tracker (`hides`), in any context but a tag name.
+            if ctx != Ctx::TagName && chars[i] == '<' && chars.get(i + 1) == Some(&'/') {
                 let name: String = chars[i + 2..]
                     .iter()
                     .take_while(|c| c.is_ascii_alphabetic())
                     .map(|c| c.to_ascii_lowercase())
                     .collect();
-                let in_text = matches!(state, State::Text);
-                if is_delim(chars.get(i + 2 + name.len())) && self.hides(in_comment_or_value, in_text, &name) {
+                let in_text = matches!(self.state, State::Text);
+                if is_delim(chars.get(i + 2 + name.len())) && self.hides(self.in_comment_or_value(), in_text, &name) {
                     self.found.push((offsets[i], InlineCode::HiddenEndTag));
                 }
             }
-            self.state = match state {
-                State::Text => {
-                    if c != '<' {
-                        State::Text
-                    } else if starts(i, "<!--") {
-                        // `<!-->` and `<!--->` are complete (empty) comments.
-                        if chars.get(i + 4) == Some(&'>') {
-                            i += 4;
-                            State::Text
-                        } else if starts(i + 4, "->") {
-                            i += 5;
-                            State::Text
-                        } else {
-                            comment_open = Some(i);
-                            i += 3;
-                            State::Comment
-                        }
-                    } else {
-                        match chars.get(i + 1) {
-                            None => {
-                                self.carry = "<".into();
-                                State::Text
-                            }
-                            Some(n) if n.is_ascii_alphabetic() => {
-                                self.pending = Some(String::new());
-                                State::Text
-                            }
-                            Some('/') if i + 2 == chars.len() => {
-                                self.carry = "</".into();
-                                i += 1;
-                                State::Text
-                            }
-                            // `<!` or `<!-` at the end: a value or block could make a comment.
-                            Some('!')
-                                if chars.len() - i < 4
-                                    && "<!--".starts_with(&chars[i..].iter().collect::<String>()) =>
-                            {
-                                self.carry = chars[i..].iter().collect();
-                                i = chars.len() - 1;
-                                State::Text
-                            }
-                            // In SVG and MathML, `<![CDATA[` (in this case only)
-                            // starts a CDATA section (found by the 1.2 audit), so
-                            // its start is read again with what follows too.
-                            Some('!')
-                                if self.in_foreign()
-                                    && chars.len() - i < CDATA.len()
-                                    && CDATA.starts_with(&chars[i..].iter().collect::<String>()) =>
-                            {
-                                self.carry = chars[i..].iter().collect();
-                                i = chars.len() - 1;
-                                State::Text
-                            }
-                            Some('!')
-                                if self.in_foreign()
-                                    && chars[i..].iter().copied().take(CDATA.len()).eq(CDATA.chars()) =>
-                            {
-                                i += CDATA.len() - 1;
-                                State::Cdata { brackets: 0 }
-                            }
-                            Some('/') => match chars.get(i + 2) {
-                                Some(n) if n.is_ascii_alphabetic() => {
-                                    self.pending = Some("/".into());
-                                    i += 1;
-                                    State::Text
-                                }
-                                Some('>') => {
-                                    i += 2;
-                                    State::Text
-                                }
-                                _ => {
-                                    i += 1;
-                                    State::Bogus
-                                }
-                            },
-                            Some('!') | Some('?') => State::Bogus,
-                            _ => State::Text,
-                        }
-                    }
+            let in_script = matches!(&self.state, State::Raw { flags, .. } if flags & SCRIPT != 0);
+            let mut read = 1;
+            for rule in rules(ctx) {
+                let Some(len) = self.matched(rule.on, &chars, i) else { continue };
+                if !rule.when.iter().all(|w| self.holds(*w, &chars, i, len)) {
+                    continue;
                 }
-                State::Comment => {
-                    if starts(i, "-->") {
-                        i += 2;
-                        State::Text
-                    } else if starts(i, "--!>") {
-                        i += 3;
-                        State::Text
-                    } else {
-                        State::Comment
-                    }
-                }
-                State::Bogus => {
-                    if c == '>' {
-                        State::Text
-                    } else {
-                        State::Bogus
-                    }
-                }
-                State::Cdata { brackets } => match c {
-                    ']' => State::Cdata { brackets: (brackets + 1).min(2) },
-                    '>' if brackets == 2 => State::Text,
-                    '>' => {
-                        self.found.push((offsets[i], InlineCode::CdataEnd));
-                        State::Text
-                    }
-                    _ => State::Cdata { brackets: 0 },
-                },
-                State::Raw { tag, escape, js } => {
-                    // The end tag, looked for only at a `<`.
-                    let end = if c == '<' { format!("</{tag}") } else { String::new() };
-                    let n = end.len();
-                    // The rest of the text matters only when it is shorter than what
-                    // it could be the start of (found by the 1.0.0 review: it was
-                    // copied at every character, quadratic in the element's length).
-                    let left = chars.len() - i;
-                    let short = left <= n.max("<script".len());
-                    let rest: String =
-                        if short { chars[i..].iter().collect::<String>().to_ascii_lowercase() } else { String::new() };
-                    // In a script, the starts of `<!--`, `<script` and `-->` too: they change
-                    // its escape state.
-                    let partial = |s: &str| short && rest.len() < s.len() && s.starts_with(&rest);
-                    let script_start = tag == "script"
-                        && ((escape == 0 && partial("<!--"))
-                            || (escape == 1 && partial("<script"))
-                            || (escape > 0 && (partial("-->") || rest == "-")));
-                    if script_start || (c == '<' && short && rest.len() <= n && end.starts_with(&rest)) {
-                        // `</tex` + a value or block: it might end the element.
-                        self.carry = chars[i..].iter().collect();
-                        i = chars.len() - 1;
-                        State::Raw { tag, escape, js }
-                    } else if c == '<' && starts(i, &end) && is_delim(chars.get(i + n)) {
-                        if tag == "script" && escape == 2 {
-                            i += n - 1;
-                            State::Raw { tag, escape: 1, js }
-                        } else {
-                            i += n - 1;
-                            State::Tag { name: tag, closing: true }
-                        }
-                    } else if self.in_foreign()
-                        && c == '<'
-                        && chars.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '!' | '/' | '?'))
-                    {
-                        // In SVG and MathML a script's text is markup: a tag, comment,
-                        // CDATA section or bogus comment can hide its end tag from
-                        // browsers but not from here (found by the 1.0 audit for CDATA
-                        // and comments, by the 1.0.0 one for tags and bogus comments).
-                        self.found.push((offsets[i], InlineCode::ForeignCdata));
-                        State::Raw { tag, escape, js }
-                    } else if tag != "script" {
-                        State::Raw { tag, escape, js }
-                    } else if escape == 0 && starts(i, "<!--") {
-                        // `<!-->` and `<!--->` return to script data at once.
-                        let mut j = i + 4;
-                        while chars.get(j) == Some(&'-') {
-                            j += 1;
-                        }
-                        if chars.get(j) == Some(&'>') {
-                            i = j;
-                            State::Raw { tag, escape: 0, js }
-                        } else {
-                            i += 3;
-                            State::Raw { tag, escape: 1, js }
-                        }
-                    } else if escape > 0 && starts(i, "-->") {
-                        i += 2;
-                        State::Raw { tag, escape: 0, js }
-                    } else if escape == 1 && starts(i, "<script") && is_delim(chars.get(i + 7)) {
-                        i += 6;
-                        State::Raw { tag, escape: 2, js }
-                    } else {
-                        State::Raw { tag, escape, js }
-                    }
-                }
-                State::Tag { name, closing } => {
-                    if c == '>' {
-                        let self_closing = i > 0 && chars[i - 1] == '/';
-                        self.end_tag(name, closing, self_closing);
-                        i += 1;
-                        continue;
-                    } else if html_space(c) || c == '/' {
-                        State::Tag { name, closing }
-                    } else {
-                        self.mark = Some(offsets[i]);
-                        State::AttrName { tag: name, closing, name: c.to_ascii_lowercase().to_string() }
-                    }
-                }
-                State::AttrName { tag, closing, mut name } => {
-                    if c == '=' {
-                        // Event handler names are letters only (`onclick`, not `onclick-free`).
-                        let handler =
-                            name.len() > 2 && name.starts_with("on") && name.bytes().all(|b| b.is_ascii_lowercase());
-                        if handler && !closing {
-                            self.found.push((self.mark.unwrap_or(self.here), InlineCode::Handler(name.clone())));
-                        }
-                        self.attrs.push(name.clone());
-                        State::BeforeValue { tag, closing, name }
-                    } else if c == '>' {
-                        let self_closing = i > 0 && chars[i - 1] == '/';
-                        self.end_tag(tag, closing, self_closing);
-                        i += 1;
-                        continue;
-                    } else if html_space(c) || c == '/' {
-                        // `name =value` is rare; a space ends a valueless attribute
-                        // unless `=` follows. The spaces are passed at once (found by
-                        // the 1.0.0 audit: looking ahead at each one was quadratic).
-                        let mut j = i;
-                        while j < chars.len() && html_space(chars[j]) {
-                            j += 1;
-                        }
-                        if html_space(c) && j > i + 1 {
-                            self.here = offsets[j - 1];
-                            i = j - 1;
-                        }
-                        if chars.get(j) == Some(&'=') && html_space(c) {
-                            State::AttrName { tag, closing, name }
-                        } else {
-                            self.attrs.push(name);
-                            State::Tag { name: tag, closing }
-                        }
-                    } else {
-                        name.push(c.to_ascii_lowercase());
-                        State::AttrName { tag, closing, name }
-                    }
-                }
-                State::BeforeValue { tag, closing, name } => {
-                    if c == '"' || c == '\'' {
-                        let url = is_url_attr(&tag, &name).then(|| UrlState::Undecided(vec![String::new()]));
-                        self.mark = Some(offsets[i]);
-                        State::Quoted { tag, closing, name, quote: c, url }
-                    } else if html_space(c) {
-                        State::BeforeValue { tag, closing, name }
-                    } else if c == '>' {
-                        self.end_tag(tag, closing, false);
-                        i += 1;
-                        continue;
-                    } else {
-                        State::Unquoted { tag, closing, name }
-                    }
-                }
-                State::Quoted { tag, closing, name, quote, mut url } => {
-                    if c == quote {
-                        State::Tag { name: tag, closing }
-                    } else {
-                        if let Some(UrlState::Undecided(ps)) = &mut url {
-                            // The strictest of the ways the text may have begun.
-                            let (mut script, mut inline) = (false, false);
-                            ps.retain_mut(|p| {
-                                // Browsers ignore whitespace and case in a scheme.
-                                if !c.is_ascii_whitespace() && !c.is_control() && p.len() < 256 {
-                                    p.push(c.to_ascii_lowercase());
-                                }
-                                match decide_url(p) {
-                                    Some(UrlState::Script) => {
-                                        // `data:` is fine for images; only script URLs are inline code.
-                                        let scheme: String = p
-                                            .chars()
-                                            .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
-                                            .collect::<String>()
-                                            .to_ascii_lowercase();
-                                        if scheme.starts_with("javascript:") || scheme.starts_with("vbscript:") {
-                                            inline = true;
-                                        }
-                                        script = true;
-                                        false
-                                    }
-                                    Some(_) => false,
-                                    // Text that can no longer become a script scheme is a safe start;
-                                    // a character reference (`&`) may be anything.
-                                    None => {
-                                        p.contains('&')
-                                            || ["javascript:", "vbscript:", "data:"]
-                                                .iter()
-                                                .any(|s| s.starts_with(p.as_str()))
-                                    }
-                                }
-                            });
-                            for p in ps.iter_mut().filter(|p| p.contains('&')) {
-                                *p = "&".into();
-                            }
-                            ps.sort();
-                            ps.dedup();
-                            if inline {
-                                self.found.push((self.mark.unwrap_or(self.here), InlineCode::ScriptUrl));
-                            }
-                            if script {
-                                url = Some(UrlState::Script);
-                            } else if ps.is_empty() {
-                                url = Some(UrlState::Safe);
-                            }
-                        }
-                        // A list of URLs: each candidate of `srcset` (after `,`) and each
-                        // value of an animation's `values` (after `;`) starts a URL again.
-                        let next_url = (name == "srcset" && c == ',')
-                            || (name == "values" && c == ';' && ANIMATION_TAGS.contains(&tag.as_str()));
-                        if next_url && !matches!(url, Some(UrlState::Script)) {
-                            url = Some(UrlState::Undecided(vec![String::new()]));
-                        }
-                        State::Quoted { tag, closing, name, quote, url }
-                    }
-                }
-                State::Unquoted { tag, closing, name } => {
-                    if html_space(c) {
-                        State::Tag { name: tag, closing }
-                    } else if c == '>' {
-                        self.end_tag(tag, closing, false);
-                        i += 1;
-                        continue;
-                    } else {
-                        State::Unquoted { tag, closing, name }
-                    }
-                }
-            };
+                read = match rule.read {
+                    One => 1,
+                    Zero => 0,
+                    Match => len,
+                    Read::Spaces => spaces_end(&chars, i).max(i + 1) - i,
+                    Read::ThroughGt => dashes_end(&chars, i + len) + 1 - i,
+                    Rest => chars.len() - i,
+                };
+                self.apply(rule.then, i, &chars, offsets[i], &mut scripts, &mut comment_open);
+                break;
+            }
             // The script's text, including what the HTML tokenizer read in one step.
             // (Carried characters are read with the next text, not now.)
             if in_script && self.carry.is_empty() {
                 if let State::Raw { js, .. } = &mut self.state {
-                    for &c in &chars[from..=i] {
+                    for &c in &chars[i..i + read] {
                         js.step(c);
                     }
                 }
             }
-            i += 1;
+            i += read;
         }
         // A comment's text that ends where what follows could end it: `<!--` or
         // `<!---` (then `>` or `->`), and `-`, `--` or `--!` (then `->`, `>`...).
@@ -1807,6 +2494,24 @@ impl HtmlTracker {
         self.tail = tail.chars().skip(skip).collect();
         scripts
     }
+}
+
+/// The index after the run of HTML whitespace at `i`.
+fn spaces_end(chars: &[char], i: usize) -> usize {
+    let mut j = i;
+    while j < chars.len() && html_space(chars[j]) {
+        j += 1;
+    }
+    j
+}
+
+/// The index after the run of `-` at `i`.
+fn dashes_end(chars: &[char], i: usize) -> usize {
+    let mut j = i;
+    while chars.get(j) == Some(&'-') {
+        j += 1;
+    }
+    j
 }
 
 #[cfg(test)]
@@ -2547,5 +3252,151 @@ mod tests {
         assert!(parse("<?phv if ($c) { ?><select><?phv } ?><option>o</option></select><title>t</title>")
             .iter()
             .all(|d| !d.is_error()));
+    }
+    /// The tables are well formed: a row always matches, the contexts are in
+    /// the order of `Ctx`, the element names are unique and lowercase, and
+    /// a row that reports something and goes on never ends a table.
+    #[test]
+    fn tables_are_well_formed() {
+        for (k, (ctx, rules)) in RULES.iter().enumerate() {
+            assert_eq!(*ctx as usize, k, "{ctx:?}");
+            let last = rules.last().expect("a context has rules");
+            assert!(
+                matches!(last.on, On::Any) && last.when.is_empty(),
+                "{ctx:?} ends with a row that matches anything"
+            );
+            for rule in *rules {
+                if let On::Lit(s) | On::Exact(s) | On::RestStarts(s) | On::RestStartsExact(s) = rule.on {
+                    assert!(s.is_ascii() && !s.is_empty(), "{s:?}");
+                }
+                if let Then::TagName(p) = rule.then {
+                    assert!(p.is_empty() || p == "/");
+                }
+            }
+        }
+        let mut names: Vec<&str> = ELEMENTS.iter().map(|e| e.name).collect();
+        assert!(names.iter().all(|n| *n == n.to_ascii_lowercase() && !n.is_empty()));
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), ELEMENTS.len(), "element names are unique");
+        for e in ELEMENTS {
+            // What hides an end tag is exactly the raw-text elements and `<noscript>`.
+            assert_eq!(e.flags & HIDES_END != 0, e.flags & (RAW | NOSCRIPT) != 0, "{}", e.name);
+            assert!(e.flags & NO_END_TAG == 0 || e.flags & RAW != 0, "{}", e.name);
+        }
+        for rules in [START_RULES, END_RULES] {
+            let last = rules.last().unwrap();
+            assert!(matches!(last.tag, TagIs::Any) && matches!(last.wrong, Wrong::None));
+            assert!(!rules.iter().any(|r| matches!((r.then, r.wrong), (Stack::Continue, Wrong::None))));
+            // Every top, self-closing or not, is covered by a row that matches any tag.
+            for top in [Top::None, Top::Html, Top::HtmlPoint, Top::TextPoint, Top::AnnotationXml, Top::Foreign] {
+                for closed in [Closed::Yes, Closed::No] {
+                    assert!(
+                        rules.iter().any(|r| r.top.contains(&top)
+                            && matches!(r.tag, TagIs::Any)
+                            && (r.self_closing == Closed::Any || r.self_closing == closed)),
+                        "{top:?} {closed:?}"
+                    );
+                }
+            }
+        }
+        assert!(URL_ATTRS
+            .iter()
+            .chain(ANIMATION_URL_ATTRS)
+            .chain(SCRIPT_SRC_ATTRS)
+            .all(|a| *a == a.to_ascii_lowercase()));
+    }
+
+    /// Each kind of row of the tables decides at least one of these (a row
+    /// removed or reordered changes one of them).
+    #[test]
+    fn every_table_row_decides_something() {
+        // Text rows.
+        assert_eq!(ctx("<p>a"), EchoContext::Text);
+        assert_eq!(ctx("<!-->a"), EchoContext::Text);
+        assert_eq!(ctx("<!--->a"), EchoContext::Text);
+        assert_eq!(ctx("<!-- a "), EchoContext::Comment { bogus: false, watched: false });
+        assert_eq!(ctx("a<"), EchoContext::AfterMarkup);
+        assert_eq!(ctx("<a"), EchoContext::Tag);
+        assert_eq!(ctx("a</"), EchoContext::AfterMarkup);
+        assert_eq!(ctx("a<!-"), EchoContext::AfterMarkup);
+        assert_eq!(ctx("<svg><![CDA"), EchoContext::AfterMarkup);
+        assert_eq!(ctx("<svg><![CDATA[ "), EchoContext::Comment { bogus: true, watched: true });
+        assert_eq!(ctx("<p></p"), EchoContext::Tag);
+        assert_eq!(ctx("</>a"), EchoContext::Text);
+        assert_eq!(ctx("</ a"), EchoContext::Comment { bogus: true, watched: false });
+        assert_eq!(ctx("<!x a"), EchoContext::Comment { bogus: true, watched: false });
+        assert_eq!(ctx("<?x a"), EchoContext::Comment { bogus: true, watched: false });
+        assert_eq!(ctx("<1"), EchoContext::Text);
+        // Tag, attribute and value rows.
+        assert_eq!(ctx("<a>"), EchoContext::Text);
+        assert_eq!(ctx("<a / "), EchoContext::Tag);
+        assert_eq!(ctx("<a x"), EchoContext::Tag);
+        assert_eq!(ctx("<a x="), EchoContext::Unquoted);
+        assert_eq!(ctx("<a x>"), EchoContext::Text);
+        assert_eq!(ctx("<a x  =\""), EchoContext::Attr);
+        assert_eq!(ctx("<a x y=\""), EchoContext::Attr);
+        assert_eq!(ctx("<a x/y=\""), EchoContext::Attr);
+        assert_eq!(ctx("<a x= \""), EchoContext::Attr);
+        assert_eq!(ctx("<a x=>"), EchoContext::Text);
+        assert_eq!(ctx("<a x=y"), EchoContext::Unquoted);
+        assert_eq!(ctx("<a x='y'"), EchoContext::Tag);
+        assert_eq!(ctx("<a x=y "), EchoContext::Tag);
+        assert_eq!(ctx("<a x=y>"), EchoContext::Text);
+        // Comment, bogus comment and CDATA rows.
+        assert_eq!(ctx("<!-- a -->"), EchoContext::Text);
+        assert_eq!(ctx("<!-- a --!>"), EchoContext::Text);
+        assert_eq!(ctx("<!x >"), EchoContext::Text);
+        assert_eq!(ctx("<svg><![CDATA[ ]]>"), EchoContext::ForeignText);
+        assert!(found("<svg><![CDATA[ ] > ]]>").contains(&InlineCode::CdataEnd));
+        // Raw text rows.
+        assert_eq!(ctx("<script>a <!-"), EchoContext::AfterMarkup);
+        assert_eq!(ctx("<script><!-- <scr"), EchoContext::AfterMarkup);
+        assert_eq!(ctx("<script><!-- --"), EchoContext::AfterMarkup);
+        assert_eq!(ctx("<textarea></te"), EchoContext::AfterMarkup);
+        assert_eq!(ctx("<script><!--<script></script>a"), EchoContext::ScriptLiteral);
+        assert_eq!(ctx("<textarea></textarea>"), EchoContext::Text);
+        assert!(found("<svg><script><a>").contains(&InlineCode::ForeignCdata));
+        assert_eq!(ctx("<style><!-- a"), EchoContext::Style);
+        // `<!---->` leaves the escape state alone (`<script>` after it is text, so
+        // `</script>` ends the script); `<!--` is a line comment for JavaScript.
+        assert_eq!(ctx("<script><!---->\n<script>\n</script>a"), EchoContext::Text);
+        assert_eq!(ctx("<script><!---->var a = "), EchoContext::ScriptLiteral);
+        assert_eq!(ctx("<script><!-- a"), EchoContext::ScriptLiteral);
+        assert_eq!(ctx("<script><!-- a -->\nvar b = "), EchoContext::Script);
+        assert_eq!(ctx("<script><!-- <script></script>--></script>"), EchoContext::Text);
+        // Open-element rows (the start and end tags of foreign content).
+        assert_eq!(ctx("<svg/>a"), EchoContext::Text);
+        assert_eq!(ctx("<math><mi><mglyph/>"), EchoContext::ForeignText);
+        assert_eq!(structure_errors("<math><mi><mglyph></mglyph></mi></math>"), 0);
+        assert_eq!(structure_errors("<math><annotation-xml><b></b></annotation-xml></math>"), 1);
+        assert_eq!(ctx("<svg><title><svg/></title></svg>a"), EchoContext::Text);
+        assert_eq!(ctx("<svg><title><svg><g/></svg></title></svg>a"), EchoContext::Text);
+        assert_eq!(ctx("<svg><title><math><mi/></math></title></svg>a"), EchoContext::Text);
+        assert_eq!(ctx("<svg><title><br></title></svg>a"), EchoContext::Text);
+        assert_eq!(ctx("<svg><title><b></b></title></svg>a"), EchoContext::Text);
+        assert_eq!(structure_errors("<svg><br></svg>"), 1);
+        assert_eq!(structure_errors("<svg><b></b></svg>"), 1);
+        assert_eq!(ctx("<svg><g/></svg>a"), EchoContext::Text);
+        assert_eq!(ctx("<svg><g></g></svg>a"), EchoContext::Text);
+        assert_eq!(structure_errors("<svg><title><b></svg>"), 1);
+        assert_eq!(ctx("<svg><title><b></i></b></title></svg>a"), EchoContext::Text);
+        assert_eq!(structure_errors("<svg></p>"), 1);
+        assert_eq!(ctx("<svg><g></svg>a"), EchoContext::Text);
+        assert_eq!(structure_errors("<svg><title><b><svg></b></svg></title></svg>"), 1);
+        assert_eq!(ctx("<svg></x>"), EchoContext::ForeignText);
+        // Rows whose conditions only a corner case tells apart (each of these
+        // passed with one condition of a row removed, so they stay).
+        // `<scripts` is not `<script` with a delimiter after it: no double escape.
+        assert_eq!(ctx("<script><!--<scripts></script>a"), EchoContext::Text);
+        // `<![CDATA[` is a bogus comment outside foreign content: no `]]>` end.
+        assert!(!found("<![CDATA[ > ]]>").contains(&InlineCode::CdataEnd));
+        // An end tag closes the nearest element of its name when the HTML
+        // element and the foreign element have the same name.
+        assert_eq!(structure_errors("<svg><foreignObject><a><svg><a></a></svg></a></foreignObject></svg>"), 0);
+        // Spaces before `=` belong to the attribute `x`, not to `href`.
+        assert_eq!(ctx("<a x href=\""), EchoContext::Url);
+        // `--` is carried only in the escaped states.
+        assert_eq!(ctx("<script>a--"), EchoContext::Script);
     }
 }

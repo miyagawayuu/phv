@@ -64,6 +64,11 @@ fn held() -> usize {
     phv_std::sqlite_kept_stats().3
 }
 
+/// Statements weighed (`EXPLAIN` runs) so far.
+fn weighed() -> u64 {
+    phv_std::sqlite_weight_stats().0
+}
+
 /// Runs `src` and checks a kept connection served its open.
 fn run_reused(site: &Site, src: &str, max_time: Option<Duration>) -> String {
     let before = reused();
@@ -323,6 +328,103 @@ fn kept_statements_are_weighed_again_after_a_schema_change() {
         None,
     );
     assert!(out.contains("could read long values 240 times") && out.ends_with(" 1"), "{out}");
+}
+
+/// A weight is kept per process by file, schema and text: the second
+/// connection to a file compiles a text the first one weighed, but does not
+/// weigh it again. After a schema change the statement is weighed again (the
+/// schema version is part of the key), once; another file at the same schema
+/// version, with another schema, has weights of its own; a long text is
+/// weighed on every connection; `:memory:` databases share nothing.
+#[test]
+fn weights_are_shared_by_the_connections_of_a_file() {
+    let site = Site::new("weights");
+    let create = |file: &str, columns: &str| {
+        format!(
+            "$db = Database::open(\"{file}\"); $db->execute(sql\"CREATE TABLE t ({columns})\");
+             $db->execute(sql\"INSERT INTO t VALUES ('7', 7)\"); echo \"ok\";"
+        )
+    };
+    // The statement on two connections held at once (the second is new).
+    let two = |file: &str| {
+        format!(
+            "$a = Database::open(\"{file}\"); $b = Database::open(\"{file}\"); {COMPARISONS}
+             foreach ([$a, $b] as $db) {{ try {{ echo $db->query($q)[0]->int(\"c\") ?? -1; }} catch (DatabaseError $e) {{ echo \"refused \"; }} }}"
+        )
+    };
+    assert_eq!(site.run(&create("data/w.db", "b TEXT, n INTEGER"), None), "ok");
+    let (before_compiled, before_weighed) = (compiled(), weighed());
+    assert_eq!(site.run(&two("data/w.db"), None), "11");
+    assert_eq!(compiled(), before_compiled + 2, "each connection compiles the text");
+    assert_eq!(weighed(), before_weighed + 1, "the second connection weighed the text again");
+    // Both kept: neither compiles nor weighs.
+    let (before_compiled, before_weighed) = (compiled(), weighed());
+    assert_eq!(run_reused(&site, &two("data/w.db"), None), "11");
+    assert_eq!((compiled(), weighed()), (before_compiled, before_weighed));
+    // The schema changes (two statements, weighed): the kept statement is
+    // compiled again at its first step, then prepared and weighed again (the
+    // schema version is part of the key), and refused at 240.
+    let before_weighed = weighed();
+    let out = run_reused(
+        &site,
+        &format!(
+            "$db = Database::open(\"data/w.db\"); {COLUMN_TYPE} {COMPARISONS}
+             try {{ $db->query($q); echo \"ran\"; }} catch (DatabaseError $e) {{ echo $e->getMessage(); }}"
+        ),
+        None,
+    );
+    assert!(out.contains("could read long values 240 times"), "{out}");
+    assert_eq!(weighed(), before_weighed + 3);
+    // Both kept connections compile the text again (one dropped the refused
+    // statement, the other's expired), and find the weight at the new schema
+    // version: refused without weighing.
+    let (before_compiled, before_weighed) = (compiled(), weighed());
+    assert_eq!(run_reused(&site, &two("data/w.db"), None), "refused refused ");
+    assert_eq!(compiled(), before_compiled + 2);
+    assert_eq!(weighed(), before_weighed, "the text was weighed again at a schema version it was weighed at");
+    // Another file whose schema version is the same (one `CREATE TABLE`) but
+    // whose column type makes the statement heavy: weighed, and refused.
+    assert_eq!(site.run(&create("data/x.db", "b INTEGER, n TEXT"), None), "ok");
+    let before_weighed = weighed();
+    assert_eq!(site.run(&two("data/x.db"), None), "refused refused ");
+    assert_eq!(weighed(), before_weighed + 1, "the weight of another file was used");
+    // A text longer than 4 KB is weighed on every connection.
+    assert_eq!(site.run(&create("data/l.db", "a INTEGER, n TEXT"), None), "ok");
+    let before_weighed = weighed();
+    let long = format!("{} {}", in_list("a", "data/l.db", 2000), in_list("b", "data/l.db", 2000));
+    assert_eq!(site.run(&long, None), "00");
+    assert_eq!(weighed(), before_weighed + 2);
+    // In a transaction a connection may see a schema of its own: weighed,
+    // and not kept (the next script, outside one, weighs the text again).
+    let before_weighed = weighed();
+    let count = |var: &str| {
+        format!("echo ${var}->query(sql\"SELECT count(*) AS c FROM t WHERE n = 'x'\")[0]->int(\"c\") ?? -1;")
+    };
+    let open = |var: &str| format!("${var} = Database::open(\"data/l.db\");");
+    let script = format!(
+        "{} {} $a->execute(sql\"BEGIN\"); $b->execute(sql\"BEGIN\"); {} {}",
+        open("a"),
+        open("b"),
+        count("a"),
+        count("b")
+    );
+    assert_eq!(site.run(&script, None), "00");
+    // `BEGIN` is weighed once (kept), the count on both connections.
+    assert_eq!(weighed(), before_weighed + 3);
+    // A third connection, outside a transaction, weighs it (and keeps it).
+    let script = format!("{} {} {} {}", open("a"), open("b"), open("c"), count("c"));
+    assert_eq!(site.run(&script, None), "0");
+    assert_eq!(weighed(), before_weighed + 4);
+    let script = format!("{} {} {} {} {}", open("a"), open("b"), open("c"), open("d"), count("d"));
+    assert_eq!(site.run(&script, None), "0");
+    assert_eq!(weighed(), before_weighed + 4);
+    // `:memory:` databases: nothing to share.
+    let before_weighed = weighed();
+    let memory = "$a = Database::open(\":memory:\"); $b = Database::open(\":memory:\");
+        foreach ([$a, $b] as $db) { echo $db->query(sql\"SELECT length('x') AS n\")[0]->int(\"n\") ?? -1; }";
+    assert_eq!(site.run(memory, None), "11");
+    assert_eq!(weighed(), before_weighed + 2);
+    assert!(phv_std::sqlite_weight_stats().1 <= 4096, "the kept weights are not bounded");
 }
 
 /// A statement's bound values are cleared when it goes back to the cache

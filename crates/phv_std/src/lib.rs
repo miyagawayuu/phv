@@ -49,6 +49,13 @@ pub fn sqlite_kept_stats() -> (usize, u64, u64, usize) {
     db::kept_stats()
 }
 
+/// SQLite statements weighed (`EXPLAIN` runs) so far, and the weights kept
+/// per process. For tests.
+#[doc(hidden)]
+pub fn sqlite_weight_stats() -> (u64, usize) {
+    db::weight_stats()
+}
+
 /// How long idle SQLite connections are kept (`None`: 30 seconds). For tests.
 #[doc(hidden)]
 pub fn sqlite_set_kept_idle(idle: Option<std::time::Duration>) {

@@ -15,14 +15,6 @@ before the release.
 
 ## 1.2.x (patch releases)
 
-### Security-critical first
-
-| Item | Code | Change | Risk | Measure | Size |
-|---|---|---|---|---|---|
-| Table-driven HTML context tracker | `crates/phv_syntax/src/htmlctx.rs` (2,551 lines) | Replace the hand-written state machine with tables of elements, contexts and transitions (what each start tag opens, what each end tag closes, the raw-text and foreign elements, the comment and CDATA rules), so that a rule is one row rather than code in several places | The tracker decides how values are escaped: a wrong row is an injection. Keep the differential harness of the sixteenth and seventeenth assessments (6,048 and 5,812 templates against html5lib, Chromium and WebKit) green at every step, and assess the result again | The harness flags none; `phv check` of the repository's templates is no slower | L |
-| SQLite opcode pin | `crates/phv_std/src/db/cost.rs` | A test that fails when `sqlite3_libversion()` is not the version the weight table was written for, and one that runs `EXPLAIN` over a corpus of statements and fails on an opcode the table does not name | None in production; the tests make a SQLite upgrade a deliberate step | The tests exist and pass | S |
-| Weight cache | `crates/phv_std/src/db/cost.rs`, `db.rs` | Keep a statement's weight by its text and the schema version, so a statement weighed once on a connection is not weighed again on another | The cache must miss when the schema changes (the schema version is part of the key) and must be bounded (a few thousand entries) | SQLite page p50 in `bench/serve.*` | S |
-
 ### Databases and sessions
 
 | Item | Code | Change | Risk | Measure | Size |

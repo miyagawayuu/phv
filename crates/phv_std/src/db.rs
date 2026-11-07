@@ -131,6 +131,10 @@ impl Db {
     /// run bound are cleared when the statement goes back to the cache (see
     /// `reusable`). A program of more than `KEPT_STATEMENT_BYTES` runs but is
     /// not kept (`Prepared::Once`).
+    ///
+    /// A weight is kept per process by file, schema and text (`weight`), so
+    /// the other connections of the file do not run `EXPLAIN` for a text one
+    /// of them weighed; each still checks the weight against `MAX_WEIGHT`.
     fn statement(&self, vm: &Vm, text: &str) -> Result<Prepared<'_>, VmError> {
         use rusqlite::limits::Limit;
         let c = self.conn();
@@ -145,7 +149,7 @@ impl Db {
             // Not kept unless it passes: the next prepare of the text compiles
             // (and weighs) it again.
             if st.is_explain() == 0 {
-                match cost::weigh(c, text) {
+                match self.weight(c, text) {
                     Ok(weight) if weight <= cost::MAX_WEIGHT => {}
                     Ok(weight) => {
                         st.discard();
@@ -187,6 +191,80 @@ impl Db {
                 ),
             )),
         }
+    }
+
+    /// The weight of `text`, which SQLite compiled just now on `c`: the one
+    /// kept per process for this file at its schema (`cost::cached`), or else
+    /// weighed now (`cost::weigh`) and kept. The schema is the cookie in the
+    /// file's header (`schema_cookie`; every schema change moves it), read
+    /// before the program is listed: a weight is kept only when the program
+    /// was compiled against that very cookie, so a schema change in between
+    /// keeps nothing. A `:memory:` database has no other connections, and a
+    /// connection in a transaction may see a schema of its own: not kept.
+    fn weight(&self, c: &Connection, text: &str) -> rusqlite::Result<u32> {
+        let Some(file) = self.session.file else { return cost::weigh(c, text).map(|(w, _)| w) };
+        let Some(schema) = self.schema_cookie(c) else { return cost::weigh(c, text).map(|(w, _)| w) };
+        let analyzed = cost::analyzed();
+        if let Some(weight) = cost::cached(file, schema, analyzed, text) {
+            return Ok(weight);
+        }
+        let (weight, compiled) = cost::weigh(c, text)?;
+        match compiled {
+            cost::Schema::None => cost::remember(file, schema, analyzed, text, weight),
+            cost::Schema::Main(cookie) if cookie == schema => cost::remember(file, schema, analyzed, text, weight),
+            _ => {}
+        }
+        Ok(weight)
+    }
+
+    /// The schema cookie of the database file (bytes 40–43 of its header,
+    /// what `PRAGMA schema_version` reads): read through SQLite's open file,
+    /// without a transaction (the pragma would take a read lock, which costs
+    /// as much as weighing a short statement). The file holds the committed
+    /// schema, so this is nothing when the connection is in a transaction (it
+    /// may have changed the schema itself), or when the file is in WAL mode
+    /// (the log may hold a newer schema); a value read while another
+    /// process writes the header is not the cookie SQLite compiles against,
+    /// so nothing is kept for it (see `weight`). An empty file is at 0.
+    fn schema_cookie(&self, c: &Connection) -> Option<i64> {
+        use rusqlite::ffi;
+        if !c.is_autocommit() {
+            return None;
+        }
+        let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
+        // SAFETY: the handle is the open connection's; the file control
+        // writes the main database's file pointer, owned by the connection.
+        let rc = unsafe {
+            ffi::sqlite3_file_control(
+                c.handle(),
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_FILE_POINTER,
+                (&mut file as *mut *mut ffi::sqlite3_file).cast(),
+            )
+        };
+        if rc != ffi::SQLITE_OK || file.is_null() {
+            return None;
+        }
+        let mut header = [0u8; 44];
+        // SAFETY: `file` is the open file; `xRead` is its method, and the
+        // buffer is as long as asked (a short read zero-fills the rest).
+        let rc = unsafe {
+            let methods = (*file).pMethods;
+            if methods.is_null() {
+                return None;
+            }
+            let read = (*methods).xRead?;
+            read(file, header.as_mut_ptr().cast(), header.len() as std::ffi::c_int, 0)
+        };
+        if rc != ffi::SQLITE_OK && rc != ffi::SQLITE_IOERR_SHORT_READ {
+            return None;
+        }
+        // Bytes 18 and 19 are the file format versions: 2 means WAL.
+        if header[18] == 2 || header[19] == 2 {
+            return None;
+        }
+        // SQLite holds the cookie as an `int`.
+        Some(i64::from(u32::from_be_bytes([header[40], header[41], header[42], header[43]]) as i32))
     }
 
     /// Whether `e`, from running a statement during which SQLite compiled
@@ -421,6 +499,12 @@ pub fn kept_stats() -> (usize, u64, u64, usize) {
     let idle: Vec<&Idle> = map.values().flatten().collect();
     (idle.len(), REUSED.load(Ordering::SeqCst), COMPILED.load(Ordering::SeqCst), idle.iter().map(|i| i.held).sum())
 }
+
+/// Statements weighed (`EXPLAIN` runs) so far, and the weights kept per
+/// process (for tests).
+pub fn weight_stats() -> (u64, usize) {
+    cost::weight_stats()
+}
 static SWEEPING: AtomicBool = AtomicBool::new(false);
 
 fn kept() -> MutexGuard<'static, HashMap<PathBuf, Vec<Idle>>> {
@@ -615,20 +699,25 @@ struct Session {
     /// SQLite's count of changes when the script took the connection
     /// (`changes()` and `total_changes()` count from there).
     changes_base: AtomicU64,
+    /// The database file the connection has open (none for `:memory:`): the
+    /// key of its statements' weights (`cost`).
+    file: Option<cost::Database>,
 }
 
 /// The instant the sessions' deadlines count from.
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 impl Session {
-    /// Registers the authorizer and PHV's SQL functions on a new connection,
-    /// after the caller's own pragmas (the authorizer refuses them).
-    fn install(c: &Connection) -> rusqlite::Result<Arc<Session>> {
+    /// Registers the authorizer and PHV's SQL functions on a new connection
+    /// to `file` (none for `:memory:`), after the caller's own pragmas (the
+    /// authorizer refuses them).
+    fn install(c: &Connection, file: Option<cost::Database>) -> rusqlite::Result<Arc<Session>> {
         let session = Arc::new(Session {
             tainted: AtomicBool::new(false),
             compiles: AtomicU64::new(0),
             deadline: AtomicU64::new(0),
             changes_base: AtomicU64::new(0),
+            file,
         });
         // SQLite runs one `LIKE` or `GLOB` as a single step, which the progress
         // handler cannot stop (a long text and pattern take minutes): these do.
@@ -638,6 +727,15 @@ impl Session {
         c.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
             use rusqlite::hooks::AuthAction;
             auth.compiles.fetch_add(1, Ordering::SeqCst);
+            match &ctx.action {
+                // The plans of later programs change: the weights kept before
+                // are not used after (see `cost`).
+                AuthAction::Analyze { .. } => cost::note_analyze(),
+                AuthAction::Pragma { pragma_name, .. } if pragma_name.eq_ignore_ascii_case("optimize") => {
+                    cost::note_analyze()
+                }
+                _ => {}
+            }
             // A pragma may change the session; temporary objects stay in it.
             if matches!(
                 ctx.action,
@@ -944,9 +1042,11 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
                 OpenError::NoFileSystem => vm.throw("DatabaseError", NO_FILE_SYSTEM),
                 OpenError::Sqlite(e) => db_error(vm, e),
             })?;
+            // When the file was made, where the file system says (see `cost::Database`).
+            let created = std::fs::metadata(dir.path().join(&name)).and_then(|m| m.created()).ok();
             let session = harden(&c)
                 .and_then(|()| script_settings(&c))
-                .and_then(|()| Session::install(&c))
+                .and_then(|()| Session::install(&c, Some(cost::Database { id, created })))
                 .map_err(|e| db_error(vm, e))?;
             let base = (phv_vm::alloc::thread_allocated() - before).max(0) as usize;
             (c, id, base, session)
@@ -999,7 +1099,7 @@ fn open_memory(vm: &mut Vm, _budget: mem::Budget) -> R {
     }
     c.execute_batch(&format!("PRAGMA page_size = 4096; PRAGMA max_page_count = {pages}"))
         .map_err(|e| db_error(vm, e))?;
-    let session = Session::install(&c).map_err(|e| db_error(vm, e))?;
+    let session = Session::install(&c, None).map_err(|e| db_error(vm, e))?;
     for_script(&c, vm, &session).map_err(|e| db_error(vm, e))?;
     let db = Db { conn: Some(c), _dir: None, depth: Cell::new(0), pages, pooled: None, session };
     vm.resources.push(Some(Box::new(db)));
