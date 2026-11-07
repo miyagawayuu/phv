@@ -79,7 +79,8 @@ echo greet($name);                                 // Web ページでは自動�
   `phv-<version>.vsix` として含まれる。
 
 まず[チュートリアル](docs/tutorial.ja.md)から始めてください。詳しくは [言語仕様 (docs/spec.ja.md)](docs/spec.ja.md)、標準ライブラリは
-[リファレンス (docs/stdlib.md、英語)](docs/stdlib.md) を参照してください。脆弱性の報告方法は [SECURITY.md](SECURITY.md) にあります。
+[リファレンス (docs/stdlib.md、英語)](docs/stdlib.md) を参照してください。次に予定している改善は、リスクと測り方とともに
+[docs/improvement-plan.ja.md](docs/improvement-plan.ja.md) にあります。脆弱性の報告方法は [SECURITY.md](SECURITY.md) にあります。
 
 ## インストール
 

@@ -69,6 +69,8 @@ const docLinks = {
     "tutorial.md": "../tutorial/",
     "tutorial.ja.md": "../../ja/docs/tutorial/",
     "stdlib.md": "../stdlib/",
+    "improvement-plan.md": "../plan/",
+    "improvement-plan.ja.md": "../../ja/docs/plan/",
   },
   ja: {
     "spec.md": "../../../docs/spec/",
@@ -78,6 +80,8 @@ const docLinks = {
     "tutorial.md": "../../../docs/tutorial/",
     "tutorial.ja.md": "../tutorial/",
     "stdlib.md": "../../../docs/stdlib/",
+    "improvement-plan.md": "../../../docs/plan/",
+    "improvement-plan.ja.md": "../plan/",
   },
 };
 
@@ -288,6 +292,8 @@ docPage("tutorial.ja.md", "ja", "ja/docs/tutorial/index.html", "tutorial", "../.
 docPage("stdlib.md", "en", "docs/stdlib/index.html", "stdlib", "../../ja/");
 docPage("security-audit.md", "en", "docs/security/index.html", "security", "../../ja/docs/security/");
 docPage("security-audit.ja.md", "ja", "ja/docs/security/index.html", "security", "../../../docs/security/");
+docPage("improvement-plan.md", "en", "docs/plan/index.html", "plan", "../../ja/docs/plan/");
+docPage("improvement-plan.ja.md", "ja", "ja/docs/plan/index.html", "plan", "../../../docs/plan/");
 for (const dir of ["docs", "ja/docs"]) {
   write(`${dir}/index.html`, `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=spec/"><a href="spec/">spec/</a>
 `);

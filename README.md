@@ -84,7 +84,8 @@ echo greet($name);                                 // HTML-escaped automatically
   includes it as `phv-<version>.vsix`.
 
 Start with the [tutorial](docs/tutorial.md). The full language specification is in [docs/spec.md](docs/spec.md), and the
-standard library's reference in [docs/stdlib.md](docs/stdlib.md).
+standard library's reference in [docs/stdlib.md](docs/stdlib.md). What is planned next, with its risks and measures, is in
+[docs/improvement-plan.md](docs/improvement-plan.md).
 
 ## Installing
 
