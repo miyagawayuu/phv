@@ -13,8 +13,8 @@ version (see the compatibility rules in the specification, §18).
 
 | Version | Supported |
 |---|---|
-| 1.1.x | Yes |
-| < 1.1 | No |
+| 1.2.x | Yes |
+| < 1.2 | No |
 
 ## Reporting a vulnerability
 
