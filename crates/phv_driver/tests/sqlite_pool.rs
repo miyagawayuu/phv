@@ -367,3 +367,79 @@ fn the_teardown_returns_the_connection() {
     drop(outcome.teardown.take());
     assert_eq!(kept(), before + 1, "dropping the teardown gave the connection back");
 }
+
+/// A script that makes the table of `file`.
+fn create(file: &str) -> String {
+    format!("$db = Database::open(\"{file}\"); $db->execute(sql\"CREATE TABLE t (a INTEGER)\"); echo \"ok\";")
+}
+
+/// A script that opens `file` as `$var` and runs a statement whose program
+/// has `n` values in an `IN` list (about 150 bytes each: 2,000 take 300 KB,
+/// 8,000 1.2 MB).
+fn in_list(var: &str, file: &str, n: usize) -> String {
+    format!(
+        "${var} = Database::open(\"{file}\"); $x = 1;
+         $q = sql\"SELECT count(*) AS c FROM t WHERE a IN ({{$x}}\"; for ($i = 0; $i < {n}; $i++) {{ $q = $q . sql\", {{$x}}\"; }}
+         echo ${var}->query($q . sql\")\")[0]->int(\"c\") ?? -1;"
+    )
+}
+
+/// A statement whose program takes more than 1 MB runs but is not kept (found
+/// by the 17th assessment: the memory of the kept statements was bounded by
+/// their count alone): the idle connection holds no more than before, and the
+/// next script compiles the text again. A statement of 300 KB is kept.
+#[test]
+fn large_statements_are_not_kept() {
+    let site = Site::new("large");
+    assert_eq!(site.run(&create("data/big.db"), None), "ok");
+    let before = held();
+    assert_eq!(run_reused(&site, &in_list("db", "data/big.db", 8000), None), "0");
+    let more = held() as i64 - before as i64;
+    assert!(more < 256 << 10, "the kept connection holds {more} more bytes: the large statement was kept");
+    let before = compiled();
+    assert_eq!(run_reused(&site, &in_list("db", "data/big.db", 8000), None), "0");
+    assert!(compiled() > before, "the large statement was kept");
+    assert_eq!(site.run(&create("data/small.db"), None), "ok");
+    assert_eq!(run_reused(&site, &in_list("db", "data/small.db", 2000), None), "0");
+    let before = compiled();
+    assert_eq!(run_reused(&site, &in_list("db", "data/small.db", 2000), None), "0");
+    assert_eq!(compiled(), before, "the kept statement was compiled again");
+}
+
+/// The idle connections hold at most 64 MB together (1 MB here; found by the
+/// 17th assessment: the pool was bounded by count alone, up to 256 connections
+/// of 32 large statements each, off every script's memory limit). A connection
+/// going back makes room by closing the idle ones that hold the most; one
+/// that would not fit alone is closed.
+#[test]
+fn idle_connections_hold_a_bounded_memory() {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            phv_std::sqlite_set_kept_bytes(None);
+        }
+    }
+    let site = Site::new("bytes");
+    let kept = || phv_std::sqlite_kept_stats().0;
+    let cap = 1 << 20;
+    // A small connection to one file is kept first.
+    assert_eq!(site.run(&create("data/b.db"), None), "ok");
+    assert_eq!(site.run(&create("data/c.db"), None), "ok");
+    assert_eq!(site.run("$a = Database::open(\"data/a.db\"); echo \"a\";", None), "a");
+    phv_std::sqlite_set_kept_bytes(Some(cap));
+    let _restore = Restore;
+    // Eight connections to another file, each with a statement of 300 KB.
+    let before = kept();
+    let eight: String = (0..8).map(|i| in_list(&format!("d{i}"), "data/b.db", 2000)).collect();
+    assert_eq!(site.run(&eight, None), "00000000");
+    assert!(held() <= cap, "the idle connections hold {} bytes", held());
+    assert!(kept() < before + 8, "all eight connections were kept");
+    // The small one is still there: the large ones went first.
+    run_reused(&site, "$a = Database::open(\"data/a.db\"); echo \"a\";", None);
+    // A connection that alone holds more than the cap is closed.
+    phv_std::sqlite_set_kept_bytes(Some(128 << 10));
+    assert_eq!(site.run(&in_list("db", "data/c.db", 2000), None), "0");
+    let before = reused();
+    assert_eq!(site.run(&in_list("db", "data/c.db", 2000), None), "0");
+    assert_eq!(reused(), before, "a connection over the cap was kept");
+}

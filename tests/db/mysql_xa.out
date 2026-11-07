@@ -1,0 +1,8 @@
+ok
+ok
+error: XA PREPARE is not allowed: a prepared transaction would keep its locks after the script until XA ROLLBACK or XA COMMIT ends it
+error: XA PREPARE is not allowed: a prepared transaction would keep its locks after the script until XA ROLLBACK or XA COMMIT ends it
+error: XA PREPARE is not allowed: a prepared transaction would keep its locks after the script until XA ROLLBACK or XA COMMIT ends it
+error: XA PREPARE is not allowed: a prepared transaction would keep its locks after the script until XA ROLLBACK or XA COMMIT ends it
+ok
+error: LOAD DATA LOCAL INFILE is not allowed: it would send the server a file of this host

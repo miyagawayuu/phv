@@ -1,0 +1,20 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: adds a job with the key "f1"
+// inside a transaction on the store's database, while jobs_tx_hold.phv holds
+// that key in another; then shows that the transaction is still usable.
+import std.db.Database;
+import std.jobs.enqueue;
+
+$db = Database::connect("main");
+try {
+    $db->transaction(function () use ($db): void {
+        try {
+            echo enqueue("k", "waited", key: "f1") == null ? "taken" : "added";
+        } catch (DatabaseError $e) {
+            echo "error: ", $e->getMessage();
+        }
+        echo " then ", $db->first(sql"SELECT 1 AS one")?->int("one") ?? 0;
+    });
+} catch (DatabaseError $e) {
+    echo " aborted: ", $e->getMessage();
+}

@@ -15,6 +15,7 @@
 //!
 //! [server]
 //! workers = 16            # scripts running at once (default: 2 per CPU, at least 8)
+//! streams_per_address = 4 # pages streaming with flush() at once from one address (default: workers / 4, at least 2; 0: no limit)
 //! static_max_age = 3600   # Cache-Control max-age of static files (default: revalidate each time)
 //! compress = true         # gzip text responses for clients that accept it (default)
 //! access_log = "logs/access.log"  # also write the access log to this file
@@ -611,6 +612,8 @@ struct Project {
 struct ServerSection {
     /// Scripts that `phv serve` runs at once; further requests wait for one.
     workers: Option<usize>,
+    /// Pages streaming with `flush()` at once from one client address (0: no limit).
+    streams_per_address: Option<usize>,
     /// `Cache-Control: public, max-age=N` for static files (default: `no-cache`).
     static_max_age: Option<u64>,
     /// Compress text responses with gzip (default: true).
@@ -680,6 +683,13 @@ pub enum LogFormat {
 /// Two workers per CPU, at least 8.
 fn default_workers() -> usize {
     std::thread::available_parallelism().map_or(8, |n| n.get() * 2).max(8)
+}
+
+/// `[server] streams_per_address` when it is not set: a quarter of the
+/// workers, at least 2, so that clients at one address that read a streamed
+/// page slowly hold a few workers, never all of them (found by the 1.2 audit).
+fn default_streams(workers: usize) -> usize {
+    (workers / 4).max(2)
 }
 
 #[derive(Deserialize)]
@@ -930,6 +940,8 @@ pub struct Config {
     pub memory_limit_mb: u64,
     /// Scripts that `phv serve` runs at once.
     pub workers: usize,
+    /// Pages streaming with `flush()` at once from one client address; 0 is no limit.
+    pub streams_per_address: usize,
     pub csp: Csp,
     pub requests_per_minute: u32,
     /// Directory for session files; None keeps sessions in memory.
@@ -986,6 +998,7 @@ impl Config {
             session_ttl: default_ttl(),
             memory_limit_mb: default_memory(),
             workers: default_workers(),
+            streams_per_address: default_streams(default_workers()),
             csp: Csp::Policy(DEFAULT_CSP.into()),
             requests_per_minute: 0,
             session_dir: None,
@@ -1385,6 +1398,7 @@ pub fn parse_config_with_jobs(root: &Path, text: &str, jobs_given: Option<Vec<St
     if file.server.workers.is_some_and(|w| !(1..=1024).contains(&w)) {
         return Err("[server].workers must be between 1 and 1024".into());
     }
+    let workers = file.server.workers.unwrap_or_else(default_workers);
     if file.server.static_max_age.is_some_and(|a| a > 31_536_000) {
         return Err("[server].static_max_age must be at most 31536000 seconds (a year)".into());
     }
@@ -1521,7 +1535,8 @@ pub fn parse_config_with_jobs(root: &Path, text: &str, jobs_given: Option<Vec<St
         secure_cookies: file.security.secure_cookies || tls.is_some(),
         session_ttl: file.security.session_ttl,
         memory_limit_mb: file.security.memory_limit_mb,
-        workers: file.server.workers.unwrap_or_else(default_workers),
+        workers,
+        streams_per_address: file.server.streams_per_address.unwrap_or_else(|| default_streams(workers)),
         csp,
         requests_per_minute: file.security.requests_per_minute,
         session_dir,
@@ -1571,6 +1586,15 @@ mod tests {
         let r = load_config(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         r
+    }
+
+    /// Found by the 1.2 audit: slow readers of a streamed page held every worker.
+    #[test]
+    fn streams_per_address_defaults_to_a_quarter_of_the_workers() {
+        assert_eq!(load("[server]\nworkers = 16\n").unwrap().streams_per_address, 4);
+        assert_eq!(load("[server]\nworkers = 2\n").unwrap().streams_per_address, 2);
+        assert_eq!(load("[server]\nworkers = 16\nstreams_per_address = 0\n").unwrap().streams_per_address, 0);
+        assert_eq!(load("[server]\nstreams_per_address = 1\n").unwrap().streams_per_address, 1);
     }
 
     /// Found by the 1.0 audit.

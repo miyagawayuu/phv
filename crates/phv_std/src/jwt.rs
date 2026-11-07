@@ -189,7 +189,8 @@ fn positive(b: &[u8]) -> Option<(Vec<u8>, &[u8])> {
 }
 
 /// `RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }`.
-fn rsa_public(der: &[u8]) -> Option<Public> {
+/// `None` when the DER is not that; the error when the numbers are not a key.
+fn rsa_public(der: &[u8]) -> Option<Result<Public, &'static str>> {
     let (tag, seq, rest) = tlv(der)?;
     if tag != 0x30 || !rest.is_empty() {
         return None;
@@ -199,13 +200,20 @@ fn rsa_public(der: &[u8]) -> Option<Public> {
     if !seq.is_empty() {
         return None;
     }
-    rsa_checked(n, e)
+    Some(rsa_checked(n, e))
 }
 
-/// RSA public keys of 2048 to 8192 bits (as `RSA_PKCS1_2048_8192_SHA256`
-/// verifies), with an exponent of at most 33 bits. A modulus of zero (no
-/// bytes once leading zeros are dropped) is refused like any other short one.
-fn rsa_checked(n: Vec<u8>, e: Vec<u8>) -> Option<Public> {
+const RSA_BITS: &str = "the RSA key is not 2048 to 8192 bits";
+const RSA_EXPONENT: &str = "the RSA key's public exponent must be odd and from 3 to 2^33 - 1 (it is usually 65537)";
+const EC_POINT: &str = "the P-256 key's point is not on the curve";
+const ED_POINT: &str = "the Ed25519 key is not a point of the curve of large order";
+
+/// RSA public keys of 2048 to 8192 bits with an odd exponent of 3 to
+/// 2^33 - 1: what `RSA_PKCS1_2048_8192_SHA256` verifies with (ring's bounds;
+/// found by the 1.2.0 audit: a key with another exponent loaded and never
+/// verified a token). A modulus of zero (no bytes once leading zeros are
+/// dropped) is refused like any other short one.
+fn rsa_checked(n: Vec<u8>, e: Vec<u8>) -> Result<Public, &'static str> {
     let n: Vec<u8> = n.into_iter().skip_while(|&x| x == 0).collect();
     let e: Vec<u8> = e.into_iter().skip_while(|&x| x == 0).collect();
     // The first byte is not zero, so it has at most 7 leading zero bits.
@@ -213,14 +221,100 @@ fn rsa_checked(n: Vec<u8>, e: Vec<u8>) -> Option<Public> {
         Some(b) => n.len().saturating_mul(8).saturating_sub(b.leading_zeros() as usize),
         None => 0,
     };
-    if !(2048..=8192).contains(&bits) || e.is_empty() || e.len() > 5 {
-        return None;
+    if !(2048..=8192).contains(&bits) {
+        return Err(RSA_BITS);
     }
-    Some(Public::Rsa { n, e })
+    if e.is_empty() || e.len() > 5 {
+        return Err(RSA_EXPONENT);
+    }
+    let exponent = e.iter().fold(0u64, |v, &b| (v << 8) | u64::from(b));
+    if !(3..=(1 << 33) - 1).contains(&exponent) || exponent & 1 == 0 {
+        return Err(RSA_EXPONENT);
+    }
+    Ok(Public::Rsa { n, e })
 }
 
-/// `SubjectPublicKeyInfo` of an RSA, P-256 or Ed25519 key.
-fn spki(der: &[u8]) -> Option<(Alg, Public)> {
+/// Whether `p`, an uncompressed P-256 point (`04 || x || y`, 65 bytes), is
+/// on the curve: y^2 = x^3 - 3x + b over the field. A point off it loads
+/// nothing ring would verify with (found by the 1.2.0 audit).
+fn on_p256(p: &[u8]) -> bool {
+    use num_bigint::BigUint;
+    let hex = |s: &[u8]| BigUint::parse_bytes(s, 16).expect("a hex constant");
+    let field = hex(b"ffffffff00000001000000000000000000000000ffffffffffffffffffffffff");
+    let b = hex(b"5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b");
+    if p.len() != 65 || p[0] != 4 {
+        return false;
+    }
+    let (x, y) = (BigUint::from_bytes_be(&p[1..33]), BigUint::from_bytes_be(&p[33..]));
+    if x >= field || y >= field {
+        return false;
+    }
+    let left = (&y * &y) % &field;
+    // 3 * field is added before 3x is taken off, so that nothing goes below zero.
+    let right = (&x * &x * &x + &field * 3u32 - &x * 3u32 + b) % &field;
+    left == right
+}
+
+/// Whether `p` (32 bytes) encodes a point of Ed25519 of large order: its y
+/// below the field, x^2 = (y^2 - 1) / (d y^2 + 1) a square, and 8 times the
+/// point not the identity (the 8 points of small order would let any
+/// signature be made for them; found by the 1.2.0 audit).
+fn on_ed25519(p: &[u8]) -> bool {
+    use num_bigint::BigUint;
+    let hex = |s: &[u8]| BigUint::parse_bytes(s, 16).expect("a hex constant");
+    let field = hex(b"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed");
+    let d = hex(b"52036cee2b6ffe738cc740797779e89800700a4d4141d8ab75eb4dca135978a3");
+    let (zero, one) = (BigUint::from(0u32), BigUint::from(1u32));
+    let modp = |v: BigUint| v % &field;
+    let inverse = |v: &BigUint| v.modpow(&(&field - 2u32), &field);
+    if p.len() != 32 {
+        return false;
+    }
+    let mut bytes = p.to_vec();
+    let sign = bytes[31] >> 7;
+    bytes[31] &= 0x7f;
+    let y = BigUint::from_bytes_le(&bytes);
+    if y >= field {
+        return false;
+    }
+    // x^2 = u / v; its square root, if it has one (the field is 5 mod 8).
+    let y2 = modp(&y * &y);
+    let u = modp(&y2 + &field - &one);
+    let v = modp(&d * &y2 + &one);
+    let x2 = modp(&u * inverse(&v));
+    let mut x = x2.modpow(&((&field + 3u32) / 8u32), &field);
+    if modp(&x * &x) != x2 {
+        let sqrt_minus_one = BigUint::from(2u32).modpow(&((&field - &one) / 4u32), &field);
+        x = modp(&x * sqrt_minus_one);
+    }
+    if modp(&x * &x) != x2 {
+        return false;
+    }
+    if x == zero && sign == 1 {
+        return false;
+    }
+    if (x.bit(0) as u8) != sign {
+        x = modp(&field - &x);
+    }
+    // Three doublings (a = -1): x' = 2xy / (y^2 - x^2), y' = (y^2 + x^2) / (2 - y^2 + x^2).
+    let (mut x, mut y) = (x, y);
+    for _ in 0..3 {
+        let (xx, yy) = (modp(&x * &x), modp(&y * &y));
+        let xy2 = modp(&x * &y * 2u32);
+        let x_den = modp(&yy + &field - &xx);
+        let y_den = modp(BigUint::from(2u32) + &field - &yy + &xx);
+        if x_den == zero || y_den == zero {
+            return false;
+        }
+        x = modp(&xy2 * inverse(&x_den));
+        y = modp((&yy + &xx) * inverse(&y_den));
+    }
+    !(x == zero && y == one)
+}
+
+/// `SubjectPublicKeyInfo` of an RSA, P-256 or Ed25519 key. `None` when the
+/// DER is not that; the error when the numbers in it are not a key.
+fn spki(der: &[u8]) -> Option<Result<(Alg, Public), &'static str>> {
     let (tag, seq, rest) = tlv(der)?;
     if tag != 0x30 || !rest.is_empty() {
         return None;
@@ -242,15 +336,17 @@ fn spki(der: &[u8]) -> Option<(Alg, Public)> {
         return None;
     }
     match oid {
-        OID_RSA => Some((Alg::Rs256, rsa_public(key)?)),
+        OID_RSA => Some(rsa_public(key)?.map(|p| (Alg::Rs256, p))),
         OID_EC => {
             let (tag, curve, rest) = tlv(params)?;
             if tag != 0x06 || curve != OID_P256 || !rest.is_empty() || key.len() != 65 || key[0] != 4 {
                 return None;
             }
-            Some((Alg::Es256, Public::Ec(key.to_vec())))
+            Some(if on_p256(key) { Ok((Alg::Es256, Public::Ec(key.to_vec()))) } else { Err(EC_POINT) })
         }
-        OID_ED25519 if params.is_empty() && key.len() == 32 => Some((Alg::EdDsa, Public::Ed(key.to_vec()))),
+        OID_ED25519 if params.is_empty() && key.len() == 32 => {
+            Some(if on_ed25519(key) { Ok((Alg::EdDsa, Public::Ed(key.to_vec()))) } else { Err(ED_POINT) })
+        }
         _ => None,
     }
 }
@@ -352,11 +448,11 @@ pub(crate) fn from_pem(text: &str, kid: Option<String>) -> Result<JwtKey, String
             .map_err(|_| refused())
         }
         "PUBLIC KEY" => {
-            let (alg, public) = spki(&der).ok_or_else(refused)?;
+            let (alg, public) = spki(&der).ok_or_else(refused)??;
             Ok(JwtKey { alg, kid, public, private: None })
         }
         "RSA PUBLIC KEY" => {
-            let public = rsa_public(&der).ok_or_else(refused)?;
+            let public = rsa_public(&der).ok_or_else(refused)??;
             Ok(JwtKey { alg: Alg::Rs256, kid, public, private: None })
         }
         "ENCRYPTED PRIVATE KEY" => Err("the key is encrypted; decrypt it first (openssl pkcs8 -topk8 -nocrypt)".into()),
@@ -417,7 +513,7 @@ pub(crate) fn from_jwk(m: &Map) -> Result<JwtKey, String> {
         Some(_) => return Err(format!("the JWK's \"kid\" must be a string of 1 to {MAX_KID} bytes")),
     };
     let (alg, public) = match kty {
-        "RSA" => (Alg::Rs256, rsa_checked(b64(m, "n")?, b64(m, "e")?).ok_or("the RSA key is not 2048 to 8192 bits")?),
+        "RSA" => (Alg::Rs256, rsa_checked(b64(m, "n")?, b64(m, "e")?)?),
         "EC" => {
             if key_str(m, "crv") != Some("P-256") {
                 return Err("only EC keys on the P-256 curve are supported".into());
@@ -426,7 +522,11 @@ pub(crate) fn from_jwk(m: &Map) -> Result<JwtKey, String> {
             if x.len() != 32 || y.len() != 32 {
                 return Err("the P-256 key's x and y must be 32 bytes".into());
             }
-            (Alg::Es256, Public::Ec([&[4u8][..], &x, &y].concat()))
+            let point = [&[4u8][..], &x, &y].concat();
+            if !on_p256(&point) {
+                return Err(EC_POINT.into());
+            }
+            (Alg::Es256, Public::Ec(point))
         }
         "OKP" => {
             if key_str(m, "crv") != Some("Ed25519") {
@@ -435,6 +535,9 @@ pub(crate) fn from_jwk(m: &Map) -> Result<JwtKey, String> {
             let x = b64(m, "x")?;
             if x.len() != 32 {
                 return Err("the Ed25519 key's x must be 32 bytes".into());
+            }
+            if !on_ed25519(&x) {
+                return Err(ED_POINT.into());
             }
             (Alg::EdDsa, Public::Ed(x))
         }
@@ -1150,6 +1253,7 @@ mod tests {
         assert!(tlv(&[0x30, 0x84, 0, 0, 0, 1, 0]).is_none());
         assert!(tlv(&[0x30, 0x82, 0xff, 0xff]).is_none());
         assert!(spki(&[]).is_none());
+        assert!(rsa_public(&[]).is_none());
         assert!(from_pem("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----", None).is_err());
         assert!(from_secret(b"short", None).is_err());
     }
@@ -1159,11 +1263,11 @@ mod tests {
     /// other short key, and a key set skips it.
     #[test]
     fn rsa_keys_with_a_zero_modulus_are_refused() {
-        assert!(rsa_checked(vec![], vec![1, 0, 1]).is_none());
-        assert!(rsa_checked(vec![0, 0, 0], vec![1, 0, 1]).is_none());
-        assert!(rsa_checked(vec![0x80; 256], vec![]).is_none(), "no exponent");
-        assert!(rsa_checked(vec![0x80; 256], vec![1, 0, 1]).is_some(), "2048 bits");
-        assert!(rsa_checked(vec![0x7f; 256], vec![1, 0, 1]).is_none(), "2047 bits");
+        assert_eq!(rsa_checked(vec![], vec![1, 0, 1]).err(), Some(RSA_BITS));
+        assert_eq!(rsa_checked(vec![0, 0, 0], vec![1, 0, 1]).err(), Some(RSA_BITS));
+        assert_eq!(rsa_checked(vec![0x80; 256], vec![]).err(), Some(RSA_EXPONENT), "no exponent");
+        assert!(rsa_checked(vec![0x80; 256], vec![1, 0, 1]).is_ok(), "2048 bits");
+        assert_eq!(rsa_checked(vec![0x7f; 256], vec![1, 0, 1]).err(), Some(RSA_BITS), "2047 bits");
         // RSAPublicKey { modulus 0, publicExponent 65537 }, in PEM.
         let pem = "-----BEGIN RSA PUBLIC KEY-----\nMAgCAQACAwEAAQ==\n-----END RSA PUBLIC KEY-----\n";
         assert!(from_pem(pem, None).is_err());
@@ -1177,5 +1281,106 @@ mod tests {
         let doc = format!(r#"{{"keys":[{},{{"kty":"RSA","n":"AA","e":"AQAB"}}]}}"#, ec.public_jwk().unwrap());
         let keys = from_jwks(None, &doc).unwrap_or_else(|_| panic!("no limits")).unwrap();
         assert_eq!(keys.len(), 1, "the zero key is skipped");
+    }
+
+    fn jwk_map(jwk: &str) -> Map {
+        let v = crate::web::json_decode(jwk);
+        let Ok(Value::Map(m)) = &v else { panic!("not a JSON map: {jwk}") };
+        (**m).clone()
+    }
+
+    /// An RSA key whose exponent ring would refuse at every verification
+    /// (even, below 3, or above 2^33 - 1; found by the 17th assessment: such
+    /// a key loaded and never verified anything) is refused when loaded.
+    #[test]
+    fn rsa_keys_with_a_degenerate_exponent_are_refused() {
+        let n = vec![0x80; 256];
+        for e in [vec![1], vec![2], vec![0, 1], vec![1, 0, 0], vec![4], vec![2, 0, 0, 0, 1], vec![1, 0, 0, 0, 0, 1]] {
+            assert_eq!(rsa_checked(n.clone(), e.clone()).err(), Some(RSA_EXPONENT), "e = {e:?}");
+        }
+        for e in [vec![3], vec![1, 0, 1], vec![0, 1, 0, 1], vec![1, 0xff, 0xff, 0xff, 0xff]] {
+            assert!(rsa_checked(n.clone(), e.clone()).is_ok(), "e = {e:?}");
+        }
+        let n_b64 = URL_SAFE_NO_PAD.encode(&n);
+        let jwk = |e: &str| jwk_map(&format!(r#"{{"kty":"RSA","n":"{n_b64}","e":"{e}"}}"#));
+        assert_eq!(from_jwk(&jwk("AQ")).err().as_deref(), Some(RSA_EXPONENT), "e = 1");
+        assert_eq!(from_jwk(&jwk("Ag")).err().as_deref(), Some(RSA_EXPONENT), "e = 2");
+        assert!(from_jwk(&jwk("AQAB")).is_ok(), "e = 65537");
+        // RSAPublicKey { modulus of 2048 bits, publicExponent 1 }, in PEM.
+        let mut der = vec![0x30, 0x82, 0x01, 0x08, 0x02, 0x82, 0x01, 0x01, 0x00];
+        der.extend_from_slice(&n);
+        der.extend_from_slice(&[0x02, 0x01, 0x01]);
+        let err = from_pem(&pem_of("RSA PUBLIC KEY", &der), None).err();
+        assert_eq!(err.as_deref(), Some(RSA_EXPONENT));
+    }
+
+    /// Points off the curve, and the Ed25519 points of small order, are
+    /// refused when loaded; real keys pass (found by the 17th assessment).
+    #[test]
+    fn ec_and_ed25519_keys_off_the_curve_are_refused() {
+        let ec = ec_key();
+        let ed = ed_key();
+        for key in [&ec, &ed] {
+            let m = jwk_map(&key.public_jwk().unwrap());
+            assert!(from_jwk(&m).is_ok(), "{}", key.alg.name());
+        }
+        let Public::Ec(point) = &ec.public else { panic!("not an EC key") };
+        assert!(on_p256(point));
+        let mut off = point.clone();
+        off[64] ^= 1;
+        assert!(!on_p256(&off), "y + 1");
+        let b = |v: &[u8]| URL_SAFE_NO_PAD.encode(v);
+        for (x, y) in [(&off[1..33], &off[33..]), (&[0u8; 32][..], &[0u8; 32][..]), (&[0xffu8; 32][..], &point[33..])] {
+            let m = jwk_map(&format!(r#"{{"kty":"EC","crv":"P-256","x":"{}","y":"{}"}}"#, b(x), b(y)));
+            assert_eq!(from_jwk(&m).err().as_deref(), Some(EC_POINT));
+        }
+        let Public::Ed(point) = &ed.public else { panic!("not an Ed25519 key") };
+        assert!(on_ed25519(point));
+        let mut small = [[0u8; 32]; 8];
+        small[1][0] = 1; // the identity
+        small[2][0] = 0xec; // y = -1
+        small[2][1..31].fill(0xff);
+        small[2][31] = 0x7f;
+        small[3][31] = 0x80; // y = 0, x negative
+                             // The four points of order 8.
+        for (i, hex) in [
+            "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+            "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+            "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+            "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+        ]
+        .iter()
+        .enumerate()
+        {
+            for (j, byte) in small[4 + i].iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&hex[2 * j..2 * j + 2], 16).unwrap();
+            }
+        }
+        for (i, p) in small.iter().enumerate() {
+            assert!(!on_ed25519(p), "small-order point {i}");
+            let m = jwk_map(&format!(r#"{{"kty":"OKP","crv":"Ed25519","x":"{}"}}"#, b(p)));
+            assert_eq!(from_jwk(&m).err().as_deref(), Some(ED_POINT), "small-order point {i}");
+        }
+        // y at or above the field, and a y whose x^2 has no square root.
+        let mut big = [0xffu8; 32];
+        big[31] = 0x7f;
+        assert!(!on_ed25519(&big), "y = 2^255 - 1");
+        let mut p_plus_one = [0u8; 32];
+        p_plus_one[0] = 0xee;
+        p_plus_one[1..31].fill(0xff);
+        p_plus_one[31] = 0x7f;
+        assert!(!on_ed25519(&p_plus_one), "y = p + 1");
+        let mut two = [0u8; 32];
+        two[0] = 2;
+        let mut three = [0u8; 32];
+        three[0] = 3;
+        assert!(!on_ed25519(&two) || !on_ed25519(&three), "one of y = 2 and y = 3 is off the curve");
+        // The public key of every generated key passes.
+        for _ in 0..8 {
+            let Public::Ed(p) = &ed_key().public else { panic!("not an Ed25519 key") };
+            assert!(on_ed25519(p));
+            let Public::Ec(p) = &ec_key().public else { panic!("not an EC key") };
+            assert!(on_p256(p));
+        }
     }
 }

@@ -54,6 +54,13 @@ pub fn sqlite_kept_stats() -> (usize, u64, u64, usize) {
 pub fn sqlite_set_kept_idle(idle: Option<std::time::Duration>) {
     db::set_kept_idle(idle)
 }
+
+/// How much memory the idle SQLite connections may hold together (`None`:
+/// 64 MB). For tests.
+#[doc(hidden)]
+pub fn sqlite_set_kept_bytes(bytes: Option<usize>) {
+    db::set_kept_bytes(bytes)
+}
 pub mod wsserver;
 
 pub use asyncio::running as async_running;

@@ -57,6 +57,8 @@ regex-automata = { version = "0.4", default-features = false, features = ["std",
 url = "2"
 chrono-tz = "0.10"
 ring = "0.17"
+# Already built for mysql: checks the points of EC and Ed25519 JWT keys at load.
+num-bigint = { version = "0.4", default-features = false, features = ["std"] }
 mysql = { version = "28.0.4", default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }

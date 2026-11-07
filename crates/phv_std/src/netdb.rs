@@ -937,9 +937,109 @@ fn pg_run<T>(
     Ok(r)
 }
 
+/// The first `n` words of a statement, in upper case, after any leading
+/// comments (`--`, `#`, `/* */`; a MySQL `/*! */` is run, so its words count).
+/// Comments may also stand between words (`XA/**/PREPARE`), so they are
+/// separators wherever they are; PostgreSQL nests `/* */` comments (`nested`),
+/// MySQL ends one at the first `*/`.
+fn leading_words(text: &str, n: usize, nested: bool) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut words: Vec<String> = Vec::new();
+    let mut word: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < b.len() && words.len() < n {
+        let rest = &b[i..];
+        let end_word = |word: &mut Vec<u8>, words: &mut Vec<String>| {
+            if !word.is_empty() {
+                words.push(String::from_utf8_lossy(word).to_ascii_uppercase());
+                word.clear();
+            }
+        };
+        if rest.starts_with(b"/*!") {
+            // MySQL runs the words inside: only the opener and its version number go.
+            end_word(&mut word, &mut words);
+            i += 3;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else if rest.starts_with(b"/*") {
+            end_word(&mut word, &mut words);
+            let mut depth = 1;
+            i += 2;
+            while i < b.len() && depth > 0 {
+                if nested && b[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if b[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        } else if rest.starts_with(b"*/") {
+            end_word(&mut word, &mut words);
+            i += 2;
+        } else if rest.starts_with(b"--") || b[i] == b'#' {
+            end_word(&mut word, &mut words);
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if b[i].is_ascii_whitespace() || b[i] == b';' || b[i] == b'(' {
+            end_word(&mut word, &mut words);
+            i += 1;
+        } else {
+            word.push(b[i]);
+            i += 1;
+        }
+    }
+    if words.len() < n && !word.is_empty() {
+        words.push(String::from_utf8_lossy(&word).to_ascii_uppercase());
+    }
+    words
+}
+
+/// Why a script may not run `text` on a server of `kind`, if it may not:
+/// a statement that prepares a transaction for a two-phase commit leaves it
+/// on the server when the script ends, with its locks, until someone ends it
+/// by name, also after a restart (the reset of a pooled connection does not:
+/// MySQL detaches a prepared XA transaction from its connection; found by the
+/// 1.2 audit), and `LOAD DATA LOCAL INFILE` would send the server a file of
+/// this host.
+fn refused_statement(text: &str, kind: Kind) -> Option<String> {
+    let words = leading_words(text, 4, matches!(kind, Kind::Postgres));
+    let word = |i: usize| words.get(i).map_or("", String::as_str);
+    let two = (word(0), word(1));
+    match kind {
+        Kind::MySql if two == ("XA", "PREPARE") => Some(
+            "XA PREPARE is not allowed: a prepared transaction would keep its locks after the script \
+             until XA ROLLBACK or XA COMMIT ends it"
+                .into(),
+        ),
+        Kind::MySql if two == ("LOAD", "DATA") && words.iter().any(|w| w == "LOCAL") => {
+            Some("LOAD DATA LOCAL INFILE is not allowed: it would send the server a file of this host".into())
+        }
+        Kind::Postgres if two == ("PREPARE", "TRANSACTION") => Some(
+            "PREPARE TRANSACTION is not allowed: a prepared transaction would keep its locks after the script \
+             until ROLLBACK PREPARED or COMMIT PREPARED ends it"
+                .into(),
+        ),
+        _ => None,
+    }
+}
+
+/// `refused_statement` as the script's error.
+fn check_statement(vm: &Vm, text: &str, kind: Kind) -> Result<(), VmError> {
+    match refused_statement(text, kind) {
+        Some(why) => Err(vm.throw("DatabaseError", why)),
+        None => Ok(()),
+    }
+}
+
 /// Runs a script's statement through the kept statements (`with_statement`),
 /// then notes what it did to the transaction and the schema (`pg_text`).
 fn pg_statement<T>(vm: &Vm, c: &mut Pooled<PgConn>, text: &str, run: RunStatement<'_, T>) -> Result<T, VmError> {
+    check_statement(vm, text, Kind::Postgres)?;
     let kind = pg_text(text);
     let in_transaction = c.depth > 0 || c.get().in_own_transaction;
     let r =
@@ -1663,6 +1763,22 @@ fn my_limit_time(vm: &Vm, c: &mut Pooled<MyConn>) -> Result<(), VmError> {
     my_set_timeout(c, left).map_err(|e| my_error(vm, c, e))
 }
 
+/// Runs one statement of PHV's own on a script's connection, with the
+/// script's limits (stopped at its deadline with `KILL QUERY`).
+fn my_run<T>(
+    vm: &Vm,
+    c: &mut Pooled<MyConn>,
+    run: impl FnOnce(&mut mysql::Conn) -> Result<T, mysql::Error>,
+) -> Result<T, VmError> {
+    my_limit_time(vm, c)?;
+    let kill = my_kill_at(vm, c);
+    let r = run(&mut c.get().conn);
+    if kill.disarm() {
+        c.broken = true;
+    }
+    r.map_err(|e| my_error(vm, c, e))
+}
+
 fn my_params(params: &[Value]) -> mysql::Params {
     if params.is_empty() {
         return mysql::Params::Empty;
@@ -1713,6 +1829,7 @@ fn my_query(vm: &mut Vm, c: &mut Pooled<MyConn>, q: &Value) -> R {
     use mysql::prelude::Queryable;
     let (text, params) = parts(q);
     let text = render_sql(text, Dialect::MySql);
+    check_statement(vm, &text, Kind::MySql)?;
     my_limit_time(vm, c)?;
     let kill = my_kill_at(vm, c);
     let mut out = ResultRows::new(Vec::new());
@@ -1762,6 +1879,7 @@ fn my_execute(vm: &mut Vm, c: &mut Pooled<MyConn>, q: &Value) -> R {
     use mysql::prelude::Queryable;
     let (text, params) = parts(q);
     let text = render_sql(text, Dialect::MySql);
+    check_statement(vm, &text, Kind::MySql)?;
     my_limit_time(vm, c)?;
     let kill = my_kill_at(vm, c);
     let mut r = c.get().conn.exec_drop(&text, my_params(params));
@@ -1882,6 +2000,7 @@ pub fn start_query(vm: &mut Vm, a: &[Value]) -> R {
     match kind_of(&url) {
         Kind::Postgres => {
             let text = render_sql(text, Dialect::Postgres);
+            check_statement(vm, &text, Kind::Postgres)?;
             let params: Vec<PgParam> = params.iter().map(PgParam::new).collect();
             crate::asyncio::start(vm, until, pool, move || {
                 let r = pg_detached(&spec, &url, &text, &params, execute, until, budget);
@@ -1890,6 +2009,7 @@ pub fn start_query(vm: &mut Vm, a: &[Value]) -> R {
         }
         Kind::MySql => {
             let text = render_sql(text, Dialect::MySql);
+            check_statement(vm, &text, Kind::MySql)?;
             let params = my_params(params);
             crate::asyncio::start(vm, until, pool, move || {
                 let r = my_detached(&spec, &url, &text, params, execute, until, budget);
@@ -3950,6 +4070,142 @@ fn pg_job_insert(
     Ok((n > 0).then_some(()))
 }
 
+/// What adding a job with a key inside a script's transaction came to.
+enum TxInsert {
+    Added,
+    /// The key is taken: nothing was added.
+    Taken,
+    /// The key is held by a transaction that has not ended.
+    Held,
+}
+
+/// The savepoint around a job with a key added inside a script's transaction.
+const JOB_SAVEPOINT: &str = "phv_job_key";
+
+/// Adds a job with a key inside a script's transaction (PostgreSQL), waiting
+/// for a key that another open transaction holds `wait_ms` at most, as
+/// outside a transaction (found by the 1.2 audit: it waited until that
+/// transaction ended or the script's time limit, holding the store's lock).
+/// The insert runs in a savepoint with a `lock_timeout` of its own (the
+/// transaction's own, when that is shorter): a held key leaves the
+/// transaction usable, with its `lock_timeout` as it was. When the job was
+/// added, the savepoint is still open and the `lock_timeout` is still set:
+/// the caller ends them (`pg_job_tx_end`) once it knows the job fits. Returns
+/// what was done and the transaction's own `lock_timeout` (ms).
+#[allow(clippy::too_many_arguments)]
+fn pg_job_tx_insert(
+    conn: &mut PgConn,
+    t: &str,
+    job: (&str, &str, &str),
+    run_at: i64,
+    uniq: &str,
+    now: i64,
+    prelude: Option<&str>,
+    wait_ms: u128,
+) -> Result<(TxInsert, u64), postgres::Error> {
+    use tokio_postgres::SimpleQueryMessage;
+    let set = prelude.map(|p| format!("{p}; ")).unwrap_or_default();
+    // `s.v` is read before `set_config` runs: the transaction's own value.
+    let sql = format!(
+        "{set}SAVEPOINT {JOB_SAVEPOINT}; \
+         SELECT set_config('lock_timeout', (CASE WHEN s.v > 0 AND s.v < {wait_ms} THEN s.v ELSE {wait_ms} END)::text, \
+         true), s.v::text FROM (SELECT setting::bigint AS v FROM pg_settings WHERE name = 'lock_timeout') s"
+    );
+    let messages = conn.client.run(None, conn.client.client().simple_query(&sql))?;
+    let old: u64 = messages
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) if r.len() == 2 => r.get(1),
+            _ => None,
+        })
+        .next_back()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    match pg_job_insert(conn, t, true, job, run_at, Some(uniq), now, None) {
+        Ok(Some(())) => Ok((TxInsert::Added, old)),
+        Ok(None) => {
+            pg_job_tx_end(conn, true, old, None)?;
+            Ok((TxInsert::Taken, old))
+        }
+        Err(e) if e.code() == Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {
+            pg_job_tx_end(conn, false, old, None)?;
+            Ok((TxInsert::Held, old))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Ends the savepoint of `pg_job_tx_insert`: released when the job is
+/// `kept`, else rolled back to (which also puts the `lock_timeout` back).
+fn pg_job_tx_end(
+    conn: &mut PgConn,
+    kept: bool,
+    old_lock_timeout: u64,
+    prelude: Option<&str>,
+) -> Result<(), postgres::Error> {
+    let set = prelude.map(|p| format!("{p}; ")).unwrap_or_default();
+    let sql = if kept {
+        format!("{set}RELEASE SAVEPOINT {JOB_SAVEPOINT}; SET LOCAL lock_timeout = {old_lock_timeout}")
+    } else {
+        format!("{set}ROLLBACK TO SAVEPOINT {JOB_SAVEPOINT}; RELEASE SAVEPOINT {JOB_SAVEPOINT}")
+    };
+    conn.client.batch_execute(&sql)
+}
+
+/// What a look at a job's key came to (MySQL).
+enum KeyProbe {
+    Free,
+    Taken,
+    Held,
+}
+
+/// Looks for the key `u` in table `t` without waiting (`FOR UPDATE NOWAIT`):
+/// a key another transaction added and has not committed is `Held`.
+fn my_key_probe(conn: &mut mysql::Conn, t: &str, u: &str) -> Result<KeyProbe, mysql::Error> {
+    use mysql::prelude::Queryable;
+    let probe = format!("SELECT id FROM {t} WHERE uniq = ? FOR UPDATE NOWAIT");
+    match conn.exec_first::<String, _, _>(probe, (u,)) {
+        Ok(Some(_)) => Ok(KeyProbe::Taken),
+        Ok(None) => Ok(KeyProbe::Free),
+        // 3572: the row is locked (MySQL); 1205: the same in MariaDB.
+        Err(mysql::Error::MySqlError(e)) if e.code == 3572 || e.code == 1205 => Ok(KeyProbe::Held),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a script's transaction sees the key `u` in table `t` (MySQL): a
+/// plain read, which takes no lock, and sees the transaction's own jobs.
+fn my_key_seen(conn: &mut mysql::Conn, t: &str, u: &str) -> Result<bool, mysql::Error> {
+    use mysql::prelude::Queryable;
+    let seen: Option<String> = conn.exec_first(format!("SELECT id FROM {t} WHERE uniq = ?"), (u,))?;
+    Ok(seen.is_some())
+}
+
+/// `my_key_probe` on a connection of the store, taken for this one look
+/// (`PoolUse::JobKey`): a statement of its own, so the look leaves no lock
+/// behind. Inside a script's transaction the probe cannot run on the
+/// script's connection: with no row found it would lock the gap of the key's
+/// index until the transaction ends, where the jobs without a key go, so
+/// every other add of the site would wait for the transaction (found by the
+/// 1.2 tests, the shape of the 1.1.1 finding).
+fn my_key_probe_store(
+    spec: &DatabaseSpec,
+    ns: Option<&str>,
+    t: &str,
+    u: &str,
+    until: Instant,
+) -> Result<KeyProbe, String> {
+    let (mut conn, _) = job_conn_for(spec, ns, Some(until), PoolUse::JobKey)?;
+    match &mut conn {
+        SessionConn::My(c) => {
+            let conn = c.get();
+            let w = conn.watch();
+            my_key_probe(&mut conn.conn, t, u).map_err(|e| w.msg(e))
+        }
+        _ => Err("the job store is not a MySQL server".into()),
+    }
+}
+
 /// Adds a job on a connection of the store, by `until`.
 ///
 /// A job with a key first looks for the key without waiting (`NOWAIT`), and
@@ -3992,16 +4248,12 @@ fn my_job_try_insert(
     uniq: Option<&str>,
     now: i64,
 ) -> Result<Tried, String> {
-    use mysql::prelude::Queryable;
     let w = conn.watch();
     if let Some(u) = uniq {
-        let probe = format!("SELECT id FROM {t} WHERE uniq = ? FOR UPDATE NOWAIT");
-        match conn.conn.exec_first::<String, _, _>(probe, (u,)) {
-            Ok(Some(_)) => return Ok(Tried::Done(None)),
-            Ok(None) => {}
-            // 3572: the row is locked (MySQL); 1205: the same in MariaDB.
-            Err(mysql::Error::MySqlError(e)) if e.code == 3572 || e.code == 1205 => return Ok(Tried::Held),
-            Err(e) => return Err(w.msg(e)),
+        match my_key_probe(&mut conn.conn, t, u).map_err(|e| w.msg(e))? {
+            KeyProbe::Taken => return Ok(Tried::Done(None)),
+            KeyProbe::Held => return Ok(Tried::Held),
+            KeyProbe::Free => {}
         }
     }
     my_job_insert_on(&mut conn.conn, t, job, run_at, uniq, now).map(Tried::Done).map_err(|e| w.msg(e))
@@ -4114,6 +4366,17 @@ fn job_tx_load(
 /// once, when the transaction first takes the lock (`job_tx_load`), and what
 /// it adds is added to it (found by the 1.1.1 audit: near the cap each
 /// `enqueue()` of a transaction counted the table again).
+///
+/// A job with a key that another open transaction holds is waited for as
+/// outside a transaction: no longer than the script may still run, 10 seconds
+/// at most (`JOB_WAIT`), then `KEY_HELD`; and before the store's lock is
+/// taken, so a waiting page holds no other add of the site (found by the 1.2
+/// audit: the wait lasted until that transaction ended or the time limit,
+/// with the store's lock held). PostgreSQL waits on the insert itself, with a
+/// `lock_timeout` in a savepoint (`pg_job_tx_insert`); MySQL looks at the key
+/// without waiting, on a connection of the store, again a little later
+/// (`my_key_probe_store`; at most `JOB_KEY_WAITERS` such waits at once, as
+/// outside a transaction).
 pub(crate) fn job_add_in_transaction(
     vm: &mut Vm,
     spec: &DatabaseSpec,
@@ -4144,21 +4407,65 @@ pub(crate) fn job_add_in_transaction(
     let count_key = job_count_key(spec, &t);
     // Whether the job fits, with what the transaction added so far.
     let fits = |tx: &JobsTx| !tx.held.plus(tx.added).full(cap, size);
+    // How long a held key is waited for: as outside a transaction.
+    let wait = vm.deadline().map_or(JOB_WAIT, |d| d.saturating_duration_since(Instant::now()).min(JOB_WAIT));
+    let key_held = || vm.check_limits().and_then(|_| Err(vm.throw("DatabaseError", format!("enqueue(): {KEY_HELD}"))));
     let r = match &mut *link {
         Link::Pg(c) => {
             if !(c.depth > 0 || c.get().in_own_transaction) {
                 return None;
             }
             (|| {
-                pg_run(vm, c, |c, prelude| pg_job_lock(c.get(), &t, prelude))?;
+                // A job with a key is added first, in a savepoint: the
+                // transaction's `lock_timeout`, to put back with the next
+                // statement, while the savepoint is open.
+                let mut saved = None;
+                if let Some(u) = uniq {
+                    let wait_ms = wait.as_millis().max(1);
+                    let (r, old) = pg_run(vm, c, |c, prelude| {
+                        pg_job_tx_insert(c.get(), &t, job, run_at, u, now, prelude, wait_ms)
+                    })?;
+                    match r {
+                        TxInsert::Taken => return Ok(None),
+                        TxInsert::Held => return key_held(),
+                        TxInsert::Added => saved = Some(old),
+                    }
+                }
+                let restore = saved.map(|old| format!("SET LOCAL lock_timeout = {old}"));
+                let end = |c: &mut Pooled<PgConn>, kept: bool| {
+                    pg_run(vm, c, |c, prelude| pg_job_tx_end(c.get(), kept, saved.unwrap_or(0), prelude))
+                };
+                pg_run(vm, c, |c, prelude| {
+                    let prelude = preludes(prelude, restore.as_deref());
+                    pg_job_lock(c.get(), &t, prelude.as_deref())
+                })?;
                 if c.get().jobs_tx.is_none() {
-                    let held = held()?;
+                    let held = match held() {
+                        Ok(held) => held,
+                        Err(e) => {
+                            if saved.is_some() {
+                                let _ = end(c, false);
+                            }
+                            return Err(e);
+                        }
+                    };
                     c.get().jobs_tx = Some(JobsTx { held, added: JobLoad::default(), count_key });
                 }
                 if !c.get().jobs_tx.as_ref().is_some_and(fits) {
+                    if saved.is_some() {
+                        end(c, false)?;
+                    }
                     return Err(full());
                 }
-                let r = pg_run(vm, c, |c, prelude| pg_job_insert(c.get(), &t, true, job, run_at, uniq, now, prelude))?;
+                let r = match saved {
+                    Some(_) => {
+                        end(c, true)?;
+                        Some(())
+                    }
+                    None => {
+                        pg_run(vm, c, |c, prelude| pg_job_insert(c.get(), &t, true, job, run_at, uniq, now, prelude))?
+                    }
+                };
                 if let (Some(()), Some(tx)) = (r, c.get().jobs_tx.as_mut()) {
                     tx.added = tx.added.plus(JobLoad::one(size));
                 }
@@ -4166,13 +4473,40 @@ pub(crate) fn job_add_in_transaction(
             })()
         }
         Link::My(c) if c.depth > 0 => (|| {
-            my_limit_time(vm, c)?;
-            let kill = my_kill_at(vm, c);
-            let r = my_job_lock(&mut c.get().conn, &t);
-            if kill.disarm() {
-                c.broken = true;
+            if let Some(u) = uniq {
+                // A key the transaction sees (its own jobs too): nothing to add.
+                if my_run(vm, c, |conn| my_key_seen(conn, &t, u))? {
+                    return Ok(None);
+                }
+                let until = Instant::now() + wait;
+                let mut pause = Duration::from_millis(10);
+                let mut waiting = None;
+                loop {
+                    vm.check_limits()?;
+                    let probe = my_key_probe_store(spec, ns.as_deref(), &t, u, until)
+                        .map_err(|e| vm.throw("DatabaseError", format!("enqueue(): {e}")))?;
+                    match probe {
+                        KeyProbe::Taken => return Ok(None),
+                        KeyProbe::Free => break,
+                        KeyProbe::Held => {
+                            if waiting.is_none() {
+                                let place = KeyWaiter::take(&count_key).ok_or_else(|| {
+                                    let why =
+                                        format!("{KEY_HELD} ({JOB_KEY_WAITERS} other adds wait for held keys already)");
+                                    vm.throw("DatabaseError", format!("enqueue(): {why}"))
+                                })?;
+                                waiting = Some(place);
+                            }
+                            if Instant::now() + pause >= until {
+                                return key_held();
+                            }
+                            std::thread::sleep(pause);
+                            pause = (pause * 2).min(Duration::from_millis(200));
+                        }
+                    }
+                }
             }
-            r.map_err(|e| my_error(vm, c, e))?;
+            my_run(vm, c, |conn| my_job_lock(conn, &t))?;
             if c.get().jobs_tx.is_none() {
                 let held = held()?;
                 c.get().jobs_tx = Some(JobsTx { held, added: JobLoad::default(), count_key });
@@ -4180,13 +4514,7 @@ pub(crate) fn job_add_in_transaction(
             if !c.get().jobs_tx.as_ref().is_some_and(fits) {
                 return Err(full());
             }
-            my_limit_time(vm, c)?;
-            let kill = my_kill_at(vm, c);
-            let r = my_job_insert_on(&mut c.get().conn, &t, job, run_at, uniq, now);
-            if kill.disarm() {
-                c.broken = true;
-            }
-            let r = r.map_err(|e| my_error(vm, c, e))?;
+            let r = my_run(vm, c, |conn| my_job_insert_on(conn, &t, job, run_at, uniq, now))?;
             if let (Some(()), Some(tx)) = (r, c.get().jobs_tx.as_mut()) {
                 tx.added = tx.added.plus(JobLoad::one(size));
             }
@@ -4195,6 +4523,16 @@ pub(crate) fn job_add_in_transaction(
         _ => return None,
     };
     Some(r)
+}
+
+/// `first` and `then` as one prelude (see `PgClient::run`).
+fn preludes(first: Option<&str>, then: Option<&str>) -> Option<String> {
+    match (first, then) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        (None, None) => None,
+    }
 }
 
 /// Makes sure the store's table exists (before a script's transaction adds to it:
@@ -5086,6 +5424,52 @@ mod tests {
         let mut b = bytes::BytesMut::new();
         for bad in ["", ".", "1e5", "abc", "1.2.3", "--1"] {
             assert!(numeric_encode(bad, &mut b).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn prepared_transactions_are_refused() {
+        for (text, kind) in [
+            ("XA PREPARE 'x'", Kind::MySql),
+            ("  xa\tprepare 'x';", Kind::MySql),
+            ("/* two phase */ XA PREPARE 'x'", Kind::MySql),
+            ("-- a note\nXA PREPARE 'x'", Kind::MySql),
+            ("# a note\nXA PREPARE 'x'", Kind::MySql),
+            ("/*!50000 XA PREPARE 'x' */", Kind::MySql),
+            ("XA/**/PREPARE 'x'", Kind::MySql),
+            ("XA/* a */PREPARE/* b */'x'", Kind::MySql),
+            ("XA-- a note\nPREPARE 'x'", Kind::MySql),
+            ("XA#a note\nPREPARE 'x'", Kind::MySql),
+            // MySQL ends a comment at the first `*/`: the statement is XA PREPARE.
+            ("/* /* */ XA PREPARE 'x'", Kind::MySql),
+            ("LOAD DATA LOCAL INFILE '/etc/passwd' INTO TABLE t", Kind::MySql),
+            ("LOAD/**/DATA/**/LOCAL INFILE 'f' INTO TABLE t", Kind::MySql),
+            ("PREPARE/**/TRANSACTION 'x'", Kind::Postgres),
+            // PostgreSQL nests comments: the statement after the comment is PREPARE TRANSACTION.
+            ("/* /* */ SELECT 1 */ PREPARE TRANSACTION 'x'", Kind::Postgres),
+            ("LOAD DATA LOW_PRIORITY LOCAL INFILE 'f' INTO TABLE t", Kind::MySql),
+            ("PREPARE TRANSACTION 'x'", Kind::Postgres),
+            ("prepare transaction 'x'", Kind::Postgres),
+        ] {
+            assert!(refused_statement(text, kind).is_some_and(|why| why.contains("is not allowed")), "{text}");
+        }
+        for (text, kind) in [
+            ("XA START 'x'", Kind::MySql),
+            ("XA COMMIT 'x' ONE PHASE", Kind::MySql),
+            ("XA ROLLBACK 'x'", Kind::MySql),
+            ("XA RECOVER", Kind::MySql),
+            ("PREPARE s FROM 'SELECT 1'", Kind::MySql),
+            ("LOAD DATA INFILE '/tmp/f' INTO TABLE t", Kind::MySql),
+            ("SELECT 'XA PREPARE'", Kind::MySql),
+            ("INSERT INTO t VALUES ('PREPARE TRANSACTION')", Kind::Postgres),
+            ("PREPARE s AS SELECT 1", Kind::Postgres),
+            ("/* /* */ PREPARE TRANSACTION */ SELECT 2", Kind::Postgres),
+            ("COMMIT PREPARED 'x'", Kind::Postgres),
+            ("ROLLBACK PREPARED 'x'", Kind::Postgres),
+            ("XA PREPARE 'x'", Kind::Postgres),
+            ("PREPARE TRANSACTION 'x'", Kind::MySql),
+        ] {
+            assert!(refused_statement(text, kind).is_none(), "{text}");
         }
     }
 

@@ -79,7 +79,7 @@ class Response
 - `public function redirectExternal(string $url, int $code = 302): void` — Redirects to an absolute http(s) URL on another site.
 - `public function file(string $path, string $type = ""): void` — Sends a file instead of the page output, for example an uploaded image kept in `data/`. The path needs [permissions].read or write. Without `$type` the Content-Type comes from the extension; HTML, SVG and unknown files are sent as `application/octet-stream`.
 - `public function json(any $value): void` — Sends `$value` as JSON.
-- `public function flush(): bool` — Sends the status, the headers and what the page has written so far, and keeps the response open: what it writes later is sent at the next flush() or when the page ends. Afterwards the status, headers, cookies and session can no longer change. Returns false once the visitor has gone away (or has taken nothing for 10 seconds): stop the work then. Outside `phv serve` (scripts, `phv test`) it keeps the output and returns true.
+- `public function flush(): bool` — Sends the status, the headers and what the page has written so far, and keeps the response open: what it writes later is sent at the next flush() or when the page ends. Afterwards the status, headers, cookies and session can no longer change. Returns false once the visitor has gone away (or has taken nothing for 10 seconds), or when the visitor's address has `[server] streams_per_address` pages streaming already (the request is answered with 429): stop the work then. Outside `phv serve` (scripts, `phv test`) it keeps the output and returns true.
 
 ### class Session
 
@@ -781,8 +781,8 @@ One key: private (signs and verifies), public (verifies) or a secret (HS256).
 - `public readonly string $alg` — "RS256", "ES256", "EdDSA" or "HS256".
 - `public readonly ?string $kid` — The key id (`kid`) put in the header of the tokens it signs, or null.
 - `public readonly bool $canSign` — Whether it can sign: a private key or a secret.
-- `public static function fromPem(string $pem, ?string $kid = null): JwtKey` — A key in PEM form: a private key (`PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`) or a public one (`PUBLIC KEY`). RSA keys of 2048 to 4096 bits sign (up to 8192 verify), P-256 and Ed25519 keys both. Throws ValueError for other keys. Keep private keys in an environment variable.
-- `public static function fromJwk(string $jwk): JwtKey` — The public key of a JWK (JSON). Private members are not read.
+- `public static function fromPem(string $pem, ?string $kid = null): JwtKey` — A key in PEM form: a private key (`PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`) or a public one (`PUBLIC KEY`). RSA keys of 2048 to 4096 bits sign (up to 8192 verify), P-256 and Ed25519 keys both. Throws ValueError for other keys, and for a public key that could never verify a token (an RSA public exponent that is even, below 3 or above 2^33 - 1; a point off the curve; an Ed25519 point of small order). Keep private keys in an environment variable.
+- `public static function fromJwk(string $jwk): JwtKey` — The public key of a JWK (JSON). Private members are not read. Throws ValueError for the keys `fromPem()` refuses.
 - `public static function secret(string $secret, ?string $kid = null): JwtKey` — An HS256 key: a secret of at least 32 bytes (`random_token()` makes one).
 - `public function sign(map<string, any> $claims): string` — A token with these claims. Throws ValueError for a public key.
 - `public function publicJwk(): string` — The public key as a JWK (JSON). Throws ValueError for a secret.

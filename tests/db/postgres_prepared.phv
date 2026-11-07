@@ -1,0 +1,19 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs against a PostgreSQL server: a
+// transaction prepared for a two-phase commit would keep its locks after the
+// script, so PREPARE TRANSACTION is refused (whatever max_prepared_transactions
+// is); PREPARE of a statement is not.
+import std.db.Database;
+
+$db = Database::connect("main");
+$try = function (Sql $s) use ($db): void {
+    try { $db->execute($s); echo "ok\n"; } catch (DatabaseError $e) { echo "error: ", $e->getMessage(), "\n"; }
+};
+$db->transaction(function () use ($try): void {
+    $try(sql"PREPARE TRANSACTION 'phv_prepared'");
+    $try(sql"/* two phase */ prepare transaction 'phv_prepared'");
+});
+try { $db->executeAsync(sql"PREPARE TRANSACTION 'phv_prepared'"); echo "ok\n"; } catch (DatabaseError $e) { echo "error: ", $e->getMessage(), "\n"; }
+$try(sql"PREPARE phv_one AS SELECT 1");
+$try(sql"DEALLOCATE phv_one");
+echo "prepared: ", $db->first(sql"SELECT count(*)::int AS n FROM pg_prepared_xacts")?->int("n") ?? -1, "\n";

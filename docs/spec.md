@@ -177,6 +177,8 @@ $len = $user?->email?->len();             // ?int
 `!= null`, `== null`, `is`, `!`, `&&`, `||`, and early `return` / `throw` / `break` / `continue` are used for narrowing.
 Narrowing applies to local variables and to properties of local variables (`$this->user != null`). Narrowing of a property
 is reset by a function or method call or by an assignment to a property (because the call may have changed the value).
+A call to a built-in function or method resets it when a closure is among the arguments (`map()`, `filter()`,
+`groupBy()`, ...), because the closure may change the property; a built-in call without one keeps it.
 After a `try`, what its `finally` assigns, or what a call in it may have changed, is no longer narrowed by what the `try`
 proved. The step of a `for` loop and the condition of a `do`-`while` loop know only what holds both at the end of the
 body and at each `continue`.
@@ -836,6 +838,8 @@ phv serve examples/site --port 8080
   (beyond it, the response is `429 Too Many Requests` with `Retry-After`). The default is unlimited. With
   `[security] rate_limit_store`, all server processes share the count (see "Rate limiting"). Connections are not
   limited per address (at most 1,024 in all): a site open to the internet should run behind a reverse proxy that limits them.
+  Pages streaming with `flush()` are: at most `[server] streams_per_address` at once from one address (default: a
+  quarter of `workers`, at least 2; see "Streaming responses").
 - Headers sent by default: `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`,
   `Referrer-Policy: strict-origin-when-cross-origin`, and Content-Security-Policy (see "Content-Security-Policy" below).
   HSTS if `secure_cookies = true` (always over HTTPS). `Cache-Control: private, no-store` on responses that use sessions or cookies, or
@@ -952,7 +956,9 @@ new route files are picked up within a second.
   send JSON requests with the visitor's cookies: list only origins you trust.
 - `[server] access_log = "logs/access.log"` also appends one line per request to a file inside the project
   (`access_log_format = "json"` writes JSON objects with `time`, `ip`, `method`, `path`, `status` and `ms`, and `id`
-  with request ids). The path is logged without the query string.
+  with request ids). The path is logged without the query string. The time ends when the response is handed over: a
+  page that streams with `flush()` goes on after it, and so does the teardown of a page's database connections; the
+  workers they hold show in `phv_workers_busy`, not in the log.
 
 ### Request ids
 
@@ -1039,7 +1045,7 @@ these are not served on the site's port):
 - Metrics (all start with `phv_`): `requests_total{kind, code}` (`kind`: `page`, `static`, `ws`, `sse`, `other`; `code`:
   `2xx`...), `request_duration_seconds{route}` (a histogram per page, labelled with its file: `/posts/[id]`, never the
   path asked for; at most 1,000 routes, the rest as `other`; static files as `static`), `worker_wait_seconds`,
-  `rejected_total{reason}` (`busy`, `output`, `body`, `rate_limit`, `too_large`), `events_waiting_bytes`, `script_failures_total{kind}`
+  `rejected_total{reason}` (`busy`, `output`, `body`, `rate_limit`, `too_large`, `streams`), `events_waiting_bytes`, `script_failures_total{kind}`
   (`exception`, `time`, `memory`, `compile`, `other`), `ws_messages_total{dir}`, `publish_total{result}`,
   `jobs_total{result}`, `job_duration_seconds`, `store_errors_total{store}`, `telemetry_dropped_spans_total`, and the gauges `up`, `ready`,
   `uptime_seconds`, `workers`, `workers_busy`, `connections`, `websockets`, `output_waiting_bytes`, `async_running` and
@@ -1095,7 +1101,8 @@ foreach ($db->query(sql"SELECT id, total FROM orders") as $i => $row) {
 ```
 
 - `response()->flush()` sends the status, the headers and what the page has written so far, and keeps the response
-  open (chunked over HTTP/1.1, a stream over HTTP/2). What the page writes afterwards is sent at the next `flush()` or
+  open (chunked over HTTP/1.1, a stream over HTTP/2; over HTTP/1.0 the response ends when the connection is closed,
+  and its head says `Connection: close`). What the page writes afterwards is sent at the next `flush()` or
   when it ends. It suits long exports, reports and answers that come bit by bit; a page can write Server-Sent Events
   this way too (`text/event-stream`).
 - After the first `flush()`, the status, headers, cookies and session cannot change (`ValueError`); the session is
@@ -1112,6 +1119,12 @@ foreach ($db->query(sql"SELECT id, total FROM orders") as $i => $row) {
   that is dropped, and output that was not sent stays counted in the page's memory until it is freed. A visitor that
   keeps reading, however slowly, is waited for. A page holds its worker until it ends, within its time limit as any
   page.
+- So one client address may have at most `[server] streams_per_address` pages streaming at once (default: a quarter
+  of `workers`, at least 2; 0 is no limit; IPv6 addresses count by /64, as `requests_per_minute` does): past it, the
+  first `flush()` answers the request with `429 Too Many Requests` and `Retry-After: 5` in place of the head, returns
+  `false`, and drops what the page writes after, as for a visitor that has gone; the page should stop then. Behind a
+  reverse proxy every visitor has the proxy's address: set `streams_per_address` to what the site streams at once (or
+  0), and let the proxy limit connections per address.
 - A page that fails after `flush()` cannot show an error page: its response is cut off (the HTTP/1.1 connection is
   closed without the last chunk, an HTTP/2 stream is reset), so the client sees that it is incomplete. The error is
   logged as usual.
@@ -1123,7 +1136,9 @@ foreach ($db->query(sql"SELECT id, total FROM orders") as $i => $row) {
   `layout()`, or in a template), in a WebSocket script or after `response()->file()` (`ValueError`). Middleware that
   calls it has answered the request. Outside `phv serve` (`phv run`, `phv test`) it keeps the output and returns
   `true`.
-- The access log, `phv_request_duration_seconds` and the trace span of a streamed response end when its head is sent.
+- The access log, `phv_request_duration_seconds` and the trace span of a streamed response end when its head is sent:
+  the time the page then streams for is in none of them. `phv_workers_busy` counts the workers that streaming pages
+  (and the teardown of pages) hold.
 
 ### Sessions
 
@@ -1171,6 +1186,9 @@ session()->destroy();                 // log out
 - In every store, a session is saved only while it still exists (a new or regenerated id only if it is new), each as
   one atomic step: a request that finishes after a logout, in this process or another, cannot bring the session back,
   and of two requests that regenerate the same session only one gets it.
+- Requests of one visitor that run at the same time each read the session when they start and save the whole of it
+  when they end: the save that ends last wins, and a value another request set meanwhile is lost. A flow that sets
+  several keys should set them in one request, or read the session again before writing.
 - A site's store holds at most 50,000 sessions and 256 MB of session data (Redis keeps within both as sessions are written).
   When it is full, sessions whose visitor never came back are removed first (the least recently used), then the newest
   of the rest: a flood of sessions, even ones whose cookie is sent back, removes its own sessions and never those
@@ -1347,11 +1365,15 @@ only its own changes are undone, and nothing is committed until the outermost on
   is opened). The new script gets its own time limit, and `lastInsertId()`, `changes()` and `total_changes()` start
   from zero. A kept connection also keeps its prepared statements (the 32 texts run last), so a script that runs the
   same texts as the one before neither compiles nor weighs them again; a kept statement whose schema changed meanwhile
-  is compiled again at its first step, and weighed again when its program is then longer than 200 steps. The values
+  is compiled again at its first step, and weighed again when its program is then longer than 200 steps. A statement
+  whose program takes more than 1 MB (`IN` with about 7,000 values) runs but is not kept. The values
   bound to a statement are cleared when its run is done. When a script is done, an open transaction is rolled back; a
   connection is closed instead of kept after a
   failed statement, after any `PRAGMA`, or when a temporary table, view, index or trigger exists. `unlink()` and
-  `rename()` close the idle connections of the file first.
+  `rename()` close the idle connections of the file first. The idle connections of a process are at most 64 per file
+  and 256 in all, and hold at most 64 MB together (their schema and statements; this memory counts against no
+  script while they are idle): a connection that would take the pool past that closes the idle ones that hold the
+  most to make room, and is closed itself when it would not fit alone.
 - SQLite's memory counts toward the script's memory limit: the page cache of each connection (up to 2 MB), its
   schema and statements, in-memory databases, and temporary tables, indexes and sorts, which are kept in memory
   (never in temporary files). A kept connection counts while the script holds it. A statement that would pass the
@@ -1411,7 +1433,10 @@ The methods are the same as for SQLite (`query`, `first`, `execute`, `transactio
   larger than the memory left to the script is refused while it is read (the connection is then closed, not reused), so
   a large result or a misbehaving server cannot grow the process past the memory limit. PostgreSQL notifications
   (`LISTEN`) are dropped as they arrive; scripts cannot read them.
-- Each call runs a single statement (MySQL multi-statements are off), and `LOAD DATA LOCAL INFILE` is refused.
+- Each call runs a single statement (MySQL multi-statements are off), and `LOAD DATA LOCAL INFILE` is refused. So
+  are `XA PREPARE` (MySQL) and `PREPARE TRANSACTION` (PostgreSQL): a transaction prepared for a two-phase commit
+  would keep its locks after the script, also across restarts, until someone ends it by name (the reset of a pooled
+  connection does not end it). The other `XA` statements are allowed.
 - Value types: PostgreSQL `bool` → `bool`; integer types → `int`; `real`/`double precision` → `float`;
   `numeric`, `json`/`jsonb`, `uuid`, dates and times (`YYYY-MM-DD HH:MM:SS[.ffffff]`, `timestamptz` in UTC),
   `bytea` (`\x...` hex) and text types → `string`. Other types (arrays, `interval`, ...) raise `DatabaseError`:
@@ -1926,7 +1951,10 @@ $data = json_decode($j->payload);
   script may still run (10 seconds at most); then it throws `DatabaseError` ("the key is held by a transaction that
   has not ended"). It looks at the key again every 10 to 200 ms and holds no connection in between, so such waits
   never take the connections that other jobs are added on, that run jobs or that add the jobs of schedules. At most 8
-  scripts of a process wait for held keys of a site at once; another throws the same error at once.
+  scripts of a process wait for held keys of a site at once; another throws the same error at once. Inside a
+  `transaction()` on the store's database, `enqueue()` waits for a held key the same way (10 seconds at most), before
+  it takes the lock of the site's jobs described below, so the other transactions of the site keep adding jobs
+  meanwhile; the error does not end the transaction (on PostgreSQL the job is added in a savepoint).
 - With PostgreSQL or MySQL, `enqueue()` inside a `transaction()` on the store's database adds the job with the
   transaction: only if it commits (with MySQL, only `transaction()` ties them: a `BEGIN` sent as SQL does not). Jobs
   are kept in a table `phv_jobs_<hash>` of the site's namespace (see "Sessions"; `phv_jobs` for a site without one),
@@ -2044,7 +2072,10 @@ $claims = $auth->verify($token, issuer: "https://auth.example.com/", audience: "
   `crit` is refused, and header parameters that point to other keys (`jku`, `x5u`, `jwk`, `x5c`) are ignored.
 - `JwtKey::fromPem()` reads private keys (`PRIVATE KEY` (PKCS#8), `RSA PRIVATE KEY`, `EC PRIVATE KEY`) and public keys
   (`PUBLIC KEY`, `RSA PUBLIC KEY`). RSA keys of 2048 to 4096 bits sign, and of up to 8192 bits verify; encrypted keys
-  and other kinds of keys are refused (`ValueError`). `JwtKey::fromJwk()` reads the public key of a JWK. `alg`, `kid`
+  and other kinds of keys are refused (`ValueError`). `JwtKey::fromJwk()` reads the public key of a JWK. A public key
+  that could never verify a token is refused when it is read (`ValueError`; a key set skips it): an RSA key whose
+  public exponent is even, below 3 or above 2^33 - 1, a P-256 point that is not on the curve, and an Ed25519 point that
+  is not on the curve or has small order. `alg`, `kid`
   and `canSign` tell what a key is. Keys stay in the runtime: no value a script holds, nor `dump()`, shows a private
   key.
 - `verify()` returns the claims, or `null` when the signature, the algorithm or the claims are not right: `exp` and
@@ -2174,6 +2205,7 @@ store_namespace = "blog"    # the site's name in shared stores (default: [projec
 
 [server]
 workers = 16            # scripts running at once (default: two per CPU, at least 8)
+streams_per_address = 4 # pages streaming with flush() at once from one address (default: workers / 4, at least 2; 0: no limit)
 static_max_age = 3600   # Cache-Control max-age of static files (default: revalidate each time)
 compress = true         # gzip text responses (default)
 access_log = "logs/access.log"   # also append the access log to this file
@@ -2672,6 +2704,7 @@ It then runs the type checker and shows the places that need manual work, such a
 | SQLite databases a script has open at once | 64 | `DatabaseError` |
 | SQLite text or blob | 16 MB | `DatabaseError` (string or blob too big) |
 | SQLite statement: weight of its steps that read a whole value (see SQLite above); steps | 128; 43,008 | `DatabaseError` |
+| SQLite connections kept idle per process: per file; in all; memory held together; a kept statement's program | 64; 256; 64 MB; 1 MB | Closed instead of kept; run but not kept |
 | Call depth | 10,000 (callbacks of builtins inside each other: 200, each only while 512 KB of the thread's stack is left) | Fatal error |
 | Request body | 8 MB | 413 |
 | Scripts running at once (`serve`) | two per CPU, at least 8 (`[server] workers`) | waits up to 10 seconds, then 503 |
@@ -2682,6 +2715,7 @@ It then runs the type checker and shows the places that need manual work, such a
 | Output waiting to be sent (`serve`) | `workers` × `memory_limit_mb`, a quarter of it for event streams | 503; an event stream is ended or skips the event |
 | Request body bytes past the first 64 KB, received or held (`serve`) | `workers` × 8 MB | waits up to 10 seconds, then 503 |
 | A streamed response (`flush()`) | one chunk ahead of the client; 10 seconds without reading | `flush()` returns false |
+| Pages streaming at once from one client address (`serve`) | a quarter of `workers`, at least 2 (`[server] streams_per_address`) | 429 at the first `flush()`, which returns false |
 | A JSON Web Token (std.jwt) | 256 KB, its header 8 KB | `verify()` returns null |
 | A JWKS | 512 KB, 64 keys read; 32 sets kept per process | `NetworkError` (`fetch`), `ValueError` (`fromJson`) |
 | Sign-ins a session has started (std.oauth) | 4, each for 10 minutes | the oldest is forgotten |

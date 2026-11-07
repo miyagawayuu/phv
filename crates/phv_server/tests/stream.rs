@@ -331,6 +331,138 @@ fn a_token_after_flush_is_in_a_private_response() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A free port on the loopback address (for `[admin] listen`), and the value
+/// of a counter or gauge on `/metrics` once the admin port answers.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+fn metric(admin: u16, name: &str) -> u64 {
+    let addr: SocketAddr = format!("127.0.0.1:{admin}").parse().unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    let text = loop {
+        if let Ok(mut s) = TcpStream::connect(addr) {
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            s.write_all(b"GET /metrics HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").unwrap();
+            let mut out = Vec::new();
+            let _ = s.read_to_end(&mut out);
+            break String::from_utf8_lossy(&out).into_owned();
+        }
+        assert!(Instant::now() < until, "the admin port does not answer");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    text.lines()
+        .find(|l| l.starts_with(name) && l[name.len()..].starts_with(' '))
+        .unwrap_or_else(|| panic!("no {name} in\n{text}"))
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// Clients at one address that read a streamed page slowly (a trickle keeps
+/// flush() waiting: it never stalls for 10 seconds) cannot hold every worker:
+/// past `[server] streams_per_address`, flush() answers 429 and the page stops,
+/// so an ordinary request is still answered at once (found by the 1.2 audit:
+/// `workers` such clients held every worker for the time limit, renewably, and
+/// `requests_per_minute` cannot count a single request twice).
+#[test]
+fn slow_readers_at_one_address_cannot_hold_every_worker() {
+    let trickle = "<?phv\nimport std.http.response;\n$c = str_repeat(\"t\", 4096);\n$n = 0;\n\
+                   while ($n < 100000) {\n    echo $c;\n    if (!response()->flush()) {\n        break;\n    }\n    $n++;\n}\n";
+    let admin = free_port();
+    let dir = site_with(
+        "trickle",
+        &format!("[server]\nworkers = 2\nstreams_per_address = 1\n[admin]\nlisten = \"127.0.0.1:{admin}\"\n"),
+        &[("trickle.phv", trickle), ("ping.phv", "<?phv echo \"pong\";\n")],
+    );
+    let addr = start(&dir);
+    assert_eq!(metric(admin, "phv_workers_busy"), 0);
+    // The first client reads 4 KB every 300 ms: never gone, never stalled.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let first = {
+        let stop = stop.clone();
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        s.write_all(b"GET /trickle HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
+        let mut head = [0u8; 12];
+        s.read_exact(&mut head).unwrap();
+        assert!(head.ends_with(b"200"), "{}", String::from_utf8_lossy(&head));
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = s.read(&mut buf);
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        })
+    };
+    // A second stream from the same address is refused at its first flush(),
+    // at once, and its page stops: its worker is free again.
+    let sent = Instant::now();
+    let second = answer(addr, "GET /trickle HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    assert!(second.starts_with("HTTP/1.1 429 "), "{second}");
+    assert!(second.to_ascii_lowercase().contains("retry-after: 5"), "{second}");
+    assert!(sent.elapsed() < Duration::from_secs(5), "refused after {:?}", sent.elapsed());
+    assert_eq!(metric(admin, "phv_rejected_total{reason=\"streams\"}"), 1);
+    // An ordinary page gets the other worker without waiting for the stream.
+    let sent = Instant::now();
+    let pong = answer(addr, "GET /ping HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    assert!(pong.ends_with("pong"), "{pong}");
+    assert!(sent.elapsed() < Duration::from_secs(5), "answered after {:?}", sent.elapsed());
+    // (The teardown of a page holds its worker a moment after its response.)
+    let workers_busy = |n: usize, why: &str| {
+        let until = Instant::now() + Duration::from_secs(15);
+        while metric(admin, "phv_workers_busy") != n as u64 {
+            assert!(Instant::now() < until, "{why}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    workers_busy(1, "only the stream should hold a worker");
+    // Once the first client is gone, its page ends and the address may stream again.
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    first.join().unwrap();
+    workers_busy(0, "the stream's worker was not freed");
+    let mut r = Reader::get(addr, "/trickle");
+    let head = r.wait_for("\r\n\r\n").to_string();
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    drop(r);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A streamed response to an HTTP/1.0 request has no length and ends when
+/// the connection is closed: its head says `Connection: close`, as HTTP/1.0,
+/// not `keep-alive` (found by the 1.2 audit: a client that asked for
+/// keep-alive was told it got it, and its next request was reset).
+#[test]
+fn a_streamed_response_to_an_http_1_0_request_says_the_connection_closes() {
+    let ten = "<?phv\nimport std.http.response;\necho \"one\\n\";\nresponse()->flush();\necho \"two\\n\";\n";
+    let dir = site_with("ten", "", &[("ten.phv", ten), ("plain.phv", "<?phv echo \"plain\";\n")]);
+    let addr = start(&dir);
+    let r = answer(addr, "GET /ten HTTP/1.0\r\nHost: test\r\nConnection: keep-alive\r\n\r\n");
+    let (head, body) = r.split_once("\r\n\r\n").unwrap_or_else(|| panic!("{r}"));
+    assert!(head.starts_with("HTTP/1.0 200 OK\r\n"), "{head}");
+    let lower = head.to_ascii_lowercase();
+    assert!(lower.contains("\r\nconnection: close\r\n"), "{head}");
+    assert!(!lower.contains("keep-alive"), "{head}");
+    assert!(!lower.contains("transfer-encoding") && !lower.contains("content-length"), "{head}");
+    assert_eq!(body, "one\ntwo\n");
+    // A response with a length keeps an HTTP/1.0 connection open when asked to.
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"GET /plain HTTP/1.0\r\nHost: test\r\nConnection: keep-alive\r\n\r\n").unwrap();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !String::from_utf8_lossy(&out).ends_with("plain") {
+        let n = s.read(&mut buf).unwrap();
+        assert!(n > 0, "closed: {}", String::from_utf8_lossy(&out));
+        out.extend_from_slice(&buf[..n]);
+    }
+    let plain = String::from_utf8_lossy(&out).to_ascii_lowercase();
+    assert!(plain.contains("connection: keep-alive") && plain.contains("content-length: 5"), "{plain}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A `catch` after flush() writes where the output was cut, not inside a tag
 /// that was sent (found by the 1.2 audit).
 #[test]

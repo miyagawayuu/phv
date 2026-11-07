@@ -157,6 +157,11 @@ struct State {
     /// The open event streams, by id: what each holds and how to drop its
     /// connection (to make room for streams whose clients read).
     streams: Mutex<HashMap<String, ws::Registered>>,
+    /// Pages streaming with flush() now, by client address (as the rate limit
+    /// keys it): at most `[server] streams_per_address` each, so clients at
+    /// one address that read slowly hold a few workers, never all of them
+    /// (found by the 1.2 audit). Touched only when a page calls flush().
+    streaming: Mutex<HashMap<String, usize>>,
     /// Pages with parameters, and when `public/` was last scanned for them
     /// (again after a second in development mode, where files change).
     routes: Mutex<(Instant, Arc<routes::Table>)>,
@@ -235,6 +240,7 @@ impl State {
             buffered_cap: config.workers * (config.memory_limit_mb as usize) * 1024 * 1024,
             events_cap: config.workers * (config.memory_limit_mb as usize) * 1024 * 1024 / 4,
             streams: Mutex::new(HashMap::new()),
+            streaming: Mutex::new(HashMap::new()),
             config,
             root,
             dev,
@@ -1261,6 +1267,15 @@ fn finish(
     let shown = id.filter(|i| i.shown);
     if let Some(v) = shown.and_then(|i| HeaderValue::from_str(&i.id).ok()) {
         resp.headers_mut().insert("x-request-id", v);
+    }
+    // A response of unknown length (a page streaming with flush(), an event
+    // stream) to an HTTP/1.0 request ends when the connection is closed: it
+    // says so, as hyper would otherwise write `connection: keep-alive` on it
+    // when the client asked for that (found by the 1.2 audit: a client that
+    // trusted the header sent its next request to a closed connection).
+    if version == hyper::Version::HTTP_10 && hyper::body::Body::size_hint(resp.body()).exact().is_none() {
+        *resp.version_mut() = hyper::Version::HTTP_10;
+        resp.headers_mut().insert(hyper::header::CONNECTION, HeaderValue::from_static("close"));
     }
     let status = resp.status().as_u16();
     log_request(state, ip, method, path, status, start, shown.map(|i| i.id.as_str()));
@@ -2680,6 +2695,18 @@ fn busy() -> Resp {
     r
 }
 
+/// The answer of a page that called flush() while its client's address had
+/// `[server] streams_per_address` pages streaming already.
+fn too_many_streams() -> Resp {
+    let mut r = simple(
+        StatusCode::TOO_MANY_REQUESTS,
+        "text/plain",
+        "too many streamed responses for this address at once; try again soon".into(),
+    );
+    r.headers_mut().insert("retry-after", HeaderValue::from_static("5"));
+    r
+}
+
 /// Reads a request body of at most `MAX_BODY` bytes within `BODY_TIMEOUT`.
 /// Past the first `SMALL_BODY` bytes, each KiB takes a permit from the body
 /// budget as it arrives, so a client holds only what it has really sent, and
@@ -2791,7 +2818,7 @@ async fn run_script(
     // it goes on running (and holding its worker) while it sends the rest.
     let (head_tx, mut head_rx) = tokio::sync::oneshot::channel();
     let sink: Option<Box<dyn FlushSink>> = (kind == Page::Normal).then(|| {
-        Box::new(PageStream::new(state.clone(), head_tx, Instant::now() + state.time_limit)) as Box<dyn FlushSink>
+        Box::new(PageStream::new(state.clone(), head_tx, Instant::now() + state.time_limit, &ip)) as Box<dyn FlushSink>
     });
     // The response is handed over as soon as the page made it; the end of its
     // VM (its database connections rolling back and going back to their pools:
@@ -2850,6 +2877,14 @@ async fn run_script(
 /// the client has read. A chunk waits for the client while it keeps reading
 /// (never past the page's time limit); once it has taken nothing for
 /// `FLUSH_STALL`, or is gone, flush() returns false and later output is dropped.
+///
+/// A client that keeps reading, however slowly, is waited for, so the pages
+/// streaming at once from one address are counted (`State::streaming`): past
+/// `[server] streams_per_address`, the first flush() answers the request with
+/// 429 instead of the head and returns false, and the page holds its worker
+/// no longer than it takes to stop (found by the 1.2 audit: `workers` clients
+/// at one address reading a trickle held every worker for the time limit,
+/// and `requests_per_minute` does not count a request twice).
 struct PageStream {
     state: Arc<State>,
     head: Option<tokio::sync::oneshot::Sender<Resp>>,
@@ -2860,10 +2895,15 @@ struct PageStream {
     deadline: Instant,
     /// The page ended normally: the body ends instead of failing.
     finished: bool,
+    /// The client's address as the rate limit keys it, and whether this
+    /// stream is counted for it.
+    client: String,
+    counted: bool,
 }
 
 impl PageStream {
-    fn new(state: Arc<State>, head: tokio::sync::oneshot::Sender<Resp>, deadline: Instant) -> PageStream {
+    fn new(state: Arc<State>, head: tokio::sync::oneshot::Sender<Resp>, deadline: Instant, ip: &str) -> PageStream {
+        let client = ip.parse::<std::net::IpAddr>().map_or_else(|_| ip.to_string(), phv_std::ratelimit::client_key);
         PageStream {
             state,
             head: Some(head),
@@ -2873,7 +2913,26 @@ impl PageStream {
             handle: tokio::runtime::Handle::current(),
             deadline,
             finished: false,
+            client,
+            counted: false,
         }
+    }
+
+    /// Counts this stream for its client's address; false when the address
+    /// has `streams_per_address` already (0: no limit).
+    fn count(&mut self) -> bool {
+        let limit = self.state.config.streams_per_address;
+        if limit == 0 {
+            return true;
+        }
+        let mut streaming = self.state.streaming.lock().unwrap_or_else(|e| e.into_inner());
+        let n = streaming.entry(self.client.clone()).or_insert(0);
+        if *n >= limit {
+            return false;
+        }
+        *n += 1;
+        self.counted = true;
+        true
     }
 
     /// Hands `chunk` to the connection; gives it back when it was not sent.
@@ -2924,6 +2983,11 @@ impl PageStream {
 impl FlushSink for PageStream {
     fn flush(&mut self, http: &mut HttpCtx, chunk: Vec<u8>) -> Result<(), Vec<u8>> {
         if let Some(head) = self.head.take() {
+            if !self.count() {
+                self.state.metrics.reject(metrics::Reject::Streams);
+                let _ = head.send(too_many_streams());
+                return Err(chunk);
+            }
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let had_session = http.session.id.is_some();
             let body = RespBody::chunks(rx, self.aborted.clone(), self.progress.clone());
@@ -2948,6 +3012,15 @@ impl Drop for PageStream {
     fn drop(&mut self) {
         if !self.finished {
             self.aborted.store(true, Ordering::Release);
+        }
+        if self.counted {
+            let mut streaming = self.state.streaming.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = streaming.get_mut(&self.client) {
+                *n -= 1;
+                if *n == 0 {
+                    streaming.remove(&self.client);
+                }
+            }
         }
     }
 }

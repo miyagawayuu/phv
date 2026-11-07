@@ -12,7 +12,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -129,8 +129,9 @@ impl Db {
     /// and is not compiled again, and need not be. The memory the kept
     /// statements take moves with the connection (`held`), and the values a
     /// run bound are cleared when the statement goes back to the cache (see
-    /// `reusable`).
-    fn statement(&self, vm: &Vm, text: &str) -> Result<rusqlite::CachedStatement<'_>, VmError> {
+    /// `reusable`). A program of more than `KEPT_STATEMENT_BYTES` runs but is
+    /// not kept (`Prepared::Once`).
+    fn statement(&self, vm: &Vm, text: &str) -> Result<Prepared<'_>, VmError> {
         use rusqlite::limits::Limit;
         let c = self.conn();
         let _ = c.set_limit(Limit::SQLITE_LIMIT_VDBE_OP, PREPARE_OPS);
@@ -138,25 +139,31 @@ impl Db {
         let prepared = c.prepare_cached(text).and_then(|st| {
             if self.session.compiles.load(Ordering::SeqCst) == before {
                 // Kept from an earlier run, and weighed then (see above).
-                return Ok(Ok(st));
+                return Ok(Ok(Prepared::Kept(st)));
             }
             COMPILED.fetch_add(1, Ordering::SeqCst);
-            if st.is_explain() != 0 {
-                return Ok(Ok(st));
-            }
             // Not kept unless it passes: the next prepare of the text compiles
             // (and weighs) it again.
-            match cost::weigh(c, text) {
-                Ok(weight) if weight <= cost::MAX_WEIGHT => Ok(Ok(st)),
-                Ok(weight) => {
-                    st.discard();
-                    Ok(Err(weight))
-                }
-                Err(e) => {
-                    st.discard();
-                    Err(e)
+            if st.is_explain() == 0 {
+                match cost::weigh(c, text) {
+                    Ok(weight) if weight <= cost::MAX_WEIGHT => {}
+                    Ok(weight) => {
+                        st.discard();
+                        return Ok(Err(weight));
+                    }
+                    Err(e) => {
+                        st.discard();
+                        return Err(e);
+                    }
                 }
             }
+            if statement_bytes(&st) <= KEPT_STATEMENT_BYTES {
+                return Ok(Ok(Prepared::Kept(st)));
+            }
+            // Too large to keep: compiled once more, outside the cache (the
+            // weighing holds, the text is the same).
+            st.discard();
+            c.prepare(text).map(|st| Ok(Prepared::Once(st)))
         });
         let _ = c.set_limit(Limit::SQLITE_LIMIT_VDBE_OP, RUN_OPS);
         let prepared = prepared.map_err(|e| {
@@ -208,6 +215,54 @@ impl Db {
     }
 }
 
+/// The most memory a kept statement takes (`SQLITE_STMTSTATUS_MEMUSED`: its
+/// program, with the texts in it). A larger one runs but is not kept, so the
+/// statements a connection keeps hold at most 32 times this (found by the
+/// 1.2.0 audit: the kept statements were bounded by count alone). The
+/// programs of real statements take a few KB; `IN` with 2,000 values about
+/// 300 KB, and with 7,000 or more over this.
+const KEPT_STATEMENT_BYTES: usize = 1 << 20;
+
+/// The memory statement `st` takes.
+fn statement_bytes(st: &rusqlite::Statement<'_>) -> usize {
+    st.get_status(rusqlite::StatementStatus::MemUsed).max(0) as usize
+}
+
+/// A script's statement: one kept in the connection's cache for the next run
+/// of its text, or one run once (a program over `KEPT_STATEMENT_BYTES`).
+enum Prepared<'c> {
+    Kept(rusqlite::CachedStatement<'c>),
+    Once(rusqlite::Statement<'c>),
+}
+
+impl<'c> std::ops::Deref for Prepared<'c> {
+    type Target = rusqlite::Statement<'c>;
+    fn deref(&self) -> &rusqlite::Statement<'c> {
+        match self {
+            Prepared::Kept(st) => st,
+            Prepared::Once(st) => st,
+        }
+    }
+}
+
+impl<'c> std::ops::DerefMut for Prepared<'c> {
+    fn deref_mut(&mut self) -> &mut rusqlite::Statement<'c> {
+        match self {
+            Prepared::Kept(st) => st,
+            Prepared::Once(st) => st,
+        }
+    }
+}
+
+impl Prepared<'_> {
+    /// Finalizes the statement instead of keeping it.
+    fn discard(self) {
+        if let Prepared::Kept(st) = self {
+            st.discard();
+        }
+    }
+}
+
 impl Drop for Db {
     fn drop(&mut self) {
         if let (Some(c), Some(lease)) = (self.conn.take(), self.pooled.take()) {
@@ -242,7 +297,10 @@ impl Drop for Db {
 //   cache is let go of; its prepared statements are kept, with their bound
 //   values cleared (see `Db::statement` and `reusable`).
 // - An idle connection is closed after `KEPT_IDLE`, and when a script deletes
-//   or renames its file. `:memory:` databases are never kept.
+//   or renames its file. `:memory:` databases are never kept. The idle
+//   connections are bounded by count (`KEPT_PER_FILE`, `KEPT_ALL`) and by
+//   the memory they hold together (`KEPT_BYTES`); a statement's program by
+//   `KEPT_STATEMENT_BYTES`.
 // - SQLite's memory is counted as the thread's (`mem`). The memory a kept
 //   connection holds is taken off the thread that gives it back and counted
 //   again on the thread that takes it (or closes it), so a script is charged
@@ -251,10 +309,18 @@ impl Drop for Db {
 /// Idle connections kept per database file, and in all.
 const KEPT_PER_FILE: usize = 64;
 const KEPT_ALL: usize = 256;
+/// The most memory the idle connections hold together (`held`): it counts
+/// against no script while they are idle (found by the 1.2.0 audit: the pool
+/// was bounded by count alone, 256 connections of 32 statements each). When a
+/// connection going back would pass it, the idle ones that hold the most are
+/// closed until it fits; one that would not fit alone is closed instead.
+const KEPT_BYTES: usize = 64 << 20;
 /// An idle connection is closed after this long.
 const KEPT_IDLE: Duration = Duration::from_secs(30);
 /// `KEPT_IDLE`, in milliseconds; tests make it shorter (`set_kept_idle`).
 static KEPT_IDLE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(KEPT_IDLE.as_millis() as u64);
+/// `KEPT_BYTES`; tests make it smaller (`set_kept_bytes`).
+static KEPT_BYTES_NOW: AtomicUsize = AtomicUsize::new(KEPT_BYTES);
 
 fn kept_idle() -> Duration {
     Duration::from_millis(KEPT_IDLE_MS.load(Ordering::SeqCst))
@@ -263,6 +329,16 @@ fn kept_idle() -> Duration {
 /// Sets how long an idle connection is kept (`None`: `KEPT_IDLE`). For tests.
 pub fn set_kept_idle(idle: Option<Duration>) {
     KEPT_IDLE_MS.store(idle.unwrap_or(KEPT_IDLE).as_millis() as u64, Ordering::SeqCst);
+}
+
+fn kept_bytes() -> usize {
+    KEPT_BYTES_NOW.load(Ordering::SeqCst)
+}
+
+/// Sets how much memory the idle connections may hold together (`None`:
+/// `KEPT_BYTES`). For tests.
+pub fn set_kept_bytes(bytes: Option<usize>) {
+    KEPT_BYTES_NOW.store(bytes.unwrap_or(KEPT_BYTES), Ordering::SeqCst);
 }
 
 /// A connection a script holds: the file it is for, and its session (whose
@@ -377,24 +453,51 @@ fn take(key: &Path, id: FileId) -> Option<(Connection, usize, Arc<Session>)> {
     found
 }
 
-/// Takes back a connection a script is done with, if it can be reused.
+/// Takes back a connection a script is done with, if it can be reused: when
+/// the pool has room for it by count (`KEPT_PER_FILE`, `KEPT_ALL`) and by
+/// memory (`KEPT_BYTES`, making room by closing the idle connections that
+/// hold the most). Otherwise it is closed.
 fn give_back(c: Connection, lease: Lease) {
     let Some(c) = reusable(c, &lease.session) else { return };
     let key = lease.key.clone();
     let idle = Idle::new(c, lease);
-    let refused = {
+    let closing = {
         let mut map = kept();
-        let all: usize = map.values().map(Vec::len).sum();
-        let list = map.entry(key).or_default();
-        if list.len() < KEPT_PER_FILE && all < KEPT_ALL {
-            list.push(idle);
-            None
+        // One pass over the idle connections (at most `KEPT_ALL`).
+        let (all, mut held) = map.values().flatten().fold((0, 0usize), |(n, b), i| (n + 1, b.saturating_add(i.held)));
+        let cap = kept_bytes();
+        let of_file = map.get(&key).map_or(0, Vec::len);
+        let mut closing = Vec::new();
+        if of_file >= KEPT_PER_FILE || all >= KEPT_ALL || idle.held > cap {
+            closing.push(idle);
         } else {
-            Some(idle)
+            while held.saturating_add(idle.held) > cap {
+                let Some(big) = take_largest(&mut map) else { break };
+                held -= big.held;
+                closing.push(big);
+            }
+            map.entry(key).or_default().push(idle);
         }
+        closing
     };
-    drop(refused);
+    // Closed outside the lock: closing a file can take a while.
+    drop(closing);
     sweep_later();
+}
+
+/// Removes the idle connection that holds the most memory.
+fn take_largest(map: &mut HashMap<PathBuf, Vec<Idle>>) -> Option<Idle> {
+    let (key, at) = map
+        .iter()
+        .flat_map(|(k, l)| l.iter().enumerate().map(move |(i, idle)| (k, i, idle.held)))
+        .max_by_key(|&(_, _, held)| held)
+        .map(|(k, i, _)| (k.clone(), i))?;
+    let list = map.get_mut(&key)?;
+    let idle = list.remove(at);
+    if list.is_empty() {
+        map.remove(&key);
+    }
+    Some(idle)
 }
 
 /// Rolls back what the script left and checks the connection can be kept.

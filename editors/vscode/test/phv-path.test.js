@@ -35,6 +35,8 @@ function checkError(name, r) {
       "C:\\work\\repo\\bin\\phv.com",
       "C:\\cmdonly\\phv.cmd",
       "C:\\cmdonly\\phv.bat",
+      "C:\\cmdonly\\phv.ps1",
+      "C:\\cmdonly\\phv",
       "C:\\tools\\phv.exe",
       "C:\\both\\phv.exe",
       "C:\\both\\phv.com",
@@ -70,7 +72,15 @@ function checkError(name, r) {
   check("a quoted PATH entry", win("phv", '"C:\\tools"'), { path: "C:\\tools\\phv.exe" });
   check("the default when the setting is empty", win("", "C:\\work\\repo;C:\\tools"), { path: "C:\\tools\\phv.exe" });
   check("an absolute setting", win("D:\\phv\\phv.exe", ""), { path: "D:\\phv\\phv.exe" });
+  check("an absolute setting in another case", win("D:\\PHV\\PHV.EXE", ""), { path: "D:\\PHV\\PHV.EXE" });
+  check("an absolute .com", win("C:\\both\\phv.com", ""), { path: "C:\\both\\phv.com" });
   checkError("an absolute setting that is not a file", win("D:\\phv\\nothing.exe", "C:\\tools"));
+  // As in PATH, only an .exe or .com is started (a .cmd or .bat needs a shell; a .ps1 is not a program).
+  for (const file of ["C:\\cmdonly\\phv.cmd", "C:\\cmdonly\\phv.bat", "C:\\cmdonly\\phv.ps1", "C:\\cmdonly\\phv"]) {
+    const r = win(file, "C:\\tools");
+    checkError(`an absolute setting ${file}`, r);
+    check(`the error of ${file} says what to use`, (r.error || "").includes(".exe"), true);
+  }
   for (const rel of ["bin\\phv.exe", ".\\phv.exe", "phv/phv.exe", "C:phv.exe", "\\phv.exe", ".", ".."]) {
     checkError(`a relative setting ${rel}`, win(rel, "C:\\tools"));
   }

@@ -1,0 +1,38 @@
+<?phv
+// A built-in call without a closure keeps a property narrowing; one with a
+// closure drops it (the closure may change the property), and checking again
+// after the call narrows it anew.
+interface Thing {}
+class Box implements Thing {
+    public function __construct(public string $label) {}
+}
+class Holder {
+    public ?Thing $t = null;
+    public function __construct() {}
+}
+
+function no_closure(Holder $h, list<int> $xs): string {
+    if (!($h->t is Box)) {
+        return "not a box";
+    }
+    $n = $xs->len() + count($xs) + $xs->sum();
+    $s = $xs->join(",");
+    return $h->t->label . " " . $n . " " . $s;
+}
+
+function with_closure(Holder $h, list<int> $xs): string {
+    if (!($h->t is Box)) {
+        return "not a box";
+    }
+    $g = $xs->groupBy(fn(int $x) => $x % 2 == 0 ? "even" : "odd");
+    $h2 = $xs->groupBy(fn(int $x) => $x % 2);
+    if (!($h->t is Box)) {
+        return "changed";
+    }
+    return $h->t->label . " " . count($g) . " " . count($h2);
+}
+
+$h = new Holder();
+$h->t = new Box("label");
+echo no_closure($h, [1, 2, 3]), "\n";
+echo with_closure($h, [1, 2, 3]), "\n";

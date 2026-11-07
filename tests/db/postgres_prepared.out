@@ -1,0 +1,6 @@
+error: PREPARE TRANSACTION is not allowed: a prepared transaction would keep its locks after the script until ROLLBACK PREPARED or COMMIT PREPARED ends it
+error: PREPARE TRANSACTION is not allowed: a prepared transaction would keep its locks after the script until ROLLBACK PREPARED or COMMIT PREPARED ends it
+error: PREPARE TRANSACTION is not allowed: a prepared transaction would keep its locks after the script until ROLLBACK PREPARED or COMMIT PREPARED ends it
+ok
+ok
+prepared: 0

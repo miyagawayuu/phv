@@ -1,0 +1,50 @@
+error: cannot read `->label` on `?Thing` because it might be null
+  --> err_groupby_prop_narrow.phv:43:12
+   |
+43 |     return $h->t->label;
+   |            ^^^^^
+   = note: check `!= null` first, or use `?->`
+
+error: cannot read `->label` on `?Thing` because it might be null
+  --> err_groupby_prop_narrow.phv:54:12
+   |
+54 |     return $h->t->label;
+   |            ^^^^^
+   = note: check `!= null` first, or use `?->`
+
+error: cannot read `->v` on `?A` because it might be null
+  --> err_groupby_prop_narrow.phv:65:12
+   |
+65 |     return $a->p->v;
+   |            ^^^^^
+   = note: check `!= null` first, or use `?->`
+
+error: cannot read `->inner` on `?Thing` because it might be null
+  --> err_groupby_prop_narrow.phv:76:12
+   |
+76 |     return $h->t->inner->v;
+   |            ^^^^^
+   = note: check `!= null` first, or use `?->`
+
+error: cannot read `->label` on `?Thing` because it might be null
+  --> err_groupby_prop_narrow.phv:89:12
+   |
+89 |     return $h->t->label;
+   |            ^^^^^
+   = note: check `!= null` first, or use `?->`
+
+error: cannot read `->label` on `?Thing` because it might be null
+   --> err_groupby_prop_narrow.phv:101:12
+    |
+101 |     return $h->t->label;
+    |            ^^^^^
+    = note: check `!= null` first, or use `?->`
+
+error: cannot read `->label` on `?Thing` because it might be null
+   --> err_groupby_prop_narrow.phv:119:12
+    |
+119 |     return $h->t->label;
+    |            ^^^^^
+    = note: check `!= null` first, or use `?->`
+
+7 errors found

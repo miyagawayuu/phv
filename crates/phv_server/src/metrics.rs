@@ -42,9 +42,11 @@ pub enum Reject {
     Body,
     RateLimit,
     TooLarge,
+    /// The client's address had `[server] streams_per_address` pages streaming already.
+    Streams,
 }
 
-const REJECTS: [&str; 5] = ["busy", "output", "body", "rate_limit", "too_large"];
+const REJECTS: [&str; 6] = ["busy", "output", "body", "rate_limit", "too_large", "streams"];
 
 /// How a script failed.
 #[derive(Clone, Copy, Debug)]

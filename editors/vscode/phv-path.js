@@ -53,7 +53,7 @@ function envGet(env, name, win) {
 /**
  * Resolves the `phv.path` setting to an absolute executable.
  *
- * - An absolute setting is used as it is (it must be a file).
+ * - An absolute setting is used as it is (it must be a file; on Windows an `.exe` or `.com`).
  * - A relative path (`bin/phv`, `.\phv.exe`) is refused: it would name a program in the workspace.
  * - A bare name (`phv`, the default) is searched in PATH: only absolute entries outside every workspace folder; on
  *   Windows with the extensions `.exe` and `.com` (in PATHEXT's order), the ones that start without a shell.
@@ -76,11 +76,17 @@ function resolvePhv(o) {
   const realpath = o.realpath || defaultRealpath;
   const folders = o.workspaceFolders || [];
   const setting = (o.setting || "").trim() || "phv";
+  // On Windows, the extensions of programs that start without a shell (.cmd and .bat need cmd.exe).
+  const runnable = [".exe", ".com"];
 
   if (path.isAbsolute(setting)) {
     // On Windows `\phv.exe` or `C:phv.exe` is "absolute" only in part: it depends on the current drive or folder.
     if (win && !/^([a-zA-Z]:\\|\\\\)/.test(path.normalize(setting))) {
       return { error: `"phv.path" must be a full path such as C:\\phv\\phv.exe (it is "${setting}")` };
+    }
+    // As in PATH: only a program that starts without a shell (not .cmd, .bat or .ps1).
+    if (win && !runnable.includes(path.extname(setting).toLowerCase())) {
+      return { error: `"phv.path" must name an .exe (or .com) file, such as C:\\phv\\phv.exe (it is "${setting}")` };
     }
     if (!isFile(setting)) {
       return { error: `"phv.path" is "${setting}", which is not an executable file` };
@@ -103,11 +109,10 @@ function resolvePhv(o) {
   let names = [setting];
   if (win) {
     const ext = path.extname(setting).toLowerCase();
-    const runnable = [".exe", ".com"];
     if (ext !== "" && runnable.includes(ext)) {
       names = [setting];
     } else {
-      // PATHEXT's order, keeping only the extensions that start without a shell (.cmd and .bat need cmd.exe).
+      // PATHEXT's order, keeping only the runnable extensions.
       const pathext = (envGet(env, "PATHEXT", win) || ".COM;.EXE")
         .split(";")
         .map((e) => e.trim().toLowerCase())

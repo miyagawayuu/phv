@@ -22,6 +22,9 @@
 //! In every store a session is only ever inserted under a new id or updated
 //! while it still exists, each as one atomic step, so a request that finishes
 //! after a logout (in this process or another) cannot bring the session back.
+//! A save writes the whole session: of requests of one visitor that run at
+//! once, the one that ends last wins, and what another set meanwhile is lost
+//! (documented in the spec; a merge would need a per-key log in every store).
 
 use crate::metrics::{Health, StoreKind};
 use indexmap::IndexMap;

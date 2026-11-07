@@ -151,7 +151,7 @@
           "type": "string",
           "default": "phv",
           "scope": "machine",
-          "description": "The phv executable used for the language server and the debugger: a full path, or a name looked for in the absolute PATH folders outside the workspace. A user setting only: a workspace cannot change which program runs."
+          "description": "The phv executable used for the language server and the debugger: a full path (on Windows an .exe or .com), or a name looked for in the absolute PATH folders outside the workspace. A user setting only: a workspace cannot change which program runs."
         },
         "phv.lsp.enabled": {
           "type": "boolean",

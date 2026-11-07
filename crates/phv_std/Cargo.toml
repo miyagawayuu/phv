@@ -34,6 +34,7 @@ regex-automata.workspace = true
 url.workspace = true
 chrono-tz.workspace = true
 ring.workspace = true
+num-bigint.workspace = true
 tokio.workspace = true
 tungstenite.workspace = true
 httparse.workspace = true

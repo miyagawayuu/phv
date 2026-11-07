@@ -129,6 +129,30 @@ fn err(span: Span) -> HExpr {
     HExpr { kind: HExprKind::Const(HConst::Null), ty: Type::Error, span }
 }
 
+/// Whether a type is, or holds, a closure: `fn(...)`, `?fn(...)`, a union with
+/// one, a `list`/`map`/`set` of them, or a class with one as a type argument.
+fn holds_func(t: &Type) -> bool {
+    match t {
+        Type::Func(..) => true,
+        Type::List(t) | Type::Set(t) => holds_func(t),
+        Type::Map(k, v) => holds_func(k) || holds_func(v),
+        Type::Union(ms) => ms.iter().any(holds_func),
+        Type::Class(_, args) => args.iter().any(holds_func),
+        _ => false,
+    }
+}
+
+/// Whether a built-in call with these parameters and arguments may run user
+/// code: a closure among the arguments (the receiver included) can change any
+/// property, so the property narrowings must be dropped after the call. Both
+/// sides are looked at, so an overload that takes a closure clears even when
+/// the argument's type was lost to an error. Every arm of `call_builtin` must
+/// ask this (found by the 1.2.0 audit: the arm for several overloads of one
+/// arity, `list->groupBy`, kept the narrowings).
+fn runs_user_code(params: &[Type], args: &[HExpr]) -> bool {
+    params.iter().any(holds_func) || args.iter().any(|h| holds_func(&h.ty))
+}
+
 impl<'a> Checker<'a> {
     // ----- assignability ---------------------------------------------------
 
@@ -1891,7 +1915,7 @@ impl<'a> Checker<'a> {
             }
             let ret = subst(ret, &b);
             let ret = if ret.has_unknown() { Type::Error } else { ret };
-            if out.iter().any(|h| matches!(h.ty, Type::Func(..))) {
+            if runs_user_code(params, &out) {
                 self.clear_prop_facts();
             }
             return HExpr { kind: HExprKind::CallBuiltin(imp.to_string(), out), ty: ret, span };
@@ -1920,7 +1944,7 @@ impl<'a> Checker<'a> {
                     }
                 });
                 if fits {
-                    let out = params
+                    let out: Vec<HExpr> = params
                         .iter()
                         .zip(hargs)
                         .map(|(p, h)| {
@@ -1929,6 +1953,9 @@ impl<'a> Checker<'a> {
                         })
                         .collect();
                     let ret = subst(ret, &b);
+                    if runs_user_code(params, &out) {
+                        self.clear_prop_facts();
+                    }
                     return HExpr { kind: HExprKind::CallBuiltin(imp.to_string(), out), ty: ret, span };
                 }
             }

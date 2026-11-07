@@ -1,0 +1,19 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs against a MySQL server: a
+// transaction prepared for a two-phase commit would keep its locks after the
+// script (the reset does not end it), so XA PREPARE is refused; the other XA
+// statements are not.
+import std.db.Database;
+
+$db = Database::connect("main");
+$try = function (Sql $s) use ($db): void {
+    try { $db->execute($s); echo "ok\n"; } catch (DatabaseError $e) { echo "error: ", $e->getMessage(), "\n"; }
+};
+$try(sql"XA START 'phv_xa'");
+$try(sql"XA END 'phv_xa'");
+$try(sql"XA PREPARE 'phv_xa'");
+$try(sql"xa prepare 'phv_xa'");
+$try(sql"/*!50000 XA PREPARE 'phv_xa' */");
+try { $db->executeAsync(sql"XA PREPARE 'phv_xa'"); echo "ok\n"; } catch (DatabaseError $e) { echo "error: ", $e->getMessage(), "\n"; }
+$try(sql"XA ROLLBACK 'phv_xa'");
+$try(sql"LOAD DATA LOCAL INFILE 'phv.toml' INTO TABLE phv_items");

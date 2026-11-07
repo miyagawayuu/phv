@@ -176,6 +176,8 @@ $len = $user?->email?->len();             // ?int
 `!= null`、`== null`、`is`、`!`、`&&`、`||`、早期 `return` / `throw` / `break` / `continue` が絞り込みに使われる。
 絞り込みの対象はローカル変数と、ローカル変数のプロパティ(`$this->user != null`)。プロパティの絞り込みは、
 関数やメソッドの呼び出し、プロパティへの代入があると解除される(呼び出しが値を変えたかもしれないため)。
+組み込み関数・メソッドの呼び出しは、引数にクロージャがあるとき(`map()`、`filter()`、`groupBy()` など)に解除する
+(クロージャがプロパティを変えたかもしれないため)。クロージャのない組み込みの呼び出しでは保たれる。
 `try` の後では、その `finally` が代入するもの、`finally` の中の呼び出しが変えたかもしれないものは、`try` の中で
 わかったことでは絞り込まれない。`for` ループのステップと `do`-`while` ループの条件では、本体の終わりと各 `continue`
 の両方で成り立つことだけがわかっている。
@@ -818,7 +820,9 @@ phv serve examples/site --port 8080
 - `[security] requests_per_minute` を書くと、1 つの接続元アドレスから 1 分間に受け付けるリクエストをその数までにする
   (超えると `429 Too Many Requests` と `Retry-After`)。既定は無制限。`[security] rate_limit_store` を書くと、
   すべてのサーバープロセスで数を共有する(「レート制限」を参照)。接続の数はアドレスごとには制限しない(全体で最大 1,024)。
-  インターネットに公開するサイトは、それを制限するリバースプロキシの後ろで動かすとよい。
+  インターネットに公開するサイトは、それを制限するリバースプロキシの後ろで動かすとよい。`flush()` でストリーミングする
+  ページは制限する: 1 つのアドレスから同時に `[server] streams_per_address` 個まで(既定は `workers` の 4 分の 1、最小 2。
+  「ストリーミングレスポンス」を参照)。
 - 既定で付けるヘッダー: `X-Content-Type-Options: nosniff`、`X-Frame-Options: SAMEORIGIN`、
   `Referrer-Policy: strict-origin-when-cross-origin`、Content-Security-Policy(下の「Content-Security-Policy」)。
   `secure_cookies = true` なら HSTS(HTTPS では常に)。セッションや Cookie を使うレスポンスと、CSRF トークンを含むレスポンス
@@ -932,7 +936,9 @@ public/docs/[...path].phv      /docs/guide/intro  request()->param("path") == "g
   Cookie 付きで JSON のリクエストを送れるので、信頼できるオリジンだけを書くこと。
 - `[server] access_log = "logs/access.log"` を書くと、プロジェクト内のファイルにもリクエストごとに 1 行を追記する
   (`access_log_format = "json"` なら `time`、`ip`、`method`、`path`、`status`、`ms`、リクエスト ID があれば `id` を持つ
-  JSON)。パスはクエリ文字列なしで記録する。
+  JSON)。パスはクエリ文字列なしで記録する。所要時間はレスポンスを渡した時点まで: `flush()` でストリーミングするページは
+  その後も続き、ページのデータベース接続の後始末も後に行う。それらが持つワーカーはログではなく `phv_workers_busy` に
+  現れる。
 
 ### リクエスト ID
 
@@ -1016,7 +1022,7 @@ token_env = "PHV_ADMIN_TOKEN"    # listen がループバック以外なら必�
 - メトリクス(すべて `phv_` で始まる): `requests_total{kind, code}`(`kind`: `page`、`static`、`ws`、`sse`、`other`。`code`:
   `2xx` など)、`request_duration_seconds{route}`(ページごとのヒストグラム。ラベルはファイル名から作る `/posts/[id]` で、
   要求されたパスは決して入らない。ルートは 1,000 個までで、残りは `other`。静的ファイルは `static`)、
-  `worker_wait_seconds`、`rejected_total{reason}`(`busy`、`output`、`body`、`rate_limit`、`too_large`)、`events_waiting_bytes`、
+  `worker_wait_seconds`、`rejected_total{reason}`(`busy`、`output`、`body`、`rate_limit`、`too_large`、`streams`)、`events_waiting_bytes`、
   `script_failures_total{kind}`(`exception`、`time`、`memory`、`compile`、`other`)、`ws_messages_total{dir}`、
   `publish_total{result}`、`jobs_total{result}`、`job_duration_seconds`、`store_errors_total{store}`、
   `telemetry_dropped_spans_total`、およびゲージ
@@ -1073,7 +1079,8 @@ foreach ($db->query(sql"SELECT id, total FROM orders") as $i => $row) {
 ```
 
 - `response()->flush()` は、ステータス・ヘッダーと、ページがそれまでに書いた出力を送り、レスポンスを開いたままにする
-  (HTTP/1.1 では chunked、HTTP/2 ではストリーム)。その後に書いた出力は、次の `flush()` か、ページが終わったときに送る。
+  (HTTP/1.1 では chunked、HTTP/2 ではストリーム。HTTP/1.0 では接続を閉じたところでレスポンスが終わり、ヘッダーに
+  `Connection: close` を付ける)。その後に書いた出力は、次の `flush()` か、ページが終わったときに送る。
   長いエクスポートやレポート、少しずつ届く応答に向く。ページから Server-Sent Events を書くこともできる
   (`text/event-stream`)。
 - 最初の `flush()` の後は、ステータス・ヘッダー・Cookie・セッションを変えられない(`ValueError`)。セッションはヘッダーと
@@ -1088,6 +1095,12 @@ foreach ($db->query(sql"SELECT id, total FROM orders") as $i => $row) {
   接続に渡す)。訪問者が去ったか(`HEAD` リクエストも)、10 秒間何も受け取らないと `false` を返し、その後に書いた出力は
   捨てる。送れなかった出力は、解放されるまでページのメモリに数える。ゆっくりでも読み続ける訪問者は待つ。ページは
   終わるまでワーカーを使い、時間の上限はほかのページと同じである。
+- そのため、1 つの接続元アドレスから同時にストリーミングできるページは `[server] streams_per_address` 個まで(既定は
+  `workers` の 4 分の 1、最小 2。0 は無制限。IPv6 のアドレスは `requests_per_minute` と同じく /64 ごとに数える)。
+  それを超えると、最初の `flush()` はヘッダーの代わりに `429 Too Many Requests` と `Retry-After: 5` をリクエストに返し、
+  `false` を返して、その後にページが書いた出力は捨てる(訪問者が去ったときと同じ)。ページはそこで止めること。
+  リバースプロキシの後ろでは、すべての訪問者がプロキシのアドレスになる: `streams_per_address` にはサイトが同時に
+  ストリーミングする数(または 0)を書き、アドレスごとの接続数はプロキシで制限すること。
 - `flush()` の後に失敗したページはエラーページを出せない: レスポンスは途中で切れる(HTTP/1.1 は最後のチャンクを送らずに
   接続を閉じ、HTTP/2 はストリームをリセットする)ので、クライアントは完全でないと分かる。エラーはいつもどおりログに出る。
 - `flush()` が送った出力は `catch` で取り消せない: `flush()` より前に始まった `try` が捨てるのは、その後に書いた出力だけ。
@@ -1098,7 +1111,8 @@ foreach ($db->query(sql"SELECT id, total FROM orders") as $i => $row) {
   ミドルウェアはリクエストに答えたことになる。`phv serve` の外(`phv run`、`phv test`)では出力をそのまま持ち、`true` を
   返す。
 - ストリーミングするレスポンスのアクセスログ、`phv_request_duration_seconds`、トレースのスパンは、ヘッダーを送った時点で
-  終わる。
+  終わる: その後にストリーミングした時間はどれにも入らない。ストリーミングするページ(とページの後始末)が持つワーカーは
+  `phv_workers_busy` に数える。
 
 ### セッション
 
@@ -1144,6 +1158,9 @@ session()->destroy();                 // ログアウト
 - どの保存先でも、セッションを保存するのはそれがまだあるときだけ(新しい ID や作り直した ID は、まだ使われていない
   ときだけ)で、それぞれを 1 つの不可分な操作で行う。ログアウトのあとに終わったリクエストが(同じプロセスでも別の
   プロセスでも)セッションを復活させることはなく、同じセッションを作り直す 2 つのリクエストのうち、引き継げるのは 1 つだけ。
+- 同じ訪問者のリクエストが同時に動くと、それぞれが始まるときにセッションを読み、終わるときにセッション全体を保存する。
+  最後に終わった保存が勝ち、その間にほかのリクエストが設定した値は失われる。いくつかのキーを設定する流れは 1 つの
+  リクエストで設定するか、書く前にセッションを読み直すこと。
 - サイトごとに、保存できるセッションは最大 50,000、データは 256 MB まで(Redis は書くたびにこの範囲に収める)。いっぱいになると、訪問者が一度も戻ってこなかったセッションから先に消し、
   その次に残りの中で一番新しいものを消す。Cookie を送り返すセッションを大量に作られても、消えるのはそのセッションで、
   それより前に作られたセッションは消えない。使われないセッションは `session_lifetime` で終わる。
@@ -1317,10 +1334,13 @@ $db->transaction(function () use ($db): void {
   新しいスクリプトには自分の制限時間が効き、`lastInsertId()`、`changes()`、`total_changes()` は 0 から数える。
   保持する接続はプリペアドステートメントも保持する(最後に実行した 32 個の文)。前のスクリプトと同じ文を実行する
   スクリプトは、その文をコンパイルも重さの計算もし直さない。保持している文のスキーマがその間に変わっていれば、最初の
-  ステップでコンパイルし直し、そのプログラムが 200 ステップより長ければ重さも計算し直す。文に束縛した値は、その実行が
+  ステップでコンパイルし直し、そのプログラムが 200 ステップより長ければ重さも計算し直す。プログラムが 1 MB を超える文
+  (約 7,000 個の値の `IN`)は実行するが保持しない。文に束縛した値は、その実行が
   終わると消す。スクリプトが終わると、開いたままのトランザクションはロールバックする。文が失敗したとき、`PRAGMA` を実行したとき、
   一時テーブル・ビュー・インデックス・トリガーが残っているときは、保持せずに閉じる。`unlink()` と `rename()` は、
-  そのファイルの使われていない接続を先に閉じる。
+  そのファイルの使われていない接続を先に閉じる。プロセスが保持する使われていない接続は、ファイルごとに 64 本、全体で
+  256 本までで、合わせて 64 MB まで(スキーマと文。使われていない間、このメモリはどのスクリプトにも数えない)。
+  それを超えることになる接続は、保持している中で最も多く持つものを閉じて場所を空け、1 本でも収まらなければ自分が閉じる。
 - SQLite のメモリはスクリプトのメモリ制限に数える。接続ごとのページキャッシュ(2 MB まで)、スキーマと文、
   インメモリのデータベース、そして一時テーブル・インデックス・ソート(一時ファイルには書かず、メモリに置く)。保持していた
   接続も、スクリプトが持っているあいだは数える。制限を超える文は、メモリ制限の致命的エラーで止まる。スクリプトが同時に
@@ -1377,6 +1397,9 @@ $id = $db->lastInsertId();                                                      
   大きい結果は、読んでいる途中で拒否します(その接続は閉じて再利用しない)。大きな結果やおかしなサーバーでプロセスが
   メモリ制限を超えて膨らむことはありません。PostgreSQL の通知(`LISTEN`)は届いたときに捨てます(スクリプトは読めない)。
 - 1 回の呼び出しで実行できる文は 1 つだけです(MySQL の複数文は無効)。`LOAD DATA LOCAL INFILE` も拒否します。
+  `XA PREPARE`(MySQL)と `PREPARE TRANSACTION`(PostgreSQL)も拒否します。2 相コミットのために準備したトランザクションは、
+  スクリプトのあとも(再起動をまたいでも)誰かが名前で終わらせるまでロックを持ち続けるからです(プールの接続のリセットでは
+  終わりません)。ほかの `XA` 文は使えます。
 - 値の型: PostgreSQL の `bool` → `bool`、整数型 → `int`、`real`/`double precision` → `float`。
   `numeric`、`json`/`jsonb`、`uuid`、日付と時刻(`YYYY-MM-DD HH:MM:SS[.ffffff]`。`timestamptz` は UTC)、
   `bytea`(`\x...` の 16 進)、文字列型 → `string`。それ以外の型(配列や `interval` など)は `DatabaseError`
@@ -1875,7 +1898,10 @@ $data = json_decode($j->payload);
   まだ動ける間(長くても 10 秒)だけ待ち、そのあとは `DatabaseError`(「the key is held by a transaction that has not
   ended」)を投げる。10〜200 ミリ秒ごとに key を見直し、その間は接続を持たないので、こうして待つ間も、ほかのジョブを
   追加する接続、ジョブを実行する接続、スケジュールのジョブを追加する接続を使わない。サイトの持たれた key を同時に
-  待てるのは 1 プロセスにつき 8 つのスクリプトまでで、それを超えたものはすぐに同じエラーを投げる。
+  待てるのは 1 プロセスにつき 8 つのスクリプトまでで、それを超えたものはすぐに同じエラーを投げる。ストアのデータベースへの
+  `transaction()` の中の `enqueue()` も、持たれた key を同じように待つ(長くても 10 秒)。下に書くサイトのジョブの
+  ロックを取る前に待つので、その間もサイトのほかのトランザクションはジョブを追加できる。
+  このエラーでトランザクションは終わらない(PostgreSQL ではジョブをセーブポイントの中で追加する)。
 - PostgreSQL と MySQL では、ストアのデータベースへの `transaction()` の中の `enqueue()` は、トランザクションと一緒に
   追加する(コミットされたときだけ。MySQL で結び付くのは `transaction()` だけで、SQL で送った `BEGIN` は結び付かない)。
   ジョブはサイトの名前空間のテーブル `phv_jobs_<hash>`(「セッション」を参照。名前空間のないサイトは `phv_jobs`)に
@@ -1990,7 +2016,9 @@ $claims = $auth->verify($token, issuer: "https://auth.example.com/", audience: "
   `crit` を持つトークンは拒否し、ほかの鍵を指すヘッダーのパラメータ(`jku`、`x5u`、`jwk`、`x5c`)は無視する。
 - `JwtKey::fromPem()` は秘密鍵(`PRIVATE KEY`(PKCS#8)、`RSA PRIVATE KEY`、`EC PRIVATE KEY`)と公開鍵(`PUBLIC KEY`、
   `RSA PUBLIC KEY`)を読む。RSA の鍵は 2048〜4096 ビットで署名、8192 ビットまで検証できる。暗号化された鍵やほかの種類の
-  鍵は拒否する(`ValueError`)。`JwtKey::fromJwk()` は JWK の公開鍵を読む。`alg`、`kid`、`canSign` で鍵の種類が分かる。
+  鍵は拒否する(`ValueError`)。`JwtKey::fromJwk()` は JWK の公開鍵を読む。トークンを検証できるはずのない公開鍵は、読むときに
+  拒否する(`ValueError`。鍵セットは飛ばす): 公開指数が偶数か、3 未満か、2^33 − 1 を超える RSA の鍵、曲線上にない P-256 の点、
+  曲線上にないか位数の小さい Ed25519 の点。`alg`、`kid`、`canSign` で鍵の種類が分かる。
   鍵は実行環境の中にだけあり、スクリプトが持つ値にも `dump()` にも秘密鍵は現れない。
 - `verify()` はクレームを返す。署名・アルゴリズム・クレームが正しくなければ `null`: `exp` と `nbf`(数値)は `$leeway` 秒
   (0〜300)の猶予付きで検査し、1 分より先の `iat`、`$issuer` を渡したときの `iss`、`aud`(文字列 `$audience`、または
@@ -2116,6 +2144,7 @@ store_namespace = "blog"    # 共有の保存先でのサイトの名前(既定:
 
 [server]
 workers = 16            # 同時に実行するスクリプトの数(既定: CPU 数の 2 倍、最小 8)
+streams_per_address = 4 # 1 つのアドレスから同時に flush() でストリーミングするページ(既定: workers / 4、最小 2。0 は無制限)
 static_max_age = 3600   # 静的ファイルの Cache-Control の max-age(既定: 毎回再検証)
 compress = true         # テキストのレスポンスを gzip で圧縮(既定)
 access_log = "logs/access.log"   # アクセスログをこのファイルにも追記
@@ -2602,6 +2631,7 @@ phv migrate legacy/page.php      # page.phv を書き出す
 | スクリプトが同時に開いておける SQLite のデータベース | 64 | `DatabaseError` |
 | SQLite のテキストやブロブ | 16 MB | `DatabaseError`(string or blob too big) |
 | SQLite の文:値全体を読むステップの重さ(上の SQLite を参照)、ステップ数 | 128、43,008 | `DatabaseError` |
+| プロセスが使われないまま保持する SQLite の接続:ファイルごと、全体、合わせて持つメモリ、保持する文のプログラム | 64、256、64 MB、1 MB | 保持せずに閉じる。文は実行するが保持しない |
 | 呼び出しの深さ | 10,000(組み込み関数のコールバックの入れ子は 200 まで。それぞれスレッドのスタックが 512 KB 残っている間だけ) | 致命的エラー |
 | リクエスト本文 | 8 MB | 413 |
 | 同時に実行するスクリプト(`serve`) | CPU 数の 2 倍、最小 8(`[server] workers`) | 最大 10 秒待ち、その後 503 |
@@ -2612,6 +2642,7 @@ phv migrate legacy/page.php      # page.phv を書き出す
 | 送信待ちの出力(`serve`) | `workers` × `memory_limit_mb`(その 4 分の 1 がイベントストリームの分) | 503。イベントストリームは終えるか、そのイベントを飛ばす |
 | 受信中・保持中のリクエスト本文の、最初の 64 KB より後のバイト(`serve`) | `workers` × 8 MB | 最大 10 秒待ち、その後 503 |
 | ストリーミングするレスポンス(`flush()`) | クライアントより 1 チャンク先まで。読まない時間は 10 秒まで | `flush()` が false を返す |
+| 1 つの接続元アドレスから同時にストリーミングするページ(`serve`) | `workers` の 4 分の 1、最小 2(`[server] streams_per_address`) | 最初の `flush()` で 429。`flush()` は false を返す |
 | JSON Web Token(std.jwt) | 256 KB、ヘッダーは 8 KB | `verify()` が null を返す |
 | JWKS | 512 KB、読む鍵は 64 個。プロセスごとに保持する鍵セットは 32 個 | `NetworkError`(`fetch`)、`ValueError`(`fromJson`) |
 | セッションが始めたサインイン(std.oauth) | 4 つ、それぞれ 10 分 | いちばん古いものを忘れる |

@@ -45,13 +45,14 @@ your `PATH` (or set `phv.path`). Highlighting works without it.
 The extension starts `phv` by its full path, never by the bare name (on Windows a bare name is looked for in the
 workspace folder first, so a cloned folder could run its own `phv.exe`). It looks in the absolute folders of
 `PATH` that are outside every workspace folder; on Windows it starts `phv.exe` or `phv.com`, not `.cmd` or `.bat`
-files. A relative `phv.path` or `PATH` entry is not used. If nothing is found, a message says so.
+files (a full `phv.path` must name an `.exe` or `.com` too). A relative `phv.path` or `PATH` entry is not used. If
+nothing is found, a message says so.
 
 ## Settings
 
 | Setting | Default | |
 |---|---|---|
-| `phv.path` | `phv` | The `phv` executable: a full path, or a name looked for in `PATH`. Only a user setting: a workspace's `.vscode/settings.json` cannot change which program runs. |
+| `phv.path` | `phv` | The `phv` executable: a full path (on Windows an `.exe` or `.com`), or a name looked for in `PATH`. Only a user setting: a workspace's `.vscode/settings.json` cannot change which program runs. |
 | `phv.lsp.enabled` | `true` | Start the language server. |
 
 ## Building the extension

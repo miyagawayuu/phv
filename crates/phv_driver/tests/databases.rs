@@ -146,6 +146,7 @@ fn postgres() {
     check(&host, "postgres_types_after");
     check_async(&url, "postgres_async");
     check_async(&url, "postgres_kept");
+    check(&host, "postgres_prepared");
     check_migrations(&host, "SELECT nope FROM missing_table");
 }
 
@@ -209,6 +210,7 @@ fn mysql() {
     check(&host, "mysql_session");
     check(&host, "mysql_session_after");
     check_async(&url, "mysql_async");
+    check(&host, "mysql_xa");
     check_migrations(&host, "SELECT nope FROM missing_table");
 }
 
@@ -602,6 +604,42 @@ fn waits_for_held_keys_leave_the_scheduler_its_connections() {
             check_held_key_waits(&url);
         }
     }
+}
+
+/// A job added with a key inside a `transaction()` on the store's database,
+/// while another open transaction holds that key, waits no longer than
+/// outside a transaction (10 seconds), then fails with the same error, and
+/// the transaction can go on (found by the 1.2 audit: it waited until the
+/// other transaction ended or its own time limit, holding the store's lock).
+fn check_tx_keyed_wait(url: &str) {
+    let host = jobs_host(url, &testing::namespace(0xf5), &["k"]);
+    std::thread::scope(|s| {
+        // Holds the key fourteen seconds.
+        let holder = s.spawn(|| run_script(&host, "jobs_tx_hold", Some(Duration::from_secs(60))));
+        std::thread::sleep(Duration::from_millis(1500));
+        let start = Instant::now();
+        let out = run_script(&host, "jobs_tx_add", Some(Duration::from_secs(30)));
+        let took = start.elapsed();
+        assert!(!holder.is_finished(), "{url}: the key is no longer held");
+        assert_eq!(out, "error: enqueue(): the key is held by a transaction that has not ended then 1", "{url}");
+        assert!(took < Duration::from_secs(12), "{url}: took {took:?}");
+        assert!(took >= Duration::from_secs(5), "{url}: gave up after {took:?}");
+        assert_eq!(holder.join().unwrap(), "rolled back", "{url}");
+    });
+}
+
+#[test]
+fn keyed_jobs_in_transactions_wait_no_longer_than_outside_them() {
+    sweep_once();
+    let _one_at_a_time = heavy();
+    let urls: Vec<String> = ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"].iter().filter_map(|v| server(v)).collect();
+    // Both servers at once: each takes fifteen seconds.
+    std::thread::scope(|s| {
+        let runs: Vec<_> = urls.iter().map(|url| s.spawn(move || check_tx_keyed_wait(url))).collect();
+        for r in runs {
+            r.join().unwrap();
+        }
+    });
 }
 
 #[test]

@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates sixteen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, §24 an assessment of the whole implementation before 1.1.0, §25 an assessment of the whole implementation before 1.1.1, and §26 an assessment of the whole implementation before 1.2.0.
+This report consolidates seventeen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, §24 an assessment of the whole implementation before 1.1.0, §25 an assessment of the whole implementation before 1.1.1, §26 an assessment of the whole implementation before 1.2.0, and §27 an assessment of the whole implementation of the 1.2.0 release candidate.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§25: 2026-11-06, §26: 2026-11-07)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§25: 2026-11-06, §26–§27: 2026-11-07)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -1744,3 +1744,103 @@ Regression tests are named after what they check, in each crate's tests and in `
 
 All tests pass on Windows and on Linux, with PostgreSQL 17, MySQL 8.4 and Redis 7, and with clippy (`-D warnings`)
 and rustfmt.
+
+## 27. Seventeenth Assessment: the Whole Implementation (the 1.2.0 release candidate)
+
+Date: 2026-11-07. Scope: everything at 6da479b: the fixes of §26 and the improvements made for 1.2.0, none of which
+had been assessed before. The improvements are the cache of the lookup of `_middleware.phv`, `_404.phv` and
+`_500.phv`; the teardown of a page's VM and the return of its database connections after the response has been handed
+over; kept SQLite connections keeping their prepared statements; the SQLite allocator set up together with SQLite's
+initialization; the test isolation (`phv_std::testing`); the benchmark harness; and the release profile with fat LTO.
+Every earlier fix was attacked again.
+
+Eight reviewers each took one area: the web server; the standard library and its clients; the compiler, the type
+checker, the VM and the JIT; templates, the website and the examples; the tools and their supply chain; background
+jobs with the job and session stores; sign-in and tokens; and, new this time, the running system as a whole (ordering,
+timing, restarts and resource accounting across requests). They attacked a release build locally, with fake identity
+providers and collectors on their own ports and the three databases in Docker. Each finding was confirmed with a PoC.
+The main session ran the High again, and checked the extension in a real VS Code with marker programs in the opened
+folder, behind a PATH junction into it, and named by workspace settings: none ran. The template check was confirmed
+against Chromium and WebKit: of 5,812 generated templates, the 1,971 that PHV accepts rendered without a value
+leaving its context, and the 6,048 templates of §26 still flag none. Four groups then fixed every finding, each with
+regression tests.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| Critical | 0 | |
+| High | 1 | Fixed |
+| Medium | 0 | |
+| Low | 2 | Fixed |
+| Info | 8 | Fixed or documented |
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R20-1 | A closure passed to a builtin with several versions of the same arity (`groupBy`) could reassign a property the type checker had narrowed (`if ($h->t is Box)`), and the read after the call was compiled for the narrowed class: a script read another class's private property, or made the VM stop with a "compiler bug" (a 500). The single-version path and user calls already forgot property facts when a closure was passed; this path did not | Every builtin call forgets property facts when the version chosen takes a closure or an argument holds one (also inside a `finally`); a call without a closure keeps them |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R20-2 | A keyed `enqueue()` inside `transaction()` waited for a key held by another transaction until that transaction ended or the script's time limit, not the 10 seconds the spec promises (14 seconds measured against a 25-second holder, on PostgreSQL and MySQL), and held the site's job lock meanwhile, so other transactions' adds waited behind it | The keyed row is tried first, waiting at most 10 seconds (PostgreSQL: in a savepoint under a lock timeout; MySQL: a look without waiting on a store connection, tried again until then), and the site's job lock is taken only for a job that is added |
+| R20-3 | A visitor who read a streamed page a few kilobytes every 9 seconds kept it from the 10-second stall cut of R19-23, so one connection held a worker for the whole time limit, and `requests_per_minute` does not count connections: `workers` such connections held every worker | `[server] streams_per_address` (a quarter of `workers`, at least 2) bounds the pages one address may stream at once; past it, `flush()` answers 429 and returns false. A proxy that limits connections per address remains the recommendation |
+
+### Info
+
+| # | Finding | Fix |
+|---|---|---|
+| R20-4 | A streamed response to an HTTP/1.0 request was delimited by closing the connection, as it must be, but carried `connection: keep-alive`; the connection was closed, so nothing was misread | It is sent as HTTP/1.0 with `Connection: close` |
+| R20-5 | An idle kept SQLite connection's memory counted toward no script, and the idle pool was bounded by count only (256 connections, 32 statements each): 3 GB at the most | Idle connections hold at most 64 MB together (the largest are closed first), and a statement over 1 MB is not kept |
+| R20-6 | An absolute `phv.path` was accepted with any extension, where the search of `PATH` keeps `.exe` and `.com` only (a `.cmd` would not have started: the extension uses no shell) | On Windows it must end in `.exe` or `.com` |
+| R20-7 | A page's `XA PREPARE` on MySQL survived the connection's reset (MySQL detaches a prepared transaction), holding its locks until an `XA ROLLBACK` | `XA PREPARE` and PostgreSQL's `PREPARE TRANSACTION` are refused, as `LOAD DATA LOCAL INFILE` is; comments between the words are seen through |
+| R20-8 | Two requests of one visitor saving the session at once: the save that ends last wins, and the other's keys are lost | Documented in the spec |
+| R20-9 | Degenerate public keys (an even or a one RSA exponent, a P-256 point off the curve, an Ed25519 point of small order) were accepted as keys and failed every verification | Refused when the key is read: an RSA exponent is odd and from 3 to 2^33 − 1 with a modulus of 2048 to 8192 bits; a P-256 point is on the curve; an Ed25519 point decodes and is not of small order |
+| R20-10 | The time in the access log ends when the response is handed over, so a worker held by a slow reader does not show there | Documented: `phv_workers_busy` shows workers held by streaming and by teardown |
+| R20-11 | Measured, not changed: 8,192-bit RSA keys verify 1,385 tokens a second with 8 keys tried; a key set is fetched at most once in 30 seconds for an unknown key id; §26's residual risks hold as written | Holds |
+
+### Residual Risks
+
+- A streaming page still holds a worker for up to its time limit for a visitor who keeps reading; the per-address
+  bound limits how many, and counts the proxy's address when the site runs behind one (raise it there, or set it to
+  0, and let the proxy limit connections per address).
+- A transactional `enqueue()` of another key waits for the store lock of a transaction that is adding a job, up to
+  that transaction's time limit.
+- A page's connection whose reset takes long (a database that answers slowly) holds its worker for up to 10 seconds
+  after the response.
+- Up to 64 MB of idle SQLite memory per process is counted toward no script, for up to 30 seconds.
+- The access log's time does not include streaming or teardown.
+- §26's residual risks remain.
+
+### Verification
+
+The PoCs were run again against the fixed build (before → after):
+- `groupBy` type confusion (three shapes): accepted, and a private property read, or a VM stop → refused at check;
+- a keyed add in a transaction against a 25-second holder: added after 14.1 seconds (PostgreSQL) and 14.1 (MySQL)
+  → refused after 10.1 and 9.8; an unkeyed add meanwhile, 11 ms;
+- two trickle readers with `workers = 2`: a plain page answered 503 after 10 seconds → with the bound at 1, 200 in
+  10 ms; 8 readers against 8 workers: 2 stream, 6 get 429, a plain page in 10 ms;
+- a streamed HTTP/1.0 response: `connection: keep-alive` → `connection: close`;
+- 8 idle connections with `IN` statements of 2,000 values held 2.4 MB, one statement of 8,000 values 1.1 MB →
+  under the caps (3 GB at the most → 64 MB);
+- keys with `e = 1`, `e = 2`, an all-zero P-256 point, the identity of Ed25519: loaded → refused with a message;
+- the extension: an absolute `.cmd`, `.bat` or `.ps1` resolved → an error naming `.exe`.
+
+The benchmarks of `bench/`, run back to back with the binary of 6da479b under the same load, are within noise: the
+micro-benchmarks 0.94–1.13, the server's pages 0.97–0.99 in requests per second, the editor 0.95–1.08.
+
+Regression tests are named after what they check, in each crate's tests and in `tests/cases` and `tests/db`
+(`err_groupby_prop_narrow`, `groupby_prop_narrow`, `mysql_xa`, `postgres_prepared`, `jobs_tx_hold` with
+`jobs_tx_add`). Some of the others:
+- `stream.rs`: `slow_readers_at_one_address_cannot_hold_every_worker`,
+  `a_streamed_response_to_an_http_1_0_request_says_the_connection_closes`;
+- `databases.rs`: `keyed_jobs_in_transactions_wait_no_longer_than_outside_them`;
+- `sqlite_pool.rs`: `large_statements_are_not_kept`, `idle_connections_hold_a_bounded_memory`;
+- `jwt.rs`: `rsa_keys_with_a_degenerate_exponent_are_refused`, `ec_and_ed25519_keys_off_the_curve_are_refused`;
+- `netdb.rs`: `prepared_transactions_are_refused`;
+- `editors/vscode/test/phv-path.test.js`: the extension of an absolute `phv.path`.
+
+All tests pass on Windows and on Linux, run at the same time against one PostgreSQL 17, MySQL 8.4 and Redis 7, and
+with clippy (`-D warnings`) and rustfmt.

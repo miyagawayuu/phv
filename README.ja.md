@@ -68,7 +68,7 @@ echo greet($name);                                 // Web ページでは自動�
     パスの検査と使用の間にすり替えられることもない。
   - **上限**: メモリ・時間・再帰の深さに上限がある。
   - **動的な実行がない**: `eval` や可変変数はない。
-  - 16 回の監査と脆弱性診断の結果は [docs/security-audit.ja.md](docs/security-audit.ja.md) にある。
+  - 17 回の監査と脆弱性診断の結果は [docs/security-audit.ja.md](docs/security-audit.ja.md) にある。
 - **速度**: 型に特化したレジスタ型バイトコード VM、Cranelift による JIT、バイトコードのディスクキャッシュ
 - **ツール**: プロジェクトやサイトを作る `phv new`、テストランナー(同じプロセスで動く HTTP クライアント `std.testing`、
   前後のフック、JUnit の報告、カバレッジ付き)、ライブリロード(`phv serve --watch`)、フォーマッタ、Language Server

@@ -1,0 +1,125 @@
+<?phv
+// A closure passed to a built-in with several overloads of one arity
+// (`groupBy`) may change a narrowed property: the narrowing is dropped after
+// the call, as for any other call (the checker used to keep it: found by the
+// 1.2.0 audit).
+interface Thing {}
+class Box implements Thing {
+    public function __construct(public string $label) {}
+}
+class Vault implements Thing {
+    public function __construct(private string $secret) {}
+}
+class Holder {
+    public ?Thing $t = null;
+    public function __construct() {}
+}
+class A {
+    public ?A $p = null;
+    public int $v = 7;
+    public function __construct() {}
+}
+class Inner {
+    public int $v = 42;
+    public function __construct() {}
+}
+class WithInner implements Thing {
+    public Inner $inner;
+    public function __construct() { $this->inner = new Inner(); }
+}
+class WithInt implements Thing {
+    public int $inner = 777;
+    public function __construct() {}
+}
+
+function string_keys(Holder $h, list<int> $xs): string {
+    if (!($h->t is Box)) {
+        return "not a box";
+    }
+    $_g = $xs->groupBy(function (int $x) use ($h): string {
+        $h->t = new Vault("secret");
+        return "k";
+    });
+    return $h->t->label;
+}
+
+function int_keys(Holder $h, list<int> $xs): string {
+    if (!($h->t is Box)) {
+        return "not a box";
+    }
+    $_g = $xs->groupBy(function (int $x) use ($h): int {
+        $h->t = new Vault("secret");
+        return 1;
+    });
+    return $h->t->label;
+}
+
+function nulled(A $a, list<int> $xs): int {
+    if ($a->p == null) {
+        return 0;
+    }
+    $_g = $xs->groupBy(function (int $x) use ($a): string {
+        $a->p = null;
+        return "k";
+    });
+    return $a->p->v;
+}
+
+function slot_retyped(Holder $h, list<int> $xs): int {
+    if (!($h->t is WithInner)) {
+        return -1;
+    }
+    $_g = $xs->groupBy(function (int $x) use ($h): string {
+        $h->t = new WithInt();
+        return "k";
+    });
+    return $h->t->inner->v;
+}
+
+function chosen(Holder $h, list<int> $xs, bool $swap): string {
+    if (!($h->t is Box)) {
+        return "not a box";
+    }
+    $writer = function (int $x) use ($h): string {
+        $h->t = new Vault("secret");
+        return "k";
+    };
+    $reader = fn(int $x) => "k";
+    $_g = $xs->groupBy($swap ? $writer : $reader);
+    return $h->t->label;
+}
+
+function from_list(Holder $h, list<int> $xs): string {
+    if (!($h->t is Box)) {
+        return "not a box";
+    }
+    $fs = [function (int $x) use ($h): string {
+        $h->t = new Vault("secret");
+        return "k";
+    }];
+    $_g = $xs->groupBy($fs[0]);
+    return $h->t->label;
+}
+
+function in_finally(Holder $h, list<int> $xs): string {
+    Thing $x = new Box("box");
+    try {
+        if (!($x is Box)) {
+            return "";
+        }
+        if (!($h->t is Box)) {
+            return "";
+        }
+    } finally {
+        $xs->groupBy(function (int $v) use ($h): string {
+            $h->t = new Vault("secret");
+            return "k";
+        });
+    }
+    return $h->t->label;
+}
+
+$h = new Holder();
+$h->t = new Box("label");
+echo string_keys($h, [1]), int_keys($h, [1]), nulled(new A(), [1]), slot_retyped($h, [1]);
+echo chosen($h, [1], true), from_list($h, [1]), in_finally($h, [1]);
