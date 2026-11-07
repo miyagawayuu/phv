@@ -23,8 +23,9 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
 use phv_vm::bytecode::{Const, Function, Instr, NativeSig, PathBase, Program, Reg, Scalar, ValKind, NO_REG};
 use phv_vm::jit::*;
-use phv_vm::{JitEntry, JitTable};
+use phv_vm::{Installed, JitEntry, JitTable};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 const I64: Type = types::I64;
 const F64: Type = types::F64;
@@ -45,12 +46,23 @@ const _: () = {
     assert!(offset_of!(phv_vm::jit::JitCtx, stack_limit) == CTX_STACK_LIMIT as usize);
 };
 
-/// Owns the JIT's executable memory.
-struct Code(#[allow(dead_code)] JITModule);
+/// Owns a unit's executable memory, freed when the unit is dropped.
+struct Code(Option<JITModule>);
 // SAFETY: after `finalize_definitions` the module is never used again except
 // to be dropped; the code it owns is immutable and safe to call from any thread.
 unsafe impl Send for Code {}
 unsafe impl Sync for Code {}
+
+impl Drop for Code {
+    fn drop(&mut self) {
+        if let Some(module) = self.0.take() {
+            // SAFETY: every entry into this code is an `Installed` holding
+            // the unit (see `compile_root`), and the unit is dropped only
+            // when the last of them is: nothing can run or call it any more.
+            unsafe { module.free_memory() };
+        }
+    }
+}
 
 /// What a register holds at some point of a function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -889,19 +901,395 @@ fn writes_args(f: &Function) -> bool {
     })
 }
 
-/// Compiles every eligible function. Returns `None` if there are none (or
-/// the host is not supported by Cranelift).
-pub fn build(prog: &Program) -> Option<JitTable> {
-    let checked = eligible(prog);
-    if checked.is_empty() {
+/// Whether `f` has a loop: a branch to an earlier instruction (the compiler
+/// branches back only for loops).
+fn has_loop(f: &Function) -> bool {
+    use Instr::*;
+    f.code.iter().enumerate().any(|(i, ins)| {
+        let t = match *ins {
+            Jump(t)
+            | JumpIfFalse(_, t)
+            | JumpIfTrue(_, t)
+            | JumpIfNull(_, t)
+            | JumpIfNotNull(_, t)
+            | JumpIfNotLtI(_, _, t)
+            | JumpIfNotLeI(_, _, t)
+            | JumpIfEq(_, _, t)
+            | JumpIfNotEq(_, _, t)
+            | JumpIfNotLtIImm(_, _, t)
+            | JumpIfNotLeIImm(_, _, t)
+            | JumpIfLtIImm(_, _, t)
+            | JumpIfLeIImm(_, _, t) => t,
+            _ => return false,
+        };
+        t as usize <= i
+    })
+}
+
+/// Per function: whether it may call itself again, directly or through other
+/// functions (it is on a cycle of the call graph). Tarjan's algorithm, with
+/// an explicit stack (call chains can be long).
+fn recursive(prog: &Program) -> Vec<bool> {
+    let n = prog.funcs.len();
+    let callees: Vec<Vec<usize>> = prog
+        .funcs
+        .iter()
+        .map(|f| {
+            f.code
+                .iter()
+                .filter_map(|i| match *i {
+                    Instr::Call { func, .. } if (func as usize) < n => Some(func as usize),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    let mut index = vec![usize::MAX; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut stack = Vec::new();
+    let mut next = 0;
+    let mut rec = vec![false; n];
+    for root in 0..n {
+        if index[root] != usize::MAX {
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = vec![(root, 0)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(top) = work.last_mut() {
+            let v = top.0;
+            if top.1 < callees[v].len() {
+                let w = callees[v][top.1];
+                top.1 += 1;
+                if index[w] == usize::MAX {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(u, _)) = work.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut members = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on_stack[w] = false;
+                    members.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                if members.len() > 1 || callees[v].contains(&v) {
+                    for w in members {
+                        rec[w] = true;
+                    }
+                }
+            }
+        }
+    }
+    rec
+}
+
+/// The native code of a program: the eligible functions with a loop or
+/// recursion, each compiled as a unit with the functions it calls (see
+/// `canonical`). Returns `None` if nothing can be compiled (or the host is not
+/// supported by Cranelift).
+///
+/// Why these functions: one call of a loop or a recursion may run for the
+/// whole script, and native code is entered only at a call, so they must be
+/// compiled before they run. A straight-line function called from the
+/// interpreter gains nothing: entering native code costs more than its body
+/// (measured on the 1.2.1 cycle: a body of one addition, 2 million calls,
+/// 172 ms compiled against 131 interpreted; one that joins strings, 710
+/// against 425; a body of 30 integer operations saves 0.3 µs a call, and
+/// compiling it costs 0.5–1.5 ms). It is compiled only inside a caller's
+/// unit, where the call is direct. So what a function runs as is fixed when
+/// the program is loaded, and the same in every run.
+pub fn table(prog: &Program) -> Option<JitTable> {
+    let rec = recursive(prog);
+    let roots = prog.funcs.iter().enumerate().filter(|(i, f)| f.native.is_some() && (rec[*i] || has_loop(f)));
+    build_table(prog, roots.map(|(i, _)| i as u32))
+}
+
+/// A table with every eligible function compiled, the straight-line ones too
+/// (tests of the JIT; `table` is what scripts run with).
+pub fn table_all(prog: &Program) -> Option<JitTable> {
+    let roots = prog.funcs.iter().enumerate().filter(|(_, f)| f.native.is_some());
+    build_table(prog, roots.map(|(i, _)| i as u32))
+}
+
+/// Compiles the units of `roots` (in order; a function already compiled in
+/// an earlier unit keeps that code) into a table.
+fn build_table(prog: &Program, roots: impl Iterator<Item = u32>) -> Option<JitTable> {
+    isa()?;
+    let mut entries: Vec<Option<Installed>> = (0..prog.funcs.len()).map(|_| None).collect();
+    for root in roots {
+        if entries[root as usize].is_some() {
+            continue;
+        }
+        for (f, installed) in compile_root(prog, root) {
+            let slot = &mut entries[f as usize];
+            if slot.is_none() {
+                *slot = Some(installed);
+            }
+        }
+    }
+    if entries.iter().all(|e| e.is_none()) {
         return None;
     }
-    let mut flags = settings::builder();
-    flags.set("use_colocated_libcalls", "false").ok()?;
-    flags.set("is_pic", "false").ok()?;
-    flags.set("opt_level", "speed").ok()?;
-    let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
-    let mut jb = JITBuilder::with_isa(isa, default_libcall_names());
+    let writes_args = prog.funcs.iter().map(writes_args).collect();
+    Some(JitTable::new(entries, writes_args))
+}
+
+/// The host's instruction set, made once per process.
+fn isa() -> Option<cranelift_codegen::isa::OwnedTargetIsa> {
+    static ISA: std::sync::OnceLock<Option<cranelift_codegen::isa::OwnedTargetIsa>> = std::sync::OnceLock::new();
+    ISA.get_or_init(|| {
+        let mut flags = settings::builder();
+        flags.set("use_colocated_libcalls", "false").ok()?;
+        flags.set("is_pic", "false").ok()?;
+        flags.set("opt_level", "speed").ok()?;
+        cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()
+    })
+    .clone()
+}
+
+/// A unit of native code: one function and the functions it calls, compiled
+/// together (their calls are direct). Immutable once made, and shared between
+/// the programs whose functions it compiles (see `canonical`).
+struct Unit {
+    /// None when the root function could not be compiled (remembered, so
+    /// that the check is not run again for the same functions).
+    code: Option<Code>,
+    /// Per function of the canonical program: its entry, when compiled.
+    entries: Vec<Option<JitEntry>>,
+}
+
+/// A function and what its native code depends on, renamed so that the same
+/// program text gives the same result wherever it is loaded: the functions it
+/// reaches through calls (numbered from the root in the order they are first
+/// called), the constants they name (numbered in the order they are first
+/// named) and the builtins they call (by name).
+///
+/// The machine code of a unit is computed from this program alone (the
+/// instructions, signatures, register counts, constant values and builtin
+/// names: `well_formed`, `step` and `Translator` read nothing else of a
+/// program), and names nothing of the program it came from: the VM's state
+/// is reached through `JitCtx`, constants through `JitCtx::consts`, calls
+/// between the unit's functions are direct, and helpers are process-wide
+/// symbols. So two programs with the same canonical form run the same code,
+/// which the standard library's functions and a project's modules give for
+/// every page that loads them.
+struct Canonical {
+    prog: Program,
+    /// The original ids of the canonical functions, in order.
+    members: Vec<u32>,
+    /// The original indices of the canonical constants, in order.
+    consts: Vec<u32>,
+    /// Every byte of `prog` the code depends on (the key under which the
+    /// unit is shared).
+    key: Vec<u8>,
+}
+
+/// The canonical form of function `root` and the functions it reaches.
+fn canonical(prog: &Program, root: u32) -> Canonical {
+    use std::fmt::Write as _;
+    let mut members = vec![root];
+    let mut local: HashMap<u32, u32> = HashMap::from([(root, 0)]);
+    let mut i = 0;
+    while i < members.len() {
+        for ins in &prog.funcs[members[i] as usize].code {
+            if let Instr::Call { func, .. } = *ins {
+                if prog.funcs.get(func as usize).is_some_and(|f| f.native.is_some()) && !local.contains_key(&func) {
+                    local.insert(func, members.len() as u32);
+                    members.push(func);
+                }
+            }
+        }
+        i += 1;
+    }
+    let mut consts: Vec<u32> = Vec::new();
+    let mut const_local: HashMap<u32, u32> = HashMap::new();
+    let mut builtins: Vec<String> = Vec::new();
+    let mut builtin_local: HashMap<u32, u32> = HashMap::new();
+    let mut funcs = Vec::with_capacity(members.len());
+    let mut key = Vec::new();
+    for &m in &members {
+        let f = &prog.funcs[m as usize];
+        let mut code = f.code.clone();
+        for ins in &mut code {
+            match ins {
+                Instr::Const(_, c) => {
+                    let n = consts.len() as u32;
+                    *c = *const_local.entry(*c).or_insert_with(|| {
+                        consts.push(*c);
+                        n
+                    });
+                }
+                // A callee that cannot be compiled (no native signature) is
+                // out of range: `step` refuses the call where it is reached.
+                Instr::Call { func, .. } => *func = local.get(func).copied().unwrap_or(u32::MAX),
+                Instr::CallBuiltin { id, .. } => {
+                    let n = builtins.len() as u32;
+                    *id = *builtin_local.entry(*id).or_insert_with(|| {
+                        builtins.push(prog.builtin_names.get(*id as usize).cloned().unwrap_or_default());
+                        n
+                    });
+                }
+                _ => {}
+            }
+        }
+        // Derived `Debug` prints every field of an instruction. The name
+        // only serves `PHV_JIT_EXPLAIN`.
+        let _ = writeln!(key_text(&mut key), "{} {} {} {:?} {:?}", f.name, f.num_params, f.num_regs, f.native, code);
+        funcs.push(Function {
+            native: f.native.clone(),
+            name: f.name.clone(),
+            num_params: f.num_params,
+            num_regs: f.num_regs,
+            code,
+            ..Default::default()
+        });
+    }
+    let const_values: Vec<Const> =
+        consts.iter().map(|&c| prog.consts.get(c as usize).cloned().unwrap_or(Const::Null)).collect();
+    for c in &const_values {
+        // Floats by their bits: `Debug` prints every NaN alike.
+        match c {
+            Const::Float(v) => key.extend_from_slice(&v.to_bits().to_le_bytes()),
+            c => {
+                let _ = write!(key_text(&mut key), "{c:?}");
+            }
+        }
+        key.push(b'\n');
+    }
+    let _ = writeln!(key_text(&mut key), "{builtins:?}");
+    let prog = Program { funcs, consts: const_values, builtin_names: builtins, ..Default::default() };
+    Canonical { prog, members, consts, key }
+}
+
+/// Writes text into `key` (which also holds raw bytes).
+fn key_text(key: &mut Vec<u8>) -> KeyText<'_> {
+    KeyText(key)
+}
+
+struct KeyText<'a>(&'a mut Vec<u8>);
+
+impl std::fmt::Write for KeyText<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// The units compiled in this process, by canonical form: a page's standard
+/// library functions are compiled once, not once per page. Bounded; the
+/// oldest units leave first (a unit still installed in a table lives on
+/// through it).
+struct Shared {
+    units: HashMap<Vec<u8>, Arc<Unit>>,
+    order: std::collections::VecDeque<Vec<u8>>,
+    key_bytes: usize,
+}
+
+const SHARED_UNITS: usize = 4096;
+const SHARED_KEY_BYTES: usize = 64 << 20;
+
+static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
+
+fn shared_get(key: &[u8]) -> Option<Arc<Unit>> {
+    SHARED.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.units.get(key).cloned()
+}
+
+/// Keeps `unit` under `key`, or gives the one another thread kept meanwhile.
+fn shared_put(key: Vec<u8>, unit: Arc<Unit>) -> Arc<Unit> {
+    let mut guard = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    let shared = guard.get_or_insert_with(|| Shared {
+        units: HashMap::new(),
+        order: std::collections::VecDeque::new(),
+        key_bytes: 0,
+    });
+    if let Some(u) = shared.units.get(&key) {
+        return u.clone();
+    }
+    while shared.units.len() >= SHARED_UNITS || shared.key_bytes + key.len() > SHARED_KEY_BYTES {
+        let Some(old) = shared.order.pop_front() else { break };
+        shared.key_bytes -= old.len();
+        shared.units.remove(&old);
+    }
+    shared.key_bytes += key.len();
+    shared.order.push_back(key.clone());
+    shared.units.insert(key, unit.clone());
+    unit
+}
+
+/// Compiles function `root` of `prog` with the functions it calls, sharing
+/// the unit with other programs of the same text, and gives the code of each
+/// function compiled, by function id (nothing when `root` cannot be
+/// compiled). `PHV_JIT_STATS=1` reports each compilation on stderr.
+fn compile_root(prog: &Program, root: u32) -> Vec<(u32, Installed)> {
+    let start = std::time::Instant::now();
+    let canon = canonical(prog, root);
+    let (unit, hit) = match shared_get(&canon.key) {
+        Some(u) => (u, true),
+        None => {
+            let unit = Arc::new(compile_unit(&canon.prog));
+            (shared_put(canon.key, unit), false)
+        }
+    };
+    if std::env::var_os("PHV_JIT_STATS").is_some() {
+        let name = &prog.funcs[root as usize].name;
+        let n = unit.entries.iter().filter(|e| e.is_some()).count();
+        let how = if hit { "shared" } else { "compiled" };
+        eprintln!(
+            "phv jit: {name}: {how} {n} of {} functions in {} µs",
+            canon.members.len(),
+            start.elapsed().as_micros()
+        );
+    }
+    if unit.code.is_none() {
+        return Vec::new();
+    }
+    let consts: Arc<[u32]> = canon.consts.into();
+    let keep_alive: Arc<dyn std::any::Any + Send + Sync> = unit.clone();
+    canon
+        .members
+        .iter()
+        .zip(&unit.entries)
+        .filter_map(|(&m, e)| {
+            let entry = (*e)?;
+            Some((m, Installed { entry, consts: consts.clone(), keep_alive: keep_alive.clone() }))
+        })
+        .collect()
+}
+
+/// Compiles the eligible functions of canonical program `prog` into one
+/// unit; function 0 is the root.
+fn compile_unit(prog: &Program) -> Unit {
+    let none = Unit { code: None, entries: vec![None; prog.funcs.len()] };
+    let checked = eligible(prog);
+    if !checked.contains_key(&0) {
+        return none;
+    }
+    build(prog, &checked).unwrap_or(none)
+}
+
+/// Compiles the functions in `checked` (see `compile_unit`); `None` if
+/// Cranelift refuses something.
+fn build(prog: &Program, checked: &HashMap<u32, Checked>) -> Option<Unit> {
+    let mut jb = JITBuilder::with_isa(isa()?, default_libcall_names());
     for (name, addr, ..) in helpers() {
         jb.symbol(name, addr);
     }
@@ -1008,8 +1396,7 @@ pub fn build(prog: &Program) -> Option<JitTable> {
         // SAFETY: `entry` was defined above with exactly the `JitEntry` signature.
         entries[f as usize] = Some(unsafe { std::mem::transmute::<*const u8, JitEntry>(p) });
     }
-    let writes_args = prog.funcs.iter().map(writes_args).collect();
-    Some(JitTable { entries, writes_args, keep_alive: Box::new(Code(module)) })
+    Some(Unit { code: Some(Code(Some(module))), entries })
 }
 
 struct Translator<'a, 'b> {

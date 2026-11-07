@@ -1467,10 +1467,37 @@ $redis->rpush("jobs", "a");  $redis->lpop("jobs");  $redis->lrange("jobs", 0, -1
 ```
 
 Methods: `get`, `set`, `delete`, `exists`, `incr`, `expire`, `ttl`, `hget`, `hset`, `hdel`, `hgetAll`, `rpush`,
-`lpop`, `lrange`, `close`. Each command waits at most until the script's time limit, and a reply larger than the
+`lpop`, `lrange`, `pipeline` (below), `close`. Each command waits at most until the script's time limit, and a reply larger than the
 memory left to the script is refused. Only these commands can be sent: commands such as `KEYS`, `FLUSHALL`, `CONFIG` or
 `EVAL` are not available. Keys starting with `phv:` belong to PHV (sessions, rate limits and jobs kept in Redis) and raise
 `ValueError`. A remote server needs a `rediss://` URL (or `tls = false`). Errors raise `DatabaseError`.
+
+#### Redis pipelines
+
+```phv
+$p = $redis->pipeline();                       // RedisPipeline
+$p->set("greeting", "hello", 60)->incr("visits")->get("name");
+[$set, $visits, $name] = $p->exec();           // [true, 3, "Ann"]: the replies, in order
+```
+
+`pipeline()` queues commands and `exec()` sends them together, in one round trip instead of one per command, and
+returns their replies in order, as `any`.
+
+- `RedisPipeline` has the data methods of `Redis` (`get` to `lrange`), each taking what the method of `Redis` takes
+  and returning the pipeline. The replies are what the server answers: `get`, `hget` and `lpop` give `?string`;
+  `incr`, `rpush` and `ttl` an `int`; `set` `true`; `delete`, `exists`, `expire`, `hset` and `hdel` the server's
+  count (`int`, not the `bool` of `Redis`); `hgetAll` a `map<string, string>`; `lrange` a `list<string>`.
+- A command the server refused (`INCRBY` on a text, say) is a `DatabaseError` value in its place, with the message
+  the same command would have thrown; the commands after it are still answered. A connection error or a time-out
+  fails the whole call (`DatabaseError`; the script's time-limit error at the limit).
+- A pipeline sends at most 1,024 commands and 16 MB of commands at once; past either, `exec()` raises `ValueError`
+  and sends nothing. The keys are checked before anything is sent (`phv:` keys raise `ValueError`). After `exec()`
+  the pipeline is empty; `exec()` on an empty one returns `[]` without a round trip.
+- The whole exchange waits until the script's time limit at most, and the replies together stay within the memory
+  left to the script: each reply is read within what the ones before it left, and the limits of one reply (its
+  size, the elements of a list, the nesting) hold for each.
+- A pipeline is not a transaction: the server may run other clients' commands between its commands, and a command
+  that fails does not undo the ones before it.
 
 ### WebSocket server (std.ws)
 
@@ -1968,8 +1995,17 @@ $data = json_decode($j->payload);
   created when first needed and taken with `SELECT ... FOR UPDATE SKIP LOCKED`; Redis keeps them under
   `phv:jobs:<hash>:`. Every server process and machine of the site using the same store shares the jobs; other sites
   on the same database do not see them. Jobs left in the shared table when a site gets a name are not taken: they stay
-  in `phv_jobs` (Redis: under `phv:jobs:`), `phv jobs list` says how many waiting, running and failed jobs are there,
-  and a later release adds a command that moves them to the site's own table. The
+  in `phv_jobs` (Redis: under `phv:jobs:`), and `phv jobs list` says how many waiting, running and failed jobs are
+  there. `phv jobs adopt [--yes] [dir]` moves them into the site's own table (or keys). The shared store records no
+  site, so it takes the waiting and failed jobs whose name is one of the site's job scripts (`<dir>/<name>.phv`) and
+  no other: check the dry run when another site on the same database had jobs of the same names. Without `--yes` it
+  is a dry run that prints what would move (each job's id, state and name, and the counts) and what is skipped, and
+  moves nothing. A running job is skipped until it has ended; so is a job whose key the site's store has already, and
+  a waiting job that does not fit under the site's caps (it stays, with the message of a full store). A job is never
+  in both stores and never lost: on PostgreSQL and MySQL each job is deleted from the shared table and inserted into
+  the site's in one transaction, which holds the site's job lock (so the caps are counted exactly, as for `enqueue()`
+  in a transaction), and a row another connection holds is skipped, not waited for; in Redis one script moves them.
+  After it, `phv jobs list` no longer counts them; what is skipped, and other sites' jobs, stay and are counted. The
   100,000 hold for transactions running at the same time too: `enqueue()` in a transaction takes a lock of the site's
   jobs that the transaction holds until it ends (PostgreSQL an advisory lock, MySQL a row of a table
   `phv_jobs_lock`), so transactions that add jobs to the same site wait for one another, and so does an `enqueue()`
@@ -1994,7 +2030,8 @@ $data = json_decode($j->payload);
 - `phv jobs run [dir]` runs the jobs (and schedules) of a project without serving its pages, until Ctrl-C or
   SIGTERM, for a worker machine; with `[jobs] run = false`, `phv serve` only adds jobs (`phv jobs run` and a built
   site's `--jobs-only` run them all the same). A built site's jobs are those built into it. `phv jobs list [--failed]`
-  shows the jobs of a shared store, and `phv jobs retry <id>` puts a job that was given up back in the queue.
+  shows the jobs of a shared store, `phv jobs retry <id>` puts a job that was given up back in the queue, and
+  `phv jobs adopt [--yes]` moves the jobs the site left in the shared store before it had a namespace (see above).
 - A job that does not compile stops `phv serve`, `phv jobs run` and `phv build`. When the server stops, running jobs
   get what is left of `shutdown_timeout`; one that does not finish runs again elsewhere when its lease runs out.
 - The payload is stored as it is: encrypt (`encrypt()`) what must stay secret. A page that adds jobs for visitors
@@ -2389,7 +2426,7 @@ When code uses a PHP function name, the error message suggests the alternative
 | `phv dap` | Debug adapter for editors (see Debugging below) |
 | `phv doc [paths] [--std] [--format html\|md] [-o file]` | An API reference from doc comments (see API reference below) |
 | `phv install [--locked]` | Fetch `[dependencies]` and the packages they need, and pin them in `phv.lock` |
-| `phv jobs run [dir]`, `phv jobs list [--failed] [dir]`, `phv jobs retry <id> [dir]` | Run a project's background jobs without serving its pages; list the jobs of its store; put a failed job back (see "Background jobs") |
+| `phv jobs run [dir]`, `phv jobs list [--failed] [dir]`, `phv jobs retry <id> [dir]`, `phv jobs adopt [--yes] [dir]` | Run a project's background jobs without serving its pages; list the jobs of its store; put a failed job back; move the jobs the site left in the shared store before it had a namespace (a dry run without `--yes`; see "Background jobs") |
 | `phv migrate file.php` | Convert PHP mechanically and list the places that need manual work (`-o` names the output, which is not written through a link) |
 | `phv disasm file.phv` | Show the bytecode |
 | `phv parse file.phv` | Show the syntax tree |
@@ -2679,7 +2716,12 @@ It then runs the type checker and shows the places that need manual work, such a
      instruction they use is supported: arithmetic including `**`, comparisons (also with `null`), conversions,
      string constants, `.`, `.=`, `(string)`, `strlen()` and `->len()`; `null`, `??` and null checks; for
      lists and maps `[...]`, `$xs[$k]`, `$xs[$k] ?? $default`, `$xs[$k] = $v`, `$xs[] = $v`, `foreach`, `range()`,
-     `count()`, `->len()` and `->has()`; and calls to other compiled functions. Numbers stay in machine registers
+     `count()`, `->len()` and `->has()`; and calls to other compiled functions. A function with a loop or
+     recursion is compiled when the program is loaded, together with the functions it calls (those calls are
+     direct); a function with neither that no compiled function calls stays in the interpreter, since entering
+     native code would cost more than its body. The code of a function, with the functions it calls, is shared
+     between the programs of a process that have the same text for them (a module several pages use is compiled
+     once). `PHV_JIT_STATS=1` reports each compilation on stderr. Numbers stay in machine registers
      (with a null flag for nullable ones); strings, lists and maps live in a register window and are handled by the
      interpreter's own code, so results, error messages (such as `IndexError` and `KeyError`) and memory checks are
      identical. `PHV_JIT_EXPLAIN=1` prints, for each function the JIT leaves to the interpreter, the instruction

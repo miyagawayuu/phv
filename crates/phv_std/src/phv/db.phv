@@ -276,7 +276,113 @@ export class Redis {
         return Redis::texts($this->run("LRANGE", [$key, (string)$start, (string)$stop]));
     }
 
+    /** Commands to send together, in one round trip (see `RedisPipeline`). */
+    public function pipeline(): RedisPipeline {
+        return new RedisPipeline(fn(list<list<string>> $commands): list<any> => __redis_pipeline($this->handle, $commands));
+    }
+
     public function close(): void {
         __db_close($this->handle);
+    }
+}
+
+/**
+ * Commands queued to be sent to Redis together, from `Redis::pipeline()`:
+ * one round trip instead of one per command.
+ *
+ *   $p = $redis->pipeline();
+ *   $p->set("greeting", "hello", 60)->incr("visits")->get("name");
+ *   [$set, $visits, $name] = $p->exec();   // [true, 3, "Ann"]
+ *
+ * The methods take what the methods of `Redis` of the same name take and
+ * queue the command; `exec()` sends them and returns the replies in order, as
+ * `any`: `get`, `hget` and `lpop` give `?string`, `incr`, `rpush` and `ttl`
+ * `int`, `set` `true`, `delete`, `exists`, `expire`, `hset` and `hdel` the
+ * server's count (`int`), `hgetAll` `map<string, string>` and `lrange`
+ * `list<string>`. A command the server refused is a `DatabaseError` value in
+ * its place; the others are still answered. A pipeline is not a transaction:
+ * other clients' commands may run between its commands.
+ */
+export class RedisPipeline {
+    private list<list<string>> $commands = [];
+
+    public function __construct(private fn(list<list<string>>): list<any> $send) {}
+
+    private function queue(string $command, list<string> $args): RedisPipeline {
+        $this->commands[] = [$command, ...$args];
+        return $this;
+    }
+
+    public function get(string $key): RedisPipeline {
+        return $this->queue("GET", [$key]);
+    }
+
+    public function set(string $key, string $value, int $ttl = 0): RedisPipeline {
+        if ($ttl > 0) {
+            return $this->queue("SET", [$key, $value, "EX", (string)$ttl]);
+        }
+        return $this->queue("SET", [$key, $value]);
+    }
+
+    public function delete(string $key): RedisPipeline {
+        return $this->queue("DEL", [$key]);
+    }
+
+    public function exists(string $key): RedisPipeline {
+        return $this->queue("EXISTS", [$key]);
+    }
+
+    public function incr(string $key, int $by = 1): RedisPipeline {
+        return $this->queue("INCRBY", [$key, (string)$by]);
+    }
+
+    public function expire(string $key, int $seconds): RedisPipeline {
+        return $this->queue("EXPIRE", [$key, (string)$seconds]);
+    }
+
+    public function ttl(string $key): RedisPipeline {
+        return $this->queue("TTL", [$key]);
+    }
+
+    public function hget(string $key, string $field): RedisPipeline {
+        return $this->queue("HGET", [$key, $field]);
+    }
+
+    public function hset(string $key, string $field, string $value): RedisPipeline {
+        return $this->queue("HSET", [$key, $field, $value]);
+    }
+
+    public function hdel(string $key, string $field): RedisPipeline {
+        return $this->queue("HDEL", [$key, $field]);
+    }
+
+    public function hgetAll(string $key): RedisPipeline {
+        return $this->queue("HGETALL", [$key]);
+    }
+
+    public function rpush(string $key, string $value): RedisPipeline {
+        return $this->queue("RPUSH", [$key, $value]);
+    }
+
+    public function lpop(string $key): RedisPipeline {
+        return $this->queue("LPOP", [$key]);
+    }
+
+    public function lrange(string $key, int $start, int $stop): RedisPipeline {
+        return $this->queue("LRANGE", [$key, (string)$start, (string)$stop]);
+    }
+
+    /**
+     * Sends the queued commands and returns their replies in order; the
+     * pipeline is empty again afterwards. At most 1,024 commands and 16 MB
+     * are sent at once (`ValueError`, nothing sent). The whole exchange
+     * waits until the script's time limit at most, and the replies together
+     * stay within the memory left to the script.
+     */
+    public function exec(): list<any> {
+        $commands = $this->commands;
+        $this->commands = [];
+        $send = $this->send;
+        return $send($commands);
     }
 }

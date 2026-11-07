@@ -1,0 +1,95 @@
+// Run by crates/phv_driver/tests/redis_pipeline.rs against a Redis server:
+// several commands sent together, their replies in order.
+import std.db.Redis;
+
+$r = Redis::connect("main");
+foreach (["t:p:a", "t:p:n", "t:p:h", "t:p:l", "t:p:text"] as $k) {
+    $r->delete($k);
+}
+
+// Every method, in one round trip; the replies come in the order queued.
+$p = $r->pipeline();
+$p->set("t:p:a", "hello", 60)
+    ->get("t:p:a")
+    ->get("t:p:none")
+    ->exists("t:p:a")
+    ->incr("t:p:n")
+    ->incr("t:p:n", 10)
+    ->expire("t:p:n", 30)
+    ->ttl("t:p:none")
+    ->hset("t:p:h", "name", "Ann")
+    ->hset("t:p:h", "name", "Bo")
+    ->hget("t:p:h", "name")
+    ->hgetAll("t:p:h")
+    ->hdel("t:p:h", "name")
+    ->rpush("t:p:l", "x")
+    ->rpush("t:p:l", "y")
+    ->lrange("t:p:l", 0, -1)
+    ->lpop("t:p:l")
+    ->delete("t:p:a");
+$replies = $p->exec();
+echo "replies: ", count($replies), "\n";
+echo json_encode($replies), "\n";
+$ttl = $r->ttl("t:p:n");
+echo "ttl ok: ", $ttl > 0 && $ttl <= 30 ? "yes" : "no", "\n";
+
+// The pipeline is empty after exec(); an empty one sends nothing.
+echo "empty: ", json_encode($p->exec()), "\n";
+
+// An error in the middle is a DatabaseError in its place; the rest is answered.
+$r->set("t:p:text", "abc");
+$replies = $r->pipeline()->incr("t:p:n")->incr("t:p:text")->get("t:p:text")->exec();
+echo "before: ", json_encode($replies[0]), "\n";
+$e = $replies[1];
+if ($e is DatabaseError) {
+    echo "error: ", $e->message, "\n";
+}
+echo "after: ", json_encode($replies[2]), "\n";
+// The connection is still in step.
+echo "get: ", $r->get("t:p:text") ?? "null", "\n";
+
+// Keys of PHV are refused before anything is sent.
+try {
+    $r->pipeline()->set("t:p:a", "x")->get("phv:session:x")->exec();
+} catch (ValueError $e) {
+    echo "refused: ", $e->message, "\n";
+}
+echo "not set: ", $r->get("t:p:a") ?? "null", "\n";
+
+// At most 1,024 commands.
+$big = $r->pipeline();
+for ($i = 0; $i < 1024; $i++) {
+    $big->get("t:p:none");
+}
+echo "1024: ", count($big->exec()), "\n";
+for ($i = 0; $i < 1025; $i++) {
+    $big->get("t:p:none");
+}
+try {
+    $big->exec();
+} catch (ValueError $e) {
+    echo "refused: ", $e->message, "\n";
+}
+
+// At most 16 MB of commands.
+$chunk = str_repeat("x", 1000000);
+$wide = $r->pipeline();
+for ($i = 0; $i < 17; $i++) {
+    $wide->set("t:p:a", $chunk);
+}
+try {
+    $wide->exec();
+} catch (ValueError $e) {
+    echo "refused: ", $e->message, "\n";
+}
+echo "not set: ", $r->get("t:p:a") ?? "null", "\n";
+
+foreach (["t:p:a", "t:p:n", "t:p:h", "t:p:l", "t:p:text"] as $k) {
+    $r->delete($k);
+}
+$r->close();
+try {
+    $r->pipeline()->get("t:p:a")->exec();
+} catch (DatabaseError $e) {
+    echo "error: ", $e->message, "\n";
+}

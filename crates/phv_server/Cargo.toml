@@ -20,7 +20,8 @@ percent-encoding.workspace = true
 getrandom.workspace = true
 phv_std.workspace = true
 indexmap.workspace = true
-serde_json.workspace = true
+# raw_value: a session record's values are kept as text until a page reads them.
+serde_json = { workspace = true, features = ["raw_value"] }
 flate2.workspace = true
 httpdate.workspace = true
 chrono.workspace = true

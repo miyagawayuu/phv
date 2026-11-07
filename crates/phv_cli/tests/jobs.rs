@@ -218,7 +218,7 @@ fn check_left_in_shared(name: &str, url: &str) {
     let note = "note: 2 jobs added before this site had a namespace are still in the shared store and not run";
     let (ok, out) = phv(&["jobs", "list", &dir.to_string_lossy()]);
     assert!(ok && out.contains("no jobs") && out.contains(note), "{out}");
-    assert!(out.contains("a later release will add a command to move them"), "{out}");
+    assert!(out.contains("`phv jobs adopt` moves those of this site's jobs"), "{out}");
     // The site's own jobs are listed, and the note counts the shared ones only.
     let own = Store::Db(spec.clone(), Some(phv_std::store_namespace(&site)));
     let own_id = own.add("mine", "", 0, None).unwrap().unwrap();
@@ -275,4 +275,196 @@ fn list_counts_the_jobs_left_in_the_shared_store_with_postgres() {
     let sep = if url.contains('?') { '&' } else { '?' };
     check_left_in_shared("left-pg", &format!("{url}{sep}options=-c%20search_path%3D{schema}"));
     admin.apply(&format!("9101_left_{tag}.sql"), &format!("DROP SCHEMA {schema} CASCADE")).unwrap();
+}
+
+/// Needs `PHV_TEST_MYSQL_URL`; the shared table has one name in the test
+/// database, so the lock of the unnamed stores is held meanwhile.
+#[test]
+fn list_counts_the_jobs_left_in_the_shared_store_with_mysql() {
+    let Ok(url) = std::env::var("PHV_TEST_MYSQL_URL") else {
+        eprintln!("PHV_TEST_MYSQL_URL is not set: skipped");
+        return;
+    };
+    let _unnamed = phv_std::testing::unnamed();
+    check_left_in_shared("left-mysql", &url);
+}
+
+/// Ends every job of `store`, the given-up ones too.
+fn drain(store: &phv_std::jobs::Store) {
+    use phv_std::jobs::End;
+    while let Some(j) = store.take(Duration::from_secs(60)).unwrap() {
+        store.end(&j, End::Done { keyed: false }).unwrap();
+    }
+    for j in store.list(true).unwrap() {
+        store.requeue(&j.id).unwrap();
+        let t = store.take(Duration::from_secs(60)).unwrap().unwrap();
+        store.end(&t, End::Done { keyed: false }).unwrap();
+    }
+}
+
+/// `phv jobs adopt` moves the jobs a site with a namespace left in the shared
+/// store (`phv_jobs`, `phv:jobs:`) into the site's own store, only those named
+/// as the site's job scripts, and a dry run first; a running job, a job whose
+/// key the site's store has, and another site's jobs stay. The names and keys
+/// are this run's, and the counts are taken against what the shared store of
+/// `url` held before, so what a run that died left there does not matter.
+fn check_adopt(name: &str, url: &str) {
+    use phv_std::jobs::{End, Store};
+    let dir = base(name);
+    let tag = run_tag();
+    let site = format!("adopt-{tag}");
+    let (left, keyed_name, other, key) =
+        (format!("left_{tag}"), format!("keyed_{tag}"), format!("other_{tag}"), format!("k_{tag}"));
+    let toml = |project: &str| {
+        format!("{project}[databases.q]\nurl = \"{url}\"\n[jobs]\nstore = \"db:q\"\nmax_attempts = 1\n")
+    };
+    write(&dir, "phv.toml", &toml(&format!("[project]\nname = \"{site}\"\n")));
+    write(&dir, "public/index.phv", "<?phv echo 1;");
+    // Without job scripts there is nothing a job could be matched to.
+    let (ok, out) = phv(&["jobs", "adopt", &dir.to_string_lossy()]);
+    assert!(ok && out.contains("nothing to adopt") && out.contains("no job scripts"), "{out}");
+    write(&dir, &format!("jobs/{left}.phv"), JOB);
+    write(&dir, &format!("jobs/{keyed_name}.phv"), JOB);
+    let spec = phv_vm::DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 2 };
+    let shared = Store::Db(spec.clone(), None);
+    let own = Store::Db(spec.clone(), Some(phv_std::store_namespace(&site)));
+    drain(&shared);
+    drain(&own);
+    // What the shared store holds besides this run's jobs (jobs of other
+    // names that a run left, not yet due): counted with them below.
+    let base = own.left_in_shared().unwrap() as usize;
+    // Nothing of this site in the shared store yet.
+    let (ok, out) = phv(&["jobs", "adopt", &dir.to_string_lossy()]);
+    assert!(ok && out.contains("nothing to adopt: the shared store holds no job of this site"), "{out}");
+    // What 1.1 left: a job given up, one running, two waiting (one in an
+    // hour), one whose key the site's store has already, and another site's.
+    let dead = shared.add(&left, "three", 0, None).unwrap().unwrap();
+    let t = shared.take(Duration::from_secs(60)).unwrap().unwrap();
+    assert_eq!(t.id, dead);
+    shared.end(&t, End::Dead { error: "left behind" }).unwrap();
+    let running = shared.add(&left, "four", 0, None).unwrap().unwrap();
+    let run = shared.take(Duration::from_secs(60)).unwrap().unwrap();
+    assert_eq!(run.id, running);
+    let one = shared.add(&left, "one", 0, None).unwrap().unwrap();
+    let two = shared.add(&left, "two", 3600, None).unwrap().unwrap();
+    own.add(&keyed_name, "", 0, Some(&key)).unwrap().unwrap();
+    let keyed = shared.add(&keyed_name, "", 0, Some(&key)).unwrap().unwrap();
+    let theirs = shared.add(&other, "theirs", 0, None).unwrap().unwrap();
+    // The ids of this run's jobs in a store.
+    let ids = |store: &Store| {
+        let mut ids: Vec<String> =
+            store.list(false).unwrap().into_iter().filter(|j| j.name.ends_with(&tag)).map(|j| j.id).collect();
+        ids.sort();
+        ids
+    };
+    let sorted = |mut v: Vec<&String>| {
+        v.sort();
+        v.into_iter().cloned().collect::<Vec<String>>()
+    };
+    // The dry run says what would move and what is skipped, and moves nothing.
+    let (ok, out) = phv(&["jobs", "adopt", &dir.to_string_lossy()]);
+    assert!(ok, "{out}");
+    assert!(out.contains("would move 3 jobs (2 waiting, 1 failed):"), "{out}");
+    assert!(out.contains(&one) && out.contains(&two) && out.contains(&dead), "{out}");
+    assert!(out.contains(&format!("skipped  {running}  running")), "{out}");
+    assert!(
+        out.contains(&format!("skipped  {keyed}  waiting  {keyed_name}: this site's store has a job with its key")),
+        "{out}"
+    );
+    assert!(!out.contains(&theirs), "{out}");
+    assert!(out.contains("a dry run: nothing was moved; run `phv jobs adopt --yes`"), "{out}");
+    assert_eq!(ids(&shared), sorted(vec![&dead, &running, &one, &two, &keyed, &theirs]));
+    assert_eq!(own.list(false).unwrap().len(), 1);
+    let note = |n: usize| {
+        format!("note: {n} jobs added before this site had a namespace are still in the shared store and not run")
+    };
+    let (ok, out) = phv(&["jobs", "list", &dir.to_string_lossy()]);
+    assert!(ok && out.contains(&note(base + 6)) && out.contains("`phv jobs adopt` moves"), "{out}");
+    // The move: this site's waiting and failed jobs, with their states.
+    let (ok, out) = phv(&["jobs", "adopt", "--yes", &dir.to_string_lossy()]);
+    assert!(ok, "{out}");
+    assert!(out.contains("moved 3 jobs (2 waiting, 1 failed):"), "{out}");
+    assert!(out.contains(&format!("skipped  {running}  running")), "{out}");
+    assert!(out.contains(&format!("skipped  {keyed}  waiting")), "{out}");
+    assert!(out.contains(&format!("note: {} jobs are still in the shared store", base + 3)), "{out}");
+    assert_eq!(ids(&shared), sorted(vec![&running, &keyed, &theirs]));
+    let mine = own.list(false).unwrap();
+    assert_eq!(mine.len(), 4, "{mine:?}");
+    let failed = mine.iter().find(|j| j.id == dead).unwrap();
+    assert_eq!((failed.state, failed.error.as_str(), failed.attempts), ("failed", "left behind", 1));
+    let later = mine.iter().find(|j| j.id == two).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()) as i64;
+    assert!(later.state == "waiting" && later.at > now + 3_000_000, "{later:?}");
+    // `phv jobs list` no longer counts them.
+    let (ok, out) = phv(&["jobs", "list", &dir.to_string_lossy()]);
+    assert!(ok && out.contains(&note(base + 3)) && out.contains(&one), "{out}");
+    // The moved jobs run as the site's own: the one due now first.
+    let t = own.take(Duration::from_secs(60)).unwrap().unwrap();
+    assert_eq!((t.id.as_str(), t.payload.as_str(), t.attempts), (one.as_str(), "one", 1));
+    own.end(&t, End::Done { keyed: false }).unwrap();
+    // Once more: nothing more to move.
+    let (ok, out) = phv(&["jobs", "adopt", "--yes", &dir.to_string_lossy()]);
+    assert!(ok && !out.contains("moved 1") && !out.contains("moved 2") && out.contains("skipped"), "{out}");
+    assert_eq!(ids(&shared), sorted(vec![&running, &keyed, &theirs]));
+    // Ended, the running job is moved too.
+    shared.end(&run, End::Done { keyed: false }).unwrap();
+    let kept = shared.add(&left, "five", 0, None).unwrap().unwrap();
+    let (ok, out) = phv(&["jobs", "adopt", "--yes", &dir.to_string_lossy()]);
+    assert!(ok && out.contains("moved 1 job (1 waiting, 0 failed):") && out.contains(&kept), "{out}");
+    assert_eq!(ids(&shared), sorted(vec![&keyed, &theirs]));
+    // A site without a namespace has the shared store as its own.
+    write(&dir, "phv.toml", &toml(""));
+    let (ok, out) = phv(&["jobs", "adopt", &dir.to_string_lossy()]);
+    assert!(ok && out.contains("nothing to adopt: the site has no namespace"), "{out}");
+    drain(&shared);
+    drain(&own);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Needs `PHV_TEST_REDIS_URL`; uses database 12 of the server (as the `list`
+/// test uses 11: the shared keys have one name, and the two tests run at once).
+#[test]
+fn adopt_moves_the_jobs_left_in_the_shared_store_with_redis() {
+    let Ok(url) = std::env::var("PHV_TEST_REDIS_URL") else {
+        eprintln!("PHV_TEST_REDIS_URL is not set: skipped");
+        return;
+    };
+    let url = match url.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('/') {
+            Some((server, _)) => format!("{scheme}://{server}/12"),
+            None => format!("{url}/12"),
+        },
+        None => format!("{url}/12"),
+    };
+    check_adopt("adopt-redis", &url);
+}
+
+/// Needs `PHV_TEST_POSTGRES_URL`; a schema of its own, as
+/// `list_counts_the_jobs_left_in_the_shared_store_with_postgres`.
+#[test]
+fn adopt_moves_the_jobs_left_in_the_shared_store_with_postgres() {
+    use phv_std::migrate::{Conn, Target};
+    let Ok(url) = std::env::var("PHV_TEST_POSTGRES_URL") else {
+        eprintln!("PHV_TEST_POSTGRES_URL is not set: skipped");
+        return;
+    };
+    let tag = run_tag();
+    let schema = format!("phv_adopt_{tag}");
+    let spec = phv_vm::DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 1 };
+    let mut admin = Conn::open(&Target::Server(&spec)).unwrap();
+    admin.apply(&format!("9102_adopt_{tag}.sql"), &format!("CREATE SCHEMA {schema}")).unwrap();
+    let sep = if url.contains('?') { '&' } else { '?' };
+    check_adopt("adopt-pg", &format!("{url}{sep}options=-c%20search_path%3D{schema}"));
+    admin.apply(&format!("9103_adopt_{tag}.sql"), &format!("DROP SCHEMA {schema} CASCADE")).unwrap();
+}
+
+/// Needs `PHV_TEST_MYSQL_URL`; holds the lock of the unnamed stores.
+#[test]
+fn adopt_moves_the_jobs_left_in_the_shared_store_with_mysql() {
+    let Ok(url) = std::env::var("PHV_TEST_MYSQL_URL") else {
+        eprintln!("PHV_TEST_MYSQL_URL is not set: skipped");
+        return;
+    };
+    let _unnamed = phv_std::testing::unnamed();
+    check_adopt("adopt-mysql", &url);
 }

@@ -25,11 +25,17 @@
 //! A save writes the whole session: of requests of one visitor that run at
 //! once, the one that ends last wins, and what another set meanwhile is lost
 //! (documented in the spec; a merge would need a per-key log in every store).
+//!
+//! A record's values are checked when it is read (a JSON object of strings)
+//! but decoded only when the page first reads or writes them, or when the
+//! record is written back (`Stored`); the memory store shares its map with
+//! the page until the page writes to it. What happens to the record itself
+//! (expiry, promotion, the `last` refresh, the save) does not wait for that.
 
 use crate::metrics::{Health, StoreKind};
 use indexmap::IndexMap;
 use phv_std::safefs;
-use phv_vm::SessionData;
+use phv_vm::{SessionData, SessionValues};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -51,7 +57,8 @@ const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 struct Entry {
-    values: IndexMap<String, String>,
+    /// Shared with the requests that loaded it; a request that writes copies it.
+    values: Arc<IndexMap<String, String>>,
     created: Instant,
     last: Instant,
     bytes: usize,
@@ -120,11 +127,42 @@ fn values_json(values: &IndexMap<String, String>) -> String {
 
 fn values_from_json(text: &str) -> Option<IndexMap<String, String>> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    values_of(&v)
+    v.as_object()?.iter().map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()
 }
 
-fn values_of(v: &serde_json::Value) -> Option<IndexMap<String, String>> {
-    v.as_object()?.iter().map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()
+/// Whether `text` would decode (`values_from_json`), without decoding it.
+fn valid_values(text: &str) -> bool {
+    serde_json::from_str::<phv_vm::SessionValuesShape>(text).is_ok()
+}
+
+/// The decoder a `SessionValues` is given: its text passed `valid_values`.
+fn decode_values(text: &str) -> IndexMap<String, String> {
+    values_from_json(text).unwrap_or_default()
+}
+
+/// A record's values: as the store keeps them (checked, not yet decoded), or
+/// decoded. A record read from the store holds the text; one being written
+/// holds the map. Writing the text back decodes and encodes it again, so the
+/// store gets the same bytes it got before values were kept as text.
+enum Stored {
+    Text(String),
+    Map(IndexMap<String, String>),
+}
+
+impl Stored {
+    fn json(&self) -> String {
+        match self {
+            Stored::Text(text) => values_json(&decode_values(text)),
+            Stored::Map(map) => values_json(map),
+        }
+    }
+
+    fn into_values(self) -> SessionValues {
+        match self {
+            Stored::Text(text) => SessionValues::encoded(text, decode_values),
+            Stored::Map(map) => SessionValues::from(map),
+        }
+    }
 }
 
 /// Sessions in a database of `[databases]`: Redis keeps them under
@@ -178,7 +216,7 @@ impl DbStore {
     }
 
     fn row(r: &Record, returned: bool) -> phv_std::SessionRow {
-        phv_std::SessionRow { data: values_json(&r.values), created: r.created, last: r.last, returned }
+        phv_std::SessionRow { data: r.values.json(), created: r.created, last: r.last, returned }
     }
 }
 
@@ -193,8 +231,10 @@ impl Backend for DbStore {
                 return None;
             }
         };
-        let values = values_from_json(&row.data)?;
-        Some((Record { created: row.created, last: row.last, values }, row.returned))
+        if !valid_values(&row.data) {
+            return None;
+        }
+        Some((Record { created: row.created, last: row.last, values: Stored::Text(row.data) }, row.returned))
     }
 
     fn insert(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<bool> {
@@ -261,17 +301,24 @@ fn now_secs() -> u64 {
 struct Record {
     created: u64,
     last: u64,
-    values: IndexMap<String, String>,
+    values: Stored,
 }
 
 impl Record {
     fn to_json(&self) -> String {
-        serde_json::json!({"created": self.created, "last": self.last, "values": self.values}).to_string()
+        format!("{{\"created\":{},\"last\":{},\"values\":{}}}", self.created, self.last, self.values.json())
     }
 
+    /// The times are read and the values checked (see `Stored`); anything
+    /// else in the file is ignored, as before.
     fn from_json(text: &str) -> Option<Record> {
-        let v: serde_json::Value = serde_json::from_str(text).ok()?;
-        Some(Record { created: v["created"].as_u64()?, last: v["last"].as_u64()?, values: values_of(&v["values"])? })
+        let top: HashMap<String, &serde_json::value::RawValue> = serde_json::from_str(text).ok()?;
+        let num = |k: &str| serde_json::from_str::<u64>(top.get(k)?.get()).ok();
+        let values = top.get("values")?.get();
+        if !valid_values(values) {
+            return None;
+        }
+        Some(Record { created: num("created")?, last: num("last")?, values: Stored::Text(values.to_string()) })
     }
 }
 
@@ -611,7 +658,7 @@ impl Store {
                     return SessionData::default();
                 }
             }
-            return SessionData { id: Some(id), values: r.values, ..SessionData::default() };
+            return SessionData { id: Some(id), values: r.values.into_values(), ..SessionData::default() };
         }
         let mut inner = self.inner.lock().unwrap();
         if let Some(id) = id {
@@ -621,7 +668,8 @@ impl Store {
                     let e = inner.map.get_mut(&id).unwrap();
                     e.last = Instant::now();
                     e.returned = true;
-                    return SessionData { id: Some(id), values: e.values.clone(), ..SessionData::default() };
+                    let values = SessionValues::shared(e.values.clone());
+                    return SessionData { id: Some(id), values, ..SessionData::default() };
                 }
                 Some(false) => {
                     if let Some(e) = inner.map.remove(&id) {
@@ -705,13 +753,14 @@ impl Store {
             created = e.created;
             returned = e.returned;
         }
-        let bytes = size(&s.values);
+        let values = s.values.into_shared();
+        let bytes = size(&values);
         if inner.map.len() >= MAX_SESSIONS || inner.bytes + bytes > MAX_BYTES {
             self.evict(&mut inner, bytes);
         }
         let issue_cookie = s.id.as_deref() != Some(new_id.as_str());
         inner.bytes += bytes;
-        inner.map.insert(new_id.clone(), Entry { values: s.values, created, last: Instant::now(), bytes, returned });
+        inner.map.insert(new_id.clone(), Entry { values, created, last: Instant::now(), bytes, returned });
         issue_cookie.then(|| self.cookie_for(Some(&new_id)))
     }
 
@@ -731,7 +780,7 @@ impl Store {
             _ => phv_std::random_hex(32),
         };
         let now = now_secs();
-        let mut record = Record { created: now, last: now, values: s.values };
+        let mut record = Record { created: now, last: now, values: Stored::Map(s.values.into_map()) };
         // As in the memory store: a session removed meanwhile (logged out,
         // regenerated or expired by another request) stays removed. Each step
         // below is atomic in the store, so this holds across processes too.
@@ -1137,6 +1186,247 @@ mod tests {
             store.save(done);
             assert!(store.load(Some(&header)).id.is_none(), "{var}");
         }
+    }
+
+    fn id_of(cookie: &str) -> String {
+        cookie.split(['=', ';']).nth(1).unwrap().to_string()
+    }
+
+    /// What a file or database store holds for a session: its values as the
+    /// store keeps them (not decoded by this), its `created` and `last` times.
+    fn stored(store: &Store, id: &str) -> Option<(String, u64, u64)> {
+        let (r, _) = store.files.as_ref().unwrap().read(id)?;
+        match r.values {
+            Stored::Text(text) => Some((text, r.created, r.last)),
+            Stored::Map(_) => panic!("a record read from the store holds its text"),
+        }
+    }
+
+    /// Stores a session whose values are the given text (which does not
+    /// decode) as the store keeps them; gives its cookie header and a way to
+    /// read the raw record back.
+    type Damaged<'a> = dyn Fn(&str) -> (String, Box<dyn Fn() -> Option<String>>) + 'a;
+
+    /// The values of a session are decoded at the page's first read, and not
+    /// at all by a page that never reads them; the record is still promoted,
+    /// refreshed and written as before. `dir` is a file store's directory.
+    fn lazy_values_hold(store: &Store, name: &str, dir: Option<&Path>, damaged: &Damaged<'_>) {
+        let read_file =
+            |id: &str, returned: bool| std::fs::read_to_string(dir.unwrap().join(FileStore::name(id, returned)));
+        // Set in an order that is not the sorted one: stores write the values sorted, as before.
+        let mut s = SessionData::default();
+        s.values.insert("zebra".into(), "1".into());
+        s.values.insert("user".into(), "ann".into());
+        s.changed = true;
+        let id = id_of(&store.save(s).unwrap());
+        let header = format!("PHVSESSID={id}");
+        let (text0, created, last0) = stored(store, &id).unwrap();
+        assert_eq!(text0, r#"{"user":"ann","zebra":"1"}"#, "{name}");
+        let file0 = dir.map(|_| read_file(&id, false).unwrap());
+
+        // (a) A page that neither reads nor writes the session: nothing is
+        // decoded, and the record is left as it was (promoted: the same bytes
+        // under the returned name).
+        let loaded = store.load(Some(&header));
+        assert!(loaded.id.is_some() && !loaded.values.is_decoded(), "{name}");
+        assert!(store.save(loaded).is_none(), "{name}");
+        assert_eq!(stored(store, &id).unwrap(), (text0.clone(), created, last0), "{name}: the record changed");
+        if dir.is_some() {
+            assert_eq!(read_file(&id, true).unwrap(), file0.unwrap(), "{name}: promoted with other bytes");
+        }
+        // With the refresh of `last` due: only `last` changes.
+        let old = Record { created, last: last0 - 120, values: Stored::Text(text0.clone()) };
+        assert!(store.files.as_ref().unwrap().update(&id, &old, true).unwrap(), "{name}");
+        let loaded = store.load(Some(&header));
+        assert!(!loaded.values.is_decoded(), "{name}");
+        assert!(store.save(loaded).is_none(), "{name}");
+        let (text1, created1, last1) = stored(store, &id).unwrap();
+        assert!(text1 == text0 && created1 == created && last1 >= last0, "{name}: {text1} {created1} {last1}");
+        if dir.is_some() {
+            let expected = format!("{{\"created\":{created},\"last\":{last1},\"values\":{text0}}}");
+            assert_eq!(read_file(&id, true).unwrap(), expected, "{name}: more than `last` changed");
+        }
+
+        // (c) Decoded at the first read; what the page writes comes back.
+        let mut s = store.load(Some(&header));
+        assert!(!s.values.is_decoded());
+        assert_eq!(s.values.get("user").map(String::as_str), Some("ann"), "{name}");
+        assert!(s.values.is_decoded());
+        assert_eq!(s.values.get("zebra").map(String::as_str), Some("1"), "{name}");
+        assert_eq!(s.values.get("seen"), None);
+        s.values.insert("seen".into(), "2".into());
+        s.changed = true;
+        assert!(store.save(s).is_none(), "{name}: the same id");
+        let s = store.load(Some(&header));
+        assert_eq!(s.values.get("seen").map(String::as_str), Some("2"), "{name}");
+        assert_eq!(s.values.len(), 3, "{name}");
+        let text2 = r#"{"seen":"2","user":"ann","zebra":"1"}"#;
+        assert_eq!(stored(store, &id).unwrap().0, text2, "{name}");
+        // A page that regenerates without reading moves the values whole.
+        let mut s = store.load(Some(&header));
+        s.regenerate = true;
+        s.changed = true;
+        let id2 = id_of(&store.save(s).unwrap());
+        assert!(store.load(Some(&header)).id.is_none(), "{name}");
+        let header2 = format!("PHVSESSID={id2}");
+        assert_eq!(stored(store, &id2).unwrap().0, text2, "{name}");
+        let mut s = store.load(Some(&header2));
+        assert_eq!(s.values.get("user").map(String::as_str), Some("ann"), "{name}");
+        s.destroyed = true;
+        store.save(s);
+
+        // (b) A record whose values do not decode is refused when it is read,
+        // as before: the page has no session, the record is left alone, and
+        // what the page sets starts a new session under a new id.
+        for text in [r#"{"a":1}"#, "[]", r#"{"a":"b""#, r#"{"a":null}"#, "\"x\""] {
+            let (header, raw) = damaged(text);
+            let before = raw();
+            assert!(before.is_some(), "{name}: {text}");
+            let s = store.load(Some(&header));
+            assert!(s.id.is_none() && s.values.is_empty(), "{name}: {text}: read");
+            assert_eq!(raw(), before, "{name}: {text}: the record was touched");
+            let mut s = store.load(Some(&header));
+            s.values.insert("x".into(), "1".into());
+            s.changed = true;
+            let cookie = store.save(s).unwrap();
+            assert_ne!(id_of(&cookie), id_of(&header), "{name}: {text}: the damaged record was taken over");
+            assert_eq!(raw(), before, "{name}: {text}: the record was touched by the save");
+            let mut s = store.load(Some(&format!("PHVSESSID={}", id_of(&cookie))));
+            assert_eq!(s.values.get("x").map(String::as_str), Some("1"), "{name}: {text}");
+            s.destroyed = true;
+            store.save(s);
+        }
+    }
+
+    #[test]
+    fn lazy_values_hold_in_the_file_store() {
+        let dir = std::env::temp_dir().join(format!("phv-sess-lazy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(Duration::from_secs(600), false, Some(dir.clone()));
+        let damaged = |text: &str| {
+            let id = phv_std::random_hex(32);
+            let path = dir.join(FileStore::name(&id, true));
+            let now = now_secs();
+            std::fs::write(&path, format!("{{\"created\":{now},\"last\":{now},\"values\":{text}}}")).unwrap();
+            let new = dir.join(FileStore::name(&id, false));
+            let raw = move || {
+                assert!(!new.exists(), "a damaged record was renamed");
+                std::fs::read_to_string(&path).ok()
+            };
+            (format!("PHVSESSID={id}"), Box::new(raw) as Box<dyn Fn() -> Option<String>>)
+        };
+        lazy_values_hold(&store, "files", Some(&dir), &damaged);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same against the database stores (skipped without the servers).
+    #[test]
+    fn lazy_values_hold_in_the_database_stores() {
+        let _one_at_a_time = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        for var in ["PHV_TEST_REDIS_URL", "PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
+            let Some(url) = std::env::var(var).ok().filter(|u| !u.is_empty()) else {
+                eprintln!("skipped: {var} is not set");
+                continue;
+            };
+            let spec = phv_vm::DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 2 };
+            let ns = phv_std::testing::namespace(0x46);
+            let store =
+                Store::with_database(Duration::from_secs(600), false, spec.clone(), Arc::default(), Some(ns.clone()));
+            let limits = phv_std::SessionLimits {
+                ttl: Duration::from_secs(600),
+                max_lifetime: MAX_LIFETIME,
+                max_sessions: MAX_SESSIONS,
+                max_bytes: MAX_BYTES,
+            };
+            let damaged = |text: &str| {
+                let id = phv_std::random_hex(32);
+                let key = shared_session_key(Some(&ns), &id);
+                let now = now_secs();
+                let row = phv_std::SessionRow { data: text.to_string(), created: now, last: now, returned: true };
+                assert!(phv_std::session_insert(&spec, Some(&ns), &key, &row, &limits).unwrap(), "{var}");
+                let (spec, ns) = (spec.clone(), ns.clone());
+                let raw = move || {
+                    let row = phv_std::session_read(&spec, Some(&ns), &key).unwrap()?;
+                    Some(format!("{} {} {} {}", row.data, row.created, row.last, row.returned))
+                };
+                (format!("PHVSESSID={id}"), Box::new(raw) as Box<dyn Fn() -> Option<String>>)
+            };
+            lazy_values_hold(&store, var, None, &damaged);
+        }
+    }
+
+    /// The memory store shares its map with the requests that load it, and a
+    /// request that writes gets a copy of its own.
+    #[test]
+    fn the_memory_store_shares_values_until_written() {
+        let store = Store::new(Duration::from_secs(600), false, None);
+        let mut s = SessionData::default();
+        s.values.insert("user".into(), "ann".into());
+        s.changed = true;
+        let id = id_of(&store.save(s).unwrap());
+        let header = format!("PHVSESSID={id}");
+        let kept = store.inner.lock().unwrap().map[&id].values.clone();
+        // A page that never reads: the same map, and nothing written.
+        let loaded = store.load(Some(&header));
+        assert!(loaded.values.is_decoded(), "a shared map needs no decoding");
+        assert!(Arc::ptr_eq(&loaded.values.into_shared(), &kept));
+        assert!(store.save(store.load(Some(&header))).is_none());
+        // A page that reads does not copy; one that writes copies, and the
+        // other request keeps seeing the old values until the writer saves.
+        let (reader, mut writer) = (store.load(Some(&header)), store.load(Some(&header)));
+        assert_eq!(reader.values.get("user").map(String::as_str), Some("ann"));
+        assert!(Arc::ptr_eq(&reader.values.into_shared(), &kept));
+        writer.values.insert("user".into(), "bob".into());
+        writer.changed = true;
+        assert_eq!(kept.get("user").map(String::as_str), Some("ann"));
+        assert_eq!(store.load(Some(&header)).values.get("user").map(String::as_str), Some("ann"));
+        assert!(store.save(writer).is_none());
+        assert_eq!(store.load(Some(&header)).values.get("user").map(String::as_str), Some("bob"));
+        assert_eq!(kept.get("user").map(String::as_str), Some("ann"));
+    }
+
+    /// A record is accepted and refused as before it was kept as text, and
+    /// decodes to the same values.
+    #[test]
+    fn records_are_checked_as_before() {
+        let ok = |text: &str| Record::from_json(text).map(|r| (r.created, r.last, r.values.into_values().into_map()));
+        let values = |pairs: &[(&str, &str)]| -> IndexMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        // As written, with spaces, with other fields, with escapes, with a repeated key (the last wins).
+        let (c, l, v) = ok(r#"{"created":1,"last":2,"values":{"b":"2","a":"1"}}"#).unwrap();
+        assert_eq!((c, l), (1, 2));
+        assert_eq!(v, values(&[("a", "1"), ("b", "2")]), "sorted, as the store writes them");
+        assert_eq!(ok(r#" { "values" : { } , "created" : 1 , "last" : 2 , "x" : [1] } "#).unwrap().2, values(&[]));
+        assert_eq!(
+            ok(r#"{"created":1,"last":2,"values":{"ké":"v\n\"","a":"x","a":"y"}}"#).unwrap().2,
+            values(&[("a", "y"), ("ké", "v\n\"")])
+        );
+        for bad in [
+            r#"{"created":1,"last":2,"values":{"a":1}}"#,
+            r#"{"created":1,"last":2,"values":{"a":null}}"#,
+            r#"{"created":1,"last":2,"values":{"a":{"b":"c"}}}"#,
+            r#"{"created":1,"last":2,"values":[]}"#,
+            r#"{"created":1,"last":2,"values":"x"}"#,
+            r#"{"created":1,"last":2}"#,
+            r#"{"created":1.0,"last":2,"values":{}}"#,
+            r#"{"created":-1,"last":2,"values":{}}"#,
+            r#"{"created":"1","last":2,"values":{}}"#,
+            r#"{"created":1,"values":{}}"#,
+            r#"[{"created":1,"last":2,"values":{}}]"#,
+            r#"{"created":1,"last":2,"values":{"a":"b"}"#,
+            "",
+        ] {
+            assert!(ok(bad).is_none(), "{bad}");
+        }
+        // The text is kept until read, and written back as before.
+        let r = Record::from_json(r#"{"created":1,"last":2,"values":{"b":"2","a":"1"}}"#).unwrap();
+        assert!(matches!(&r.values, Stored::Text(t) if t == r#"{"b":"2","a":"1"}"#));
+        assert_eq!(r.to_json(), r#"{"created":1,"last":2,"values":{"a":"1","b":"2"}}"#);
+        let v = r.values.into_values();
+        assert!(!v.is_decoded());
+        assert_eq!(v.get("a").map(String::as_str), Some("1"));
+        assert!(v.is_decoded());
     }
 
     #[test]

@@ -4,12 +4,15 @@
 //!
 //! ```text
 //! cargo run --release -p phv_server --example load -- \
-//!     --url http://127.0.0.1:8080 --path / --connections 16 --requests 500 [--warmup 50] [--json]
+//!     --url http://127.0.0.1:8080 --path / --connections 16 --requests 500 [--warmup 50] \
+//!     [--cookie PHVSESSID=...] [--json]
 //! ```
 //!
 //! Every connection first sends `--warmup` requests that are not counted, then
 //! all connections start the measured requests together. A response other than
 //! 200 is counted as an error; a connection the server closes is reopened.
+//! `--cookie` sends that `Cookie` header with every request (a page with a
+//! session, for example).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -22,15 +25,23 @@ struct Args {
     connections: usize,
     requests: usize,
     warmup: usize,
+    cookie: Option<String>,
     json: bool,
 }
 
-const USAGE: &str =
-    "usage: load --url http://HOST:PORT [--path /] [--connections 16] [--requests 500] [--warmup 50] [--json]";
+const USAGE: &str = "usage: load --url http://HOST:PORT [--path /] [--connections 16] [--requests 500] [--warmup 50] \
+                     [--cookie NAME=VALUE] [--json]";
 
 fn parse_args() -> Result<Args, String> {
-    let mut args =
-        Args { url: String::new(), path: "/".into(), connections: 16, requests: 500, warmup: 50, json: false };
+    let mut args = Args {
+        url: String::new(),
+        path: "/".into(),
+        connections: 16,
+        requests: 500,
+        warmup: 50,
+        cookie: None,
+        json: false,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -42,6 +53,13 @@ fn parse_args() -> Result<Args, String> {
             }
             "--requests" => args.requests = value("--requests")?.parse().map_err(|e| format!("--requests: {e}"))?,
             "--warmup" => args.warmup = value("--warmup")?.parse().map_err(|e| format!("--warmup: {e}"))?,
+            "--cookie" => {
+                let c = value("--cookie")?;
+                if c.is_empty() || c.bytes().any(|b| b < 0x20 || b == 0x7f) {
+                    return Err("--cookie must be a header value without control characters".into());
+                }
+                args.cookie = Some(c);
+            }
             "--json" => args.json = true,
             other => return Err(format!("unknown option {other}")),
         }
@@ -200,9 +218,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let cookie = args.cookie.as_ref().map_or(String::new(), |c| format!("Cookie: {c}\r\n"));
     let req = Arc::new(
         format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: phv-bench-load\r\nAccept: text/html,application/json\r\n\r\n",
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: phv-bench-load\r\nAccept: text/html,application/json\r\n{cookie}\r\n",
             args.path, addr
         )
         .into_bytes(),

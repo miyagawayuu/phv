@@ -5,7 +5,7 @@
 
 use crate::bytecode::*;
 use crate::jit::*;
-pub use crate::jit::{JitCtx, JitEntry, JitLimits, JitTable};
+pub use crate::jit::{Installed, JitCtx, JitEntry, JitLimits, JitTable};
 use crate::value::*;
 use indexmap::IndexMap;
 use std::cell::{Cell, RefCell};
@@ -119,11 +119,142 @@ pub struct UploadedFile {
 pub struct SessionData {
     /// Id of an existing session (from the cookie), if any.
     pub id: Option<String>,
-    pub values: indexmap::IndexMap<String, String>,
+    pub values: SessionValues,
     pub changed: bool,
     /// `regenerate()` was called: issue a new id (prevents session fixation).
     pub regenerate: bool,
     pub destroyed: bool,
+}
+
+/// The values of a session, as a map of strings. The store hands them over
+/// as it keeps them (the text of its record, or the map of the memory store,
+/// shared) and they are decoded, or copied, at the first read or write, so a
+/// page that never looks at its session does not pay for them. Reads and
+/// writes go through `Deref` and `DerefMut`, so the map is used as before.
+#[derive(Clone, Default)]
+pub struct SessionValues {
+    /// The values as the store keeps them, with the store's decoder; decoded
+    /// into `map` at the first use. The decoder is given text the store has
+    /// checked already, so it does not fail.
+    encoded: Option<(String, SessionDecoder)>,
+    map: std::cell::OnceCell<std::sync::Arc<SessionMap>>,
+}
+
+/// A session's values once decoded.
+pub type SessionMap = indexmap::IndexMap<String, String>;
+
+/// A store's decoder of the text it keeps a session's values as.
+pub type SessionDecoder = fn(&str) -> SessionMap;
+
+impl SessionValues {
+    /// Values a store keeps as text, decoded by `decode` at the first use.
+    pub fn encoded(text: String, decode: SessionDecoder) -> SessionValues {
+        SessionValues { encoded: Some((text, decode)), map: std::cell::OnceCell::new() }
+    }
+
+    /// Values the memory store keeps: shared until written (then copied).
+    pub fn shared(map: std::sync::Arc<SessionMap>) -> SessionValues {
+        SessionValues { encoded: None, map: std::cell::OnceCell::from(map) }
+    }
+
+    /// Whether the values have been decoded (or copied) yet.
+    pub fn is_decoded(&self) -> bool {
+        self.map.get().is_some()
+    }
+
+    fn force(&self) -> &std::sync::Arc<SessionMap> {
+        self.map.get_or_init(|| {
+            std::sync::Arc::new(match &self.encoded {
+                Some((text, decode)) => decode(text),
+                None => SessionMap::new(),
+            })
+        })
+    }
+
+    /// The map, shared with the memory store's entry when nothing wrote to it.
+    pub fn into_shared(self) -> std::sync::Arc<SessionMap> {
+        self.force();
+        self.map.into_inner().expect("initialized above")
+    }
+
+    pub fn into_map(self) -> SessionMap {
+        std::sync::Arc::unwrap_or_clone(self.into_shared())
+    }
+}
+
+impl From<SessionMap> for SessionValues {
+    fn from(map: SessionMap) -> SessionValues {
+        SessionValues::shared(std::sync::Arc::new(map))
+    }
+}
+
+impl std::ops::Deref for SessionValues {
+    type Target = SessionMap;
+
+    fn deref(&self) -> &SessionMap {
+        self.force()
+    }
+}
+
+impl std::ops::DerefMut for SessionValues {
+    fn deref_mut(&mut self) -> &mut SessionMap {
+        self.force();
+        std::sync::Arc::make_mut(self.map.get_mut().expect("initialized above"))
+    }
+}
+
+impl<'a> IntoIterator for &'a SessionValues {
+    type Item = (&'a String, &'a String);
+    type IntoIter = indexmap::map::Iter<'a, String, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.force().iter()
+    }
+}
+
+/// What a stored session's values must be: a JSON object of strings.
+/// Deserializing into it checks that shape without building anything, so a
+/// store can check a record as it reads it and decode it later (or never).
+pub struct SessionValuesShape;
+
+impl<'de> serde::Deserialize<'de> for SessionValuesShape {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<SessionValuesShape, D::Error> {
+        struct Shape;
+        impl<'de> serde::de::Visitor<'de> for Shape {
+            type Value = SessionValuesShape;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object of strings")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<SessionValuesShape, A::Error> {
+                while map.next_entry::<StrShape, StrShape>()?.is_some() {}
+                Ok(SessionValuesShape)
+            }
+        }
+        d.deserialize_map(Shape)
+    }
+}
+
+/// A JSON string, not kept.
+struct StrShape;
+
+impl<'de> serde::Deserialize<'de> for StrShape {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<StrShape, D::Error> {
+        struct Shape;
+        impl serde::de::Visitor<'_> for Shape {
+            type Value = StrShape;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<StrShape, E> {
+                Ok(StrShape)
+            }
+        }
+        d.deserialize_str(Shape)
+    }
 }
 
 /// Request data and response state for scripts running under the web server.
@@ -673,6 +804,28 @@ struct Frame {
     stop: bool,
 }
 
+/// A closure a builtin calls once per element, from `Vm::callback`. The calls
+/// of one builtin share what `callback` checked; the closure is still a frame
+/// of the call stack during each call, so an exception it throws has the
+/// same trace, and an error the same position, as through `call_value`.
+pub struct Callback {
+    clo: Rc<Closure>,
+    /// Checked by `Vm::callback`: `call` may skip to `call_fast`.
+    fast: bool,
+}
+
+impl Callback {
+    /// Calls the closure with `args`.
+    #[inline]
+    pub fn call(&self, vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
+        if self.fast {
+            vm.call_fast(self.clo.func, &self.clo.caps, args)
+        } else {
+            vm.call_inner(self.clo.func, &self.clo.caps, args)
+        }
+    }
+}
+
 struct Handler {
     frame: usize,
     catch_pc: u32,
@@ -747,6 +900,11 @@ pub struct Vm {
     equal_since: Cell<usize>,
     pub rng: u64,
     native_depth: u32,
+    /// Per function, once looked at: 1 when its body has no `try`, 2 when it
+    /// has one (see `callback`); empty until the first callback.
+    plain_bodies: Vec<u8>,
+    /// Tests only: every `Callback` takes the full path of `call_value`.
+    slow_callbacks: bool,
     argbuf: Vec<Value>,
     /// The keys of a path assignment (`SetPath`, `AppendPath`), kept for reuse.
     keybuf: Vec<Value>,
@@ -1102,6 +1260,8 @@ impl Vm {
             equal_since: Cell::new(0),
             rng: seed,
             native_depth: 0,
+            plain_bodies: Vec::new(),
+            slow_callbacks: false,
             argbuf: Vec::new(),
             keybuf: Vec::new(),
             jit_rerun: Vec::new(),
@@ -1165,6 +1325,82 @@ impl Vm {
             Value::Closure(c) => self.call_inner(c.func, &c.caps, args),
             v => bad("closure", v),
         }
+    }
+
+    /// Prepares closure `callee` for the calls a builtin makes to it once per
+    /// element (`map`, `filter`, `sortBy` ...): what `call_value` would check
+    /// before every call is checked here once, and `Callback::call` skips it.
+    /// A closure whose body has a `try` (so a `finally`), one the JIT
+    /// compiled, or every closure once `set_slow_callbacks` was called, takes
+    /// the full path of `call_value` at each call.
+    pub fn callback(&mut self, callee: &Value) -> Callback {
+        let clo = match callee {
+            Value::Closure(c) => Rc::clone(c),
+            v => bad("closure", v),
+        };
+        // The stack probe and the native depth are the same for every call
+        // the builtin makes: it calls from one place, with the same frames
+        // below it. The frame bound stays per call.
+        let fast = !self.slow_callbacks
+            && self.body_is_plain(clo.func)
+            && !self.jit.as_ref().is_some_and(|j| j.is_compiled(clo.func))
+            && self.native_depth < MAX_NATIVE_DEPTH
+            && !crate::stack::left_below(CALL_STACK);
+        Callback { clo, fast }
+    }
+
+    /// Tests only: `Callback::call` takes the full path of `call_value` for
+    /// every closure (the differential test runs the callbacks both ways).
+    pub fn set_slow_callbacks(&mut self, slow: bool) {
+        self.slow_callbacks = slow;
+    }
+
+    /// Whether function `func` has no `try` (so no `finally`): looked up once
+    /// per function and kept.
+    fn body_is_plain(&mut self, func: u32) -> bool {
+        if self.plain_bodies.is_empty() {
+            self.plain_bodies = vec![0; self.prog.funcs.len()];
+        }
+        let kind = &mut self.plain_bodies[func as usize];
+        if *kind == 0 {
+            let code = &self.prog.funcs[func as usize].code;
+            *kind = if code.iter().any(|i| matches!(i, Instr::TryBegin { .. })) { 2 } else { 1 };
+        }
+        *kind == 1
+    }
+
+    /// `call_inner` for a `Callback` that `callback` checked: the stack probe
+    /// and the native depth were checked there, and the register window is
+    /// not emptied and filled with nulls between two calls (as between the
+    /// interpreter's own calls, the callee writes a register before it reads
+    /// it). The captures and arguments are bound, the frame is pushed (an
+    /// exception's trace reads it) and the time limit is ticked as in every
+    /// call.
+    fn call_fast(&mut self, func: u32, caps: &[Value], args: &[Value]) -> Result<Value, VmError> {
+        if self.frames.len() >= self.limits.max_frames {
+            return Err(VmError::Fatal("maximum call stack depth exceeded".into()));
+        }
+        self.tick()?;
+        let base = match self.frames.last() {
+            Some(f) => f.base + self.prog.funcs[f.func as usize].num_regs as usize,
+            None => 0,
+        };
+        let nregs = self.prog.funcs[func as usize].num_regs as usize;
+        let need = base + nregs.max(caps.len() + args.len());
+        if self.regs.len() < need {
+            self.grow_regs(need)?;
+        }
+        let window = &mut self.regs[base..need];
+        // The captures again at each call: the body may change its copy
+        // (`$count++`), and every call starts from the captured value.
+        for (slot, v) in window.iter_mut().zip(caps.iter().chain(args.iter())) {
+            *slot = v.clone();
+        }
+        self.frames.push(Frame { func, pc: 0, base, ret: 0, stop: true });
+        self.native_depth += 1;
+        let r = self.exec();
+        self.native_depth -= 1;
+        r
     }
 
     /// `==` of two values: comparing large strings or lists can take long in one
@@ -1636,6 +1872,7 @@ impl Vm {
     fn call_jit(
         &mut self,
         entry: JitEntry,
+        consts: *const u32,
         func: u32,
         sig: &NativeSig,
         start: usize,
@@ -1701,10 +1938,12 @@ impl Vm {
             detail: 0,
             rt: &mut rt,
             stack_limit: self.jit_stack_limit as i64,
+            consts,
         };
         // SAFETY: the JIT creates entries only for functions it checked
         // (`phv_jit::well_formed`), the arguments match their native signature
-        // (checked above), and `ctx`, `limits` and `rt` outlive the call.
+        // (checked above), `consts` is the table of the entry's unit (kept
+        // alive by `self.jit`), and `ctx`, `limits` and `rt` outlive the call.
         let r = unsafe { entry(&mut ctx, raw.as_ptr()) };
         if outermost {
             self.jit_stack_limit = 0;
@@ -2378,21 +2617,29 @@ impl Vm {
                     Instr::AppendPath { path, cur } => tri!(self.append_path(base, path, *cur)),
 
                     Instr::Call { dst, func: callee, args, argc } => {
-                        let mut entry =
-                            self.jit.as_ref().and_then(|j| j.entries.get(*callee as usize).copied().flatten());
-                        match self.jit_paused {
-                            Some(n) if self.frames.len() > n => entry = None,
-                            Some(_) => self.jit_paused = None,
-                            None => {}
-                        }
-                        if let Some(entry) = entry {
+                        let paused = match self.jit_paused {
+                            Some(n) if self.frames.len() > n => true,
+                            Some(_) => {
+                                self.jit_paused = None;
+                                false
+                            }
+                            None => false,
+                        };
+                        // The function's native code, as its entry and the
+                        // program's indices of the constants its unit names.
+                        let entry = if paused {
+                            None
+                        } else {
+                            self.jit.as_ref().and_then(|j| j.entry(*callee)).map(|i| (i.entry, i.consts.as_ptr()))
+                        };
+                        if let Some((entry, consts)) = entry {
                             let sig = prog.funcs[*callee as usize]
                                 .native
                                 .as_ref()
                                 .expect("JIT entry for a function without a native signature");
                             self.frames[fi].pc = pc as u32;
                             let start = base + *args as usize;
-                            match tri!(self.call_jit(entry, *callee, sig, start, *argc as usize)) {
+                            match tri!(self.call_jit(entry, consts, *callee, sig, start, *argc as usize)) {
                                 Some(v) => {
                                     reg!(*dst) = v;
                                     continue;

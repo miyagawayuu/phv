@@ -15,7 +15,10 @@ use std::collections::HashMap;
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub use netdb::{JobCap, JobEnd as End, JobInfo as Info, JobRow as Row, JOB_KEY_WAITERS, JOB_MAX_DEAD, JOB_MAX_KEPT};
+pub use netdb::{
+    Adopted as Outcome, AdoptedJob as Adopted, JobCap, JobEnd as End, JobInfo as Info, JobRow as Row, JOB_KEY_WAITERS,
+    JOB_MAX_DEAD, JOB_MAX_KEPT,
+};
 
 /// The largest payload of a job.
 pub const MAX_PAYLOAD: usize = 64 * 1024;
@@ -379,6 +382,27 @@ impl Store {
         match self {
             Store::Db(spec, ns) => netdb::job_count_shared(spec, ns.as_deref()),
             Store::Memory(_) => Ok(0),
+        }
+    }
+
+    /// Moves the jobs the site left in the shared store (see `left_in_shared`)
+    /// into its own store when `apply`, or says what would move: the waiting
+    /// and given-up jobs whose name is one of `names` (the site's job
+    /// scripts; the shared store records no site). Running jobs, jobs whose
+    /// key the site's store has, and jobs that do not fit under its caps are
+    /// left and reported. `None` for a site whose store is the shared one, and
+    /// for the memory store: there is nothing to adopt.
+    pub fn adopt(&self, names: &[String], apply: bool) -> Result<Option<Vec<Adopted>>, String> {
+        self.adopt_within(names, apply, DB_CAP)
+    }
+
+    /// `adopt` with the caps given (for the tests).
+    pub fn adopt_within(&self, names: &[String], apply: bool, cap: JobCap) -> Result<Option<Vec<Adopted>>, String> {
+        match self {
+            Store::Db(spec, ns) if !netdb::job_store_is_shared(ns.as_deref()) => {
+                netdb::job_adopt(spec, ns.as_deref(), names, apply, cap).map(Some)
+            }
+            _ => Ok(None),
         }
     }
 

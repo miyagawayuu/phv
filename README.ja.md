@@ -100,7 +100,7 @@ scoop bucket add phv https://github.com/miyagawayuu/scoop-phv; scoop install phv
 
 ## ビルド
 
-最近の安定版 Rust が必要です(1.97 で確認)。SQLite を同梱してビルドするため、C コンパイラ
+最近の安定版 Rust が必要です(1.97 で確認)。SQLite と割り当て器(mimalloc)を同梱してビルドするため、C コンパイラ
 (Windows では Visual Studio Build Tools)も必要です。
 
 ```bash

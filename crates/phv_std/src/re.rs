@@ -232,13 +232,13 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "__re_replace_with" => |vm, a| {
             let c = regex(vm, &a[0])?;
-            let (text, f) = (s(&a[1]).to_string(), a[2].clone());
+            let (text, f) = (s(&a[1]).to_string(), vm.callback(&a[2]));
             budget_groups(vm, &c, &text)?;
             let mut out = String::new();
             let mut last = 0;
             for caps in c.regex.captures_iter(&text) {
                 let whole = caps.get(0).expect("group 0 is the match");
-                let with = vm.call_value(&f, &[groups(vm, &caps)?])?;
+                let with = f.call(vm, &[groups(vm, &caps)?])?;
                 let grow = (whole.start() - last).saturating_add(s(&with).len());
                 vm.reserve(grow)?;
                 out.reserve(grow);

@@ -1,0 +1,8 @@
+// Run by crates/phv_driver/tests/redis_pipeline.rs against a server that
+// answers the first command of a pipeline and then nothing (run with a time
+// limit of a second).
+import std.db.Redis;
+
+$r = Redis::connect("main");
+$r->pipeline()->set("t:slow", "1")->get("t:slow")->exec();
+echo "not reached\n";

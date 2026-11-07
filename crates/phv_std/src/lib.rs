@@ -1195,27 +1195,27 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             sort_metered(vm, v, |x| x).map(Value::list)
         },
         "list_sort_by" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             let items = list(&a[0]).as_ref().clone();
-            let sorted = merge_sort(items, &mut |x, y| match vm.call_value(&f, &[x.clone(), y.clone()])? {
+            let sorted = merge_sort(items, &mut |x, y| match f.call(vm, &[x.clone(), y.clone()])? {
                 Value::Int(i) => Ok(i),
                 other => Err(VmError::Fatal(format!("sortBy callback returned {}", other.type_name()))),
             })?;
             Ok(Value::list(sorted))
         },
         "list_map" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             let mut out = Vec::with_capacity(list(&a[0]).len());
             for x in list(&a[0]).iter() {
-                out.push(vm.call_value(&f, std::slice::from_ref(x))?);
+                out.push(f.call(vm, std::slice::from_ref(x))?);
             }
             Ok(Value::list(out))
         },
         "list_filter" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             let mut out = Vec::new();
             for x in list(&a[0]).iter() {
-                let keep = vm.call_value(&f, std::slice::from_ref(x))?;
+                let keep = f.call(vm, std::slice::from_ref(x))?;
                 if truthy(vm, keep)? {
                     out.push(x.clone());
                 }
@@ -1223,9 +1223,9 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::list(out))
         },
         "list_find" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             for x in list(&a[0]).iter() {
-                let hit = vm.call_value(&f, std::slice::from_ref(x))?;
+                let hit = f.call(vm, std::slice::from_ref(x))?;
                 if truthy(vm, hit)? {
                     return Ok(x.clone());
                 }
@@ -1233,9 +1233,9 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::Null)
         },
         "list_any" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             for x in list(&a[0]).iter() {
-                let hit = vm.call_value(&f, std::slice::from_ref(x))?;
+                let hit = f.call(vm, std::slice::from_ref(x))?;
                 if truthy(vm, hit)? {
                     return Ok(Value::Bool(true));
                 }
@@ -1243,9 +1243,9 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::Bool(false))
         },
         "list_all" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             for x in list(&a[0]).iter() {
-                let hit = vm.call_value(&f, std::slice::from_ref(x))?;
+                let hit = f.call(vm, std::slice::from_ref(x))?;
                 if !truthy(vm, hit)? {
                     return Ok(Value::Bool(false));
                 }

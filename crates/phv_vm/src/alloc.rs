@@ -5,9 +5,21 @@
 //! #[global_allocator]
 //! static ALLOC: phv_vm::alloc::CountingAlloc = phv_vm::alloc::CountingAlloc;
 //! ```
+//!
+//! The memory itself comes from mimalloc (`INNER`), not from the C library's
+//! `malloc`: it serves a thread's small allocations from pages of its own
+//! without a lock, which is what a request's run mostly does (objects,
+//! strings, map entries). The counting does not depend on the allocator
+//! underneath: every byte a thread asks for is added to its counter whatever
+//! hands it out, so the limits fire at the same sizes with either.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use mimalloc::MiMalloc;
+use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
+
+/// The allocator that provides the memory. Its own bookkeeping (pages,
+/// arenas) is not counted; the counters see what the program asked for.
+const INNER: MiMalloc = MiMalloc;
 
 thread_local! {
     // Const-initialized and without a destructor, so it is safe to use from
@@ -57,11 +69,11 @@ pub fn reset_thread_peak() {
 
 pub struct CountingAlloc;
 
-// SAFETY: every method forwards to the system allocator unchanged and only
-// updates a thread-local counter.
+// SAFETY: every method forwards to `INNER` unchanged and only updates a
+// thread-local counter.
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc(layout);
+        let p = INNER.alloc(layout);
         if !p.is_null() {
             add(layout.size() as isize);
         }
@@ -69,7 +81,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc_zeroed(layout);
+        let p = INNER.alloc_zeroed(layout);
         if !p.is_null() {
             add(layout.size() as isize);
         }
@@ -77,15 +89,88 @@ unsafe impl GlobalAlloc for CountingAlloc {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
+        INNER.dealloc(ptr, layout);
         add(-(layout.size() as isize));
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = System.realloc(ptr, layout, new_size);
+        let p = INNER.realloc(ptr, layout, new_size);
         if !p.is_null() {
             add(new_size as isize - layout.size() as isize);
         }
         p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::c_void;
+
+    extern "C" {
+        // Exported by the mimalloc the sys crate links; not declared by the
+        // crate without its `extended` feature.
+        fn mi_is_in_heap_region(p: *const c_void) -> bool;
+        fn mi_usable_size(p: *const c_void) -> usize;
+    }
+
+    /// What the counting allocator hands out comes from mimalloc, and the
+    /// counter moves by exactly the bytes asked for, not by what mimalloc
+    /// rounds them up to.
+    #[test]
+    fn counts_the_bytes_asked_for_and_serves_them_from_mimalloc() {
+        let alloc = CountingAlloc;
+        for (size, align) in [(1usize, 1usize), (24, 8), (1000, 16), (70_000, 64), (3 << 20, 4096)] {
+            let layout = Layout::from_size_align(size, align).unwrap();
+            let before = thread_allocated();
+            // SAFETY: the layouts are valid and every pointer is freed once,
+            // with the layout it was last given.
+            unsafe {
+                let p = alloc.alloc(layout);
+                assert!(!p.is_null());
+                assert_eq!(p as usize % align, 0, "alignment {align}");
+                assert!(mi_is_in_heap_region(p.cast()), "{size} bytes not from mimalloc");
+                assert!(mi_usable_size(p.cast()) >= size);
+                assert_eq!(thread_allocated() - before, size as isize, "after alloc of {size}");
+
+                let p = alloc.realloc(p, layout, size * 2);
+                assert!(!p.is_null());
+                assert!(mi_is_in_heap_region(p.cast()));
+                assert_eq!(thread_allocated() - before, 2 * size as isize, "after realloc of {size}");
+
+                let grown = Layout::from_size_align(size * 2, align).unwrap();
+                alloc.dealloc(p, grown);
+                assert_eq!(thread_allocated(), before, "after dealloc of {size}");
+
+                let z = alloc.alloc_zeroed(layout);
+                assert!(!z.is_null());
+                assert!(std::slice::from_raw_parts(z, size).iter().all(|&b| b == 0));
+                assert_eq!(thread_allocated() - before, size as isize, "after alloc_zeroed of {size}");
+                alloc.dealloc(z, layout);
+                assert_eq!(thread_allocated(), before);
+            }
+        }
+    }
+
+    /// The peak follows the counter, whatever allocator is underneath.
+    #[test]
+    fn peak_follows_the_counter() {
+        let alloc = CountingAlloc;
+        let layout = Layout::from_size_align(1 << 16, 8).unwrap();
+        reset_thread_peak();
+        let base = thread_allocated();
+        assert_eq!(thread_peak(), base);
+        // SAFETY: as above.
+        unsafe {
+            let a = alloc.alloc(layout);
+            let b = alloc.alloc(layout);
+            assert_eq!(thread_peak() - base, 2 << 16);
+            alloc.dealloc(a, layout);
+            alloc.dealloc(b, layout);
+        }
+        assert_eq!(thread_peak() - base, 2 << 16);
+        assert_eq!(thread_allocated(), base);
+        reset_thread_peak();
+        assert_eq!(thread_peak(), base);
     }
 }

@@ -106,8 +106,8 @@ scoop bucket add phv https://github.com/miyagawayuu/scoop-phv; scoop install phv
 
 ## Building
 
-You need a recent stable Rust (tested with 1.97). SQLite is built in, so a C compiler is also needed
-(Visual Studio Build Tools on Windows).
+You need a recent stable Rust (tested with 1.97). SQLite and the allocator (mimalloc) are built in, so a C
+compiler is also needed (Visual Studio Build Tools on Windows).
 
 ```bash
 cargo build --release

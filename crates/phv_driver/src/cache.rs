@@ -178,6 +178,7 @@ fn load(root: &Path, entry: &Path, key: &[u8; 32], stamp: &str) -> Option<Compil
         from_cache: true,
         marked_tests: e.marked_tests,
         test_hooks: e.test_hooks,
+        slow_callbacks: false,
     })
 }
 

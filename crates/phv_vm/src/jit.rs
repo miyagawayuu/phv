@@ -35,6 +35,10 @@ pub struct JitCtx {
     /// The lowest stack address native code may use: a function entered below
     /// it stops with `JIT_ERR_STACK` (depth alone does not bound large frames).
     pub stack_limit: i64,
+    /// The program's constant index of each constant the running unit of
+    /// native code names (see `Installed::consts`): compiled code is shared
+    /// between programs, so it names constants by their index in the unit.
+    pub consts: *const u32,
 }
 
 /// Native stack the JIT's code may use below the outermost native call.
@@ -83,16 +87,55 @@ impl JitLimits {
 /// in `JitRt`'s first window and a string result is left in `JitRt::ret`.
 pub type JitEntry = unsafe extern "C" fn(*mut JitCtx, *const i64) -> i64;
 
-/// Native code for the functions the JIT compiled, indexed by function id.
+/// A function's native code, once it is compiled (see `JitTable::entry`).
+pub struct Installed {
+    pub entry: JitEntry,
+    /// For `JitCtx::consts`: the program's index of each constant the unit
+    /// of code `entry` belongs to names (the unit's code is shared between
+    /// programs, and names constants by their index in the unit).
+    pub consts: Arc<[u32]>,
+    /// Owns the executable memory `entry` points into: the unit lives at
+    /// least as long as this.
+    pub keep_alive: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+/// Native code for the functions the JIT compiled, by function id. One table
+/// per compiled program, filled when the program is loaded (by `phv_jit`, on
+/// the thread that loads it) and then only read, by every run of the program
+/// on any thread: the units' memory is made executable, with the instruction
+/// cache and pipeline flushed, before the table is published with the
+/// program, so what a function runs as, interpreted or compiled, is fixed
+/// from the first call.
 pub struct JitTable {
-    pub entries: Vec<Option<JitEntry>>,
+    /// Per function: its code, when it is compiled.
+    entries: Vec<Option<Installed>>,
     /// Per function: it changes a string, list or map parameter in place
     /// (`$xs[] = ...`, `.=`). Its arguments are not kept for a rerun (an
     /// extra reference would make that change copy the whole value), so when
     /// its native code runs out of stack it stops instead.
     pub writes_args: Vec<bool>,
-    /// Owns the executable memory the entries point into.
-    pub keep_alive: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl JitTable {
+    pub fn new(entries: Vec<Option<Installed>>, writes_args: Vec<bool>) -> JitTable {
+        JitTable { entries, writes_args }
+    }
+
+    /// The native code of function `f`, if it has any.
+    #[inline]
+    pub fn entry(&self, f: u32) -> Option<&Installed> {
+        self.entries.get(f as usize)?.as_ref()
+    }
+
+    /// Whether function `f` has native code.
+    pub fn is_compiled(&self, f: u32) -> bool {
+        self.entry(f).is_some()
+    }
+
+    /// The number of functions with native code.
+    pub fn compiled(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_some()).count()
+    }
 }
 
 /// The `Value`s of a call into native code.
@@ -258,13 +301,14 @@ pub unsafe extern "C" fn phv_jit_take_ret(ctx: *mut JitCtx, d: i64) {
     rt.top()[d as usize] = v;
 }
 
-/// `Const`: constant `c` (a string) into slot `d`.
+/// `Const`: constant `c` of the unit (a string, or an empty list or map) into
+/// slot `d`.
 ///
 /// # Safety
-/// See `rt`.
+/// See `rt`; `ctx.consts` has an entry for every constant the unit names.
 pub unsafe extern "C" fn phv_jit_const(ctx: *mut JitCtx, d: i64, c: i64) {
+    let c = *(*ctx).consts.add(c as usize) as usize;
     let rt = rt(ctx);
-    let c = c as usize;
     let v = match &rt.consts[c] {
         Some(v) => v.clone(),
         None => {

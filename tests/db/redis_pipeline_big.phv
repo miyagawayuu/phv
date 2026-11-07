@@ -1,0 +1,20 @@
+// A pipeline whose replies together are larger than the memory limit allows
+// (run with a 16 MB limit).
+import std.db.Redis;
+
+$r = Redis::connect("main");
+$r->delete("t:pbig");
+$chunk = str_repeat("x", 1000000);
+for ($i = 0; $i < 5; $i++) {
+    $r->rpush("t:pbig", $chunk);
+}
+echo "pushed\n";
+// Five replies of 5 MB each: the first fits, the budget runs out on the way.
+$items = $r->pipeline()
+    ->lrange("t:pbig", 0, -1)
+    ->lrange("t:pbig", 0, -1)
+    ->lrange("t:pbig", 0, -1)
+    ->lrange("t:pbig", 0, -1)
+    ->lrange("t:pbig", 0, -1)
+    ->exec();
+echo "not reached: ", count($items), "\n";

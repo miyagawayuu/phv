@@ -10,6 +10,11 @@ use std::time::Instant;
 /// Deepest nesting of arrays accepted in a reply (our commands return at most one level).
 const MAX_DEPTH: usize = 8;
 
+/// Most commands one pipeline sends.
+pub(crate) const MAX_PIPELINE_COMMANDS: usize = 1024;
+/// Most bytes one pipeline sends (the commands as encoded).
+pub(crate) const MAX_PIPELINE_BYTES: usize = 16 << 20;
+
 pub(crate) enum Reply {
     Nil,
     Int(i64),
@@ -121,33 +126,54 @@ impl RedisConn {
         check_plain(&t.host, t.tls, tls_setting, "rediss://")?;
         let stream = dial(&t.host, t.port, t.tls, until)?;
         let mut conn = RedisConn { stream, buf: Vec::new(), pos: 0, budget: 1 << 20 };
-        let run = |conn: &mut RedisConn, args: &[&[u8]]| match conn.command(args, until, 1 << 20) {
-            Ok(_) => Ok(()),
-            Err(RedisError::Server(m)) => Err(m),
-            Err(RedisError::Broken(m)) => Err(m),
-            Err(RedisError::TooLarge) => Err("the server sent an invalid reply".into()),
-        };
+        // AUTH and SELECT go in one pipeline: one round trip to set a connection up.
+        let db = t.db.to_string();
+        let mut setup: Vec<Vec<&[u8]>> = Vec::new();
         if let Some(pass) = &t.password {
-            match &t.user {
-                Some(user) => run(&mut conn, &[b"AUTH", user.as_bytes(), pass.as_bytes()])?,
-                None => run(&mut conn, &[b"AUTH", pass.as_bytes()])?,
-            }
+            setup.push(match &t.user {
+                Some(user) => vec![b"AUTH", user.as_bytes(), pass.as_bytes()],
+                None => vec![b"AUTH", pass.as_bytes()],
+            });
         }
         if t.db != 0 {
-            run(&mut conn, &[b"SELECT", t.db.to_string().as_bytes()])?;
+            setup.push(vec![b"SELECT", db.as_bytes()]);
+        }
+        if !setup.is_empty() {
+            let replies = match conn.pipeline(&setup, until, 1 << 20) {
+                Ok(r) => r,
+                Err(RedisError::Server(m) | RedisError::Broken(m)) => return Err(m),
+                Err(RedisError::TooLarge) => return Err("the server sent an invalid reply".into()),
+            };
+            // The first error is the connection's (after a failed AUTH, SELECT fails too).
+            if let Some(Err(m)) = replies.into_iter().find(|r| r.is_err()) {
+                return Err(m);
+            }
         }
         Ok(conn)
     }
 
-    /// Sends one command and reads its reply, before `until` and within `budget` bytes.
-    pub(crate) fn command(&mut self, args: &[&[u8]], until: Instant, budget: usize) -> Result<Reply, RedisError> {
-        self.stream.set_deadline(until);
-        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    /// Appends one command to `out` in the wire format (RESP arrays of bulk strings).
+    fn encode(out: &mut Vec<u8>, args: &[&[u8]]) {
+        out.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
         for a in args {
             out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
             out.extend_from_slice(a);
             out.extend_from_slice(b"\r\n");
         }
+    }
+
+    /// The bytes `args` take on the wire.
+    pub(crate) fn encoded_len(args: &[&[u8]]) -> usize {
+        // `*N\r\n`, then `$len\r\n`, the bytes and `\r\n` for each argument.
+        let digits = |n: usize| n.checked_ilog10().map_or(1, |d| d as usize + 1);
+        3 + digits(args.len()) + args.iter().map(|a| 5 + digits(a.len()) + a.len()).sum::<usize>()
+    }
+
+    /// Sends one command and reads its reply, before `until` and within `budget` bytes.
+    pub(crate) fn command(&mut self, args: &[&[u8]], until: Instant, budget: usize) -> Result<Reply, RedisError> {
+        self.stream.set_deadline(until);
+        let mut out = Vec::new();
+        Self::encode(&mut out, args);
         let io = |e: std::io::Error| RedisError::Broken(describe(&e));
         self.stream.write_all(&out).map_err(io)?;
         self.stream.flush().map_err(io)?;
@@ -165,16 +191,62 @@ impl RedisConn {
         }
     }
 
+    /// Sends `commands` in one write and reads their replies in order, all
+    /// before `until`. The replies together stay within `budget` bytes: each
+    /// is read within what the ones before it left, and the limits of one
+    /// reply (its size, the elements of an array, the nesting) hold for each
+    /// as for `command`. An error reply is `Err(message)` in its position, as
+    /// `RedisError::Server` reports it for one command; a connection error, a
+    /// reply past the budget or a connection out of step fails the whole call
+    /// (and the connection cannot be reused). Callers keep within
+    /// `MAX_PIPELINE_COMMANDS` and `MAX_PIPELINE_BYTES`.
+    pub(crate) fn pipeline(
+        &mut self,
+        commands: &[Vec<&[u8]>],
+        until: Instant,
+        budget: usize,
+    ) -> Result<Vec<Result<Reply, String>>, RedisError> {
+        debug_assert!(commands.len() <= MAX_PIPELINE_COMMANDS);
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.stream.set_deadline(until);
+        let mut out = Vec::with_capacity(commands.iter().map(|c| Self::encoded_len(c)).sum());
+        for args in commands {
+            Self::encode(&mut out, args);
+        }
+        let io = |e: std::io::Error| RedisError::Broken(describe(&e));
+        self.stream.write_all(&out).map_err(io)?;
+        self.stream.flush().map_err(io)?;
+        self.budget = budget;
+        let mut replies = Vec::with_capacity(commands.len());
+        for _ in commands {
+            match self.reply(0) {
+                Ok(r) => replies.push(r),
+                Err(e) => {
+                    // The connection is out of step: what is left belongs to no one.
+                    self.buf.clear();
+                    self.pos = 0;
+                    return Err(e);
+                }
+            }
+        }
+        if self.pos != self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+            return Err(RedisError::Broken("the server sent an unexpected reply".into()));
+        }
+        self.buf.clear();
+        self.pos = 0;
+        Ok(replies)
+    }
+
     /// Writes one command without reading its reply (for pipelines and the
     /// commands of a subscribed connection).
     pub(crate) fn send(&mut self, args: &[&[u8]], until: Instant) -> Result<(), RedisError> {
         self.stream.set_deadline(until);
-        let mut out = format!("*{}\r\n", args.len()).into_bytes();
-        for a in args {
-            out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
-            out.extend_from_slice(a);
-            out.extend_from_slice(b"\r\n");
-        }
+        let mut out = Vec::new();
+        Self::encode(&mut out, args);
         let io = |e: std::io::Error| RedisError::Broken(describe(&e));
         self.stream.write_all(&out).map_err(io)?;
         self.stream.flush().map_err(io)
@@ -507,6 +579,183 @@ mod tests {
         assert!(matches!(c.next_reply(until(), budget), Err(RedisError::Server(m)) if m == "ResponseError: late"));
         assert!(matches!(c.next_reply(until(), budget), Ok(Reply::Simple(m)) if m == "PONG"));
         server.join().unwrap();
+    }
+
+    /// Reads one command (`*N`, then N bulk strings) from a client.
+    #[cfg(test)]
+    fn read_command(r: &mut impl std::io::BufRead) -> Vec<String> {
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        let n: usize = line.trim()[1..].parse().unwrap();
+        let mut args = Vec::with_capacity(n);
+        for _ in 0..n {
+            line.clear();
+            r.read_line(&mut line).unwrap();
+            line.clear();
+            r.read_line(&mut line).unwrap();
+            args.push(line.trim_end().to_string());
+        }
+        args
+    }
+
+    /// A pipeline's commands go out together and its replies come back in
+    /// order: an error reply in its position, the others answered, and the
+    /// connection in step afterwards; a reply too many breaks it.
+    #[test]
+    fn a_pipeline_reads_each_reply_in_its_position() {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut s = s;
+            // The four commands arrive before any reply is sent.
+            let got: Vec<Vec<String>> = (0..4).map(|_| read_command(&mut r)).collect();
+            assert_eq!(got[0], ["SET", "a", "1"]);
+            assert_eq!(got[3], ["LRANGE", "l", "0", "-1"]);
+            // The replies, split in the middle of one.
+            s.write_all(b"+OK\r\n:7\r\n-WRONGTYPE not a counter\r\n*2\r\n$1\r\nx\r\n").unwrap();
+            s.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            s.write_all(b"$1\r\ny\r\n").unwrap();
+            assert_eq!(read_command(&mut r), ["PING"]);
+            s.write_all(b"+PONG\r\n").unwrap();
+            // A pipeline of two answered with three replies.
+            read_command(&mut r);
+            read_command(&mut r);
+            s.write_all(b"+OK\r\n+OK\r\n+OK\r\n").unwrap();
+            s.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        let until = || Instant::now() + std::time::Duration::from_secs(5);
+        let mut c = RedisConn::connect(&format!("redis://127.0.0.1:{port}"), None, until()).unwrap();
+        let budget = 1 << 20;
+        let commands: Vec<Vec<&[u8]>> = vec![
+            vec![b"SET", b"a", b"1"],
+            vec![b"INCR", b"n"],
+            vec![b"INCR", b"text"],
+            vec![b"LRANGE", b"l", b"0", b"-1"],
+        ];
+        let Ok(replies) = c.pipeline(&commands, until(), budget) else { panic!("the pipeline failed") };
+        assert_eq!(replies.len(), 4);
+        assert!(matches!(&replies[0], Ok(Reply::Simple(m)) if m == "OK"));
+        assert!(matches!(&replies[1], Ok(Reply::Int(7))));
+        assert!(matches!(&replies[2], Err(m) if m == "WRONGTYPE: not a counter"));
+        assert!(matches!(&replies[3], Ok(Reply::Array(items)) if items.len() == 2));
+        assert!(matches!(c.command(&[b"PING"], until(), budget), Ok(Reply::Simple(m)) if m == "PONG"));
+        assert!(matches!(c.pipeline(&[], until(), budget), Ok(r) if r.is_empty()), "nothing is sent for no commands");
+        let two: Vec<Vec<&[u8]>> = vec![vec![b"SET", b"a", b"1"], vec![b"SET", b"b", b"2"]];
+        assert!(matches!(c.pipeline(&two, until(), budget), Err(RedisError::Broken(m)) if m.contains("unexpected")));
+        server.join().unwrap();
+    }
+
+    /// The replies of a pipeline share one budget: a reply past what the
+    /// ones before it left is refused, as one reply past the budget is.
+    #[test]
+    fn a_pipeline_reply_past_the_budget_fails_the_call() {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut s = s;
+            for _ in 0..3 {
+                read_command(&mut r);
+            }
+            // 600 KB, 600 KB and 600 KB: the third does not fit in 1 MB.
+            let mut reply = format!("${}\r\n", 600 << 10).into_bytes();
+            reply.extend(std::iter::repeat_n(b'x', 600 << 10));
+            reply.extend_from_slice(b"\r\n");
+            for _ in 0..3 {
+                if s.write_all(&reply).is_err() {
+                    break;
+                }
+            }
+        });
+        let until = || Instant::now() + std::time::Duration::from_secs(5);
+        let mut c = RedisConn::connect(&format!("redis://127.0.0.1:{port}"), None, until()).unwrap();
+        let commands: Vec<Vec<&[u8]>> = vec![vec![b"GET", b"a"], vec![b"GET", b"b"], vec![b"GET", b"c"]];
+        assert!(matches!(c.pipeline(&commands, until(), 1 << 20), Err(RedisError::TooLarge)));
+        drop(c);
+        server.join().unwrap();
+    }
+
+    /// A server that stops answering in the middle of a pipeline: the call
+    /// ends at the deadline with a connection error.
+    #[test]
+    fn a_pipeline_stops_at_the_deadline() {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut s = s;
+            read_command(&mut r);
+            read_command(&mut r);
+            s.write_all(b"+OK\r\n").unwrap();
+            s.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        });
+        let until = Instant::now() + std::time::Duration::from_secs(5);
+        let mut c = RedisConn::connect(&format!("redis://127.0.0.1:{port}"), None, until).unwrap();
+        let commands: Vec<Vec<&[u8]>> = vec![vec![b"SET", b"a", b"1"], vec![b"GET", b"a"]];
+        let start = Instant::now();
+        let deadline = start + std::time::Duration::from_millis(300);
+        assert!(matches!(c.pipeline(&commands, deadline, 1 << 20), Err(RedisError::Broken(_))));
+        let took = start.elapsed();
+        assert!(took >= std::time::Duration::from_millis(250) && took < std::time::Duration::from_secs(2), "{took:?}");
+        server.join().unwrap();
+    }
+
+    /// AUTH and SELECT are sent together when a connection is set up, and a
+    /// failed AUTH is the connection's error (not the NOAUTH of the SELECT after it).
+    #[test]
+    fn connecting_sends_auth_and_select_together() {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for ok in [true, false] {
+                let (s, _) = listener.accept().unwrap();
+                let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+                let mut s = s;
+                assert_eq!(read_command(&mut r), ["AUTH", "ann", "p@ss"]);
+                assert_eq!(read_command(&mut r), ["SELECT", "3"]);
+                if ok {
+                    s.write_all(b"+OK\r\n+OK\r\n").unwrap();
+                    assert_eq!(read_command(&mut r), ["PING"]);
+                    s.write_all(b"+PONG\r\n").unwrap();
+                } else {
+                    s.write_all(b"-WRONGPASS invalid username-password pair\r\n-NOAUTH Authentication required.\r\n")
+                        .unwrap();
+                }
+                s.flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+        let until = || Instant::now() + std::time::Duration::from_secs(5);
+        let url = format!("redis://ann:p%40ss@127.0.0.1:{port}/3");
+        let mut c = RedisConn::connect(&url, None, until()).unwrap();
+        assert!(matches!(c.command(&[b"PING"], until(), 1 << 20), Ok(Reply::Simple(m)) if m == "PONG"));
+        drop(c);
+        assert_eq!(
+            RedisConn::connect(&url, None, until()).err().as_deref(),
+            Some("WRONGPASS: invalid username-password pair")
+        );
+        server.join().unwrap();
+    }
+
+    /// The wire size of a command is counted as it is encoded.
+    #[test]
+    fn encoded_lengths_match_the_encoding() {
+        for args in [vec![b"PING" as &[u8]], vec![b"SET", b"key", b""], vec![b"GET", &[b'x'; 1000]]] {
+            let mut out = Vec::new();
+            RedisConn::encode(&mut out, &args);
+            assert_eq!(RedisConn::encoded_len(&args), out.len(), "{:?}", args.len());
+        }
     }
 
     /// A subscribed connection reads pushed messages; one longer than allowed

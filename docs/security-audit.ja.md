@@ -1794,7 +1794,7 @@ Web サイト・サンプル、ツールとサプライチェーン、バック�
 - `databases.rs`: `keyed_jobs_in_transactions_wait_no_longer_than_outside_them`。
 - `sqlite_pool.rs`: `large_statements_are_not_kept`、`idle_connections_hold_a_bounded_memory`。
 - `jwt.rs`: `rsa_keys_with_a_degenerate_exponent_are_refused`、`ec_and_ed25519_keys_off_the_curve_are_refused`。
-- `netdb.rs`: `prepared_transactions_are_refused`。
+- `netdb/mod.rs`: `prepared_transactions_are_refused`。
 - `editors/vscode/test/phv-path.test.js`: 絶対パスの `phv.path` の拡張子。
 
 すべてのテストは Windows と Linux で同時に、1 組の PostgreSQL 17・MySQL 8.4・Redis 7 に対して、clippy(`-D warnings`)と

@@ -13,30 +13,6 @@ changes in the same commit (§18 says what may change); a change that touches pe
 before/after `bench/results/*.json`; and the security-critical items are done first in a cycle and assessed again
 before the release.
 
-## 1.2.x (patch releases)
-
-### Databases and sessions
-
-| Item | Code | Change | Risk | Measure | Size |
-|---|---|---|---|---|---|
-| Lazy session values | `crates/phv_server/src/session.rs` | Read and promote the session record as now, but decode its values only at the first `session()` call of the page | The `last` update, the promotion and the cookie must stay eager, or sessions expire differently | Home page p50 with a session cookie | M |
-| Redis pipelining | `crates/phv_std/src/redisclient.rs`, `netdb.rs`, the spec | A `pipeline()` on the Redis client that sends several commands and reads their replies together; the job and session stores use it where they send more than one command | A new API: needs its section in the spec and the reference, and the reply limits apply per command | Jobs added per second in `databases.rs` | M |
-| `phv jobs adopt` | `crates/phv_cli/src/jobs.rs`, `netdb.rs`, the spec | Move the jobs a site left in the shared store before it had a namespace (`phv jobs list` counts them) into the site's own table or keys | Must not take another site's jobs: only rows whose site name matches, with a dry run first | The test of `left_in_shared` extended | M |
-
-### Runtime and compiler
-
-| Item | Code | Change | Risk | Measure | Size |
-|---|---|---|---|---|---|
-| mimalloc under the counting allocator | `crates/phv_vm/src/alloc.rs`, `Cargo.toml` | Put mimalloc under `CountingAlloc` as the system allocator; the counting and the per-thread charging stay | A new C dependency in the supply chain (pinned, audited); Windows and musl builds must link it | `bench/run.*` rows (object creation, strings) | S |
-| Lazy JIT | `crates/phv_jit/src/lib.rs`, `phv_vm` | Compile a function at its Nth call instead of at load, and share the compiled code of the standard library between scripts of a process | The eligibility test and `step()` do not change; a function must run identically before and after it is compiled (the differential test) | Compile time of a page (`phv_workers_busy` at the first requests), the micro-benchmarks unchanged | M |
-| Callback fast path | `crates/phv_std/src/lists.rs`, `phv_vm` | `map()`, `filter()` and their kind call a closure without a full frame when it has no `finally` and no captures by the VM | Error positions and traces must not change | "map / filter / sum" | M |
-
-### Tools
-
-| Item | Code | Change | Risk | Measure | Size |
-|---|---|---|---|---|---|
-| Split `netdb.rs` | `crates/phv_std/src/netdb.rs` (5,767 lines) → `netdb/{pool,pg,my,redis,jobs,publish,ratelimit,migrate}.rs` | A mechanical split: no code changes, the tests stay where they are | None if mechanical; review the diff with `--color-moved` | The tests pass; `git log --follow` works per file | S |
-
 ## 1.3 (the next minor release)
 
 | Item | Code | Change | Risk | Measure | Size |

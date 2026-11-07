@@ -1,0 +1,15 @@
+replies: 18
+[true,"hello",null,1,1,11,1,-2,1,0,"Bo",{"name":"Bo"},1,1,2,["x","y"],"x",1]
+ttl ok: yes
+empty: []
+before: 12
+error: ResponseError: value is not an integer or out of range
+after: "abc"
+get: abc
+refused: Redis keys starting with `phv:` belong to PHV (sessions, rate limits, jobs): "phv:session:x"
+not set: null
+1024: 1024
+refused: a Redis pipeline sends at most 1024 commands
+refused: a Redis pipeline sends at most 16 MB of commands
+not set: null
+error: the database connection is closed

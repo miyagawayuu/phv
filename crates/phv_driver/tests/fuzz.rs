@@ -162,7 +162,7 @@ fn front_end_never_panics() {
                         // Editors check code even when it has syntax errors.
                         let _ = analyze_for_editor(&root, case, overlay.clone());
                         if let Ok(mut c) = compile_with_overlay(&root, case, overlay) {
-                            c.enable_jit();
+                            c.enable_jit_all();
                         }
                     });
                     if r.is_err() {

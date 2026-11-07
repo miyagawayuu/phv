@@ -133,11 +133,11 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::list(s.iter().map(Key::to_value).collect()))
         },
         "set_filter" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             let s = Rc::clone(set(&a[0]));
             let mut out = with_room(vm, s.len())?;
             for k in s.iter() {
-                let hit = vm.call_value(&f, &[k.to_value()])?;
+                let hit = f.call(vm, &[k.to_value()])?;
                 if truthy(vm, hit)? {
                     out.insert(k.clone());
                 }
@@ -145,10 +145,10 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::set(out))
         },
         "set_any" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             let s = Rc::clone(set(&a[0]));
             for k in s.iter() {
-                let hit = vm.call_value(&f, &[k.to_value()])?;
+                let hit = f.call(vm, &[k.to_value()])?;
                 if truthy(vm, hit)? {
                     return Ok(Value::Bool(true));
                 }
@@ -156,10 +156,10 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::Bool(false))
         },
         "set_all" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             let s = Rc::clone(set(&a[0]));
             for k in s.iter() {
-                let hit = vm.call_value(&f, &[k.to_value()])?;
+                let hit = f.call(vm, &[k.to_value()])?;
                 if !truthy(vm, hit)? {
                     return Ok(Value::Bool(false));
                 }

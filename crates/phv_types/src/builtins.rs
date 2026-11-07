@@ -368,6 +368,7 @@ pub static BUILTINS: &[BuiltinSig] = &[
     internal("__http_start", "fn(string, string, string, map<string, string>, map<string, string>, string): int"),
     internal("__db_start", "fn(int, Sql, bool): int"),
     internal("__redis_start", "fn(int, string, list<string>): int"),
+    internal("__redis_pipeline", "fn(int, list<list<string>>): list<any>"),
     internal("__async_any", "fn(int): any"),
     internal("__async_map", "fn(int): map<string, any>"),
     internal("__async_rows", "fn(int): list<map<string, any>>"),

@@ -15,8 +15,9 @@ fn cases() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/cases")
 }
 
-/// Runs `src` with and without the JIT; both must give the same output and
-/// error, which is returned. `native` functions must be compiled.
+/// Runs `src` with and without the JIT (every eligible function compiled);
+/// both must give the same output and error, which is returned. `native`
+/// functions must be compiled.
 fn run_both(name: &str, src: &str, limits: Limits, native: &[&str]) -> String {
     let dir = std::env::temp_dir().join(format!("phv-jit-test-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -26,7 +27,7 @@ fn run_both(name: &str, src: &str, limits: Limits, native: &[&str]) -> String {
     for jit in [false, true] {
         let mut c = compile(&dir, &entry).unwrap_or_else(|e| panic!("{}", e.render(false)));
         if jit {
-            c.enable_jit();
+            c.enable_jit_all();
             assert_compiled(&c, native);
         }
         let outcome = run(&c, RunOptions { html: false, limits, http: None, host: None });
@@ -46,8 +47,138 @@ fn assert_compiled(c: &phv_driver::Compiled, names: &[&str]) {
     let jit = c.jit.as_ref().expect("nothing was compiled");
     for name in names {
         let i = c.program.funcs.iter().position(|f| f.name == *name).unwrap_or_else(|| panic!("no function {name}"));
-        assert!(jit.entries[i].is_some(), "{name} was not compiled to native code");
+        assert!(jit.is_compiled(i as u32), "{name} was not compiled to native code");
     }
+}
+
+/// Runs `src` without the JIT and with it as `phv run` has it (functions
+/// with a loop or recursion compiled at load, with the functions they call):
+/// the output and the error, which must be the same apart from the stack
+/// traces (an exception raised in native code has one that goes back only
+/// as far as the caller, as the specification says), and the compiled
+/// program.
+fn run_as_shipped(name: &str, src: &str) -> (String, phv_driver::Compiled) {
+    let dir = std::env::temp_dir().join(format!("phv-jit-test-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("main.phv");
+    std::fs::write(&entry, src).unwrap();
+    let mut results = Vec::new();
+    let mut compiled = None;
+    for jit in [false, true] {
+        let mut c = compile(&dir, &entry).unwrap_or_else(|e| panic!("{}", e.render(false)));
+        if jit {
+            c.enable_jit();
+        }
+        let outcome = run(&c, RunOptions { html: false, limits: Limits::default(), http: None, host: None });
+        results.push(format!("{}{}", outcome.output, outcome.error.map(|e| e.render()).unwrap_or_default()));
+        compiled = Some(c);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let strip = |s: &str| s.lines().filter(|l| !l.trim_start().starts_with("at ")).collect::<Vec<_>>().join("\n");
+    assert_eq!(strip(&results[0]), strip(&results[1]), "the JIT changed the result of {name}");
+    (results.pop().unwrap(), compiled.unwrap())
+}
+
+/// What is compiled is fixed when the program is loaded: a function with a
+/// loop or recursion, with the functions it calls; a straight-line function
+/// on its own is never compiled, however often it is called (entering native
+/// code costs more than its body). The output and the error positions are
+/// the interpreter's in both cases.
+#[test]
+fn straight_line_functions_are_compiled_only_within_a_unit() {
+    let pick = "function pick(list<int> $xs, int $i): int {\n    return $xs[$i] * 2;\n}\n";
+    // Alone, called 100,000 times (with an exception every fourth call).
+    let src = format!(
+        r#"<?phv
+{pick}$xs = [1, 2, 3];
+$t = 0;
+$caught = 0;
+$trace = "";
+for ($k = 0; $k < 100000; $k++) {{
+    try {{
+        $t += pick($xs, $k % 4);
+    }} catch (IndexError $e) {{
+        $caught++;
+        $trace = $e->getTraceAsString();
+    }}
+}}
+echo $t, " ", $caught, "\n", $trace, "\n";
+echo pick($xs, 7);
+"#
+    );
+    let (out, c) = run_as_shipped("alone", &src);
+    assert!(out.starts_with("300000 25000\nat pick (main.phv:3)\nat {main} (main.phv:11)\n"), "{out}");
+    assert!(
+        out.contains("Uncaught IndexError: list index 7 is out of range (length 3)\n  at pick (main.phv:3)\n  at {main} (main.phv:18)"),
+        "{out}"
+    );
+    if !std::env::var("PHV_JIT").is_ok_and(|v| v == "0") {
+        assert!(c.jit.is_none(), "nothing to compile: `pick` has no loop and no recursion");
+    }
+
+    // Reached from a function with a loop: compiled in that function's unit,
+    // and then native also when called directly.
+    let src = format!(
+        r#"<?phv
+{pick}function total(list<int> $xs, int $n): int {{
+    $t = 0;
+    for ($k = 0; $k < $n; $k++) {{
+        $t += pick($xs, $k % 3);
+    }}
+    return $t;
+}}
+function unused(int $n): int {{
+    return $n + 1;
+}}
+$xs = [1, 2, 3];
+echo total($xs, 100000), " ", pick($xs, 1), "\n";
+try {{
+    echo total($xs, 4) + pick($xs, 3);
+}} catch (IndexError $e) {{
+    echo "caught: ", $e->getMessage(), "\n";
+}}
+echo pick($xs, 7);
+"#
+    );
+    let (out, c) = run_as_shipped("within_unit", &src);
+    assert!(out.starts_with("399998 4\ncaught: list index 3 is out of range (length 3)\n"), "{out}");
+    assert!(out.contains("Uncaught IndexError: list index 7 is out of range (length 3)\n"), "{out}");
+    if std::env::var("PHV_JIT").is_ok_and(|v| v == "0") {
+        return;
+    }
+    let jit = c.jit.as_ref().unwrap();
+    let id = |name: &str| c.program.funcs.iter().position(|f| f.name == name).unwrap() as u32;
+    assert!(jit.is_compiled(id("total")), "a function with a loop");
+    assert!(jit.is_compiled(id("pick")), "called by a compiled function");
+    assert!(!jit.is_compiled(id("unused")), "straight-line, called by no compiled function");
+    assert_eq!(jit.compiled(), 2);
+    // Compiled, `pick` raises from the caller's line (the specification's rule).
+    assert!(out.ends_with("  at {main} (main.phv:22)\n"), "{out}");
+}
+
+/// The compiled code of a function is shared between the programs of a
+/// process that have the same text for it and what it calls: a second
+/// program with the same function gets the same entry, whatever else it
+/// holds and wherever its constants and functions are numbered.
+#[test]
+fn compiled_code_is_shared_between_programs() {
+    let f = "function greet(string $who, int $n): string {\n    $s = \"\";\n    for ($i = 0; $i < $n; $i++) {\n        $s .= \"hi \" . $who . \"! \";\n    }\n    return $s;\n}\n";
+    // The second program names other constants and functions before `greet`.
+    let a = format!("<?phv\n{f}echo greet(\"a\", 2);\n");
+    let b = format!("<?phv\nfunction other(int $x): int {{ return $x; }}\n$u = \"unrelated\" . other(1);\n{f}echo greet(\"b\", 3), $u;\n");
+    let (out_a, ca) = run_as_shipped("share_a", &a);
+    let (out_b, cb) = run_as_shipped("share_b", &b);
+    assert_eq!(out_a, "hi a! hi a! ");
+    assert_eq!(out_b, "hi b! hi b! hi b! unrelated1");
+    if std::env::var("PHV_JIT").is_ok_and(|v| v == "0") {
+        return;
+    }
+    let id = |c: &phv_driver::Compiled| c.program.funcs.iter().position(|f| f.name == "greet").unwrap() as u32;
+    let ea = ca.jit.as_ref().unwrap().entry(id(&ca)).unwrap();
+    let eb = cb.jit.as_ref().unwrap().entry(id(&cb)).unwrap();
+    assert_eq!(ea.entry as usize, eb.entry as usize, "the same native code");
+    assert_ne!(id(&ca), id(&cb), "numbered differently");
+    assert_ne!(ea.consts, eb.consts, "with each program's own constants");
 }
 
 #[test]
@@ -71,7 +202,7 @@ function double(string $s): string {
 echo strlen(append(1000)), "\n";
 echo strlen(append(10000000)), "\n";
 "#;
-    let out = run_both("append", src, limits, &["append", "double"]);
+    let out = run_both("append", src, limits, &["append"]);
     assert_eq!(out, "18890\nFatal error: allowed memory size of 16 MB exhausted");
     let src = src.replace("append(10000000)", "double(\"ab\")");
     let out = run_both("double", &src, limits, &["append", "double"]);
@@ -242,7 +373,7 @@ fn golden_jit_cases_are_compiled() {
         ),
     ] {
         let mut c = compile(&cases(), &cases().join(case)).unwrap_or_else(|e| panic!("{}", e.render(false)));
-        c.enable_jit();
+        c.enable_jit_all();
         assert_compiled(&c, names);
     }
 }
@@ -272,6 +403,7 @@ fn deep_recursion_of_large_frames_does_not_overflow() {
         .spawn(move || {
             let mut c = compile(&dir, &entry).unwrap_or_else(|e| panic!("{}", e.render(false)));
             c.enable_jit();
+            // Recursive: compiled at load.
             assert_compiled(&c, &["f"]);
             let outcome = run(&c, RunOptions { html: false, limits: Limits::default(), http: None, host: None });
             (outcome.output, outcome.error.map(|e| e.render()))
@@ -349,13 +481,16 @@ fn deep_callbacks_into_the_jit_stop_cleanly() {
         std::fs::write(&entry, format!("{src}{main}")).unwrap();
         let root = dir.clone();
         // Compiled on a thread of the usual size: only the run is measured.
-        let mut c = std::thread::Builder::new()
+        let c = std::thread::Builder::new()
             .stack_size(64 << 20)
-            .spawn(move || compile(&root, &entry).unwrap_or_else(|e| panic!("{}", e.render(false))))
+            .spawn(move || {
+                let mut c = compile(&root, &entry).unwrap_or_else(|e| panic!("{}", e.render(false)));
+                c.enable_jit_all();
+                c
+            })
             .unwrap()
             .join()
             .unwrap();
-        c.enable_jit();
         assert_compiled(&c, &["f"]);
         let out = std::thread::Builder::new()
             .stack_size(stack)

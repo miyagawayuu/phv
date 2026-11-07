@@ -30,19 +30,19 @@ const GROUP: usize = 64;
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
     let f: BuiltinFn = match name {
         "list_reduce" => |vm, a| {
-            let f = a[2].clone();
+            let f = vm.callback(&a[2]);
             let mut acc = a[1].clone();
             for (i, x) in list(&a[0]).iter().enumerate() {
                 tick(vm, i)?;
-                acc = vm.call_value(&f, &[acc, x.clone()])?;
+                acc = f.call(vm, &[acc, x.clone()])?;
             }
             Ok(acc)
         },
         "list_flat_map" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             let mut out = Vec::new();
             for x in list(&a[0]).iter() {
-                let part = vm.call_value(&f, std::slice::from_ref(x))?;
+                let part = f.call(vm, std::slice::from_ref(x))?;
                 let part = list(&part);
                 // The parts may all be one shared list: count what copying adds.
                 vm.reserve(part.len().saturating_mul(VALUE))?;
@@ -62,7 +62,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::list(out))
         },
         "list_group_by" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             let mut groups: IndexMap<phv_vm::Key, Vec<Value>> = IndexMap::new();
             let xs = list(&a[0]);
             // Each item may start a group of its own.
@@ -72,7 +72,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let mut hashed = 0usize;
             for (i, x) in xs.iter().enumerate() {
                 tick(vm, i)?;
-                let key = vm.call_value(&f, std::slice::from_ref(x))?;
+                let key = f.call(vm, std::slice::from_ref(x))?;
                 if let Value::Str(s) = &key {
                     hashed += s.len();
                     if hashed >= 16 << 20 {
@@ -96,19 +96,19 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::list(xs.chunks(size).map(|c| Value::list(c.to_vec())).collect()))
         },
         "list_zip" => |vm, a| {
-            let f = a[2].clone();
+            let f = vm.callback(&a[2]);
             let (xs, ys) = (list(&a[0]).clone(), list(&a[1]).clone());
             let mut out = Vec::with_capacity(xs.len().min(ys.len()));
             for (x, y) in xs.iter().zip(ys.iter()) {
-                out.push(vm.call_value(&f, &[x.clone(), y.clone()])?);
+                out.push(f.call(vm, &[x.clone(), y.clone()])?);
             }
             Ok(Value::list(out))
         },
         "list_partition" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             let (mut yes, mut no) = (Vec::new(), Vec::new());
             for x in list(&a[0]).iter() {
-                let keep = vm.call_value(&f, std::slice::from_ref(x))?;
+                let keep = f.call(vm, std::slice::from_ref(x))?;
                 if truthy(vm, keep)? {
                     yes.push(x.clone());
                 } else {
@@ -118,10 +118,10 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::list(vec![Value::list(yes), Value::list(no)]))
         },
         "list_count" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             let mut n = 0;
             for x in list(&a[0]).iter() {
-                let hit = vm.call_value(&f, std::slice::from_ref(x))?;
+                let hit = f.call(vm, std::slice::from_ref(x))?;
                 if truthy(vm, hit)? {
                     n += 1;
                 }
@@ -154,10 +154,10 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::map(m))
         },
         "map_filter" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             let mut out = IndexMap::new();
             for (k, v) in map(&a[0]).iter() {
-                let keep = vm.call_value(&f, &[k.to_value(), v.clone()])?;
+                let keep = f.call(vm, &[k.to_value(), v.clone()])?;
                 if truthy(vm, keep)? {
                     out.insert(k.clone(), v.clone());
                 }
@@ -165,10 +165,10 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             Ok(Value::map(out))
         },
         "map_map_values" => |vm, a| {
-            let f = a[1].clone();
+            let f = vm.callback(&a[1]);
             let mut out = IndexMap::new();
             for (k, v) in map(&a[0]).iter() {
-                out.insert(k.clone(), vm.call_value(&f, std::slice::from_ref(v))?);
+                out.insert(k.clone(), f.call(vm, std::slice::from_ref(v))?);
             }
             Ok(Value::map(out))
         },

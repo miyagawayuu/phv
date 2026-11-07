@@ -26,7 +26,7 @@ pub struct Compiled {
     pub warnings: String,
     /// Source file id of the entry script.
     pub entry_file: u32,
-    /// Native code for the functions the JIT can compile (see `enable_jit`).
+    /// Native code for the functions the JIT compiled (see `enable_jit`).
     pub jit: Option<Arc<phv_vm::JitTable>>,
     /// Loaded from the on-disk bytecode cache.
     pub from_cache: bool,
@@ -34,20 +34,36 @@ pub struct Compiled {
     pub marked_tests: Vec<(u32, Option<String>)>,
     /// Functions marked `#[Before]` (false) or `#[After]` (true), by index.
     pub test_hooks: Vec<(u32, bool)>,
+    /// Tests only: builtins call their closures through the full call path
+    /// instead of the callback fast path (`Vm::set_slow_callbacks`), so that
+    /// the two can be compared.
+    pub slow_callbacks: bool,
 }
 
 impl Compiled {
-    /// Compiles eligible functions to native code. Disabled by `PHV_JIT=0`.
+    /// Compiles eligible functions to native code: those with a loop or
+    /// recursion, with the functions they call (see `phv_jit::table`).
+    /// Disabled by `PHV_JIT=0`.
     pub fn enable_jit(&mut self) {
         if std::env::var("PHV_JIT").is_ok_and(|v| v == "0") {
             return;
         }
-        self.jit = phv_jit::build(&self.program).map(Arc::new);
+        self.jit = phv_jit::table(&self.program).map(Arc::new);
+    }
+
+    /// Compiles every eligible function to native code, also those without a
+    /// loop or recursion that `enable_jit` leaves to the interpreter (tests
+    /// of the JIT). Disabled by `PHV_JIT=0`.
+    pub fn enable_jit_all(&mut self) {
+        if std::env::var("PHV_JIT").is_ok_and(|v| v == "0") {
+            return;
+        }
+        self.jit = phv_jit::table_all(&self.program).map(Arc::new);
     }
 
     /// Number of functions compiled to native code.
     pub fn jit_count(&self) -> usize {
-        self.jit.as_ref().map(|j| j.entries.iter().filter(|e| e.is_some()).count()).unwrap_or(0)
+        self.jit.as_ref().map(|j| j.compiled()).unwrap_or(0)
     }
 
     /// The tests of the entry file, in the order they are declared: functions
@@ -1149,6 +1165,7 @@ fn compile_full(
         from_cache: false,
         marked_tests,
         test_hooks,
+        slow_callbacks: false,
     })
 }
 
@@ -1308,6 +1325,7 @@ fn new_vm(c: &Compiled, opts: RunOptions) -> Vm {
         vm.host = host;
     }
     vm.jit = c.jit.clone();
+    vm.set_slow_callbacks(c.slow_callbacks);
     vm
 }
 

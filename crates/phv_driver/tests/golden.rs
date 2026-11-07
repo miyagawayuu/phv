@@ -19,7 +19,8 @@ fn render_opts(root: &Path, path: &Path, overlay: HashMap<PathBuf, String>, jit:
         Err(e) => e.render(false),
         Ok(mut c) => {
             if jit {
-                c.enable_jit();
+                // Every eligible function, at its first call.
+                c.enable_jit_all();
             }
             let outcome = run(&c, RunOptions { html: false, limits: Default::default(), http: None, host: None });
             let mut out = c.warnings.clone();

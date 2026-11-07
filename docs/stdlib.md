@@ -226,7 +226,46 @@ A Redis server named `[databases.<name>]` in phv.toml.
 - `public function rpush(string $key, string $value): int` — Appends to the list at `$key` and returns its new length.
 - `public function lpop(string $key): ?string` — Removes and returns the first element of the list at `$key`, or null when it is empty.
 - `public function lrange(string $key, int $start, int $stop): list<string>` — Elements `$start` to `$stop` (inclusive; negative counts from the end) of the list at `$key`.
+- `public function pipeline(): RedisPipeline` — Commands to send together, in one round trip (see `RedisPipeline`).
 - `public function close(): void`
+
+### class RedisPipeline
+
+```phv
+class RedisPipeline
+```
+
+Commands queued to be sent to Redis together, from `Redis::pipeline()`:
+one round trip instead of one per command.
+
+  $p = $redis->pipeline();
+  $p->set("greeting", "hello", 60)->incr("visits")->get("name");
+  [$set, $visits, $name] = $p->exec();   // [true, 3, "Ann"]
+
+The methods take what the methods of `Redis` of the same name take and
+queue the command; `exec()` sends them and returns the replies in order, as
+`any`: `get`, `hget` and `lpop` give `?string`, `incr`, `rpush` and `ttl`
+`int`, `set` `true`, `delete`, `exists`, `expire`, `hset` and `hdel` the
+server's count (`int`), `hgetAll` `map<string, string>` and `lrange`
+`list<string>`. A command the server refused is a `DatabaseError` value in
+its place; the others are still answered. A pipeline is not a transaction:
+other clients' commands may run between its commands.
+
+- `public function get(string $key): RedisPipeline`
+- `public function set(string $key, string $value, int $ttl = 0): RedisPipeline`
+- `public function delete(string $key): RedisPipeline`
+- `public function exists(string $key): RedisPipeline`
+- `public function incr(string $key, int $by = 1): RedisPipeline`
+- `public function expire(string $key, int $seconds): RedisPipeline`
+- `public function ttl(string $key): RedisPipeline`
+- `public function hget(string $key, string $field): RedisPipeline`
+- `public function hset(string $key, string $field, string $value): RedisPipeline`
+- `public function hdel(string $key, string $field): RedisPipeline`
+- `public function hgetAll(string $key): RedisPipeline`
+- `public function rpush(string $key, string $value): RedisPipeline`
+- `public function lpop(string $key): RedisPipeline`
+- `public function lrange(string $key, int $start, int $stop): RedisPipeline`
+- `public function exec(): list<any>` — Sends the queued commands and returns their replies in order; the pipeline is empty again afterwards. At most 1,024 commands and 16 MB are sent at once (`ValueError`, nothing sent). The whole exchange waits until the script's time limit at most, and the replies together stay within the memory left to the script.
 
 
 ## std.net

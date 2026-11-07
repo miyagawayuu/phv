@@ -63,6 +63,16 @@ mysql = { version = "28.0.4", default-features = false, features = ["minimal-rus
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 httparse = "1.10"
+# The allocator under the counting allocator (crates/phv_vm/src/alloc.rs).
+# Both crates are pinned exactly: the sys crate vendors mimalloc's C sources
+# (3.3.2 in 0.1.49), so moving it means a new C library in the binary, which
+# is reviewed like any other dependency change. No features: not `secure`
+# (the per-script memory limit is the defence that matters here, and the
+# hardened mode costs about a tenth of the allocator's speed), not `override`
+# (Rust's allocations all go through `CountingAlloc`; C code with its own
+# malloc, such as SQLite, is routed to it explicitly).
+mimalloc = { version = "=0.1.52", default-features = false }
+libmimalloc-sys = { version = "=0.1.49", default-features = false }
 
 [profile.release]
 # Arithmetic bugs in the runtime become caught panics instead of silent wraps.

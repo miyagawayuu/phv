@@ -24,7 +24,7 @@ fn run_src(name: &str, src: &str, limits: Limits) -> (String, usize) {
     for jit in [false, true] {
         let mut c = compile(&dir, &entry).unwrap_or_else(|e| panic!("{}", e.render(false)));
         if jit {
-            c.enable_jit();
+            c.enable_jit_all();
         }
         let base = thread_allocated();
         reset_thread_peak();

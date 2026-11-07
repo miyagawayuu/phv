@@ -90,6 +90,15 @@ enum JobsAction {
         #[arg(default_value = ".")]
         project: PathBuf,
     },
+    /// Move the jobs this site left in the shared store before it had a namespace into its own store (a dry run without --yes).
+    Adopt {
+        /// Move them; without it, only say what would move.
+        #[arg(long)]
+        yes: bool,
+        /// The project's directory.
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -607,6 +616,7 @@ fn exec(cmd: Command) -> ExitCode {
             JobsAction::Run { project } => jobs::run(&project, 30.0),
             JobsAction::List { failed, project } => jobs::list(&project, failed),
             JobsAction::Retry { id, project } => jobs::retry(&project, &id),
+            JobsAction::Adopt { yes, project } => jobs::adopt(&project, yes),
         },
         Command::Db { action } => {
             let (a, apply) = match &action {

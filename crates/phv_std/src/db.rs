@@ -1597,6 +1597,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
         "__redis_connect" => crate::netdb::connect_redis,
         "__redis" => crate::netdb::redis_command,
         "__redis_start" => crate::netdb::start_redis,
+        "__redis_pipeline" => crate::netdb::redis_pipeline,
         "__db_start" => |vm, a| {
             if !is_sqlite(vm, &a[0]) {
                 return crate::netdb::start_query(vm, a);

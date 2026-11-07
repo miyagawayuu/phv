@@ -11,7 +11,8 @@ pub mod vm;
 pub use bytecode::*;
 pub use value::{Key, KeySet, Map, Value};
 pub use vm::{
-    BuiltinFn, DatabaseSpec, Exc, FlushSink, Host, HttpCtx, HttpSpec, JitCtx, JitEntry, JitLimits, JitTable, JobCtx,
-    JobsSpec, Limits, MailSpec, OAuthSpec, OutBuf, Permissions, SessionData, Site, SiteRequest, SiteResponse, Span,
-    SpanKind, SpanValue, TraceCtx, TraceLine, UploadedFile, Vm, VmError, WebSocketSpec, WsCtx, WsEvent,
+    BuiltinFn, Callback, DatabaseSpec, Exc, FlushSink, Host, HttpCtx, HttpSpec, Installed, JitCtx, JitEntry, JitLimits,
+    JitTable, JobCtx, JobsSpec, Limits, MailSpec, OAuthSpec, OutBuf, Permissions, SessionData, SessionValues,
+    SessionValuesShape, Site, SiteRequest, SiteResponse, Span, SpanKind, SpanValue, TraceCtx, TraceLine, UploadedFile,
+    Vm, VmError, WebSocketSpec, WsCtx, WsEvent,
 };

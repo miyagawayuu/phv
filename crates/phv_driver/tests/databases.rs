@@ -721,3 +721,160 @@ fn job_stores() {
         }
     });
 }
+
+/// Ends every job of `store`, the given-up ones too.
+fn drain(store: &phv_std::jobs::Store) {
+    use phv_std::jobs::End;
+    while let Some(j) = store.take(Duration::from_secs(60)).unwrap() {
+        store.end(&j, End::Done { keyed: false }).unwrap();
+    }
+    for j in store.list(true).unwrap() {
+        store.requeue(&j.id).unwrap();
+        let t = store.take(Duration::from_secs(60)).unwrap().unwrap();
+        store.end(&t, End::Done { keyed: false }).unwrap();
+    }
+}
+
+/// The jobs two sites left in the store every site shared before 1.1 gave
+/// sites namespaces (`phv_jobs`, `phv:jobs:`): `Store::adopt` as one site
+/// moves the waiting and given-up jobs named as that site's scripts into its
+/// own store, and none of the other site's; a dry run moves nothing; a
+/// running job and a job whose key the site's store has are left; the site's
+/// caps hold; `left_in_shared` counts what is left. The lock of the unnamed
+/// stores is held by the caller; the names and keys are this run's, and the
+/// counts are taken against what the shared store held before, so what a run
+/// that died left there does not matter.
+fn check_adopt(url: &str) {
+    use phv_std::jobs::{End, JobCap, Outcome, Store};
+    let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 4 };
+    let shared = Store::Db(spec.clone(), None);
+    let a = Store::Db(spec.clone(), Some(testing::namespace(0x20)));
+    let b = Store::Db(spec.clone(), Some(testing::namespace(0x21)));
+    for s in [&shared, &a, &b] {
+        drain(s);
+    }
+    let run_id = testing::run_id();
+    let name = |n: &str| format!("{n}_{run_id}");
+    let (key, key_b) = (format!("k_{run_id}"), format!("kb_{run_id}"));
+    let base = a.left_in_shared().unwrap();
+    // A site without a namespace has nothing to adopt: the shared store is its own.
+    assert!(shared.adopt(&[name("a_one")], true).unwrap().is_none());
+    assert!(a.adopt(&[], true).unwrap().unwrap().is_empty(), "no names, nothing");
+    // Site A's jobs: one given up, one running, two waiting, one with a key;
+    // site B's: one waiting, one with the same key.
+    let a_dead = shared.add(&name("a_two"), "gone", 0, None).unwrap().unwrap();
+    let t = shared.take(Duration::from_secs(60)).unwrap().unwrap();
+    assert_eq!(t.id, a_dead);
+    shared.end(&t, End::Dead { error: "gone wrong" }).unwrap();
+    let a_run = shared.add(&name("a_run"), "", 0, None).unwrap().unwrap();
+    let running = shared.take(Duration::from_secs(60)).unwrap().unwrap();
+    assert_eq!(running.id, a_run);
+    let a_one = shared.add(&name("a_one"), "first", 0, None).unwrap().unwrap();
+    let a_other = shared.add(&name("a_one"), "second", 1800, None).unwrap().unwrap();
+    let a_key = shared.add(&name("a_key"), "", 0, Some(&key)).unwrap().unwrap();
+    let b_one = shared.add(&name("b_one"), "", 0, None).unwrap().unwrap();
+    assert!(shared.add(&name("b_key"), "", 0, Some(&key)).unwrap().is_none(), "the key is A's in the shared store");
+    let b_key = shared.add(&name("b_key"), "", 0, Some(&key_b)).unwrap().unwrap();
+    let names_a: Vec<String> = ["a_one", "a_two", "a_key", "a_run"].iter().map(|n| name(n)).collect();
+    let names_b: Vec<String> = ["b_one", "b_key"].iter().map(|n| name(n)).collect();
+    // The ids of this run's jobs in a store.
+    let ids = |store: &Store| {
+        let mut ids: Vec<String> =
+            store.list(false).unwrap().into_iter().filter(|j| j.name.ends_with(run_id)).map(|j| j.id).collect();
+        ids.sort();
+        ids
+    };
+    let sorted = |mut v: Vec<&String>| {
+        v.sort();
+        v.into_iter().cloned().collect::<Vec<String>>()
+    };
+    let outcomes = |jobs: &[phv_std::jobs::Adopted]| {
+        let mut o: Vec<(String, &str, Outcome)> = jobs.iter().map(|j| (j.id.clone(), j.state, j.outcome)).collect();
+        o.sort();
+        o
+    };
+    assert_eq!(a.left_in_shared().unwrap(), base + 7);
+    // The dry run: A's jobs and their outcomes, B's not mentioned, nothing moved.
+    let dry = a.adopt(&names_a, false).unwrap().unwrap();
+    assert_eq!(
+        outcomes(&dry),
+        outcomes(&[
+            adopted(&a_dead, "failed", Outcome::Moved),
+            adopted(&a_run, "running", Outcome::Running),
+            adopted(&a_one, "waiting", Outcome::Moved),
+            adopted(&a_other, "waiting", Outcome::Moved),
+            adopted(&a_key, "waiting", Outcome::Moved),
+        ])
+    );
+    assert_eq!(ids(&shared), sorted(vec![&a_dead, &a_run, &a_one, &a_other, &a_key, &b_one, &b_key]));
+    assert!(a.list(false).unwrap().is_empty());
+    assert_eq!(a.left_in_shared().unwrap(), base + 7);
+    // Under a cap of two jobs, one waiting job does not fit (the given-up one
+    // is not counted); the dry run says so, and the move stops there.
+    let small = JobCap { jobs: 2, bytes: 1 << 30 };
+    let dry = a.adopt_within(&names_a, false, small).unwrap().unwrap();
+    let count = |jobs: &[phv_std::jobs::Adopted], o: Outcome| jobs.iter().filter(|j| j.outcome == o).count();
+    assert_eq!((count(&dry, Outcome::Moved), count(&dry, Outcome::NoRoom), count(&dry, Outcome::Running)), (3, 1, 1));
+    assert!(dry.iter().all(|j| j.outcome != Outcome::NoRoom || j.state == "waiting"));
+    assert_eq!(ids(&shared).len(), 7, "a dry run moves nothing");
+    let moved = a.adopt_within(&names_a, true, small).unwrap().unwrap();
+    assert_eq!(outcomes(&moved), outcomes(&dry), "the move does what the dry run said");
+    let mine = a.list(false).unwrap();
+    assert_eq!(mine.len(), 3, "{mine:?}");
+    assert_eq!(mine.iter().filter(|j| j.state == "waiting").count(), 2);
+    let dead = mine.iter().find(|j| j.id == a_dead).unwrap();
+    assert_eq!((dead.state, dead.error.as_str(), dead.attempts), ("failed", "gone wrong", 1));
+    assert_eq!(ids(&shared).len(), 4);
+    assert_eq!(a.left_in_shared().unwrap(), base + 4);
+    // With the store's own caps the rest moves; the running job stays.
+    let rest = a.adopt(&names_a, true).unwrap().unwrap();
+    assert_eq!((count(&rest, Outcome::Moved), count(&rest, Outcome::Running), rest.len()), (1, 1, 2));
+    assert_eq!(ids(&shared), sorted(vec![&a_run, &b_one, &b_key]));
+    assert_eq!(ids(&a), sorted(vec![&a_dead, &a_one, &a_other, &a_key]));
+    assert_eq!(a.left_in_shared().unwrap(), base + 3);
+    // A job whose key A's store has now (the moved one) is left in the shared store.
+    let a_again = shared.add(&name("a_key"), "", 0, Some(&key)).unwrap().unwrap();
+    let again = a.adopt(&names_a, true).unwrap().unwrap();
+    assert_eq!(
+        outcomes(&again),
+        outcomes(&[adopted(&a_run, "running", Outcome::Running), adopted(&a_again, "waiting", Outcome::KeyTaken)])
+    );
+    assert_eq!(ids(&shared), sorted(vec![&a_run, &a_again, &b_one, &b_key]));
+    // B adopts its own: A's are not touched.
+    let theirs = b.adopt(&names_b, true).unwrap().unwrap();
+    assert_eq!(count(&theirs, Outcome::Moved), 2);
+    assert_eq!(ids(&b), sorted(vec![&b_one, &b_key]));
+    assert_eq!(ids(&shared), sorted(vec![&a_run, &a_again]));
+    assert_eq!(b.left_in_shared().unwrap(), base + 2);
+    // The moved jobs run as the site's own, the one due now first, with its
+    // payload; the key moved with its job (it is taken in A's store).
+    let t = a.take(Duration::from_secs(60)).unwrap().unwrap();
+    assert_eq!((t.id.as_str(), t.payload.as_str(), t.attempts), (a_one.as_str(), "first", 1));
+    a.end(&t, End::Done { keyed: false }).unwrap();
+    assert!(a.add(&name("a_key"), "", 0, Some(&key)).unwrap().is_none());
+    // The running job is moved once it has ended and waits again.
+    shared.end(&running, End::Retry { at: 0, error: "once more" }).unwrap();
+    let last = a.adopt(&names_a, true).unwrap().unwrap();
+    assert_eq!(
+        outcomes(&last),
+        outcomes(&[adopted(&a_run, "waiting", Outcome::Moved), adopted(&a_again, "waiting", Outcome::KeyTaken)])
+    );
+    assert_eq!(a.left_in_shared().unwrap(), base + 1);
+    for s in [&shared, &a, &b] {
+        drain(s);
+    }
+}
+
+fn adopted(id: &str, state: &'static str, outcome: phv_std::jobs::Outcome) -> phv_std::jobs::Adopted {
+    phv_std::jobs::Adopted { id: id.to_string(), name: String::new(), state, outcome }
+}
+
+#[test]
+fn jobs_left_in_the_shared_store_are_adopted() {
+    sweep_once();
+    // The shared store is one for every test process: one at a time.
+    let _unnamed = testing::unnamed();
+    for url in ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL", "PHV_TEST_REDIS_URL"].into_iter().filter_map(server) {
+        check_adopt(&url);
+    }
+}
