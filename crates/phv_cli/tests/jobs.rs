@@ -347,7 +347,10 @@ fn check_adopt(name: &str, url: &str) {
     assert_eq!(run.id, running);
     let one = shared.add(&left, "one", 0, None).unwrap().unwrap();
     let two = shared.add(&left, "two", 3600, None).unwrap().unwrap();
-    own.add(&keyed_name, "", 0, Some(&key)).unwrap().unwrap();
+    // Due in an hour: only its key matters here, and a job of the site's own
+    // due now would tie with `one` below (the same millisecond on a fast
+    // machine, where the store takes them in the order of their ids).
+    own.add(&keyed_name, "", 3600, Some(&key)).unwrap().unwrap();
     let keyed = shared.add(&keyed_name, "", 0, Some(&key)).unwrap().unwrap();
     let theirs = shared.add(&other, "theirs", 0, None).unwrap().unwrap();
     // The ids of this run's jobs in a store.
@@ -515,14 +518,23 @@ fn slow_proxy(target: u16, delay: Duration) -> u16 {
     port
 }
 
-/// `url` with its port replaced by `port`; the port it had.
+/// `url` with its port replaced by `port`; the port it had (the scheme's
+/// default when it names none, as the CI's URLs do).
 fn with_port(url: &str, port: u16) -> (String, u16) {
     let (scheme, rest) = url.split_once("://").unwrap();
     let (host_part, path) = rest.split_once('/').map_or((rest, ""), |(h, p)| (h, p));
     let (auth, host_port) = host_part.rsplit_once('@').map_or(("", host_part), |(a, h)| (a, h));
-    let (host, old) = host_port.rsplit_once(':').unwrap();
+    let default = match scheme {
+        "postgres" | "postgresql" => 5432,
+        "mysql" => 3306,
+        other => panic!("no default port for {other}"),
+    };
+    let (host, old) = match host_port.rsplit_once(':') {
+        Some((host, old)) => (host, old.parse().unwrap()),
+        None => (host_port, default),
+    };
     let at = if auth.is_empty() { "" } else { "@" };
-    (format!("{scheme}://{auth}{at}{host}:{port}/{path}"), old.parse().unwrap())
+    (format!("{scheme}://{auth}{at}{host}:{port}/{path}"), old)
 }
 
 /// `phv jobs adopt --yes` moves 10,200 jobs through a store 10 ms away (a
