@@ -365,6 +365,10 @@ fn check_adopt(name: &str, url: &str) {
     let (ok, out) = phv(&["jobs", "adopt", &dir.to_string_lossy()]);
     assert!(ok, "{out}");
     assert!(out.contains("would move 3 jobs (2 waiting, 1 failed):"), "{out}");
+    // A count per name before the jobs (found by the 18th assessment: with
+    // 50,000 lines and no count, the check of the names was impractical).
+    assert!(out.contains(&format!("  {left}: 2 waiting, 1 failed\n")), "{out}");
+    assert!(!out.contains(&format!("\n  {keyed_name}: ")), "{out}");
     assert!(out.contains(&one) && out.contains(&two) && out.contains(&dead), "{out}");
     assert!(out.contains(&format!("skipped  {running}  running")), "{out}");
     assert!(
@@ -375,6 +379,15 @@ fn check_adopt(name: &str, url: &str) {
     assert!(out.contains("a dry run: nothing was moved; run `phv jobs adopt --yes`"), "{out}");
     assert_eq!(ids(&shared), sorted(vec![&dead, &running, &one, &two, &keyed, &theirs]));
     assert_eq!(own.list(false).unwrap().len(), 1);
+    // `--name` restricts the adoption to those of the site's job scripts.
+    let (ok, out) = phv(&["jobs", "adopt", "--name", &keyed_name, &dir.to_string_lossy()]);
+    assert!(ok && out.contains(&format!("skipped  {keyed}  waiting")) && !out.contains("would move"), "{out}");
+    assert!(!out.contains(&one) && !out.contains(&dead) && !out.contains(&running), "{out}");
+    let (ok, out) = phv(&["jobs", "adopt", "--name", &left, "--name", &keyed_name, &dir.to_string_lossy()]);
+    assert!(ok && out.contains("would move 3 jobs (2 waiting, 1 failed):") && out.contains(&keyed), "{out}");
+    let (ok, out) = phv(&["jobs", "adopt", "--name", "nosuch", "--yes", &dir.to_string_lossy()]);
+    assert!(!ok && out.contains("--name nosuch: jobs/ has no job script nosuch.phv"), "{out}");
+    assert_eq!(ids(&shared), sorted(vec![&dead, &running, &one, &two, &keyed, &theirs]));
     let note = |n: usize| {
         format!("note: {n} jobs added before this site had a namespace are still in the shared store and not run")
     };
@@ -467,4 +480,162 @@ fn adopt_moves_the_jobs_left_in_the_shared_store_with_mysql() {
     };
     let _unnamed = phv_std::testing::unnamed();
     check_adopt("adopt-mysql", &url);
+}
+
+/// A TCP proxy to `127.0.0.1:target` that holds every chunk of data `delay`
+/// in each direction (a store on a network with twice that round trip); its
+/// port. The threads end with the connections.
+fn slow_proxy(target: u16, delay: Duration) -> u16 {
+    fn pipe(mut from: TcpStream, mut to: TcpStream, delay: Duration) {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match from.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    std::thread::sleep(delay);
+                    if to.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = to.shutdown(std::net::Shutdown::Write);
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(client) = client else { break };
+            let Ok(server) = TcpStream::connect(("127.0.0.1", target)) else { continue };
+            let (c2, s2) = (client.try_clone().unwrap(), server.try_clone().unwrap());
+            std::thread::spawn(move || pipe(client, s2, delay));
+            std::thread::spawn(move || pipe(server, c2, delay));
+        }
+    });
+    port
+}
+
+/// `url` with its port replaced by `port`; the port it had.
+fn with_port(url: &str, port: u16) -> (String, u16) {
+    let (scheme, rest) = url.split_once("://").unwrap();
+    let (host_part, path) = rest.split_once('/').map_or((rest, ""), |(h, p)| (h, p));
+    let (auth, host_port) = host_part.rsplit_once('@').map_or(("", host_part), |(a, h)| (a, h));
+    let (host, old) = host_port.rsplit_once(':').unwrap();
+    let at = if auth.is_empty() { "" } else { "@" };
+    (format!("{scheme}://{auth}{at}{host}:{port}/{path}"), old.parse().unwrap())
+}
+
+/// `phv jobs adopt --yes` moves 10,200 jobs through a store 10 ms away (a
+/// proxy that holds every chunk 5 ms) and every one arrives; its time is
+/// compared with that of 200 single jobs added through the same proxy, so
+/// the bound does not depend on the machine (found by the 18th assessment:
+/// a batch took 4 round trips per job within 10 s, so a store 4 ms away
+/// never moved anything, and 50,000 local jobs took 3 minutes). `run_sql`
+/// runs a statement on the shared store directly (the bulk of the jobs is
+/// inserted with it, and the tables are cleaned with it).
+fn check_adopt_many(name: &str, url: &str, run_sql: &mut dyn FnMut(&str)) {
+    use phv_std::jobs::Store;
+    let dir = base(name);
+    let tag = run_tag();
+    let site = format!("many-{tag}");
+    let job_name = format!("bulk_{tag}");
+    let (proxied, target) = with_port(url, 0);
+    let proxy = slow_proxy(target, Duration::from_millis(5));
+    let (proxied, _) = with_port(&proxied, proxy);
+    write(
+        &dir,
+        "phv.toml",
+        &format!(
+            "[project]\nname = \"{site}\"\n[databases.q]\nurl = \"{proxied}\"\n[jobs]\nstore = \"db:q\"\nmax_attempts = 1\n"
+        ),
+    );
+    write(&dir, "public/index.phv", "<?phv echo 1;");
+    write(&dir, &format!("jobs/{job_name}.phv"), JOB);
+    let spec = |url: &str| phv_vm::DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 2 };
+    let shared = Store::Db(spec(url), None);
+    let own = Store::Db(spec(url), Some(phv_std::store_namespace(&site)));
+    let own_table = format!("phv_jobs_{}", phv_std::store_namespace(&site));
+    drain(&shared);
+    drain(&own);
+    let base = own.left_in_shared().unwrap();
+    // 10,000 jobs of the site's name, in a few statements.
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let prefix = format!("{:016x}", nanos as u64);
+    for chunk in 0..5 {
+        let rows: Vec<String> = (chunk * 2000..(chunk + 1) * 2000)
+            .map(|i| format!("('{prefix}{i:016x}', '{job_name}', 'p{i}', 0, 0, 0, NULL, NULL, 0, 2)"))
+            .collect();
+        run_sql(&format!(
+            "INSERT INTO phv_jobs (id, name, payload, run_at, attempts, state, uniq, error, created, size) VALUES {}",
+            rows.join(", ")
+        ));
+    }
+    // 200 more, one by one through the proxy: the time of single statements.
+    let slow = Store::Db(spec(&proxied), None);
+    let started = Instant::now();
+    for i in 0..200 {
+        slow.add(&job_name, &format!("s{i}"), 0, None).unwrap().unwrap();
+    }
+    let singles = started.elapsed();
+    assert_eq!(own.left_in_shared().unwrap(), base + 10_200);
+    let started = Instant::now();
+    let (ok, out) = phv(&["jobs", "adopt", "--yes", &dir.to_string_lossy()]);
+    let moved = started.elapsed();
+    assert!(ok, "{}", out.lines().take(3).chain(out.lines().rev().take(3)).collect::<Vec<_>>().join("\n"));
+    assert!(out.contains("moved 10200 jobs (10200 waiting, 0 failed):"), "{}", out.lines().next().unwrap_or(""));
+    assert!(out.contains(&format!("  {job_name}: 10200 waiting, 0 failed\n")), "{}", out.lines().nth(1).unwrap_or(""));
+    let skipped: Vec<&str> = out.lines().filter(|l| l.starts_with("skipped ")).take(3).collect();
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(own.left_in_shared().unwrap(), base, "jobs were left in the shared store");
+    assert!(
+        moved < singles * 5,
+        "the move of 10,200 jobs took {moved:?}, 200 single jobs {singles:?} (a round trip of 10 ms)"
+    );
+    run_sql(&format!("DELETE FROM {own_table} WHERE name = '{job_name}'"));
+    run_sql(&format!("DELETE FROM phv_jobs WHERE name = '{job_name}'"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Needs `PHV_TEST_POSTGRES_URL`; a schema of its own.
+#[test]
+fn adopt_moves_many_jobs_through_a_slow_store_with_postgres() {
+    use phv_std::migrate::{Conn, Target};
+    let Ok(url) = std::env::var("PHV_TEST_POSTGRES_URL") else {
+        eprintln!("PHV_TEST_POSTGRES_URL is not set: skipped");
+        return;
+    };
+    let tag = run_tag();
+    let schema = format!("phv_many_{tag}");
+    let spec = phv_vm::DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 1 };
+    let mut admin = Conn::open(&Target::Server(&spec)).unwrap();
+    admin.apply(&format!("9104_many_{tag}.sql"), &format!("CREATE SCHEMA {schema}")).unwrap();
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let url = format!("{url}{sep}options=-c%20search_path%3D{schema}");
+    let in_schema = phv_vm::DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 1 };
+    let mut conn = Conn::open(&Target::Server(&in_schema)).unwrap();
+    let mut n = 0;
+    check_adopt_many("many-pg", &url, &mut |sql| {
+        n += 1;
+        conn.apply(&format!("9200_many_{n}_{tag}.sql"), sql).unwrap();
+    });
+    admin.apply(&format!("9105_many_{tag}.sql"), &format!("DROP SCHEMA {schema} CASCADE")).unwrap();
+}
+
+/// Needs `PHV_TEST_MYSQL_URL`; holds the lock of the unnamed stores.
+#[test]
+fn adopt_moves_many_jobs_through_a_slow_store_with_mysql() {
+    use phv_std::migrate::{Conn, Target};
+    let Ok(url) = std::env::var("PHV_TEST_MYSQL_URL") else {
+        eprintln!("PHV_TEST_MYSQL_URL is not set: skipped");
+        return;
+    };
+    let _unnamed = phv_std::testing::unnamed();
+    let tag = run_tag();
+    let spec = phv_vm::DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 1 };
+    let mut conn = Conn::open(&Target::Server(&spec)).unwrap();
+    let mut n = 0;
+    check_adopt_many("many-mysql", &url, &mut |sql| {
+        n += 1;
+        conn.apply(&format!("9200_many_{n}_{tag}.sql"), sql).unwrap();
+    });
 }

@@ -50,13 +50,37 @@ function envGet(env, name, win) {
   return key === undefined ? undefined : env[key];
 }
 
+// A Windows path with a drive (`C:\...`): the drive letter is the only place a `:` may be.
+const DRIVE = /^[a-zA-Z]:\\/;
+// A network path (`\\host\share\...`). The host starts with a letter or a digit: `\\?\` and `\\.\` are device paths,
+// which Windows passes to the file system without its usual name rules, so the checks below would not hold for them.
+const UNC = /^\\\\[a-zA-Z0-9][^\\]*\\[^\\]+\\/;
+
+/**
+ * Why a full Windows path (already normalised) is not accepted as `phv.path`, or null when it is. Only the drive
+ * letter may hold a `:`: `phv.cmd:s.exe` is an alternate data stream of `phv.cmd` (a shell script), and the
+ * extension check would see `.exe`.
+ */
+function windowsPathProblem(p) {
+  if (/^\\\\[?.]/.test(p)) return "a device path (\\\\?\\ or \\\\.\\) is not used";
+  if (p.startsWith("\\\\") && !UNC.test(p)) return "a network path must be \\\\host\\share\\...\\phv.exe";
+  if (!DRIVE.test(p) && !UNC.test(p)) return "it must be a full path such as C:\\phv\\phv.exe";
+  if ((DRIVE.test(p) ? p.slice(2) : p).includes(":")) {
+    return "a `:` after the drive letter (an alternate data stream) is not used";
+  }
+  return null;
+}
+
 /**
  * Resolves the `phv.path` setting to an absolute executable.
  *
- * - An absolute setting is used as it is (it must be a file; on Windows an `.exe` or `.com`).
+ * - An absolute setting is used as it is (it must be a file; on Windows an `.exe` or `.com` named by a drive path or
+ *   a `\\host\share` path, with no `:` after the drive letter and no `\\?\` or `\\.\` prefix).
  * - A relative path (`bin/phv`, `.\phv.exe`) is refused: it would name a program in the workspace.
- * - A bare name (`phv`, the default) is searched in PATH: only absolute entries outside every workspace folder; on
- *   Windows with the extensions `.exe` and `.com` (in PATHEXT's order), the ones that start without a shell.
+ * - A bare name (`phv`, the default) is searched in PATH: only absolute entries outside every workspace folder (on
+ *   Windows only drive paths: a network entry, or one that is a link to a network path, is skipped, since the
+ *   workspace folders cannot be recognised under every name a share gives them); on Windows with the extensions
+ *   `.exe` and `.com` (in PATHEXT's order), the ones that start without a shell.
  *
  * Returns `{ path }` or `{ error }`.
  *
@@ -80,18 +104,23 @@ function resolvePhv(o) {
   const runnable = [".exe", ".com"];
 
   if (path.isAbsolute(setting)) {
-    // On Windows `\phv.exe` or `C:phv.exe` is "absolute" only in part: it depends on the current drive or folder.
-    if (win && !/^([a-zA-Z]:\\|\\\\)/.test(path.normalize(setting))) {
-      return { error: `"phv.path" must be a full path such as C:\\phv\\phv.exe (it is "${setting}")` };
+    const full = path.normalize(setting);
+    if (win) {
+      // On Windows `\phv.exe` or `C:phv.exe` is "absolute" only in part: it depends on the current drive or folder;
+      // a `:` elsewhere names an alternate data stream; `\\?\` and `\\.\` skip the name rules the checks rely on.
+      const problem = windowsPathProblem(full);
+      if (problem) {
+        return { error: `"phv.path" is "${setting}": ${problem}` };
+      }
+      // As in PATH: only a program that starts without a shell (not .cmd, .bat or .ps1).
+      if (!runnable.includes(path.extname(full).toLowerCase())) {
+        return { error: `"phv.path" must name an .exe (or .com) file, such as C:\\phv\\phv.exe (it is "${setting}")` };
+      }
     }
-    // As in PATH: only a program that starts without a shell (not .cmd, .bat or .ps1).
-    if (win && !runnable.includes(path.extname(setting).toLowerCase())) {
-      return { error: `"phv.path" must name an .exe (or .com) file, such as C:\\phv\\phv.exe (it is "${setting}")` };
-    }
-    if (!isFile(setting)) {
+    if (!isFile(full)) {
       return { error: `"phv.path" is "${setting}", which is not an executable file` };
     }
-    return { path: path.normalize(setting) };
+    return { path: full };
   }
   const separators = win ? /[\\/:]/ : /\//;
   if (separators.test(setting) || setting === "." || setting === "..") {
@@ -100,9 +129,13 @@ function resolvePhv(o) {
     };
   }
 
-  // The workspace folders, as written and with links resolved.
-  const inWorkspace = (p) => {
+  // Whether a PATH entry or a program in it is not to be used: in a workspace folder (as written or with links
+  // resolved), or on Windows a network path (as written or after resolving links). A workspace folder has other
+  // names over the network (`\\127.0.0.1\C$\work\repo`, `\\<this machine>\<a share>\...`, a mapped drive), which a
+  // comparison cannot know all of, so a network entry is skipped: phv on a share is named by a full `phv.path`.
+  const skipped = (p) => {
     const real = realpath(p);
+    if (win && (p.startsWith("\\\\") || real.startsWith("\\\\"))) return true;
     return folders.some((f) => isInside(p, f, win) || isInside(real, f, win) || isInside(real, realpath(f), win));
   };
 
@@ -128,17 +161,21 @@ function resolvePhv(o) {
     if (win && dir.length >= 2 && dir.startsWith('"') && dir.endsWith('"')) dir = dir.slice(1, -1);
     // An empty or relative entry (`.`, `bin`) names a folder relative to the working directory.
     if (dir === "" || !path.isAbsolute(dir)) continue;
-    if (win && !/^([a-zA-Z]:\\|\\\\)/.test(path.normalize(dir))) continue;
-    if (inWorkspace(dir)) continue;
+    // On Windows only a drive path (`C:\...`): `\phv` and `C:phv` are relative in part, `\\...` is a network path.
+    if (win && !DRIVE.test(path.normalize(dir))) continue;
+    if (skipped(dir)) continue;
     for (const name of names) {
       const candidate = path.join(dir, name);
-      if (isFile(candidate) && !inWorkspace(candidate)) {
+      if (isFile(candidate) && !skipped(candidate)) {
         return { path: candidate };
       }
     }
   }
+  const notSearched = win
+    ? "folders inside the workspace, relative PATH entries and network entries are not searched"
+    : "folders inside the workspace and relative PATH entries are not searched";
   return {
-    error: `could not find "${setting}" in PATH (folders inside the workspace and relative PATH entries are not searched). Install phv from https://phv-lang.org, or set "phv.path" to its full path`,
+    error: `could not find "${setting}" in PATH (${notSearched}). Install phv from https://phv-lang.org, or set "phv.path" to its full path`,
   };
 }
 

@@ -403,8 +403,10 @@ pub fn session_read(spec: &DatabaseSpec, ns: Option<&str>, key: &str) -> Result<
         SessionConn::Redis(c) => {
             let k = redis_session_key(key);
             let Reply::Bulk(b) = redis_run(c, &[b"GET", k.as_bytes()], until)? else { return Ok(None) };
-            let text = String::from_utf8_lossy(&b);
             let damaged = || "a stored session is damaged".to_string();
+            // Not UTF-8: refused like any other damage (the file store does
+            // too), never read with replacement characters.
+            let text = String::from_utf8(b).map_err(|_| damaged())?;
             let (head, data) = text.split_once('\n').ok_or_else(damaged)?;
             let mut nums = head.split(' ').map(|n| n.parse::<u64>().ok());
             let (Some(Some(created)), Some(Some(last)), Some(Some(returned))) = (nums.next(), nums.next(), nums.next())
@@ -506,7 +508,7 @@ fn session_store(
             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
             // Until the visitor comes back, a session lives an hour at most; never past its lifetime.
             let mut life = if row.returned { limits.ttl } else { limits.ttl.min(NEW_SESSION_TTL) };
-            let left = (row.created + limits.max_lifetime.as_secs()).saturating_sub(now);
+            let left = row.created.saturating_add(limits.max_lifetime.as_secs()).saturating_sub(now);
             life = life.min(Duration::from_secs(left.max(1)));
             let px = life.as_millis().max(1).to_string();
             let value = redis_session_text(row);

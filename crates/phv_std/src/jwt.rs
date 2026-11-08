@@ -205,14 +205,16 @@ fn rsa_public(der: &[u8]) -> Option<Result<Public, &'static str>> {
 
 const RSA_BITS: &str = "the RSA key is not 2048 to 8192 bits";
 const RSA_EXPONENT: &str = "the RSA key's public exponent must be odd and from 3 to 2^33 - 1 (it is usually 65537)";
+const RSA_MODULUS: &str = "the RSA key's modulus must be odd (an even one is not a product of two primes)";
 const EC_POINT: &str = "the P-256 key's point is not on the curve";
 const ED_POINT: &str = "the Ed25519 key is not a point of the curve of large order";
 
-/// RSA public keys of 2048 to 8192 bits with an odd exponent of 3 to
-/// 2^33 - 1: what `RSA_PKCS1_2048_8192_SHA256` verifies with (ring's bounds;
-/// found by the 1.2.0 audit: a key with another exponent loaded and never
-/// verified a token). A modulus of zero (no bytes once leading zeros are
-/// dropped) is refused like any other short one.
+/// RSA public keys of 2048 to 8192 bits, an odd modulus and an odd exponent
+/// of 3 to 2^33 - 1: what `RSA_PKCS1_2048_8192_SHA256` verifies with (ring's
+/// bounds; found by the 1.2.0 audit: a key with another exponent loaded and
+/// never verified a token; by the 1.2.1 audit: one with an even modulus too).
+/// A modulus of zero (no bytes once leading zeros are dropped) is refused
+/// like any other short one.
 fn rsa_checked(n: Vec<u8>, e: Vec<u8>) -> Result<Public, &'static str> {
     let n: Vec<u8> = n.into_iter().skip_while(|&x| x == 0).collect();
     let e: Vec<u8> = e.into_iter().skip_while(|&x| x == 0).collect();
@@ -230,6 +232,11 @@ fn rsa_checked(n: Vec<u8>, e: Vec<u8>) -> Result<Public, &'static str> {
     let exponent = e.iter().fold(0u64, |v, &b| (v << 8) | u64::from(b));
     if !(3..=(1 << 33) - 1).contains(&exponent) || exponent & 1 == 0 {
         return Err(RSA_EXPONENT);
+    }
+    // ring refuses an even modulus at every verification (its Montgomery
+    // arithmetic needs an odd one), as the number theory does.
+    if n.last().is_some_and(|b| b & 1 == 0) {
+        return Err(RSA_MODULUS);
     }
     Ok(Public::Rsa { n, e })
 }
@@ -1266,7 +1273,7 @@ mod tests {
         assert_eq!(rsa_checked(vec![], vec![1, 0, 1]).err(), Some(RSA_BITS));
         assert_eq!(rsa_checked(vec![0, 0, 0], vec![1, 0, 1]).err(), Some(RSA_BITS));
         assert_eq!(rsa_checked(vec![0x80; 256], vec![]).err(), Some(RSA_EXPONENT), "no exponent");
-        assert!(rsa_checked(vec![0x80; 256], vec![1, 0, 1]).is_ok(), "2048 bits");
+        assert!(rsa_checked(odd_modulus(), vec![1, 0, 1]).is_ok(), "2048 bits");
         assert_eq!(rsa_checked(vec![0x7f; 256], vec![1, 0, 1]).err(), Some(RSA_BITS), "2047 bits");
         // RSAPublicKey { modulus 0, publicExponent 65537 }, in PEM.
         let pem = "-----BEGIN RSA PUBLIC KEY-----\nMAgCAQACAwEAAQ==\n-----END RSA PUBLIC KEY-----\n";
@@ -1283,6 +1290,13 @@ mod tests {
         assert_eq!(keys.len(), 1, "the zero key is skipped");
     }
 
+    /// A modulus of 2048 bits that passes every check (odd; not a real key).
+    fn odd_modulus() -> Vec<u8> {
+        let mut n = vec![0x80; 256];
+        n[255] = 0x81;
+        n
+    }
+
     fn jwk_map(jwk: &str) -> Map {
         let v = crate::web::json_decode(jwk);
         let Ok(Value::Map(m)) = &v else { panic!("not a JSON map: {jwk}") };
@@ -1294,7 +1308,7 @@ mod tests {
     /// a key loaded and never verified anything) is refused when loaded.
     #[test]
     fn rsa_keys_with_a_degenerate_exponent_are_refused() {
-        let n = vec![0x80; 256];
+        let n = odd_modulus();
         for e in [vec![1], vec![2], vec![0, 1], vec![1, 0, 0], vec![4], vec![2, 0, 0, 0, 1], vec![1, 0, 0, 0, 0, 1]] {
             assert_eq!(rsa_checked(n.clone(), e.clone()).err(), Some(RSA_EXPONENT), "e = {e:?}");
         }
@@ -1312,6 +1326,37 @@ mod tests {
         der.extend_from_slice(&[0x02, 0x01, 0x01]);
         let err = from_pem(&pem_of("RSA PUBLIC KEY", &der), None).err();
         assert_eq!(err.as_deref(), Some(RSA_EXPONENT));
+    }
+
+    /// An RSA key whose modulus is even (found by the 18th assessment: ring
+    /// refuses it at every verification, so it loaded and never verified
+    /// anything, as a degenerate exponent did) is refused when loaded, from
+    /// a JWK and from PEM, and a key set skips it.
+    #[test]
+    fn rsa_keys_with_an_even_modulus_are_refused() {
+        let even = vec![0x80; 256];
+        assert_eq!(rsa_checked(even.clone(), vec![1, 0, 1]).err(), Some(RSA_MODULUS));
+        assert!(rsa_checked(odd_modulus(), vec![1, 0, 1]).is_ok());
+        // A bad exponent is reported first; a short modulus before both.
+        assert_eq!(rsa_checked(even.clone(), vec![2]).err(), Some(RSA_EXPONENT));
+        assert_eq!(rsa_checked(vec![0x80; 255], vec![1, 0, 1]).err(), Some(RSA_BITS));
+        let jwk = |n: &[u8]| jwk_map(&format!(r#"{{"kty":"RSA","n":"{}","e":"AQAB"}}"#, URL_SAFE_NO_PAD.encode(n)));
+        assert_eq!(from_jwk(&jwk(&even)).err().as_deref(), Some(RSA_MODULUS));
+        assert!(from_jwk(&jwk(&odd_modulus())).is_ok());
+        // RSAPublicKey { an even modulus of 2048 bits, publicExponent 65537 }, in PEM.
+        let mut der = vec![0x30, 0x82, 0x01, 0x0a, 0x02, 0x82, 0x01, 0x01, 0x00];
+        der.extend_from_slice(&even);
+        der.extend_from_slice(&[0x02, 0x03, 0x01, 0x00, 0x01]);
+        let err = from_pem(&pem_of("RSA PUBLIC KEY", &der), None).err();
+        assert_eq!(err.as_deref(), Some(RSA_MODULUS));
+        let ec = ec_key();
+        let doc = format!(
+            r#"{{"keys":[{},{{"kty":"RSA","n":"{}","e":"AQAB","kid":"even"}}]}}"#,
+            ec.public_jwk().unwrap(),
+            URL_SAFE_NO_PAD.encode(&even)
+        );
+        let keys = from_jwks(None, &doc).unwrap_or_else(|_| panic!("no limits")).unwrap();
+        assert_eq!(keys.len(), 1, "the even key is skipped");
     }
 
     /// Points off the curve, and the Ed25519 points of small order, are

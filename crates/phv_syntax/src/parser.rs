@@ -33,8 +33,14 @@ pub fn parse_module_within(
     if (is_template || p.uses_layout) && !p.halted && !p.html.at_top_level() {
         let span = p.span();
         let what = if is_template { "template" } else { "page (it uses `layout()`)" };
-        let mut d =
-            Diagnostic::error(format!("the {what} ends inside a tag, comment, `<script>`/`<style>` or `<svg>`"), span);
+        let mut d = if p.html.only_select_open() {
+            // Found by the 1.2.1 audit: a partial that opened a `<select>` passed.
+            let mut d = Diagnostic::error(format!("the {what} ends inside an open `<select>`"), span);
+            d.add_note("close the `<select>`: what follows this output is checked outside one, where older browsers would still read a `<title>` or `<style>` as markup inside it");
+            d
+        } else {
+            Diagnostic::error(format!("the {what} ends inside a tag, comment, `<script>`/`<style>` or `<svg>`"), span)
+        };
         d.add_note(
             "close everything the template opens: its output is `Html`, which can be joined with other `Html` values",
         );
@@ -595,7 +601,8 @@ impl Parser {
             d.add_note("a browser would read that end tag there (this template or function may be written inside a `<noscript>`); put a space after `<`, or move the code");
             self.diags.push(d);
         }
-        if ctx != EchoContext::Text && !matches!(s.kind, StmtKind::InlineHtml(..)) {
+        // Inside a `<select>`, functions may write output as in text.
+        if !matches!(ctx, EchoContext::Text | EchoContext::SelectText) && !matches!(s.kind, StmtKind::InlineHtml(..)) {
             s.out = Some(ctx);
         }
         Ok(s)
@@ -637,7 +644,8 @@ impl Parser {
             }
             Tok::Echo => {
                 self.bump();
-                // `echo` between pieces of HTML lands in the same context as `<?= ?>`.
+                // `echo` between pieces of HTML lands in the same context as `<?= ?>`
+                // (inside a `<select>`, its `Html` is checked as well).
                 let ctx = self.html.context();
                 let exprs = self.expr_list()?;
                 self.semi()?;
@@ -1656,10 +1664,12 @@ impl Parser {
                         if n == "layout" {
                             self.uses_layout = true;
                             if !self.html.at_top_level() {
-                                let mut d = Diagnostic::error(
-                                    "`layout()` is called inside a tag, attribute, comment or `<script>`",
-                                    e.span,
-                                );
+                                let inside = if self.html.only_select_open() {
+                                    "an open `<select>`"
+                                } else {
+                                    "a tag, attribute, comment or `<script>`"
+                                };
+                                let mut d = Diagnostic::error(format!("`layout()` is called inside {inside}"), e.span);
                                 d.add_note("the layout's HTML would be written there; call it where the page's HTML is at the top");
                                 self.diags.push(d);
                             }

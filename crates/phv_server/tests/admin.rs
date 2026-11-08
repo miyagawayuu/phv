@@ -272,26 +272,30 @@ fn requests_get_ids() {
 /// span of their own.
 #[test]
 fn calls_to_other_services_carry_the_trace() {
+    // The service that echoes the trace is another server: a service cannot
+    // point at the server itself (18th audit).
+    let other = site("trace-other");
+    write(&other, "phv.toml", "[server]\nrequest_ids = true\ntrust_request_id = true\n");
+    write(
+        &other,
+        "public/echo.phv",
+        "<?phv\nimport std.http.request;\necho request()->header(\"traceparent\") ?? \"none\";\n",
+    );
+    let other_addr = start(&other);
     let dir = site("trace");
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
     write(
         &dir,
         "phv.toml",
-        &format!("[server]\nrequest_ids = true\ntrust_request_id = true\n[http.self]\nurl = \"http://{addr}\"\n"),
+        &format!(
+            "[server]\nrequest_ids = true\ntrust_request_id = true\n[http.other]\nurl = \"http://{other_addr}\"\n"
+        ),
     );
     write(
         &dir,
         "public/call.phv",
-        "<?phv\nimport std.net.HttpClient;\necho HttpClient::connect(\"self\")->get(\"/echo\")->body;\n",
+        "<?phv\nimport std.net.HttpClient;\necho HttpClient::connect(\"other\")->get(\"/echo\")->body;\n",
     );
-    write(
-        &dir,
-        "public/echo.phv",
-        "<?phv\nimport std.http.request;\necho request()->header(\"traceparent\") ?? \"none\";\n",
-    );
-    let opts = options(&dir);
-    std::thread::spawn(move || serve_on(listener, opts).unwrap());
+    let addr = start(&dir);
     let tp = "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\n";
     let sent = get(addr, "/call", tp).body;
     let parts: Vec<&str> = sent.split('-').collect();
@@ -299,5 +303,7 @@ fn calls_to_other_services_carry_the_trace() {
     assert_eq!((parts[0], parts[1], parts[3]), ("00", "4bf92f3577b34da6a3ce929d0e0e4736", "01"));
     assert_ne!(parts[2], "00f067aa0ba902b7", "a span of its own");
     assert_eq!(parts[2].len(), 16);
-    let _ = std::fs::remove_dir_all(&dir);
+    for d in [dir, other] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

@@ -181,6 +181,36 @@ fn compiled_code_is_shared_between_programs() {
     assert_ne!(ea.consts, eb.consts, "with each program's own constants");
 }
 
+/// Sharing is by the program's text, not by what its bytes spell: a float
+/// constant whose bits are the bytes of another constant's text makes
+/// another program, with its own code. (Before 1.2.1 the key held a float's
+/// raw bytes between the texts of the other constants, so these two
+/// programs shared one unit, and the second printed the first one's
+/// constant.)
+#[test]
+fn programs_differing_in_a_float_constants_bits_do_not_share_code() {
+    // The float whose bits are the bytes of `Str("a")`, as the source names it.
+    let bits = u64::from_le_bytes(*b"Str(\"a\")");
+    let lit = format!("{:e}", f64::from_bits(bits));
+    assert_eq!(lit.parse::<f64>().unwrap().to_bits(), bits);
+    let src = |c: &str| {
+        format!(
+            "<?phv\nfunction f(int $n): string {{\n    $s = \"\";\n    for ($i = 0; $i < $n; $i++) {{\n        $s = $s . {c};\n    }}\n    return $s;\n}}\necho f(2);\n"
+        )
+    };
+    let (out_a, ca) = run_as_shipped("bits_a", &src(&lit));
+    let (out_b, cb) = run_as_shipped("bits_b", &src("\"a\""));
+    assert_ne!(out_a, "aa");
+    assert_eq!(out_b, "aa");
+    if std::env::var("PHV_JIT").is_ok_and(|v| v == "0") {
+        return;
+    }
+    let id = |c: &phv_driver::Compiled| c.program.funcs.iter().position(|f| f.name == "f").unwrap() as u32;
+    let ea = ca.jit.as_ref().unwrap().entry(id(&ca)).unwrap();
+    let eb = cb.jit.as_ref().unwrap().entry(id(&cb)).unwrap();
+    assert_ne!(ea.entry as usize, eb.entry as usize, "each its own native code");
+}
+
 #[test]
 fn memory_limit_inside_native_string_loops() {
     let limits = Limits { max_memory: Some(16 << 20), ..Limits::default() };

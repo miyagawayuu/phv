@@ -690,8 +690,9 @@ echo render("views/layout.phv.html", title: "Home", body: $html);
   tag, an attribute, a comment or a `<script>`: its output is joined with the layout's.
 - `render()` returns `Html`, so the result can be passed directly to another template and embedded there (layouts).
 - A template must close everything it opens: it cannot end inside a tag, an attribute, a comment, a `<script>` /
-  `<style>` / `<textarea>` element or `<svg>` / `<math>` (compile error). `Html` values can be joined with `.`, and a
-  template that ended at `<a href="` would put the next value at the start of a URL without the check above.
+  `<style>` / `<textarea>` element, `<svg>` / `<math>` or a `<select>` (compile error). `Html` values can be joined with
+  `.`, and a template that ended at `<a href="` would put the next value at the start of a URL without the check above
+  (one that ended inside a `<select>` would leave what follows inside it for older browsers, see §13).
 
 ## 13. Output and escaping
 
@@ -746,7 +747,9 @@ ignore it and read on as SVG: close the element first); an HTML element such as 
 `<annotation-xml>`; an end tag inside SVG that would close an HTML element around it; and a `>` inside a CDATA section
 (`<![CDATA[ ... ]]>`, read to `]]>` there) that is not the end of `]]>`. A `<title>`, `<style>`, `<xmp>`, `<iframe>`,
 `<noembed>`, `<noframes>` or `<plaintext>` inside an open `<select>` is an error: older browsers ignore it there and read its
-text as markup. Inside `<noscript>`, `<svg>` and `<math>`, the end tag of an
+text as markup. `Html` inserted inside an open `<select>` (`<select><?= render(...) ?></select>`) that holds the start tag of
+one of these elements stops the script with a runtime error (the template that made it was checked on its own), and a
+template may not end inside a `<select>`. Inside `<noscript>`, `<svg>` and `<math>`, the end tag of an
 element whose text a browser may read as raw text (`</textarea>`, `</noscript>`, `</xmp>`...) inside a comment or an attribute value
 is an error, and so is a value right after `</` and the start of such a name there, or any other statement there
 (`</<?phv f(); ?>`: a function could write the rest): where a browser reads the element differently (`<noscript>` with scripting
@@ -763,7 +766,7 @@ while it is checked on its own. So `<!--</<?= $v ?>-->` and `title="</nos<?phv f
 | Element content or a comment inside `<svg>` or `<math>` | `<svg><?= render("bar.phv.html") ?></svg>` | As element content. Browsers read markup there as foreign content, while a template was checked as HTML: `Html` that holds a CDATA section, the end tag of a raw-text element it did not open, or a raw-text element (`<title>`, `<style>`, `<textarea>`...) whose text holds `<` or does not end, stops the script with a runtime error (an SVG `<title>Bar 3</title>` or `<style>.a{fill:red}</style>` is fine) |
 | Unquoted attribute value | `href=<?= $u ?>` | Error (add quotes) |
 | Inside a tag (between attributes) | `<div <?= $attrs ?>>` | Error |
-| Start of a URL attribute | `href="<?= $u ?>"`, `src="<?= $u ?>"` | Only `SafeUrl` (`safe_url($u)`) and numbers. If the preceding text contains `/` `?` `#` `:`, it is not the start (`href="/post?id=<?= $id ?>"` is allowed). `href="j<?= ?>"` still counts as the start. After a `&` at the start (`href="&<?= ?>"`, `&#106;`) only numbers are allowed, `SafeUrl` included: the value would continue a character reference (`&` and `#x6a;avascript:` make `javascript:`). and so does the text after an inserted value (`safe_url("")` is empty): `href="<?= safe_url($a) ?><?= $b ?>"` is an error; check the whole URL with `safe_url($a . $b)` |
+| Start of a URL attribute | `href="<?= $u ?>"`, `src="<?= $u ?>"` | Only `SafeUrl` (`safe_url($u)`) and numbers. If the preceding text contains `/` `?` `#` `:`, it is not the start (`href="/post?id=<?= $id ?>"` is allowed). `href="j<?= ?>"` still counts as the start. After a `&` at the start (`href="&<?= ?>"`, `&#106;`) only numbers are allowed, `SafeUrl` included: the value would continue a character reference (`&` and `#x6a;avascript:` make `javascript:`). and so does the text after an inserted value (`safe_url("")` is empty): `href="<?= safe_url($a) ?><?= $b ?>"` is an error; check the whole URL with `safe_url($a . $b)`. `<base href="<?= safe_url($u) ?>">` is accepted like any URL attribute and relies on the default CSP's `base-uri 'self'` (§14), and `<meta charset="<?= $c ?>">` is text: the response's `charset=utf-8` header wins over it |
 | `javascript:` / `data:` URL | `href="javascript:go(<?= $v ?>)"` | Error (numbers are allowed) |
 | Inside `<script>` | `var x = <?= $v ?>;` | Only `SafeJs` (`json_html($v)`) and numbers, where an expression goes. Inside a JavaScript string, template literal, comment or regular expression (`` `<?= $v ?>` ``, `"<?= $v ?>"`), only numbers: a JSON value's quotes would end the string, and `${...}` in a template literal runs. Write `const s = <?= json_html($v) ?>;` |
 | `<style>`, `style="..."` | | Error (numbers are allowed) |
@@ -1188,7 +1191,12 @@ session()->destroy();                 // log out
   and of two requests that regenerate the same session only one gets it.
 - Requests of one visitor that run at the same time each read the session when they start and save the whole of it
   when they end: the save that ends last wins, and a value another request set meanwhile is lost. A flow that sets
-  several keys should set them in one request, or read the session again before writing.
+  several keys should set them in one request, or read the session again before writing. A request that reads the
+  session file while another request's save replaces it reads again: it never runs without the session.
+- A stored session that is damaged (its values are not a JSON object of strings, its text is not UTF-8, or its times
+  are more than a day ahead of the server's clock) is refused in every store: the request runs without a session, and
+  what it sets starts a new one under a new id. A record with times ahead of the clock is removed, since nothing else
+  would expire it; other damaged records are left as they are.
 - A site's store holds at most 50,000 sessions and 256 MB of session data (Redis keeps within both as sessions are written).
   When it is full, sessions whose visitor never came back are removed first (the least recently used), then the newest
   of the rest: a flood of sessions, even ones whose cookie is sent back, removes its own sessions and never those
@@ -1368,7 +1376,10 @@ only its own changes are undone, and nothing is committed until the outermost on
   is compiled again at its first step, and weighed again when its program is then longer than 200 steps. A weight is
   also kept per process by the database file, its schema version and the statement's text (at most 4,096 of them,
   for texts up to 4 KB; an `ANALYZE` sets them aside), so the other connections of the file do not weigh a text one
-  of them weighed, at the same schema; each still refuses a statement over the limit. A statement
+  of them weighed, at the same schema; each still refuses a statement over the limit. The file is known by its
+  identity and the time it was made; on a file system that does not record that time, by the connection that
+  opened it, so there the weights are not shared between connections (a file made later at the same place cannot
+  take another's). A statement
   whose program takes more than 1 MB (`IN` with about 7,000 values) runs but is not kept. The values
   bound to a statement are cleared when its run is done. When a script is done, an open transaction is rolled back; a
   connection is closed instead of kept after a
@@ -1470,7 +1481,11 @@ Methods: `get`, `set`, `delete`, `exists`, `incr`, `expire`, `ttl`, `hget`, `hse
 `lpop`, `lrange`, `pipeline` (below), `close`. Each command waits at most until the script's time limit, and a reply larger than the
 memory left to the script is refused. Only these commands can be sent: commands such as `KEYS`, `FLUSHALL`, `CONFIG` or
 `EVAL` are not available. Keys starting with `phv:` belong to PHV (sessions, rate limits and jobs kept in Redis) and raise
-`ValueError`. A remote server needs a `rediss://` URL (or `tls = false`). Errors raise `DatabaseError`.
+`ValueError`. A remote server needs a `rediss://` URL (or `tls = false`). Errors raise `DatabaseError`. A connection
+is used for a command only when it is in step: one on which something arrived while no command was waiting (a reply
+the server sent late), or that the server closed meanwhile, is replaced by another before the command is sent, so no
+command reads another's reply; a reply the server sends past what a command asked for fails that command
+(`DatabaseError`) and closes the connection.
 
 #### Redis pipelines
 
@@ -1657,6 +1672,8 @@ $ws->close();
   public CAs. `tls = false` allows `ws://` to such a host.
 - Connection failures, a server that closes the connection, and network errors raise `NetworkError`. The URL is
   never shown in messages.
+- A server cannot be the site itself: `phv serve` refuses to start when the URL has the server's port and an
+  address it listens on (see the HTTP client).
 
 ### HTTP client (std.net)
 
@@ -1711,15 +1728,22 @@ when the body is not JSON).
   is returned with its `Location` header.
 - **TLS (`https://`) is required for every host except `localhost`**, with the server certificate checked against the
   public CAs. `tls = false` allows `http://` to such a host.
+- **A service cannot be the server itself.** A page that calls its own server holds a worker while it waits for
+  one, and once every worker waits so, nothing is answered for 10 seconds. `phv serve` refuses to start when the URL
+  of an `[http]` or `[websockets]` service has the server's port and a host that is an address the server listens
+  on (the loopback, `localhost`, or any address of the machine when it listens on every one). Call the code directly
+  instead, or serve the API from another address. A reverse proxy in front of the server is on another port, so it
+  is not caught, and calling the site through it has the same problem.
 - Connections are kept open between requests to the same host (at most 8 per host and 256 in all, closed after 30
   idle seconds): one is kept only when its response ended where its framing said (`Content-Length`, or a chunked body
   with nothing after it) and the server did not ask to close it, and it is used again only if nothing arrived on it
   while it was idle. Every request takes a kept connection; one the server closed meanwhile is retried once on a
-  new connection, only when no byte of an answer came, and for a request with side effects (`POST`, `PUT`, `PATCH`,
-  `DELETE`) only when the request had not been written whole (the server may have acted on one it got whole: the
-  script gets `NetworkError`). Such a request takes a kept connection only when it was idle for less than a second,
-  since servers close idle connections after a few seconds; a connection idle for longer waits for a `GET`, `HEAD`
-  or `OPTIONS`.
+  new connection, only when no byte of an answer came, and only for a request without side effects (`GET`, `HEAD`,
+  `OPTIONS`). A request with side effects (`POST`, `PUT`, `PATCH`, `DELETE`) is never sent twice: when its write or
+  the read of its answer fails on a kept connection, the script gets `NetworkError` (the server may have acted on
+  what reached it). Such a request takes a kept connection only when it was idle for less than a second, since
+  servers close idle connections after a few seconds; a connection idle for longer waits for a `GET`, `HEAD` or
+  `OPTIONS`.
 - Each request waits at most until the script's time limit (30 seconds when it has none),
   whatever the server sends: the name lookup, every read and every write stop at that deadline, and at most 10
   interim (`1xx`) responses are skipped. The addresses a host name was looked up to are kept for 30 seconds (a
@@ -1777,8 +1801,9 @@ response()->redirect("/");
   given, but not those of the flow itself.
 - `callback()` accepts only a `state` this session started for this provider, so a sign-in cannot be finished in
   another browser, and another site cannot sign a visitor in to an account of its own. It refuses an `iss` parameter
-  that names another issuer (RFC 9207; an error answer too), passes the provider's error (`?error=access_denied`) on as
-  `OAuthError`, and exchanges the code at the token endpoint with the verifier and the client secret (with HTTP Basic,
+  that names another issuer (RFC 9207; an error answer too), and an answer without `iss` when the discovery document
+  says the provider always sends it (`authorization_response_iss_parameter_supported`; OAuth 2.0 without discovery has
+  no such check), passes the provider's error (`?error=access_denied`) on as `OAuthError`, and exchanges the code at the token endpoint with the verifier and the client secret (with HTTP Basic,
   unless `client_auth = "post"` or the discovery document allows only `client_secret_post`). The access token must be
   a Bearer token (`token_type` in any case; a response without `token_type` is taken as Bearer); another type is
   refused with `unsupported_token_type`. The sign-in is kept in the session, so `redirect()`, `authorizationUrl()` and
@@ -1996,16 +2021,22 @@ $data = json_decode($j->payload);
   `phv:jobs:<hash>:`. Every server process and machine of the site using the same store shares the jobs; other sites
   on the same database do not see them. Jobs left in the shared table when a site gets a name are not taken: they stay
   in `phv_jobs` (Redis: under `phv:jobs:`), and `phv jobs list` says how many waiting, running and failed jobs are
-  there. `phv jobs adopt [--yes] [dir]` moves them into the site's own table (or keys). The shared store records no
-  site, so it takes the waiting and failed jobs whose name is one of the site's job scripts (`<dir>/<name>.phv`) and
-  no other: check the dry run when another site on the same database had jobs of the same names. Without `--yes` it
-  is a dry run that prints what would move (each job's id, state and name, and the counts) and what is skipped, and
-  moves nothing. A running job is skipped until it has ended; so is a job whose key the site's store has already, and
-  a waiting job that does not fit under the site's caps (it stays, with the message of a full store). A job is never
-  in both stores and never lost: on PostgreSQL and MySQL each job is deleted from the shared table and inserted into
-  the site's in one transaction, which holds the site's job lock (so the caps are counted exactly, as for `enqueue()`
-  in a transaction), and a row another connection holds is skipped, not waited for; in Redis one script moves them.
-  After it, `phv jobs list` no longer counts them; what is skipped, and other sites' jobs, stay and are counted. The
+  there. `phv jobs adopt [--yes] [--name <name>]... [dir]` moves them into the site's own table (or keys). The shared
+  store records no site, so it takes the waiting and failed jobs whose name is one of the site's job scripts
+  (`<dir>/<name>.phv`) and no other: check the dry run when another site on the same database had jobs of the same
+  names, and give `--name <name>` (one of the site's job scripts; more than once for several) to take only the jobs
+  of those names. Without `--yes` it is a dry run that prints what would move (the counts, then a line per name
+  `<name>: N waiting, M failed`, then each job's id, state and name) and what is skipped, and moves nothing. A
+  running job is skipped until it has ended; so is a job whose key the site's store has already, and a waiting job
+  that does not fit under the site's caps (it stays, with the message of a full store). A job is never in both stores
+  and never lost: on PostgreSQL and MySQL the jobs are moved in batches of up to 1,000, each inserted into the site's
+  table and deleted from the shared one in one transaction of a few statements, which holds the site's job lock (so
+  the caps are counted exactly, as for `enqueue()` in a transaction); only the rows the site's table accepted are
+  deleted, and a row another connection holds is skipped, not waited for. In Redis a script moves them a page of
+  1,000 ids at a time, so other clients of the server wait a few milliseconds at most. Each page listed or batch
+  moved has 60 seconds (not the 10 seconds of one operation of a page), and a batch that takes more than a quarter
+  of that halves the next, so a store far away (a round trip of tens of milliseconds) is moved as well as a local
+  one. After it, `phv jobs list` no longer counts them; what is skipped, and other sites' jobs, stay and are counted. The
   100,000 hold for transactions running at the same time too: `enqueue()` in a transaction takes a lock of the site's
   jobs that the transaction holds until it ends (PostgreSQL an advisory lock, MySQL a row of a table
   `phv_jobs_lock`), so transactions that add jobs to the same site wait for one another, and so does an `enqueue()`
@@ -2031,7 +2062,8 @@ $data = json_decode($j->payload);
   SIGTERM, for a worker machine; with `[jobs] run = false`, `phv serve` only adds jobs (`phv jobs run` and a built
   site's `--jobs-only` run them all the same). A built site's jobs are those built into it. `phv jobs list [--failed]`
   shows the jobs of a shared store, `phv jobs retry <id>` puts a job that was given up back in the queue, and
-  `phv jobs adopt [--yes]` moves the jobs the site left in the shared store before it had a namespace (see above).
+  `phv jobs adopt [--yes] [--name <name>]...` moves the jobs the site left in the shared store before it had a
+  namespace (see above).
 - A job that does not compile stops `phv serve`, `phv jobs run` and `phv build`. When the server stops, running jobs
   get what is left of `shutdown_timeout`; one that does not finish runs again elsewhere when its lease runs out.
 - The payload is stored as it is: encrypt (`encrypt()`) what must stay secret. A page that adds jobs for visitors
@@ -2118,7 +2150,7 @@ $claims = $auth->verify($token, issuer: "https://auth.example.com/", audience: "
   (`PUBLIC KEY`, `RSA PUBLIC KEY`). RSA keys of 2048 to 4096 bits sign, and of up to 8192 bits verify; encrypted keys
   and other kinds of keys are refused (`ValueError`). `JwtKey::fromJwk()` reads the public key of a JWK. A public key
   that could never verify a token is refused when it is read (`ValueError`; a key set skips it): an RSA key whose
-  public exponent is even, below 3 or above 2^33 - 1, a P-256 point that is not on the curve, and an Ed25519 point that
+  modulus is even or whose public exponent is even, below 3 or above 2^33 - 1, a P-256 point that is not on the curve, and an Ed25519 point that
   is not on the curve or has small order. `alg`, `kid`
   and `canSign` tell what a key is. Keys stay in the runtime: no value a script holds, nor `dump()`, shows a private
   key.
@@ -2426,7 +2458,7 @@ When code uses a PHP function name, the error message suggests the alternative
 | `phv dap` | Debug adapter for editors (see Debugging below) |
 | `phv doc [paths] [--std] [--format html\|md] [-o file]` | An API reference from doc comments (see API reference below) |
 | `phv install [--locked]` | Fetch `[dependencies]` and the packages they need, and pin them in `phv.lock` |
-| `phv jobs run [dir]`, `phv jobs list [--failed] [dir]`, `phv jobs retry <id> [dir]`, `phv jobs adopt [--yes] [dir]` | Run a project's background jobs without serving its pages; list the jobs of its store; put a failed job back; move the jobs the site left in the shared store before it had a namespace (a dry run without `--yes`; see "Background jobs") |
+| `phv jobs run [dir]`, `phv jobs list [--failed] [dir]`, `phv jobs retry <id> [dir]`, `phv jobs adopt [--yes] [--name <name>]... [dir]` | Run a project's background jobs without serving its pages; list the jobs of its store; put a failed job back; move the jobs the site left in the shared store before it had a namespace (a dry run without `--yes`, with a count per name; only the jobs of the names given with `--name`; see "Background jobs") |
 | `phv migrate file.php` | Convert PHP mechanically and list the places that need manual work (`-o` names the output, which is not written through a link) |
 | `phv disasm file.phv` | Show the bytecode |
 | `phv parse file.phv` | Show the syntax tree |
@@ -2452,8 +2484,13 @@ is looked for in the working directory (a workspace folder) before `PATH`, so op
 would run that folder's `phv.exe`. The setting `phv.path` (a user setting only; a workspace cannot change it) is
 either a full path, used as it is, or a name (`phv` by default) looked for in `PATH`. Only the absolute entries of
 `PATH` outside every workspace folder are searched, on Windows for `.exe` and `.com` files (in the order of
-`PATHEXT`); a relative `phv.path` or `PATH` entry is not used. When nothing is found, the extension says so and
-starts no server.
+`PATHEXT`) and only drive entries (`C:\...`): a network entry (`\\server\share`), or an entry or program that is a
+link to a network path, is skipped, because a workspace folder has names over the network (`\\127.0.0.1\C$\...`, a
+share of it) that a comparison cannot all know. A relative `phv.path` or `PATH` entry is not used. On Windows a full
+`phv.path` must be a drive path or a `\\server\share\...` path to an `.exe` or `.com` with no `:` after the drive
+letter (`phv.cmd:s.exe` is an alternate data stream of a shell script) and no `\\?\` or `\\.\` prefix (a device
+path, to which Windows applies none of its name rules). When nothing is found, the extension says so and starts no
+server.
 
 ### Debugging and profiling
 
@@ -2721,7 +2758,9 @@ It then runs the type checker and shows the places that need manual work, such a
      direct); a function with neither that no compiled function calls stays in the interpreter, since entering
      native code would cost more than its body. The code of a function, with the functions it calls, is shared
      between the programs of a process that have the same text for them (a module several pages use is compiled
-     once). `PHV_JIT_STATS=1` reports each compilation on stderr. Numbers stay in machine registers
+     once): the same instructions, signatures, constants (floats by their bits) and builtin names, compared as a
+     serialization in which every part is tagged and length-prefixed, so that no two different texts share.
+     `PHV_JIT_STATS=1` reports each compilation on stderr. Numbers stay in machine registers
      (with a null flag for nullable ones); strings, lists and maps live in a register window and are handled by the
      interpreter's own code, so results, error messages (such as `IndexError` and `KeyError`) and memory checks are
      identical. `PHV_JIT_EXPLAIN=1` prints, for each function the JIT leaves to the interpreter, the instruction

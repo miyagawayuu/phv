@@ -162,16 +162,27 @@ pub(super) fn job_conn_before(
     ns: Option<&str>,
     deadline: Option<Instant>,
 ) -> Result<(SessionConn, Instant), String> {
-    job_conn_for(spec, ns, deadline, PoolUse::Jobs)
+    job_conn_for(spec, ns, deadline, PoolUse::Jobs, JOB_WAIT)
 }
 
-/// A connection of the job store for one operation (see `store_conn`), with
-/// the store's tables made ready once per process.
+/// `job_conn` for an operation of a command (not a page) that may take
+/// `wait`: `phv jobs adopt` moves a batch of jobs within one.
+pub(super) fn job_conn_within(
+    spec: &DatabaseSpec,
+    ns: Option<&str>,
+    wait: Duration,
+) -> Result<(SessionConn, Instant), String> {
+    job_conn_for(spec, ns, None, PoolUse::Jobs, wait)
+}
+
+/// A connection of the job store for one operation (see `store_conn`) of at
+/// most `wait`, with the store's tables made ready once per process.
 pub(super) fn job_conn_for(
     spec: &DatabaseSpec,
     ns: Option<&str>,
     deadline: Option<Instant>,
     use_: PoolUse,
+    wait: Duration,
 ) -> Result<(SessionConn, Instant), String> {
     let t = jobs_table(ns);
     let Some(url) = spec.url.clone() else {
@@ -180,8 +191,8 @@ pub(super) fn job_conn_for(
     tls_init();
     // No longer than the script may still run (found by the 1.1 audit: a store
     // that did not answer held a page for 10 s, whatever its time limit).
-    let until = deadline.map_or(Instant::now() + JOB_WAIT, |d| d.min(Instant::now() + JOB_WAIT));
-    let mut conn = store_conn(spec, &url, use_, until, JOB_WAIT)?;
+    let until = deadline.map_or(Instant::now() + wait, |d| d.min(Instant::now() + wait));
+    let mut conn = store_conn(spec, &url, use_, until, wait)?;
     let made = format!("{url}|{t}");
     let retry = lock(&JOB_UNSIZED).get(&t).is_some_and(|at| at.elapsed() >= JOB_SIZE_RETRY);
     if !matches!(conn, SessionConn::Redis(_)) && (retry || !lock(&JOB_TABLES).contains(&made)) {

@@ -167,7 +167,7 @@ fn job_add_once(
         JobAdder::Script if uniq.is_some() => PoolUse::JobKey,
         JobAdder::Script => PoolUse::Jobs,
     };
-    let (mut conn, until) = job_conn_for(spec, ns, Some(until), use_)?;
+    let (mut conn, until) = job_conn_for(spec, ns, Some(until), use_, JOB_WAIT)?;
     let now = now_ms();
     let load = match &mut conn {
         SessionConn::Redis(c) => {
@@ -246,7 +246,7 @@ fn job_add_locked(
 ) -> Result<Option<()>, String> {
     use mysql::prelude::Queryable;
     let t = jobs_table(ns);
-    let (mut conn, until) = job_conn_for(spec, ns, deadline, use_)?;
+    let (mut conn, until) = job_conn_for(spec, ns, deadline, use_, JOB_WAIT)?;
     let now = now_ms();
     let size = job.2.len();
     let count_key = job_count_key(spec, &t);
@@ -653,7 +653,7 @@ fn my_key_probe_store(
     u: &str,
     until: Instant,
 ) -> Result<KeyProbe, String> {
-    let (mut conn, _) = job_conn_for(spec, ns, Some(until), PoolUse::JobKey)?;
+    let (mut conn, _) = job_conn_for(spec, ns, Some(until), PoolUse::JobKey, JOB_WAIT)?;
     match &mut conn {
         SessionConn::My(c) => {
             let conn = c.get();

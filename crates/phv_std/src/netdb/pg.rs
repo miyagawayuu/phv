@@ -374,7 +374,7 @@ impl Driver for PgConn {
         ok
     }
 
-    fn closed(&self) -> bool {
+    fn closed(&mut self) -> bool {
         self.client.is_closed()
     }
 }

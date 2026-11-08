@@ -1,0 +1,7 @@
+// Run by crates/phv_driver/tests/databases.rs after redis_late_reply_first:
+// the connection it left in the pool has a stray reply waiting, and must
+// not answer this script's command with it.
+import std.db.Redis;
+
+$r = Redis::connect("main");
+echo "get: ", json_encode($r->get("k")), "\n";

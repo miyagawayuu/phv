@@ -35,6 +35,9 @@ struct Provider {
     token_requests: usize,
     /// The token_type of the token responses.
     token_type: &'static str,
+    /// The discovery document says every authorization response carries `iss`.
+    iss_supported: bool,
+    discovery_requests: usize,
 }
 
 fn new_key() -> EcdsaKeyPair {
@@ -123,8 +126,11 @@ fn provider(state: Arc<Mutex<Provider>>, listener: TcpListener) {
             let issuer = p.issuer.clone();
             match (method.as_str(), target.as_str()) {
                 ("GET", "/.well-known/openid-configuration") => {
+                    p.discovery_requests += 1;
+                    let iss =
+                        if p.iss_supported { r#","authorization_response_iss_parameter_supported":true"# } else { "" };
                     let doc = format!(
-                        r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/auth","token_endpoint":"{issuer}/token","jwks_uri":"{issuer}/jwks","token_endpoint_auth_methods_supported":["client_secret_basic"]}}"#
+                        r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/auth","token_endpoint":"{issuer}/token","jwks_uri":"{issuer}/jwks","token_endpoint_auth_methods_supported":["client_secret_basic"]{iss}}}"#
                     );
                     reply(&mut s, "200 OK", &doc);
                 }
@@ -229,6 +235,12 @@ try {
 
 /// The site and the provider; returns the site's address and the provider's state.
 fn start() -> (SocketAddr, Arc<Mutex<Provider>>, PathBuf) {
+    start_with(false, false)
+}
+
+/// `start()` with a provider that advertises `iss` in every answer, or a
+/// site whose sessions are files (`<dir>/sessions/`).
+fn start_with(iss_supported: bool, file_sessions: bool) -> (SocketAddr, Arc<Mutex<Provider>>, PathBuf) {
     let idp = TcpListener::bind("127.0.0.1:0").unwrap();
     let issuer = format!("http://{}", idp.local_addr().unwrap());
     let state = Arc::new(Mutex::new(Provider {
@@ -239,6 +251,8 @@ fn start() -> (SocketAddr, Arc<Mutex<Provider>>, PathBuf) {
         started: HashMap::new(),
         token_requests: 0,
         token_type: "Bearer",
+        iss_supported,
+        discovery_requests: 0,
     }));
     provider(state.clone(), idp);
 
@@ -248,11 +262,12 @@ fn start() -> (SocketAddr, Arc<Mutex<Provider>>, PathBuf) {
     let dir = std::env::temp_dir().join(format!("phv-oauth-{}-{}", std::process::id(), addr.port()));
     let _ = std::fs::remove_dir_all(&dir);
     std::env::set_var("PHV_TEST_OAUTH_SECRET", "s3cret");
+    let sessions = if file_sessions { "[security]\nsession_store = \"sessions/\"\n" } else { "" };
     write(
         &dir,
         "phv.toml",
         &format!(
-            "[oauth.idp]\nissuer = \"{issuer}\"\nclient_id = \"site\"\nclient_secret_env = \"PHV_TEST_OAUTH_SECRET\"\n\
+            "{sessions}[oauth.idp]\nissuer = \"{issuer}\"\nclient_id = \"site\"\nclient_secret_env = \"PHV_TEST_OAUTH_SECRET\"\n\
              redirect_uri = \"http://{addr}/cb\"\nscopes = [\"openid\", \"email\"]\n\
              [oauth.plain]\nauthorize_url = \"{issuer}/auth\"\ntoken_url = \"{issuer}/token\"\nclient_id = \"site\"\n\
              client_secret_env = \"PHV_TEST_OAUTH_SECRET\"\nredirect_uri = \"http://{addr}/cbp\"\n"
@@ -445,5 +460,117 @@ fn token_responses_and_answers_are_checked() {
     // OAuth 2.0 without OpenID Connect: the ID token in the response is not verified, so it is not passed on.
     let body = finish("/cbp", "/loginp");
     assert_eq!(body, "ok access=at-1 id=null claims=0");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A provider whose discovery document says it sends `iss` with every
+/// answer (`authorization_response_iss_parameter_supported`) must (RFC 9207
+/// 2.4): an answer without it is refused as another provider's, a code and an
+/// error alike; one naming the issuer finishes. The flag is kept with the
+/// cached document. Found by the 18th assessment: `iss` was checked only when
+/// present, so a provider sharing the callback could leave it out.
+#[test]
+fn answers_without_iss_are_refused_when_the_provider_always_sends_it() {
+    let (addr, p, dir) = start_with(true, false);
+    let issuer = p.lock().unwrap().issuer.clone();
+    let iss = form_urlencoded::byte_serialize(issuer.as_bytes()).collect::<String>();
+
+    let (cookie, params) = login(addr, &p, None);
+    let state = params["state"].clone();
+    let (_, _, body) = get(addr, &format!("/cb?code=code-{state}&state={state}"), Some(&cookie));
+    assert!(body.starts_with("error invalid_issuer"), "{body}");
+    assert_eq!(p.lock().unwrap().token_requests, 0, "the code was not exchanged");
+    // The answer used the state up all the same.
+    let (_, _, body) = get(addr, &format!("/cb?code=code-{state}&state={state}&iss={iss}"), Some(&cookie));
+    assert!(body.starts_with("error invalid_state"), "{body}");
+
+    let (cookie, params) = login(addr, &p, None);
+    let state = params["state"].clone();
+    let (_, _, body) = get(addr, &format!("/cb?error=access_denied&state={state}"), Some(&cookie));
+    assert!(body.starts_with("error invalid_issuer"), "an error answer too: {body}");
+
+    let (cookie, params) = login(addr, &p, None);
+    let state = params["state"].clone();
+    let (_, _, body) = get(addr, &format!("/cb?code=code-{state}&state={state}&iss={iss}"), Some(&cookie));
+    assert_eq!(body, "ok sub=user-1 email=ann@example.com access=at-1");
+    assert_eq!(p.lock().unwrap().discovery_requests, 1, "the cached document kept the flag");
+
+    // A provider that does not advertise it: an answer without `iss` is its own (as before).
+    let (addr2, p2, dir2) = start();
+    let (cookie, params) = login(addr2, &p2, None);
+    let state = params["state"].clone();
+    let (_, _, body) = get(addr2, &format!("/cb?code=code-{state}&state={state}"), Some(&cookie));
+    assert!(body.starts_with("ok sub=user-1"), "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// The one session file of `<dir>/sessions/`.
+fn session_file(dir: &Path) -> PathBuf {
+    let files: Vec<PathBuf> = std::fs::read_dir(dir.join("sessions"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    files[0].clone()
+}
+
+/// The `phv.oauth` value of the session file: the pending list's text.
+fn pending_text(dir: &Path) -> String {
+    let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(session_file(dir)).unwrap()).unwrap();
+    record["values"]["phv.oauth"].as_str().unwrap_or("[]").to_string()
+}
+
+/// Writes `entries` as the session file's pending list, with the record's times as they are.
+fn set_pending(dir: &Path, entries: &[String]) {
+    let file = session_file(dir);
+    let mut record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    record["values"]["phv.oauth"] = serde_json::Value::String(format!("[{}]", entries.join(",")));
+    std::fs::write(&file, record.to_string()).unwrap();
+}
+
+/// A session record holding thousands of started sign-ins (a page cannot
+/// make one, only a writer of the store) finishes the callback: not found,
+/// `invalid_state`; found, the sign-in; and the list is cut back to what a
+/// page could have kept. Found by the 18th assessment: the save of the list
+/// after the one used was over the session's 64 KB and the callback was a 500.
+#[test]
+fn an_oversized_pending_list_in_the_store_finishes_the_callback() {
+    let (addr, p, dir) = start_with(false, true);
+    let (cookie, params) = login(addr, &p, None);
+    let state = params["state"].clone();
+    let stored = pending_text(&dir);
+    let list: Vec<serde_json::Value> = serde_json::from_str(&stored).unwrap();
+    assert_eq!(list.len(), 1);
+    let t = list[0]["t"].as_i64().unwrap();
+    let fakes: Vec<String> =
+        (0..5000).map(|i| format!(r#"{{"p":"idp","s":"x{i}","n":"n","v":"v","t":{t}}}"#)).collect();
+
+    // The real sign-in is not among them.
+    set_pending(&dir, &fakes);
+    assert!(pending_text(&dir).len() > 200_000, "well over the session's 64 KB");
+    let (status, _, body) = get(addr, &format!("/cb?code=code-{state}&state={state}"), Some(&cookie));
+    assert_eq!(status, 200);
+    assert!(body.starts_with("error invalid_state"), "{body}");
+    let after = pending_text(&dir);
+    assert!(after.matches(r#""p":"#).count() <= 4 && after.len() < 64 * 1024, "cut back: {} bytes", after.len());
+
+    // The real sign-in is the last of them.
+    let (_, params) = login(addr, &p, Some(&cookie));
+    let state = params["state"].clone();
+    let stored = pending_text(&dir);
+    let list: Vec<serde_json::Value> = serde_json::from_str(&stored).unwrap();
+    let real = list.last().unwrap().to_string();
+    assert!(real.contains(&state));
+    let mut entries = fakes.clone();
+    entries.push(real);
+    set_pending(&dir, &entries);
+    let (status, _, body) = get(addr, &format!("/cb?code=code-{state}&state={state}"), Some(&cookie));
+    assert_eq!(status, 200);
+    assert_eq!(body, "ok sub=user-1 email=ann@example.com access=at-1");
+    let after = pending_text(&dir);
+    assert!(after.matches(r#""p":"#).count() <= 4 && after.len() < 64 * 1024, "cut back: {} bytes", after.len());
+    assert!(!after.contains(&state), "the finished sign-in is gone");
     let _ = std::fs::remove_dir_all(&dir);
 }

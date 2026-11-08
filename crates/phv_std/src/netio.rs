@@ -120,20 +120,42 @@ impl Stream {
     /// may carry another request, or the next one would read what was sent
     /// meanwhile as its answer. Checked without waiting.
     pub(crate) fn quiet(&mut self) -> bool {
+        self.idle() == Idle::Quiet
+    }
+
+    /// What an idle connection holds (see `quiet`): nothing, bytes to read,
+    /// or a close (an error counts as one). Checked without waiting.
+    pub(crate) fn idle(&mut self) -> Idle {
         if let Stream::Tls(t) = self {
             match t.conn.process_new_packets() {
-                Ok(state) if state.plaintext_bytes_to_read() == 0 && !state.peer_has_closed() => {}
-                _ => return false,
+                Ok(state) if state.peer_has_closed() => return Idle::Closed,
+                Ok(state) if state.plaintext_bytes_to_read() > 0 => return Idle::Pending,
+                Ok(_) => {}
+                Err(_) => return Idle::Closed,
             }
         }
         let tcp = &self.socket().tcp;
         if tcp.set_nonblocking(true).is_err() {
-            return false;
+            return Idle::Closed;
         }
         let r = tcp.peek(&mut [0u8; 1]);
-        let blocking = tcp.set_nonblocking(false).is_ok();
-        blocking && matches!(r, Err(e) if e.kind() == ErrorKind::WouldBlock)
+        if tcp.set_nonblocking(false).is_err() {
+            return Idle::Closed;
+        }
+        match r {
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Idle::Quiet,
+            Ok(n) if n > 0 => Idle::Pending,
+            Ok(_) | Err(_) => Idle::Closed,
+        }
     }
+}
+
+/// What an idle connection holds, see `Stream::idle`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Idle {
+    Quiet,
+    Pending,
+    Closed,
 }
 
 impl Read for Stream {

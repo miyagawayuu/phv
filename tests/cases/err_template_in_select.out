@@ -1,0 +1,9 @@
+error: the template ends inside an open `<select>`
+ --> views/open_select.phv.html:2:1
+  |
+2 | 
+  | ^
+  = note: close the `<select>`: what follows this output is checked outside one, where older browsers would still read a `<title>` or `<style>` as markup inside it
+  = note: close everything the template opens: its output is `Html`, which can be joined with other `Html` values
+
+1 error found

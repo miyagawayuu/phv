@@ -1,0 +1,13 @@
+<?phv
+// Older browsers ignore a `<title>`, `<style>`, `<xmp>`... written inside a
+// `<select>` and read its text as markup (see err_select_raw_text). A partial
+// rendered there is checked on its own, as its text: here the link would take
+// the unchecked URL. `Html` holding such an element stops the page when it is
+// inserted inside a `<select>` (found by the 1.2.1 audit). Options, and a
+// function writing output there, are fine.
+function opts(): void { echo "<option>c</option>"; }
+$u = "javascript:alert(1)";
+?>
+<select><?= render("views/select_options.phv.html", v: "a") ?><?phv echo render("views/select_options.phv.html", v: "b"); ?><?phv opts(); ?></select>
+<select><?= render("views/select_title.phv.html", u: $u) ?></select>
+not reached

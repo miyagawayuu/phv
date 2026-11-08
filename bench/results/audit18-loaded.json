@@ -1,0 +1,353 @@
+{
+  "commit": "34d8272",
+  "dirty": true,
+  "date": "2026-11-08T04:38:15Z",
+  "machine": {
+    "os": "Microsoft Windows 11 Pro",
+    "cpu": "AMD Ryzen 9 5950X 16-Core Processor",
+    "cores": 32
+  },
+  "binary": "phv.exe",
+  "binary_bytes": 27075072,
+  "runs": 5,
+  "rows": [
+    {
+      "id": "fib",
+      "label": "fib(30) (recursive calls)",
+      "jit_ms": 6.7,
+      "interp_ms": 80.3,
+      "jit_runs_ms": [
+        6.8,
+        6.7,
+        6.9,
+        6.9,
+        6.8
+      ],
+      "interp_runs_ms": [
+        87.9,
+        80.3,
+        89.8,
+        83.3,
+        84.5
+      ]
+    },
+    {
+      "id": "loop",
+      "label": "10 million loop iterations",
+      "jit_ms": 12.2,
+      "interp_ms": 280.9,
+      "jit_runs_ms": [
+        12.2,
+        12.7,
+        12.7,
+        12.5,
+        12.3
+      ],
+      "interp_runs_ms": [
+        284.2,
+        280.9,
+        303.4,
+        288.6,
+        285.1
+      ]
+    },
+    {
+      "id": "append",
+      "label": "Concatenating 1 million characters",
+      "jit_ms": 20.3,
+      "interp_ms": 27.4,
+      "jit_runs_ms": [
+        20.4,
+        20.3,
+        20.3,
+        21.6,
+        20.7
+      ],
+      "interp_runs_ms": [
+        27.4,
+        28.0,
+        27.7,
+        28.6,
+        28.1
+      ]
+    },
+    {
+      "id": "mandelbrot",
+      "label": "Mandelbrot 300x300 (floats)",
+      "jit_ms": 4.2,
+      "interp_ms": 225.1,
+      "jit_runs_ms": [
+        4.2,
+        4.2,
+        4.4,
+        4.3,
+        4.2
+      ],
+      "interp_runs_ms": [
+        226.1,
+        225.1,
+        236.2,
+        227.1,
+        230.7
+      ]
+    },
+    {
+      "id": "concat",
+      "label": "Building 1 million strings from numbers",
+      "jit_ms": 264.4,
+      "interp_ms": 305.0,
+      "jit_runs_ms": [
+        264.4,
+        271.2,
+        268.3,
+        267.0,
+        265.6
+      ],
+      "interp_runs_ms": [
+        305.0,
+        338.1,
+        311.4,
+        323.9,
+        315.9
+      ]
+    },
+    {
+      "id": "map_filter",
+      "label": "map / filter / sum over 1 million elements",
+      "jit_ms": 136.6,
+      "interp_ms": 139.3,
+      "jit_runs_ms": [
+        137.1,
+        139.4,
+        141.0,
+        138.8,
+        136.6
+      ],
+      "interp_runs_ms": [
+        140.8,
+        142.8,
+        139.3,
+        151.1,
+        147.9
+      ]
+    },
+    {
+      "id": "map_updates",
+      "label": "200,000 map updates",
+      "jit_ms": 29.5,
+      "interp_ms": 34.8,
+      "jit_runs_ms": [
+        31.4,
+        30.3,
+        31.3,
+        29.5,
+        29.7
+      ],
+      "interp_runs_ms": [
+        36.3,
+        35.0,
+        34.8,
+        35.1,
+        35.7
+      ]
+    },
+    {
+      "id": "sieve",
+      "label": "Sieve of Eratosthenes up to 1 million (list<bool>)",
+      "jit_ms": 78.7,
+      "interp_ms": 153.1,
+      "jit_runs_ms": [
+        85.4,
+        82.2,
+        78.7,
+        80.9,
+        93.6
+      ],
+      "interp_runs_ms": [
+        154.7,
+        160.6,
+        153.1,
+        153.5,
+        157.2
+      ]
+    },
+    {
+      "id": "list_floats",
+      "label": "Building and summing a list of 1 million floats",
+      "jit_ms": 24.6,
+      "interp_ms": 70.2,
+      "jit_runs_ms": [
+        24.8,
+        25.5,
+        25.9,
+        25.1,
+        24.6
+      ],
+      "interp_runs_ms": [
+        73.7,
+        70.3,
+        70.2,
+        70.5,
+        71.8
+      ]
+    },
+    {
+      "id": "prop_append",
+      "label": "Appending to a property with .= 200,000 times",
+      "jit_ms": 11.1,
+      "interp_ms": 11.0,
+      "jit_runs_ms": [
+        11.1,
+        11.3,
+        11.4,
+        11.1,
+        11.2
+      ],
+      "interp_runs_ms": [
+        11.0,
+        11.5,
+        11.2,
+        11.1,
+        11.3
+      ]
+    },
+    {
+      "id": "string_eq",
+      "label": "1 million string comparisons (==)",
+      "jit_ms": 19.5,
+      "interp_ms": 48.4,
+      "jit_runs_ms": [
+        20.0,
+        20.0,
+        19.9,
+        19.9,
+        19.5
+      ],
+      "interp_runs_ms": [
+        48.6,
+        48.4,
+        48.6,
+        48.7,
+        51.8
+      ]
+    },
+    {
+      "id": "escape",
+      "label": "Escaping 200,000 strings for HTML",
+      "jit_ms": 52.0,
+      "interp_ms": 51.9,
+      "jit_runs_ms": [
+        52.2,
+        53.7,
+        52.0,
+        52.3,
+        52.2
+      ],
+      "interp_runs_ms": [
+        55.2,
+        51.9,
+        53.2,
+        52.6,
+        53.5
+      ]
+    },
+    {
+      "id": "new_objects",
+      "label": "Creating 1 million objects",
+      "jit_ms": 142.3,
+      "interp_ms": 142.8,
+      "jit_runs_ms": [
+        145.8,
+        145.1,
+        143.4,
+        142.3,
+        144.0
+      ],
+      "interp_runs_ms": [
+        145.9,
+        144.1,
+        145.8,
+        142.8,
+        150.7
+      ]
+    },
+    {
+      "id": "throw_catch",
+      "label": "Throwing and catching 100,000 exceptions",
+      "jit_ms": 25.3,
+      "interp_ms": 24.3,
+      "jit_runs_ms": [
+        27.1,
+        25.5,
+        25.3,
+        25.6,
+        25.4
+      ],
+      "interp_runs_ms": [
+        25.7,
+        25.4,
+        25.2,
+        24.3,
+        28.8
+      ]
+    },
+    {
+      "id": "sort_by",
+      "label": "Sorting 200,000 elements with sortBy",
+      "jit_ms": 229.1,
+      "interp_ms": 224.8,
+      "jit_runs_ms": [
+        247.5,
+        230.9,
+        235.7,
+        235.2,
+        229.1
+      ],
+      "interp_runs_ms": [
+        228.0,
+        225.0,
+        227.6,
+        224.8,
+        265.0
+      ]
+    }
+  ],
+  "serve": {
+    "mode": "prod",
+    "connections": 16,
+    "requests_per_connection": 500,
+    "warmup_per_connection": 50,
+    "runs": 5,
+    "pages": {
+      "/": {
+        "requests_per_s": 63956.3,
+        "p50_ms": 0.236,
+        "p99_ms": 0.46
+      },
+      "/archive/2026/11": {
+        "requests_per_s": 66755.6,
+        "p50_ms": 0.224,
+        "p99_ms": 0.437
+      },
+      "/guestbook": {
+        "requests_per_s": 5439.3,
+        "p50_ms": 2.871,
+        "p99_ms": 4.781
+      }
+    }
+  },
+  "lsp": {
+    "document": "examples/site/public/guestbook.phv",
+    "document_bytes": 1416,
+    "edits": 20,
+    "open_ms": 7.754,
+    "diagnostics_ms": {
+      "median": 164.185,
+      "p99": 170.474
+    },
+    "completion_ms": {
+      "median": 4.241,
+      "p99": 7.708
+    }
+  }
+}

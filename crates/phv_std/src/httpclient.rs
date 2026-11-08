@@ -53,7 +53,8 @@ const KEEP_IDLE_UNSAFE: Duration = Duration::from_secs(1);
 /// looked up to when it was made, as any connection to that host would.
 /// Every request takes one; a kept connection the server has closed meanwhile
 /// is retried once on a new one when the request has no side effects (`GET`,
-/// `HEAD`, `OPTIONS`), or when it was not written whole (see `exchange`).
+/// `HEAD`, `OPTIONS`); a request with side effects is never sent twice (see
+/// `exchange`).
 struct Pool {
     idle: HashMap<(String, u16, bool), Vec<(Stream, Instant)>>,
     count: usize,
@@ -580,38 +581,32 @@ fn exchange(base: &Base, req: &Request, until: Instant, limit: usize) -> Result<
     let safe = matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS");
     if let Some(mut stream) = take(base, if safe { KEEP_IDLE } else { KEEP_IDLE_UNSAFE }) {
         stream.set_deadline(until);
-        // A kept connection may have been closed by the server: the request is
-        // sent again on a new one, but only when no byte of an answer came
-        // (found by the 1.0.0 audit: an answer refused as too large was asked
-        // for again), and a request with side effects only when it was not
-        // written whole (a server that got it whole may have acted on it;
-        // one that got part of it cannot have).
-        let mut progress = Progress::default();
-        match send(&mut stream, base, req, limit, &mut progress) {
+        // A kept connection may have been closed by the server: a request
+        // without side effects is sent again on a new one, but only when no
+        // byte of an answer came (found by the 1.0.0 audit: an answer refused
+        // as too large was asked for again). A request with side effects is
+        // never sent twice: the server may have acted on what reached it, and
+        // a failed write does not say how much did (found by the 1.2.1 audit:
+        // a POST whose write failed after its head and 64 KB of its body had
+        // reached the server was sent whole again on a new connection).
+        let mut received = 0;
+        match send(&mut stream, base, req, limit, &mut received) {
             Ok((resp, keep)) => {
                 if keep {
                     give(base, stream);
                 }
                 return Ok(resp);
             }
-            Err(e) if progress.received > 0 || (!safe && progress.written) => return Err(e),
+            Err(e) if !safe || received > 0 => return Err(e),
             Err(_) => {}
         }
     }
     let mut stream = dial(&base.host, base.port, base.tls, until)?;
-    let (resp, keep) = send(&mut stream, base, req, limit, &mut Progress::default())?;
+    let (resp, keep) = send(&mut stream, base, req, limit, &mut 0)?;
     if keep {
         give(base, stream);
     }
     Ok(resp)
-}
-
-/// How far an exchange on a connection got: whether the whole request was
-/// written, and the bytes of the response that came.
-#[derive(Default)]
-struct Progress {
-    written: bool,
-    received: usize,
 }
 
 /// Counts the bytes read through it.
@@ -629,13 +624,13 @@ impl Read for Counting<'_> {
 }
 
 /// Writes `req` on `stream` and reads the response (see `read_response`),
-/// recording in `progress` how far it got.
+/// counting in `received` the bytes of the response that came.
 fn send(
     stream: &mut Stream,
     base: &Base,
     req: &Request,
     limit: usize,
-    progress: &mut Progress,
+    received: &mut usize,
 ) -> Result<(Response, bool), String> {
     let mut head = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", req.method, req.target, base.authority);
     for (name, value) in &req.headers {
@@ -650,8 +645,7 @@ fn send(
     stream.write_all(head.as_bytes()).map_err(io)?;
     stream.write_all(&req.body).map_err(io)?;
     stream.flush().map_err(io)?;
-    progress.written = true;
-    read_response(&mut Counting { inner: stream, read: &mut progress.received }, req.method == "HEAD", limit)
+    read_response(&mut Counting { inner: stream, read: received }, req.method == "HEAD", limit)
 }
 
 /// `__http_request(name, method, path, query, headers, body)`: sends a request

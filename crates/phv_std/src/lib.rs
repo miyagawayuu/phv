@@ -125,6 +125,12 @@ fn s(v: &Value) -> &str {
 const RAW_TEXT_TAGS: &[&str] =
     &["script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "plaintext"];
 
+/// The raw-text elements whose start tag older browsers ignore inside
+/// `<select>`, reading their text as markup (`IGNORED_IN_SELECT` in the
+/// HTML context tracker, R19-26; not `<script>` and `<textarea>`, which they
+/// read there as everywhere).
+const IGNORED_IN_SELECT: &[&str] = &["title", "style", "xmp", "iframe", "noembed", "noframes", "plaintext"];
+
 /// Whether the tag name `name` is at `at` in `b` (in any ASCII case), ended
 /// as browsers end one: by whitespace, `/`, `>`, or the end of the text
 /// (what follows it in the page may end it).
@@ -151,6 +157,13 @@ fn tag_name_at(b: &[u8], at: usize, name: &str) -> bool {
 /// and there may be no CDATA section, and no end tag of a raw-text element
 /// that the `Html` did not open (one may be open around it, in HTML that this
 /// SVG or MathML holds, such as a `<foreignObject>`).
+///
+/// Inside `<select>` (`select`), older browsers ignore the start tag of a
+/// `<title>`, `<style>`, `<xmp>`, `<iframe>`, `<noembed>`, `<noframes>` or
+/// `<plaintext>` and read its text as markup, where the template was checked
+/// as its text (the check a template gets for its own `<select>`, R19-26;
+/// found by the 1.2.1 audit). Such a start tag anywhere in the `Html` is
+/// refused (in a comment or a `<script>` too: simpler, and rare there).
 fn html_inside(html: &str, place: &str) -> Option<String> {
     let b = html.as_bytes();
     // `watched `: inside `<noscript>`, `<svg>` or `<math>` (see below).
@@ -158,6 +171,17 @@ fn html_inside(html: &str, place: &str) -> Option<String> {
         Some(p) => (true, p),
         None => (false, place),
     };
+    if place == "select" {
+        let tag =
+            html.match_indices('<').find_map(|(i, _)| IGNORED_IN_SELECT.iter().find(|t| tag_name_at(b, i + 1, t)));
+        return tag.map(|t| {
+            format!(
+                "`<{t}>` inside `<select>`: `Html` inserted into a `<select>` holds it, and older browsers ignore it \
+                 there and read its text as markup, where the template that made the `Html` is checked as its text; \
+                 close the `<select>` first, or insert a string (it is escaped) instead"
+            )
+        });
+    }
     // An end tag that ends an element a browser may read around the `Html` as
     // raw text, where the template was checked as a comment or raw text: any
     // template may be written inside a `<noscript>` (raw text with scripting

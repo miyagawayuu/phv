@@ -95,6 +95,9 @@ enum JobsAction {
         /// Move them; without it, only say what would move.
         #[arg(long)]
         yes: bool,
+        /// Only the jobs of this job script (one of jobs/<name>.phv); may be given more than once.
+        #[arg(long = "name", value_name = "NAME")]
+        names: Vec<String>,
         /// The project's directory.
         #[arg(default_value = ".")]
         project: PathBuf,
@@ -616,7 +619,7 @@ fn exec(cmd: Command) -> ExitCode {
             JobsAction::Run { project } => jobs::run(&project, 30.0),
             JobsAction::List { failed, project } => jobs::list(&project, failed),
             JobsAction::Retry { id, project } => jobs::retry(&project, &id),
-            JobsAction::Adopt { yes, project } => jobs::adopt(&project, yes),
+            JobsAction::Adopt { yes, names, project } => jobs::adopt(&project, yes, &names),
         },
         Command::Db { action } => {
             let (a, apply) = match &action {

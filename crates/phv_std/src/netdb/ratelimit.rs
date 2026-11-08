@@ -2,7 +2,7 @@
 
 use super::handle::{kind_of, link_of, out_of_memory, read_budget, remaining, tls_init, Kind, Link};
 use super::pool::{lock, AcquireError, Pooled, REDIS_POOLS};
-use super::query_async::{pooled, PoolUse};
+use super::query_async::{handle_name, pooled, renew, spec_of, PoolUse};
 use super::redis::redis_connect;
 use super::sessions::LuaScript;
 use super::{MAX_WAIT, R};
@@ -200,6 +200,38 @@ pub(crate) fn redis_value(v: Reply) -> Value {
     }
 }
 
+/// The connection of the script's Redis handle `h`, ready for a command.
+/// One on which bytes arrived while the script was not using it (a reply the
+/// server sent late, which the next command would read as its own: found by
+/// the 1.2.1 audit), or that the server closed meanwhile, is out of step;
+/// nothing has been sent on it since, so another connection from the pool
+/// takes its place (the errors of `Redis::connect` when none can be had).
+fn ready<'a>(
+    vm: &mut Vm,
+    h: &Value,
+    c: &'a mut Pooled<RedisConn>,
+    until: Instant,
+) -> Result<&'a mut RedisConn, VmError> {
+    if c.conn().is_some_and(RedisConn::in_step) {
+        return Ok(c.get());
+    }
+    let name = handle_name(vm, h)?;
+    let (spec, url) = spec_of(vm, &name)?;
+    match renew(c, until, |t| redis_connect(&url, &spec, t)) {
+        Ok(()) => Ok(c.get()),
+        Err(AcquireError::Busy) => {
+            vm.check_limits()?;
+            Err(vm.throw(
+                "DatabaseError",
+                format!("all {} connections to database \"{name}\" are in use (raise pool_size?)", spec.pool_size),
+            ))
+        }
+        Err(AcquireError::Connect(e)) => {
+            Err(vm.throw("DatabaseError", format!("cannot connect to database \"{name}\": {e}")))
+        }
+    }
+}
+
 /// `__redis(handle, command, args)`: runs one allowed command.
 pub fn redis_command(vm: &mut Vm, a: &[Value]) -> R {
     let link = link_of(vm, &a[0])?;
@@ -219,7 +251,8 @@ pub fn redis_command(vm: &mut Vm, a: &[Value]) -> R {
     let mut argv: Vec<&[u8]> = vec![name.as_bytes()];
     argv.extend(args.iter().map(|a| s(a).as_bytes()));
     let budget = read_budget(vm);
-    let v = match c.get().command(&argv, until, budget) {
+    let conn = ready(vm, &a[0], c, until)?;
+    let v = match conn.command(&argv, until, budget) {
         Ok(v) => v,
         Err(RedisError::Server(m)) => return Err(vm.throw("DatabaseError", m)),
         Err(RedisError::TooLarge) => {
@@ -232,24 +265,30 @@ pub fn redis_command(vm: &mut Vm, a: &[Value]) -> R {
             return Err(vm.throw("DatabaseError", m));
         }
     };
-    let out = redis_command_value(name, v);
+    let out = redis_command_value(name, v).map_err(|m| vm.throw("DatabaseError", m))?;
     vm.check_memory()?;
     Ok(out)
 }
 
-/// The value of the reply `v` to the command `name`.
-fn redis_command_value(name: &str, v: Reply) -> Value {
+/// The value of the reply `v` to the command `name`; an error for a reply
+/// of a shape the command never has.
+fn redis_command_value(name: &str, v: Reply) -> Result<Value, String> {
     match (name, v) {
-        // RESP2 answers HGETALL with a flat list of fields and values.
+        // RESP2 answers HGETALL with a flat list of fields and values: a
+        // field without a value is not a hash (found by the 1.2.1 audit: it
+        // was dropped).
         ("HGETALL", Reply::Array(items)) => {
+            if items.len() % 2 != 0 {
+                return Err("the server sent an unexpected reply".into());
+            }
             let mut m = IndexMap::with_capacity(items.len() / 2);
             let mut it = items.into_iter().map(redis_value);
             while let (Some(k), Some(v)) = (it.next(), it.next()) {
                 m.insert(Key::Str(Rc::new(k.to_display_string())), v);
             }
-            Value::map(m)
+            Ok(Value::map(m))
         }
-        (_, v) => redis_value(v),
+        (_, v) => Ok(redis_value(v)),
     }
 }
 
@@ -295,7 +334,8 @@ pub fn redis_pipeline(vm: &mut Vm, a: &[Value]) -> R {
     let left = remaining(vm)?;
     let until = Instant::now() + left.unwrap_or(MAX_WAIT);
     let budget = read_budget(vm);
-    let replies = match c.get().pipeline(&argv, until, budget) {
+    let conn = ready(vm, &a[0], c, until)?;
+    let replies = match conn.pipeline(&argv, until, budget) {
         Ok(r) => r,
         Err(RedisError::Server(m)) => return Err(vm.throw("DatabaseError", m)),
         Err(RedisError::TooLarge) => {
@@ -311,7 +351,7 @@ pub fn redis_pipeline(vm: &mut Vm, a: &[Value]) -> R {
     let mut out = Vec::with_capacity(replies.len());
     for (name, reply) in names.into_iter().zip(replies) {
         out.push(match reply {
-            Ok(v) => redis_command_value(name, v),
+            Ok(v) => redis_command_value(name, v).map_err(|m| vm.throw("DatabaseError", m))?,
             // The exception value as `__redis` would throw it, in the reply's place.
             Err(m) => match vm.throw("DatabaseError", m) {
                 VmError::Exception(e) => e.value,
@@ -321,4 +361,26 @@ pub fn redis_pipeline(vm: &mut Vm, a: &[Value]) -> R {
     }
     vm.check_memory()?;
     Ok(Value::list(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `HGETALL` answers fields and values in pairs: a reply with a field
+    /// and no value is not a hash and is refused (found by the 1.2.1 audit:
+    /// the last field was dropped).
+    #[test]
+    fn an_hgetall_reply_with_a_field_without_a_value_is_refused() {
+        let bulk = |s: &str| Reply::Bulk(s.as_bytes().to_vec());
+        let v = redis_command_value("HGETALL", Reply::Array(vec![bulk("name"), bulk("Ann")])).unwrap();
+        assert!(matches!(&v, Value::Map(m) if m.len() == 1));
+        let odd = Reply::Array(vec![bulk("name"), bulk("Ann"), bulk("age")]);
+        assert_eq!(redis_command_value("HGETALL", odd).err().as_deref(), Some("the server sent an unexpected reply"));
+        let empty = redis_command_value("HGETALL", Reply::Array(Vec::new())).unwrap();
+        assert!(matches!(&empty, Value::Map(m) if m.is_empty()));
+        // Other commands keep an array as a list, whatever its length.
+        let list = redis_command_value("LRANGE", Reply::Array(vec![bulk("x")])).unwrap();
+        assert!(matches!(&list, Value::List(l) if l.len() == 1));
+    }
 }

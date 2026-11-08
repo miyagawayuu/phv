@@ -1046,7 +1046,7 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
             let created = std::fs::metadata(dir.path().join(&name)).and_then(|m| m.created()).ok();
             let session = harden(&c)
                 .and_then(|()| script_settings(&c))
-                .and_then(|()| Session::install(&c, Some(cost::Database { id, created })))
+                .and_then(|()| Session::install(&c, Some(cost::Database::new(id, created))))
                 .map_err(|e| db_error(vm, e))?;
             let base = (phv_vm::alloc::thread_allocated() - before).max(0) as usize;
             (c, id, base, session)

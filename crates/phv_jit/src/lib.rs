@@ -1098,14 +1098,14 @@ struct Canonical {
     members: Vec<u32>,
     /// The original indices of the canonical constants, in order.
     consts: Vec<u32>,
-    /// Every byte of `prog` the code depends on (the key under which the
-    /// unit is shared).
+    /// Everything of `prog` the code depends on, serialized so that no other
+    /// canonical program gives the same bytes (the key under which the unit
+    /// is shared; see `unit_key`).
     key: Vec<u8>,
 }
 
 /// The canonical form of function `root` and the functions it reaches.
 fn canonical(prog: &Program, root: u32) -> Canonical {
-    use std::fmt::Write as _;
     let mut members = vec![root];
     let mut local: HashMap<u32, u32> = HashMap::from([(root, 0)]);
     let mut i = 0;
@@ -1125,7 +1125,6 @@ fn canonical(prog: &Program, root: u32) -> Canonical {
     let mut builtins: Vec<String> = Vec::new();
     let mut builtin_local: HashMap<u32, u32> = HashMap::new();
     let mut funcs = Vec::with_capacity(members.len());
-    let mut key = Vec::new();
     for &m in &members {
         let f = &prog.funcs[m as usize];
         let mut code = f.code.clone();
@@ -1151,9 +1150,7 @@ fn canonical(prog: &Program, root: u32) -> Canonical {
                 _ => {}
             }
         }
-        // Derived `Debug` prints every field of an instruction. The name
-        // only serves `PHV_JIT_EXPLAIN`.
-        let _ = writeln!(key_text(&mut key), "{} {} {} {:?} {:?}", f.name, f.num_params, f.num_regs, f.native, code);
+        // The name only serves `PHV_JIT_EXPLAIN`.
         funcs.push(Function {
             native: f.native.clone(),
             name: f.name.clone(),
@@ -1165,32 +1162,125 @@ fn canonical(prog: &Program, root: u32) -> Canonical {
     }
     let const_values: Vec<Const> =
         consts.iter().map(|&c| prog.consts.get(c as usize).cloned().unwrap_or(Const::Null)).collect();
-    for c in &const_values {
-        // Floats by their bits: `Debug` prints every NaN alike.
-        match c {
-            Const::Float(v) => key.extend_from_slice(&v.to_bits().to_le_bytes()),
-            c => {
-                let _ = write!(key_text(&mut key), "{c:?}");
-            }
-        }
-        key.push(b'\n');
-    }
-    let _ = writeln!(key_text(&mut key), "{builtins:?}");
+    let key = unit_key(&funcs, &const_values, &builtins);
     let prog = Program { funcs, consts: const_values, builtin_names: builtins, ..Default::default() };
     Canonical { prog, members, consts, key }
 }
 
-/// Writes text into `key` (which also holds raw bytes).
-fn key_text(key: &mut Vec<u8>) -> KeyText<'_> {
-    KeyText(key)
+// The tags of the unit key (see `unit_key`).
+const KEY_FUNCS: u8 = 0x01;
+const KEY_FUNC: u8 = 0x02;
+const KEY_CONSTS: u8 = 0x03;
+const KEY_BUILTINS: u8 = 0x04;
+const KEY_BUILTIN: u8 = 0x05;
+const KEY_CONST_NULL: u8 = 0x10;
+const KEY_CONST_BOOL: u8 = 0x11;
+const KEY_CONST_INT: u8 = 0x12;
+const KEY_CONST_FLOAT: u8 = 0x13;
+const KEY_CONST_STR: u8 = 0x14;
+const KEY_CONST_EMPTY_LIST: u8 = 0x15;
+const KEY_CONST_EMPTY_MAP: u8 = 0x16;
+const KEY_CONST_EMPTY_SET: u8 = 0x17;
+const KEY_PRIVATE: u8 = 0xFF;
+
+/// The key a unit is shared under: a serialization of the canonical
+/// program that no other canonical program gives. Every component starts
+/// with a tag; a sequence with its count, a byte string with its length
+/// (u32, little-endian), and a number is written fixed-width, so the bytes
+/// of one component never run into the next. The instructions and the
+/// signature are written as postcard (the variant index, then the fields,
+/// each fixed-width or length-prefixed), and a float constant as its bits
+/// (so that no two NaNs are alike, and nothing reads as another constant's
+/// kind). A unit shares code only with a canonical program of the same
+/// functions, the same number of constants of the same kinds and values,
+/// and the same builtin names, in the same order. Should a component not
+/// encode (postcard refusing a value, or a length above `u32::MAX`), the
+/// key gets a number no other key has, and the unit is not shared.
+fn unit_key(funcs: &[Function], consts: &[Const], builtins: &[String]) -> Vec<u8> {
+    let mut key = UnitKey::default();
+    key.seq(KEY_FUNCS, funcs.len());
+    for f in funcs {
+        key.bytes.push(KEY_FUNC);
+        key.text(f.name.as_bytes());
+        key.bytes.extend_from_slice(&f.num_params.to_le_bytes());
+        key.bytes.extend_from_slice(&f.num_regs.to_le_bytes());
+        key.postcard(&f.native);
+        key.postcard(&f.code);
+    }
+    key.seq(KEY_CONSTS, consts.len());
+    for c in consts {
+        match c {
+            Const::Null => key.bytes.push(KEY_CONST_NULL),
+            Const::Bool(b) => key.bytes.extend_from_slice(&[KEY_CONST_BOOL, *b as u8]),
+            Const::Int(v) => {
+                key.bytes.push(KEY_CONST_INT);
+                key.bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            Const::Float(v) => {
+                key.bytes.push(KEY_CONST_FLOAT);
+                key.bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+            Const::Str(s) => {
+                key.bytes.push(KEY_CONST_STR);
+                key.text(s.as_bytes());
+            }
+            Const::EmptyList => key.bytes.push(KEY_CONST_EMPTY_LIST),
+            Const::EmptyMap => key.bytes.push(KEY_CONST_EMPTY_MAP),
+            Const::EmptySet => key.bytes.push(KEY_CONST_EMPTY_SET),
+        }
+    }
+    key.seq(KEY_BUILTINS, builtins.len());
+    for b in builtins {
+        key.bytes.push(KEY_BUILTIN);
+        key.text(b.as_bytes());
+    }
+    if !key.ok {
+        static PRIVATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = PRIVATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        key.bytes.push(KEY_PRIVATE);
+        key.bytes.extend_from_slice(&n.to_le_bytes());
+    }
+    key.bytes
 }
 
-struct KeyText<'a>(&'a mut Vec<u8>);
+struct UnitKey {
+    bytes: Vec<u8>,
+    /// False once a component could not be encoded.
+    ok: bool,
+}
 
-impl std::fmt::Write for KeyText<'_> {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        self.0.extend_from_slice(s.as_bytes());
-        Ok(())
+impl Default for UnitKey {
+    fn default() -> Self {
+        UnitKey { bytes: Vec::new(), ok: true }
+    }
+}
+
+impl UnitKey {
+    /// A tag and the number of items that follow.
+    fn seq(&mut self, tag: u8, n: usize) {
+        self.bytes.push(tag);
+        self.len(n);
+    }
+
+    fn len(&mut self, n: usize) {
+        match u32::try_from(n) {
+            Ok(n) => self.bytes.extend_from_slice(&n.to_le_bytes()),
+            Err(_) => self.ok = false,
+        }
+    }
+
+    /// A length-prefixed byte string.
+    fn text(&mut self, s: &[u8]) {
+        self.len(s.len());
+        self.bytes.extend_from_slice(s);
+    }
+
+    /// A value in postcard, length-prefixed.
+    fn postcard<T: serde::Serialize>(&mut self, v: &T) {
+        match postcard::to_allocvec(v) {
+            Ok(b) => self.text(&b),
+            Err(_) => self.ok = false,
+        }
     }
 }
 
@@ -2614,5 +2704,68 @@ mod tests {
         assert!(!one(f));
         assert!(!one(func(vec![ValKind::Void], ValKind::Void, 1, vec![RetNull])));
         assert!(!one(func(vec![I; 17], I, 17, vec![Ret(0)])));
+    }
+
+    /// Programs whose constants differ never share a unit, whatever the
+    /// constants' bytes spell: the key is a serialization, not text.
+    #[test]
+    fn unit_keys_tell_constants_apart() {
+        let key = |consts: Vec<C>, code: Vec<Instr>| {
+            let prog = Program { funcs: vec![func(vec![], S, 3, code)], consts, ..Default::default() };
+            canonical(&prog, 0).key
+        };
+        let to_str = vec![Instr::Const(1, 0), ToStr(2, 1), Ret(2)];
+        let one = |c: C| key(vec![c], to_str.clone());
+        // A float whose bits spell the text of another constant (before
+        // 1.2.1 the key held a float's raw bytes between the other
+        // constants' texts, and these were the same key).
+        let spells = |text: &[u8; 8]| C::Float(f64::from_bits(u64::from_le_bytes(*text)));
+        assert_ne!(one(spells(b"Int(100)")), one(C::Int(100)));
+        assert_ne!(one(spells(b"Str(\"a\")")), one(C::Str("a".into())));
+        // Floats by their bits: the sign of zero, a byte that is a newline,
+        // the payload of a NaN.
+        assert_ne!(one(C::Float(0.0)), one(C::Float(-0.0)));
+        let nl = f64::from_bits(0x4000_0000_0000_000A);
+        assert!(nl.to_bits().to_le_bytes().contains(&b'\n'));
+        assert_ne!(one(C::Float(2.0)), one(C::Float(nl)));
+        assert_ne!(one(C::Float(f64::NAN)), one(C::Float(f64::from_bits(f64::NAN.to_bits() | 1))));
+        // A newline in a string is not a separator.
+        assert_ne!(one(C::Str("a\n".into())), one(C::Str("a".into())));
+        let two = vec![Instr::Const(1, 0), Instr::Const(2, 1), Concat(1, 1, 2, false), Ret(1)];
+        let pair = |a: &str, b: &str| key(vec![C::Str(a.into()), C::Str(b.into())], two.clone());
+        assert_ne!(pair("a\n", "b"), pair("a", "\nb"));
+        assert_ne!(pair("ab", ""), pair("a", "b"));
+        // Every kind of constant has its own tag.
+        let kinds = [
+            C::Null,
+            C::Bool(false),
+            C::Int(0),
+            C::Float(0.0),
+            C::Str(String::new()),
+            C::EmptyList,
+            C::EmptyMap,
+            C::EmptySet,
+        ];
+        let keys: std::collections::HashSet<Vec<u8>> = kinds.iter().map(|c| one(c.clone())).collect();
+        assert_eq!(keys.len(), kinds.len());
+        // The number of constants: a unit names constants by index.
+        let twice = vec![Instr::Const(1, 0), Instr::Const(2, 0), Concat(1, 1, 2, false), Ret(1)];
+        assert_ne!(pair("a", "a"), key(vec![C::Str("a".into())], twice));
+        // Builtins by their names, each delimited.
+        let call = vec![Instr::Const(1, 0), CallBuiltin { dst: 2, id: 0, args: 1, argc: 1 }, Ret(2)];
+        let with = |names: &[&str]| Program {
+            funcs: vec![func(vec![], I, 3, call.clone())],
+            consts: vec![C::Str("a".into())],
+            builtin_names: names.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        assert_ne!(canonical(&with(&["strlen"]), 0).key, canonical(&with(&["strlen\n"]), 0).key);
+        // The same text numbered differently is the same key.
+        let a = Program {
+            funcs: vec![func(vec![], S, 3, vec![Instr::Const(1, 1), ToStr(2, 1), Ret(2)])],
+            consts: vec![C::Str("z".into()), C::Float(1.0)],
+            ..Default::default()
+        };
+        assert_eq!(canonical(&a, 0).key, one(C::Float(1.0)));
     }
 }

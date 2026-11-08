@@ -113,6 +113,10 @@ struct Discovery {
     jwks: String,
     /// The token endpoint accepts the secret in the body only (not Basic).
     post_only: bool,
+    /// The provider says it sends `iss` with every authorization response
+    /// (`authorization_response_iss_parameter_supported`, RFC 9207), so one
+    /// without it is not its own.
+    iss_always: bool,
 }
 
 /// Discovery documents by issuer: fetched again after an hour; one that cannot
@@ -172,11 +176,15 @@ fn discovery_of(doc: Result<Value, String>, issuer: &str, tls: Option<bool>) -> 
     };
     let basic = methods.is_empty() || methods.iter().any(|m| m == "client_secret_basic");
     let post = methods.iter().any(|m| m == "client_secret_post");
+    // RFC 9207 3: a boolean; left out, it is false.
+    let iss_always =
+        matches!(m.get(&str_key("authorization_response_iss_parameter_supported")), Some(Value::Bool(true)));
     Ok(Discovery {
         authorize: endpoint("authorization_endpoint")?,
         token: endpoint("token_endpoint")?,
         jwks: endpoint("jwks_uri")?,
         post_only: !basic && post,
+        iss_always,
     })
 }
 
@@ -233,12 +241,14 @@ fn discovery(vm: &Vm, name: &str, issuer: &str, tls: Option<bool>) -> Result<Arc
 }
 
 /// The endpoints of a provider: authorization, token, and the JWKS of OpenID
-/// Connect; and whether the secret goes in the body.
+/// Connect; whether the secret goes in the body; and whether every
+/// authorization response of the provider carries `iss` (discovery only).
 struct Endpoints {
     authorize: String,
     token: String,
     jwks: Option<String>,
     secret_in_body: bool,
+    iss_always: bool,
 }
 
 fn endpoints(vm: &Vm, name: &str, spec: &OAuthSpec) -> Result<Endpoints, VmError> {
@@ -250,6 +260,7 @@ fn endpoints(vm: &Vm, name: &str, spec: &OAuthSpec) -> Result<Endpoints, VmError
                 token: d.token.clone(),
                 jwks: Some(d.jwks.clone()),
                 secret_in_body: spec.secret_in_body.unwrap_or(d.post_only),
+                iss_always: d.iss_always,
             })
         }
         None => Ok(Endpoints {
@@ -257,6 +268,7 @@ fn endpoints(vm: &Vm, name: &str, spec: &OAuthSpec) -> Result<Endpoints, VmError
             token: spec.token_url.clone().unwrap_or_default(),
             jwks: None,
             secret_in_body: spec.secret_in_body.unwrap_or(false),
+            iss_always: false,
         }),
     }
 }
@@ -275,12 +287,16 @@ fn now() -> i64 {
     jwt::now() as i64
 }
 
-fn pending(vm: &Vm) -> Vec<Pending> {
-    let Some(text) = vm.http.session.values.get(PENDING_KEY) else { return Vec::new() };
-    let Ok(doc) = crate::web::json_decode(text) else { return Vec::new() };
-    let Value::List(items) = &doc else { return Vec::new() };
+/// The sign-ins started in this session and not yet expired, oldest first.
+/// The value is decoded within the script's limits (the record comes from
+/// the store, which a page did not necessarily write); text that is not a
+/// list of entries is treated as no sign-ins.
+fn pending(vm: &Vm) -> Result<Vec<Pending>, VmError> {
+    let Some(text) = vm.http.session.values.get(PENDING_KEY) else { return Ok(Vec::new()) };
+    let Ok(doc) = crate::web::json_decode_in(vm, text)? else { return Ok(Vec::new()) };
+    let Value::List(items) = &doc else { return Ok(Vec::new()) };
     let now = now();
-    items
+    let list = items
         .iter()
         .filter_map(|v| {
             let Value::Map(m) = v else { return None };
@@ -298,17 +314,11 @@ fn pending(vm: &Vm) -> Vec<Pending> {
         })
         // Saturating: the session value is only text, and an odd one must not stop the script.
         .filter(|p| (0..PENDING_TTL).contains(&now.saturating_sub(p.started)))
-        .collect()
+        .collect();
+    Ok(list)
 }
 
-fn save_pending(vm: &mut Vm, list: &[Pending]) -> Result<(), VmError> {
-    crate::web::unsent(vm, "the session")?;
-    if list.is_empty() {
-        if vm.http.session.values.shift_remove(PENDING_KEY).is_some() {
-            vm.http.session.changed = true;
-        }
-        return Ok(());
-    }
+fn encode_pending(list: &[Pending]) -> String {
     let mut out = String::from("[");
     for (i, p) in list.iter().enumerate() {
         if i > 0 {
@@ -322,7 +332,34 @@ fn save_pending(vm: &mut Vm, list: &[Pending]) -> Result<(), VmError> {
         ));
     }
     out.push(']');
-    crate::web::session_set(vm, PENDING_KEY, &out).map(|_| ())
+    out
+}
+
+/// Keeps `list` (oldest first) in the session: the newest `PENDING_MAX`
+/// entries that fit in the session's 64 KB beside its other values; the
+/// oldest are dropped first. Returns how many were kept. A page never makes
+/// a list over the caps, but a record written to the store by other means
+/// can hold one, and it must not stop the callback.
+fn save_pending(vm: &mut Vm, list: &[Pending]) -> Result<usize, VmError> {
+    crate::web::unsent(vm, "the session")?;
+    let other: usize =
+        vm.http.session.values.iter().filter(|(k, _)| k.as_str() != PENDING_KEY).map(|(k, v)| k.len() + v.len()).sum();
+    let room = crate::web::MAX_SESSION_BYTES.saturating_sub(other + PENDING_KEY.len());
+    let mut skip = list.len().saturating_sub(PENDING_MAX);
+    let mut out = encode_pending(&list[skip..]);
+    while out.len() > room && skip < list.len() {
+        skip += 1;
+        out = encode_pending(&list[skip..]);
+    }
+    let kept = list.len() - skip;
+    if kept == 0 {
+        if vm.http.session.values.shift_remove(PENDING_KEY).is_some() {
+            vm.http.session.changed = true;
+        }
+        return Ok(0);
+    }
+    crate::web::session_set(vm, PENDING_KEY, &out)?;
+    Ok(kept)
 }
 
 // --- The flow ---------------------------------------------------------------------
@@ -388,10 +425,13 @@ fn begin(vm: &mut Vm, a: &[Value]) -> R {
     let sep = if ep.authorize.contains('?') { '&' } else { '?' };
     let url = format!("{}{sep}{query}", ep.authorize);
     // The newest sign-ins are kept; the oldest is dropped past the limit.
-    let mut list = pending(vm);
+    let mut list = pending(vm)?;
     list.push(p);
-    let skip = list.len().saturating_sub(PENDING_MAX);
-    save_pending(vm, &list[skip..])?;
+    if save_pending(vm, &list)? == 0 {
+        // Not even the new one fits: the script filled the session (a mistake it should hear of).
+        let msg = "the sign-in cannot be kept in the session: its other values fill the 64 KB";
+        return Err(vm.throw("ValueError", msg));
+    }
     Ok(Value::str(url))
 }
 
@@ -411,10 +451,14 @@ fn finish(vm: &mut Vm, a: &[Value]) -> R {
         return Ok(error_map("invalid_request", "the provider sent no state"));
     };
     // The sign-in must have been started by this session for this provider; it is used once.
-    let mut list = pending(vm);
+    let mut list = pending(vm)?;
     let found =
         list.iter().position(|p| p.provider == name && crate::constant_time_eq(p.state.as_bytes(), state.as_bytes()));
     let Some(i) = found else {
+        // A list longer than a page makes (a record written by other means) is cut back.
+        if list.len() > PENDING_MAX {
+            save_pending(vm, &list)?;
+        }
         return Ok(error_map(
             "invalid_state",
             "this sign-in was not started in this browser session, was already finished, or took more than 10 minutes",
@@ -422,12 +466,20 @@ fn finish(vm: &mut Vm, a: &[Value]) -> R {
     };
     let p = list.remove(i);
     save_pending(vm, &list)?;
+    let ep = endpoints(vm, &name, &spec)?;
     // RFC 9207: an `iss` in the answer names the provider that sent it, an
-    // error answer too (so another provider's error is not shown as this one's).
-    if let (Some(iss), Some(issuer)) = (query(vm, "iss"), &spec.issuer) {
-        if &iss != issuer {
+    // error answer too (so another provider's error is not shown as this
+    // one's); and a provider whose discovery document says it always sends
+    // `iss` must (2.4): an answer without it may be another provider's.
+    match (query(vm, "iss"), &spec.issuer) {
+        (Some(iss), Some(issuer)) if &iss != issuer => {
             return Ok(error_map("invalid_issuer", "the answer came from another provider"));
         }
+        (None, Some(_)) if ep.iss_always => {
+            let msg = "the answer does not name the provider (iss), which this provider always does";
+            return Ok(error_map("invalid_issuer", msg));
+        }
+        _ => {}
     }
     if let Some(code) = query(vm, "error") {
         let desc = query(vm, "error_description").map(|d| clean(&d, 256)).unwrap_or_default();
@@ -438,7 +490,6 @@ fn finish(vm: &mut Vm, a: &[Value]) -> R {
     let Some(code) = query(vm, "code") else {
         return Ok(error_map("invalid_request", "the provider sent no code"));
     };
-    let ep = endpoints(vm, &name, &spec)?;
 
     // The code, exchanged for tokens.
     let mut fields: Vec<(&str, &str)> = vec![
@@ -660,6 +711,28 @@ mod tests {
         // A provider on this machine (tests, development) keeps its endpoints here.
         let local = "http://127.0.0.1:8080";
         assert!(parse(local, &doc(local, "http://127.0.0.1:8081/token"), None).is_ok());
+    }
+
+    /// `authorization_response_iss_parameter_supported` is kept (RFC 9207 3:
+    /// a boolean, false when left out); `finish()` then requires `iss`.
+    #[test]
+    fn discovery_keeps_whether_iss_is_always_sent() {
+        let doc = |flag: &str| {
+            format!(
+                r#"{{"issuer":"https://id.example","authorization_endpoint":"https://id.example/auth","token_endpoint":"https://id.example/token","jwks_uri":"https://id.example/jwks"{flag}}}"#
+            )
+        };
+        let parse = |doc: &str| {
+            parse_discovery(None, "https://id.example", None, doc.as_bytes()).unwrap_or_else(|_| panic!("no limits"))
+        };
+        assert!(parse(&doc(r#","authorization_response_iss_parameter_supported":true"#)).unwrap().iss_always);
+        for flag in [
+            "",
+            r#","authorization_response_iss_parameter_supported":false"#,
+            r#","authorization_response_iss_parameter_supported":"true""#,
+        ] {
+            assert!(!parse(&doc(flag)).unwrap().iss_always, "{flag:?}");
+        }
     }
 
     #[test]

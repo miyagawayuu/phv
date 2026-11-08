@@ -61,9 +61,9 @@ export final class JwtKey extends Verifier {
      * `EC PRIVATE KEY`) or a public one (`PUBLIC KEY`). RSA keys of 2048 to 4096
      * bits sign (up to 8192 verify), P-256 and Ed25519 keys both. Throws
      * ValueError for other keys, and for a public key that could never verify
-     * a token (an RSA public exponent that is even, below 3 or above 2^33 - 1;
-     * a point off the curve; an Ed25519 point of small order). Keep private
-     * keys in an environment variable.
+     * a token (an RSA modulus that is even, or a public exponent that is even,
+     * below 3 or above 2^33 - 1; a point off the curve; an Ed25519 point of
+     * small order). Keep private keys in an environment variable.
      */
     public static function fromPem(string $pem, ?string $kid = null): JwtKey {
         return JwtKey::wrap(__jwt_pem($pem, $kid));

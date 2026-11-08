@@ -1,0 +1,13 @@
+import std.net.HttpClient;
+
+// A POST on a kept connection that the server resets after reading part of
+// its body is not sent again: the server may have acted on what it got.
+$api = HttpClient::connect("api");
+echo $api->get("/warm")->body, "\n";
+try {
+    $api->post("/drop", str_repeat("x", 16777216));
+    echo "answered\n";
+} catch (NetworkError $e) {
+    echo "NetworkError\n";
+}
+echo $api->get("/after")->body, "\n";

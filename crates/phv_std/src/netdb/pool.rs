@@ -13,8 +13,10 @@ pub(super) trait Driver: Send + Sized + 'static {
     fn reset(&mut self) -> bool;
     /// Whether a connection that sat idle still works.
     fn check(&mut self) -> bool;
-    /// Whether the connection is known to be closed (checked without a round trip).
-    fn closed(&self) -> bool {
+    /// Whether the connection is known to be unusable, checked without a
+    /// round trip: closed, or with bytes waiting that no command asked for
+    /// (the next command would read them as its reply).
+    fn closed(&mut self) -> bool {
         false
     }
 }
@@ -107,6 +109,30 @@ pub(super) struct Pooled<C: Driver> {
 impl<C: Driver> Pooled<C> {
     pub(super) fn get(&mut self) -> &mut C {
         self.conn.as_mut().expect("pooled connection")
+    }
+
+    /// The connection, unless a `renew` failed to replace it.
+    pub(super) fn conn(&mut self) -> Option<&mut C> {
+        self.conn.as_mut()
+    }
+
+    /// Closes the connection and takes another from the pool (a new one when
+    /// none is idle), waiting until `until` for one: for a connection found
+    /// unusable (`Driver::closed`) before anything was sent on it. When that
+    /// fails, none is held (`conn` is `None`) until a later call succeeds.
+    pub(super) fn renew(
+        &mut self,
+        until: Instant,
+        connect: impl FnOnce() -> Result<C, String>,
+    ) -> Result<(), AcquireError> {
+        if let Some(c) = self.conn.take() {
+            drop(c);
+            self.pool.discard();
+        }
+        self.broken = false;
+        let mut fresh = self.pool.acquire(until, connect)?;
+        self.conn = fresh.conn.take();
+        Ok(())
     }
 }
 

@@ -1,0 +1,6 @@
+<select><option value="a">a</option>
+<option value="b">b</option>
+<option>c</option></select>
+<select>
+--- runtime error ---
+Fatal error: `<title>` inside `<select>`: `Html` inserted into a `<select>` holds it, and older browsers ignore it there and read its text as markup, where the template that made the `Html` is checked as its text; close the `<select>` first, or insert a string (it is escaped) instead

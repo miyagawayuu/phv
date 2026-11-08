@@ -1666,6 +1666,9 @@ impl HtmlTracker {
             // content, where this tracker read it (in its own template or
             // function) as HTML (found by the 1.1.1 audit).
             State::Text if self.in_foreign() => EchoContext::ForeignText,
+            // Inside `<select>`, older browsers ignore raw-text elements that
+            // inserted `Html` may hold (R19-26; found by the 1.2.1 audit).
+            State::Text if self.select => EchoContext::SelectText,
             State::Text => EchoContext::Text,
             State::Raw { flags, js, .. } if flags & SCRIPT != 0 => {
                 if js.in_code() {
@@ -1817,11 +1820,23 @@ impl HtmlTracker {
     }
 
     /// True between elements of an HTML document: not inside a tag, comment,
-    /// raw-text element or foreign content. A template must end here, so that
-    /// joining its output with other `Html` values cannot move them into
-    /// another context.
+    /// raw-text element, foreign content or `<select>`. A template must end
+    /// here, so that joining its output with other `Html` values cannot move
+    /// them into another context (inside a `<select>`, older browsers read a
+    /// `<title>` or `<style>` that follows as markup; found by the 1.2.1
+    /// audit).
     pub fn at_top_level(&self) -> bool {
+        self.between_elements() && !self.select
+    }
+
+    /// `at_top_level` but for an open `<select>`.
+    fn between_elements(&self) -> bool {
         self.state == State::Text && self.pending.is_none() && !self.in_foreign() && self.carry.is_empty()
+    }
+
+    /// Only a `<select>` keeps the output from the top level (for the message).
+    pub fn only_select_open(&self) -> bool {
+        self.select && self.between_elements()
     }
 
     /// Inside SVG or MathML (see `open`).
@@ -1959,6 +1974,12 @@ impl HtmlTracker {
             self.found.push((self.here, InlineCode::MetaHttpEquiv));
         }
         // 2. The open elements of foreign content (`START_RULES`, `END_RULES`).
+        //    A self-closing start tag read as foreign content (not in an
+        //    integration point) opens nothing (WHATWG 13.2.6.5): `<svg><script/>`
+        //    opens no script text either (found by the 1.2.1 audit).
+        let foreign_self_closed = !closing
+            && self_closing
+            && matches!(self.open.last().map_or(Top::None, Open::top), Top::Foreign | Top::AnnotationXml);
         if closing {
             self.open_end(&tag);
         } else {
@@ -1980,9 +2001,10 @@ impl HtmlTracker {
             self.found.push((self.here, InlineCode::RawTextInSelect(tag.clone())));
         }
         // 5. A raw-text element's start tag opens its text (`RAW` in HTML content,
-        //    `RAW_IN_FOREIGN` inside SVG or MathML); anything else returns to text.
+        //    `RAW_IN_FOREIGN` inside SVG or MathML, unless self-closed there);
+        //    anything else returns to text.
         let flags = flags(&tag);
-        let raw = flags & if self.in_foreign() { RAW_IN_FOREIGN } else { RAW } != 0;
+        let raw = flags & if self.in_foreign() { RAW_IN_FOREIGN } else { RAW } != 0 && !foreign_self_closed;
         self.state =
             if !closing && raw { State::Raw { tag, flags, escape: 0, js: Js::default() } } else { State::Text };
     }
@@ -3253,6 +3275,78 @@ mod tests {
             .iter()
             .all(|d| !d.is_error()));
     }
+
+    /// Found by the 1.2.1 audit: `Html` written inside a `<select>` (a partial
+    /// rendered there) was not checked for the elements above, and a partial
+    /// could end inside a `<select>` it opened. Inside one, values land in
+    /// `SelectText` (checked at run time), and a template may not end there.
+    #[test]
+    fn select_is_a_context_and_not_the_top_level() {
+        assert_eq!(ctx("<select>"), EchoContext::SelectText);
+        assert_eq!(ctx("<select><option>a</option>"), EchoContext::SelectText);
+        assert_eq!(ctx("<select><optgroup label=\"g\">"), EchoContext::SelectText);
+        assert_eq!(ctx("<select></select>"), EchoContext::Text);
+        assert_eq!(ctx("<select><option>a</option></select><p>"), EchoContext::Text);
+        // Inside SVG and in attributes, the stricter contexts stay.
+        assert_eq!(ctx("<select><svg>"), EchoContext::ForeignText);
+        assert_eq!(ctx("<select><option title=\""), EchoContext::Attr);
+        assert_eq!(ctx("<select><textarea>"), EchoContext::RawText("textarea"));
+        for html in ["<select>", "<select><option>a</option>", "<?phv if ($c) { ?><select><?phv } ?>"] {
+            let mut t = HtmlTracker::default();
+            t.feed(html);
+            assert!(!t.at_top_level(), "{html}");
+            assert!(t.only_select_open(), "{html}");
+        }
+        let mut t = HtmlTracker::default();
+        t.feed("<select><option>a</option></select>");
+        assert!(t.at_top_level());
+        t.feed("<select><option title=\"");
+        assert!(!t.at_top_level() && !t.only_select_open(), "not between elements");
+        // A template may not end inside a `<select>`, also one a block may have opened.
+        let parse = |src: &str| crate::parse_module(src, 0, true).1;
+        for src in ["<select><option>a</option>", "<?phv if ($c) { ?><select><?phv } ?><option>o</option>"] {
+            let diags = parse(src);
+            assert!(diags.iter().any(|d| d.is_error() && d.message.contains("inside an open `<select>`")), "{src}");
+        }
+        assert!(parse("<select><option>a</option></select>").iter().all(|d| !d.is_error()));
+        // Values inside a `<select>` are checked (`HtmlEcho`), with or without `<?= ?>`.
+        for src in ["<select><?= $v ?></select>", "<select><?phv echo $v; ?></select>"] {
+            let (module, diags) = crate::parse_module(src, 0, true);
+            assert!(diags.iter().all(|d| !d.is_error()), "{src}");
+            assert!(
+                module
+                    .stmts
+                    .iter()
+                    .any(|s| matches!(&s.kind, crate::ast::StmtKind::HtmlEcho(_, EchoContext::SelectText))),
+                "{src}"
+            );
+            // Functions called there may write output (no guard), as in text.
+            assert!(module.stmts.iter().all(|s| s.out.is_none()), "{src}");
+        }
+    }
+
+    /// Found by the 1.2.1 audit: a self-closed `<script/>` or `<style/>` in
+    /// SVG or MathML opens nothing for browsers (a self-closing foreign start
+    /// tag is popped at once), where the tracker read raw text up to its end
+    /// tag and refused everything after as markup in a script.
+    #[test]
+    fn self_closed_script_in_foreign_content_opens_no_text() {
+        assert_eq!(ctx("<svg><script/><g>"), EchoContext::ForeignText);
+        assert!(!found("<svg><script/><g>").contains(&InlineCode::ForeignCdata));
+        assert_eq!(ctx("<svg><style/><a href=\""), EchoContext::Url);
+        assert_eq!(ctx("<math><script/><mi>"), EchoContext::ForeignText);
+        assert_eq!(ctx("<svg><script /><g>"), EchoContext::ForeignText);
+        // Not self-closed: the script's text, as before.
+        assert_eq!(ctx("<svg><script><g>"), EchoContext::Script);
+        assert!(found("<svg><script><g>").contains(&InlineCode::ForeignCdata));
+        // In an HTML integration point the tag is HTML, whose `/>` browsers
+        // ignore: the script's text begins.
+        assert_eq!(ctx("<svg><foreignObject><script/>var a = "), EchoContext::Script);
+        assert_eq!(ctx("<svg><foreignObject><div><script/>var a = "), EchoContext::Script);
+        assert_eq!(ctx("<math><mi><script/>var a = "), EchoContext::Script);
+        assert_eq!(ctx("<script/>var a = "), EchoContext::Script);
+    }
+
     /// The tables are well formed: a row always matches, the contexts are in
     /// the order of `Ctx`, the element names are unique and lowercase, and
     /// a row that reports something and goes on never ends a table.

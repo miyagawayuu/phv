@@ -519,6 +519,70 @@ fn open_access_log(root: &Path, path: &Path) -> Result<std::fs::File, String> {
     dir.open_append(&name).map_err(describe)
 }
 
+/// Refuses an `[http]` or `[websockets]` service whose URL points at this
+/// server: a page that calls its own server holds a worker while it waits
+/// for one, and with every worker waiting so, nothing is answered for
+/// `QUEUE_WAIT` (found by the 18th audit). A URL points at this server when
+/// its port is the server's and its host is an address the server listens
+/// on (any address of this machine when it listens on every one). A reverse
+/// proxy in front of the server is on another port, so it is not caught.
+fn check_self_calls(config: &Config, addr: SocketAddr) -> Result<(), String> {
+    let host = &config.host;
+    let http = host.http.iter().map(|(n, s)| (format!("[http.{n}]"), s.url.as_deref(), s.url_env.as_deref()));
+    let ws = host.websockets.iter().map(|(n, s)| (format!("[websockets.{n}]"), s.url.as_deref(), s.url_env.as_deref()));
+    for (section, url, url_env) in http.chain(ws) {
+        let Some((name, port)) = url.and_then(url_host_port) else { continue };
+        if port == addr.port() && is_this_server(&name, addr) {
+            // A URL from the environment is not shown (like the other config errors).
+            let from = match url_env {
+                Some(v) => format!("the URL from ${v}"),
+                None => format!("{name}:{port}"),
+            };
+            return Err(format!(
+                "{section}: the service points at this server ({from}); a page cannot call its own server, since it \
+                 holds a worker while it waits for one. Call the code directly, or serve the API from another address"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The host (without brackets) and port of an `http`, `https`, `ws` or `wss`
+/// URL that phv.toml accepted.
+fn url_host_port(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let default = match scheme {
+        "http" | "ws" => 80,
+        "https" | "wss" => 443,
+        _ => return None,
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && (!h.contains(':') || h.ends_with(']')) => (h, p.parse().ok()?),
+        _ => (authority, default),
+    };
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    (!host.is_empty()).then(|| (host.to_string(), port))
+}
+
+/// Whether `host` (a name or an address) reaches the server listening on
+/// `addr`: it resolves to the address the server is bound to, or the server
+/// is bound to every address and it resolves to one of this machine.
+fn is_this_server(host: &str, addr: SocketAddr) -> bool {
+    use std::net::ToSocketAddrs;
+    let Ok(resolved) = (host, addr.port()).to_socket_addrs() else { return false };
+    let listen = addr.ip().to_canonical();
+    resolved
+        .map(|a| a.ip().to_canonical())
+        .any(|ip| ip == listen || (listen.is_unspecified() && (ip.is_loopback() || is_address_of_this_machine(ip))))
+}
+
+/// Whether `ip` is an address of this machine: a socket can be bound to it.
+fn is_address_of_this_machine(ip: std::net::IpAddr) -> bool {
+    std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
 fn serve_with(
     listener: Option<std::net::TcpListener>,
     opts: ServeOptions,
@@ -547,6 +611,9 @@ fn serve_with(
             load_config(&root)?
         }
     };
+    if let Some(addr) = addr {
+        check_self_calls(&config, addr)?;
+    }
     let secrets = server_secrets(&config, |v| std::env::var_os(v))?;
     let admin = match &config.admin {
         None => None,
@@ -3187,6 +3254,29 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A service URL points at this server when its port is the server's and
+    /// its host is an address the server listens on (18th audit, H-3).
+    #[test]
+    fn service_urls_pointing_at_this_server_are_told_apart() {
+        assert_eq!(url_host_port("http://127.0.0.1:8080/api"), Some(("127.0.0.1".into(), 8080)));
+        assert_eq!(url_host_port("https://api.example.com"), Some(("api.example.com".into(), 443)));
+        assert_eq!(url_host_port("ws://[::1]:9000/socket?x=1"), Some(("::1".into(), 9000)));
+        assert_eq!(url_host_port("wss://game.example.com/"), Some(("game.example.com".into(), 443)));
+        assert_eq!(url_host_port("ftp://a/"), None);
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(is_this_server("127.0.0.1", loopback));
+        assert!(is_this_server("localhost", loopback));
+        assert!(!is_this_server("::1", loopback), "another loopback address is another socket");
+        assert!(!is_this_server("192.0.2.1", loopback));
+        let every: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        assert!(is_this_server("127.0.0.1", every));
+        assert!(is_this_server("localhost", every));
+        assert!(!is_this_server("192.0.2.1", every), "a documentation address is not this machine");
+        let lan: SocketAddr = "192.0.2.1:8080".parse().unwrap();
+        assert!(!is_this_server("127.0.0.1", lan), "the loopback does not reach a server bound elsewhere");
+        assert!(is_this_server("192.0.2.1", lan));
+    }
 
     #[test]
     fn routes_stay_inside_public() {

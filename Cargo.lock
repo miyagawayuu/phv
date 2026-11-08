@@ -1634,6 +1634,8 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "phv_vm",
+ "postcard",
+ "serde",
 ]
 
 [[package]]

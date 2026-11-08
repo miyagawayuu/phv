@@ -63,6 +63,8 @@ use jobs::{job_conn, job_sized, jobs_table, now_ms, JOB_SIZE_RETRY, JOB_TABLES, 
 #[cfg(test)]
 use jobs_add::job_add;
 #[cfg(test)]
+use jobs_run::REDIS_ADOPT_CALLS;
+#[cfg(test)]
 use my::{my_connect, my_statements};
 #[cfg(test)]
 use pg::{
@@ -568,6 +570,105 @@ mod tests {
                 session_remove(&spec, old, k).unwrap();
                 session_remove(&spec, None, k).unwrap();
             }
+        }
+    }
+
+    /// A row the site's table refuses for a reason other than its key (a
+    /// CHECK constraint here) stops the adoption with the server's message,
+    /// on MySQL as on PostgreSQL (found by the 18th assessment: `INSERT
+    /// IGNORE` reported every refusal as "a job with its key" and went on),
+    /// and the job stays in the shared store.
+    #[test]
+    fn adopt_reports_a_refused_row_with_the_servers_message() {
+        let _unnamed = crate::testing::unnamed();
+        let ns = crate::testing::namespace(0x33);
+        let ns = Some(ns.as_str());
+        let dst = jobs_table(ns);
+        let cap = JobCap { jobs: 1000, bytes: 1 << 20 };
+        for (var, spec) in test_servers() {
+            if var == "PHV_TEST_REDIS_URL" {
+                continue;
+            }
+            let name = format!("refused_{}", crate::testing::run_id());
+            let id = crate::random_hex(16);
+            assert_eq!(job_add(&spec, None, (&id, &name, "p"), now_ms(), None, cap, None), Ok(Some(())), "{var}");
+            let run = |sql: &str| {
+                let (mut conn, _) = job_conn(&spec, ns).unwrap();
+                match &mut conn {
+                    SessionConn::Pg(c) => c.get().client.batch_execute(sql).unwrap(),
+                    SessionConn::My(c) => {
+                        use mysql::prelude::Queryable;
+                        c.get().conn.query_drop(sql).unwrap()
+                    }
+                    SessionConn::Redis(_) => unreachable!(),
+                }
+            };
+            run(&format!("ALTER TABLE {dst} ADD CONSTRAINT no_refused CHECK (id <> '{id}')"));
+            let err = job_adopt(&spec, ns, std::slice::from_ref(&name), true, cap).unwrap_err();
+            assert!(err.contains("no_refused"), "{var}: {err}");
+            let left = job_list(&spec, None, false).unwrap();
+            assert!(left.iter().any(|j| j.id == id), "{var}: the job left the shared store: {left:?}");
+            assert!(job_list(&spec, ns, false).unwrap().iter().all(|j| j.id != id), "{var}: the job was moved");
+            run(&format!("ALTER TABLE {dst} DROP CONSTRAINT no_refused"));
+            let moved = job_adopt(&spec, ns, &[name], true, cap).unwrap();
+            assert_eq!((moved.len(), moved[0].outcome), (1, Adopted::Moved), "{var}");
+            let j = job_take(&spec, ns, 60_000).unwrap().unwrap();
+            assert_eq!(j.id, id, "{var}");
+            job_end(&spec, ns, &j, JobEnd::Done { keyed: false }).unwrap();
+        }
+    }
+
+    /// The Redis adoption runs its script over a page of ids at a time, so a
+    /// shared store of many jobs is moved in several calls (found by the 18th
+    /// assessment: one call over 100,000 jobs held every client 0.7 s); every
+    /// job of the site's name moves, the others stay, the dry run too.
+    #[test]
+    fn redis_adopt_moves_a_large_shared_store_in_pages() {
+        let Some((var, spec)) = test_servers().into_iter().find(|(v, _)| *v == "PHV_TEST_REDIS_URL") else {
+            return;
+        };
+        let _unnamed = crate::testing::unnamed();
+        let ns = crate::testing::namespace(0x34);
+        let ns = Some(ns.as_str());
+        let cap = JobCap { jobs: 100_000, bytes: 1 << 30 };
+        let run_id = crate::testing::run_id();
+        let (mine, theirs) = (format!("page_{run_id}"), format!("other_{run_id}"));
+        let (n_mine, n_theirs) = (2500, 300);
+        for i in 0..n_mine + n_theirs {
+            let name = if i < n_mine { &mine } else { &theirs };
+            let r = job_add(&spec, None, (&crate::random_hex(16), name, "p"), now_ms(), None, cap, None);
+            assert_eq!(r, Ok(Some(())), "{var}");
+        }
+        let base = job_count_shared(&spec, ns).unwrap();
+        let calls = || REDIS_ADOPT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let before = calls();
+        let dry = job_adopt(&spec, ns, std::slice::from_ref(&mine), false, cap).unwrap();
+        let dry_calls = calls() - before;
+        assert_eq!(dry.len(), n_mine, "{var}");
+        assert!(dry.iter().all(|j| j.outcome == Adopted::Moved && j.name == mine), "{var}");
+        assert!((4..=12).contains(&dry_calls), "{var}: the dry run took {dry_calls} calls");
+        assert_eq!(job_count_shared(&spec, ns).unwrap(), base, "{var}: a dry run moved something");
+        let before = calls();
+        let moved = job_adopt(&spec, ns, std::slice::from_ref(&mine), true, cap).unwrap();
+        let move_calls = calls() - before;
+        assert_eq!(moved.len(), n_mine, "{var}");
+        assert!(moved.iter().all(|j| j.outcome == Adopted::Moved), "{var}");
+        assert!((4..=12).contains(&move_calls), "{var}: the move took {move_calls} calls");
+        assert_eq!(job_count_shared(&spec, ns).unwrap(), base - n_mine as i64, "{var}");
+        // The list shows 1,000 of them at most; taking them all counts them.
+        let own = job_list(&spec, ns, false).unwrap();
+        assert!(own.len() >= 1000 && own.iter().all(|j| j.name == mine && j.state == "waiting"), "{var}");
+        // Nothing more of the name to move; the other name stays.
+        assert!(job_adopt(&spec, ns, &[mine], true, cap).unwrap().is_empty(), "{var}");
+        for (store, n) in [(ns, n_mine), (None, n_theirs)] {
+            let mut ended = 0;
+            while let Some(j) = job_take(&spec, store, 60_000).unwrap() {
+                job_end(&spec, store, &j, JobEnd::Done { keyed: false }).unwrap();
+                if j.name.ends_with(run_id) {
+                    ended += 1;
+                }
+            }
+            assert_eq!(ended, n, "{var}");
         }
     }
 

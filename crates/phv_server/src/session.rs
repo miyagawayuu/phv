@@ -37,6 +37,7 @@ use indexmap::IndexMap;
 use phv_std::safefs;
 use phv_vm::{SessionData, SessionValues};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -347,6 +348,11 @@ impl Drop for DirLock<'_> {
     }
 }
 
+/// How many times a read of a session file is tried while a save holds the
+/// directory lock (two yields, then a millisecond's sleep each: about 40 ms
+/// at most, paid only when a read fails while a save is in progress).
+const READ_RETRIES: usize = 40;
+
 /// Session files are `<64 hex>.json` (`n-<64 hex>.json` while new); temporary
 /// ones `.<that name>.<16 hex>`. The sweep never touches anything else in the directory.
 fn is_session_file(name: &str) -> bool {
@@ -424,13 +430,33 @@ impl FileStore {
     /// Locks the store against changes by other threads and processes.
     fn lock_dir(&self) -> std::io::Result<DirLock<'_>> {
         let mut held = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        Self::open_lock_file(&self.dir, &mut held)?.lock()?;
+        Ok(DirLock(held))
+    }
+
+    /// `lock_dir` without waiting: None when another thread or process holds
+    /// the lock (a save or the sweep is in progress).
+    fn try_lock_dir(&self) -> std::io::Result<Option<DirLock<'_>>> {
+        let mut held = match self.lock.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        };
+        match Self::open_lock_file(&self.dir, &mut held)?.try_lock() {
+            Ok(()) => Ok(Some(DirLock(held))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    /// `.phv-session.lock` in `dir`, opened once.
+    fn open_lock_file<'a>(dir: &Path, held: &'a mut Option<File>) -> std::io::Result<&'a File> {
         if held.is_none() {
             let fail = |e: safefs::FsError| std::io::Error::other(format!("{e:?}"));
-            let (dir, name) = safefs::open_parent(&self.dir, Path::new(".phv-session.lock")).map_err(fail)?;
-            *held = Some(dir.open(&name, true).map_err(fail)?);
+            let (parent, name) = safefs::open_parent(dir, Path::new(".phv-session.lock")).map_err(fail)?;
+            *held = Some(parent.open(&name, true).map_err(fail)?);
         }
-        held.as_ref().expect("opened above").lock()?;
-        Ok(DirLock(held))
+        Ok(held.as_ref().expect("opened above"))
     }
 
     fn exists(&self, id: &str, returned: bool) -> bool {
@@ -464,11 +490,40 @@ impl FileStore {
             .or_else(|| self.read_file(&back).map(|r| (r, true)))
     }
 
+    /// Reads a session file. A save renames a temporary file over it (and a
+    /// visitor's first request back renames `n-<hash>.json`): a reader that
+    /// opens the file meanwhile can get the old one (on Windows already moved
+    /// away for deletion, so its real name no longer matches, or still
+    /// pending deletion), find the name absent for a moment, or land in the
+    /// rename itself; under load (Windows Defender scans each new file) the
+    /// moment stretches to milliseconds. So a read that fails is not trusted
+    /// while a save may be in progress: every save holds the directory lock,
+    /// so the read is tried again while the lock is held by someone, and once
+    /// nobody holds it, read once more under the lock; that result is final
+    /// (found by the 1.2.1 audit). A cookie of a session that is gone costs
+    /// one failed open, a lock taken without waiting and one more failed
+    /// open; reads that succeed never touch the lock (they would otherwise
+    /// wait behind every save and the sweep).
     fn read_file(&self, name: &str) -> Option<Record> {
         let (dir, name) = safefs::open_parent(&self.dir, Path::new(name)).ok()?;
+        for attempt in 0..READ_RETRIES {
+            if let Ok(text) = Self::read_text(&dir, &name) {
+                return Record::from_json(&text);
+            }
+            match self.try_lock_dir() {
+                Ok(Some(_held)) => return Self::read_text(&dir, &name).ok().and_then(|t| Record::from_json(&t)),
+                Ok(None) if attempt < 2 => std::thread::yield_now(),
+                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    fn read_text(dir: &safefs::DirGuard, name: &OsStr) -> Result<String, safefs::FsError> {
         let mut text = String::new();
-        dir.open(&name, false).ok()?.take(1 << 20).read_to_string(&mut text).ok()?;
-        Record::from_json(&text)
+        dir.open(name, false)?.take(1 << 20).read_to_string(&mut text)?;
+        Ok(text)
     }
 
     /// Writes the file atomically: a temporary file renamed over the old one.
@@ -640,7 +695,15 @@ impl Store {
             let Some(id) = id else { return SessionData::default() };
             let Some((mut r, mut returned)) = files.read(&id) else { return SessionData::default() };
             let now = now_secs();
-            if now >= r.last.saturating_add(self.ttl.as_secs())
+            // A record whose times lie more than a day ahead of the clock is
+            // damaged (something else wrote the store): refused and removed,
+            // since nothing would ever expire it and the arithmetic below
+            // must not overflow (found by the 1.2.1 audit). Less than a day
+            // ahead (a clock set back) is accepted.
+            let ahead = now.saturating_add(MAX_LIFETIME.as_secs());
+            if r.last > ahead
+                || r.created > ahead
+                || now >= r.last.saturating_add(self.ttl.as_secs())
                 || now >= r.created.saturating_add(MAX_LIFETIME.as_secs())
             {
                 files.remove(&id);
@@ -652,7 +715,7 @@ impl Store {
             }
             // Refresh the expiry, at most once a minute per session (never
             // bringing back one that a logout removed meanwhile).
-            if now >= r.last + 60 {
+            if now >= r.last.saturating_add(60) {
                 r.last = now;
                 if let Ok(false) = files.update(&id, &r, returned) {
                     return SessionData::default();
@@ -866,6 +929,254 @@ mod tests {
                 let _ = std::fs::remove_dir_all(d);
             }
         }
+    }
+
+    /// Requests of one visitor that read the session while others save it
+    /// (the save renames a temporary file over the session file; on Windows
+    /// the file a reader opened meanwhile is already the old one, moved away
+    /// for deletion, or the name is absent for a moment) always see the live
+    /// session, never none: the visitor is not signed out by a parallel
+    /// request (found by the 1.2.1 audit). 8 writers saving 600 times each
+    /// and 16 readers; it must hold on a loaded machine too.
+    #[test]
+    fn a_read_during_another_requests_save_sees_the_session() {
+        use std::sync::atomic::AtomicBool;
+        let dir = std::env::temp_dir().join(format!("phv-sess-readrace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(Duration::from_secs(600), false, Some(dir.clone()));
+        let mut s = SessionData::default();
+        s.values.insert("user".into(), "alice".into());
+        s.changed = true;
+        let header = format!("PHVSESSID={}", id_of(&store.save(s).unwrap()));
+        // The cookie comes back once: the file is renamed to `<hash>.json`.
+        assert!(store.load(Some(&header)).id.is_some());
+        let writing = AtomicBool::new(true);
+        let (saves_lost, reads, empty) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+        std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..8)
+                .map(|w| {
+                    let (store, header, saves_lost) = (&store, &header, &saves_lost);
+                    scope.spawn(move || {
+                        for i in 0..600 {
+                            let mut s = store.load(Some(header));
+                            if s.id.is_none() {
+                                saves_lost.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            s.values.insert("seen".into(), format!("{w}-{i}"));
+                            s.changed = true;
+                            // The same id: no cookie.
+                            assert!(store.save(s).is_none(), "writer {w} save {i}");
+                        }
+                    })
+                })
+                .collect();
+            for _ in 0..16 {
+                let (store, header, writing, reads, empty) = (&store, &header, &writing, &reads, &empty);
+                scope.spawn(move || {
+                    let mut n = 0;
+                    while n < 600 || writing.load(Ordering::Relaxed) {
+                        let s = store.load(Some(header));
+                        n += 1;
+                        reads.fetch_add(1, Ordering::Relaxed);
+                        if s.id.is_none() {
+                            empty.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            assert_eq!(s.values.get("user").map(String::as_str), Some("alice"));
+                        }
+                    }
+                });
+            }
+            for w in writers {
+                w.join().unwrap();
+            }
+            writing.store(false, Ordering::Relaxed);
+        });
+        let (reads, empty, saves_lost) =
+            (reads.load(Ordering::Relaxed), empty.load(Ordering::Relaxed), saves_lost.load(Ordering::Relaxed));
+        assert!(reads >= 9600, "{reads} reads");
+        assert_eq!(empty, 0, "{empty} of {reads} reads saw no session");
+        assert_eq!(saves_lost, 0, "{saves_lost} saves found no session");
+        let s = store.load(Some(&header));
+        assert!(s.values.get("seen").is_some_and(|v| v.ends_with("-599")), "{:?}", s.values.get("seen"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Writes raw bytes under a key in the Redis server of `url`
+    /// (`redis://[[user]:password@]host[:port][/db]`), as damage would, with
+    /// an expiry of a minute; or reads them back (`value` None).
+    fn redis_raw(url: &str, key: &[u8], value: Option<&[u8]>) -> Option<Vec<u8>> {
+        use std::io::BufRead;
+        let rest = url.split_once("://").map_or(url, |(_, r)| r);
+        let (auth, rest) = match rest.rsplit_once('@') {
+            Some((a, r)) => (Some(a), r),
+            None => (None, rest),
+        };
+        let (addr, db) = rest.split_once('/').unwrap_or((rest, "0"));
+        let addr = if addr.contains(':') { addr.to_string() } else { format!("{addr}:6379") };
+        let mut conn = std::net::TcpStream::connect(&addr).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut commands: Vec<Vec<&[u8]>> = Vec::new();
+        if let Some(auth) = auth {
+            let (user, pass) = auth.split_once(':').unwrap_or(("", auth));
+            commands.push(if user.is_empty() {
+                vec![b"AUTH", pass.as_bytes()]
+            } else {
+                vec![b"AUTH", user.as_bytes(), pass.as_bytes()]
+            });
+        }
+        commands.push(vec![b"SELECT", db.as_bytes()]);
+        match value {
+            Some(v) => commands.push(vec![b"SET", key, v, b"PX", b"60000"]),
+            None => commands.push(vec![b"GET", key]),
+        }
+        let mut out = Vec::new();
+        for c in &commands {
+            out.extend_from_slice(format!("*{}\r\n", c.len()).as_bytes());
+            for a in c {
+                out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                out.extend_from_slice(a);
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        conn.write_all(&out).unwrap();
+        let mut r = std::io::BufReader::new(conn);
+        let mut result = None;
+        for (i, _) in commands.iter().enumerate() {
+            let mut line = Vec::new();
+            r.read_until(b'\n', &mut line).unwrap();
+            let last = i + 1 == commands.len();
+            match line.first() {
+                Some(b'+') => {}
+                Some(b'$') => {
+                    let n: i64 = std::str::from_utf8(&line[1..]).unwrap().trim().parse().unwrap();
+                    if n >= 0 {
+                        let mut buf = vec![0u8; n as usize + 2];
+                        r.read_exact(&mut buf).unwrap();
+                        buf.truncate(n as usize);
+                        if last {
+                            result = Some(buf);
+                        }
+                    }
+                }
+                _ => panic!("redis answered {}", String::from_utf8_lossy(&line)),
+            }
+        }
+        result
+    }
+
+    /// A record whose `created` or `last` lies more than a day ahead of the
+    /// clock is damaged: refused and removed in every store, instead of
+    /// overflowing the refresh arithmetic (a task panic, 500 on every request
+    /// of the visitor, the record never removed; found by the 1.2.1 audit). A
+    /// time less than a day ahead (a clock set back) is still accepted.
+    #[test]
+    fn a_record_with_times_in_the_future_is_damaged() {
+        let dir = std::env::temp_dir().join(format!("phv-sess-future-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(Duration::from_secs(600), false, Some(dir.clone()));
+        let now = now_secs();
+        let day = MAX_LIFETIME.as_secs();
+        let file = |id: &str, created: u64, last: u64| {
+            let path = dir.join(FileStore::name(id, true));
+            std::fs::write(&path, format!("{{\"created\":{created},\"last\":{last},\"values\":{{\"a\":\"1\"}}}}"))
+                .unwrap();
+            path
+        };
+        for (created, last) in [(now, u64::MAX), (now, now + day + 60), (u64::MAX, now), (now + day + 60, now)] {
+            let id = phv_std::random_hex(32);
+            let path = file(&id, created, last);
+            let s = store.load(Some(&format!("PHVSESSID={id}")));
+            assert!(s.id.is_none() && s.values.is_empty(), "{created} {last}");
+            assert!(!path.exists(), "{created} {last}: the damaged record was kept");
+            // What the page sets starts a new session.
+            let mut s = store.load(Some(&format!("PHVSESSID={id}")));
+            s.values.insert("x".into(), "1".into());
+            s.changed = true;
+            assert_ne!(id_of(&store.save(s).unwrap()), id);
+        }
+        for (created, last) in [(now, now + 3600), (now - 60, now + day - 60)] {
+            let id = phv_std::random_hex(32);
+            file(&id, created, last);
+            let s = store.load(Some(&format!("PHVSESSID={id}")));
+            assert_eq!(s.values.get("a").map(String::as_str), Some("1"), "{created} {last}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let _one_at_a_time = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        for var in ["PHV_TEST_REDIS_URL", "PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
+            let Some(url) = std::env::var(var).ok().filter(|u| !u.is_empty()) else {
+                eprintln!("skipped: {var} is not set");
+                continue;
+            };
+            let spec = phv_vm::DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 2 };
+            let ns = phv_std::testing::namespace(0x47);
+            let store =
+                Store::with_database(Duration::from_secs(600), false, spec.clone(), Arc::default(), Some(ns.clone()));
+            let limits = phv_std::SessionLimits {
+                ttl: Duration::from_secs(600),
+                max_lifetime: MAX_LIFETIME,
+                max_sessions: MAX_SESSIONS,
+                max_bytes: MAX_BYTES,
+            };
+            // PostgreSQL and MySQL keep the times as signed 64-bit integers:
+            // u64::MAX comes back as 0 there (an expired record, also removed).
+            for (created, last) in [(now, u64::MAX), (now, now + day + 60), (now + day + 60, now)] {
+                let id = phv_std::random_hex(32);
+                let key = shared_session_key(Some(&ns), &id);
+                let row = phv_std::SessionRow { data: r#"{"a":"1"}"#.into(), created, last, returned: true };
+                assert!(phv_std::session_insert(&spec, Some(&ns), &key, &row, &limits).unwrap(), "{var}");
+                let s = store.load(Some(&format!("PHVSESSID={id}")));
+                assert!(s.id.is_none() && s.values.is_empty(), "{var}: {created} {last}");
+                assert!(
+                    phv_std::session_read(&spec, Some(&ns), &key).unwrap().is_none(),
+                    "{var}: {created} {last}: the damaged record was kept"
+                );
+            }
+            let id = phv_std::random_hex(32);
+            let key = shared_session_key(Some(&ns), &id);
+            let row =
+                phv_std::SessionRow { data: r#"{"a":"1"}"#.into(), created: now, last: now + 3600, returned: true };
+            assert!(phv_std::session_insert(&spec, Some(&ns), &key, &row, &limits).unwrap(), "{var}");
+            let mut s = store.load(Some(&format!("PHVSESSID={id}")));
+            assert_eq!(s.values.get("a").map(String::as_str), Some("1"), "{var}");
+            s.destroyed = true;
+            store.save(s);
+        }
+    }
+
+    /// The Redis store refuses a record that is not UTF-8, as the file store
+    /// does, instead of reading it with replacement characters (found by the
+    /// 1.2.1 audit). Skipped without `PHV_TEST_REDIS_URL`.
+    #[test]
+    fn a_redis_record_that_is_not_utf8_is_refused() {
+        let Some(url) = std::env::var("PHV_TEST_REDIS_URL").ok().filter(|u| !u.is_empty()) else {
+            eprintln!("skipped: PHV_TEST_REDIS_URL is not set");
+            return;
+        };
+        let _one_at_a_time = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let spec = phv_vm::DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 2 };
+        let ns = phv_std::testing::namespace(0x48);
+        let store =
+            Store::with_database(Duration::from_secs(600), false, spec.clone(), Arc::default(), Some(ns.clone()));
+        let now = now_secs();
+        let id = phv_std::random_hex(32);
+        let key = format!("phv:session:{}", shared_session_key(Some(&ns), &id));
+        let mut raw = format!("{now} {now} 1\n{{\"a\":\"").into_bytes();
+        raw.extend_from_slice(b"\xff\xfe\"}");
+        redis_raw(&url, key.as_bytes(), Some(&raw));
+        let s = store.load(Some(&format!("PHVSESSID={id}")));
+        assert!(s.id.is_none() && s.values.is_empty(), "a record that is not UTF-8 was read");
+        assert_eq!(redis_raw(&url, key.as_bytes(), None).as_deref(), Some(&raw[..]), "the record was touched");
+        // The same bytes in the header.
+        let mut raw = format!("{now} ").into_bytes();
+        raw.extend_from_slice(b"\xff 1\n{}");
+        redis_raw(&url, key.as_bytes(), Some(&raw));
+        assert!(store.load(Some(&format!("PHVSESSID={id}"))).id.is_none());
+        // A record that is UTF-8 is read as before.
+        redis_raw(&url, key.as_bytes(), Some(format!("{now} {now} 1\n{{\"a\":\"\u{3042}\"}}").as_bytes()));
+        assert_eq!(store.load(Some(&format!("PHVSESSID={id}"))).values.get("a").map(String::as_str), Some("\u{3042}"));
+        redis_raw(&url, key.as_bytes(), Some(b"0 0 0\n{}"));
     }
 
     /// Two server processes share a session directory (two stores here):

@@ -178,7 +178,7 @@ pub fn start_redis(vm: &mut Vm, a: &[Value]) -> R {
 }
 
 /// The `[databases]` name of the connection behind handle `h`.
-fn handle_name(vm: &Vm, h: &Value) -> Result<String, VmError> {
+pub(super) fn handle_name(vm: &Vm, h: &Value) -> Result<String, VmError> {
     vm.resources
         .get(int(h) as usize)
         .and_then(|r| r.as_ref())
@@ -187,7 +187,7 @@ fn handle_name(vm: &Vm, h: &Value) -> Result<String, VmError> {
         .ok_or_else(|| vm.throw("DatabaseError", "the database connection is closed"))
 }
 
-fn spec_of(vm: &Vm, name: &str) -> Result<(DatabaseSpec, String), VmError> {
+pub(super) fn spec_of(vm: &Vm, name: &str) -> Result<(DatabaseSpec, String), VmError> {
     let spec = vm.host.databases.get(name).cloned();
     let Some(spec) = spec else { return Err(vm.throw("DatabaseError", format!("no database named \"{name}\""))) };
     let Some(url) = spec.url.clone() else {
@@ -264,6 +264,18 @@ pub(super) fn pooled<C: Driver>(
     let (key, size) = pool_key(spec, url, use_);
     let timeout = until.saturating_duration_since(Instant::now()).clamp(Duration::from_millis(100), CONNECT_TIMEOUT);
     pool_for(registry, &key, size).acquire(until, || connect(timeout))
+}
+
+/// Replaces the connection of `c`, found unusable before anything was sent
+/// on it (`Driver::closed`), with another from its pool, waiting until
+/// `until` for one; a new connection gets the time left, as in `pooled`.
+pub(super) fn renew<C: Driver>(
+    c: &mut Pooled<C>,
+    until: Instant,
+    connect: impl FnOnce(Duration) -> Result<C, String>,
+) -> Result<(), AcquireError> {
+    let timeout = until.saturating_duration_since(Instant::now()).clamp(Duration::from_millis(100), CONNECT_TIMEOUT);
+    c.renew(until, || connect(timeout))
 }
 
 /// `pooled`, for work outside a script (background statements, sessions).

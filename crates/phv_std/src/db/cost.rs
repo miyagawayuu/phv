@@ -472,11 +472,28 @@ pub(super) fn analyzed() -> u64 {
 /// The database file a connection has open, as the key of its weights: its
 /// identity, and when it was made, where the file system says (a Unix file
 /// system may give a deleted file's inode to a new file; Windows file
-/// indexes carry a sequence number).
+/// indexes carry a sequence number). Where the file system does not say
+/// (no birth time), the opening of the file stands in: each connection then
+/// has weights of its own, which it keeps across the scripts that take it,
+/// and two files that had one inode in turn cannot share them (found by
+/// the 1.2.1 audit).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct Database {
-    pub(super) id: FileId,
-    pub(super) created: Option<SystemTime>,
+    id: FileId,
+    created: Option<SystemTime>,
+    /// 0 when `created` is known; else a number no other open in this
+    /// process has.
+    opened: u64,
+}
+
+impl Database {
+    /// The key for the file `id`, made at `created` where the file system
+    /// says so.
+    pub(super) fn new(id: FileId, created: Option<SystemTime>) -> Database {
+        static OPENS: AtomicU64 = AtomicU64::new(0);
+        let opened = if created.is_some() { 0 } else { OPENS.fetch_add(1, Ordering::Relaxed) + 1 };
+        Database { id, created, opened }
+    }
 }
 
 /// What a weight is kept by: the file, the schema cookie the program was
@@ -1015,9 +1032,27 @@ mod tests {
                 std::fs::write(dir.join(&name), b"").unwrap();
                 let (guard, name) = crate::safefs::open_parent(&dir, std::path::Path::new(&name)).unwrap();
                 let id = guard.plain_file_id(&name).unwrap().unwrap();
-                Database { id, created: std::fs::metadata(dir.join(name)).and_then(|m| m.created()).ok() }
+                Database::new(id, std::fs::metadata(dir.join(name)).and_then(|m| m.created()).ok())
             })
             .collect()
+    }
+
+    /// A file whose birth time the file system does not record is known by
+    /// its opening: two opens of it do not share weights (an inode given to
+    /// another file after a delete would otherwise; found by the 1.2.1
+    /// audit). With a birth time, they do.
+    #[test]
+    fn a_file_without_a_birth_time_has_weights_per_open() {
+        let id = files("nonce", 1)[0].id;
+        let (a, b) = (Database::new(id, None), Database::new(id, None));
+        assert_ne!(a, b);
+        let n = analyzed();
+        remember(a, 3, n, "SELECT 1", 5);
+        assert_eq!(cached(a, 3, n, "SELECT 1"), Some(5));
+        assert_eq!(cached(b, 3, n, "SELECT 1"), None, "shared by two opens of a file without a birth time");
+        let made = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        assert_eq!(Database::new(id, Some(made)), Database::new(id, Some(made)));
+        assert_ne!(Database::new(id, Some(made)), Database::new(id, Some(made + std::time::Duration::from_secs(1))));
     }
 
     /// The weights are kept by file, schema cookie, `ANALYZE` count and

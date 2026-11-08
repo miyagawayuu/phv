@@ -3,7 +3,7 @@
 //! the command, and a reply larger than the byte budget is refused, so neither
 //! a huge value nor a slow server can outlast the script's limits.
 
-use crate::netio::{check_plain, describe, dial, Stream};
+use crate::netio::{check_plain, describe, dial, Idle, Stream};
 use std::io::{Read, Write};
 use std::time::Instant;
 
@@ -169,8 +169,39 @@ impl RedisConn {
         3 + digits(args.len()) + args.iter().map(|a| 5 + digits(a.len()) + a.len()).sum::<usize>()
     }
 
-    /// Sends one command and reads its reply, before `until` and within `budget` bytes.
+    /// Whether the connection is in step: nothing is left of the last reply,
+    /// nothing arrived since, and the server has not closed it. Only such a
+    /// connection can carry a command (see `check_in_step`); checked without
+    /// waiting.
+    pub(crate) fn in_step(&mut self) -> bool {
+        self.pos == self.buf.len() && self.stream.idle() == Idle::Quiet
+    }
+
+    /// Fails when a command cannot be written on the connection: bytes are
+    /// left of the last reply or arrived since, which the command would read
+    /// as its reply (found by the 1.2.1 audit: a reply the server sent late,
+    /// after a pipeline's own, waited in the socket and was read as the next
+    /// command's; the HTTP client has checked a kept connection this way
+    /// since the 1.0.0 audit), or the server closed it. Nothing is written
+    /// then, so the caller may send the command on another connection.
+    fn check_in_step(&mut self) -> Result<(), RedisError> {
+        let state = if self.pos != self.buf.len() { Idle::Pending } else { self.stream.idle() };
+        match state {
+            Idle::Quiet => Ok(()),
+            Idle::Pending => {
+                self.buf.clear();
+                self.pos = 0;
+                Err(RedisError::Broken("the server sent an unexpected reply".into()))
+            }
+            Idle::Closed => Err(RedisError::Broken("the server closed the connection".into())),
+        }
+    }
+
+    /// Sends one command and reads its reply, before `until` and within
+    /// `budget` bytes. Nothing is sent on a connection that is not in step
+    /// (`check_in_step`).
     pub(crate) fn command(&mut self, args: &[&[u8]], until: Instant, budget: usize) -> Result<Reply, RedisError> {
+        self.check_in_step()?;
         self.stream.set_deadline(until);
         let mut out = Vec::new();
         Self::encode(&mut out, args);
@@ -199,7 +230,8 @@ impl RedisConn {
     /// `RedisError::Server` reports it for one command; a connection error, a
     /// reply past the budget or a connection out of step fails the whole call
     /// (and the connection cannot be reused). Callers keep within
-    /// `MAX_PIPELINE_COMMANDS` and `MAX_PIPELINE_BYTES`.
+    /// `MAX_PIPELINE_COMMANDS` and `MAX_PIPELINE_BYTES`. Nothing is sent on
+    /// a connection that is not in step (`check_in_step`).
     pub(crate) fn pipeline(
         &mut self,
         commands: &[Vec<&[u8]>],
@@ -210,6 +242,7 @@ impl RedisConn {
         if commands.is_empty() {
             return Ok(Vec::new());
         }
+        self.check_in_step()?;
         self.stream.set_deadline(until);
         let mut out = Vec::with_capacity(commands.iter().map(|c| Self::encoded_len(c)).sum());
         for args in commands {
@@ -242,7 +275,10 @@ impl RedisConn {
     }
 
     /// Writes one command without reading its reply (for pipelines and the
-    /// commands of a subscribed connection).
+    /// commands of a subscribed connection). The connection is not checked
+    /// for bytes waiting: on a subscribed connection a pushed message may
+    /// arrive at any time, and a pipeline's replies are due after its first
+    /// command (a pooled connection is checked when it is taken, `Driver::closed`).
     pub(crate) fn send(&mut self, args: &[&[u8]], until: Instant) -> Result<(), RedisError> {
         self.stream.set_deadline(until);
         let mut out = Vec::new();
@@ -746,6 +782,64 @@ mod tests {
             Some("WRONGPASS: invalid username-password pair")
         );
         server.join().unwrap();
+    }
+
+    /// Found by the 1.2.1 audit: a reply the server sent late, after a
+    /// pipeline's own replies, waited in the socket and was read as the
+    /// next command's reply. Bytes waiting before a command is written put
+    /// the connection out of step: the command fails without being sent
+    /// (a new connection gets the server's real reply), and so does one on a
+    /// connection the server has closed.
+    #[test]
+    fn bytes_waiting_before_a_command_break_the_connection() {
+        use std::io::{BufRead as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut s = s;
+            for _ in 0..4 {
+                read_command(&mut r);
+            }
+            s.write_all(b"+OK\r\n:7\r\n-WRONGTYPE not a counter\r\n$1\r\nx\r\n").unwrap();
+            s.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            s.write_all(b"+EXTRA\r\n").unwrap();
+            // Nothing more comes on this connection: the client closes it
+            // (with the stray reply unread, which Windows reports as a reset).
+            let mut line = String::new();
+            let end = r.read_line(&mut line);
+            assert!(matches!(end, Ok(0) | Err(_)), "a command was sent on a connection out of step: {line:?}");
+            let (s, _) = listener.accept().unwrap();
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut s = s;
+            assert_eq!(read_command(&mut r), ["GET", "k"]);
+            s.write_all(b"$5\r\nfresh\r\n").unwrap();
+            // Closed by the server: the next command is not written either.
+        });
+        let until = || Instant::now() + std::time::Duration::from_secs(5);
+        let url = format!("redis://127.0.0.1:{port}");
+        let mut c = RedisConn::connect(&url, None, until()).unwrap();
+        let budget = 1 << 20;
+        let commands: Vec<Vec<&[u8]>> =
+            vec![vec![b"SET", b"a", b"1"], vec![b"INCR", b"n"], vec![b"INCR", b"text"], vec![b"GET", b"a"]];
+        assert_eq!(c.pipeline(&commands, until(), budget).ok().map(|r| r.len()), Some(4));
+        assert!(c.in_step());
+        // The late reply arrives meanwhile.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(!c.in_step());
+        assert!(
+            matches!(c.command(&[b"GET", b"k"], until(), budget), Err(RedisError::Broken(m)) if m.contains("unexpected")),
+            "the late reply was read as the command's"
+        );
+        drop(c);
+        let mut c = RedisConn::connect(&url, None, until()).unwrap();
+        assert!(matches!(c.command(&[b"GET", b"k"], until(), budget), Ok(Reply::Bulk(b)) if b == b"fresh"));
+        server.join().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!c.in_step());
+        assert!(matches!(c.command(&[b"PING"], until(), budget), Err(RedisError::Broken(m)) if m.contains("closed")));
     }
 
     /// The wire size of a command is counted as it is encoded.

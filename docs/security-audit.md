@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates seventeen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, §24 an assessment of the whole implementation before 1.1.0, §25 an assessment of the whole implementation before 1.1.1, §26 an assessment of the whole implementation before 1.2.0, and §27 an assessment of the whole implementation of the 1.2.0 release candidate.
+This report consolidates eighteen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, §24 an assessment of the whole implementation before 1.1.0, §25 an assessment of the whole implementation before 1.1.1, §26 an assessment of the whole implementation before 1.2.0, §27 an assessment of the whole implementation of the 1.2.0 release candidate, and §28 an assessment of the whole implementation before 1.2.1.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§25: 2026-11-06, §26–§27: 2026-11-07)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§25: 2026-11-06, §26–§27: 2026-11-07, §28: 2026-11-08)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -1841,6 +1841,142 @@ Regression tests are named after what they check, in each crate's tests and in `
 - `jwt.rs`: `rsa_keys_with_a_degenerate_exponent_are_refused`, `ec_and_ed25519_keys_off_the_curve_are_refused`;
 - `netdb/mod.rs`: `prepared_transactions_are_refused`;
 - `editors/vscode/test/phv-path.test.js`: the extension of an absolute `phv.path`.
+
+All tests pass on Windows and on Linux, run at the same time against one PostgreSQL 17, MySQL 8.4 and Redis 7, and
+with clippy (`-D warnings`) and rustfmt.
+
+## 28. Eighteenth Assessment: the Whole Implementation (before 1.2.1)
+
+Date: 2026-11-08. Scope: everything at 34d8272: the fixes of §27 and the three batches of the 1.2.1 improvement plan,
+none of which had been assessed before. The improvements are the table-driven HTML context tracker, the SQLite cost
+model with its opcode pin and the per-process weight cache; the PostgreSQL and MySQL resets, the sharded rate limiter
+and route histograms, the route cache keyed by the path, exception traces built when printed, the editor's debounce,
+the HTTP client taking kept connections for every method, one wording for time-outs; lazy session values, the Redis
+pipeline API, `phv jobs adopt`, mimalloc under the counting allocator, the JIT compiling loop and recursive functions
+as shared units, the split of `netdb.rs`, and the callback fast path. Every earlier fix was attacked again.
+
+Eight reviewers each took one area, as in §27: the web server; the standard library and its clients; the compiler,
+the type checker, the VM, the JIT and the allocator; templates and the tracker; the tools and their supply chain;
+background jobs and the stores; sign-in and tokens; and the running system as a whole. They attacked a release build
+locally, with fake identity providers, Redis servers and HTTP servers on their own ports, the three databases in
+Docker, and Linux builds in Docker where a question depended on the platform. Each finding was confirmed with a PoC;
+where a reviewer had reasoned from the source alone, the main session sent it back to run the attack, which turned
+two notes into findings. The tracker was read row by row against the WHATWG tokenizer and tree-construction rules and
+against Chrome 157 and html5lib: every template PHV accepts rendered the value in the context it was escaped for.
+The vendored mimalloc was compared byte by byte with the upstream 3.3.2 release. Eight groups then fixed every
+finding, each with regression tests.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| Critical | 0 | |
+| High | 0 | |
+| Medium | 1 | Fixed |
+| Low | 10 | Fixed |
+| Info | 16 | Fixed or documented |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R21-4 | The key under which compiled JIT units are shared between the pages of a process was not an injective encoding: a float constant was its eight raw bytes and a newline, without a tag or a length, while the other constants were their debug text. Every finite float is nameable by a 17-digit literal, so a page whose float constant's bytes spell the text of another page's string constant made the second page run the first's native code and print the first's constant (one page per site in one process). Introduced by the shared units of this cycle; not in a release | The key is a serialization in which every part is tagged and length-prefixed: the instruction words, signatures, constant count, each constant with its kind (floats by their bits), and the builtin names; a key that cannot be built makes the unit private |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R21-1 | The rate limiter's table, when full, evicted expired windows, then windows not at their limit, then the oldest limited ones: a flood of about 100,000 keys each limited after one hit (`max = 1`) evicted a victim's long-standing limit, which the module's comment said could not happen | When the table is full, limited windows are evicted newest first (a flood's own windows), after expired and not-limited ones; the doc says what is guaranteed: a limit set before a flood survives it, one set while the table is already full of an attacker's limited windows can be lost after about 10,000 more |
+| R21-2 | A request with side effects on a kept connection was sent again on a fresh connection when its write had failed before completing, so a server that read the head and part of a large body and then reset got the request twice (a 16 MB POST on Linux: three request heads over two connections, and the script saw 200); 1.2.0 never retried such a request | A request with side effects is never sent twice: on a kept connection a failed write or read gives `NetworkError`; only `GET`, `HEAD` and `OPTIONS` are retried on a fresh connection, when no byte of an answer came |
+| R21-3 | The Redis client checked for stray bytes only right after reading a reply; a reply arriving a moment later on a pooled connection was read by the next command as its own (the HTTP client got that check after the 1.0.0 audit, the Redis client had not) | Before a command or pipeline is written on a kept or pooled connection, the socket is checked for pending bytes or a close; either marks the connection out of step and it is replaced, nothing having been sent; a stray reply that lands in the window between a command's write and its reply is still read as that reply (RESP has no way to tell them apart) and the next command detects the shift |
+| R21-5 | `Html` written inside `<select>` (a partial rendered there, or a partial that opened a `<select>` and ended inside it) was not checked for the raw-text elements §26 refuses in the template itself, so with a parser of the old rules their text was read as markup | Element text inside an open `<select>` is its own context: `Html` written there is checked at run time for those elements, and a template may not end inside an open `<select>` |
+| R21-6 | `phv jobs adopt --yes` moved jobs one at a time inside a transaction (four to five round trips each, 500 per batch) within a page's 10-second budget, so over a store four milliseconds away nothing could be moved at all, and 50,000 jobs took three minutes locally; the dry run gave no hint | A batch of up to 1,000 jobs is moved in a few set-based statements under the site's job lock (PostgreSQL: a locked select, then an insert returning the accepted ids whose rows alone are deleted; MySQL: a marked insert that tells inserted rows from duplicates, then the delete, in one transaction), with a budget of 60 seconds and a batch size that halves when a batch takes long; 50,000 jobs move in 2.3 seconds locally and in 26 seconds over a 30 ms store |
+| R21-7 | A provider's discovery document saying it always sends `iss` with the authorization response was not read, so a callback without `iss` was accepted when the provider sends one (RFC 9207 says a client that knows must require it); the mix-up defence then rested on the redirect URI alone | The discovery document's flag is kept; when it is set, a callback without `iss`, for a code or an error, is refused as `invalid_issuer` |
+| R21-8 | An RSA public key with an even modulus was accepted and failed every verification (the class §27 refused for the exponent) | The modulus must be odd; refused when the key is read, from a JWK or a PEM, and skipped in a key set |
+| R21-9 | File session store on Windows: a read that overlapped another request's save of the same session (a rename over the file) failed the real-name check, and the request ran with no session; one in a hundred reads with four writers and eight readers of one visitor, and a page that then wrote signed the visitor out | A read that fails tries the directory lock without waiting: free, it reads once more under the lock and that result is final; busy (a save or the sweep holds it), it yields or sleeps a millisecond and tries again, forty times at most. A read that succeeds never takes the lock |
+| R21-10 | A session record whose `last` was near the largest value overflowed the refresh check and panicked the request task (overflow checks are on in release builds): 500 on every page of that visitor, the record never removed; only a writer of the store can make such a record | The refresh check saturates, and a record whose `last` or `created` is more than a day in the future is damaged: refused and removed, in every store |
+| R21-11 | A page calling an `[http]` service that pointed at its own server held its worker while waiting up to 10 seconds for another worker of the same server: with as many concurrent pages as workers, every worker and a bystander's page stalled for 10 seconds | At startup every `[http]` and `[websockets]` URL whose host resolves to this server's address (or to a loopback or local address when it listens on every address) and whose port is the server's is refused with a message that says to call the code directly or serve the API elsewhere |
+
+### Info
+
+| # | Finding | Fix |
+|---|---|---|
+| R21-12 | The SQLite weight cache keyed two database files alike only when the file system reports no creation time, the inode was reused and the schema cookie matched; not reproducible on Windows, overlayfs or tmpfs | When the file system reports no creation time, a per-open counter is folded into the key, so weights are per connection there |
+| R21-13 | An `HGETALL` reply with an odd number of elements lost its last field | Refused as an unexpected reply |
+| R21-14 | mimalloc's size-class rounding and per-thread retention are outside the counted memory limit, as the system allocator's were | Documented below |
+| R21-15 | The per-thread memory counter relies on callers balancing `charge_thread`; the teardown after the response runs on the VM's thread, so no cross-thread free reaches the counters today | Documented below |
+| R21-16 | A self-closed `<script/>` or `<style/>` inside SVG put the tracker into raw text, where browsers pop the element at once; everything after it was refused | A self-closing start tag read as foreign content opens no raw text; in an HTML integration point, where browsers ignore the slash, it still does |
+| R21-17 | `<base href>` with `safe_url` and `<meta charset>` are accepted; the CSP's `base-uri 'self'` and the response's charset header make them harmless | Documented in the specification's table of URL attributes |
+| R21-18 | On MySQL, `phv jobs adopt` reported any refused insert (a CHECK or NOT NULL constraint) as "a job with its key" and went on | The insert reports duplicates exactly (`ON DUPLICATE KEY UPDATE` with a marker) and every other refusal with the server's message, as PostgreSQL does |
+| R21-19 | The Redis `phv jobs adopt`, the dry run too, ran one script over the whole shared store, stalling every client of the server for about a second at the caps | The script moves 1,000 jobs per call and is called again from where it stopped; the worst wait of another client fell from 751 to 65 ms |
+| R21-20 | `phv.path` forms that passed §27's check: an alternate data stream named `.exe` on a `.cmd`, the `\\?\` and `\\.\` prefixes; a PATH entry spelling the workspace as an administrative share was searched | An absolute setting with a `:` after the drive letter or a `\\?\` or `\\.\` prefix is refused; network entries of `PATH` are not searched (the error says to set `phv.path`); a plain share path in the setting is still accepted |
+| R21-21 | The dry run of `phv jobs adopt` listed every job with no count per name and no filter, so the check the spec asks for was impractical | The dry run prints a count per name, and `--name` restricts the adoption to the named scripts |
+| R21-22 | While the shared rate-limit store is unreachable, `requests_per_minute` counts per process (N processes allow N times the limit); `rate_limit()` fails closed | Documented below |
+| R21-23 | Two callbacks of one browser with the same sign-in state in flight at once both exchanged the code; the pending list is saved when the request ends, and providers refuse the second use of a code | Documented below |
+| R21-24 | A stored pending list over 64 KB (only a writer of the store can make one) gave a 500 at the callback instead of `invalid_state`, and was decoded outside the script's limits | The list is decoded within the script's limits, and the oldest entries are dropped past the caps, so the callback answers `invalid_state` |
+| R21-25 | Measured, not changed: eight 8,192-bit RSA keys verify a token without `kid` in 2.2 ms (7.0 ms with the largest exponent); a password hash at the verifier's caps takes 220 ms and 64 MiB | Holds |
+| R21-26 | The compiled-page cache is bounded by the number of page files only: 600 small pages held 200 MB | Documented below |
+| R21-27 | The Redis session store read a record with invalid UTF-8 lossily where the file store refuses it | Refused as damaged, like the file store |
+
+### Residual Risks
+
+- mimalloc's own overhead (size classes, per-thread retention) is outside the counted memory, by a small factor, as
+  the system allocator's was; on Windows the committed memory grows by about 70 MB per process for mimalloc's
+  arenas, while the resident memory does not.
+- The per-thread memory counter is exact only while every cross-thread free is paired with `charge_thread`.
+- While the shared rate-limit store is unreachable, `requests_per_minute` holds per process.
+- A browser that sends two callbacks with the same sign-in state at once exchanges the code twice; the provider
+  refuses the second.
+- The compiled-page cache grows with the number of page files (about 330 KB per small page).
+- Git finds the history of the files of `netdb/` across the split with `-M10%`.
+- §27's residual risks remain.
+
+### Verification
+
+The PoCs were run again against the fixed build (before → after):
+- a flood of 102,000 limited windows against an older limit: lifted → still limited, the flood's newest windows gone;
+- a 16 MB POST on a kept connection reset after 64 KB (Linux): three request heads over two connections and 200 →
+  one head and `NetworkError`;
+- a Redis reply 300 ms late: the next `get` answered `EXTRA` → `fresh` on a new connection;
+- two pages differing in one float constant (its bits spelling `Str("a")`): page b printed page a's float → `aa`;
+- a partial holding `<title>` rendered inside `<select>`: accepted → refused at run time; a partial opening a
+  `<select>`: accepted → refused at check;
+- `phv jobs adopt --yes` over a 30 ms store (PostgreSQL, MySQL): an error after 12 seconds and nothing moved →
+  50,003 jobs in 26 and 47 seconds; locally 2.3 and 12.4 seconds; the Redis move's worst stall of another client
+  751 → 65 ms;
+- a callback without `iss` from a provider that advertises it: `ok` → `invalid_issuer`; an RSA key with an even
+  modulus: accepted → refused (three lines of 56 changed, the rest identical);
+- 2,400 reads of a session during 1,200 saves (Windows, file store): 165–201 saw no session → 0; a record with
+  `last` at the largest value: 500 on every request → no session and the file removed; a Redis record with invalid
+  UTF-8: read lossily → refused;
+- four pages calling their own server on four workers: every page and a bystander stalled 10 seconds → the server
+  refuses to start with the service named;
+- `phv.path` as `phv.cmd:s.exe` or `\\?\...`: resolved → refused; the workspace spelt as an administrative share
+  in `PATH`: searched → skipped.
+
+The differential oracle of the tracker rewrite was run again with the fixed binary: of 177,208 templates, 132
+differ, every one with a self-closed `<script/>` or `<style/>` read as foreign content (84 now accepted, 48 still
+refused by their other errors); the reviewer's harness of session records differs only in the three fixed cases.
+The benchmarks of `bench/`, run back to back with the binary of 34d8272 under the same load (`bench/results/34d8272-loaded.json`, `audit18-loaded.json`), are within noise: the micro-benchmarks 0.93–1.04, the server's pages 0.98–1.09 in requests per second; the editor's rows moved with the load of a test suite running alongside.
+
+### Regression tests
+
+Regression tests are named after what they check, in each crate's tests and in `tests/cases`, `tests/db` and
+`tests/http` (`err_html_in_select`, `err_template_in_select`, `post_reset`, `redis_late_reply`). Some of the others:
+- `ratelimit.rs`: `a_flood_of_limited_windows_does_not_lift_an_older_limit`;
+- `http.rs`: `a_post_whose_write_fails_on_a_kept_connection_is_not_repeated`;
+- `redisclient.rs`: `bytes_waiting_before_a_command_break_the_connection`; `databases.rs`:
+  `a_late_redis_reply_is_not_read_as_the_next_commands`;
+- `jit.rs`: `programs_differing_in_a_float_constants_bits_do_not_share_code`; `phv_jit`:
+  `unit_keys_tell_constants_apart`;
+- `htmlctx.rs`: `select_is_a_context_and_not_the_top_level`, `self_closed_script_in_foreign_content_opens_no_text`;
+- `jobs.rs` (CLI): `adopt_moves_many_jobs_through_a_slow_store_with_postgres` and `_with_mysql`; `netdb`:
+  `adopt_reports_a_refused_row_with_the_servers_message`, `redis_adopt_moves_a_large_shared_store_in_pages`;
+- `oauth.rs`: `answers_without_iss_are_refused_when_the_provider_always_sends_it`,
+  `an_oversized_pending_list_in_the_store_finishes_the_callback`; `jwt.rs`: `rsa_keys_with_an_even_modulus_are_refused`;
+- `session.rs`: `a_read_during_another_requests_save_sees_the_session`, `a_record_with_times_in_the_future_is_damaged`,
+  `a_redis_record_that_is_not_utf8_is_refused`; `selfcall.rs`: `a_service_pointing_at_this_server_is_refused`;
+- `editors/vscode/test/phv-path.test.js`: the alternate-data-stream, device-path and network cases.
 
 All tests pass on Windows and on Linux, run at the same time against one PostgreSQL 17, MySQL 8.4 and Redis 7, and
 with clippy (`-D warnings`) and rustfmt.

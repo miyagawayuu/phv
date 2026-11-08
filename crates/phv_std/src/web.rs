@@ -9,7 +9,7 @@ use std::rc::Rc;
 type R = Result<Value, VmError>;
 
 /// Largest total size of one session's values.
-const MAX_SESSION_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_SESSION_BYTES: usize = 64 * 1024;
 
 // ----- JSON ---------------------------------------------------------------
 

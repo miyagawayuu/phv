@@ -98,8 +98,9 @@ pub fn list(project: &Path, failed: bool) -> ExitCode {
 }
 
 /// `phv jobs adopt`: moves the jobs the site left in the shared store before
-/// it had a namespace into its own store; a dry run unless `yes`.
-pub fn adopt(project: &Path, yes: bool) -> ExitCode {
+/// it had a namespace into its own store; a dry run unless `yes`. With
+/// `only` (`--name`), only the jobs of those of the site's job scripts.
+pub fn adopt(project: &Path, yes: bool, only: &[String]) -> ExitCode {
     use phv_std::jobs::Outcome;
     use phv_syntax::diag::log_escape;
     let (store, root, config) = match opened(project) {
@@ -112,10 +113,23 @@ pub fn adopt(project: &Path, yes: bool) -> ExitCode {
     // The shared store records no site: only jobs named as this site's job
     // scripts are taken.
     let dir = config.jobs.as_ref().map_or("jobs", |j| j.dir.as_str());
-    let names = phv_driver::config::scan_jobs(&root, dir).unwrap_or_default();
+    let mut names = phv_driver::config::scan_jobs(&root, dir).unwrap_or_default();
     if names.is_empty() {
         println!("nothing to adopt: {dir}/ has no job scripts, and only jobs of this site's scripts are adopted");
         return ExitCode::SUCCESS;
+    }
+    if !only.is_empty() {
+        // A name that is not a job script of the site would adopt nothing:
+        // said, so a typo is not taken for an empty store.
+        if let Some(n) = only.iter().find(|n| !names.contains(n)) {
+            eprintln!(
+                "error: --name {}: {dir}/ has no job script {}.phv, and only jobs of this site's scripts are adopted",
+                log_escape(n),
+                log_escape(n)
+            );
+            return ExitCode::FAILURE;
+        }
+        names.retain(|n| only.contains(n));
     }
     let jobs = match store.adopt(&names, yes) {
         Ok(Some(jobs)) => jobs,
@@ -146,6 +160,21 @@ pub fn adopt(project: &Path, yes: bool) -> ExitCode {
             count("waiting"),
             count("failed")
         );
+        // By name first: the check that another site on the same database
+        // did not leave jobs of the same names is made on these counts, not
+        // on the lines of every job (found by the 18th assessment).
+        let mut by_name: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+        for j in &moved {
+            let e = by_name.entry(j.name.as_str()).or_default();
+            if j.state == "waiting" {
+                e.0 += 1;
+            } else {
+                e.1 += 1;
+            }
+        }
+        for (name, (waiting, failed)) in &by_name {
+            println!("  {}: {waiting} waiting, {failed} failed", short(name));
+        }
         for j in &moved {
             println!("  {}  {:<8} {}", short(&j.id), short(j.state), short(&j.name));
         }

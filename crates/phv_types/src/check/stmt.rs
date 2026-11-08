@@ -30,18 +30,19 @@ fn breaks_out(stmts: &[Stmt], nest: u32) -> bool {
     })
 }
 
-/// A value inserted inside `<svg>`/`<math>`, into the text of a raw-text
-/// element or into a comment: `Html` (a template's output, a layout's body,
-/// `raw()`) was checked as HTML on its own, so it is looked at when it is
-/// inserted (`__html_inside` refuses markup that browsers would read in
-/// another way there, or that ends the comment; found by the 1.1.1 audit).
-/// Strings and numbers are escaped and need no look.
+/// A value inserted inside `<svg>`/`<math>`, inside `<select>`, into the text
+/// of a raw-text element or into a comment: `Html` (a template's output, a
+/// layout's body, `raw()`) was checked as HTML on its own, so it is looked at
+/// when it is inserted (`__html_inside` refuses markup that browsers would
+/// read in another way there, or that ends the comment; found by the 1.1.1
+/// audit). Strings and numbers are escaped and need no look.
 fn html_inside(h: HExpr, ctx: phv_syntax::ast::EchoContext) -> HExpr {
     use phv_syntax::ast::EchoContext;
     // `watched `: where the end tag of any raw-text element may end what a
     // browser reads (found by the 1.2 audit).
     let place = match ctx {
         EchoContext::ForeignText => "foreign",
+        EchoContext::SelectText => "select",
         EchoContext::RawText(tag) => tag,
         EchoContext::Comment { bogus: false, watched: false } => "comment",
         EchoContext::Comment { bogus: false, watched: true } => "watched comment",

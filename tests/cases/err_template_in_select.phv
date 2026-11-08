@@ -1,0 +1,8 @@
+<?phv
+// A template may not end inside a `<select>` it opened: what follows its
+// output is checked outside one, where older browsers would still read a
+// `<title>` there as markup (found by the 1.2.1 audit).
+$u = "javascript:alert(1)";
+echo render("views/open_select.phv.html");
+?>
+<title><a href="<?= $u ?>">x</a></title></select>

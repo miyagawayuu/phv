@@ -1,9 +1,16 @@
 //! Request counters shared by every request in the process, for
 //! `rate_limit()` and the server's per-client limit. Each (key, window) pair
-//! counts hits in a fixed window. The table is bounded; when it is full,
-//! expired windows go first, then windows that are not at their limit, and
-//! only then the oldest limited ones, so flooding the table with new keys
-//! does not lift an active limit.
+//! counts hits in a fixed window. The table is bounded; when it is full, a
+//! tenth of it is freed: expired windows go first, then windows that are not
+//! at their limit (oldest first), and only then limited ones, newest first.
+//! So a limited window is lost only when nothing in the table has expired
+//! and fewer than a tenth of its windows are not limited or limited and
+//! newer. A flood of new keys, limited or not, cannot lift a limit that was
+//! set before it began, since its own windows are the newest (found by the
+//! 18th audit: the oldest limited windows went first, so a flood of limited
+//! windows lifted the oldest limits). What is not guaranteed: a limit set
+//! while the table is already full of someone's limited windows is lost once
+//! a tenth of the table's worth of newer ones arrive.
 //!
 //! The table is split by key into `SHARDS` maps, each under a lock of its
 //! own, so requests with different keys do not wait for one another. The
@@ -83,8 +90,9 @@ impl Table {
     }
 
     /// Makes room for more keys, in amortized O(1): each pass frees a tenth.
-    /// Expired windows go first, then windows that are not at their limit,
-    /// then the oldest limited ones, chosen over every shard together.
+    /// Expired windows go first, then the oldest windows that are not at
+    /// their limit, then the newest limited ones, chosen over every shard
+    /// together (see the module doc).
     fn make_room(&self) {
         let mut shards: Vec<MutexGuard<'_, Map>> = (0..SHARDS).map(|i| self.lock(i)).collect();
         for t in shards.iter_mut() {
@@ -95,8 +103,9 @@ impl Table {
         if len > target {
             let mut order: Vec<(bool, Instant, TableKey)> =
                 shards.iter().flat_map(|t| t.iter().map(|(k, w)| (w.hits >= w.max, w.start, k.clone()))).collect();
-            // Not-limited before limited, then oldest first.
-            order.sort();
+            // Not-limited before limited; the not-limited oldest first, the
+            // limited newest first (a flood's own windows are the newest).
+            order.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| if a.0 { b.1.cmp(&a.1) } else { a.1.cmp(&b.1) }));
             for (_, _, k) in order.into_iter().take(len - target) {
                 shards[self.shard_of(&k.0)].remove(&k);
             }
@@ -197,6 +206,16 @@ fn exact_len() -> usize {
     len
 }
 
+/// For the tests: empties the table.
+#[cfg(test)]
+fn clear() {
+    let mut shards: Vec<MutexGuard<'_, Map>> = (0..SHARDS).map(|i| TABLE.lock(i)).collect();
+    for t in shards.iter_mut() {
+        t.clear();
+    }
+    TABLE.len.store(0, Ordering::SeqCst);
+}
+
 /// Counts a hit in the store phv.toml names: the Redis database of
 /// `[security] rate_limit_store`, or this process. Returns whether the hit is
 /// allowed and the seconds until the window ends. When the Redis server cannot
@@ -260,8 +279,20 @@ pub fn client_key(ip: std::net::IpAddr) -> String {
 mod tests {
     use super::*;
 
+    /// The table is one per process: a test that floods it, or whose windows
+    /// must stay, takes this and starts with an empty table. (A flood of
+    /// limited windows left behind would otherwise make the next test's
+    /// limit the newest, and a flood there would evict it: see the module doc.)
+    fn serial() -> MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        guard
+    }
+
     #[test]
     fn limits_and_resets() {
+        let _serial = serial();
         let k = "test:limits_and_resets";
         let minute = Duration::from_secs(60);
         for _ in 0..3 {
@@ -285,6 +316,7 @@ mod tests {
     /// 1.2.0 audit: `reset("login:a")` also reset `"login:a\0b"`).
     #[test]
     fn reset_clears_only_its_own_key() {
+        let _serial = serial();
         let minute = Duration::from_secs(60);
         let long = format!("test:reset-own:{}", "x".repeat(200));
         let others =
@@ -309,6 +341,7 @@ mod tests {
 
     #[test]
     fn a_flood_of_keys_does_not_lift_a_limit() {
+        let _serial = serial();
         let day = Duration::from_secs(86_400);
         assert!(hit("test:flood-victim", 1, day));
         assert!(!hit("test:flood-victim", 1, day));
@@ -320,12 +353,39 @@ mod tests {
         assert!(exact_len() <= MAX_KEYS);
     }
 
+    /// A flood of limited windows (one hit each with `max = 1`) does not lift
+    /// an older limit either: among limited windows the newest go first, and
+    /// the flood's own windows are the newest (found by the 18th audit: the
+    /// oldest limited windows went first, so the flood lifted the oldest
+    /// limit in the table).
+    #[test]
+    fn a_flood_of_limited_windows_does_not_lift_an_older_limit() {
+        let _serial = serial();
+        let day = Duration::from_secs(86_400);
+        assert!(hit("test:limited-flood-victim", 1, day));
+        assert!(!hit("test:limited-flood-victim", 1, day), "the victim is limited");
+        // The victim's window is the oldest; make that clear.
+        std::thread::sleep(Duration::from_millis(5));
+        let key = |i: usize| format!("test:limited-flood-{i}");
+        for i in 0..MAX_KEYS + 2000 {
+            assert!(hit(&key(i), 1, day));
+        }
+        assert!(exact_len() <= MAX_KEYS);
+        assert!(!hit("test:limited-flood-victim", 1, day), "still limited after a flood of limited windows");
+        // What went was the newest of the flood, never its first window; at
+        // least the 2,000 over the bound are gone.
+        assert!(!hit(&key(0), 1, day), "the flood's oldest window is kept");
+        let gone = (0..MAX_KEYS + 2000).filter(|i| retry_after(&key(*i), day) == 0).count();
+        assert!(gone >= 2000, "{gone} of the flood's windows are gone");
+    }
+
     /// The bound and the eviction are those of the whole table, not of a
     /// shard: a flood past the bound keeps every limited window of the
     /// victims (there is room for them among the not-limited ones that go
     /// first), and a reset takes its windows out of the count.
     #[test]
     fn the_bound_is_counted_over_every_shard() {
+        let _serial = serial();
         let day = Duration::from_secs(86_400);
         let victims: Vec<String> = (0..500).map(|i| format!("test:shard-victim-{i}")).collect();
         for v in &victims {
@@ -352,6 +412,7 @@ mod tests {
     /// Hits on one key from many threads at once: exactly `max` of them count.
     #[test]
     fn concurrent_hits_on_one_key_count_exactly() {
+        let _serial = serial();
         let minute = Duration::from_secs(60);
         let allowed = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|s| {

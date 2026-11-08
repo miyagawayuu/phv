@@ -61,6 +61,92 @@ fn run_script(host: &Arc<Host>, name: &str, max_time: Option<Duration>) -> Strin
     run_limited(host, name, max_time, None)
 }
 
+/// Reads one RESP command (`*N`, then N bulk strings) from a client; None
+/// at the end of the stream.
+fn read_resp_command(r: &mut impl std::io::BufRead) -> Option<Vec<String>> {
+    let mut line = String::new();
+    if r.read_line(&mut line).ok()? == 0 {
+        return None;
+    }
+    let n: usize = line.trim().strip_prefix('*')?.parse().ok()?;
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        line.clear();
+        r.read_line(&mut line).ok()?;
+        line.clear();
+        r.read_line(&mut line).ok()?;
+        args.push(line.trim_end().to_string());
+    }
+    Some(args)
+}
+
+/// Found by the 1.2.1 audit: a reply the Redis server sent late, after a
+/// pipeline's own replies, waited in the socket and was read as the next
+/// command's reply, by the same script or by the next script that took the
+/// connection from the pool. A connection with bytes waiting is out of step
+/// before anything more is written on it: another takes its place, and the
+/// script gets the server's real reply. (No real Redis server is needed: a
+/// test server answers here.)
+#[test]
+fn a_late_redis_reply_is_not_read_as_the_next_commands() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let seen = connections.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(s) = stream else { continue };
+            seen.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+                let mut s = s;
+                while let Some(command) = read_resp_command(&mut r) {
+                    let reply: &[u8] = match command.first().map(String::as_str) {
+                        // The pipeline (SET, INCRBY, INCRBY, GET): its four
+                        // replies, then one too many 100 ms later.
+                        Some("SET") => {
+                            for _ in 0..3 {
+                                read_resp_command(&mut r);
+                            }
+                            if s.write_all(b"+OK\r\n:7\r\n-WRONGTYPE not a counter\r\n$1\r\nx\r\n").is_err() {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                            b"+EXTRA\r\n"
+                        }
+                        Some("PING") => b"+PONG\r\n",
+                        _ => b"$5\r\nfresh\r\n",
+                    };
+                    if s.write_all(reply).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let host = host(&format!("redis://127.0.0.1:{port}"));
+    // Within one script: the pipeline, other work while the late reply
+    // arrives, then a GET on the same handle.
+    let out = run_script(&host, "redis_late_reply", Some(Duration::from_secs(30)));
+    assert_eq!(
+        out,
+        "pipeline replies: 4\n  [0] true\n  [1] 7\n  [2] DatabaseError: WRONGTYPE: not a counter\n  [3] \"x\"\n\
+         next get: \"fresh\"\nsecond get: \"fresh\"\n",
+        "{out}"
+    );
+    assert_eq!(connections.load(Ordering::SeqCst), 2, "the GET went on the connection out of step");
+    // Across scripts: the late reply arrives after the connection went back
+    // to the pool, before the next script takes it.
+    let out = run_script(&host, "redis_late_reply_first", Some(Duration::from_secs(30)));
+    assert_eq!(out, "pipeline replies: 4\n", "{out}");
+    std::thread::sleep(Duration::from_millis(400));
+    let out = run_script(&host, "redis_late_reply_second", Some(Duration::from_secs(30)));
+    assert_eq!(out, "get: \"fresh\"\n", "{out}");
+    assert_eq!(connections.load(Ordering::SeqCst), 3, "the pooled connection out of step was used again");
+}
+
 fn run_limited(host: &Arc<Host>, name: &str, max_time: Option<Duration>, max_memory: Option<usize>) -> String {
     let path = root().join(format!("{name}.phv"));
     // The script with this run's table names (the expected output has the fixed ones).

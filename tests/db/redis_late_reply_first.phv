@@ -1,0 +1,8 @@
+// Run by crates/phv_driver/tests/databases.rs: the first of two scripts that
+// share a pooled connection. The test server answers this pipeline, then
+// sends one reply too many after the script is done.
+import std.db.Redis;
+
+$r = Redis::connect("main");
+$replies = $r->pipeline()->set("a", "1")->incr("n")->incr("text")->get("a")->exec();
+echo "pipeline replies: ", count($replies), "\n";

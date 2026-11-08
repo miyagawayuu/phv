@@ -1,0 +1,21 @@
+// Run by crates/phv_driver/tests/databases.rs against a test server that
+// sends one reply too many, a moment after a pipeline's own: the next
+// command must not read it as its reply.
+import std.db.Redis;
+
+$r = Redis::connect("main");
+$replies = $r->pipeline()->set("a", "1")->incr("n")->incr("text")->get("a")->exec();
+echo "pipeline replies: ", count($replies), "\n";
+foreach ($replies as $i => $v) {
+    if ($v is DatabaseError) {
+        echo "  [", $i, "] DatabaseError: ", $v->message, "\n";
+    } else {
+        echo "  [", $i, "] ", json_encode($v), "\n";
+    }
+}
+// The late reply arrives while the script does other work.
+$t = microtime();
+while (microtime() - $t < 0.5) {
+}
+echo "next get: ", json_encode($r->get("k")), "\n";
+echo "second get: ", json_encode($r->get("k2")), "\n";

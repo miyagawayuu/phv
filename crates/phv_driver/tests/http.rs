@@ -240,10 +240,9 @@ fn connections_are_kept_between_requests() {
 }
 
 /// A kept connection the server closed meanwhile: a GET is sent again on a
-/// new connection (`late_answers` above), a POST only when it was not
-/// written whole. A server that got the whole POST and closed without
-/// answering may have acted on it: the script gets the error, and the POST
-/// is not sent again.
+/// new connection (`late_answers` above), a POST never. A server that got the
+/// whole POST and closed without answering may have acted on it: the script
+/// gets the error, and the POST is not sent again.
 #[test]
 fn requests_with_side_effects_are_not_repeated_on_a_closed_connection() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -276,6 +275,87 @@ fn requests_with_side_effects_are_not_repeated_on_a_closed_connection() {
     let url = format!("http://{addr}/v1");
     let out = run_script(&host(&url, None), "post_closed", Some(Duration::from_secs(30)));
     assert_eq!(out, "GET /v1/warm\nNetworkError\nGET /v1/after\n", "{out}");
+    assert_eq!(posts.load(Ordering::SeqCst), 1, "the POST was sent again");
+}
+
+/// Found by the 1.2.1 audit: a POST on a kept connection that the server
+/// reset after reading its head and part of its body was sent whole again on
+/// a new connection (the failed write was taken for one that had reached
+/// nothing). A request with side effects is never sent twice: the script
+/// gets the error, and the server sees the request once. The body is larger
+/// than the socket buffers, so the write is still going when the reset comes
+/// (on Linux the write then fails; Windows reports it done, and the read
+/// fails: either way the request is not repeated).
+#[test]
+fn a_post_whose_write_fails_on_a_kept_connection_is_not_repeated() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let seen = posts.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut chunk = vec![0u8; 64 << 10];
+                let mut read_more = |s: &mut TcpStream, buf: &mut Vec<u8>| match s.read(&mut chunk) {
+                    Ok(n) if n > 0 => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        true
+                    }
+                    _ => false,
+                };
+                loop {
+                    // The head, with the first bytes of the body after it.
+                    let mut buf = Vec::new();
+                    let head_end = loop {
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                        if !read_more(&mut s, &mut buf) {
+                            return;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let line = head.lines().next().unwrap_or("").to_string();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Content-Length: "))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    if line.starts_with("POST ") {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let mut body = buf.drain(head_end..).count();
+                    if line.starts_with("POST /v1/drop") {
+                        // 64 KB of the body, then the socket is closed with the
+                        // rest unread: a reset, and no answer.
+                        while body < 64 << 10 {
+                            if !read_more(&mut s, &mut buf) {
+                                return;
+                            }
+                            body += buf.drain(..).count();
+                        }
+                        return;
+                    }
+                    while body < length {
+                        if !read_more(&mut s, &mut buf) {
+                            return;
+                        }
+                        body += buf.drain(..).count();
+                    }
+                    let reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{line}", line.len());
+                    if s.write_all(reply.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let url = format!("http://{addr}/v1");
+    let out = run_script(&host(&url, None), "post_reset", Some(Duration::from_secs(60)));
+    assert_eq!(out, "GET /v1/warm HTTP/1.1\nNetworkError\nGET /v1/after HTTP/1.1\n", "{out}");
     assert_eq!(posts.load(Ordering::SeqCst), 1, "the POST was sent again");
 }
 

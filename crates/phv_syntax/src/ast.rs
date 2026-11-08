@@ -107,6 +107,12 @@ pub enum StmtKind {
 pub enum EchoContext {
     /// Element content.
     Text,
+    /// Element content inside an open `<select>`. Older browsers ignore the
+    /// start tag of a raw-text element such as `<title>` or `<style>` there
+    /// and read its text as markup (R19-26), so `Html` inserted here may hold
+    /// none (the template that made it was checked on its own). Otherwise as
+    /// `Text`: functions called here may write output.
+    SelectText,
     /// A quoted attribute value.
     Attr,
     /// The start of a quoted URL attribute (`href="<?= ?>"`).
