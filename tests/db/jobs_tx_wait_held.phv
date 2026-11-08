@@ -1,0 +1,21 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: waits until jobs_tx_hold.phv is
+// sleeping inside its transaction (so it holds the key "f1"), up to 20
+// seconds, and says "held"; a fixed pause was too short on a loaded machine.
+import std.db.Database;
+
+$db = Database::connect("main");
+$pg = ($db->first(sql"SELECT version() AS v")?->string("v") ?? "")->startsWith("PostgreSQL");
+$start = microtime();
+$held = false;
+while (!$held && microtime() - $start < 20.0) {
+    if ($pg) {
+        $n = $db->first(sql"SELECT count(*) AS n FROM pg_stat_activity
+            WHERE state = 'active' AND query LIKE '%pg_sleep(14)%' AND pid <> pg_backend_pid()")?->int("n") ?? 0;
+    } else {
+        $n = $db->first(sql"SELECT COUNT(*) AS n FROM information_schema.processlist
+            WHERE info LIKE '%SLEEP(14)%' AND id <> CONNECTION_ID()")?->int("n") ?? 0;
+    }
+    $held = $n > 0;
+}
+echo $held ? "held" : "not held after 20 seconds";

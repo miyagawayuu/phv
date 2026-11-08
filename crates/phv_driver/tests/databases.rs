@@ -702,7 +702,9 @@ fn check_tx_keyed_wait(url: &str) {
     std::thread::scope(|s| {
         // Holds the key fourteen seconds.
         let holder = s.spawn(|| run_script(&host, "jobs_tx_hold", Some(Duration::from_secs(60))));
-        std::thread::sleep(Duration::from_millis(1500));
+        // Until the holder sleeps inside its transaction: a fixed pause was
+        // too short on a loaded machine, and the add then found no key.
+        assert_eq!(run_script(&host, "jobs_tx_wait_held", Some(Duration::from_secs(30))), "held", "{url}");
         let start = Instant::now();
         let out = run_script(&host, "jobs_tx_add", Some(Duration::from_secs(30)));
         let took = start.elapsed();
@@ -857,7 +859,9 @@ fn check_adopt(url: &str) {
     assert_eq!(running.id, a_run);
     let a_one = shared.add(&name("a_one"), "first", 0, None).unwrap().unwrap();
     let a_other = shared.add(&name("a_one"), "second", 1800, None).unwrap().unwrap();
-    let a_key = shared.add(&name("a_key"), "", 0, Some(&key)).unwrap().unwrap();
+    // Due in half an hour: a job due now would tie with `a_one` (the same
+    // millisecond on a fast machine, where the store takes them by id).
+    let a_key = shared.add(&name("a_key"), "", 1800, Some(&key)).unwrap().unwrap();
     let b_one = shared.add(&name("b_one"), "", 0, None).unwrap().unwrap();
     assert!(shared.add(&name("b_key"), "", 0, Some(&key)).unwrap().is_none(), "the key is A's in the shared store");
     let b_key = shared.add(&name("b_key"), "", 0, Some(&key_b)).unwrap().unwrap();
