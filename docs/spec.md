@@ -2927,11 +2927,14 @@ Planned, in this order. Each release is audited before it is published, as befor
   shared store, and faster pages: the lookup of middleware and error pages is cached, a page's connections are
   returned after its response, kept SQLite connections keep their prepared statements, and the release build uses
   fat LTO.
-- **1.2.x**, in patch releases: what the measuring and the assessments of 1.2.0 left, listed with its code, risks
-  and measures in [improvement-plan.md](improvement-plan.md): a table-driven HTML context tracker and a pinned SQLite
-  opcode table first; then cheaper connection resets, lazy session values, Redis pipelining, `phv jobs adopt`, a lazy
-  JIT with shared standard-library code, lazy exception traces, a fast path for callbacks, a smaller allocator
-  under the counting one, and the editor's debounce.
+- **1.2.1, the plan of 1.2.0** (done): what the measuring and the assessments of 1.2.0 left
+  ([improvement-plan.md](improvement-plan.md)): a table-driven HTML context tracker, a pinned SQLite opcode table and a
+  cache of statement weights; cheaper PostgreSQL and MySQL connection resets, lazy session values, Redis pipelines
+  (`Redis::pipeline()`), `phv jobs adopt`, the JIT compiling loops and recursive functions as units that the pages of
+  a process share, exception traces built when they are printed, a fast path for callbacks, mimalloc under the
+  counting allocator, the HTTP client keeping connections for every method, and the editor's debounce. A JIT that
+  compiles a function at its Nth call was tried and left out: its gain was small and it changed a function's
+  exception trace at the Nth call.
 - **1.3**: the JIT for objects, closures, methods and `echo`, cached type-checked modules, a worker pool that reuses
   VMs, and more of the standard library. Generators (`yield`) and traits are being considered; they would come in a
   minor release too, since they only add to the language.
