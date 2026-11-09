@@ -3457,9 +3457,10 @@ Planned, in this order. Each release is audited before it is published, as befor
   counting allocator, the HTTP client keeping connections for every method, and the editor's debounce. A JIT that
   compiles a function at its Nth call was tried and left out: its gain was small and it changed a function's
   exception trace at the Nth call.
-- **1.3**: the JIT for objects, methods and `echo`, a smaller syntax tree, faster loading and checking of pages;
-  generators (`yield`) and traits, which only add to the language; and in the standard library, translations
-  (i18n), images and an ORM.
+- **1.3** (done): the JIT for objects, methods and `echo`, a smaller syntax tree, faster loading and checking of
+  pages, and a pool of page threads; generators (`yield`) and traits, which only add to the language; and in the
+  standard library, translations (`std.i18n`), images (`std.image`) and an ORM (`std.orm`). Reusing VMs between
+  pages and caching type-checked modules were measured and left out ([improvement-plan.md](improvement-plan.md)).
 
 Some features are left out on purpose, because they work against the design principles (§1): `eval`, variable
 variables, static properties and global variables, references (`&$x`), truthiness, `===`, `@`, `goto`, magic
