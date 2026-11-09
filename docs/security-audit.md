@@ -2137,6 +2137,15 @@ them) against databases reached through Docker Desktop's port forwarding, a MySQ
 limits. 8d1a290 fails the same way, in another test of keyed jobs; each passes when run alone, with its own file, or
 after a pause of 90 seconds.
 
+After the fixes were pushed, CI found two more things. Its dependency audit reported RUSTSEC-2026-0459 (SQLite
+CVE-2026-119375, through `libsqlite3-sys` 0.35, published 2026-10-30): rusqlite is now 0.41.0 with `libsqlite3-sys`
+0.39.0 and SQLite 3.54.0, and the cost model's table of SQLite's steps was checked against 3.54.0 as its pin asks
+(`IFindKey`, an index seek of `integrity_check`, weighs a comparison; `IfEmpty` is free; `IfNotOpen` is gone; the
+changed operands of `IdxDelete`, `Int64`, `NullRow` and the hints change no weight), and every one of its 191 steps is
+in the table. And the new session locks of R22-24 let a session saved without a pause keep a reader under the same
+lock waiting for many saves (375 ms on Linux), as a plain mutex lets the thread that just let it go take it again:
+each lock now hands itself over in the order it was asked for.
+
 ### Regression tests
 
 Regression tests are named after what they check, in each crate's tests and in `tests/cases` and `tests/db`

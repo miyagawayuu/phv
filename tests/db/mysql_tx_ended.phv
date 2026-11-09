@@ -7,6 +7,14 @@
 import std.db.Database;
 
 $db = Database::connect("main");
+
+/** Waits up to 10 seconds until `$count` finds a row (its column `n` above 0). */
+function waitFor(Database $db, Sql $count): void {
+    $start = microtime();
+    while (($db->first($count)?->int("n") ?? 0) == 0 && microtime() - $start < 10.0) {
+        $db->query(sql"SELECT SLEEP(0.02)");
+    }
+}
 $db->execute(sql"DROP TABLE IF EXISTS phv_tx");
 $db->execute(sql"DROP TABLE IF EXISTS phv_tx_extra");
 $db->execute(sql"CREATE TABLE phv_tx (id int PRIMARY KEY AUTO_INCREMENT, name varchar(20) NOT NULL UNIQUE, v int NOT NULL DEFAULT 0)");
@@ -58,7 +66,9 @@ try {
         // last one: this transaction, which changed nothing, is the one
         // MySQL rolls back when it then waits for the first row.
         $other = $db->executeAsync(sql"UPDATE phv_tx SET v = 2 WHERE id >= {$first}");
-        $db->query(sql"SELECT SLEEP(0.5)");
+        // Until the other connection waits for the last row (a fixed pause
+        // was too short on a loaded machine).
+        waitFor($db, sql"SELECT COUNT(*) AS n FROM information_schema.innodb_trx WHERE trx_state = 'LOCK WAIT'");
         try {
             $db->execute(sql"UPDATE phv_tx SET v = 1 WHERE id = {$first}");
         } catch (DatabaseError $e) {
@@ -83,7 +93,9 @@ $db->transaction(function () use ($db, $first): void {
     $db->execute(sql"INSERT INTO phv_tx (name) VALUES ('lock-wait')");
     // Another connection holds the first row for two seconds.
     $other = $db->executeAsync(sql"UPDATE phv_tx SET v = 3 WHERE id = {$first} AND SLEEP(2) = 0");
-    $db->query(sql"SELECT SLEEP(0.5)");
+    // Until the other connection holds the row and sleeps.
+    waitFor($db, sql"SELECT COUNT(*) AS n FROM information_schema.processlist
+        WHERE info LIKE '%SLEEP(2) = 0%' AND state = 'User sleep' AND id <> CONNECTION_ID()");
     try {
         $db->execute(sql"UPDATE phv_tx SET v = 4 WHERE id = {$first}");
     } catch (DatabaseError $e) {

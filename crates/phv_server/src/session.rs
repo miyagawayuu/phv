@@ -339,7 +339,7 @@ struct FileStore {
     /// at a time while those of other sessions go on (found by the 19th
     /// assessment: one lock for the directory let a server save about 250
     /// sessions a second on Windows, whatever its cores).
-    locks: Vec<Mutex<Option<File>>>,
+    locks: Vec<Stripe>,
     /// How long each write of a session file takes longer (a slow disk, in tests).
     #[cfg(test)]
     write_delay: Duration,
@@ -356,8 +356,36 @@ fn stripe_of(hash: &str) -> Option<usize> {
     u8::from_str_radix(hash.get(..2)?, 16).ok().map(|b| usize::from(b) % LOCK_STRIPES)
 }
 
-/// Holds a session lock, and the OS lock on its file, until dropped.
-struct SessionLock<'a>(std::sync::MutexGuard<'a, Option<File>>);
+/// One of the session locks: its lock file, opened once, and a queue that
+/// hands the lock over in the order it was asked for. A plain mutex lets the
+/// thread that just let it go take it again at once, so a session saved
+/// without a pause kept a reader of another session under the same lock
+/// waiting for many saves (375 ms on CI, found while checking the fixes of
+/// the 19th assessment).
+#[derive(Default)]
+struct Stripe {
+    file: Mutex<Option<File>>,
+    /// The next ticket to give out, and the ticket whose turn it is.
+    queue: Mutex<(u64, u64)>,
+    turn: std::sync::Condvar,
+}
+
+/// A turn at a `Stripe`: the next ticket's turn comes when it is dropped
+/// (also when what it guards failed or panicked).
+struct Turn<'a>(&'a Stripe);
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut q = self.0.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.1 += 1;
+        drop(q);
+        self.0.turn.notify_all();
+    }
+}
+
+/// Holds a session lock, and the OS lock on its file, until dropped. The
+/// fields drop after `drop` lets the OS lock go: the file, then the turn.
+struct SessionLock<'a>(std::sync::MutexGuard<'a, Option<File>>, #[allow(dead_code)] Turn<'a>);
 
 impl Drop for SessionLock<'_> {
     fn drop(&mut self) {
@@ -440,7 +468,7 @@ impl FileStore {
             written: AtomicU64::new(0),
             max_sessions: MAX_SESSIONS,
             max_bytes: MAX_BYTES as u64,
-            locks: (0..LOCK_STRIPES).map(|_| Mutex::new(None)).collect(),
+            locks: (0..LOCK_STRIPES).map(|_| Stripe::default()).collect(),
             #[cfg(test)]
             write_delay: Duration::ZERO,
         }
@@ -453,7 +481,18 @@ impl FileStore {
 
     /// Takes lock `n` of `LOCK_STRIPES`.
     fn lock_stripe(&self, n: usize) -> std::io::Result<SessionLock<'_>> {
-        let mut held = self.locks[n].lock().unwrap_or_else(|e| e.into_inner());
+        let stripe = &self.locks[n];
+        let turn = {
+            let mut q = stripe.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let ticket = q.0;
+            q.0 += 1;
+            while q.1 != ticket {
+                q = stripe.turn.wait(q).unwrap_or_else(|e| e.into_inner());
+            }
+            Turn(stripe)
+        };
+        // Only the holder of the turn gets here, so this is free.
+        let mut held = stripe.file.lock().unwrap_or_else(|e| e.into_inner());
         if held.is_none() {
             let fail = |e: safefs::FsError| std::io::Error::other(format!("{e:?}"));
             let name = format!(".phv-session-{n:02x}.lock");
@@ -461,7 +500,7 @@ impl FileStore {
             *held = Some(parent.open(&name, true).map_err(fail)?);
         }
         held.as_ref().expect("opened above").lock()?;
-        Ok(SessionLock(held))
+        Ok(SessionLock(held, turn))
     }
 
     /// The session directory, opened once for the steps of one change (each

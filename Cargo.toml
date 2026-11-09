@@ -38,7 +38,7 @@ sha1 = "0.10"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 argon2 = "0.5"
 base64 = "0.22"
-rusqlite = { version = "0.37", features = ["bundled", "limits", "hooks", "functions"] }
+rusqlite = { version = "=0.41.0", features = ["bundled", "limits", "hooks", "functions"] }
 toml = "0.9"
 semver = "1"
 serde = { version = "1", features = ["derive"] }

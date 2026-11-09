@@ -44,7 +44,7 @@ use std::time::SystemTime;
 /// class it belongs to (`SQLITE_OPCODES` in the tests lists them all), run the
 /// corpus test (`every_opcode_is_classed`), then change this.
 #[cfg(test)]
-const SQLITE_VERSION: &str = "3.50.2";
+const SQLITE_VERSION: &str = "3.54.0";
 
 /// The most a statement may weigh, in slow reads of a whole value. At 16 MB a
 /// value, 128 of them take about 3.5 seconds (measured, the slowest kind);
@@ -84,7 +84,7 @@ const FREE: &[&str] = &[
     "Halt",
     "HaltIfNull",
     "IdxRowid",
-    "IfNotOpen",
+    "IfEmpty",
     "IfNotZero",
     "IfNullRow",
     "IfPos",
@@ -173,6 +173,7 @@ const COMPARE: &[&str] = &[
     "Filter",
     "FilterAdd",
     "Found",
+    "IFindKey",
     "IdxDelete",
     "IdxGE",
     "IdxGT",
@@ -646,6 +647,7 @@ mod tests {
         "Gt",
         "Halt",
         "HaltIfNull",
+        "IFindKey",
         "IdxDelete",
         "IdxGE",
         "IdxGT",
@@ -654,9 +656,9 @@ mod tests {
         "IdxLT",
         "IdxRowid",
         "If",
+        "IfEmpty",
         "IfNoHope",
         "IfNot",
-        "IfNotOpen",
         "IfNotZero",
         "IfNullRow",
         "IfPos",

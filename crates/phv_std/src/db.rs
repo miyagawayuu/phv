@@ -588,9 +588,9 @@ fn take_largest(map: &mut HashMap<PathBuf, Vec<Idle>>) -> Option<Idle> {
 }
 
 /// Rolls back what the script left and checks the connection can be kept.
-fn reusable(c: Connection, session: &Session) -> Option<Connection> {
+fn reusable(mut c: Connection, session: &Session) -> Option<Connection> {
     // Statements run here must not stop at the script's deadline.
-    c.progress_handler(0, None::<fn() -> bool>);
+    c.progress_handler(0, None::<fn() -> bool>).ok()?;
     session.set_deadline(None);
     if session.tainted.load(Ordering::SeqCst) {
         return None;
@@ -714,7 +714,7 @@ impl Session {
     /// Registers the authorizer and PHV's SQL functions on a new connection
     /// to `file` (none for `:memory:`), after the caller's own pragmas (the
     /// authorizer refuses them).
-    fn install(c: &Connection, file: Option<cost::Database>) -> rusqlite::Result<Arc<Session>> {
+    fn install(c: &mut Connection, file: Option<cost::Database>) -> rusqlite::Result<Arc<Session>> {
         let session = Arc::new(Session {
             tainted: AtomicBool::new(false),
             compiles: AtomicU64::new(0),
@@ -751,7 +751,7 @@ impl Session {
                 auth.tainted.store(true, Ordering::SeqCst);
             }
             sqlite_authorizer(ctx)
-        }));
+        }))?;
         Ok(session)
     }
 
@@ -775,11 +775,11 @@ impl Session {
 /// progress handler with its deadline, the session's deadline and taint,
 /// counters that start from zero, and the size of programs. Nothing here
 /// expires the connection's prepared statements.
-fn for_script(c: &Connection, vm: &Vm, session: &Session) -> rusqlite::Result<()> {
+fn for_script(c: &mut Connection, vm: &Vm, session: &Session) -> rusqlite::Result<()> {
     // Queries stop when the script's time limit is reached.
     match vm.deadline() {
-        Some(deadline) => c.progress_handler(PROGRESS_STEPS, Some(move || Instant::now() > deadline)),
-        None => c.progress_handler(0, None::<fn() -> bool>),
+        Some(deadline) => c.progress_handler(PROGRESS_STEPS, Some(move || Instant::now() > deadline))?,
+        None => c.progress_handler(0, None::<fn() -> bool>)?,
     }
     session.set_deadline(vm.deadline());
     session.tainted.store(false, Ordering::SeqCst);
@@ -1096,8 +1096,7 @@ fn query(vm: &mut Vm, a: &[Value]) -> R {
                 }
                 Err(e) => return Err(db.fail(vm, e)),
             };
-            let out =
-                out.get_or_insert_with(|| ResultRows::new(row.as_ref().column_names().iter().map(|n| n.to_string())));
+            let out = out.get_or_insert_with(|| ResultRows::new(row.as_ref().column_names().map(|n| n.to_string())));
             let mut values = Vec::with_capacity(out.names.len());
             for i in 0..out.names.len() {
                 let v = match row.get_ref(i).map_err(|e| db.fail(vm, e))? {
@@ -1185,13 +1184,13 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
     check_journals(&dir, &name).map_err(|e| file_error(vm, e))?;
     let now = dir.plain_file_id(&name).map_err(|e| file_error(vm, e))?;
     let key = dir.path().join(&name);
-    let (c, id, base, session) = match now.and_then(|id| take(&key, id).map(|(c, base, s)| (c, id, base, s))) {
+    let (mut c, id, base, session) = match now.and_then(|id| take(&key, id).map(|(c, base, s)| (c, id, base, s))) {
         Some(kept) => kept,
         None => {
             // SQLite starts (once, for good) before the connection is measured.
             vfs::register();
             let before = phv_vm::alloc::thread_allocated();
-            let (c, id) = open_in(&dir, &name).map_err(|e| match e {
+            let (mut c, id) = open_in(&dir, &name).map_err(|e| match e {
                 OpenError::File(_, e) => file_error(vm, e),
                 OpenError::NoFileSystem => vm.throw("DatabaseError", NO_FILE_SYSTEM),
                 OpenError::Sqlite(e) => db_error(vm, e),
@@ -1200,7 +1199,7 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
             let created = std::fs::metadata(dir.path().join(&name)).and_then(|m| m.created()).ok();
             let session = harden(&c)
                 .and_then(|()| script_settings(&c))
-                .and_then(|()| Session::install(&c, Some(cost::Database::new(id, created))))
+                .and_then(|()| Session::install(&mut c, Some(cost::Database::new(id, created))))
                 .map_err(|e| db_error(vm, e))?;
             let base = (phv_vm::alloc::thread_allocated() - before).max(0) as usize;
             (c, id, base, session)
@@ -1208,7 +1207,7 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
     };
     // A kept connection's memory counts from here (its `Idle` was dropped):
     // a failure below closes it on this thread.
-    for_script(&c, vm, &session).map_err(|e| db_error(vm, e))?;
+    for_script(&mut c, vm, &session).map_err(|e| db_error(vm, e))?;
     drop(budget);
     let lease = Lease { key, id, session: session.clone(), base };
     let db = Db {
@@ -1241,7 +1240,7 @@ fn script_settings(c: &Connection) -> rusqlite::Result<()> {
 /// `Database::open(":memory:")`: a database of the script's own, never kept.
 fn open_memory(vm: &mut Vm, _budget: mem::Budget) -> R {
     let counted = mem::init();
-    let c = Connection::open_in_memory().map_err(|e| db_error(vm, e))?;
+    let mut c = Connection::open_in_memory().map_err(|e| db_error(vm, e))?;
     harden(&c).and_then(|()| script_settings(&c)).map_err(|e| db_error(vm, e))?;
     // An in-memory database has at most the script's memory limit in pages
     // (found by the 1.0 audit: it had all of SQLite's). Its pages count as
@@ -1261,8 +1260,8 @@ fn open_memory(vm: &mut Vm, _budget: mem::Budget) -> R {
     }
     c.execute_batch(&format!("PRAGMA page_size = 4096; PRAGMA max_page_count = {pages}"))
         .map_err(|e| db_error(vm, e))?;
-    let session = Session::install(&c, None).map_err(|e| db_error(vm, e))?;
-    for_script(&c, vm, &session).map_err(|e| db_error(vm, e))?;
+    let session = Session::install(&mut c, None).map_err(|e| db_error(vm, e))?;
+    for_script(&mut c, vm, &session).map_err(|e| db_error(vm, e))?;
     let db =
         Db { conn: Some(c), _dir: None, depth: Cell::new(0), ended: Cell::new(None), pages, pooled: None, session };
     vm.resources.push(Some(Box::new(db)));
@@ -1363,14 +1362,14 @@ pub(crate) fn open_file(
 ) -> Result<(Connection, crate::safefs::DirGuard), String> {
     let (dir, name) = crate::safefs::open_parent(base, rel)
         .map_err(|e| format!("{}: {}", rel.display(), crate::safefs::describe(&e)))?;
-    let (c, _) = open_in(&dir, &name).map_err(|e| match e {
+    let (mut c, _) = open_in(&dir, &name).map_err(|e| match e {
         OpenError::File(suffix, e) => format!("{}{suffix}: {}", rel.display(), crate::safefs::describe(&e)),
         OpenError::NoFileSystem => NO_FILE_SYSTEM.to_string(),
         OpenError::Sqlite(e) => format!("{}: {e}", rel.display()),
     })?;
     harden(&c).map_err(|e| e.to_string())?;
     // Last: the authorizer refuses the pragmas set above.
-    c.authorizer(Some(sqlite_authorizer));
+    c.authorizer(Some(sqlite_authorizer)).map_err(|e| e.to_string())?;
     Ok((c, dir))
 }
 

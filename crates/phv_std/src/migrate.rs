@@ -105,20 +105,33 @@ impl Conn {
         let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         match self {
             Conn::Sqlite(c, _) => {
-                let tx = c.transaction().map_err(|e| e.to_string())?;
+                c.execute_batch("BEGIN").map_err(|e| e.to_string())?;
                 // The migration cannot end the transaction it runs in (`COMMIT;`
                 // in it would keep half of a failing migration; found by the
-                // 1.0.0 audit).
-                tx.authorizer(Some(migration_authorizer));
-                let ran = tx.execute_batch(sql).map_err(|e| e.to_string());
-                tx.authorizer(Some(crate::db::sqlite_authorizer));
-                ran?;
-                tx.execute(
-                    "INSERT INTO phv_migrations (name, checksum, applied_at) VALUES (?1, ?2, ?3)",
-                    [name, sum.as_str(), at.as_str()],
-                )
-                .map_err(|e| e.to_string())?;
-                tx.commit().map_err(|e| e.to_string())
+                // 1.0.0 audit). The authorizer is set on the connection, which
+                // is not borrowed by a transaction meanwhile.
+                let ran = c
+                    .authorizer(Some(migration_authorizer))
+                    .and_then(|()| c.execute_batch(sql))
+                    .map_err(|e| e.to_string());
+                // Back to the scripts' authorizer whatever happened; if that
+                // fails, the connection is not used again.
+                let restored = c.authorizer(Some(crate::db::sqlite_authorizer)).map_err(|e| e.to_string());
+                let done = ran
+                    .and(restored)
+                    .and_then(|()| {
+                        c.execute(
+                            "INSERT INTO phv_migrations (name, checksum, applied_at) VALUES (?1, ?2, ?3)",
+                            [name, sum.as_str(), at.as_str()],
+                        )
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                    })
+                    .and_then(|()| c.execute_batch("COMMIT").map_err(|e| e.to_string()));
+                if done.is_err() && !c.is_autocommit() {
+                    let _ = c.execute_batch("ROLLBACK");
+                }
+                done
             }
             Conn::Server(c) => c.apply(name, &sum, sql, &at),
         }
