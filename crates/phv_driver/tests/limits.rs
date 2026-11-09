@@ -179,9 +179,10 @@ $u = str_repeat("a", 9999999) . "c";
 list<string> $a = [];
 list<string> $b = [];
 // Equal to $s and $t, but other strings: each comparison reads them whole.
+// 40,000 of them: 4,000 took less than the second on CI's fastest runners.
 $s2 = $s . "";
 $t2 = $t . "";
-for ($i = 0; $i < 4000; $i++) {{ $a[] = $i % 2 == 0 ? $s : $t; $b[] = $i % 2 == 0 ? $s2 : $t2; }}
+for ($i = 0; $i < 40000; $i++) {{ $a[] = $i % 2 == 0 ? $s : $t; $b[] = $i % 2 == 0 ? $s2 : $t2; }}
 echo {expr};
 "#
         );
