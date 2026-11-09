@@ -756,12 +756,16 @@ impl Store {
             return;
         }
         // Drop a tenth: first sessions that were never used again (the least
-        // recently used), then the newest of those that were.
+        // recently used), then the newest of those that were. Every session's
+        // age is measured from one instant: measured as the map is walked, a
+        // session read later looks older than one created just before it.
+        let now = Instant::now();
         let mut by_age: Vec<(bool, f64, String)> = inner
             .map
             .iter()
             .map(|(k, e)| {
-                let (idle, age) = (e.last.elapsed().as_secs_f64(), e.created.elapsed().as_secs_f64());
+                let idle = now.saturating_duration_since(e.last).as_secs_f64();
+                let age = now.saturating_duration_since(e.created).as_secs_f64();
                 (e.returned, if e.returned { keep_score(age, idle) } else { -idle }, k.clone())
             })
             .collect();

@@ -40,6 +40,29 @@ fn run_both(name: &str, src: &str, limits: Limits, native: &[&str]) -> String {
     format!("{out}{}", err.unwrap_or_default())
 }
 
+/// Runs `src` without and with the JIT (every eligible function compiled),
+/// as `run_both` does, but returns each run's output and first error line
+/// without comparing them: for programs whose output depends on timing.
+fn run_each(name: &str, src: &str, limits: Limits, native: &[&str]) -> Vec<(bool, String)> {
+    let dir = std::env::temp_dir().join(format!("phv-jit-test-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("main.phv");
+    std::fs::write(&entry, src).unwrap();
+    let mut results = Vec::new();
+    for jit in [false, true] {
+        let mut c = compile(&dir, &entry).unwrap_or_else(|e| panic!("{}", e.render(false)));
+        if jit {
+            c.enable_jit_all();
+            assert_compiled(&c, native);
+        }
+        let outcome = run(&c, RunOptions { html: false, limits, http: None, host: None });
+        let err = outcome.error.map(|e| e.render().lines().next().unwrap_or_default().to_string());
+        results.push((jit, format!("{}{}", outcome.output, err.unwrap_or_default())));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    results
+}
+
 fn assert_compiled(c: &phv_driver::Compiled, names: &[&str]) {
     if std::env::var("PHV_JIT").is_ok_and(|v| v == "0") {
         return;
@@ -1145,8 +1168,11 @@ echo hoard(10000000);
     assert!(out.ends_with("Fatal error: allowed memory size of 32 MB exhausted\n"), "{out}");
     let limits = Limits { max_time: Some(Duration::from_millis(300)), ..Limits::default() };
     let src = src.replace("echo shout(100000000);", "echo hoard(2000);\nwhile (true) { shout(10); }");
-    let out = run_both("echo_time", &src, limits, &["shout", "hoard"]);
-    assert!(out.ends_with("Fatal error: maximum execution time of 0.3 seconds exceeded"), "{out}");
+    // Where a time limit stops a program depends on the machine's speed, so
+    // the two runs' output is not compared: both must stop at the limit.
+    for (jit, out) in run_each("echo_time", &src, limits, &["shout", "hoard"]) {
+        assert!(out.ends_with("Fatal error: maximum execution time of 0.3 seconds exceeded"), "JIT {jit}: {out}");
+    }
 }
 
 /// Compiled code that reads properties by slot is shared only between
