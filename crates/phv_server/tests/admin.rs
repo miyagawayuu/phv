@@ -223,10 +223,33 @@ fn silent_connections_do_not_keep_health_waiting() {
         })
         .collect();
     std::thread::sleep(Duration::from_millis(500));
-    let mut worst = Duration::ZERO;
+    // The probes come from the flooding address itself: one whose request
+    // is not read before more silent connections arrive may be closed to
+    // make room (as the specification says), and is then tried again, as a
+    // liveness checker does. What must not happen is a probe kept waiting
+    // (it waited the 5-second header timeout before).
+    let probe = || -> Option<Reply> {
+        let mut s = TcpStream::connect(admin).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(20))).ok()?;
+        s.write_all(b"GET /health HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").ok()?;
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status = text.lines().next()?.split(' ').nth(1)?.parse().ok()?;
+        Some(Reply { status, headers: Vec::new(), body: text.split_once("\r\n\r\n")?.1.to_string() })
+    };
+    let (mut worst, mut closed) = (Duration::ZERO, 0);
     for _ in 0..10 {
         let start = Instant::now();
-        let h = get(admin, "/health", "");
+        let h = loop {
+            match probe() {
+                Some(h) => break h,
+                None => {
+                    closed += 1;
+                    assert!(closed <= 10, "probes closed {closed} times");
+                }
+            }
+        };
         assert_eq!((h.status, h.body.as_str()), (200, "ok\n"));
         worst = worst.max(start.elapsed());
         std::thread::sleep(Duration::from_millis(100));
@@ -235,7 +258,7 @@ fn silent_connections_do_not_keep_health_waiting() {
     for h in holders {
         h.join().unwrap();
     }
-    assert!(worst < Duration::from_secs(1), "the slowest /health took {worst:?}");
+    assert!(worst < Duration::from_secs(1), "the slowest /health took {worst:?} ({closed} probes closed)");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
