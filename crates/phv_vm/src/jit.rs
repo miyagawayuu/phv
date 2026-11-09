@@ -12,7 +12,7 @@ use crate::bytecode::Program;
 use crate::value::{compare, Value};
 use crate::vm::{
     const_value, copy_cost, key_repr, op_append, op_concat, op_to_str, path_append, path_assign, str_len, MemLimit,
-    PathError, BUDGET, LONG_OP,
+    PathError, Vm, VmError, BUDGET, LONG_OP,
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -39,6 +39,14 @@ pub struct JitCtx {
     /// native code names (see `Installed::consts`): compiled code is shared
     /// between programs, so it names constants by their index in the unit.
     pub consts: *const u32,
+    /// The VM that made the call: helpers that create objects, write output
+    /// or check the limits run its own code (see `with_vm`).
+    pub vm: *mut Vm,
+    /// The program's function id of each function of the running unit, by
+    /// its index in the unit (see `Installed::funcs`).
+    pub funcs: *const u32,
+    /// The program's class id of each class the running unit names.
+    pub classes: *const u32,
 }
 
 /// Native stack the JIT's code may use below the outermost native call.
@@ -62,6 +70,9 @@ pub const JIT_ERR_FLOAT_TO_INT: i64 = 8;
 pub const JIT_ERR_STACK: i64 = 9;
 /// A helper raised an exception (`JitRt::pending`), as the interpreter would.
 pub const JIT_ERR_THROW: i64 = 10;
+/// The VM's own code, run by a helper, failed (`JitRt::error`): an
+/// exception, or a limit, with the interpreter's message.
+pub const JIT_ERR_VM: i64 = 11;
 
 /// Kinds of the scalar `phv_jit_put` stores in a window slot.
 pub const JIT_PUT_INT: i64 = 1;
@@ -94,9 +105,37 @@ pub struct Installed {
     /// of code `entry` belongs to names (the unit's code is shared between
     /// programs, and names constants by their index in the unit).
     pub consts: Arc<[u32]>,
+    /// For `JitCtx::funcs`: the program's id of each function of the unit.
+    pub funcs: Arc<[u32]>,
+    /// For `JitCtx::classes`: the program's id of each class the unit names.
+    pub classes: Arc<[u32]>,
     /// Owns the executable memory `entry` points into: the unit lives at
     /// least as long as this.
     pub keep_alive: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl Installed {
+    /// What `Vm::call_jit` needs of it: pointers into it, which live as long
+    /// as the table the VM keeps.
+    pub(crate) fn call(&self) -> JitCall {
+        JitCall {
+            entry: self.entry,
+            consts: self.consts.as_ptr(),
+            funcs: self.funcs.as_ptr(),
+            nfuncs: self.funcs.len(),
+            classes: self.classes.as_ptr(),
+        }
+    }
+}
+
+/// See `Installed::call`.
+#[derive(Clone, Copy)]
+pub(crate) struct JitCall {
+    pub entry: JitEntry,
+    pub consts: *const u32,
+    pub funcs: *const u32,
+    pub nfuncs: usize,
+    pub classes: *const u32,
 }
 
 /// Native code for the functions the JIT compiled, by function id. One table
@@ -114,11 +153,16 @@ pub struct JitTable {
     /// extra reference would make that change copy the whole value), so when
     /// its native code runs out of stack it stops instead.
     pub writes_args: Vec<bool>,
+    /// Per function: it, or a function it calls, changes an object or
+    /// writes output. Such a call is never run again by the interpreter
+    /// (its effects would happen twice): out of native stack it stops, and
+    /// out of memory it fails as the interpreter would at that point.
+    pub impure: Vec<bool>,
 }
 
 impl JitTable {
-    pub fn new(entries: Vec<Option<Installed>>, writes_args: Vec<bool>) -> JitTable {
-        JitTable { entries, writes_args }
+    pub fn new(entries: Vec<Option<Installed>>, writes_args: Vec<bool>, impure: Vec<bool>) -> JitTable {
+        JitTable { entries, writes_args, impure }
     }
 
     /// The native code of function `f`, if it has any.
@@ -153,6 +197,13 @@ pub struct JitRt {
     pub(crate) prog: Option<Arc<Program>>,
     /// The exception a helper raised (`JIT_ERR_THROW`): its class and message.
     pending: Option<(&'static str, String)>,
+    /// The error the VM's code returned to a helper (`JIT_ERR_VM`).
+    error: Option<VmError>,
+    /// When native code stops with an error, each native frame it leaves
+    /// notes its function (by index in the unit) and the position after the
+    /// instruction that failed, innermost first: the exception's trace has
+    /// the calls the interpreter would have had.
+    pub(crate) trace: Vec<(u32, u32)>,
 }
 
 impl JitRt {
@@ -187,6 +238,11 @@ impl JitRt {
     pub(crate) fn take_pending(&mut self) -> (&'static str, String) {
         self.pending.take().unwrap_or(("RuntimeException", "internal error in native code".into()))
     }
+
+    /// The error of `JIT_ERR_VM`.
+    pub(crate) fn take_error(&mut self) -> VmError {
+        self.error.take().unwrap_or_else(|| VmError::Fatal("internal error in native code".into()))
+    }
 }
 
 /// Makes native code stop with exception `class`.
@@ -207,21 +263,48 @@ unsafe fn wrong_value(ctx: *mut JitCtx) {
     throw(ctx, "RuntimeException", "internal error: a native list operation found another kind of value".into());
 }
 
-/// Called by native code when its budget runs out: checks the time and memory limits.
+/// Runs `f` on the VM that made the native call, with native code's budget
+/// (so a long step makes the next loop step or call check the limits, as in
+/// the interpreter); an error is kept for the VM (`JIT_ERR_VM`).
 ///
 /// # Safety
-/// `ctx` must point to a live `JitCtx` whose `limits` points to live `JitLimits`.
+/// `ctx.vm` points to the VM running `Vm::call_jit`, which does not touch it
+/// until native code returns; `f` must not run PHV code.
+unsafe fn with_vm<T>(ctx: *mut JitCtx, f: impl FnOnce(&mut Vm) -> Result<T, VmError>) -> Option<T> {
+    let vm = &mut *(*ctx).vm;
+    vm.budget = (*ctx).budget.clamp(1, BUDGET as i64) as u32;
+    let r = f(vm);
+    (*ctx).budget = vm.budget as i64;
+    match r {
+        Ok(v) => Some(v),
+        Err(e) => {
+            rt(ctx).error = Some(e);
+            (*ctx).error = JIT_ERR_VM;
+            None
+        }
+    }
+}
+
+/// Called by native code when its budget runs out (at a loop step or a
+/// call): the interpreter's own check, which runs the cycle collector when
+/// it is due and checks the memory and time limits.
+///
+/// # Safety
+/// See `with_vm`.
 pub unsafe extern "C" fn phv_jit_tick(ctx: *mut JitCtx) -> i64 {
-    let ctx = &mut *ctx;
-    ctx.budget = BUDGET as i64;
-    let limits = &*ctx.limits;
-    if limits.deadline.is_some_and(|d| Instant::now() > d) {
-        return JIT_ERR_TIME;
+    match with_vm(ctx, |vm| vm.check_deadline()) {
+        Some(()) => 0,
+        None => JIT_ERR_VM,
     }
-    if limits.mem().check().is_err() {
-        return JIT_ERR_MEMORY;
-    }
-    0
+}
+
+/// Notes that the native frame of function `func` (its index in the unit)
+/// stops with an error after instruction `pc - 1` (see `JitRt::trace`).
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_unwind(ctx: *mut JitCtx, func: i64, pc: i64) {
+    rt(ctx).trace.push((func as u32, pc as u32));
 }
 
 // The helpers below take register numbers as i64. The JIT only passes numbers
@@ -460,6 +543,10 @@ pub extern "C" fn phv_jit_pow(x: f64, y: f64) -> f64 {
 pub const JIT_ELEM_INT: i64 = 0;
 pub const JIT_ELEM_FLOAT: i64 = 1;
 pub const JIT_ELEM_STR: i64 = 2;
+/// A list, a map or an object, in slot `d` (property reads, see `deliver`).
+pub const JIT_ELEM_LIST: i64 = 3;
+pub const JIT_ELEM_MAP: i64 = 4;
+pub const JIT_ELEM_OBJ: i64 = 5;
 
 /// `NewList`: the `n` slots from `start` (moved out) as a list in slot `d`.
 ///
@@ -650,7 +737,8 @@ unsafe fn deliver(ctx: *mut JitCtx, d: i64, kind: i64, v: Value, nullable: bool)
     match (kind, v) {
         (_, Value::Null) if nullable => {
             (*ctx).detail = 1;
-            if kind == JIT_ELEM_STR {
+            // Kinds kept in the window get the null there.
+            if kind >= JIT_ELEM_STR {
                 rt(ctx).top()[d as usize] = Value::Null;
             }
             0
@@ -658,7 +746,10 @@ unsafe fn deliver(ctx: *mut JitCtx, d: i64, kind: i64, v: Value, nullable: bool)
         (JIT_ELEM_INT, Value::Int(n)) => n,
         (JIT_ELEM_INT, Value::Bool(b)) => b as i64,
         (JIT_ELEM_FLOAT, Value::Float(f)) => f.to_bits() as i64,
-        (JIT_ELEM_STR, v @ Value::Str(_)) => {
+        (JIT_ELEM_STR, v @ Value::Str(_))
+        | (JIT_ELEM_LIST, v @ Value::List(_))
+        | (JIT_ELEM_MAP, v @ Value::Map(_))
+        | (JIT_ELEM_OBJ, v @ Value::Object(_)) => {
             rt(ctx).top()[d as usize] = v;
             0
         }
@@ -851,4 +942,305 @@ pub unsafe extern "C" fn phv_jit_new_map(ctx: *mut JitCtx, d: i64, start: i64, n
         m.insert(k.to_key(), v);
     }
     w[d as usize] = Value::map(m);
+}
+
+// Objects, methods and output. Objects live in the window like strings;
+// properties are read and written by slot, with the interpreter's code.
+
+/// `NewObject`: a new object of class `class` (by its index in the unit)
+/// into slot `d`, made by the interpreter's own code (field defaults, the
+/// cycle collector's list).
+///
+/// # Safety
+/// See `with_vm`; `ctx.classes` has an entry for every class the unit names.
+pub unsafe extern "C" fn phv_jit_new(ctx: *mut JitCtx, d: i64, class: i64) {
+    let class = *(*ctx).classes.add(class as usize);
+    let v = with_vm(ctx, |vm| Ok(((class as usize) < vm.prog.classes.len()).then(|| vm.new_object(class))));
+    match v {
+        Some(Some(v)) => rt(ctx).top()[d as usize] = v,
+        _ => wrong_value(ctx),
+    }
+}
+
+/// `GetProp`: property `slot` of the object in slot `o`, into register `d`
+/// (see `deliver`; a null is accepted when `nullable` is set).
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_get_prop(
+    ctx: *mut JitCtx,
+    d: i64,
+    o: i64,
+    slot: i64,
+    kind: i64,
+    nullable: i64,
+) -> i64 {
+    let v = match &rt(ctx).top()[o as usize] {
+        Value::Object(ob) => match ob.try_borrow() {
+            Ok(ob) => ob.fields.get(slot as usize).cloned(),
+            Err(_) => None,
+        },
+        _ => None,
+    };
+    match v {
+        Some(v) => deliver(ctx, d, kind, v, nullable != 0),
+        None => {
+            wrong_value(ctx);
+            0
+        }
+    }
+}
+
+/// `SetProp`: the value in slot `v` into property `slot` of the object in slot `o`.
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_set_prop(ctx: *mut JitCtx, o: i64, slot: i64, v: i64) {
+    let w = rt(ctx).top();
+    let val = w[v as usize].clone();
+    let done = match &w[o as usize] {
+        Value::Object(ob) => match ob.try_borrow_mut() {
+            Ok(mut ob) => match ob.fields.get_mut(slot as usize) {
+                Some(f) => {
+                    let old = std::mem::replace(f, val);
+                    drop(ob);
+                    // Dropped after the borrow: the old value may hold the last
+                    // reference to objects that point back at this one.
+                    drop(old);
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        },
+        _ => false,
+    };
+    if !done {
+        wrong_value(ctx);
+    }
+}
+
+/// `SetProp` of a number or boolean (`JIT_PUT_*`): one call instead of
+/// storing the value in the window first.
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_set_prop_scalar(ctx: *mut JitCtx, o: i64, slot: i64, kind: i64, bits: i64) {
+    let val = match kind {
+        JIT_PUT_INT => Value::Int(bits),
+        JIT_PUT_FLOAT => Value::Float(f64::from_bits(bits as u64)),
+        JIT_PUT_NULL => Value::Null,
+        _ => Value::Bool(bits != 0),
+    };
+    let done = match &rt(ctx).top()[o as usize] {
+        Value::Object(ob) => match ob.try_borrow_mut() {
+            Ok(mut ob) => match ob.fields.get_mut(slot as usize) {
+                Some(f) => {
+                    let old = std::mem::replace(f, val);
+                    drop(ob);
+                    drop(old);
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        },
+        _ => false,
+    };
+    if !done {
+        wrong_value(ctx);
+    }
+}
+
+/// `$o->p = $v` through a path: `$o->p[] = $v` (`push` set, no key) or
+/// `$o->p[$k] = $v` (key in slot `k`), on property `slot` of the object in
+/// slot `o`, with the value in slot `val`: copies accounted first, as the
+/// interpreter does (`set_path_with`).
+///
+/// # Safety
+/// See `rt` and `mem`.
+pub unsafe extern "C" fn phv_jit_set_prop_path(ctx: *mut JitCtx, o: i64, slot: i64, k: i64, push: i64, val: i64) {
+    let mem = mem(ctx);
+    let w = rt(ctx).top();
+    let Value::Object(ob) = &w[o as usize] else {
+        wrong_value(ctx);
+        return;
+    };
+    let ob = ob.clone();
+    let v = w[val as usize].clone();
+    let key = if k >= 0 { vec![w[k as usize].clone()] } else { Vec::new() };
+    let push = push != 0;
+    let r = {
+        let Ok(mut b) = ob.try_borrow_mut() else {
+            wrong_value(ctx);
+            return;
+        };
+        let Some(field) = b.fields.get_mut(slot as usize) else {
+            drop(b);
+            wrong_value(ctx);
+            return;
+        };
+        let cost = copy_cost(field, &key, push);
+        if cost > 0 {
+            if mem.reserve(cost).is_err() {
+                drop(b);
+                (*ctx).error = JIT_ERR_MEMORY;
+                return;
+            }
+            long_op(ctx, cost);
+        }
+        path_assign(field, &key, &[], push, v)
+    };
+    long_key(ctx, key.iter().map(str_len).sum());
+    if let Err((class, msg)) = r {
+        if (*ctx).error == 0 {
+            throw(ctx, class, msg);
+        }
+    }
+}
+
+/// `$o->p .= $x` on property `slot` of the object in slot `o`: `cur` holds
+/// the value read before the string in slot `val` was made (see
+/// `path_append`), as in the interpreter's `append_path_with`.
+///
+/// # Safety
+/// See `rt` and `mem`.
+pub unsafe extern "C" fn phv_jit_append_prop(ctx: *mut JitCtx, o: i64, slot: i64, cur: i64, val: i64) {
+    let mem = mem(ctx);
+    let w = rt(ctx).top();
+    let Value::Object(ob) = &w[o as usize] else {
+        wrong_value(ctx);
+        return;
+    };
+    let ob = ob.clone();
+    let cur = std::mem::take(&mut w[cur as usize]);
+    let src = w[val as usize].clone();
+    let r = {
+        let Ok(mut b) = ob.try_borrow_mut() else {
+            wrong_value(ctx);
+            return;
+        };
+        let Some(field) = b.fields.get_mut(slot as usize) else {
+            drop(b);
+            wrong_value(ctx);
+            return;
+        };
+        let cost = copy_cost(field, &[], false);
+        if cost > 0 {
+            if mem.reserve(cost).is_err() {
+                drop(b);
+                (*ctx).error = JIT_ERR_MEMORY;
+                return;
+            }
+            long_op(ctx, cost);
+        }
+        path_append(field, &[], &[], cur, &src, mem)
+    };
+    match r {
+        Ok(work) => long_op(ctx, work),
+        Err(PathError::Memory(_)) => (*ctx).error = JIT_ERR_MEMORY,
+        Err(PathError::Throw(class, msg)) => throw(ctx, class, msg),
+    }
+}
+
+/// `CallVirtual` of vtable slot `slot` on the object in slot `o`: the
+/// program's id of the function to call (the caller compares it with the
+/// functions of its unit), or -1 with an error.
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_vtarget(ctx: *mut JitCtx, o: i64, slot: i64) -> i64 {
+    let rt = rt(ctx);
+    let class = match &rt.top()[o as usize] {
+        Value::Object(ob) => ob.try_borrow().ok().map(|b| b.class),
+        _ => None,
+    };
+    let f = class.and_then(|c| {
+        let prog = rt.prog.as_ref()?;
+        prog.classes.get(c as usize)?.vtable.get(slot as usize).copied()
+    });
+    match f {
+        Some(f) => f as i64,
+        None => {
+            wrong_value(ctx);
+            -1
+        }
+    }
+}
+
+/// `Echo` (or, with `attr` set, `EchoAttr`) of the value in slot `r`: the
+/// interpreter's own code, with the output checks, escaping and limits of
+/// the buffer being written; returns an error code.
+///
+/// # Safety
+/// See `with_vm`.
+pub unsafe extern "C" fn phv_jit_echo(ctx: *mut JitCtx, r: i64, attr: i64) -> i64 {
+    let v = rt(ctx).top()[r as usize].clone();
+    // The frame's index as the interpreter would have it, for the guards
+    // of the HTML around the call (and those the function set itself).
+    let fi = frame_index(ctx);
+    match with_vm(ctx, |vm| vm.echo_value(fi, v, attr != 0)) {
+        Some(()) => 0,
+        None => JIT_ERR_VM,
+    }
+}
+
+/// `EchoHtml` of constant `c` of the unit; returns an error code.
+///
+/// # Safety
+/// See `with_vm` and `phv_jit_const`.
+pub unsafe extern "C" fn phv_jit_echo_html(ctx: *mut JitCtx, c: i64) -> i64 {
+    let c = *(*ctx).consts.add(c as usize) as usize;
+    let fi = frame_index(ctx);
+    match with_vm(ctx, |vm| vm.echo_html_const(fi, c)) {
+        Some(()) => 0,
+        None => JIT_ERR_VM,
+    }
+}
+
+/// A `CallVirtual` reached a function its unit does not have (only bytecode
+/// that is not what the compiler makes could do that).
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_bad(ctx: *mut JitCtx) {
+    wrong_value(ctx);
+}
+
+/// The interpreter's index of the frame of the native function running: the
+/// frames of native code continue those of the interpreter.
+///
+/// # Safety
+/// See `rt`.
+unsafe fn frame_index(ctx: *mut JitCtx) -> usize {
+    ((*ctx).depth - 1).max(0) as usize
+}
+
+/// `GuardOutput` (`end` 0) or `EndGuard` (`end` 1) in the running native
+/// frame, as the interpreter notes them.
+///
+/// # Safety
+/// See `with_vm`.
+pub unsafe extern "C" fn phv_jit_guard(ctx: *mut JitCtx, end: i64) {
+    let fi = frame_index(ctx);
+    with_vm(ctx, |vm| {
+        if end == 0 {
+            vm.guard_output(fi);
+        } else {
+            vm.end_guard(fi);
+        }
+        Ok(())
+    });
+}
+
+/// `EchoNonce`; returns an error code.
+///
+/// # Safety
+/// See `with_vm`.
+pub unsafe extern "C" fn phv_jit_echo_nonce(ctx: *mut JitCtx) -> i64 {
+    let fi = frame_index(ctx);
+    match with_vm(ctx, |vm| vm.echo_nonce(fi)) {
+        Some(()) => 0,
+        None => JIT_ERR_VM,
+    }
 }

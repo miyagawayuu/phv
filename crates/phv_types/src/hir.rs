@@ -238,6 +238,8 @@ pub struct HField {
     pub name: String,
     pub default: HConst,
     pub public: bool,
+    /// The declared type (with the class's own type parameters, if any).
+    pub ty: Type,
 }
 
 #[derive(Clone, Debug)]

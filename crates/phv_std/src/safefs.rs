@@ -196,6 +196,67 @@ impl DirGuard {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileId(u64, u64);
 
+/// What can be known of a file's content without reading it: which file it
+/// is (see `FileId`), its size and when it was last written (on Unix also
+/// when its inode last changed, which a program cannot set back). Two equal
+/// stamps taken at different times are the same file, unchanged in between,
+/// unless it was written again within the clock's resolution of the first
+/// stamp (the callers' "racy" rule) or its write time was set back (on
+/// Windows; on Unix the change time sees that too).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    file: FileId,
+    len: u64,
+    /// Seconds and nanoseconds since the epoch (None: before it).
+    written: Option<(u64, u32)>,
+    /// The inode's change time on Unix (seconds, nanoseconds); zero on Windows.
+    changed: (i64, i64),
+    is_file: bool,
+}
+
+impl Stamp {
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// A regular file (not a directory, a pipe or a device).
+    pub fn is_file(&self) -> bool {
+        self.is_file
+    }
+
+    /// When the file was last written: seconds and nanoseconds since the
+    /// epoch, as `Metadata::modified` gives them (None before the epoch).
+    pub fn modified(&self) -> Option<(u64, u32)> {
+        self.written
+    }
+
+    /// Whether the file was last written (on Unix: changed in any way) more
+    /// than two seconds before `at` (seconds since the epoch). A file stamped
+    /// at `at` that was not could have been written again within the clock's
+    /// resolution without its stamp changing (the "racy" case). A time before
+    /// the epoch is never settled.
+    pub fn settled_before(&self, at: u64) -> bool {
+        let changed = u64::try_from(self.changed.0).unwrap_or(0);
+        self.written.is_some_and(|(w, _)| w.saturating_add(2) < at) && changed.saturating_add(2) < at
+    }
+}
+
+/// The stamp of an open file.
+pub fn stamp(f: &File) -> io::Result<Stamp> {
+    imp::stamp(f)
+}
+
+/// The stamp of the file at `path`, links followed as opening it would. The
+/// file is not opened for reading (on Unix not opened at all, so a pipe does
+/// not block).
+pub fn stamp_path(path: &Path) -> io::Result<Stamp> {
+    imp::stamp_path(path)
+}
+
 /// Why a path was refused, for messages.
 pub fn describe(e: &FsError) -> String {
     match e {
@@ -340,6 +401,29 @@ mod imp {
         }
         // SAFETY: `fd` is a freshly opened descriptor that nothing else owns.
         Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn stamp_of(m: &std::fs::Metadata) -> super::Stamp {
+        let written = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| (d.as_secs(), d.subsec_nanos()));
+        super::Stamp {
+            file: super::FileId(m.dev(), m.ino()),
+            len: m.len(),
+            written,
+            changed: (m.ctime(), m.ctime_nsec()),
+            is_file: m.is_file(),
+        }
+    }
+
+    pub fn stamp(f: &File) -> io::Result<super::Stamp> {
+        Ok(stamp_of(&f.metadata()?))
+    }
+
+    pub fn stamp_path(path: &Path) -> io::Result<super::Stamp> {
+        Ok(stamp_of(&std::fs::metadata(path)?))
     }
 
     fn link_error(e: io::Error) -> FsError {
@@ -526,6 +610,7 @@ mod imp {
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_SHARE_READ: u32 = 0x1;
     const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_SHARE_DELETE: u32 = 0x4;
     const ATTR_DIRECTORY: u32 = 0x10;
     const ATTR_REPARSE_POINT: u32 = 0x400;
 
@@ -768,6 +853,40 @@ mod imp {
             return Err(FsError::Io(io::Error::last_os_error()));
         }
         Ok(info.nNumberOfLinks as u64)
+    }
+
+    pub fn stamp(f: &File) -> io::Result<super::Stamp> {
+        // SAFETY: `info` is plain data filled by the call; the handle is open.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // 100-nanosecond intervals since 1601, read as `Metadata::modified` does.
+        let ticks =
+            (u64::from(info.ftLastWriteTime.dwHighDateTime) << 32) | u64::from(info.ftLastWriteTime.dwLowDateTime);
+        const EPOCH: u64 = 11_644_473_600;
+        let secs = ticks / 10_000_000;
+        let written = (secs >= EPOCH).then(|| (secs - EPOCH, ((ticks % 10_000_000) * 100) as u32));
+        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        Ok(super::Stamp {
+            file: super::FileId(u64::from(info.dwVolumeSerialNumber), index),
+            len: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+            written,
+            changed: (0, 0),
+            // Any reparse point counts as not a plain file here (its stamp is
+            // then never taken for an earlier one's).
+            is_file: info.dwFileAttributes & (ATTR_DIRECTORY | ATTR_REPARSE_POINT) == 0,
+        })
+    }
+
+    pub fn stamp_path(path: &Path) -> io::Result<super::Stamp> {
+        // No access to the content: only its attributes are read. Without
+        // FILE_FLAG_BACKUP_SEMANTICS a directory is not opened.
+        let f = OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)?;
+        stamp(&f)
     }
 
     const DRIVE_REMOTE: u32 = 4;

@@ -91,8 +91,8 @@ fn subst_in(t: &Type, b: &Bindings) -> Type {
 /// Whether `e` is a member/index chain containing `?->` (e.g. `$a?->b->c`).
 fn in_nullsafe_chain(e: &Expr) -> bool {
     match &e.kind {
-        ExprKind::MethodCall { nullsafe: true, .. } | ExprKind::Prop { nullsafe: true, .. } => true,
-        ExprKind::MethodCall { obj, .. } | ExprKind::Prop { obj, .. } => in_nullsafe_chain(obj),
+        ExprKind::MethodCall(m) => m.nullsafe || in_nullsafe_chain(&m.obj),
+        ExprKind::Prop(p) => p.nullsafe || in_nullsafe_chain(&p.obj),
         ExprKind::Index { base, .. } => in_nullsafe_chain(base),
         _ => false,
     }
@@ -566,7 +566,8 @@ impl<'a> Checker<'a> {
                 let id = *cx.names.get(name)?;
                 cx.flow.is_assigned(id).then(|| (FactKey::Local(id), cx.current_type(id)))
             }
-            ExprKind::Prop { obj, name, nullsafe: false, .. } => {
+            ExprKind::Prop(p) if !p.nullsafe => {
+                let ast::Prop { obj, name, .. } = &**p;
                 let ExprKind::Var(v) = &obj.kind else { return None };
                 let id = *cx.names.get(v)?;
                 if !cx.flow.is_assigned(id) {
@@ -788,9 +789,7 @@ impl<'a> Checker<'a> {
                 let h = self.expr(x, expect);
                 HExpr { span, ..h }
             }
-            ExprKind::ClassConst { class, class_span, name, name_span } => {
-                self.class_const(class, *class_span, name, *name_span, span)
-            }
+            ExprKind::ClassConst(c) => self.class_const(&c.class, c.class_span, &c.name, c.name_span, span),
             ExprKind::Sql(parts) => {
                 // Placeholders and identifiers are marked with private-use
                 // characters; each database renders them in its own syntax
@@ -881,7 +880,8 @@ impl<'a> Checker<'a> {
                 self.json_decode_as(args, expect, span)
             }
             ExprKind::Call { callee, args } => self.call(callee, args, span),
-            ExprKind::MethodCall { obj, name, name_span, args, nullsafe } => {
+            ExprKind::MethodCall(m) => {
+                let ast::MethodCall { obj, name, name_span, args, nullsafe } = &**m;
                 let ho = self.expr(obj, None);
                 let f = |c: &mut Self, recv| c.method_on(recv, name, *name_span, args, span);
                 if !*nullsafe && in_nullsafe_chain(obj) && matches!(ho.kind, HExprKind::NullSafe { .. }) {
@@ -889,7 +889,8 @@ impl<'a> Checker<'a> {
                 }
                 self.nullsafe(ho, *nullsafe, span, f)
             }
-            ExprKind::Prop { obj, name, name_span, nullsafe } => {
+            ExprKind::Prop(p) => {
+                let ast::Prop { obj, name, name_span, nullsafe } = &**p;
                 let ho = self.expr(obj, None);
                 let ho = self.through_bound(ho);
                 let f = |c: &mut Self, recv: HExpr| match c.prop_access(&recv, name, *name_span) {
@@ -904,12 +905,8 @@ impl<'a> Checker<'a> {
                 }
                 self.nullsafe(ho, *nullsafe, span, f)
             }
-            ExprKind::StaticCall { class, class_span, name, name_span, args } => {
-                self.static_call(class, *class_span, name, *name_span, args, span)
-            }
-            ExprKind::New { class, class_span, type_args, args } => {
-                self.new_expr(class, *class_span, type_args, args, expect, span)
-            }
+            ExprKind::StaticCall(c) => self.static_call(&c.class, c.class_span, &c.name, c.name_span, &c.args, span),
+            ExprKind::New(n) => self.new_expr(&n.class, n.class_span, &n.type_args, &n.args, expect, span),
             ExprKind::Index { base, index } => self.index(base, index.as_deref(), span),
             ExprKind::Closure(c) => self.closure(c, expect, span),
             ExprKind::FuncRef(call) => self.func_ref(call, expect, span),
@@ -2100,7 +2097,8 @@ impl<'a> Checker<'a> {
                 Some((HPlace { base: HPlaceBase::Local(id), path: Vec::new() }, ty))
             }
             ExprKind::Paren(x) => self.place(x),
-            ExprKind::Prop { obj, name, name_span, nullsafe } => {
+            ExprKind::Prop(p) => {
+                let ast::Prop { obj, name, name_span, nullsafe } = &**p;
                 self.clear_prop_facts();
                 if *nullsafe {
                     self.error("cannot assign through `?->`", e.span);
@@ -2642,21 +2640,21 @@ impl<'a> Checker<'a> {
             args.push(Arg { name: None, value: Expr { kind: ExprKind::Var(name), span } });
         }
         let kind = match &call.kind {
-            ExprKind::Call { callee, .. } => ExprKind::Call { callee: callee.clone(), args },
-            ExprKind::MethodCall { name, name_span, .. } => ExprKind::MethodCall {
+            ExprKind::Call { callee, .. } => ExprKind::Call { callee: callee.clone(), args: args.into() },
+            ExprKind::MethodCall(m) => ExprKind::MethodCall(Box::new(ast::MethodCall {
                 obj: Box::new(Expr { kind: ExprKind::Var("%recv".into()), span }),
-                name: name.clone(),
-                name_span: *name_span,
+                name: m.name.clone(),
+                name_span: m.name_span,
                 args,
                 nullsafe: false,
-            },
-            ExprKind::StaticCall { class, class_span, name, name_span, .. } => ExprKind::StaticCall {
-                class: class.clone(),
-                class_span: *class_span,
-                name: name.clone(),
-                name_span: *name_span,
+            })),
+            ExprKind::StaticCall(c) => ExprKind::StaticCall(Box::new(ast::StaticCall {
+                class: c.class.clone(),
+                class_span: c.class_span,
+                name: c.name.clone(),
+                name_span: c.name_span,
                 args,
-            },
+            })),
             _ => unreachable!(),
         };
         self.ctx.push(ctx);
@@ -2765,7 +2763,8 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            ExprKind::MethodCall { obj, name, name_span, nullsafe, .. } => {
+            ExprKind::MethodCall(m) => {
+                let ast::MethodCall { obj, name, name_span, nullsafe, .. } = &**m;
                 if *nullsafe {
                     self.error("`?->` cannot be used with `(...)`", span).add_note("check the value for null first");
                     return None;
@@ -2807,7 +2806,8 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            ExprKind::StaticCall { class, class_span, name, name_span, .. } => {
+            ExprKind::StaticCall(c) => {
+                let ast::StaticCall { class, class_span, name, name_span, .. } = &**c;
                 let cid = match class.as_str() {
                     "self" => self.cx().class,
                     "parent" => {

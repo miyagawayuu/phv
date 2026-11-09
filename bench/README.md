@@ -79,6 +79,12 @@ be sure none follows), and `checks_per_edit` counts those `publishDiagnostics`: 
 waits for the typing to pause before checking, up to `K` when it checks every keystroke. These
 numbers go under `lsp_typing`, beside `lsp`.
 
+With `--pages N`, the session makes no edits: it opens the `N` largest `.phv` files of
+`examples/` one after the other (each waits for its diagnostics), as an editor with `N` tabs does,
+and then reads the server's memory. `rss_bytes` is its working set (resident set),
+`peak_rss_bytes` the peak of it (on macOS, the current value), `open_ms` the time to open them
+all. These go under `lsp_pages`.
+
 ## Comparing two commits
 
 ```powershell

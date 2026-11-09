@@ -7,6 +7,7 @@ pub mod config;
 
 pub use cache::compile_cached;
 pub use config::{load_config, Config, Csp, DEFAULT_CSP};
+use phv_std::safefs;
 use phv_syntax::ast::{Module, StmtKind};
 use phv_syntax::{diag, parse_module_within, Diagnostic, SourceMap, Span};
 use phv_types::{CheckInput, ModuleInput, ModuleKind};
@@ -192,14 +193,27 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 impl Dep {
     /// Records `path` with the content that was actually read (`None`: missing).
     /// Records `path` of the project in `root`.
+    #[cfg(test)]
     fn new(root: &Path, path: &Path, content: Option<&[u8]>) -> Dep {
-        let (mtime, len) = stat(root, path).unwrap_or((None, 0));
+        Dep::hashed(root, path, content.map(sha256), None)
+    }
+
+    /// `Dep::new` with the SHA-256 of the content that was read, and the
+    /// stamp the file had then (see `read_known`), if known.
+    fn hashed(root: &Path, path: &Path, hash: Option<[u8; 32]>, stamp: Option<&safefs::Stamp>) -> Dep {
+        let (mtime, len) = match stamp {
+            // The time and size of the content read, which `stat` would read
+            // again. The check of `stat` for another machine still runs.
+            Some(s) if !safefs::on_another_machine_below(root, path) => (s.modified(), s.len()),
+            Some(_) => (None, 0),
+            None => stat(root, path).unwrap_or((None, 0)),
+        };
         Dep {
             path: path.to_path_buf(),
             root: root.to_path_buf(),
             mtime,
             len,
-            hash: content.map(sha256),
+            hash,
             recorded: Recorded(now_secs().into()),
         }
     }
@@ -320,11 +334,23 @@ pub fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Reads a source file: only a regular file (not a pipe or a device, which could
 /// block forever), of at most `MAX_SOURCE` bytes.
 pub fn read_source(path: &Path) -> std::io::Result<String> {
-    use std::io::{Error, ErrorKind, Read};
     if final_link_to_another_machine(path) {
-        return Err(Error::new(ErrorKind::PermissionDenied, "it is a link to another machine"));
+        return Err(link_to_another_machine());
     }
+    read_opened(path, false).map(|(text, _)| text)
+}
+
+fn link_to_another_machine() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "it is a link to another machine")
+}
+
+/// The rest of `read_source`, once `path` is known not to be a link to
+/// another machine; with `stamped`, also the stamp the file had while it was
+/// read (None when it changed meanwhile, or none could be taken).
+fn read_opened(path: &Path, stamped: bool) -> std::io::Result<(String, Option<safefs::Stamp>)> {
+    use std::io::{Error, ErrorKind, Read};
     let file = std::fs::File::open(path)?;
+    let before = if stamped { safefs::stamp(&file).ok() } else { None };
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
@@ -333,11 +359,122 @@ pub fn read_source(path: &Path) -> std::io::Result<String> {
         return Err(Error::new(ErrorKind::InvalidData, format!("larger than {} MB", MAX_SOURCE >> 20)));
     }
     let mut text = String::new();
-    file.take(MAX_SOURCE + 1).read_to_string(&mut text)?;
+    (&file).take(MAX_SOURCE + 1).read_to_string(&mut text)?;
     if text.len() as u64 > MAX_SOURCE {
         return Err(Error::new(ErrorKind::InvalidData, format!("larger than {} MB", MAX_SOURCE >> 20)));
     }
-    Ok(text)
+    let stamp = before.filter(|b| safefs::stamp(&file).ok().as_ref() == Some(b));
+    Ok((text, stamp))
+}
+
+/// The text of a source, its SHA-256 and, for a file read from disk, the
+/// file's stamp while it was read (None when it changed meanwhile).
+#[derive(Debug)]
+struct Source {
+    text: String,
+    hash: [u8; 32],
+    stamp: Option<safefs::Stamp>,
+}
+
+impl Source {
+    /// A text that is not read from disk (std, or an editor's buffer).
+    fn of(text: String) -> Source {
+        let hash = sha256(text.as_bytes());
+        Source { text, hash, stamp: None }
+    }
+}
+
+/// A file the loader read from disk, kept while it is unchanged (see `read_known`).
+struct Known {
+    /// The file's stamp while it was read.
+    stamp: safefs::Stamp,
+    /// When it was read (seconds since the epoch, taken before it was opened).
+    read_at: u64,
+    text: String,
+    hash: [u8; 32],
+}
+
+/// The files the loader read in this process, by the path they were read at,
+/// and the bytes of their text. Only in memory: never shared with another
+/// process.
+#[allow(clippy::type_complexity)]
+static KNOWN: std::sync::LazyLock<std::sync::Mutex<(HashMap<PathBuf, Known>, usize)>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The most text the kept files may hold (all forgotten at once when it would
+/// be passed); larger files are read each time.
+const KNOWN_KEEP: usize = 32 << 20;
+const KNOWN_TEXT_MAX: usize = 1 << 20;
+
+/// `read_source` for the loader, with the SHA-256 of the text. While a file
+/// is unchanged, the text an earlier load in this process read is used again
+/// instead of reading and hashing the file (the language server loads the
+/// program at each keystroke, a server in development each page at each
+/// change of a file).
+///
+/// Only what the content alone decides is reused: the text and its hash. The
+/// checks of `read_source` still run at each load, on the file as it is now:
+/// that the path is not a link to another machine (before anything else),
+/// that it leads to a regular file, and that it is not too large. The checks
+/// the loader makes of the path before (another machine on the way, a link
+/// out of the project) run before this, as they did. The content is taken to
+/// be the one read when the file is unchanged by the rule `Dep::is_fresh`
+/// trusts without hashing: the same file (volume and index, or device and
+/// inode: a file renamed over it, or a link now leading elsewhere, is
+/// another), the same size and write time (on Unix also change time), and
+/// that time not within two seconds of the read ("racy": the file could have
+/// changed again within the clock's resolution). Otherwise it is read again.
+fn read_known(path: &Path) -> std::io::Result<Source> {
+    if final_link_to_another_machine(path) {
+        return Err(link_to_another_machine());
+    }
+    let kept = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).0.get(path).map(|k| (k.stamp, k.read_at));
+    if let Some((stamp, read_at)) = kept {
+        // A stamp that is not of a regular file of the allowed size is never
+        // reused: reading it refuses it, with the message of `read_source`.
+        let now = safefs::stamp_path(path).ok().filter(|s| s.is_file() && s.len() <= MAX_SOURCE);
+        if now.is_some_and(|now| now == stamp && now.settled_before(read_at)) {
+            let known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(k) = known.0.get(path).filter(|k| k.stamp == stamp) {
+                return Ok(Source { text: k.text.clone(), hash: k.hash, stamp: now });
+            }
+        }
+    }
+    #[cfg(test)]
+    tests::DISK_READS.with(|r| r.set(r.get() + 1));
+    let read_at = now_secs();
+    let (text, stamp) = read_opened(path, true)?;
+    let hash = sha256(text.as_bytes());
+    if let Some(stamp) = stamp.filter(|_| text.len() <= KNOWN_TEXT_MAX) {
+        // Each entry counts its text and a little more, so that many small
+        // files are bounded too.
+        let size = |t: &str| t.len() + 256;
+        let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if known.1 + size(&text) > KNOWN_KEEP {
+            *known = Default::default();
+        }
+        known.1 += size(&text);
+        let old = known.0.insert(path.to_path_buf(), Known { stamp, read_at, text: text.clone(), hash });
+        if let Some(old) = old {
+            known.1 -= size(&old.text);
+        }
+    }
+    Ok(Source { text, hash, stamp })
+}
+
+/// The SHA-256 of a module of the standard library (`name` is its file name):
+/// built into the binary, its text never changes, so it is hashed once per
+/// process.
+fn std_hash(name: &str, text: &str) -> [u8; 32] {
+    static HASHES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, [u8; 32]>>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut hashes = HASHES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = hashes.get(name) {
+        return *h;
+    }
+    let h = sha256(text.as_bytes());
+    hashes.insert(name.to_string(), h);
+    h
 }
 
 /// The canonical form of `path`, or, when a link on the way leads to another
@@ -451,9 +588,10 @@ const PARSED_TEXT_MAX: usize = 1 << 20;
 /// Parses a module of at most `limit` tokens: None when it has more and
 /// `limit` is below `lexer::MAX_TOKENS` (the program's budget would be passed;
 /// above that, the file itself is too large, which its diagnostics report).
-fn parsed(text: &str, file: u32, template: bool, limit: usize) -> Option<Parsed> {
+/// `hash` is the SHA-256 of `text`.
+fn parsed(text: &str, hash: [u8; 32], file: u32, template: bool, limit: usize) -> Option<Parsed> {
     let keep = text.len() <= PARSED_TEXT_MAX;
-    let key = (file, template, sha256(text.as_bytes()));
+    let key = (file, template, hash);
     if keep {
         if let Some(p) = PARSED.lock().unwrap_or_else(|e| e.into_inner()).0.get(&key) {
             return (p.2 <= limit).then(|| p.clone());
@@ -546,22 +684,26 @@ impl Loader {
         true
     }
 
+    /// Adds the module `name` with its source, read from `path` (None: std),
+    /// whose canonical form is `canonical`.
     fn add(
         &mut self,
         name: String,
         path: Option<PathBuf>,
-        text: String,
+        canonical: Option<PathBuf>,
+        source: Source,
         kind: ModuleKind,
         span: Option<Span>,
     ) -> usize {
+        let Source { text, hash, stamp } = source;
         if let Some(p) = &path {
-            self.deps.push(Dep::new(&self.root, p, Some(text.as_bytes())));
+            self.deps.push(Dep::hashed(&self.root, p, Some(hash), stamp.as_ref()));
         }
         self.text += text.len();
         let file = self.sources.add(name.clone(), path.clone(), text);
         let limit = MAX_PROGRAM_TOKENS.saturating_sub(self.tokens);
         let template = kind == ModuleKind::Template;
-        let (module, diags, tokens) = match parsed(&self.sources.get(file).text, file, template, limit) {
+        let (module, diags, tokens) = match parsed(&self.sources.get(file).text, hash, file, template, limit) {
             Some(p) => p,
             None => {
                 let at = span.unwrap_or(Span::new(file, 0, 0));
@@ -574,8 +716,9 @@ impl Loader {
         self.diags.extend(diags.iter().cloned());
         self.modules.push((module, kind, name));
         let idx = self.modules.len() - 1;
-        let owner = path.as_ref().and_then(|p| {
-            let canonical = p.canonicalize().ok()?;
+        // The canonical form the caller resolved moments ago (the one it
+        // checked to be inside the project or a package), not resolved again.
+        let owner = canonical.and_then(|canonical| {
             self.package_roots
                 .iter()
                 .filter(|(_, dir)| canonical.starts_with(dir))
@@ -633,18 +776,18 @@ impl Loader {
                     format!("larger than {} MB", MAX_SOURCE >> 20),
                 ))
             } else {
-                Ok(t)
+                Ok(Source::of(t))
             }
         });
-        match overlaid.unwrap_or_else(|| read_source(&path)) {
-            Ok(text) if self.text + text.len() > MAX_PROGRAM_TEXT => {
+        match overlaid.unwrap_or_else(|| read_known(&path)) {
+            Ok(source) if self.text + source.text.len() > MAX_PROGRAM_TEXT => {
                 let mb = MAX_PROGRAM_TEXT >> 20;
                 self.refuse_too_large(format!("its files have more than {mb} MB of source in all"), span);
                 None
             }
-            Ok(text) => {
+            Ok(source) => {
                 let name = display_name(&self.root, &path);
-                Some(self.add(name, Some(path), text, kind, Some(span)))
+                Some(self.add(name, Some(path), Some(canonical), source, kind, Some(span)))
             }
             Err(e) => {
                 let shown = display_name(&self.root, &path);
@@ -682,7 +825,8 @@ impl Loader {
                         let file = format!("<std>/{}.phv", name.trim_start_matches("std."));
                         // Reserve the name first so import cycles terminate.
                         self.imports.insert(name.clone(), usize::MAX);
-                        let i = self.add(file, None, src.to_string(), ModuleKind::Std, Some(span));
+                        let source = Source { text: src.to_string(), hash: std_hash(&file, src), stamp: None };
+                        let i = self.add(file, None, None, source, ModuleKind::Std, Some(span));
                         self.imports.insert(name, i);
                     }
                     None => self.diags.push(Diagnostic::error(format!("unknown standard module `{name}`"), span)),
@@ -863,7 +1007,7 @@ fn package_dependencies(root: &Path, dir: &Path) -> Vec<String> {
     if phv_std::safefs::on_another_machine_below(root, &manifest) {
         return Vec::new();
     }
-    let Ok(text) = read_source(&manifest) else { return Vec::new() };
+    let Ok(Source { text, .. }) = read_known(&manifest) else { return Vec::new() };
     let Ok(t) = toml::from_str::<toml::Table>(&text) else { return Vec::new() };
     let Some(table) = t.get("dependencies").and_then(|d| d.as_table()) else { return Vec::new() };
     table.keys().filter(|k| config::valid_package_name(k)).cloned().collect()
@@ -884,7 +1028,7 @@ pub fn analyze_for_editor(root: &Path, entry: &Path, overlay: HashMap<PathBuf, S
 
 fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, editor: bool) -> Analysis {
     let mut messages = Vec::new();
-    let config = load_config(root).unwrap_or_else(|e| {
+    let config = config::load_config_known(root).unwrap_or_else(|e| {
         messages.push(e);
         Config::default_for(root)
     });
@@ -948,16 +1092,27 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
     };
     let toml = root.join("phv.toml");
     // Bounded like every source file (a huge phv.toml would be read whole on each keystroke).
-    loader.deps.push(Dep::new(root, &toml, read_source(&toml).ok().as_ref().map(|t| t.as_bytes())));
+    let read = read_known(&toml).ok();
+    loader.deps.push(Dep::hashed(
+        root,
+        &toml,
+        read.as_ref().map(|s| s.hash),
+        read.as_ref().and_then(|s| s.stamp.as_ref()),
+    ));
     // The packages' own [dependencies] decide what their modules may import.
     let mut manifests: Vec<PathBuf> = loader.packages.values().map(|d| d.join("phv.toml")).collect();
     manifests.sort();
     for m in manifests {
-        if let Ok(text) = read_source(&m) {
-            loader.deps.push(Dep::new(root, &m, Some(text.as_bytes())));
+        if let Ok(s) = read_known(&m) {
+            loader.deps.push(Dep::hashed(root, &m, Some(s.hash), s.stamp.as_ref()));
         }
     }
-    loader.add("<std>/prelude.phv".into(), None, phv_std::PRELUDE.to_string(), ModuleKind::Prelude, None);
+    let prelude = "<std>/prelude.phv";
+    let source = Source { text: phv_std::PRELUDE.to_string(), hash: std_hash(prelude, phv_std::PRELUDE), stamp: None };
+    loader.add(prelude.into(), None, None, source, ModuleKind::Prelude, None);
+    // The entry's canonical form, resolved only once it is known not to be
+    // on another machine.
+    let mut canonical = None;
     // The entry is looked at like the files it imports (see `Loader::remote`).
     let read = if remote(entry) {
         Err(std::io::Error::new(
@@ -967,19 +1122,20 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
     } else {
         // The editor's text of the document has the limit of files read from disk
         // (found by the 1.0.0 audit).
-        let overlaid = entry.canonicalize().ok().and_then(|c| loader.overlay.get(&c).cloned()).map(|t| {
+        canonical = entry.canonicalize().ok();
+        let overlaid = canonical.as_ref().and_then(|c| loader.overlay.get(c).cloned()).map(|t| {
             if t.len() as u64 > MAX_SOURCE {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("larger than {} MB", MAX_SOURCE >> 20),
                 ))
             } else {
-                Ok(t)
+                Ok(Source::of(t))
             }
         });
-        overlaid.unwrap_or_else(|| read_source(entry))
+        overlaid.unwrap_or_else(|| read_known(entry))
     };
-    let text = match read {
+    let source = match read {
         Ok(t) => t,
         Err(e) => {
             messages.push(format!("cannot read {}: {e}", entry.display()));
@@ -999,7 +1155,7 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
     // An editor can open a template on its own; it is checked as a template.
     let template = editor && entry.to_string_lossy().ends_with(".phv.html");
     let kind = if template { ModuleKind::Template } else { ModuleKind::Entry };
-    let entry_module = loader.add(name, Some(entry.to_path_buf()), text, kind, None);
+    let entry_module = loader.add(name, Some(entry.to_path_buf()), canonical, source, kind, None);
     let entry_file = Some(loader.modules[entry_module].0.file);
     // A program past a budget is not checked: checking is what takes the most
     // memory (found by the 15th assessment). Its trees are dropped first.
@@ -1353,6 +1509,146 @@ fn call_caught(vm: &mut Vm, func: u32) -> Option<RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// The files `read_known` read from disk on this thread.
+        pub(super) static DISK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn disk_reads() -> usize {
+        DISK_READS.with(|r| r.get())
+    }
+
+    fn set_modified(p: &Path, t: SystemTime) {
+        std::fs::File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
+    }
+
+    /// A source the loader read is not read again while it is unchanged, and
+    /// is read again after any change: of its size, another file renamed over
+    /// it with the same size and time, and a change within two seconds of the
+    /// read whatever its time says.
+    #[test]
+    fn kept_sources_are_read_again_when_they_change() {
+        let dir = std::env::temp_dir().join(format!("phv-known-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("m.phv");
+        let old = SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::write(&p, "echo 1;").unwrap();
+        set_modified(&p, old);
+        // On Unix setting the time changed the inode just now: the file is
+        // kept only once that is two seconds old.
+        #[cfg(unix)]
+        std::thread::sleep(std::time::Duration::from_millis(3100));
+        let n = disk_reads();
+        for _ in 0..2 {
+            let s = read_known(&p).unwrap();
+            assert_eq!((s.text.as_str(), s.hash), ("echo 1;", sha256(b"echo 1;")));
+            // What a dependency records from the stamp is what `stat` reads.
+            assert_eq!(s.stamp.map(|t| (t.modified(), t.len())), stat(&dir, &p));
+        }
+        assert_eq!(disk_reads(), n + 1, "the second load reuses the text");
+        // Another size, the same time.
+        std::fs::write(&p, "echo 22;").unwrap();
+        set_modified(&p, old);
+        assert_eq!(read_known(&p).unwrap().text, "echo 22;");
+        assert_eq!(read_known(&p).unwrap().text, "echo 22;");
+        // Another file, of the same size and time.
+        let q = dir.join("q.phv");
+        std::fs::write(&q, "echo 33;").unwrap();
+        set_modified(&q, old);
+        std::fs::rename(&q, &p).unwrap();
+        let n = disk_reads();
+        assert_eq!(read_known(&p).unwrap().text, "echo 33;");
+        assert_eq!(disk_reads(), n + 1);
+        // Written just now, twice with the same size (the time may well be
+        // the same): read at each load while its time is recent.
+        std::fs::write(&p, "echo 44;").unwrap();
+        assert_eq!(read_known(&p).unwrap().text, "echo 44;");
+        std::fs::write(&p, "echo 55;").unwrap();
+        assert_eq!(read_known(&p).unwrap().text, "echo 55;");
+        let n = disk_reads();
+        assert_eq!(read_known(&p).unwrap().text, "echo 55;");
+        assert_eq!(disk_reads(), n + 1, "a racy file is read again");
+        // On Unix the change time also sees a write time set back.
+        #[cfg(unix)]
+        {
+            std::fs::write(&p, "echo 66;").unwrap();
+            set_modified(&p, old);
+            assert_eq!(read_known(&p).unwrap().text, "echo 66;");
+            std::fs::write(&p, "echo 77;").unwrap();
+            set_modified(&p, old);
+            assert_eq!(read_known(&p).unwrap().text, "echo 77;");
+        }
+        // Missing: the error of `read_source`; nothing kept is used.
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(read_known(&p).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The checks of a load still run for a kept module: one now reached
+    /// through a link out of the project (the same file, of the same size
+    /// and time) is refused.
+    #[test]
+    fn a_kept_module_behind_a_new_link_out_of_the_project_is_refused() {
+        let dir = std::env::temp_dir().join(format!("phv-known-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(proj.join("lib")).unwrap();
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        let page = proj.join("page.phv");
+        let module = proj.join("lib/m.phv");
+        std::fs::write(&page, "<?phv\nimport lib.m.f;\necho f();\n").unwrap();
+        std::fs::write(&module, "export function f(): int {\n    return 1;\n}\n").unwrap();
+        let old = SystemTime::now() - std::time::Duration::from_secs(60);
+        set_modified(&page, old);
+        set_modified(&module, old);
+        let errors = |a: &Analysis| -> Vec<String> {
+            a.diags.iter().filter(|d| d.is_error()).map(|d| d.message.clone()).chain(a.messages.clone()).collect()
+        };
+        let a = analyze(&proj, &page, HashMap::new());
+        assert!(errors(&a).is_empty(), "{:?}", errors(&a));
+        std::fs::rename(proj.join("lib"), dir.join("outside/lib")).unwrap();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(dir.join("outside/lib"), proj.join("lib")).is_ok();
+        #[cfg(windows)]
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(proj.join("lib"))
+            .arg(dir.join("outside/lib"))
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if made {
+            let a = analyze(&proj, &page, HashMap::new());
+            let errors = errors(&a);
+            assert!(errors.iter().any(|m| m.contains("resolves to a file outside the project")), "{errors:?}");
+            #[cfg(windows)]
+            let _ = std::fs::remove_dir(proj.join("lib"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A kept source that has become a link to another machine is refused
+    /// without being followed. Making a link needs Developer Mode or the
+    /// privilege: skipped without.
+    #[cfg(windows)]
+    #[test]
+    fn a_kept_source_that_became_a_link_to_another_machine_is_refused() {
+        let dir = std::env::temp_dir().join(format!("phv-known-far-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("m.phv");
+        std::fs::write(&p, "echo 1;").unwrap();
+        set_modified(&p, SystemTime::now() - std::time::Duration::from_secs(60));
+        assert_eq!(read_known(&p).unwrap().text, "echo 1;");
+        std::fs::remove_file(&p).unwrap();
+        if std::os::windows::fs::symlink_file(r"\\phv-test.invalid\share\m.phv", &p).is_ok() {
+            let start = std::time::Instant::now();
+            assert_eq!(read_known(&p).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A file saved just before it was read is hashed at each check ("racy"),
     /// until a check finds it unchanged once its time is no longer recent.

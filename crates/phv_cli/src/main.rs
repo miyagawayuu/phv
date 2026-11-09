@@ -122,8 +122,11 @@ enum Command {
         #[arg(long)]
         profile: bool,
     },
-    /// Type-check a script and everything it imports, without running it.
-    Check { file: PathBuf },
+    /// Type-check scripts and everything they import, without running them.
+    Check {
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
     /// Print the syntax tree of a file.
     Parse { file: PathBuf },
     /// Run the `test_*` functions of every `*_test.phv` file.
@@ -586,19 +589,24 @@ fn exec(cmd: Command) -> ExitCode {
                 None => ExitCode::SUCCESS,
             }
         }
-        Command::Check { file } => {
-            let root = find_root(&file);
-            match compile(&root, &file) {
-                Ok(c) => {
-                    eprint!("{}", c.warnings);
-                    println!("ok: no errors in {}", file.display());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprint!("{}", e.render(color));
-                    ExitCode::FAILURE
+        Command::Check { files } => {
+            // Each file on its own, as `phv check` of one file does; one
+            // process for all of them (a project's pages in CI, say).
+            let mut code = ExitCode::SUCCESS;
+            for file in files {
+                let root = find_root(&file);
+                match compile(&root, &file) {
+                    Ok(c) => {
+                        eprint!("{}", c.warnings);
+                        println!("ok: no errors in {}", file.display());
+                    }
+                    Err(e) => {
+                        eprint!("{}", e.render(color));
+                        code = ExitCode::FAILURE;
+                    }
                 }
             }
+            code
         }
         Command::Test { paths, filter, json, junit, coverage } => {
             let color = std::io::stdout().is_terminal();

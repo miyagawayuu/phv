@@ -54,7 +54,12 @@ pub fn compile_with(h: &HProgram, sources: &SourceMap, opts: Options) -> Result<
             fields: c
                 .fields
                 .iter()
-                .map(|f| Field { name: f.name.clone(), default: to_const(&f.default), public: f.public })
+                .map(|f| Field {
+                    name: f.name.clone(),
+                    default: to_const(&f.default),
+                    public: f.public,
+                    kind: native_kind(&f.ty),
+                })
                 .collect(),
             vtable: c.vtable.clone(),
             supers: c.supers.clone(),
@@ -1448,9 +1453,10 @@ fn stmt_span(s: &HStmt) -> Option<phv_syntax::Span> {
     })
 }
 
-/// A function whose every local is an int, bool, float or string, a
-/// nullable one, or a list or map of them, may be compiled natively.
-fn native_sig(f: &HFunc) -> Option<NativeSig> {
+/// The kind of a value of type `t` that native code may hold: an int, bool,
+/// float or string, a nullable one, a list or map of them, or an object of a
+/// class without type arguments (nullable or not).
+fn native_kind(t: &Type) -> Option<ValKind> {
     let scalar = |t: &Type| match t {
         Type::Int => Some(Scalar::Int),
         Type::Bool => Some(Scalar::Bool),
@@ -1458,17 +1464,30 @@ fn native_sig(f: &HFunc) -> Option<NativeSig> {
         Type::Str => Some(Scalar::Str),
         _ => None,
     };
-    let kind = |t: &Type| match t {
+    match t {
         Type::Int => Some(ValKind::Int),
         Type::Bool => Some(ValKind::Bool),
         Type::Float => Some(ValKind::Float),
         Type::Str => Some(ValKind::Str),
         Type::List(e) => Some(ValKind::List(scalar(e)?)),
         Type::Map(k, v) if matches!(**k, Type::Int | Type::Str) => Some(ValKind::Map(scalar(k)?, scalar(v)?)),
-        t if t.is_nullable() => Some(ValKind::Opt(scalar(&t.without_null())?)),
+        Type::Class(c, args) if args.is_empty() => Some(ValKind::Object(*c)),
+        t if t.is_nullable() => match t.without_null() {
+            Type::Class(c, args) if args.is_empty() => Some(ValKind::OptObject(c)),
+            t => Some(ValKind::Opt(scalar(&t)?)),
+        },
         _ => None,
-    };
-    if f.kind != FuncKind::Normal || !f.captures.is_empty() || f.params.len() > 16 {
+    }
+}
+
+/// A function whose every local has a native kind (see `native_kind`) may
+/// be compiled natively: a function, a method or a constructor.
+fn native_sig(f: &HFunc) -> Option<NativeSig> {
+    let kind = native_kind;
+    if !matches!(f.kind, FuncKind::Normal | FuncKind::Method | FuncKind::Ctor)
+        || !f.captures.is_empty()
+        || f.params.len() > 16
+    {
         return None;
     }
     if !f.locals.iter().all(|l| kind(&l.ty).is_some()) {

@@ -342,10 +342,13 @@ impl Parser {
         // writes must end where it started; otherwise the context of what
         // follows depends on control flow the tracker cannot see.
         let entry = (!ends.is_empty()).then(|| self.html.clone());
-        let stmts = self.block_stmts(ends);
+        let mut stmts = self.block_stmts(ends);
         if let Some(entry) = entry {
             self.check_block_html(&entry);
         }
+        // Kept as long as the tree: without the room the vector grew into
+        // (a `Stmt` is 168 bytes, and a body of one statement had room for four).
+        stmts.shrink_to_fit();
         stmts
     }
 
@@ -735,25 +738,27 @@ impl Parser {
                 return Ok(s);
             }
             Tok::Function if matches!(self.peek_at(1), Tok::Ident(_)) => {
-                StmtKind::Function(self.function_decl(false, Visibility::Public, false)?)
+                StmtKind::Function(Box::new(self.function_decl(false, Visibility::Public, false)?))
             }
             Tok::Class | Tok::Interface | Tok::Enum | Tok::Abstract | Tok::Final => {
-                StmtKind::Class(self.class_decl(false)?)
+                StmtKind::Class(Box::new(self.class_decl(false)?))
             }
-            Tok::Const => StmtKind::Const(self.const_decl(false)?),
+            Tok::Const => StmtKind::Const(Box::new(self.const_decl(false)?)),
             Tok::Ident(ref name) if name == "type" && self.at_type_alias(0) => {
-                StmtKind::TypeAlias(self.type_alias(false)?)
+                StmtKind::TypeAlias(Box::new(self.type_alias(false)?))
             }
             Tok::Export => {
                 self.bump();
                 match self.peek() {
-                    Tok::Function => StmtKind::Function(self.function_decl(true, Visibility::Public, false)?),
-                    Tok::Class | Tok::Interface | Tok::Enum | Tok::Abstract | Tok::Final => {
-                        StmtKind::Class(self.class_decl(true)?)
+                    Tok::Function => {
+                        StmtKind::Function(Box::new(self.function_decl(true, Visibility::Public, false)?))
                     }
-                    Tok::Const => StmtKind::Const(self.const_decl(true)?),
+                    Tok::Class | Tok::Interface | Tok::Enum | Tok::Abstract | Tok::Final => {
+                        StmtKind::Class(Box::new(self.class_decl(true)?))
+                    }
+                    Tok::Const => StmtKind::Const(Box::new(self.const_decl(true)?)),
                     Tok::Ident(name) if name == "type" && self.at_type_alias(0) => {
-                        StmtKind::TypeAlias(self.type_alias(true)?)
+                        StmtKind::TypeAlias(Box::new(self.type_alias(true)?))
                     }
                     _ => return Err(self.error_here("expected a declaration after `export`")),
                 }
@@ -816,7 +821,7 @@ impl Parser {
                 let name_span = self.bump();
                 self.bump();
                 let value = self.expr()?;
-                return Ok(Some(StmtKind::TypedDecl { ty, name, name_span, value }));
+                return Ok(Some(StmtKind::TypedDecl { ty: Box::new(ty), name, name_span, value }));
             }
         }
         self.pos = saved_pos;
@@ -952,7 +957,7 @@ impl Parser {
         if let Some(p) = pattern {
             body.insert(0, p);
         }
-        let kind = StmtKind::Foreach { subject, key, value, body };
+        let kind = StmtKind::Foreach { subject: Box::new(subject), key, value, body };
         Ok(Stmt { out: None, kind, span: start.to(self.prev_span()) })
     }
 
@@ -1552,7 +1557,7 @@ impl Parser {
                 self.bump();
                 let ty = self.ty()?;
                 let span = lhs.span.to(ty.span);
-                lhs = Expr { kind: ExprKind::Is(Box::new(lhs), ty), span };
+                lhs = Expr { kind: ExprKind::Is(Box::new(lhs), Box::new(ty)), span };
                 continue;
             }
             if matches!(tok, Tok::DotDot | Tok::DotDotEq) && min_bp <= 18 {
@@ -1656,7 +1661,8 @@ impl Parser {
             match self.peek().clone() {
                 Tok::LParen if self.at_func_ref() => {
                     let span = e.span;
-                    e = self.func_ref(Expr { kind: ExprKind::Call { callee: Box::new(e), args: Vec::new() }, span });
+                    e = self
+                        .func_ref(Expr { kind: ExprKind::Call { callee: Box::new(e), args: Box::default() }, span });
                 }
                 Tok::LParen => {
                     let args = self.args()?;
@@ -1683,7 +1689,7 @@ impl Parser {
                         }
                     }
                     let span = e.span.to(self.prev_span());
-                    e = Expr { kind: ExprKind::Call { callee: Box::new(e), args }, span };
+                    e = Expr { kind: ExprKind::Call { callee: Box::new(e), args: args.into() }, span };
                 }
                 Tok::LBracket => {
                     self.bump();
@@ -1698,19 +1704,33 @@ impl Parser {
                     let (name, name_span) = self.member_name()?;
                     if self.at_func_ref() {
                         let span = e.span.to(name_span);
-                        let kind =
-                            ExprKind::MethodCall { obj: Box::new(e), name, name_span, args: Vec::new(), nullsafe };
+                        let kind = ExprKind::MethodCall(Box::new(MethodCall {
+                            obj: Box::new(e),
+                            name,
+                            name_span,
+                            args: Vec::new(),
+                            nullsafe,
+                        }));
                         e = self.func_ref(Expr { kind, span });
                     } else if self.at(&Tok::LParen) {
                         let args = self.args()?;
                         let span = e.span.to(self.prev_span());
                         e = Expr {
-                            kind: ExprKind::MethodCall { obj: Box::new(e), name, name_span, args, nullsafe },
+                            kind: ExprKind::MethodCall(Box::new(MethodCall {
+                                obj: Box::new(e),
+                                name,
+                                name_span,
+                                args,
+                                nullsafe,
+                            })),
                             span,
                         };
                     } else {
                         let span = e.span.to(self.prev_span());
-                        e = Expr { kind: ExprKind::Prop { obj: Box::new(e), name, name_span, nullsafe }, span };
+                        e = Expr {
+                            kind: ExprKind::Prop(Box::new(Prop { obj: Box::new(e), name, name_span, nullsafe })),
+                            span,
+                        };
                     }
                 }
                 Tok::DoubleColon => {
@@ -1723,18 +1743,30 @@ impl Parser {
                     let (name, name_span) = self.member_name()?;
                     if !self.at(&Tok::LParen) {
                         let span = e.span.to(self.prev_span());
-                        e = Expr { kind: ExprKind::ClassConst { class, class_span, name, name_span }, span };
+                        e = Expr {
+                            kind: ExprKind::ClassConst(Box::new(ClassConst { class, class_span, name, name_span })),
+                            span,
+                        };
                         continue;
                     }
                     if self.at_func_ref() {
                         let span = e.span.to(name_span);
-                        let kind = ExprKind::StaticCall { class, class_span, name, name_span, args: Vec::new() };
+                        let kind = ExprKind::StaticCall(Box::new(StaticCall {
+                            class,
+                            class_span,
+                            name,
+                            name_span,
+                            args: Vec::new(),
+                        }));
                         e = self.func_ref(Expr { kind, span });
                         continue;
                     }
                     let args = self.args()?;
                     let span = e.span.to(self.prev_span());
-                    e = Expr { kind: ExprKind::StaticCall { class, class_span, name, name_span, args }, span };
+                    e = Expr {
+                        kind: ExprKind::StaticCall(Box::new(StaticCall { class, class_span, name, name_span, args })),
+                        span,
+                    };
                 }
                 _ => break,
             }
@@ -1796,6 +1828,7 @@ impl Parser {
             }
         }
         self.expect(Tok::RParen)?;
+        args.shrink_to_fit();
         Ok(args)
     }
 
@@ -1905,7 +1938,7 @@ impl Parser {
                 let (class, class_span) = self.expect_ident("a class name")?;
                 let type_args = self.type_args()?;
                 let args = if self.at(&Tok::LParen) { self.args()? } else { Vec::new() };
-                ExprKind::New { class, class_span, type_args, args }
+                ExprKind::New(Box::new(New { class, class_span, type_args, args }))
             }
             Tok::Fn => {
                 self.bump();
@@ -2044,6 +2077,6 @@ impl Parser {
             }
         }
         self.expect(Tok::RBrace)?;
-        Ok(ExprKind::Match { subject, arms })
+        Ok(ExprKind::Match { subject, arms: arms.into() })
     }
 }

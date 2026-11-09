@@ -891,7 +891,7 @@ pub struct Vm {
     limits: Limits,
     mem_base: isize,
     deadline: Option<Instant>,
-    budget: u32,
+    pub(crate) budget: u32,
     /// Bytes echoed since the limits were last checked for output.
     echoed: usize,
     /// Bytes compared by `equal` since the limits were last checked: kept
@@ -1640,6 +1640,127 @@ impl Vm {
         }
     }
 
+    /// `Echo` (or `EchoAttr`, with `attr` set) of `v` in frame `fi`, for
+    /// native code. The output methods below are what `dispatch` runs for
+    /// the same instructions, written there again: called from `dispatch`,
+    /// they made the interpreter's other paths 5-13% slower (its code
+    /// layout); the differential tests of `phv_driver/tests/jit.rs` run both.
+    #[inline(never)]
+    pub(crate) fn echo_value(&mut self, fi: usize, v: Value, attr: bool) -> Result<(), VmError> {
+        if !self.guards.is_empty() {
+            self.output_allowed(fi)?;
+        }
+        if self.js_output && self.out.len() == 1 && !inert_js(&v) {
+            return Err(self.throw(
+                "ValueError",
+                "only `json_html()` values and numbers can be written to a JavaScript response (a string or template output would be code)",
+            ));
+        }
+        // The output buffer grows with every echo; large pieces
+        // (and escaping, up to 6x) are checked before they are added.
+        let len = match &v {
+            Value::Str(s) => s.len().saturating_mul(6),
+            Value::Html(s) => s.len(),
+            _ => 0,
+        };
+        let before = self.out.last().map(|o| o.buf.len()).unwrap_or(0);
+        if len > 1 << 12 || before > 1 << 20 && before.next_power_of_two() < before + len + 64 {
+            self.reserve(len.max(before))?;
+        }
+        match &v {
+            Value::Html(s) if attr && self.out.last().is_some_and(|o| o.html) => {
+                let buf = &mut self.out.last_mut().unwrap().buf;
+                if s.contains(['"', '\'', '<', '>']) {
+                    self.reserve(s.len().saturating_mul(6))?;
+                    let buf = &mut self.out.last_mut().unwrap().buf;
+                    attr_quotes_into(s, buf);
+                } else {
+                    buf.push_str(s);
+                }
+            }
+            _ => self.echo(&v),
+        }
+        // Escaping a long value takes long; a template's output is
+        // dropped after `render()`, so the buffer does not bound it
+        // (found by the 1.0.0 audit).
+        self.long_op(len);
+        self.echoed(len);
+        Ok(())
+    }
+
+    /// `EchoHtml` of `s` in frame `fi`.
+    #[inline(never)]
+    pub(crate) fn echo_html(&mut self, fi: usize, s: &str) -> Result<(), VmError> {
+        if !self.guards.is_empty() {
+            self.output_allowed(fi)?;
+        }
+        // As for `Echo`: a large piece, or a large buffer about
+        // to grow, is counted before it is added.
+        let len = s.len();
+        let before = self.out.last().map(|o| o.buf.len()).unwrap_or(0);
+        if len > 1 << 12 || before > 1 << 20 && before.next_power_of_two() < before + len + 64 {
+            self.reserve(len.max(before))?;
+        }
+        self.out.last_mut().unwrap().buf.push_str(s);
+        self.echoed(len);
+        Ok(())
+    }
+
+    /// `EchoNonce` in frame `fi`.
+    #[inline(never)]
+    pub(crate) fn echo_nonce(&mut self, fi: usize) -> Result<(), VmError> {
+        if !self.guards.is_empty() {
+            self.output_allowed(fi)?;
+        }
+        if let Some(n) = &self.http.csp_nonce {
+            let buf = &mut self.out.last_mut().unwrap().buf;
+            buf.push_str(" nonce=\"");
+            buf.push_str(n);
+            buf.push('"');
+        }
+        Ok(())
+    }
+
+    /// `GuardOutput` in frame `fi`.
+    #[inline(never)]
+    pub(crate) fn guard_output(&mut self, fi: usize) {
+        self.guards.push((fi, self.out.len(), self.flushes));
+    }
+
+    /// `EndGuard` in frame `fi`.
+    #[inline(never)]
+    pub(crate) fn end_guard(&mut self, fi: usize) {
+        if matches!(self.guards.last(), Some(g) if g.0 == fi) {
+            self.guards.pop();
+        }
+    }
+
+    /// `EchoHtml` of the program's constant `c` (native code).
+    pub(crate) fn echo_html_const(&mut self, fi: usize, c: usize) -> Result<(), VmError> {
+        let prog = Arc::clone(&self.prog);
+        match prog.consts.get(c) {
+            Some(Const::Str(s)) => self.echo_html(fi, s),
+            _ => Ok(()),
+        }
+    }
+
+    /// `NewObject`: an object of `class` with its fields' defaults, for the
+    /// interpreter and native code alike.
+    #[inline(always)]
+    pub(crate) fn new_object(&mut self, class: u32) -> Value {
+        let fields = self.new_fields(class);
+        let o = Rc::new(RefCell::new(Object { class, fields }));
+        // An object that can hold no other object is never in a cycle.
+        if !self.prog.classes[class as usize].acyclic {
+            self.track(&o);
+            if self.gc_due.get() {
+                // Collect at the next loop step or call.
+                self.budget = 1;
+            }
+        }
+        Value::Object(o)
+    }
+
     /// Output from frame `frame` (or deeper) is refused while a statement of a
     /// frame below it runs in HTML other than element text, into the same output.
     fn output_allowed(&self, frame: usize) -> Result<(), VmError> {
@@ -1729,6 +1850,19 @@ impl Vm {
         } else {
             let (outer, inner) = (&self.frames[..TRACE_ENDS], &self.frames[n - TRACE_ENDS..]);
             inner.iter().rev().chain(outer.iter().rev()).map(call).collect()
+        };
+        ThrownAt { calls, depth: n }
+    }
+
+    /// `thrown_at` for an exception raised in native code: `native` are the
+    /// native calls above the interpreter's frames, innermost first.
+    fn thrown_at_native(&self, native: &[(u32, u32)]) -> ThrownAt {
+        let n = self.frames.len() + native.len();
+        let all = native.iter().copied().chain(self.frames.iter().rev().map(|f| (f.func, f.pc)));
+        let calls: Rc<[(u32, u32)]> = if n <= 2 * TRACE_ENDS {
+            all.collect()
+        } else {
+            all.enumerate().filter(|(k, _)| *k < TRACE_ENDS || *k >= n - TRACE_ENDS).map(|(_, c)| c).collect()
         };
         ThrownAt { calls, depth: n }
     }
@@ -1862,13 +1996,42 @@ impl Vm {
         Ok(())
     }
 
+    /// `CallVirtual`'s way into native code (`Call` has its own, as in 1.2.1),
+    /// kept out of `dispatch`: inlined there a second time, it slowed the
+    /// interpreter's other paths by a few percent. Runs `func` natively with
+    /// the `argc` arguments from register `start` when it is compiled and
+    /// native calls are not paused; None when the interpreter is to run the
+    /// call.
+    #[inline(never)]
+    fn call_native(&mut self, func: u32, start: usize, argc: usize) -> Result<Option<Value>, VmError> {
+        match self.jit_paused {
+            Some(n) if self.frames.len() > n => return Ok(None),
+            Some(_) => self.jit_paused = None,
+            None => {}
+        }
+        let Some(unit) = self.jit.as_ref().and_then(|j| j.entry(func)).map(|i| i.call()) else {
+            return Ok(None);
+        };
+        let prog = Arc::clone(&self.prog);
+        let sig =
+            prog.funcs[func as usize].native.as_ref().expect("JIT entry for a function without a native signature");
+        let r = self.call_jit(unit.entry, unit.consts, func, sig, start, argc)?;
+        if r.is_none() {
+            // Out of native stack: the interpreter runs this call, and the
+            // calls it makes, with the arguments put back.
+            self.jit_paused = Some(self.frames.len());
+        }
+        Ok(r)
+    }
+
     /// Runs natively compiled function `func` (whose native signature is
     /// `sig`) with the `argc` arguments in the registers from `start`, which
     /// it moves out as an interpreted call does. When the native code runs
     /// out of stack, puts the arguments back and returns None, so that the
-    /// interpreter runs the call: compiled functions have no side effects
-    /// (only arithmetic, strings and calls to other compiled functions), so
-    /// running it again gives the same result.
+    /// interpreter runs the call: a function that changes no object and
+    /// writes no output (nor does any function it calls) has no effect other
+    /// than its result, so running it again gives the same result. Another
+    /// stops with an error instead (see `JitTable::impure`).
     fn call_jit(
         &mut self,
         entry: JitEntry,
@@ -1878,6 +2041,13 @@ impl Vm {
         start: usize,
         argc: usize,
     ) -> Result<Option<Value>, VmError> {
+        // The rest of the unit's tables (looked up here, so that `dispatch`
+        // passes what it passed in 1.2.1).
+        let unit = match self.jit.as_ref().and_then(|j| j.entry(func)) {
+            Some(i) => i.call(),
+            None => panic!("phv vm: native call of a function without native code"),
+        };
+        debug_assert!(unit.entry as usize == entry as usize && unit.consts == consts);
         // The JIT compiles at most 16 parameters.
         let mut raw = [0i64; 16];
         if argc != sig.params.len() {
@@ -1890,7 +2060,11 @@ impl Vm {
                 (ValKind::Float, Value::Float(f)) => f.to_bits() as i64,
                 (ValKind::Str, Value::Str(_)) => 0,
                 // Passed in the window.
-                (ValKind::List(_), Value::List(_)) | (ValKind::Map(..), Value::Map(_)) | (ValKind::Opt(_), _) => 0,
+                (ValKind::List(_), Value::List(_))
+                | (ValKind::Map(..), Value::Map(_))
+                | (ValKind::Opt(_), _)
+                | (ValKind::Object(_), Value::Object(_))
+                | (ValKind::OptObject(_), Value::Object(_) | Value::Null) => 0,
                 (_, v) => bad("an argument of the native signature", v),
             };
         }
@@ -1898,13 +2072,21 @@ impl Vm {
         let mut rt = std::mem::take(&mut self.jit_rt);
         rt.prog.get_or_insert_with(|| Arc::clone(&self.prog));
         rt.consts = std::mem::take(&mut self.consts);
+        rt.trace.clear();
         // Strings and lists are moved into the native call's window: kept for
         // a rerun, unless the function changes them in place (found by the 1.0
-        // audit: the kept copy made that change copy a whole list). Numbers
-        // are passed in `raw` and stay in their registers.
+        // audit: the kept copy made that change copy a whole list), or a rerun
+        // would repeat its effects. Numbers are passed in `raw` and stay in
+        // their registers.
         let boxed_args = sig.params.iter().any(|p| p.boxed());
-        let writes = self.jit.as_ref().is_some_and(|j| j.writes_args.get(func as usize).copied().unwrap_or(true));
-        let kept = boxed_args && !writes;
+        let (writes, impure) = match &self.jit {
+            Some(j) => (
+                j.writes_args.get(func as usize).copied().unwrap_or(true),
+                j.impure.get(func as usize).copied().unwrap_or(true),
+            ),
+            None => (true, true),
+        };
+        let kept = boxed_args && !writes && !impure;
         let args = &mut self.regs[start..start + argc];
         if kept {
             self.jit_rerun.clear();
@@ -1929,35 +2111,42 @@ impl Vm {
             }
             self.jit_stack_limit = limit.max(1);
         }
+        let depth = self.frames.len();
         let mut ctx = JitCtx {
             error: 0,
-            depth: self.frames.len() as i64,
+            depth: depth as i64,
             max_depth: self.limits.max_frames as i64,
             budget: self.budget as i64,
             limits: &limits,
             detail: 0,
             rt: &mut rt,
             stack_limit: self.jit_stack_limit as i64,
-            consts,
+            consts: unit.consts,
+            vm: self as *mut Vm,
+            funcs: unit.funcs,
+            classes: unit.classes,
         };
         // SAFETY: the JIT creates entries only for functions it checked
         // (`phv_jit::well_formed`), the arguments match their native signature
-        // (checked above), `consts` is the table of the entry's unit (kept
-        // alive by `self.jit`), and `ctx`, `limits` and `rt` outlive the call.
-        let r = unsafe { entry(&mut ctx, raw.as_ptr()) };
+        // (checked above), `consts`, `funcs` and `classes` are the tables of
+        // the entry's unit (kept alive by `self.jit`), and `ctx`, `limits`
+        // and `rt` outlive the call. Nothing uses `self` but the helpers,
+        // through `ctx.vm`, until the call returns.
+        let r = unsafe { (unit.entry)(&mut ctx, raw.as_ptr()) };
         if outermost {
             self.jit_stack_limit = 0;
         }
         let ret = rt.finish();
         self.consts = std::mem::take(&mut rt.consts);
+        let mut native: Vec<(u32, u32)> = std::mem::take(&mut rt.trace);
         self.jit_rt = rt;
         self.budget = ctx.budget.clamp(1, BUDGET as i64) as u32;
         let error = ctx.error;
-        let mut again = error == JIT_ERR_STACK;
-        if error == JIT_ERR_MEMORY && (kept || !boxed_args) && self.made_since_collection() > 0 {
-            // Native code cannot run the cycle collector: when cycles made
-            // before this call held the memory, the interpreter runs the call
-            // again once they are freed.
+        let mut again = error == JIT_ERR_STACK && !impure;
+        if error == JIT_ERR_MEMORY && !impure && (kept || !boxed_args) && self.made_since_collection() > 0 {
+            // Native code cannot run the cycle collector between two of its
+            // checks: when cycles made before this call held the memory, the
+            // interpreter runs the call again once they are freed.
             again = self.collect_within(true) > 0 && self.check_memory().is_ok();
         }
         // The kept arguments are dropped now, so that they do not keep the
@@ -1971,40 +2160,64 @@ impl Vm {
             self.jit_rerun.clear();
             false
         };
-        match error {
-            0 => {}
-            JIT_ERR_STACK if boxed_args && !rerun => {
+        // The calls of native code an exception left, as program functions.
+        for (f, _) in &mut native {
+            // SAFETY: `funcs` has `nfuncs` entries (see `Installed::call`).
+            *f = if (*f as usize) < unit.nfuncs { unsafe { *unit.funcs.add(*f as usize) } } else { func };
+        }
+        let exc = match error {
+            0 => {
+                self.jit_rerun.clear();
+                return Ok(Some(match sig.ret {
+                    ValKind::Int => Value::Int(r),
+                    ValKind::Bool => Value::Bool(r != 0),
+                    ValKind::Float => Value::Float(f64::from_bits(r as u64)),
+                    ValKind::Str
+                    | ValKind::List(_)
+                    | ValKind::Map(..)
+                    | ValKind::Opt(_)
+                    | ValKind::Object(_)
+                    | ValKind::OptObject(_) => ret,
+                    ValKind::Void => Value::Null,
+                }));
+            }
+            JIT_ERR_STACK if (boxed_args || impure) && !rerun => {
                 return Err(VmError::Fatal("maximum call stack depth exceeded".into()));
             }
             // The arguments are in their registers again (numbers were never moved).
             JIT_ERR_STACK => return Ok(None),
             JIT_ERR_MEMORY if again => return Ok(None),
-            JIT_ERR_OVERFLOW => return Err(self.throw("ArithmeticError", "integer overflow")),
-            JIT_ERR_DIV_ZERO => return Err(self.throw("DivisionByZeroError", "modulo by zero")),
-            JIT_ERR_FDIV_ZERO => return Err(self.throw("DivisionByZeroError", "division by zero")),
-            JIT_ERR_SHIFT => return Err(self.throw("ArithmeticError", "bit shift by a negative number")),
+            JIT_ERR_OVERFLOW => self.throw("ArithmeticError", "integer overflow"),
+            JIT_ERR_DIV_ZERO => self.throw("DivisionByZeroError", "modulo by zero"),
+            JIT_ERR_FDIV_ZERO => self.throw("DivisionByZeroError", "division by zero"),
+            JIT_ERR_SHIFT => self.throw("ArithmeticError", "bit shift by a negative number"),
             JIT_ERR_FLOAT_TO_INT => {
                 let f = f64::from_bits(ctx.detail as u64);
-                return Err(self.throw("ValueError", format!("cannot convert {} to int", format_float(f))));
+                self.throw("ValueError", format!("cannot convert {} to int", format_float(f)))
             }
             JIT_ERR_DEPTH => return Err(VmError::Fatal("maximum call stack depth exceeded".into())),
             JIT_ERR_THROW => {
                 let (class, msg) = self.jit_rt.take_pending();
-                return Err(self.throw(class, msg));
+                self.throw(class, msg)
             }
+            JIT_ERR_VM => self.jit_rt.take_error(),
             JIT_ERR_MEMORY => return Err(memory_error(self.limits.max_memory.unwrap_or(4 << 30))),
             _ => {
                 let secs = self.limits.max_time.map(|t| t.as_secs_f64()).unwrap_or(0.0);
                 return Err(VmError::Fatal(format!("maximum execution time of {secs} seconds exceeded")));
             }
-        }
-        Ok(Some(match sig.ret {
-            ValKind::Int => Value::Int(r),
-            ValKind::Bool => Value::Bool(r != 0),
-            ValKind::Float => Value::Float(f64::from_bits(r as u64)),
-            ValKind::Str | ValKind::List(_) | ValKind::Map(..) | ValKind::Opt(_) => ret,
-            ValKind::Void => Value::Null,
-        }))
+        };
+        // An exception raised in native code was thrown in its innermost
+        // frame: its trace has the native calls above this one, as the
+        // interpreter's would.
+        Err(match exc {
+            VmError::Exception(mut e) if e.at.is_none() => {
+                e.at = Some(self.thrown_at_native(&native));
+                self.record_trace(&e);
+                VmError::Exception(e)
+            }
+            other => other,
+        })
     }
 
     fn mem(&self) -> MemLimit {
@@ -2074,7 +2287,7 @@ impl Vm {
     }
 
     #[cold]
-    fn check_deadline(&mut self) -> Result<(), VmError> {
+    pub(crate) fn check_deadline(&mut self) -> Result<(), VmError> {
         self.budget = BUDGET;
         if let Some(p) = &mut self.profile {
             self.budget = PROFILE_BUDGET;
@@ -2657,6 +2870,13 @@ impl Vm {
                             v => bad("object", v),
                         };
                         let callee = prog.classes[class as usize].vtable[*slot as usize];
+                        if self.jit.as_ref().is_some_and(|j| j.is_compiled(callee)) {
+                            self.frames[fi].pc = pc as u32;
+                            if let Some(v) = tri!(self.call_native(callee, base + *args as usize, *argc as usize)) {
+                                reg!(*dst) = v;
+                                continue;
+                            }
+                        }
                         call!(callee, *dst, *args, *argc, &[])
                     }
                     Instr::CallClosure { dst, callee, args, argc } => {
@@ -2726,19 +2946,7 @@ impl Vm {
                         }
                     }
 
-                    Instr::NewObject(d, class) => {
-                        let fields = self.new_fields(*class);
-                        let o = Rc::new(RefCell::new(Object { class: *class, fields }));
-                        // An object that can hold no other object is never in a cycle.
-                        if !self.prog.classes[*class as usize].acyclic {
-                            self.track(&o);
-                            if self.gc_due.get() {
-                                // Collect at the next loop step or call.
-                                self.budget = 1;
-                            }
-                        }
-                        reg!(*d) = Value::Object(o);
-                    }
+                    Instr::NewObject(d, class) => reg!(*d) = self.new_object(*class),
                     Instr::GetProp(d, o, slot) => {
                         let v = match &reg!(*o) {
                             Value::Object(ob) => ob.borrow().fields[*slot as usize].clone(),

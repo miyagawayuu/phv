@@ -248,6 +248,10 @@ pub enum ValKind {
     Map(Scalar, Scalar),
     /// `?T` of a scalar.
     Opt(Scalar),
+    /// An object of the class (or a subclass of it), by class id.
+    Object(u32),
+    /// An object of the class (or a subclass of it), or `null`.
+    OptObject(u32),
 }
 
 /// The scalar types: the elements of lists and maps, and nullable values.
@@ -263,13 +267,22 @@ impl ValKind {
     /// Passed and returned as a `Value` in the register window, not in a
     /// machine register.
     pub fn boxed(self) -> bool {
-        matches!(self, ValKind::Str | ValKind::List(_) | ValKind::Map(..) | ValKind::Opt(_))
+        matches!(
+            self,
+            ValKind::Str
+                | ValKind::List(_)
+                | ValKind::Map(..)
+                | ValKind::Opt(_)
+                | ValKind::Object(_)
+                | ValKind::OptObject(_)
+        )
     }
 }
 
 /// Present when every local of a function is an `int`, `bool`, `float` or
-/// `string`, a nullable one, or a list or map of them, so the JIT may compile
-/// it to native code (it still checks every instruction, see `phv_jit`).
+/// `string`, a nullable one, a list or map of them, or an object of a class
+/// that takes no type arguments (nullable or not), so the JIT may compile it
+/// to native code (it still checks every instruction, see `phv_jit`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NativeSig {
     pub params: Vec<ValKind>,
@@ -297,6 +310,11 @@ pub struct Field {
     pub name: String,
     pub default: Const,
     pub public: bool,
+    /// The declared type of the property, when it is one native code may
+    /// hold (see `NativeSig`): what the JIT reads from it. The JIT checks
+    /// the value it reads, so a wrong kind gives an error, never a misread.
+    #[serde(default)]
+    pub kind: Option<ValKind>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

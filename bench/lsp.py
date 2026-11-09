@@ -18,7 +18,12 @@ the edit caused (the server is given a quiet moment to show there are no
 more), and "checks" counts those publishDiagnostics per edit: one when the
 server waits for the typing to pause, up to K when it checks every keystroke.
 
-    python bench/lsp.py [--edits 20] [--keystrokes 1] [--interval-ms 50] [--phv target/release/phv] [--out bench/results/<sha>.json]
+With --pages N, the session instead opens the N largest .phv files of examples/
+one after the other (each waits for its diagnostics), as an editor with N
+tabs does, and then reads the memory of the server: its working set (resident
+set) and the peak of it. These go under "lsp_pages".
+
+    python bench/lsp.py [--edits 20] [--keystrokes 1] [--interval-ms 50] [--pages N] [--phv target/release/phv] [--out bench/results/<sha>.json]
 """
 
 import argparse
@@ -48,6 +53,83 @@ def default_phv() -> Path:
 def largest_page() -> Path:
     pages = sorted((SITE / "public").rglob("*.phv"), key=lambda p: (p.stat().st_size, str(p)))
     return pages[-1]
+
+
+def largest_files(n: int) -> list[Path]:
+    # Not templates (`.phv.html`): the pages that render them publish their diagnostics.
+    files = list((ROOT / "examples").rglob("*.phv"))
+    return sorted(files, key=lambda p: (-p.stat().st_size, str(p)))[:n]
+
+
+def memory(pid: int) -> tuple[int, int]:
+    """The working set (resident set) of a process and its peak, in bytes."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class Counters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(0x0400 | 0x0010, False, pid)  # query information, read
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "OpenProcess failed")
+        try:
+            c = Counters()
+            c.cb = ctypes.sizeof(c)
+            if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(c), c.cb):
+                raise OSError(ctypes.get_last_error(), "GetProcessMemoryInfo failed")
+            return c.WorkingSetSize, c.PeakWorkingSetSize
+        finally:
+            kernel32.CloseHandle(handle)
+    status = Path(f"/proc/{pid}/status")
+    if status.exists():
+        fields = {}
+        for line in status.read_text().splitlines():
+            name, _, value = line.partition(":")
+            fields[name] = value.split()
+        return int(fields["VmRSS"][0]) * 1024, int(fields["VmHWM"][0]) * 1024
+    # macOS: ps knows the resident set, not its peak.
+    rss = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(pid)], text=True).strip()) * 1024
+    return rss, rss
+
+
+def open_pages(client: "Client", n: int) -> dict:
+    files = largest_files(n)
+    if len(files) < n:
+        print(f"warning: examples/ has only {len(files)} files to open", file=sys.stderr)
+    start = time.perf_counter()
+    for i, path in enumerate(files):
+        uri = path.as_uri()
+        client.notify(
+            "textDocument/didOpen",
+            {"textDocument": {"uri": uri, "languageId": "phv", "version": 0, "text": path.read_text(encoding="utf-8")}},
+        )
+        client.wait(is_diagnostics_for(uri))
+    open_ms = (time.perf_counter() - start) * 1000
+    # Work that follows the last diagnostics (keeping the analysis) ends first.
+    time.sleep(1.0)
+    rss, peak = memory(client.proc.pid)
+    return {
+        "pages": len(files),
+        "bytes": sum(p.stat().st_size for p in files),
+        "open_ms": round(open_ms, 3),
+        "rss_bytes": rss,
+        "peak_rss_bytes": peak,
+    }
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -154,6 +236,7 @@ def main() -> int:
     ap.add_argument("--edits", type=int, default=20)
     ap.add_argument("--keystrokes", type=int, default=1, help="didChange notifications per edit (typing)")
     ap.add_argument("--interval-ms", type=float, default=50.0, help="between keystrokes")
+    ap.add_argument("--pages", type=int, default=0, help="open this many files of examples/ and read the memory")
     ap.add_argument("--phv", type=Path, default=None)
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
@@ -166,6 +249,29 @@ def main() -> int:
         return 1
     sha = short_sha()
     out = args.out or ROOT / "bench" / "results" / f"{sha}.json"
+
+    if args.pages > 0:
+        client = Client(phv)
+        try:
+            rid, _ = client.request(
+                "initialize",
+                {"processId": os.getpid(), "rootUri": SITE.as_uri(), "capabilities": {}, "clientInfo": {"name": "bench"}},
+            )
+            client.wait(lambda m: m.get("id") == rid)
+            client.notify("initialized", {})
+            section = open_pages(client, args.pages)
+        finally:
+            client.close()
+        doc = json.loads(out.read_text(encoding="utf-8")) if out.exists() else {"commit": sha}
+        doc["lsp_pages"] = section
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8", newline="") as f:
+            json.dump(doc, f, indent=2)
+            f.write("\n")
+        print(f"{section['pages']} files of examples/ ({section['bytes']} bytes) opened in {section['open_ms']:.1f} ms")
+        print(f"  memory  {section['rss_bytes'] / 2**20:.1f} MiB  peak {section['peak_rss_bytes'] / 2**20:.1f} MiB")
+        print(f"Wrote the lsp_pages section of {out}")
+        return 0
 
     page = largest_page()
     uri = page.as_uri()

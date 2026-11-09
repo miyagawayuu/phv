@@ -1142,6 +1142,20 @@ pub fn load_config(root: &Path) -> Result<Config, String> {
     parse_config(root, &text)
 }
 
+/// `load_config` for the loader, which reads `phv.toml` again at each load:
+/// while the file is unchanged its text is not read again (see
+/// `read_known`). It is still parsed and checked each time: the checks also
+/// look at the project's folders (`[jobs] dir`, the TLS files).
+pub(crate) fn load_config_known(root: &Path) -> Result<Config, String> {
+    let path = root.join("phv.toml");
+    let text = match crate::read_known(&path) {
+        Ok(s) => s.text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default_for(root)),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    parse_config(root, &text)
+}
+
 /// The configuration in `text` (a phv.toml) for the project at `root`.
 pub fn parse_config(root: &Path, text: &str) -> Result<Config, String> {
     parse_config_with_jobs(root, text, None)

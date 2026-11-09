@@ -9,6 +9,7 @@ mod jobs;
 mod log;
 mod metrics;
 mod multipart;
+mod pool;
 mod routes;
 mod session;
 mod static_files;
@@ -136,6 +137,8 @@ struct State {
     embedded: Option<Embedded>,
     /// Scripts running at once (`[server] workers`).
     workers: Arc<tokio::sync::Semaphore>,
+    /// The threads pages run on (one per worker at most).
+    pages: pool::Pool,
     /// Bytes of request bodies received or held, in KiB: as much as the workers
     /// can use at once. Past its first `SMALL_BODY` bytes, a body takes its share
     /// as the bytes arrive (never for bytes not yet sent) and keeps it until its
@@ -233,6 +236,7 @@ impl State {
             csrf_old: None,
             secret: None,
             workers: Arc::new(tokio::sync::Semaphore::new(config.workers)),
+            pages: pool::Pool::new(),
             body_budget: Arc::new(tokio::sync::Semaphore::new(config.workers.max(1) * (MAX_BODY / 1024))),
             buffered: Arc::new(AtomicUsize::new(0)),
             events_buffered: Arc::new(AtomicUsize::new(0)),
@@ -669,6 +673,7 @@ fn serve_with(
     };
     let state = Arc::new(state);
     let log = state.log.clone();
+    let stopped = state.clone();
     if listener.is_none() && state.config.jobs.is_none() {
         return Err("phv.toml has no [jobs] section: there are no jobs to run".into());
     }
@@ -676,7 +681,7 @@ fn serve_with(
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // Scripts run on blocking threads; give them room for deep recursion.
-        .thread_stack_size(16 * 1024 * 1024)
+        .thread_stack_size(pool::STACK)
         .build()
         .map_err(|e| e.to_string())?;
     let result = rt.block_on(async move {
@@ -804,6 +809,8 @@ fn serve_with(
     });
     // Scripts still running past the timeout are not waited for.
     rt.shutdown_timeout(Duration::from_millis(500));
+    // Then the threads of pages end (the busy ones after their page).
+    stopped.pages.close();
     log.flush();
     result
 }
@@ -1408,11 +1415,12 @@ fn finish(
 /// message) of the client at `ip`; the seconds to wait when it is over.
 async fn rate_limited(state: &State, ip: std::net::IpAddr) -> Option<u64> {
     let limit = state.config.requests_per_minute;
+    if limit == 0 {
+        return None;
+    }
     let client = format!("ip:{}", phv_std::ratelimit::client_key(ip));
     let minute = Duration::from_secs(60);
-    if limit == 0 {
-        None
-    } else if state.config.host.rate_limit_store.is_none() {
+    if state.config.host.rate_limit_store.is_none() {
         (!phv_std::ratelimit::hit(&client, limit, minute)).then(|| phv_std::ratelimit::retry_after(&client, minute))
     } else {
         // Counted on the shared Redis server; if it cannot be reached, in this process.
@@ -2644,10 +2652,12 @@ impl State {
     /// title and details, and whether the page had sent its response with
     /// flush() (it is cut off then: no error page can follow).
     fn run_one(&self, script: &Path, ctx: HttpCtx) -> Result<phv_driver::RunOutcome, (String, String, bool)> {
-        let rel = script.strip_prefix(&self.root).unwrap_or(script).to_string_lossy().replace('\\', "/");
+        // The name the logs give the page (made only when one is written).
+        let rel = || script.strip_prefix(&self.root).unwrap_or(script).to_string_lossy().replace('\\', "/");
         let compiled = match self.compiled(script) {
             Ok(c) => c,
             Err(diagnostics) => {
+                let rel = rel();
                 self.metrics.failure(metrics::Failure::Compile);
                 eprintln!("compile error in {rel}:\n{diagnostics}");
                 return Err(("Compile error".into(), format!("{rel} could not be compiled.\n\n{diagnostics}"), false));
@@ -2664,7 +2674,7 @@ impl State {
         if let Some(err) = &outcome.error {
             self.metrics.failure(metrics::Failure::of(&err.message));
             let text = err.render();
-            eprintln!("runtime error in {rel}:\n{}", err.render_for_log());
+            eprintln!("runtime error in {}:\n{}", rel(), err.render_for_log());
             return Err(("Runtime error".into(), text, outcome.http.flushed));
         }
         Ok(outcome)
@@ -2946,14 +2956,27 @@ async fn run_script(
     // VM (its database connections rolling back and going back to their pools:
     // round trips) comes after, on the same thread, while the worker is still
     // held, so no more pages run at once than `workers` allows.
-    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
-    let mut task = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+    // A panic is caught on the page's thread and reported as tokio reported
+    // it when pages ran on its blocking threads.
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<Result<Resp, String>>();
+    state.pages.run(permit, move || {
         let _reserved = reserved;
-        let (resp, teardown) = st.execute(&script, params, ip, parts, body, kind, None, sink);
+        let run = std::panic::AssertUnwindSafe(|| st.execute(&script, params, ip, parts, body, kind, None, sink));
+        let (resp, teardown) = match std::panic::catch_unwind(run) {
+            Ok(done) => done,
+            Err(panic) => {
+                let _ = done_tx.send(Err(panic_text(&*panic)));
+                return;
+            }
+        };
         // Not received: the request is gone (its connection closed).
-        let _ = done_tx.send(resp);
-        drop(teardown);
+        let sent = done_tx.send(Ok(resp)).is_ok();
+        // The teardown goes on; a panic in it is still seen and logged.
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(teardown))) {
+            if sent {
+                eprintln!("internal error: {}", panic_text(&*panic));
+            }
+        }
     });
     let done = tokio::select! {
         biased;
@@ -2961,20 +2984,8 @@ async fn run_script(
             head.extensions_mut().insert(served);
             return head;
         }
-        Ok(resp) = &mut done_rx => {
-            // The teardown goes on; a panic in it is still seen and logged.
-            tokio::spawn(async move {
-                if let Err(e) = task.await {
-                    eprintln!("internal error: {e}");
-                }
-            });
-            Ok(resp)
-        }
-        done = &mut task => match done {
-            // The response was sent just before the task ended (or never: a bug).
-            Ok(()) => done_rx.try_recv().map_err(|_| "the page gave no response".to_string()),
-            Err(e) => Err(e.to_string()),
-        },
+        // Never closed without an answer (a bug otherwise).
+        done = &mut done_rx => done.unwrap_or_else(|_| Err("the page gave no response".to_string())),
     };
     // The head may have been sent just before the page ended.
     if let Ok(mut head) = head_rx.try_recv() {
@@ -2990,6 +3001,18 @@ async fn run_script(
             eprintln!("internal error: {e}");
             page(StatusCode::INTERNAL_SERVER_ERROR, "500 Internal Server Error", "<p>Something went wrong.</p>")
         }
+    }
+}
+
+/// What a panic of a page says in the log, in the words of tokio's `JoinError`
+/// (pages ran on its blocking threads until 1.3). The number counts the panics
+/// of pages, where tokio's counted its tasks.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
+    static PANICS: AtomicU64 = AtomicU64::new(1);
+    let id = PANICS.fetch_add(1, Ordering::Relaxed);
+    match panic.downcast_ref::<String>().map(String::as_str).or_else(|| panic.downcast_ref::<&str>().copied()) {
+        Some(message) => format!("task {id} panicked with message {message:?}"),
+        None => format!("task {id} panicked"),
     }
 }
 

@@ -2,7 +2,7 @@ use super::flow::{assigned_vars, ContinueTo, Flow};
 use super::Checker;
 use crate::hir::*;
 use crate::types::*;
-use phv_syntax::ast::{Arg, AssignOp, BinOp, Expr, ExprKind, Stmt, StmtKind};
+use phv_syntax::ast::{Arg, AssignOp, BinOp, Expr, ExprKind, MethodCall, Stmt, StmtKind};
 use phv_syntax::Span;
 use std::collections::HashSet;
 
@@ -400,13 +400,13 @@ impl Checker<'_> {
                             self.error("`...` must come last in a pattern", x.span);
                         }
                         let from = Arg { name: None, value: Expr { kind: ExprKind::Int(i as i64), span: x.span } };
-                        let slice = ExprKind::MethodCall {
+                        let slice = ExprKind::MethodCall(Box::new(MethodCall {
                             obj: tmp(),
                             name: "slice".into(),
                             name_span: x.span,
                             args: vec![from],
                             nullsafe: false,
-                        };
+                        }));
                         items.push((rest, slice));
                         continue;
                     }

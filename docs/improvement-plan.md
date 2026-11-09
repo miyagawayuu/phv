@@ -17,11 +17,16 @@ before the release.
 
 | Item | Code | Change | Risk | Measure | Size |
 |---|---|---|---|---|---|
-| JIT for objects, closures, methods and `echo` | `crates/phv_jit` | Compile the operations the interpreter still runs for objects and closures, and the output path | The JIT is part of the trust base: it gets its own review in the assessment, and the differential test grows with it | The rows of the README table that still show the same time with and without the JIT | L |
-| Cached type-checked modules | `crates/phv_types`, `crates/phv_compiler/src/cache.rs` | Cache the checked HIR of a module keyed by its source and its imports, so a page's check reuses what did not change | Also bounds the residual risk of the sixteenth assessment (a check of 415 MB): a cache entry has the same limits as the compile | `phv check` of the test corpus; the editor's diagnostics latency | L |
-| Worker pool with reused VMs | `crates/phv_driver`, `crates/phv_server` | Keep a VM per worker and reset its heap between requests, instead of a new VM per request | Needs an argument that the reset leaves nothing of the previous request (the heap, the kept statements, the output buffer): a test that runs two requests on one VM and compares the heap to a fresh one | Home page p50 | L |
 | Generators, traits, i18n, images, an ORM | the language and `crates/phv_std` | As the roadmap says: additions only, each with its spec section | Each is a new surface for the assessment | — | L each |
-| A smaller AST | `crates/phv_syntax/src/ast.rs` | Box the rare variants so that the common nodes are small, with `size_of` assertions in the tests | None for behaviour | Parse time of the corpus; memory of the editor with 20 pages | M |
+
+## Later
+
+| Item | Code | Change | Risk | Measure | Size |
+|---|---|---|---|---|---|
+| Cheaper native object operations | `crates/phv_jit`, `crates/phv_vm/src/jit.rs` | Since 1.3 objects, methods and `echo` are compiled, but each property read or write and each `new` is a call into the runtime that costs what the interpreter's instruction does; read and write properties by slot in native code | The JIT is part of the trust base; the slot layout is part of the unit key (§28, R21-4) | A method that walks objects (a tree's sum); the `new` row of the README table | L |
+
+Closures were measured and left out of the JIT: their bodies are short and called by builtins, and entering native
+code costs more than such a body, so `map()`, `filter()` and `sortBy()` would not gain.
 
 ## Measured already
 
@@ -29,3 +34,19 @@ The harness measured these in 1.2.0 (`bench/results/6da479b.json` against `ae069
 took a page three directories deep from 4,589 to 67,918 requests per second; the teardown after the response took
 the PostgreSQL page's p50 from 1.61 to 0.90 ms; kept prepared statements made the SQLite page about 18% faster; and
 fat LTO made the binary 1 MB smaller and the micro-benchmarks 3–9% faster.
+
+In the 1.3 cycle, reusing VMs between requests was measured and dropped: making a VM and dropping its empty shell
+take about 0.43 µs, 0.2% of the home page's p50 of 230 µs, and the whole run of the page is 2.4% of it. A page that
+echoes one word answers as fast as the home page, so the time of a request is in the HTTP path, not in the VM; a
+reset would have added the burden of proving that nothing of a request survives into the next. Profiled instead,
+the trivial page's time was about three quarters the client, the loopback and hyper; the server's own share went
+mostly to two thread hand-offs and a wake of the log thread. A pool of page threads and batched log writes took the
+p50 down 8–9% and the requests per second up 10–12%.
+
+A cache of type-checked modules was measured and dropped too: the bodies of imported modules and all declarations
+take 1–2.5% of `phv check` of the test corpus, 3–4% of a page's first compile, and under 1% of the editor's
+diagnostics. The checker numbers functions and classes and counts its budgets over the whole program, so a correct
+cache would have meant rebuilding it. The profile found the time elsewhere: parsing the builtin signatures (0.57 ms
+per process, about 4% of a `phv check`) and the loader's file-system work (2–5 ms per analysis, about half of a
+page's first compile). In 1.3 the builtin signatures are read by a parser of their own (85 µs instead of 450),
+the loader keeps the text and hash of an unchanged file, and `phv check` takes several files in one process.

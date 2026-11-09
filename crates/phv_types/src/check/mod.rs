@@ -11,6 +11,7 @@
 mod expr;
 mod flow;
 mod pmap;
+mod sig;
 mod stmt;
 
 use crate::builtins::{BuiltinSig, Recv, BUILTINS};
@@ -21,7 +22,7 @@ use flow::FnCtx;
 use phv_syntax::ast::{
     self, BinOp, ClassDecl, ClassKind, ExprKind, FunctionDecl, StmtKind, TypeExpr, TypeExprKind, UnOp, Visibility,
 };
-use phv_syntax::{parse_type_str, Diagnostic, Span};
+use phv_syntax::{Diagnostic, Span};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
@@ -326,43 +327,15 @@ const LARGE_TYPE: usize = 100;
 /// 16-bit operand of the bytecode.
 const MAX_FIELDS: usize = u16::MAX as usize;
 
-fn sig_type(t: &TypeExpr) -> Type {
-    match &t.kind {
-        TypeExprKind::Named(n, args) => match (n.as_str(), args.as_slice()) {
-            ("int", []) => Type::Int,
-            ("float", []) => Type::Float,
-            ("string", []) => Type::Str,
-            ("bool", []) => Type::Bool,
-            ("void", []) => Type::Void,
-            ("any", []) => Type::Any,
-            ("Html", []) => Type::Html,
-            ("SafeUrl", []) => Type::SafeUrl,
-            ("SafeJs", []) => Type::SafeJs,
-            ("Sql", []) => Type::Sql,
-            ("T", []) => Type::Generic(0),
-            ("U", []) => Type::Generic(1),
-            ("K", []) => Type::Generic(2),
-            ("V", []) => Type::Generic(3),
-            ("W", []) => Type::Generic(4),
-            ("list", [a]) => Type::list(sig_type(a)),
-            ("set", [a]) => Type::set(sig_type(a)),
-            ("map", [k, v]) => Type::map(sig_type(k), sig_type(v)),
-            _ => panic!("bad builtin signature type `{n}`"),
-        },
-        TypeExprKind::Nullable(inner) => Type::nullable(sig_type(inner)),
-        TypeExprKind::Union(ms) => Type::union(ms.iter().map(sig_type).collect()),
-        TypeExprKind::Func(ps, r) => Type::Func(ps.iter().map(sig_type).collect(), Box::new(sig_type(r))),
-    }
-}
-
-/// The signatures of the builtins, parsed once per process.
+/// The signatures of the builtins, read once per process (see `sig`).
 fn parsed_builtins() -> &'static HashMap<&'static str, Vec<ParsedBuiltin>> {
     static PARSED: std::sync::OnceLock<HashMap<&'static str, Vec<ParsedBuiltin>>> = std::sync::OnceLock::new();
     PARSED.get_or_init(|| {
         let mut builtins: HashMap<_, Vec<ParsedBuiltin>> = HashMap::new();
         for sig in BUILTINS {
-            let t = parse_type_str(sig.sig).unwrap_or_else(|| panic!("bad builtin signature: {}", sig.sig));
-            let Type::Func(params, ret) = sig_type(&t) else { panic!("builtin signature must be a function type") };
+            let Type::Func(params, ret) = sig::parse(sig.sig) else {
+                panic!("builtin signature must be a function type")
+            };
             builtins.entry(sig.name).or_default().push(ParsedBuiltin { sig, params, ret: *ret });
         }
         builtins
@@ -1492,7 +1465,8 @@ impl<'a> Checker<'a> {
                     return None;
                 }
             },
-            ExprKind::ClassConst { class, class_span, name, name_span } => {
+            ExprKind::ClassConst(c) => {
+                let ast::ClassConst { class, class_span, name, name_span } = &**c;
                 let cid = match class.as_str() {
                     "self" | "static" => self_class,
                     other => self.class_ref(other, *class_span),
@@ -2845,13 +2819,13 @@ impl<'a> Checker<'a> {
                         span,
                     };
                     out.push(HStmt::Assign(HPlace { base: HPlaceBase::Local(body), path: Vec::new() }, end));
-                    let mut args = args.clone();
+                    let mut args = args.to_vec();
                     args.push(ast::Arg {
                         name: Some(("body".into(), span)),
                         value: ast::Expr { kind: ExprKind::Var("%body".into()), span },
                     });
                     let callee = Box::new(ast::Expr { kind: ExprKind::Name("render".into()), span });
-                    let render = ast::Expr { kind: ExprKind::Call { callee, args }, span };
+                    let render = ast::Expr { kind: ExprKind::Call { callee, args: args.into() }, span };
                     let echo = ast::Stmt { kind: StmtKind::Echo(vec![render]), span, out: None };
                     self.stmt(&echo, &mut out);
                 }
@@ -2900,8 +2874,8 @@ impl<'a> Checker<'a> {
             .iter()
             .filter_map(|s| match &s.kind {
                 StmtKind::Assign { target, op: ast::AssignOp::Set, .. } => match &target.kind {
-                    ExprKind::Prop { obj, name, .. } if matches!(&obj.kind, ExprKind::Var(v) if v == "this") => {
-                        Some(name.as_str())
+                    ExprKind::Prop(p) if matches!(&p.obj.kind, ExprKind::Var(v) if v == "this") => {
+                        Some(p.name.as_str())
                     }
                     _ => None,
                 },
@@ -2910,7 +2884,7 @@ impl<'a> Checker<'a> {
             .collect();
         let calls_parent = d.body.iter().any(|s| {
             matches!(&s.kind, StmtKind::Expr(e) if matches!(&e.kind,
-                ExprKind::StaticCall { class, name, .. } if class == "parent" && name == "__construct"))
+                ExprKind::StaticCall(c) if c.class == "parent" && c.name == "__construct"))
         });
         let promoted: Vec<&str> = d.params.iter().filter(|p| p.promote.is_some()).map(|p| p.name.as_str()).collect();
         let class = &self.classes[cid as usize];
@@ -2974,6 +2948,7 @@ impl<'a> Checker<'a> {
                         name: f.name.clone(),
                         default: f.default.clone().unwrap_or(HConst::Null),
                         public: f.vis == Visibility::Public,
+                        ty: f.ty.clone(),
                     })
                     .collect(),
                 vtable: c.vtable.clone(),

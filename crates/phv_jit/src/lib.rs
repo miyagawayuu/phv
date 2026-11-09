@@ -21,7 +21,9 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
-use phv_vm::bytecode::{Const, Function, Instr, NativeSig, PathBase, Program, Reg, Scalar, ValKind, NO_REG};
+use phv_vm::bytecode::{
+    Class, Const, Field, Function, Instr, NativeSig, PathBase, Program, Reg, Scalar, ValKind, NO_REG,
+};
 use phv_vm::jit::*;
 use phv_vm::{Installed, JitEntry, JitTable};
 use std::collections::HashMap;
@@ -36,6 +38,7 @@ const CTX_MAX_DEPTH: i32 = 16;
 const CTX_BUDGET: i32 = 24;
 const CTX_DETAIL: i32 = 40;
 const CTX_STACK_LIMIT: i32 = 56;
+const CTX_FUNCS: i32 = 80;
 const _: () = {
     use std::mem::offset_of;
     assert!(offset_of!(phv_vm::jit::JitCtx, error) == CTX_ERROR as usize);
@@ -44,6 +47,7 @@ const _: () = {
     assert!(offset_of!(phv_vm::jit::JitCtx, budget) == CTX_BUDGET as usize);
     assert!(offset_of!(phv_vm::jit::JitCtx, detail) == CTX_DETAIL as usize);
     assert!(offset_of!(phv_vm::jit::JitCtx, stack_limit) == CTX_STACK_LIMIT as usize);
+    assert!(offset_of!(phv_vm::jit::JitCtx, funcs) == CTX_FUNCS as usize);
 };
 
 /// Owns a unit's executable memory, freed when the unit is dropped.
@@ -82,6 +86,11 @@ enum K {
     /// A scalar or `null`: a machine register and a null flag (a string is
     /// in the window).
     Opt(E),
+    /// An object of the class (by id in the program being compiled) or of a
+    /// subclass (in the window).
+    Obj(u32),
+    /// The same, or `null`.
+    OptObj(u32),
     /// Different kinds on different paths: must not be read.
     Mixed,
 }
@@ -157,13 +166,41 @@ impl K {
             ValKind::List(s) => Some(K::List(E::from(s))),
             ValKind::Map(k, v) => Some(K::Map(E::from(k), E::from(v))),
             ValKind::Opt(s) => Some(K::Opt(E::from(s))),
+            ValKind::Object(c) => Some(K::Obj(c)),
+            ValKind::OptObject(c) => Some(K::OptObj(c)),
             ValKind::Void => None,
         }
     }
 
     /// Kept in the register window, not in a machine register.
     fn boxed(self) -> bool {
-        matches!(self, K::Str | K::List(_) | K::Map(..) | K::Opt(E::Str))
+        matches!(self, K::Str | K::List(_) | K::Map(..) | K::Opt(E::Str) | K::Obj(_) | K::OptObj(_))
+    }
+
+    /// The class of an object, nullable or not (the type checker proved
+    /// that it is not null where it is used as an object).
+    fn class(self) -> Option<u32> {
+        match self {
+            K::Obj(c) | K::OptObj(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// The `JIT_ELEM_*` a helper delivers a value of this kind as, and
+    /// whether it may be null.
+    fn elem(self) -> Option<(i64, bool)> {
+        Some(match self {
+            K::Int | K::Bool => (JIT_ELEM_INT, false),
+            K::Float => (JIT_ELEM_FLOAT, false),
+            K::Str => (JIT_ELEM_STR, false),
+            K::List(_) => (JIT_ELEM_LIST, false),
+            K::Map(..) => (JIT_ELEM_MAP, false),
+            K::Obj(_) => (JIT_ELEM_OBJ, false),
+            K::OptObj(_) => (JIT_ELEM_OBJ, true),
+            K::Opt(E::Empty) => return None,
+            K::Opt(e) => (e.code(), true),
+            _ => return None,
+        })
     }
 
     /// A scalar, nullable or not: its element kind and whether it may be null.
@@ -182,6 +219,7 @@ impl K {
     fn strip(self) -> K {
         match self {
             K::Opt(e) => e.scalar().unwrap_or(self),
+            K::OptObj(c) => K::Obj(c),
             k => k,
         }
     }
@@ -194,6 +232,12 @@ impl K {
             _ if self == other => Some(self),
             (K::List(a), K::List(b)) => E::join(a, b).map(K::List),
             (K::Map(k1, v1), K::Map(k2, v2)) => E::join(k1, k2).zip(E::join(v1, v2)).map(|(k, v)| K::Map(k, v)),
+            // An object meets `null` (or the nullable form of its class).
+            (K::Null | K::OptObj(_), K::Obj(c) | K::OptObj(c)) | (K::Obj(c) | K::OptObj(c), K::Null | K::OptObj(_))
+                if self.class().is_none_or(|a| a == c) && other.class().is_none_or(|b| b == c) =>
+            {
+                Some(K::OptObj(c))
+            }
             (K::Null, x) | (x, K::Null) => x.base().map(|(e, _)| K::Opt(e)),
             (K::Opt(e), x) | (x, K::Opt(e)) if x.base() == Some((e, false)) => Some(K::Opt(e)),
             _ => None,
@@ -205,16 +249,58 @@ impl K {
 /// Whether a value of kind `have` may be used where `want` is needed: the
 /// same kind, an empty list or map for any, a scalar or `null` for a nullable
 /// one, and a nullable value where the scalar is needed (the type checker
-/// proved that it is not null there).
-fn fits(have: K, want: K) -> bool {
+/// proved that it is not null there); an object of a class where one of a
+/// class it extends (or implements) is needed.
+fn fits(prog: &Program, have: K, want: K) -> bool {
     have == want
         || match (have, want) {
+            (K::Null, K::OptObj(_)) => true,
+            (K::Obj(a) | K::OptObj(a), K::Obj(b) | K::OptObj(b)) => extends(prog, a, b),
             (K::List(E::Empty), K::List(_)) | (K::Map(E::Empty, E::Empty), K::Map(..)) | (K::Null, K::Opt(_)) => true,
             (K::Map(k1, v1), K::Map(k2, v2)) => E::join(k1, k2) == Some(k2) && E::join(v1, v2) == Some(v2),
             (x, K::Opt(e)) => x.base().is_some_and(|(b, _)| b == e),
             (K::Opt(e), x) => x.base() == Some((e, false)),
             _ => false,
         }
+}
+
+/// `K::join`, where objects of two classes meet as the nearest class both
+/// extend (`$p = $c ? new A() : new B()`, the type checker's type of `$p`).
+fn join(prog: &Program, a: K, b: K) -> K {
+    let common = match (a.class(), b.class()) {
+        (Some(x), Some(y)) if x != y => {
+            let mut c = Some(x);
+            // The parents of `x`, nearest first, until one `y` extends.
+            for _ in 0..prog.classes.len() {
+                match c {
+                    Some(p) if extends(prog, y, p) => break,
+                    Some(p) => c = prog.classes.get(p as usize).and_then(|k| k.parent),
+                    None => break,
+                }
+            }
+            c.filter(|&p| extends(prog, x, p) && extends(prog, y, p))
+        }
+        _ => None,
+    };
+    match common {
+        Some(c) => {
+            let nullable = matches!(a, K::OptObj(_)) || matches!(b, K::OptObj(_));
+            if nullable {
+                K::OptObj(c)
+            } else {
+                K::Obj(c)
+            }
+        }
+        None => a.join(b),
+    }
+}
+
+/// Whether class `a` is class `b`, extends it or implements it (both in range).
+fn extends(prog: &Program, a: u32, b: u32) -> bool {
+    match (prog.classes.get(a as usize), prog.classes.get(b as usize)) {
+        (Some(c), Some(_)) => a == b || c.supers.binary_search(&b).is_ok(),
+        _ => false,
+    }
 }
 
 /// How `==` / `!=` is computed natively.
@@ -233,8 +319,8 @@ enum EqMode {
 fn eq_mode(ka: K, kb: K) -> Option<EqMode> {
     match (ka, kb) {
         (K::Null, K::Null) => Some(EqMode::BothNull),
-        (K::Null, x) => x.base().map(|_| EqMode::NullTest(false)),
-        (x, K::Null) => x.base().map(|_| EqMode::NullTest(true)),
+        (K::Null, x) => (x.base().is_some() || x.class().is_some()).then_some(EqMode::NullTest(false)),
+        (x, K::Null) => (x.base().is_some() || x.class().is_some()).then_some(EqMode::NullTest(true)),
         _ => {
             let ((ea, oa), (eb, ob)) = (ka.base()?, kb.base()?);
             if ea != eb {
@@ -368,7 +454,7 @@ fn well_formed(prog: &Program, f: &Function, ok: &[bool]) -> Option<Checked> {
                 Some(old) => {
                     let mut changed = false;
                     for (o, k) in old.iter_mut().zip(&st) {
-                        let j = o.join(*k);
+                        let j = join(prog, *o, *k);
                         if j != *o {
                             *o = j;
                             changed = true;
@@ -559,6 +645,27 @@ fn step(prog: &Program, sig: &NativeSig, ok: &[bool], ins: &Instr, st: &mut [K],
             eq_mode(kind(st, a)?, kind(st, b)?)?;
             return Some(Flow::Branch(t));
         }
+        // `$o->p .= $x` on a string property.
+        AppendPath { ref path, cur } if matches!(path.base, PathBase::Prop(..)) => {
+            let PathBase::Prop(o, slot) = path.base else { return None };
+            if !path.keys.is_empty() || path.push || field_kind(prog, kind(st, o)?, slot)? != K::Str {
+                return None;
+            }
+            need(st, cur, K::Str)?;
+            kind(st, path.val)?;
+            set(st, cur, K::Undef)?;
+        }
+        // `$o->p[] = $v` and `$o->p[$k] = $v` on a list or map property.
+        SetPath(ref path) if matches!(path.base, PathBase::Prop(..)) => {
+            let PathBase::Prop(o, slot) = path.base else { return None };
+            let v = E::of(kind(st, path.val)?)?;
+            match (field_kind(prog, kind(st, o)?, slot)?, path.push, path.keys.as_slice()) {
+                (K::List(e), true, []) if e == v => {}
+                (K::List(e), false, [k]) if e == v => need(st, *k, K::Int)?,
+                (K::Map(ke, ve), false, [k]) if ve == v && matches!(ke, E::Int | E::Str) => need(st, *k, ke.scalar()?)?,
+                _ => return None,
+            }
+        }
         // `.=` on an element of a string list or map in a variable.
         AppendPath { ref path, cur } => {
             let PathBase::Local(r) = path.base else { return None };
@@ -574,41 +681,50 @@ fn step(prog: &Program, sig: &NativeSig, ok: &[bool], ins: &Instr, st: &mut [K],
             set(st, cur, K::Undef)?;
         }
         Call { dst, func, args, argc } => {
-            if !ok.get(func as usize).copied().unwrap_or(false) {
-                return None;
-            }
-            let callee = prog.funcs.get(func as usize)?.native.as_ref()?;
-            if callee.params.len() != argc as usize {
-                return None;
-            }
-            for (k, p) in callee.params.iter().enumerate() {
-                fits(kind(st, args.checked_add(k as u16)?)?, K::of(*p)?).then_some(())?;
-            }
-            for k in 0..argc {
-                set(st, args + k, K::Undef)?;
-            }
-            let ret = match callee.ret {
-                ValKind::Void => K::Undef,
-                v => K::of(v)?,
-            };
+            let ret = call_kind(prog, ok, st, func, args, argc, false)?;
             // Arguments and results passed in the window (strings, lists,
             // maps and nullable values) need one in the caller too (found by
             // the 1.0 audit: an int function calling a `?int` one wrote into
             // its caller's window).
+            let callee = prog.funcs.get(func as usize)?.native.as_ref()?;
             if callee.ret.boxed() || callee.params.iter().any(|p| p.boxed()) {
                 *strings = true;
+            }
+            for k in 0..argc {
+                set(st, args + k, K::Undef)?;
+            }
+            set(st, dst, ret)?;
+        }
+        // A method call through the class's method table: every function
+        // the object's class (the receiver's or a subclass) may have in that
+        // slot is compiled, takes these arguments and returns the same kind.
+        CallVirtual { dst, slot, args, argc } => {
+            let targets = virtual_targets(prog, kind(st, args)?.class()?, slot)?;
+            let mut ret = None;
+            for &t in &targets {
+                let k = call_kind(prog, ok, st, t, args, argc, true)?;
+                let r = prog.funcs.get(t as usize)?.native.as_ref()?.ret;
+                if ret.is_some_and(|(_, old)| old != r) {
+                    return None;
+                }
+                ret = Some((k, r));
+            }
+            let (ret, _) = ret?;
+            *strings = true;
+            for k in 0..argc {
+                set(st, args + k, K::Undef)?;
             }
             set(st, dst, ret)?;
         }
         Ret(r) => {
             match K::of(sig.ret) {
                 None => kind(st, r).map(|_| ())?,
-                Some(k) => fits(kind(st, r)?, k).then_some(())?,
+                Some(k) => fits(prog, kind(st, r)?, k).then_some(())?,
             }
             return Some(Flow::Stop);
         }
-        // A string, list or map function must return one on every path.
-        RetNull if sig.ret.boxed() && !matches!(sig.ret, ValKind::Opt(_)) => return None,
+        // A string, list, map or object function must return one on every path.
+        RetNull if sig.ret.boxed() && !matches!(sig.ret, ValKind::Opt(_) | ValKind::OptObject(_)) => return None,
         RetNull => return Some(Flow::Stop),
         PowI(d, a, b) => {
             need(st, a, K::Int)?;
@@ -738,12 +854,100 @@ fn step(prog: &Program, sig: &NativeSig, ok: &[bool], ins: &Instr, st: &mut [K],
             need(st, b, K::Int)?;
             set(st, d, K::List(E::Int))?;
         }
+        NewObject(d, c) => {
+            prog.classes.get(c as usize)?;
+            set(st, d, K::Obj(c))?;
+        }
+        // Properties by slot, of the kind the class declares.
+        GetProp(d, o, slot) => {
+            let k = field_kind(prog, kind(st, o)?, slot)?;
+            k.elem()?;
+            set(st, d, k)?;
+        }
+        SetProp(o, slot, v) => {
+            let k = field_kind(prog, kind(st, o)?, slot)?;
+            fits(prog, kind(st, v)?, k).then_some(())?;
+        }
+        // Output: what `echo` writes of a number, a boolean, a string or null.
+        Echo(r) | EchoAttr(r) => {
+            let k = kind(st, r)?;
+            if k != K::Null && k.base().is_none() {
+                return None;
+            }
+            *strings = true;
+        }
+        EchoHtml(c) => {
+            prog.consts.get(c as usize)?;
+        }
+        // Statements in HTML other than element text (see `Vm::guard_output`).
+        GuardOutput | EndGuard | EchoNonce => {}
         _ => return None,
     }
     if st.iter().any(|k| k.boxed()) {
         *strings = true;
     }
     Some(Flow::Next)
+}
+
+/// The kind a call of `func` with the `argc` arguments from register `args`
+/// returns (`Undef` for none), when `func` can be compiled (`ok`) and takes
+/// them. For a method called through the method table (`virt`), the object
+/// is of the class the function belongs to, so the first one is not checked.
+fn call_kind(prog: &Program, ok: &[bool], st: &[K], func: u32, args: Reg, argc: u16, virt: bool) -> Option<K> {
+    if !ok.get(func as usize).copied().unwrap_or(false) {
+        return None;
+    }
+    let callee = prog.funcs.get(func as usize)?.native.as_ref()?;
+    if callee.params.len() != argc as usize {
+        return None;
+    }
+    for (k, p) in callee.params.iter().enumerate() {
+        let have = kind(st, args.checked_add(k as u16)?)?;
+        if !(virt && k == 0) && !fits(prog, have, K::of(*p)?) {
+            return None;
+        }
+    }
+    Some(match callee.ret {
+        ValKind::Void => K::Undef,
+        v => K::of(v)?,
+    })
+}
+
+/// The functions a `CallVirtual` of `slot` on an object of class `c` may
+/// call: what each class that is `c` or extends it has in that slot, sorted.
+/// None when a class has nothing there, or there is no such class.
+fn virtual_targets(prog: &Program, c: u32, slot: u32) -> Option<Vec<u32>> {
+    let mut targets = Vec::new();
+    for (x, class) in prog.classes.iter().enumerate() {
+        if extends(prog, x as u32, c) {
+            targets.push(*class.vtable.get(slot as usize)?);
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    (!targets.is_empty()).then_some(targets)
+}
+
+/// The kind property `slot` of an object of kind `k` holds, as its class
+/// declares it.
+fn field_kind(prog: &Program, k: K, slot: u16) -> Option<K> {
+    let field = prog.classes.get(k.class()? as usize)?.fields.get(slot as usize)?;
+    K::of(field.kind?)
+}
+
+/// The functions instruction `ins` may call: a `Call`'s, or for a
+/// `CallVirtual` what any class has in its slot.
+fn callees_of(prog: &Program, ins: &Instr) -> Vec<u32> {
+    match *ins {
+        Instr::Call { func, .. } => vec![func],
+        Instr::CallVirtual { slot, .. } => {
+            let mut v: Vec<u32> = prog.classes.iter().filter_map(|c| c.vtable.get(slot as usize).copied()).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Functions that can be compiled: well formed, with calls only to other
@@ -758,7 +962,7 @@ fn eligible(prog: &Program) -> HashMap<u32, Checked> {
     let mut callers: Vec<Vec<u32>> = vec![Vec::new(); n];
     for (i, f) in prog.funcs.iter().enumerate().filter(|(i, _)| ok[*i]) {
         for ins in &f.code {
-            if let Instr::Call { func, .. } = *ins {
+            for func in callees_of(prog, ins) {
                 if let Some(c) = callers.get_mut(func as usize) {
                     if c.last() != Some(&(i as u32)) {
                         c.push(i as u32);
@@ -850,11 +1054,24 @@ enum H {
     NewMap,
     AppendKey,
     StrEq,
+    Unwind,
+    New,
+    GetProp,
+    SetProp,
+    SetPropPath,
+    AppendProp,
+    VTarget,
+    Echo,
+    EchoHtml,
+    Bad,
+    Guard,
+    EchoNonce,
+    SetPropScalar,
 }
 
 /// Name, address, number of i64 arguments after `ctx` (None: `(f64, f64) -> f64`)
 /// and whether it returns an i64, in the order of `H`.
-fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 31] {
+fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 44] {
     [
         ("phv_jit_tick", phv_jit_tick as *const u8, Some(0), true),
         ("phv_jit_enter", phv_jit_enter as *const u8, Some(3), true),
@@ -887,6 +1104,19 @@ fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 31] {
         ("phv_jit_new_map", phv_jit_new_map as *const u8, Some(3), false),
         ("phv_jit_append_key", phv_jit_append_key as *const u8, Some(4), false),
         ("phv_jit_str_eq", phv_jit_str_eq as *const u8, Some(2), true),
+        ("phv_jit_unwind", phv_jit_unwind as *const u8, Some(2), false),
+        ("phv_jit_new", phv_jit_new as *const u8, Some(2), false),
+        ("phv_jit_get_prop", phv_jit_get_prop as *const u8, Some(5), true),
+        ("phv_jit_set_prop", phv_jit_set_prop as *const u8, Some(3), false),
+        ("phv_jit_set_prop_path", phv_jit_set_prop_path as *const u8, Some(5), false),
+        ("phv_jit_append_prop", phv_jit_append_prop as *const u8, Some(4), false),
+        ("phv_jit_vtarget", phv_jit_vtarget as *const u8, Some(2), true),
+        ("phv_jit_echo", phv_jit_echo as *const u8, Some(2), true),
+        ("phv_jit_echo_html", phv_jit_echo_html as *const u8, Some(1), true),
+        ("phv_jit_bad", phv_jit_bad as *const u8, Some(0), false),
+        ("phv_jit_guard", phv_jit_guard as *const u8, Some(1), false),
+        ("phv_jit_echo_nonce", phv_jit_echo_nonce as *const u8, Some(0), true),
+        ("phv_jit_set_prop_scalar", phv_jit_set_prop_scalar as *const u8, Some(4), false),
     ]
 }
 
@@ -937,10 +1167,9 @@ fn recursive(prog: &Program) -> Vec<bool> {
         .map(|f| {
             f.code
                 .iter()
-                .filter_map(|i| match *i {
-                    Instr::Call { func, .. } if (func as usize) < n => Some(func as usize),
-                    _ => None,
-                })
+                .flat_map(|i| callees_of(prog, i))
+                .filter(|&func| (func as usize) < n)
+                .map(|func| func as usize)
                 .collect()
         })
         .collect();
@@ -1019,8 +1248,111 @@ fn recursive(prog: &Program) -> Vec<bool> {
 /// the program is loaded, and the same in every run.
 pub fn table(prog: &Program) -> Option<JitTable> {
     let rec = recursive(prog);
-    let roots = prog.funcs.iter().enumerate().filter(|(i, f)| f.native.is_some() && (rec[*i] || has_loop(f)));
+    if std::env::var_os("PHV_JIT_EXPLAIN").is_some() {
+        for (i, f) in prog.funcs.iter().enumerate() {
+            if f.native.is_none() && (rec[i] || has_loop(f)) {
+                eprintln!(
+                    "phv jit: {} not compiled: a script, a template or a closure, or a value of a type native code does not hold",
+                    f.name
+                );
+            }
+        }
+    }
+    let roots = prog.funcs.iter().enumerate().filter(|(i, f)| {
+        if f.native.is_none() {
+            return false;
+        }
+        if has_loop(f) {
+            return true;
+        }
+        if !rec[*i] {
+            return false;
+        }
+        let (inline, helpers) = work(prog, f);
+        let pays = inline >= 2 * helpers;
+        if !pays && std::env::var_os("PHV_JIT_EXPLAIN").is_some() {
+            eprintln!(
+                "phv jit: {} not compiled on its own: recursive, with {inline} instructions run inline against {helpers} calls into the runtime",
+                f.name
+            );
+        }
+        pays
+    });
     build_table(prog, roots.map(|(i, _)| i as u32))
+}
+
+/// For a recursive function without a loop: the instructions of its body
+/// native code runs inline (arithmetic, comparisons, branches, moves, calls
+/// of functions that take and return only numbers) and those that are calls
+/// into the runtime (properties, `new`, strings, lists and maps, output,
+/// builtins, and calls that pass or return a string, list, map or object).
+/// Such a function is compiled on its own only when the first are at least
+/// twice the second. A runtime call costs about what the interpreter's
+/// instruction costs, and a native call that passes an object costs about
+/// what an interpreted call costs, so a recursion whose work is object
+/// operations gains nothing natively and pays for entering native code
+/// (measured on the 1.3 cycle: a recursive sum over a tree of objects, 8
+/// against 7, ran 15% slower natively; `fib`, 9 against 0, 12 times faster).
+/// A function with a loop is always compiled: each pass saves the
+/// interpreter's dispatch even when its body is runtime calls (a loop of
+/// `.=` on a property, 2 against 3, ran 30% faster).
+fn work(prog: &Program, f: &Function) -> (usize, usize) {
+    use Instr::*;
+    let boxed_call = |func: u32| {
+        prog.funcs
+            .get(func as usize)
+            .and_then(|c| c.native.as_ref())
+            .is_none_or(|sig| sig.ret.boxed() || sig.params.iter().any(|p| p.boxed()))
+    };
+    let (mut inline, mut helpers) = (0, 0);
+    for ins in &f.code {
+        let helper = match ins {
+            Const(_, c) => !matches!(
+                prog.consts.get(*c as usize),
+                Some(
+                    phv_vm::bytecode::Const::Int(_)
+                        | phv_vm::bytecode::Const::Float(_)
+                        | phv_vm::bytecode::Const::Bool(_)
+                )
+            ),
+            Call { func, .. } => boxed_call(*func),
+            GetProp(..)
+            | SetProp(..)
+            | NewObject(..)
+            | SetPath(_)
+            | AppendPath { .. }
+            | AppendStr(..)
+            | Concat(..)
+            | ToStr(..)
+            | NewList(..)
+            | NewMap(..)
+            | Index(..)
+            | IndexOrNull(..)
+            | IterInit(..)
+            | IterNext { .. }
+            | Range(..)
+            | CallBuiltin { .. }
+            | CallVirtual { .. }
+            | CallNamed { .. }
+            | CallClosure { .. }
+            | Echo(_)
+            | EchoAttr(_)
+            | EchoHtml(_)
+            | EchoNonce
+            | GuardOutput
+            | EndGuard
+            | PowI(..)
+            | ModF(..)
+            | PowF(..) => true,
+            _ => false,
+        };
+        if helper {
+            helpers += 1;
+        } else {
+            inline += 1;
+        }
+    }
+    (inline, helpers)
 }
 
 /// A table with every eligible function compiled, the straight-line ones too
@@ -1050,7 +1382,45 @@ fn build_table(prog: &Program, roots: impl Iterator<Item = u32>) -> Option<JitTa
         return None;
     }
     let writes_args = prog.funcs.iter().map(writes_args).collect();
-    Some(JitTable::new(entries, writes_args))
+    Some(JitTable::new(entries, writes_args, impure(prog)))
+}
+
+/// Per function: it changes an object or writes output, or calls a
+/// function that may (see `JitTable::impure`).
+fn impure(prog: &Program) -> Vec<bool> {
+    let n = prog.funcs.len();
+    let effect = |ins: &Instr| match ins {
+        Instr::SetProp(..)
+        | Instr::Echo(_)
+        | Instr::EchoAttr(_)
+        | Instr::EchoHtml(_)
+        | Instr::EchoNonce
+        | Instr::GuardOutput
+        | Instr::EndGuard => true,
+        Instr::SetPath(p) | Instr::AppendPath { path: p, .. } => matches!(p.base, PathBase::Prop(..)),
+        _ => false,
+    };
+    let mut imp: Vec<bool> = prog.funcs.iter().map(|f| f.code.iter().any(effect)).collect();
+    let mut callers: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for (i, f) in prog.funcs.iter().enumerate() {
+        for ins in &f.code {
+            for c in callees_of(prog, ins) {
+                if let Some(v) = callers.get_mut(c as usize) {
+                    v.push(i as u32);
+                }
+            }
+        }
+    }
+    let mut work: Vec<u32> = (0..n as u32).filter(|&i| imp[i as usize]).collect();
+    while let Some(f) = work.pop() {
+        for &c in &callers[f as usize] {
+            if !imp[c as usize] {
+                imp[c as usize] = true;
+                work.push(c);
+            }
+        }
+    }
+    imp
 }
 
 /// The host's instruction set, made once per process.
@@ -1098,6 +1468,8 @@ struct Canonical {
     members: Vec<u32>,
     /// The original indices of the canonical constants, in order.
     consts: Vec<u32>,
+    /// The original ids of the canonical classes, in order.
+    classes: Vec<u32>,
     /// Everything of `prog` the code depends on, serialized so that no other
     /// canonical program gives the same bytes (the key under which the unit
     /// is shared; see `unit_key`).
@@ -1106,20 +1478,85 @@ struct Canonical {
 
 /// The canonical form of function `root` and the functions it reaches.
 fn canonical(prog: &Program, root: u32) -> Canonical {
+    let native = |f: u32| prog.funcs.get(f as usize).is_some_and(|f| f.native.is_some());
     let mut members = vec![root];
     let mut local: HashMap<u32, u32> = HashMap::from([(root, 0)]);
-    let mut i = 0;
-    while i < members.len() {
-        for ins in &prog.funcs[members[i] as usize].code {
-            if let Instr::Call { func, .. } = *ins {
-                if prog.funcs.get(func as usize).is_some_and(|f| f.native.is_some()) && !local.contains_key(&func) {
-                    local.insert(func, members.len() as u32);
-                    members.push(func);
+    // The classes the code names (in signatures, `new` and the kinds of
+    // properties), with every class that extends one of them: a method call
+    // through the method table may reach any of these.
+    let mut classes: Vec<u32> = Vec::new();
+    let mut class_local: HashMap<u32, u32> = HashMap::new();
+    // The method table slots the code calls through.
+    let mut slots: Vec<u32> = Vec::new();
+    let add_class = |c: u32, classes: &mut Vec<u32>, class_local: &mut HashMap<u32, u32>| {
+        if (c as usize) < prog.classes.len() && !class_local.contains_key(&c) {
+            class_local.insert(c, classes.len() as u32);
+            classes.push(c);
+        }
+    };
+    let kinds_class = |k: &ValKind| match *k {
+        ValKind::Object(c) | ValKind::OptObject(c) => Some(c),
+        _ => None,
+    };
+    let (mut seen_members, mut seen_classes, mut seen_slots) = (0, 0, 0);
+    loop {
+        let before = (members.len(), classes.len(), slots.len());
+        while seen_members < members.len() {
+            let f = &prog.funcs[members[seen_members] as usize];
+            seen_members += 1;
+            if let Some(sig) = &f.native {
+                for c in sig.params.iter().chain([&sig.ret]).filter_map(kinds_class) {
+                    add_class(c, &mut classes, &mut class_local);
+                }
+            }
+            for ins in &f.code {
+                match *ins {
+                    Instr::Call { func, .. } if native(func) && !local.contains_key(&func) => {
+                        local.insert(func, members.len() as u32);
+                        members.push(func);
+                    }
+                    Instr::NewObject(_, c) => add_class(c, &mut classes, &mut class_local),
+                    Instr::CallVirtual { slot, .. } if !slots.contains(&slot) => slots.push(slot),
+                    _ => {}
                 }
             }
         }
-        i += 1;
+        while seen_classes < classes.len() {
+            let c = classes[seen_classes];
+            seen_classes += 1;
+            for k in prog.classes[c as usize].fields.iter().filter_map(|f| f.kind.as_ref()) {
+                if let Some(x) = kinds_class(k) {
+                    add_class(x, &mut classes, &mut class_local);
+                }
+            }
+            for (x, class) in prog.classes.iter().enumerate() {
+                if class.supers.binary_search(&c).is_ok() {
+                    add_class(x as u32, &mut classes, &mut class_local);
+                }
+            }
+        }
+        if seen_slots < slots.len() || before != (members.len(), classes.len(), slots.len()) {
+            seen_slots = slots.len();
+            for &c in &classes {
+                for &slot in &slots {
+                    let Some(&func) = prog.classes[c as usize].vtable.get(slot as usize) else { continue };
+                    if native(func) && !local.contains_key(&func) {
+                        local.insert(func, members.len() as u32);
+                        members.push(func);
+                    }
+                }
+            }
+        }
+        if before == (members.len(), classes.len(), slots.len()) && seen_members == members.len() {
+            break;
+        }
     }
+    let class_id = |c: u32| class_local.get(&c).copied().unwrap_or(u32::MAX);
+    let kind = |k: ValKind| match k {
+        ValKind::Object(c) => ValKind::Object(class_id(c)),
+        ValKind::OptObject(c) => ValKind::OptObject(class_id(c)),
+        k => k,
+    };
     let mut consts: Vec<u32> = Vec::new();
     let mut const_local: HashMap<u32, u32> = HashMap::new();
     let mut builtins: Vec<String> = Vec::new();
@@ -1130,7 +1567,7 @@ fn canonical(prog: &Program, root: u32) -> Canonical {
         let mut code = f.code.clone();
         for ins in &mut code {
             match ins {
-                Instr::Const(_, c) => {
+                Instr::Const(_, c) | Instr::EchoHtml(c) => {
                     let n = consts.len() as u32;
                     *c = *const_local.entry(*c).or_insert_with(|| {
                         consts.push(*c);
@@ -1140,6 +1577,7 @@ fn canonical(prog: &Program, root: u32) -> Canonical {
                 // A callee that cannot be compiled (no native signature) is
                 // out of range: `step` refuses the call where it is reached.
                 Instr::Call { func, .. } => *func = local.get(func).copied().unwrap_or(u32::MAX),
+                Instr::NewObject(_, c) => *c = class_id(*c),
                 Instr::CallBuiltin { id, .. } => {
                     let n = builtins.len() as u32;
                     *id = *builtin_local.entry(*id).or_insert_with(|| {
@@ -1150,9 +1588,13 @@ fn canonical(prog: &Program, root: u32) -> Canonical {
                 _ => {}
             }
         }
+        let native = f
+            .native
+            .as_ref()
+            .map(|sig| NativeSig { params: sig.params.iter().map(|&p| kind(p)).collect(), ret: kind(sig.ret) });
         // The name only serves `PHV_JIT_EXPLAIN`.
         funcs.push(Function {
-            native: f.native.clone(),
+            native,
             name: f.name.clone(),
             num_params: f.num_params,
             num_regs: f.num_regs,
@@ -1160,11 +1602,43 @@ fn canonical(prog: &Program, root: u32) -> Canonical {
             ..Default::default()
         });
     }
+    // What the code reads of each class: its name, what it extends, the
+    // kinds of its properties by slot and, for the calls through its method
+    // table, the functions of the unit in each slot (others are out of
+    // range, so `step` refuses a call that would reach them).
+    let canon_classes: Vec<Class> = classes
+        .iter()
+        .map(|&c| {
+            let class = &prog.classes[c as usize];
+            let mut supers: Vec<u32> = class.supers.iter().filter_map(|s| class_local.get(s).copied()).collect();
+            supers.sort_unstable();
+            Class {
+                name: class.name.clone(),
+                parent: class.parent.and_then(|p| class_local.get(&p).copied()),
+                fields: class
+                    .fields
+                    .iter()
+                    .map(|f| Field {
+                        name: f.name.clone(),
+                        default: Const::Null,
+                        public: f.public,
+                        kind: f.kind.map(kind),
+                    })
+                    .collect(),
+                vtable: class.vtable.iter().map(|f| local.get(f).copied().unwrap_or(u32::MAX)).collect(),
+                supers,
+                by_name: Vec::new(),
+                cases: Vec::new(),
+                acyclic: false,
+            }
+        })
+        .collect();
     let const_values: Vec<Const> =
         consts.iter().map(|&c| prog.consts.get(c as usize).cloned().unwrap_or(Const::Null)).collect();
-    let key = unit_key(&funcs, &const_values, &builtins);
-    let prog = Program { funcs, consts: const_values, builtin_names: builtins, ..Default::default() };
-    Canonical { prog, members, consts, key }
+    let key = unit_key(&funcs, &const_values, &builtins, &canon_classes);
+    let prog =
+        Program { funcs, consts: const_values, builtin_names: builtins, classes: canon_classes, ..Default::default() };
+    Canonical { prog, members, consts, classes, key }
 }
 
 // The tags of the unit key (see `unit_key`).
@@ -1181,6 +1655,12 @@ const KEY_CONST_STR: u8 = 0x14;
 const KEY_CONST_EMPTY_LIST: u8 = 0x15;
 const KEY_CONST_EMPTY_MAP: u8 = 0x16;
 const KEY_CONST_EMPTY_SET: u8 = 0x17;
+const KEY_CLASSES: u8 = 0x20;
+const KEY_CLASS: u8 = 0x21;
+const KEY_FIELDS: u8 = 0x22;
+const KEY_FIELD: u8 = 0x23;
+const KEY_SUPERS: u8 = 0x24;
+const KEY_VTABLE: u8 = 0x25;
 const KEY_PRIVATE: u8 = 0xFF;
 
 /// The key a unit is shared under: a serialization of the canonical
@@ -1196,7 +1676,7 @@ const KEY_PRIVATE: u8 = 0xFF;
 /// and the same builtin names, in the same order. Should a component not
 /// encode (postcard refusing a value, or a length above `u32::MAX`), the
 /// key gets a number no other key has, and the unit is not shared.
-fn unit_key(funcs: &[Function], consts: &[Const], builtins: &[String]) -> Vec<u8> {
+fn unit_key(funcs: &[Function], consts: &[Const], builtins: &[String], classes: &[Class]) -> Vec<u8> {
     let mut key = UnitKey::default();
     key.seq(KEY_FUNCS, funcs.len());
     for f in funcs {
@@ -1233,6 +1713,28 @@ fn unit_key(funcs: &[Function], consts: &[Const], builtins: &[String]) -> Vec<u8
     for b in builtins {
         key.bytes.push(KEY_BUILTIN);
         key.text(b.as_bytes());
+    }
+    // The classes, with what native code depends on: the layout of their
+    // properties (slot, name and kind), what they extend and their method
+    // tables (as functions of the unit).
+    key.seq(KEY_CLASSES, classes.len());
+    for c in classes {
+        key.bytes.push(KEY_CLASS);
+        key.text(c.name.as_bytes());
+        key.seq(KEY_SUPERS, c.supers.len());
+        for s in &c.supers {
+            key.bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        key.seq(KEY_FIELDS, c.fields.len());
+        for f in &c.fields {
+            key.bytes.push(KEY_FIELD);
+            key.text(f.name.as_bytes());
+            key.postcard(&f.kind);
+        }
+        key.seq(KEY_VTABLE, c.vtable.len());
+        for f in &c.vtable {
+            key.bytes.extend_from_slice(&f.to_le_bytes());
+        }
     }
     if !key.ok {
         static PRIVATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1353,6 +1855,8 @@ fn compile_root(prog: &Program, root: u32) -> Vec<(u32, Installed)> {
         return Vec::new();
     }
     let consts: Arc<[u32]> = canon.consts.into();
+    let funcs: Arc<[u32]> = canon.members.clone().into();
+    let classes: Arc<[u32]> = canon.classes.into();
     let keep_alive: Arc<dyn std::any::Any + Send + Sync> = unit.clone();
     canon
         .members
@@ -1360,7 +1864,16 @@ fn compile_root(prog: &Program, root: u32) -> Vec<(u32, Installed)> {
         .zip(&unit.entries)
         .filter_map(|(&m, e)| {
             let entry = (*e)?;
-            Some((m, Installed { entry, consts: consts.clone(), keep_alive: keep_alive.clone() }))
+            Some((
+                m,
+                Installed {
+                    entry,
+                    consts: consts.clone(),
+                    funcs: funcs.clone(),
+                    classes: classes.clone(),
+                    keep_alive: keep_alive.clone(),
+                },
+            ))
         })
         .collect()
 }
@@ -1434,15 +1947,24 @@ fn build(prog: &Program, checked: &HashMap<u32, Checked>) -> Option<Unit> {
             let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
             let helpers: Vec<FuncRef> = imports.iter().map(|id| module.declare_func_in_func(*id, b.func)).collect();
             let mut callees = HashMap::new();
-            for ins in &func.code {
-                if let Instr::Call { func: c, .. } = ins {
-                    // (unreachable calls were not checked)
-                    if let Some((id, _)) = ids.get(*c as usize).copied().flatten() {
-                        callees.entry(*c).or_insert_with(|| module.declare_func_in_func(id, b.func));
+            for (ins, st) in func.code.iter().zip(&checked[&f].kinds) {
+                // (unreachable calls were not checked)
+                let Some(st) = st else { continue };
+                let targets = match *ins {
+                    Instr::Call { func: c, .. } => vec![c],
+                    Instr::CallVirtual { slot, args, .. } => {
+                        let class = st.get(args as usize).and_then(|k| k.class());
+                        class.and_then(|c| virtual_targets(prog, c, slot)).unwrap_or_default()
+                    }
+                    _ => continue,
+                };
+                for c in targets {
+                    if let Some((id, _)) = ids.get(c as usize).copied().flatten() {
+                        callees.entry(c).or_insert_with(|| module.declare_func_in_func(id, b.func));
                     }
                 }
             }
-            let t = Translator::new(&mut b, prog, func, &checked[&f], helpers, callees);
+            let t = Translator::new(&mut b, prog, func, &checked[&f], helpers, callees, f);
             t.translate();
             b.seal_all_blocks();
             b.finalize(config);
@@ -1508,6 +2030,10 @@ struct Translator<'a, 'b> {
     /// each goes through, which counts the budget, and the target's block.
     back_edges: Vec<(Block, Block)>,
     ctx: Value,
+    /// The function's index in the unit, and the position after the
+    /// instruction being translated (for `JitRt::trace`).
+    fid: u32,
+    pc: u32,
 }
 
 impl<'a, 'b> Translator<'a, 'b> {
@@ -1518,6 +2044,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         checked: &'a Checked,
         helpers: Vec<FuncRef>,
         callees: HashMap<u32, FuncRef>,
+        fid: u32,
     ) -> Translator<'a, 'b> {
         Translator {
             b,
@@ -1534,6 +2061,8 @@ impl<'a, 'b> Translator<'a, 'b> {
             blocks: Vec::new(),
             back_edges: Vec::new(),
             ctx: Value::from_u32(0),
+            fid,
+            pc: 0,
         }
     }
 
@@ -1561,8 +2090,23 @@ impl<'a, 'b> Translator<'a, 'b> {
         match k {
             K::Null => self.iconst(1),
             K::Opt(E::Str) => self.call_regs(H::IsNull, &[r as i64]).unwrap(),
+            // Every instruction that makes an object register sets its null
+            // flag (see `obj_flag`).
+            K::OptObj(_) => self.getn(r),
             K::Opt(_) => self.getn(r),
             _ => self.iconst(0),
+        }
+    }
+
+    /// Sets the null flag of object register `r`, whose value is in its
+    /// slot: read from the slot when it may be null. Objects are tested for
+    /// null by this flag, so every instruction that makes one sets it.
+    fn obj_flag(&mut self, r: Reg, nullable: bool) {
+        if nullable {
+            let n = self.call_regs(H::IsNull, &[r as i64]).unwrap();
+            self.b.def_var(self.nvars[r as usize], n);
+        } else {
+            self.setn(r, 0);
         }
     }
 
@@ -1626,8 +2170,11 @@ impl<'a, 'b> Translator<'a, 'b> {
         }
     }
 
-    /// Stores `code` in `ctx.error` and returns. The VM drops the windows.
+    /// Stores `code` in `ctx.error` and returns, after noting this frame for
+    /// the trace of an exception. The VM drops the windows.
     fn fail(&mut self, code: Value) {
+        let (f, pc) = (self.fid as i64, self.pc as i64);
+        self.call_regs(H::Unwind, &[f, pc]);
         self.b.ins().store(self.mf, code, self.ctx, CTX_ERROR);
         let zero = self.zero();
         self.b.ins().return_(&[zero]);
@@ -1720,7 +2267,7 @@ impl<'a, 'b> Translator<'a, 'b> {
     /// Stores a number or boolean in its window slot, for a string operation.
     fn spill(&mut self, r: Reg, k: K) {
         let (tag, bits) = match k {
-            K::Str | K::List(_) | K::Map(..) | K::Opt(E::Str) => return,
+            K::Str | K::List(_) | K::Map(..) | K::Opt(E::Str) | K::Obj(_) | K::OptObj(_) => return,
             K::Null => (JIT_PUT_NULL, self.iconst(0)),
             K::Opt(e) => {
                 let (tag, bits) = match e {
@@ -1835,6 +2382,45 @@ impl<'a, 'b> Translator<'a, 'b> {
         through
     }
 
+    /// A direct call of function `func` of the unit with the `argc`
+    /// arguments from register `args` (of kinds `st`), its result into `dst`.
+    fn emit_call(&mut self, func: u32, dst: Reg, args: Reg, argc: u16, st: &[K]) {
+        let k = |r: Reg| st[r as usize];
+        let callee = self.callees[&func];
+        let csig = self.prog.funcs[func as usize].native.as_ref().unwrap();
+        let mut vals = vec![self.ctx, self.iconst(args as i64)];
+        for (i, r) in (args..args + argc).enumerate() {
+            let p = csig.params[i];
+            let v = if p.boxed() {
+                // Moved from the window by the callee.
+                self.spill(r, k(r));
+                self.iconst(0)
+            } else if p == ValKind::Float {
+                self.getf(r)
+            } else {
+                self.get(r)
+            };
+            vals.push(v);
+        }
+        let call = self.b.ins().call(callee, &vals);
+        let r = self.b.inst_results(call)[0];
+        let e = self.b.ins().load(I64, self.mf, self.ctx, CTX_ERROR);
+        self.check(e);
+        match csig.ret {
+            ValKind::Float => self.setf(dst, r),
+            v if v.boxed() => {
+                self.call_regs(H::TakeRet, &[dst as i64]);
+                match v {
+                    ValKind::Opt(s) => self.unbox(dst, E::from(s)),
+                    ValKind::Object(_) => self.obj_flag(dst, false),
+                    ValKind::OptObject(_) => self.obj_flag(dst, true),
+                    _ => {}
+                }
+            }
+            _ => self.set(dst, r),
+        }
+    }
+
     fn translate(mut self) {
         let code = &self.func.code;
         let nparams = self.sig.params.len();
@@ -1882,10 +2468,13 @@ impl<'a, 'b> Translator<'a, 'b> {
             let (n, m) = (self.iconst(self.func.num_regs as i64), self.iconst(mask));
             let e = self.call(H::Enter, &[n, args_base, m]).unwrap();
             self.check(e);
-            // Nullable scalar arguments come in the window.
+            // Nullable scalar arguments come in the window; so does
+            // whether a nullable object is null.
             for (r, p) in self.sig.params.iter().enumerate() {
-                if let ValKind::Opt(s) = p {
-                    self.unbox(r as Reg, E::from(*s));
+                match p {
+                    ValKind::Opt(s) => self.unbox(r as Reg, E::from(*s)),
+                    ValKind::OptObject(_) => self.obj_flag(r as Reg, true),
+                    _ => {}
                 }
             }
         }
@@ -1894,6 +2483,7 @@ impl<'a, 'b> Translator<'a, 'b> {
 
         for (i, ins) in code.iter().enumerate() {
             self.b.switch_to_block(self.blocks[i]);
+            self.pc = (i + 1) as u32;
             let Some(st) = &self.checked.kinds[i] else {
                 // Never reached (e.g. the `return null` after the last `return`).
                 self.b.ins().trap(TrapCode::unwrap_user(1));
@@ -1930,6 +2520,10 @@ impl<'a, 'b> Translator<'a, 'b> {
                 Instr::Move(d, s) => match k(s) {
                     ks if ks.boxed() => {
                         self.call_regs(H::Move, &[d as i64, s as i64]);
+                        if ks.class().is_some() {
+                            let n = self.getn(s);
+                            self.b.def_var(self.nvars[d as usize], n);
+                        }
                     }
                     K::Float => {
                         let v = self.getf(s);
@@ -2265,37 +2859,37 @@ impl<'a, 'b> Translator<'a, 'b> {
                     self.b.ins().brif(c, yes, &[], no, &[]);
                     continue;
                 }
-                Instr::Call { dst, func, args, argc } => {
-                    let callee = self.callees[&func];
-                    let csig = self.prog.funcs[func as usize].native.as_ref().unwrap();
-                    let mut vals = vec![self.ctx, self.iconst(args as i64)];
-                    for (i, r) in (args..args + argc).enumerate() {
-                        let p = csig.params[i];
-                        let v = if p.boxed() {
-                            // Moved from the window by the callee.
-                            self.spill(r, k(r));
-                            self.iconst(0)
-                        } else if p == ValKind::Float {
-                            self.getf(r)
-                        } else {
-                            self.get(r)
-                        };
-                        vals.push(v);
+                Instr::Call { dst, func, args, argc } => self.emit_call(func, dst, args, argc, st),
+                Instr::CallVirtual { dst, slot, args, argc } => {
+                    let class = k(args).class().expect("checked");
+                    let targets = virtual_targets(self.prog, class, slot).expect("checked");
+                    // One function in that slot for the class and every class
+                    // that extends it (the unit has them all, see `canonical`):
+                    // the call is direct.
+                    if let [only] = targets[..] {
+                        self.emit_call(only, dst, args, argc, st);
+                        self.jump(next);
+                        continue;
                     }
-                    let call = self.b.ins().call(callee, &vals);
-                    let r = self.b.inst_results(call)[0];
-                    let e = self.b.ins().load(I64, self.mf, self.ctx, CTX_ERROR);
-                    self.check(e);
-                    match csig.ret {
-                        ValKind::Float => self.setf(dst, r),
-                        v if v.boxed() => {
-                            self.call_regs(H::TakeRet, &[dst as i64]);
-                            if let ValKind::Opt(s) = v {
-                                self.unbox(dst, E::from(s));
-                            }
-                        }
-                        _ => self.set(dst, r),
+                    let t = self.call_regs(H::VTarget, &[args as i64, slot as i64]).unwrap();
+                    self.check_ctx();
+                    // The program's id of each function of the unit it may be.
+                    let funcs = self.b.ins().load(I64, self.mf, self.ctx, CTX_FUNCS);
+                    let join = self.b.create_block();
+                    for f in targets {
+                        let id = self.b.ins().uload32(self.mf, funcs, (f * 4) as i32);
+                        let is = self.b.ins().icmp(IntCC::Equal, t, id);
+                        let (yes, no) = (self.b.create_block(), self.b.create_block());
+                        self.b.ins().brif(is, yes, &[], no, &[]);
+                        self.b.switch_to_block(yes);
+                        self.emit_call(f, dst, args, argc, st);
+                        self.b.ins().jump(join, &[]);
+                        self.b.switch_to_block(no);
                     }
+                    self.call(H::Bad, &[]);
+                    let c = self.iconst(JIT_ERR_THROW);
+                    self.fail(c);
+                    self.b.switch_to_block(join);
                 }
                 Instr::Ret(r) => {
                     match self.sig.ret {
@@ -2373,6 +2967,24 @@ impl<'a, 'b> Translator<'a, 'b> {
                     }
                     self.call_regs(H::NewMap, &[d as i64, start as i64, n as i64]);
                     // A long key may have passed the time limit.
+                    self.check_ctx();
+                }
+                Instr::SetPath(ref path) if matches!(path.base, PathBase::Prop(..)) => {
+                    let PathBase::Prop(o, slot) = path.base else { unreachable!("checked") };
+                    let key = path.keys.first().copied();
+                    if let Some(key) = key {
+                        self.spill(key, k(key));
+                    }
+                    self.spill(path.val, k(path.val));
+                    let kv = key.map_or(-1, |r| r as i64);
+                    let args = [o as i64, slot as i64, kv, path.push as i64, path.val as i64];
+                    self.call_regs(H::SetPropPath, &args);
+                    self.check_ctx();
+                }
+                Instr::AppendPath { ref path, cur } if matches!(path.base, PathBase::Prop(..)) => {
+                    let PathBase::Prop(o, slot) = path.base else { unreachable!("checked") };
+                    self.spill(path.val, k(path.val));
+                    self.call_regs(H::AppendProp, &[o as i64, slot as i64, cur as i64, path.val as i64]);
                     self.check_ctx();
                 }
                 Instr::SetPath(ref path) if matches!(path.base, PathBase::Local(r) if matches!(k(r), K::Map(..))) => {
@@ -2476,6 +3088,68 @@ impl<'a, 'b> Translator<'a, 'b> {
                     }
                     let n = self.b.ins().iadd_imm_s(idx, 1);
                     self.set(it + 1, n);
+                }
+                Instr::NewObject(d, c) => {
+                    self.call_regs(H::New, &[d as i64, c as i64]);
+                    self.check_ctx();
+                    self.setn(d, 0);
+                }
+                Instr::GetProp(d, o, slot) => {
+                    let fk = field_kind(self.prog, k(o), slot).expect("checked");
+                    let (code, nullable) = fk.elem().expect("checked");
+                    let args = [d as i64, o as i64, slot as i64, code, nullable as i64];
+                    let v = self.call_regs(H::GetProp, &args).unwrap();
+                    self.check_ctx();
+                    match fk {
+                        K::Float | K::Opt(E::Float) => {
+                            let f = self.b.ins().bitcast(F64, MemFlagsData::new(), v);
+                            self.setf(d, f);
+                        }
+                        K::Int | K::Bool | K::Opt(E::Int) | K::Opt(E::Bool) => self.set(d, v),
+                        _ => {}
+                    }
+                    if matches!(fk, K::Opt(E::Int | E::Bool | E::Float) | K::OptObj(_)) {
+                        let null = self.b.ins().load(I64, self.mf, self.ctx, CTX_DETAIL);
+                        self.b.def_var(self.nvars[d as usize], null);
+                    } else if matches!(fk, K::Obj(_)) {
+                        self.setn(d, 0);
+                    }
+                }
+                Instr::SetProp(o, slot, v) if matches!(k(v), K::Int | K::Bool | K::Float | K::Null) => {
+                    let (tag, bits) = match k(v) {
+                        K::Float => {
+                            let f = self.getf(v);
+                            (JIT_PUT_FLOAT, self.b.ins().bitcast(I64, MemFlagsData::new(), f))
+                        }
+                        K::Bool => (JIT_PUT_BOOL, self.get(v)),
+                        K::Null => (JIT_PUT_NULL, self.iconst(0)),
+                        _ => (JIT_PUT_INT, self.get(v)),
+                    };
+                    let (ov, sv, tv) = (self.iconst(o as i64), self.iconst(slot as i64), self.iconst(tag));
+                    self.call(H::SetPropScalar, &[ov, sv, tv, bits]);
+                    self.check_ctx();
+                }
+                Instr::SetProp(o, slot, v) => {
+                    self.spill(v, k(v));
+                    self.call_regs(H::SetProp, &[o as i64, slot as i64, v as i64]);
+                    self.check_ctx();
+                }
+                Instr::Echo(r) | Instr::EchoAttr(r) => {
+                    self.spill(r, k(r));
+                    let attr = matches!(ins, Instr::EchoAttr(_)) as i64;
+                    let e = self.call_regs(H::Echo, &[r as i64, attr]).unwrap();
+                    self.check(e);
+                }
+                Instr::EchoHtml(c) => {
+                    let e = self.call_regs(H::EchoHtml, &[c as i64]).unwrap();
+                    self.check(e);
+                }
+                Instr::GuardOutput | Instr::EndGuard => {
+                    self.call_regs(H::Guard, &[matches!(ins, Instr::EndGuard) as i64]);
+                }
+                Instr::EchoNonce => {
+                    let e = self.call(H::EchoNonce, &[]).unwrap();
+                    self.check(e);
                 }
                 Instr::Range(d, a, b, inclusive) => {
                     let (x, y) = (self.get(a), self.get(b));
@@ -2685,7 +3359,7 @@ mod tests {
         let mut funcs: Vec<Function> = (0..n - 1)
             .map(|i| func(vec![I], I, 2, vec![Call { dst: 1, func: i + 1, args: 0, argc: 1 }, Ret(1)]))
             .collect();
-        funcs.push(func(vec![I], I, 1, vec![Echo(0), Ret(0)]));
+        funcs.push(func(vec![I], I, 1, vec![Throw(0), Ret(0)]));
         let prog = Program { funcs, ..Default::default() };
         let start = std::time::Instant::now();
         assert!(eligible(&prog).is_empty());
@@ -2767,5 +3441,120 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(canonical(&a, 0).key, one(C::Float(1.0)));
+    }
+
+    fn class(name: &str, fields: &[(&str, ValKind)], supers: Vec<u32>, vtable: Vec<u32>) -> Class {
+        Class {
+            name: name.into(),
+            // (in these tests, a class extends at most the first one)
+            parent: (supers.len() > 1).then(|| supers[0]),
+            fields: fields
+                .iter()
+                .map(|(n, k)| Field { name: n.to_string(), default: C::Int(0), public: true, kind: Some(*k) })
+                .collect(),
+            vtable,
+            supers,
+            by_name: Vec::new(),
+            cases: Vec::new(),
+            acyclic: true,
+        }
+    }
+
+    /// Units that read properties by slot or call through method tables
+    /// are shared only between programs whose classes have the same layout
+    /// (the kinds and names of their properties, what they extend, their
+    /// method tables): the key holds them. Defaults and the numbering of
+    /// classes do not change the code, and do not change the key.
+    #[test]
+    fn unit_keys_tell_class_layouts_apart() {
+        let o = ValKind::Object(0);
+        let key = |classes: Vec<Class>| {
+            let read = func(vec![o], S, 3, vec![GetProp(1, 0, 0), ToStr(2, 1), Ret(2)]);
+            let prog = Program { funcs: vec![read], classes, ..Default::default() };
+            assert!(accepts(&prog));
+            canonical(&prog, 0).key
+        };
+        let base = key(vec![class("P", &[("v", I)], vec![0], vec![])]);
+        assert_ne!(base, key(vec![class("P", &[("v", F)], vec![0], vec![])]), "another kind");
+        assert_ne!(base, key(vec![class("P", &[("w", I)], vec![0], vec![])]), "another name");
+        assert_ne!(base, key(vec![class("P", &[("v", I), ("w", I)], vec![0], vec![])]), "another property");
+        assert_ne!(base, key(vec![class("Q", &[("v", I)], vec![0], vec![])]), "another class");
+        // A subclass can reach the code (a call through the method table).
+        let sub = vec![class("P", &[("v", I)], vec![0], vec![]), class("R", &[("v", I)], vec![0, 1], vec![])];
+        assert_ne!(base, key(sub), "a subclass");
+        // The same layout: other defaults, or the class numbered otherwise.
+        let mut other = class("P", &[("v", I)], vec![0], vec![]);
+        other.fields[0].default = C::Int(5);
+        assert_eq!(base, key(vec![other]));
+        let moved = Program {
+            funcs: vec![func(vec![ValKind::Object(1)], S, 3, vec![GetProp(1, 0, 0), ToStr(2, 1), Ret(2)])],
+            classes: vec![class("Z", &[("x", F)], vec![0], vec![]), class("P", &[("v", I)], vec![1], vec![])],
+            ..Default::default()
+        };
+        assert_eq!(base, canonical(&moved, 0).key);
+        // Method tables: the function in a slot is part of the key.
+        let call = |ret: i64| {
+            let caller = func(vec![o], I, 2, vec![CallVirtual { dst: 1, slot: 0, args: 0, argc: 1 }, Ret(1)]);
+            let method = func(vec![o], I, 2, vec![Int(1, ret), Ret(1)]);
+            let prog = Program {
+                funcs: vec![caller, method],
+                classes: vec![class("P", &[], vec![0], vec![1])],
+                ..Default::default()
+            };
+            assert!(accepts(&prog));
+            canonical(&prog, 0).key
+        };
+        assert_ne!(call(1), call(2));
+        assert_eq!(call(1), call(1));
+        // A property of a kind native code does not hold is not read natively.
+        let mut none = class("P", &[("v", I)], vec![0], vec![]);
+        none.fields[0].kind = None;
+        let prog = Program {
+            funcs: vec![func(vec![o], I, 2, vec![GetProp(1, 0, 0), Ret(1)])],
+            classes: vec![none],
+            ..Default::default()
+        };
+        assert!(!accepts(&prog));
+    }
+
+    /// Objects: a property is read and written with the kind its class
+    /// declares, a method call through the method table needs every function
+    /// that may receive it to take the arguments and return the same kind,
+    /// and an object of another class fits only where a class it extends is
+    /// expected.
+    #[test]
+    fn checks_the_kinds_of_objects() {
+        let (o, o1) = (ValKind::Object(0), ValKind::Object(1));
+        let classes = || vec![class("P", &[("v", I)], vec![0], vec![1]), class("Q", &[("v", I)], vec![0, 1], vec![2])];
+        let with = |funcs: Vec<Function>| Program { funcs, classes: classes(), ..Default::default() };
+        // Reading an int property gives an int; writing a float to it is refused.
+        assert!(accepts(&with(vec![func(vec![o], I, 2, vec![GetProp(1, 0, 0), Ret(1)])])));
+        assert!(!accepts(&with(vec![func(vec![o], F, 2, vec![GetProp(1, 0, 0), Ret(1)])])));
+        let prog = Program {
+            funcs: vec![func(vec![o, F], ValKind::Void, 2, vec![SetProp(0, 0, 1), RetNull])],
+            classes: classes(),
+            ..Default::default()
+        };
+        assert!(!accepts(&prog));
+        // A property that is not there, or a value that is not an object.
+        assert!(!accepts(&with(vec![func(vec![o], I, 2, vec![GetProp(1, 0, 3), Ret(1)])])));
+        assert!(!accepts(&with(vec![func(vec![I], I, 2, vec![GetProp(1, 0, 0), Ret(1)])])));
+        // A subclass where the class is expected, not the other way round.
+        let callee = |p: ValKind| func(vec![p], I, 1, vec![Int(0, 1), Ret(0)]);
+        let caller = |p: ValKind| func(vec![p], I, 2, vec![Call { dst: 1, func: 1, args: 0, argc: 1 }, Ret(1)]);
+        assert!(accepts(&with(vec![caller(o1), callee(o)])));
+        assert!(!accepts(&with(vec![caller(o), callee(o1)])));
+        // Through the method table: P's slot 0 is function 1, Q's is 2.
+        let virt = |ret2: ValKind| {
+            with(vec![
+                func(vec![o], I, 2, vec![CallVirtual { dst: 1, slot: 0, args: 0, argc: 1 }, Ret(1)]),
+                func(vec![o], I, 1, vec![Int(0, 1), Ret(0)]),
+                func(vec![o1], ret2, 1, vec![Int(0, 2), Ret(0)]),
+            ])
+        };
+        assert!(accepts(&virt(I)));
+        assert!(!accepts(&virt(ValKind::Opt(Scalar::Int))), "another return kind");
+        assert_eq!(virtual_targets(&virt(I), 0, 0), Some(vec![1, 2]));
+        assert_eq!(virtual_targets(&virt(I), 1, 0), Some(vec![2]));
     }
 }

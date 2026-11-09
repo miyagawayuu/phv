@@ -2448,7 +2448,7 @@ When code uses a PHP function name, the error message suggests the alternative
 | Command | Description |
 |---|---|
 | `phv run file.phv [args...]` | Type-check and run (`--html`, `--time-limit seconds`, `--profile`); `argv()` returns the arguments after the file |
-| `phv check file.phv` | Type-check only (including imported modules and templates) |
+| `phv check file.phv...` | Type-check only (including imported modules and templates); several files are checked one after the other in one process, each on its own, and the exit status is an error if any of them has one |
 | `phv serve dir` | Web server (`--port`, `--host`, `--prod`, `--time-limit`; `--watch` reloads the pages open in the browser when a file of the site is saved, in development only) |
 | `phv build path -o file` | Compile a site or a script into one executable (see below) |
 | `phv new dir [--site]` | Create a project: a script with a module and a test, or with `--site` a site with a page, a layout and a page test |
@@ -2744,38 +2744,57 @@ It then runs the type checker and shows the places that need manual work, such a
      a walk of every object would not fit in what is left, it walks the newest objects that fit (those made since its
      last run, where new cycles are; older ones are kept until a walk takes them all), and a walk that outgrows that
      room stops and frees nothing. Before a script is stopped at the limit, it may use an eighth of the limit more.
-     Native code cannot run it: when native code runs out of memory and the collector frees cycles made before the
-     call, the interpreter runs the call again. Objects that are still reachable from a variable, a list, a map, a
+     Native code runs it at the same checks as the interpreter (a loop's next pass, a call); when a string or list
+     operation in native code runs out of memory between two checks and the collector frees cycles made before the
+     call, the interpreter runs the call again (unless it changes objects or writes output). Objects that are still reachable from a variable, a list, a map, a
      closure or another live object are never freed. When a run ends, the fields of every object left are cleared. Objects of a class whose properties all
      hold scalars, strings or enum cases cannot be part of a cycle: the collector does not look at them.
-   - **JIT** (Cranelift): functions whose locals are all `int`, `bool`, `float` or `string`, nullable ones (`?int`,
-     ...), or lists and maps of them (`list<int>`, `map<string, int>`, ...) are compiled to native code when every
-     instruction they use is supported: arithmetic including `**`, comparisons (also with `null`), conversions,
-     string constants, `.`, `.=`, `(string)`, `strlen()` and `->len()`; `null`, `??` and null checks; for
-     lists and maps `[...]`, `$xs[$k]`, `$xs[$k] ?? $default`, `$xs[$k] = $v`, `$xs[] = $v`, `foreach`, `range()`,
-     `count()`, `->len()` and `->has()`; and calls to other compiled functions. A function with a loop or
-     recursion is compiled when the program is loaded, together with the functions it calls (those calls are
-     direct); a function with neither that no compiled function calls stays in the interpreter, since entering
-     native code would cost more than its body. The code of a function, with the functions it calls, is shared
-     between the programs of a process that have the same text for them (a module several pages use is compiled
-     once): the same instructions, signatures, constants (floats by their bits) and builtin names, compared as a
-     serialization in which every part is tagged and length-prefixed, so that no two different texts share.
-     `PHV_JIT_STATS=1` reports each compilation on stderr. Numbers stay in machine registers
-     (with a null flag for nullable ones); strings, lists and maps live in a register window and are handled by the
-     interpreter's own code, so results, error messages (such as `IndexError` and `KeyError`) and memory checks are
-     identical. `PHV_JIT_EXPLAIN=1` prints, for each function the JIT leaves to the interpreter, the instruction
-     that kept it out.
+   - **JIT** (Cranelift): functions, methods and constructors whose locals are all `int`, `bool`, `float` or
+     `string`, nullable ones (`?int`, ...), lists and maps of them (`list<int>`, `map<string, int>`, ...), or objects
+     of a class that takes no type arguments (`Point`, `?Point`) are compiled to native code when every instruction
+     they use is supported: arithmetic including `**`, comparisons (also with `null`), conversions, string constants,
+     `.`, `.=`, `(string)`, `strlen()` and `->len()`; `null`, `??`, `?->` and null checks; for lists and maps `[...]`,
+     `$xs[$k]`, `$xs[$k] ?? $default`, `$xs[$k] = $v`, `$xs[] = $v`, `foreach`, `range()`, `count()`, `->len()` and
+     `->has()`; for objects `new` (with its constructor), reading and writing a property whose type is one of those
+     kinds, `.=` on a string property, `$o->p[] = $v` and `$o->p[$k] = $v` on a list or map property; calls to other
+     compiled functions, and to methods, directly or through the class's method table (when every class that may
+     receive the call has a compiled method there, returning the same kind); and `echo`, with the HTML a function
+     writes around it. Properties are read and written by their slot in the class, objects are made and output is
+     written by the interpreter's own code (field defaults, the cycle collector's list, the escaping of the buffer
+     written and the checks of a function's output in HTML other than element text). Closures, exceptions (`throw`,
+     `try`), and builtins other than those named stay in the interpreter, with the functions that use them.
+     A function with a loop or recursion is compiled when the program is loaded, together with the functions it calls
+     (those calls are direct); a function with neither that no compiled function calls stays in the interpreter, since
+     entering native code would cost more than its body. A recursive function without a loop is compiled on its
+     own only when its body has at least twice as many instructions native code runs inline (arithmetic,
+     comparisons, branches, moves) as calls into the runtime (properties, `new`, strings, lists, maps, output,
+     builtins, calls that pass an object or a string), since a recursion that mostly walks objects would run slower
+     natively. The code of a function, with the functions it calls, is
+     shared between the programs of a process that have the same text for them (a module several pages use is compiled
+     once): the same instructions, signatures, constants (floats by their bits) and builtin names, and the same
+     layout of the classes they name (the name and kind of each property by slot, the classes each extends, and the
+     functions of their method tables), compared as a serialization in which every part is tagged and length-prefixed,
+     so that no two different texts share. `PHV_JIT_STATS=1` reports each compilation on stderr. Numbers stay in
+     machine registers (with a null flag for nullable ones); strings, lists, maps and objects live in a register window
+     and are handled by the interpreter's own code, so results, error messages (such as `IndexError` and `KeyError`)
+     and memory checks are identical. `PHV_JIT_EXPLAIN=1` prints, for each function the JIT leaves to the
+     interpreter, the instruction that kept it out (or, for a function with a loop or recursion whose values native
+     code does not hold, that it has one).
      Integer overflow, division and modulo by zero, negative shifts, out-of-range float to int conversion, recursion
-     depth, and the execution time and memory limits are checked in the JIT just as in the interpreter. Native code
-     uses at most 8 MB of stack, and never comes within 1 MB of the end of the thread's stack (on Windows, Linux and
-     macOS, which tell where it ends): a call that needs more (deep recursion of a function with a large frame) is run by
-     the interpreter instead, whose frames are not on the stack. Compiled functions have no side effects, so the
-     result is the same; a function that changes a string, list or map parameter in place (`$xs[] = ...`) stops
-     with "maximum call stack depth exceeded" instead (its arguments are not kept for a rerun, so changing them
-     never copies them). Functions with more than 1,024 registers or 16,384 instructions are left to the interpreter
-     (compiling them would take much memory). Before compiling, the JIT checks every instruction and the kind of every register on every path, so bytecode from the
-     cache is never trusted. It can be disabled with `PHV_JIT=0`. The stack trace of an exception raised inside the JIT
-     goes back only as far as the caller.
+     depth, and the execution time and memory limits are checked in the JIT just as in the interpreter; at a loop's
+     next pass and at a call, native code runs the interpreter's own check, which also runs the cycle collector when
+     it is due. Native code uses at most 8 MB of stack, and never comes within 1 MB of the end of the thread's stack
+     (on Windows, Linux and macOS, which tell where it ends): a call that needs more (deep recursion of a function with
+     a large frame) is run by the interpreter instead, whose frames are not on the stack. A function that changes no
+     object and writes no output, nor does any function it calls, has no effect but its result, so the result is the
+     same; one that does, or that changes a string, list or map parameter in place (`$xs[] = ...`), stops with
+     "maximum call stack depth exceeded" instead (its effects would happen twice; the arguments of the second kind are
+     not kept for a rerun, so changing them never copies them). Functions with more than 1,024 registers or 16,384
+     instructions are left to the interpreter (compiling them would take much memory). Before compiling, the JIT checks
+     every instruction and the kind of every register on every path, so bytecode from the cache is never trusted;
+     helpers check the value they read from a property or an element against the kind they deliver. It can be
+     disabled with `PHV_JIT=0`. An exception raised in native code has the stack trace it has in the interpreter:
+     each native call it leaves notes its function and position.
 5. **Bytecode cache**: `phv run` and `phv serve` save compiled output in `.phv-cache/` and reuse it
    if neither the source files nor the `phv` binary have changed.
    - The cache is signed with an HMAC using a per-user key (`%LOCALAPPDATA%\phv\cache.key`, `~/.cache/phv/cache.key`), and entries whose
@@ -2935,9 +2954,9 @@ Planned, in this order. Each release is audited before it is published, as befor
   counting allocator, the HTTP client keeping connections for every method, and the editor's debounce. A JIT that
   compiles a function at its Nth call was tried and left out: its gain was small and it changed a function's
   exception trace at the Nth call.
-- **1.3**: the JIT for objects, closures, methods and `echo`, cached type-checked modules, a worker pool that reuses
-  VMs, and more of the standard library. Generators (`yield`) and traits are being considered; they would come in a
-  minor release too, since they only add to the language.
+- **1.3**: the JIT for objects, methods and `echo`, a smaller syntax tree, faster loading and checking of pages;
+  generators (`yield`) and traits, which only add to the language; and in the standard library, translations
+  (i18n), images and an ORM.
 
 Some features are left out on purpose, because they work against the design principles (§1): `eval`, variable
 variables, static properties and global variables, references (`&$x`), truthiness, `===`, `@`, `goto`, magic

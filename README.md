@@ -225,9 +225,10 @@ language server too; a change that touches performance comes with its before/aft
 | Throwing and catching 100,000 exceptions | 40 ms | 42 ms | 14 ms |
 | Sorting 200,000 elements with `sortBy` | 318 ms | 306 ms | 269 ms |
 
-The JIT compiles functions whose values are all `int`, `bool`, `float` or `string`, nullable ones, or lists and
-maps of them. Lists and maps are handled by the interpreter's own code, so the gain is in the loops around them.
-Code that relies on closures or objects runs in the interpreter and, as the table shows, can be slower than
+The JIT compiles functions and methods whose values are all `int`, `bool`, `float` or `string`, nullable ones,
+lists and maps of them, or objects. Lists, maps and objects are handled by the interpreter's own code, so the gain
+is in the loops and arithmetic around them: creating objects and reading their properties take about as long as in
+the interpreter. Code that relies on closures runs in the interpreter and, as the table shows, can be slower than
 CPython (`PHV_JIT_EXPLAIN=1` shows why a function is not compiled); so are exceptions, which note where they were
 thrown (to be improved). Set `PHV_JIT=0` to turn the JIT off.
 

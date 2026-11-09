@@ -47,7 +47,7 @@ pub enum StmtKind {
     },
     /// `?User $found = null;`
     TypedDecl {
-        ty: TypeExpr,
+        ty: Box<TypeExpr>,
         name: String,
         name_span: Span,
         value: Expr,
@@ -77,7 +77,7 @@ pub enum StmtKind {
         body: Vec<Stmt>,
     },
     Foreach {
-        subject: Expr,
+        subject: Box<Expr>,
         key: Option<(String, Span)>,
         value: (String, Span),
         body: Vec<Stmt>,
@@ -92,12 +92,12 @@ pub enum StmtKind {
         finally: Option<Vec<Stmt>>,
     },
     Block(Vec<Stmt>),
-    Function(FunctionDecl),
-    Class(ClassDecl),
+    Function(Box<FunctionDecl>),
+    Class(Box<ClassDecl>),
     Import(ImportDecl),
-    Const(ConstDecl),
+    Const(Box<ConstDecl>),
     /// `type UserId = int;`
-    TypeAlias(TypeAliasDecl),
+    TypeAlias(Box<TypeAliasDecl>),
     /// `params(string $title, list<Item> $items);` at the top of a template.
     Params(Vec<Param>),
 }
@@ -455,6 +455,56 @@ pub struct Closure {
     pub arrow: bool,
 }
 
+/// `$obj->name(...)`, or `$obj?->name(...)`.
+#[derive(Debug, Clone)]
+pub struct MethodCall {
+    pub obj: Box<Expr>,
+    pub name: String,
+    pub name_span: Span,
+    pub args: Vec<Arg>,
+    pub nullsafe: bool,
+}
+
+/// `$obj->name`, or `$obj?->name`.
+#[derive(Debug, Clone)]
+pub struct Prop {
+    pub obj: Box<Expr>,
+    pub name: String,
+    pub name_span: Span,
+    pub nullsafe: bool,
+}
+
+/// `Cls::name(...)`.
+#[derive(Debug, Clone)]
+pub struct StaticCall {
+    pub class: String,
+    pub class_span: Span,
+    pub name: String,
+    pub name_span: Span,
+    pub args: Vec<Arg>,
+}
+
+/// `Cls::NAME`.
+#[derive(Debug, Clone)]
+pub struct ClassConst {
+    pub class: String,
+    pub class_span: Span,
+    pub name: String,
+    pub name_span: Span,
+}
+
+/// `new Cls(...)`.
+#[derive(Debug, Clone)]
+pub struct New {
+    pub class: String,
+    pub class_span: Span,
+    /// `new Box<int>(...)`; empty when they are inferred.
+    pub type_args: Vec<TypeExpr>,
+    pub args: Vec<Arg>,
+}
+
+/// The rare or large variants hold a box, so that the common nodes stay
+/// small (the sizes are checked in the tests).
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     Int(i64),
@@ -472,46 +522,18 @@ pub enum ExprKind {
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
     Call {
         callee: Box<Expr>,
-        args: Vec<Arg>,
+        args: Box<[Arg]>,
     },
-    MethodCall {
-        obj: Box<Expr>,
-        name: String,
-        name_span: Span,
-        args: Vec<Arg>,
-        nullsafe: bool,
-    },
-    Prop {
-        obj: Box<Expr>,
-        name: String,
-        name_span: Span,
-        nullsafe: bool,
-    },
-    StaticCall {
-        class: String,
-        class_span: Span,
-        name: String,
-        name_span: Span,
-        args: Vec<Arg>,
-    },
+    MethodCall(Box<MethodCall>),
+    Prop(Box<Prop>),
+    StaticCall(Box<StaticCall>),
     /// `Suit::Hearts` (enum case) or `Config::MAX` (class constant).
-    ClassConst {
-        class: String,
-        class_span: Span,
-        name: String,
-        name_span: Span,
-    },
+    ClassConst(Box<ClassConst>),
     /// A parenthesized member access; stops a `?->` chain like in PHP.
     Paren(Box<Expr>),
     /// `sql"SELECT * FROM t WHERE id = {$id}"`
     Sql(Vec<InterpPart>),
-    New {
-        class: String,
-        class_span: Span,
-        /// `new Box<int>(...)`; empty when they are inferred.
-        type_args: Vec<TypeExpr>,
-        args: Vec<Arg>,
-    },
+    New(Box<New>),
     /// `$a[$k]`, or `$a[]` (push, only valid as an assignment target).
     Index {
         base: Box<Expr>,
@@ -520,9 +542,9 @@ pub enum ExprKind {
     Closure(Box<Closure>),
     Match {
         subject: Option<Box<Expr>>,
-        arms: Vec<MatchArm>,
+        arms: Box<[MatchArm]>,
     },
-    Is(Box<Expr>, TypeExpr),
+    Is(Box<Expr>, Box<TypeExpr>),
     Cast(CastKind, Box<Expr>),
     Range {
         from: Box<Expr>,
@@ -535,4 +557,85 @@ pub enum ExprKind {
     FuncRef(Box<Expr>),
     /// `...$xs` in an argument list or a list literal.
     Spread(Box<Expr>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::size_of;
+
+    /// Every node of a kind is as large as its largest variant, so a large
+    /// variant that is rare would make the common ones (`$x`, `"..."`,
+    /// `f($x)`) pay for it, in memory and in parse time.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn common_nodes_stay_small() {
+        const BOX: &str =
+            "a variant grew past the others: box its payload (as `ExprKind::MethodCall(Box<MethodCall>)` \
+                           or `StmtKind::Class(Box<ClassDecl>)`), box a large field of it (as `Foreach`'s `subject`), \
+                           or hold a list as `Box<[T]>` (as `Call`'s `args`)";
+        let sizes = [
+            ("ExprKind", size_of::<ExprKind>(), 32),
+            ("Expr", size_of::<Expr>(), 48),
+            ("StmtKind", size_of::<StmtKind>(), 128),
+            ("Stmt", size_of::<Stmt>(), 168),
+            ("Arg", size_of::<Arg>(), 88),
+            ("InterpPart", size_of::<InterpPart>(), 48),
+            ("MatchArm", size_of::<MatchArm>(), 88),
+            ("Param", size_of::<Param>(), 152),
+            ("TypeExpr", size_of::<TypeExpr>(), 64),
+        ];
+        for (name, size, max) in sizes {
+            assert!(size <= max, "`{name}` is {size} bytes, more than {max}: {BOX}");
+        }
+    }
+
+    /// The lists of statements and of arguments the parser keeps have no
+    /// room left over from growing: they live as long as the tree.
+    #[test]
+    fn lists_keep_no_spare_room() {
+        let src = "<?phv\nfunction f(int $x): int {\n    if ($x > 0) {\n        return $x;\n    }\n    return 0;\n}\n$o->m(1);\nf(2);\n";
+        let (m, diags) = crate::parse_module(src, 0, false);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(m.stmts.capacity(), m.stmts.len());
+        let StmtKind::Function(f) = &m.stmts[0].kind else { panic!("{:?}", m.stmts[0]) };
+        assert_eq!((f.body.len(), f.body.capacity()), (2, 2));
+        let StmtKind::If { then, .. } = &f.body[0].kind else { panic!("{:?}", f.body[0]) };
+        assert_eq!((then.len(), then.capacity()), (1, 1));
+        let StmtKind::Expr(e) = &m.stmts[1].kind else { panic!("{:?}", m.stmts[1]) };
+        let ExprKind::MethodCall(c) = &e.kind else { panic!("{e:?}") };
+        assert_eq!((c.args.len(), c.args.capacity()), (1, 1));
+    }
+
+    /// The boxed variants hold what they held before, with the same spans.
+    #[test]
+    fn boxed_variants_keep_their_parts() {
+        let src = "<?phv\n$a?->b->c(1);\nX::Y;\nX::f(2);\nnew Box<int>(3);\n$x is int;\nf(4, 5);\n";
+        let (m, diags) = crate::parse_module(src, 0, false);
+        assert!(diags.is_empty(), "{diags:?}");
+        let exprs: Vec<&Expr> = m
+            .stmts
+            .iter()
+            .map(|s| match &s.kind {
+                StmtKind::Expr(e) => e,
+                k => panic!("{k:?}"),
+            })
+            .collect();
+        let text = |s: Span| &src[s.start as usize..s.end as usize];
+        let ExprKind::MethodCall(c) = &exprs[0].kind else { panic!("{:?}", exprs[0]) };
+        assert_eq!((c.name.as_str(), text(c.name_span), c.args.len(), c.nullsafe), ("c", "c", 1, false));
+        let ExprKind::Prop(p) = &c.obj.kind else { panic!("{:?}", c.obj) };
+        assert_eq!((p.name.as_str(), text(p.name_span), p.nullsafe, text(c.obj.span)), ("b", "b", true, "$a?->b"));
+        assert_eq!(text(exprs[0].span), "$a?->b->c(1)");
+        let ExprKind::ClassConst(k) = &exprs[1].kind else { panic!("{:?}", exprs[1]) };
+        assert_eq!((k.class.as_str(), text(k.class_span), k.name.as_str(), text(k.name_span)), ("X", "X", "Y", "Y"));
+        let ExprKind::StaticCall(s) = &exprs[2].kind else { panic!("{:?}", exprs[2]) };
+        assert_eq!((s.class.as_str(), s.name.as_str(), s.args.len(), text(exprs[2].span)), ("X", "f", 1, "X::f(2)"));
+        let ExprKind::New(n) = &exprs[3].kind else { panic!("{:?}", exprs[3]) };
+        assert_eq!((n.class.as_str(), text(n.class_span), n.type_args.len(), n.args.len()), ("Box", "Box", 1, 1));
+        let ExprKind::Is(x, ty) = &exprs[4].kind else { panic!("{:?}", exprs[4]) };
+        assert_eq!((text(x.span), text(ty.span), text(exprs[4].span)), ("$x", "int", "$x is int"));
+        let ExprKind::Call { args, .. } = &exprs[5].kind else { panic!("{:?}", exprs[5]) };
+        assert_eq!(args.len(), 2);
+    }
 }
