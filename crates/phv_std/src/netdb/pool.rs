@@ -54,16 +54,19 @@ pub(super) enum AcquireError {
 }
 
 impl<C: Driver> Pool<C> {
+    /// A connection: an idle one that `fits` (one that does not is closed),
+    /// or a new one when the pool has room, waiting until `until` for either.
     pub(super) fn acquire(
         self: &Arc<Self>,
         until: Instant,
+        fits: impl Fn(&C) -> bool,
         connect: impl FnOnce() -> Result<C, String>,
     ) -> Result<Pooled<C>, AcquireError> {
         let mut st = lock(&self.state);
         loop {
             if let Some((mut c, since)) = st.idle.pop() {
                 drop(st);
-                if !c.closed() && (since.elapsed() < CHECK_AFTER || c.check()) {
+                if fits(&c) && !c.closed() && (since.elapsed() < CHECK_AFTER || c.check()) {
                     return Ok(Pooled { conn: Some(c), pool: self.clone(), broken: false, depth: 0, ended: None });
                 }
                 drop(c);
@@ -134,7 +137,7 @@ impl<C: Driver> Pooled<C> {
             self.pool.discard();
         }
         self.broken = false;
-        let mut fresh = self.pool.acquire(until, connect)?;
+        let mut fresh = self.pool.acquire(until, |_| true, connect)?;
         self.conn = fresh.conn.take();
         Ok(())
     }

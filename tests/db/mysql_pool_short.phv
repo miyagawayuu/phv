@@ -1,0 +1,7 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: leaves a connection in the pool
+// (made under a short time limit).
+import std.db.Database;
+
+$db = Database::connect("main");
+echo $db->first(sql"SELECT 1 AS one")?->int("one") ?? 0;

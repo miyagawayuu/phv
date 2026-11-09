@@ -20,10 +20,10 @@
 // removed only once no site can use it (see `session_sweep`).
 
 use super::handle::{kind_of, tls_init, Kind};
-use super::my::{my_connect, my_message, KillAt, MyConn};
+use super::my::{my_connect, my_fits, my_message, KillAt, MyConn};
 use super::pg::{pg_connect, pg_message, PgConn};
 use super::pool::{lock, Pooled, MY_POOLS, PG_POOLS};
-use super::query_async::{detached_conn, PoolUse};
+use super::query_async::{detached_conn, detached_error, pooled_fitting, PoolUse};
 use super::ratelimit::redis_conn;
 use crate::redisclient::{RedisConn, RedisError, Reply};
 use phv_vm::DatabaseSpec;
@@ -124,9 +124,13 @@ pub(super) fn store_conn(
             SessionConn::Pg(Box::new(c))
         }
         Kind::MySql => {
-            let mut c = detached_conn(&MY_POOLS, spec, url, use_, until, |t| {
+            // An idle connection whose socket waits long enough for `wait`
+            // (see `my_fits`): the stores' operations wait for different times.
+            let fits = my_fits(Some(8 << 20), Some(wait));
+            let mut c = pooled_fitting(&MY_POOLS, spec, url, use_, until, fits, |t| {
                 my_connect(url, spec, t, Some(8 << 20), Some(wait))
-            })?;
+            })
+            .map_err(|e| detached_error(spec, url, use_, e))?;
             my_store_limits(c.get(), until)?;
             SessionConn::My(Box::new(c))
         }

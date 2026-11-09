@@ -1,9 +1,9 @@
 // ----- Connections held by a script ------------------------------------------
 
-use super::my::{my_connect, my_error, my_execute, my_query, MyConn};
+use super::my::{my_connect, my_error, my_execute, my_fits, my_query, MyConn};
 use super::pg::{pg_connect, pg_execute, pg_query, pg_run, PgConn};
 use super::pool::{AcquireError, Driver, Pooled, MY_POOLS, PG_POOLS, REDIS_POOLS};
-use super::query_async::{pooled, PoolUse};
+use super::query_async::{pooled, pooled_fitting, PoolUse};
 use super::redis::redis_connect;
 use super::{MAX_WAIT, R};
 use crate::db::{parts, transaction_step, Dialect, Ended, TxConn};
@@ -109,8 +109,10 @@ fn open(vm: &mut Vm, name: &str, want_redis: bool) -> R {
         Kind::Postgres => {
             pooled(&PG_POOLS, &spec, &url, use_, until, |t| pg_connect(&url, &spec, t)).map(|p| Link::Pg(Box::new(p)))
         }
-        Kind::MySql => pooled(&MY_POOLS, &spec, &url, use_, until, |t| my_connect(&url, &spec, t, memory, time_limit))
-            .map(|p| Link::My(Box::new(p))),
+        Kind::MySql => pooled_fitting(&MY_POOLS, &spec, &url, use_, until, my_fits(memory, time_limit), |t| {
+            my_connect(&url, &spec, t, memory, time_limit)
+        })
+        .map(|p| Link::My(Box::new(p))),
         Kind::Redis => {
             pooled(&REDIS_POOLS, &spec, &url, use_, until, |t| redis_connect(&url, &spec, t)).map(Link::Redis)
         }

@@ -29,6 +29,11 @@ pub(super) struct MyConn {
     failed: Arc<std::sync::atomic::AtomicBool>,
     /// `innodb_rollback_on_timeout`, once read (`rolls_back_on_timeout`).
     rollback_on_timeout: Option<bool>,
+    /// The read and write timeout of the socket, and the largest packet,
+    /// fixed when the connection was made from the limits of the script that
+    /// made it (`my_io_limits`); the driver cannot change them later.
+    io_timeout: Duration,
+    packet: usize,
 }
 
 impl MyConn {
@@ -139,11 +144,7 @@ pub(super) fn my_connect(
         (true, Some(o)) => Some(o),
         (true, None) => Some(mysql::SslOpts::default()),
     };
-    // A server that stops answering is given up on a little after the time limit
-    // (statements are stopped at the deadline with KILL QUERY before that).
-    let io_timeout = time_limit.map_or(Duration::from_secs(300), |t| t + Duration::from_secs(10));
-    // No packet (one row, mostly) larger than half the script's memory.
-    let packet = memory.unwrap_or(128 << 20) / 2;
+    let (io_timeout, packet) = my_io_limits(memory, time_limit);
     let builder = mysql::OptsBuilder::from_opts(opts)
         .ssl_opts(ssl)
         .tcp_connect_timeout(Some(timeout))
@@ -164,7 +165,32 @@ pub(super) fn my_connect(
         store_kill: None,
         failed: Default::default(),
         rollback_on_timeout: None,
+        io_timeout,
+        packet,
     })
+}
+
+/// The socket timeout and the largest packet of a connection made for a
+/// script with these limits. A server that stops answering is given up on a
+/// little after the time limit (statements are stopped at the deadline with
+/// KILL QUERY before that); no packet (one row, mostly) is larger than half
+/// the script's memory.
+fn my_io_limits(memory: Option<usize>, time_limit: Option<Duration>) -> (Duration, usize) {
+    let io_timeout = time_limit.map_or(Duration::from_secs(300), |t| t + Duration::from_secs(10));
+    (io_timeout, memory.unwrap_or(128 << 20) / 2)
+}
+
+/// Whether an idle connection made for another script serves one with these
+/// limits: its socket waits long enough, and it takes packets as large
+/// (found while checking the fixes of the 19th assessment: a connection made
+/// by a script with a 2-second limit, taken by one with 60 seconds, gave up
+/// on a 14-second statement after 12 seconds with "the time limit was
+/// reached"). A connection made for a longer limit serves a shorter one: its
+/// statements are stopped at the deadline by KILL QUERY, and the socket's
+/// timeout only bounds the wait for a server that stops answering.
+pub(super) fn my_fits(memory: Option<usize>, time_limit: Option<Duration>) -> impl Fn(&MyConn) -> bool {
+    let (io_timeout, packet) = my_io_limits(memory, time_limit);
+    move |c: &MyConn| c.io_timeout >= io_timeout && c.packet >= packet
 }
 
 pub(super) fn my_message(e: &mysql::Error) -> String {

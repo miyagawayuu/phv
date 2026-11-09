@@ -1,0 +1,7 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs after mysql_pool_short.phv: a
+// statement of 12 seconds under a longer limit, on a connection of the same pool.
+import std.db.Database;
+
+$db = Database::connect("main");
+echo $db->first(sql"SELECT SLEEP(12) AS s")?->int("s") ?? -1;

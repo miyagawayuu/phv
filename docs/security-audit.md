@@ -2144,7 +2144,11 @@ CVE-2026-119375, through `libsqlite3-sys` 0.35, published 2026-10-30): rusqlite 
 changed operands of `IdxDelete`, `Int64`, `NullRow` and the hints change no weight), and every one of its 191 steps is
 in the table. And the new session locks of R22-24 let a session saved without a pause keep a reader under the same
 lock waiting for many saves (375 ms on Linux), as a plain mutex lets the thread that just let it go take it again:
-each lock now hands itself over in the order it was asked for.
+each lock now hands itself over in the order it was asked for. And a MySQL connection kept
+the socket timeout of the script that made it (its time limit and ten seconds), which the driver cannot change: a
+connection made under a 2-second limit, taken from the pool by a script with 60 seconds, gave up on a 14-second
+statement after 12 ("the time limit was reached"); an idle connection is now given only to a script whose limits it
+fits, and the others make a new one.
 
 ### Regression tests
 

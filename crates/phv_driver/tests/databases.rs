@@ -321,6 +321,24 @@ fn transactions_the_database_ended_are_not_reported_as_committed() {
     }
 }
 
+/// A MySQL connection's socket timeout is fixed when it is made, from the
+/// time limit of the script that made it: a connection made under a 1-second
+/// limit is not given to a script whose 12-second statement it would cut off
+/// after 11 seconds (found while checking the fixes of the 19th assessment:
+/// a keyed-job test failed whenever a test with a 2-second limit had used the
+/// pool before it).
+#[test]
+fn a_connection_made_for_a_shorter_time_limit_is_not_used_for_a_longer_one() {
+    sweep_once();
+    let Some(url) = server("PHV_TEST_MYSQL_URL") else { return };
+    // A pool of its own (pool_size 12), with one connection.
+    let spec = DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 12 };
+    let host =
+        Arc::new(Host { root: root(), databases: BTreeMap::from([("main".to_string(), spec)]), ..Host::default() });
+    assert_eq!(run_script(&host, "mysql_pool_short", Some(Duration::from_secs(1))), "1");
+    assert_eq!(run_script(&host, "mysql_pool_long", Some(Duration::from_secs(30))), "0");
+}
+
 #[test]
 fn mysql() {
     sweep_once();
@@ -426,7 +444,11 @@ fn remote_servers_need_tls() {
 /// once; inside a transaction() a job is added only if it commits.
 fn check_jobs(url: &str) {
     use phv_std::jobs::{End, Store};
-    let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 4 };
+    // A pool of its own (pools are shared by URL and size): with size 4 it
+    // shared the pool of the job tests run one at a time (`jobs_host`), and
+    // took the connection a script of theirs then waited for until its time
+    // limit (CI, after the larger adopt test of the 19th assessment).
+    let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 10 };
     // A namespace of this run (the stores of sites without one are covered
     // by the unnamed-site tests of phv_std and phv_server).
     let ns = testing::namespace(0x10);
@@ -872,7 +894,8 @@ fn drain(store: &phv_std::jobs::Store) {
 /// that died left there does not matter.
 fn check_adopt(url: &str) {
     use phv_std::jobs::{End, JobCap, Outcome, Store};
-    let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 4 };
+    // A pool of its own, as in `check_jobs`.
+    let spec = DatabaseSpec { url: Some(url.to_string()), url_env: None, tls: None, pool_size: 11 };
     let shared = Store::Db(spec.clone(), None);
     let a = Store::Db(spec.clone(), Some(testing::namespace(0x20)));
     let b = Store::Db(spec.clone(), Some(testing::namespace(0x21)));

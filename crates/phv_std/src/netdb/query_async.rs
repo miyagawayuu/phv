@@ -261,9 +261,22 @@ pub(super) fn pooled<C: Driver>(
     until: Instant,
     connect: impl FnOnce(Duration) -> Result<C, String>,
 ) -> Result<Pooled<C>, AcquireError> {
+    pooled_fitting(registry, spec, url, use_, until, |_| true, connect)
+}
+
+/// `pooled`, taking only an idle connection that `fits` (see `Pool::acquire`).
+pub(super) fn pooled_fitting<C: Driver>(
+    registry: &Registry<C>,
+    spec: &DatabaseSpec,
+    url: &str,
+    use_: PoolUse,
+    until: Instant,
+    fits: impl Fn(&C) -> bool,
+    connect: impl FnOnce(Duration) -> Result<C, String>,
+) -> Result<Pooled<C>, AcquireError> {
     let (key, size) = pool_key(spec, url, use_);
     let timeout = until.saturating_duration_since(Instant::now()).clamp(Duration::from_millis(100), CONNECT_TIMEOUT);
-    pool_for(registry, &key, size).acquire(until, || connect(timeout))
+    pool_for(registry, &key, size).acquire(until, fits, || connect(timeout))
 }
 
 /// Replaces the connection of `c`, found unusable before anything was sent
@@ -287,15 +300,19 @@ pub(super) fn detached_conn<C: Driver>(
     until: Instant,
     connect: impl FnOnce(Duration) -> Result<C, String>,
 ) -> Result<Pooled<C>, String> {
-    match pooled(registry, spec, url, use_, until, connect) {
-        Ok(c) => Ok(c),
-        // The size of the pool that was full (found by the 1.2 audit: the
-        // error named pool_size for the smaller pools of PHV's own stores).
-        Err(AcquireError::Busy) => Err(match pool_key(spec, url, use_).1 {
+    pooled(registry, spec, url, use_, until, connect).map_err(|e| detached_error(spec, url, use_, e))
+}
+
+/// Why `detached_conn` got no connection: the size of the pool that was full
+/// (found by the 1.2 audit: the error named pool_size for the smaller pools of
+/// PHV's own stores), or why connecting failed.
+pub(super) fn detached_error(spec: &DatabaseSpec, url: &str, use_: PoolUse, e: AcquireError) -> String {
+    match e {
+        AcquireError::Busy => match pool_key(spec, url, use_).1 {
             n if use_ == PoolUse::Scripts => format!("all {n} connections are in use (raise pool_size?)"),
             n => format!("all {n} connections for {} are in use", use_.what()),
-        }),
-        Err(AcquireError::Connect(e)) => Err(format!("cannot connect: {e}")),
+        },
+        AcquireError::Connect(e) => format!("cannot connect: {e}"),
     }
 }
 
@@ -370,9 +387,11 @@ fn my_detached(
 ) -> Result<Detached, String> {
     use mysql::prelude::Queryable;
     let left = until.saturating_duration_since(Instant::now());
-    let mut c = detached_conn(&MY_POOLS, spec, url, PoolUse::Scripts, until, |t| {
+    let fits = super::my::my_fits(Some(budget * 2), Some(left));
+    let mut c = pooled_fitting(&MY_POOLS, spec, url, PoolUse::Scripts, until, fits, |t| {
         my_connect(url, spec, t, Some(budget * 2), Some(left))
-    })?;
+    })
+    .map_err(|e| detached_error(spec, url, PoolUse::Scripts, e))?;
     let error = |c: &mut Pooled<MyConn>, e: mysql::Error| -> String {
         match &e {
             mysql::Error::MySqlError(m) if m.code == 3024 || m.code == 1317 => {
