@@ -424,6 +424,293 @@ foreach (["more", "large", "fine"] as $name) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A WebP of 1×1 (lossless) whose EXIF chunk declares `declared` bytes and holds 10.
+fn webp_exif_declaring(declared: u32) -> Vec<u8> {
+    let mut simple = Vec::new();
+    image::codecs::webp::WebPEncoder::new_lossless(&mut simple)
+        .encode(&[1, 2, 3, 4], 1, 1, ExtendedColorType::Rgba8)
+        .unwrap();
+    let mut body = b"WEBP".to_vec();
+    body.extend_from_slice(b"VP8X\x0a\0\0\0\x18\0\0\0\0\0\0\0\0\0");
+    body.extend_from_slice(&simple[12..]);
+    body.extend_from_slice(b"EXIF");
+    body.extend_from_slice(&declared.to_le_bytes());
+    body.extend_from_slice(b"Exif\0\0MM\0\x2a");
+    let mut out = b"RIFF".to_vec();
+    out.extend_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// A WebP whose VP8X canvas is 16×16 and whose VP8 frame declares `side` × `side`.
+fn webp_vp8_declaring(side: u16) -> Vec<u8> {
+    let mut vp8 = vec![0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a];
+    vp8.extend_from_slice(&side.to_le_bytes());
+    vp8.extend_from_slice(&side.to_le_bytes());
+    vp8.extend_from_slice(&[0; 4096]);
+    let mut body = b"WEBP".to_vec();
+    body.extend_from_slice(b"VP8X\x0a\0\0\0\0\0\0\0\x0f\0\0\x0f\0\0");
+    body.extend_from_slice(b"VP8 ");
+    body.extend_from_slice(&(vp8.len() as u32).to_le_bytes());
+    body.extend_from_slice(&vp8);
+    let mut out = b"RIFF".to_vec();
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+#[test]
+fn a_webp_exif_chunk_declaring_a_gigabyte_is_not_allocated() {
+    let dir = project("webp-exif");
+    std::fs::write(dir.join("data/exif.webp"), webp_exif_declaring(0x4000_0000)).unwrap();
+    std::fs::write(dir.join("data/vp8.webp"), webp_vp8_declaring(16_383)).unwrap();
+    let r = run_in(
+        &dir,
+        r#"<?phv
+import std.image.Image;
+$i = Image::open("data/exif.webp");
+echo $i->width, "×", $i->height, " ", strlen($i->toBase64("png")) > 0 ? "written" : "", "\n";
+try {
+    echo Image::open("data/vp8.webp")->width, "\n";
+} catch (ValueError $e) {
+    echo $e->getMessage(), "\n";
+}
+"#,
+        Limits { max_memory: Some(128 * MB), ..Limits::default() },
+    );
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert_eq!(lines[0], "1×1 written", "{}", r.out);
+    // Refused by its header, before image-webp decodes 400 MB of planes.
+    assert!(lines[1].contains("16383×16383 pixels, not 16×16"), "{}", r.out);
+    // Reading them held the files and a few buffers, not what they declare.
+    assert!(r.peak < 4 * MB, "held {} MB", r.peak / MB);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `jpeg` with a stray byte after its first segment (zune-jpeg skips it).
+fn with_stray_byte(mut jpeg: Vec<u8>) -> Vec<u8> {
+    let len = u16::from_be_bytes([jpeg[4], jpeg[5]]) as usize;
+    jpeg.insert(4 + len, 0x00);
+    jpeg
+}
+
+#[test]
+fn a_stray_byte_does_not_hide_a_progressive_jpeg() {
+    let dir = project("stray");
+    // 7000 × 6000 with four components: its coefficients alone are 336 MB.
+    std::fs::write(dir.join("data/cmyk.jpg"), with_stray_byte(progressive_bomb(7000, 6000, 4, 2))).unwrap();
+    // More scans than 1024 × 1024 may have, found by the header.
+    std::fs::write(dir.join("data/scans.jpg"), with_stray_byte(progressive_bomb(1024, 1024, 1, 150))).unwrap();
+    let r = run_in(
+        &dir,
+        r#"<?phv
+import std.image.Image;
+try {
+    echo Image::open("data/scans.jpg")->width, "\n";
+} catch (ValueError $e) {
+    echo $e->getMessage(), "\n";
+}
+$i = Image::open("data/cmyk.jpg");
+echo $i->width, "×", $i->height, "\n";
+echo strlen($i->fit(64)->toBase64("png"));
+"#,
+        Limits { max_memory: Some(128 * MB), ..Limits::default() },
+    );
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert!(lines[0].ends_with("has 150 scans; one of 1024×1024 pixels may have at most 100"), "{}", r.out);
+    assert_eq!(lines[1], "7000×6000", "{}", r.out);
+    // Refused before decoding, not after 477 MB.
+    assert!(lines[2].contains("allowed memory size of 128 MB exhausted"), "{}", r.out);
+    assert!(r.peak < 16 * MB, "held {} MB", r.peak / MB);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A deflate stream of `n` zeros, about 2 bytes for each 258 (fixed codes).
+fn deflate_zeros(n: usize) -> Vec<u8> {
+    let mut out = vec![0x78, 0x01];
+    let (mut acc, mut bits) = (0u64, 0u32);
+    let mut put = |out: &mut Vec<u8>, code: u64, len: u32, reversed: bool| {
+        let code = if reversed { (code.reverse_bits() >> (64 - len)) & ((1 << len) - 1) } else { code };
+        acc |= code << bits;
+        bits += len;
+        while bits >= 8 {
+            out.push(acc as u8);
+            acc >>= 8;
+            bits -= 8;
+        }
+    };
+    // A final block with fixed codes: a zero, then (258, 1) pairs, then the end.
+    put(&mut out, 0b011, 3, false);
+    put(&mut out, 0b0011_0000, 8, true);
+    for _ in 0..(n - 1) / 258 {
+        put(&mut out, 0b1100_0101, 8, true);
+        put(&mut out, 0, 5, true);
+    }
+    put(&mut out, 0, 7, true);
+    put(&mut out, 0, 7, false);
+    out
+}
+
+fn png_chunk(out: &mut Vec<u8>, name: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(data);
+    // The decoder is told to check the CRC; this one is computed.
+    let mut c = !0u32;
+    for &b in name.iter().chain(data) {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+        }
+    }
+    out.extend_from_slice(&(!c).to_be_bytes());
+}
+
+#[test]
+fn an_icc_profile_bomb_is_not_inflated() {
+    let dir = project("iccp");
+    let small = png(16, 16);
+    let mut bomb = small[..33].to_vec();
+    let mut iccp = b"bomb\0\0".to_vec();
+    iccp.extend_from_slice(&deflate_zeros(512 * MB));
+    png_chunk(&mut bomb, b"iCCP", &iccp);
+    bomb.extend_from_slice(&small[33..]);
+    std::fs::write(dir.join("data/bomb.png"), &bomb).unwrap();
+    let r = run_in(
+        &dir,
+        r#"<?phv
+import std.image.Image;
+$i = Image::open("data/bomb.png");
+echo $i->width, "×", $i->height, " ", strlen($i->toBase64("png")) > 0 ? "written" : "", "\n";
+"#,
+        Limits { max_memory: Some(128 * MB), ..Limits::default() },
+    );
+    assert_eq!(r.out, "16×16 written\n");
+    // The file (about 1 MB) is held; the profile (512 MB) is never inflated.
+    assert!(r.peak < 8 * MB, "held {} MB", r.peak / MB);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A GIF whose screen is `screen` pixels square and whose first frame is
+/// `frame` square (its data ends at once).
+fn gif_frame_larger_than_screen(screen: u16, frame: u16) -> Vec<u8> {
+    let mut g = b"GIF89a".to_vec();
+    g.extend_from_slice(&screen.to_le_bytes());
+    g.extend_from_slice(&screen.to_le_bytes());
+    g.extend_from_slice(&[0x80, 0, 0, 0, 0, 0, 255, 255, 255]);
+    g.extend_from_slice(&[0x2C, 0, 0, 0, 0]);
+    g.extend_from_slice(&frame.to_le_bytes());
+    g.extend_from_slice(&frame.to_le_bytes());
+    // LZW of 2-bit codes: a clear code and the end.
+    g.extend_from_slice(&[0, 2, 1, 0x2C, 0, 0x3B]);
+    g
+}
+
+#[test]
+fn a_gif_frame_larger_than_its_screen_stays_within_the_limit() {
+    let dir = project("gif-frame");
+    // The screen takes 18 MB with what decoding it takes; the frame 25 MB more.
+    std::fs::write(dir.join("data/big.gif"), gif_frame_larger_than_screen(1500, 2500)).unwrap();
+    let r = run_in(
+        &dir,
+        r#"<?phv
+import std.image.Image;
+$i = Image::open("data/big.gif");
+echo $i->width, "\n";
+try {
+    echo strlen($i->toBase64("png")), "\n";
+} catch (ValueError $e) {
+    echo $e->getMessage(), "\n";
+}
+"#,
+        Limits { max_memory: Some(32 * MB), ..Limits::default() },
+    );
+    assert!(r.out.starts_with("1500\n"), "{}", r.out);
+    // The decoder's limit is the memory left: the usual memory error.
+    assert!(r.out.contains("allowed memory size of 32 MB exhausted"), "{}", r.out);
+    assert!(r.peak < 32 * MB, "held {} MB", r.peak / MB);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn encoding_counts_what_the_encoders_take() {
+    let dir = project("encode");
+    // 1500 × 1500 of noise: 6.75 MB of pixels, and a PNG about as large.
+    let mut out = Vec::new();
+    PngEncoder::new_with_quality(&mut out, CompressionType::Fast, FilterType::Adaptive)
+        .write_image(&noise(1500 * 1500 * 3), 1500, 1500, ExtendedColorType::Rgb8)
+        .unwrap();
+    std::fs::write(dir.join("data/noise.png"), &out).unwrap();
+    for format in ["png", "webp", "jpeg"] {
+        let src = format!(
+            "<?phv\nimport std.image.Image;\necho strlen(Image::open(\"data/noise.png\")->toBase64(\"{format}\", 100));\n"
+        );
+        let limit = 32 * MB;
+        let r = run_in(&dir, &src, Limits { max_memory: Some(limit), ..Limits::default() });
+        // Refused before encoding (PNG and WebP take about 4 times the
+        // pixels, JPEG 2.5), or written within the limit.
+        assert!(r.peak < limit, "{format}: held {} MB: {}", r.peak / MB, r.out);
+        if format != "jpeg" {
+            assert!(r.out.contains("exhausted"), "{format}: {}", r.out);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Noise: what compresses least.
+fn noise(n: usize) -> Vec<u8> {
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    (0..n)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        })
+        .collect()
+}
+
+/// Prints the memory the encoders take besides their input, as a multiple
+/// of it (what `encode_need` in std.image reserves).
+#[test]
+#[ignore]
+fn measure_encoder_memory() {
+    let (w, h) = (2000u32, 1500u32);
+    for (name, data) in [
+        ("noise", noise(w as usize * h as usize * 4)),
+        ("smooth", {
+            let mut d = smooth(w, h * 4 / 3);
+            d.truncate(w as usize * h as usize * 4);
+            d
+        }),
+    ] {
+        for (ch, color) in [(3usize, ExtendedColorType::Rgb8), (4, ExtendedColorType::Rgba8)] {
+            let px = &data[..w as usize * h as usize * ch];
+            for format in ["png", "webp", "jpeg"] {
+                if format == "jpeg" && ch == 4 {
+                    continue;
+                }
+                let base = thread_allocated();
+                reset_thread_peak();
+                let mut out = Vec::new();
+                match format {
+                    "png" => PngEncoder::new_with_quality(&mut out, CompressionType::Fast, FilterType::Adaptive)
+                        .write_image(px, w, h, color)
+                        .unwrap(),
+                    "webp" => image::codecs::webp::WebPEncoder::new_lossless(&mut out).encode(px, w, h, color).unwrap(),
+                    _ => JpegEncoder::new_with_quality(&mut out, 100).write_image(px, w, h, color).unwrap(),
+                }
+                let peak = (thread_peak() - base).max(0) as f64;
+                eprintln!(
+                    "{name:<7} {ch} ch {format:<5} peak {:>6.2} × input, output {:>5.2} × input",
+                    peak / px.len() as f64,
+                    out.len() as f64 / px.len() as f64
+                );
+            }
+        }
+    }
+}
+
 /// Prints the time and memory of a typical upload and of the worst cases.
 #[test]
 #[ignore]

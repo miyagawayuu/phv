@@ -130,6 +130,10 @@ pub struct Dep {
     /// Modification time (seconds, nanoseconds) and size, for a quick check.
     mtime: Option<(u64, u32)>,
     len: u64,
+    /// The change time (seconds, nanoseconds; see `safefs::Stamp`), which a
+    /// rewrite of the same size that puts the old modification time back
+    /// changes (the inode's on Unix, NTFS's ChangeTime on Windows).
+    changed: (i64, i64),
     /// SHA-256 of the content that was compiled; None if the file was missing.
     hash: Option<[u8; 32]>,
     /// When the content was last known to be the recorded one (seconds since
@@ -170,7 +174,10 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn stat(root: &Path, p: &Path) -> Option<(Option<(u64, u32)>, u64)> {
+/// What `Dep` compares of a file: its modification time, size and change time.
+type FileTimes = (Option<(u64, u32)>, u64, (i64, i64));
+
+fn stat(root: &Path, p: &Path) -> Option<FileTimes> {
     // A file that has become a link to another machine, or that is now reached
     // through one (a directory on the way became a link to a share), is not
     // followed: it counts as missing, so the program is loaded (and refused)
@@ -180,9 +187,10 @@ fn stat(root: &Path, p: &Path) -> Option<(Option<(u64, u32)>, u64)> {
     if phv_std::safefs::on_another_machine_below(root, p) {
         return None;
     }
-    let m = std::fs::metadata(p).ok()?;
-    let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
-    Some((t.map(|d| (d.as_secs(), d.subsec_nanos())), m.len()))
+    // The stamp of the file links lead to (on Unix not opened, so a pipe does
+    // not block; on Windows opened for its attributes only).
+    let s = safefs::stamp_path(p).ok()?;
+    Some((s.modified(), s.len(), s.changed()))
 }
 
 fn sha256(data: &[u8]) -> [u8; 32] {
@@ -201,44 +209,46 @@ impl Dep {
     /// `Dep::new` with the SHA-256 of the content that was read, and the
     /// stamp the file had then (see `read_known`), if known.
     fn hashed(root: &Path, path: &Path, hash: Option<[u8; 32]>, stamp: Option<&safefs::Stamp>) -> Dep {
-        let (mtime, len) = match stamp {
-            // The time and size of the content read, which `stat` would read
+        let (mtime, len, changed) = match stamp {
+            // The times and size of the content read, which `stat` would read
             // again. The check of `stat` for another machine still runs.
-            Some(s) if !safefs::on_another_machine_below(root, path) => (s.modified(), s.len()),
-            Some(_) => (None, 0),
-            None => stat(root, path).unwrap_or((None, 0)),
+            Some(s) if !safefs::on_another_machine_below(root, path) => (s.modified(), s.len(), s.changed()),
+            Some(_) => (None, 0, (0, 0)),
+            None => stat(root, path).unwrap_or((None, 0, (0, 0))),
         };
         Dep {
             path: path.to_path_buf(),
             root: root.to_path_buf(),
             mtime,
             len,
+            changed,
             hash,
             recorded: Recorded(now_secs().into()),
         }
     }
 
-    /// Whether the file still has the recorded content. A different time or size
-    /// means changed. Equal ones are trusted only if the file was not modified
-    /// close to when it was read (the "racy" case: it may have changed again
-    /// within the clock's resolution); otherwise, or when `thorough`, the
-    /// content is hashed and compared.
+    /// Whether the file still has the recorded content. A different time
+    /// (modification or change) or size means changed. Equal ones are trusted
+    /// only if the file was not changed close to when it was read (the "racy"
+    /// case: it may have changed again within the clock's resolution);
+    /// otherwise, or when `thorough`, the content is hashed and compared.
     ///
     /// A racy file whose content is found unchanged when its time is no longer
     /// recent is recorded as known then: a later change would give it another
     /// time, so it is not hashed again at every check.
     pub fn is_fresh(&self, thorough: bool) -> bool {
-        let Some((mtime, len)) = stat(&self.root, &self.path) else { return self.hash.is_none() };
-        if self.hash.is_none() || mtime != self.mtime || len != self.len {
+        let Some((mtime, len, changed)) = stat(&self.root, &self.path) else { return self.hash.is_none() };
+        if self.hash.is_none() || mtime != self.mtime || len != self.len || changed != self.changed {
             return false;
         }
-        let racy = mtime.is_none_or(|(s, _)| s + 2 >= self.recorded.get());
+        let recent = |secs: u64| secs.saturating_add(2) >= self.recorded.get();
+        let racy = mtime.is_none_or(|(s, _)| recent(s)) || recent(u64::try_from(changed.0).unwrap_or(0));
         if !thorough && !racy {
             return true;
         }
         let checked = now_secs();
         let same = std::fs::read(&self.path).is_ok_and(|bytes| Some(sha256(&bytes)) == self.hash);
-        if same && stat(&self.root, &self.path) == Some((mtime, len)) {
+        if same && stat(&self.root, &self.path) == Some((mtime, len, changed)) {
             self.recorded.0.fetch_max(checked, std::sync::atomic::Ordering::Relaxed);
         }
         same
@@ -421,7 +431,8 @@ const KNOWN_TEXT_MAX: usize = 1 << 20;
 /// be the one read when the file is unchanged by the rule `Dep::is_fresh`
 /// trusts without hashing: the same file (volume and index, or device and
 /// inode: a file renamed over it, or a link now leading elsewhere, is
-/// another), the same size and write time (on Unix also change time), and
+/// another), the same size, write time and change time (NTFS's ChangeTime on
+/// Windows: a rewrite that puts the old write time back is seen), and
 /// that time not within two seconds of the read ("racy": the file could have
 /// changed again within the clock's resolution). Otherwise it is read again.
 fn read_known(path: &Path) -> std::io::Result<Source> {
@@ -1658,16 +1669,16 @@ mod tests {
         let old = SystemTime::now() - std::time::Duration::from_secs(60);
         std::fs::write(&p, "echo 1;").unwrap();
         set_modified(&p, old);
-        // On Unix setting the time changed the inode just now: the file is
-        // kept only once that is two seconds old.
-        #[cfg(unix)]
+        // Setting the time changed the file just now (its change time: the
+        // inode's on Unix, NTFS's ChangeTime on Windows): the file is kept
+        // only once that is two seconds old.
         std::thread::sleep(std::time::Duration::from_millis(3100));
         let n = disk_reads();
         for _ in 0..2 {
             let s = read_known(&p).unwrap();
             assert_eq!((s.text.as_str(), s.hash), ("echo 1;", sha256(b"echo 1;")));
             // What a dependency records from the stamp is what `stat` reads.
-            assert_eq!(s.stamp.map(|t| (t.modified(), t.len())), stat(&dir, &p));
+            assert_eq!(s.stamp.map(|t| (t.modified(), t.len(), t.changed())), stat(&dir, &p));
         }
         assert_eq!(disk_reads(), n + 1, "the second load reuses the text");
         // Another size, the same time.
@@ -1692,16 +1703,14 @@ mod tests {
         let n = disk_reads();
         assert_eq!(read_known(&p).unwrap().text, "echo 55;");
         assert_eq!(disk_reads(), n + 1, "a racy file is read again");
-        // On Unix the change time also sees a write time set back.
-        #[cfg(unix)]
-        {
-            std::fs::write(&p, "echo 66;").unwrap();
-            set_modified(&p, old);
-            assert_eq!(read_known(&p).unwrap().text, "echo 66;");
-            std::fs::write(&p, "echo 77;").unwrap();
-            set_modified(&p, old);
-            assert_eq!(read_known(&p).unwrap().text, "echo 77;");
-        }
+        // The change time also sees a write time set back (on Windows too
+        // since the 19th assessment).
+        std::fs::write(&p, "echo 66;").unwrap();
+        set_modified(&p, old);
+        assert_eq!(read_known(&p).unwrap().text, "echo 66;");
+        std::fs::write(&p, "echo 77;").unwrap();
+        set_modified(&p, old);
+        assert_eq!(read_known(&p).unwrap().text, "echo 77;");
         // Missing: the error of `read_source`; nothing kept is used.
         std::fs::remove_file(&p).unwrap();
         assert_eq!(read_known(&p).unwrap_err().kind(), std::io::ErrorKind::NotFound);
@@ -1790,6 +1799,37 @@ mod tests {
         let racy = Dep::new(tmp.parent().unwrap(), &tmp, Some(b"echo 2;"));
         racy.recorded.0.store(mtime, std::sync::atomic::Ordering::Relaxed);
         assert!(!racy.is_fresh(false));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Found by the 19th assessment: a page rewritten in place with text of
+    /// the same size, its old modification time then put back, kept being
+    /// served by a running server (on Windows the change time was not read,
+    /// and the quick check compared only time and size). The change time sees
+    /// the rewrite, also in the quick check and in the memo of sources.
+    #[test]
+    fn a_rewrite_with_the_old_time_is_seen() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!("phv-rewrite-{}.phv", std::process::id()));
+        std::fs::write(&tmp, "echo 1;").unwrap();
+        let old = SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&tmp).unwrap().set_modified(old).unwrap();
+        // Settled (changed more than two seconds before it is read): the memo
+        // of sources keeps it.
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let dep = Dep::new(tmp.parent().unwrap(), &tmp, Some(b"echo 1;"));
+        // Read well after it settled: the quick check trusts time and size.
+        dep.recorded.0.store(now_secs() + 10, std::sync::atomic::Ordering::Relaxed);
+        assert!(dep.is_fresh(false));
+        let first = read_known(&tmp).unwrap();
+        assert_eq!(&*first.text, "echo 1;");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut f = std::fs::File::options().write(true).open(&tmp).unwrap();
+        f.write_all(b"echo 2;").unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+        assert!(!dep.is_fresh(false), "the quick check took the rewritten file for the one read");
+        assert_eq!(&*read_known(&tmp).unwrap().text, "echo 2;");
         let _ = std::fs::remove_file(&tmp);
     }
 

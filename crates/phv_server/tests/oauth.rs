@@ -574,3 +574,54 @@ fn an_oversized_pending_list_in_the_store_finishes_the_callback() {
     assert!(!after.contains(&state), "the finished sign-in is gone");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A provider without an issuer (OAuth 2.0) refuses an answer whose `iss`
+/// names the issuer of another provider of the site: that answer is the other
+/// provider's (RFC 9207 mix-up on a shared callback). Found by the 19th
+/// assessment (R22-14): the code and the PKCE verifier went to the plain
+/// provider's token endpoint.
+#[test]
+fn an_iss_of_another_provider_is_refused_by_a_plain_provider() {
+    let (addr, p, dir) = start();
+    let issuer = p.lock().unwrap().issuer.clone();
+    for iss in [issuer.clone(), format!("{issuer}/")] {
+        let iss = form_urlencoded::byte_serialize(iss.as_bytes()).collect::<String>();
+        let (cookie, params) = login_at(addr, &p, None, "/loginp");
+        let state = params["state"].clone();
+        let (_, _, body) = get(addr, &format!("/cbp?code=code-{state}&state={state}&iss={iss}"), Some(&cookie));
+        assert!(body.starts_with("error invalid_issuer"), "{body}");
+    }
+    assert_eq!(p.lock().unwrap().token_requests, 0, "no code was exchanged");
+    // An `iss` that names no provider of the site is not checked (as documented), nor is a missing one.
+    let (cookie, params) = login_at(addr, &p, None, "/loginp");
+    let state = params["state"].clone();
+    let (_, _, body) =
+        get(addr, &format!("/cbp?code=code-{state}&state={state}&iss=https%3A%2F%2Fplain.example"), Some(&cookie));
+    assert_eq!(body, "ok access=at-1 id=null claims=0");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A used state written back into the session by another request of the
+/// same session (a sign-in started in a second tab that read the session
+/// before the callback used it) does not finish a second time. Found by the
+/// 19th assessment (R22-25): the callback URL worked once more.
+#[test]
+fn a_state_written_back_by_another_request_is_not_used_twice() {
+    let (addr, p, dir) = start_with(false, true);
+    let (cookie, params) = login(addr, &p, None);
+    let state = params["state"].clone();
+    // What the second tab's request read, and later writes back.
+    let before = pending_text(&dir);
+    assert!(before.contains(&state));
+    let cb = format!("/cb?code=code-{state}&state={state}");
+    let (_, _, body) = get(addr, &cb, Some(&cookie));
+    assert!(body.starts_with("ok sub=user-1"), "{body}");
+    assert_eq!(p.lock().unwrap().token_requests, 1);
+    let list: Vec<serde_json::Value> = serde_json::from_str(&before).unwrap();
+    set_pending(&dir, &list.iter().map(|v| v.to_string()).collect::<Vec<_>>());
+    assert!(pending_text(&dir).contains(&state), "the used state is back in the store");
+    let (_, _, body) = get(addr, &cb, Some(&cookie));
+    assert!(body.starts_with("error invalid_state"), "{body}");
+    assert_eq!(p.lock().unwrap().token_requests, 1, "the code was not exchanged again");
+    let _ = std::fs::remove_dir_all(&dir);
+}

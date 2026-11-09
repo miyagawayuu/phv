@@ -173,6 +173,25 @@ fn catalogs_are_checked_when_compiled() {
     assert_eq!(ok, "compiled");
 }
 
+/// `[]` as the parameters is an empty map: a message with a placeholder it
+/// leaves out is refused when compiled, as with `["other" => 1]` or no
+/// parameters (it passed, and threw when the page ran).
+#[test]
+fn empty_parameters_are_checked_when_compiled() {
+    let main = "import std.i18n.{t, tn, t_html, translator};\n\
+                echo t(\"welcome\", []);\n\
+                echo translator()->t(\"welcome\", []);\n\
+                echo t(params: [], key: \"welcome\");\n\
+                echo t_html(\"welcome\", []);\n\
+                echo tn(\"items\", 2, []);\n\
+                echo t(\"hi\", []);\n";
+    let en = "hi = \"Hi\"\nwelcome = \"Welcome, {name}!\"\nitems.one = \"{count} {what}\"\nitems.other = \"{count} {what}s\"\n";
+    let e = errors(&[("phv.toml", TOML), ("main.phv", main), ("lang/en.toml", en), ("lang/ja.toml", "")]);
+    assert_eq!(e.matches("the message `welcome` needs the parameter `name`").count(), 4, "{e}");
+    assert_eq!(e.matches("the message `items` needs the parameter `what`").count(), 1, "{e}");
+    assert_eq!(e.matches("error:").count(), 5, "{e}");
+}
+
 #[test]
 fn settings_are_checked() {
     let with = |toml: &str| errors(&[("phv.toml", toml), ("main.phv", "echo 1;")]);

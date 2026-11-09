@@ -411,12 +411,54 @@ pub(crate) fn resolve(host: &str, port: u16, until: Instant) -> Result<Vec<Socke
     Ok(addrs.iter().map(|ip| SocketAddr::new(*ip, port)).collect())
 }
 
+/// Whether a connection to `ip:port` reaches the server listening on
+/// `listen`: the address it is bound to; an address of this machine when it
+/// is bound to every one; or the unspecified address (`0.0.0.0`, `::`),
+/// which a connection takes as this machine (on Linux, through the loopback).
+pub fn reaches_listener(ip: IpAddr, port: u16, listen: SocketAddr) -> bool {
+    if port != listen.port() {
+        return false;
+    }
+    let ip = ip.to_canonical();
+    let bound = listen.ip().to_canonical();
+    ip == bound
+        || ip.is_unspecified()
+        || (bound.is_unspecified() && (ip.is_loopback() || is_address_of_this_machine(ip)))
+}
+
+/// Whether `ip` is an address of this machine: a socket can be bound to it.
+fn is_address_of_this_machine(ip: IpAddr) -> bool {
+    std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
 /// Connects to `host:port` before `until`, then starts TLS when `tls` is set.
 /// Reads and writes on the stream also stop at `until` (see `set_deadline`).
 pub(crate) fn dial(host: &str, port: u16, tls: bool, until: Instant) -> Result<Stream, String> {
+    dial_avoiding(host, port, tls, until, None)
+}
+
+/// `dial`, refusing an address that reaches the server listening on `own`
+/// (a page of `phv serve` calling its own server holds a worker while it
+/// waits for one). Checked on the addresses the name has now, so a DNS answer
+/// that changed since the server started, or an endpoint a discovery
+/// document named, is caught too (R22-19).
+pub(crate) fn dial_avoiding(
+    host: &str,
+    port: u16,
+    tls: bool,
+    until: Instant,
+    own: Option<SocketAddr>,
+) -> Result<Stream, String> {
     let left = || until.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     let addrs = resolve(bare, port, until)?;
+    if let Some(own) = own {
+        if addrs.iter().any(|a| reaches_listener(a.ip(), a.port(), own)) {
+            return Err("the address is this server's own: a page cannot call its own server, since it holds a \
+                        worker while it waits for one"
+                .into());
+        }
+    }
     let mut last = "cannot resolve the host name".to_string();
     let mut tcp = None;
     for addr in addrs {

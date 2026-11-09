@@ -95,6 +95,12 @@ jobs:
           ./target/release/phv fmt --check examples
           ./target/release/phv test examples
           ./target/release/phv check examples/site/public/index.phv
+      - name: Licence notices of the crates (THIRD-PARTY-LICENSES.txt of the release archives)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 packaging/licenses.py x86_64-unknown-linux-musl notices.txt
+          grep -q "^  moxcms " notices.txt
       - name: Website samples match the compiler
         if: runner.os == 'Linux'
         shell: bash

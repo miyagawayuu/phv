@@ -9,7 +9,7 @@
 //! returned to the script.
 
 use crate::deadline::until;
-use crate::netio::{check_plain, describe, dial, Stream};
+use crate::netio::{check_plain, describe, dial_avoiding, Stream};
 use crate::{map, s};
 use indexmap::IndexMap;
 use phv_vm::{Key, Value, Vm, VmError};
@@ -145,6 +145,9 @@ struct Base {
     path: String,
     /// Query string of the base URL, without `?` (may be empty).
     query: String,
+    /// The address `phv serve` listens on, when a page of it sends the
+    /// request: a connection that would reach it is refused (R22-19).
+    own: Option<std::net::SocketAddr>,
 }
 
 fn parse_base(url: &str) -> Result<Base, String> {
@@ -183,6 +186,7 @@ fn parse_base(url: &str) -> Result<Base, String> {
         authority: authority.to_string(),
         path: path.trim_end_matches('/').to_string(),
         query: query.to_string(),
+        own: None,
     })
 }
 
@@ -601,7 +605,7 @@ fn exchange(base: &Base, req: &Request, until: Instant, limit: usize) -> Result<
             Err(_) => {}
         }
     }
-    let mut stream = dial(&base.host, base.port, base.tls, until)?;
+    let mut stream = dial_avoiding(&base.host, base.port, base.tls, until, base.own)?;
     let (resp, keep) = send(&mut stream, base, req, limit, &mut 0)?;
     if keep {
         give(base, stream);
@@ -753,10 +757,11 @@ fn prepare(vm: &mut Vm, a: &[Value]) -> Result<(Base, Request, String), VmError>
             headers.push(("traceparent".into(), tp.clone()));
         }
     }
-    let base = match parse_base(&url) {
+    let mut base = match parse_base(&url) {
         Ok(b) => b,
         Err(e) => return Err(fail(vm, e)),
     };
+    base.own = vm.host.listen;
     if let Err(e) = check_plain(&base.host, base.tls, spec.tls, "https://") {
         return Err(fail(vm, e));
     }
@@ -834,7 +839,8 @@ pub(crate) fn send_url(
     body: Vec<u8>,
     limit: usize,
 ) -> Result<Response, String> {
-    let base = parse_base(url)?;
+    let mut base = parse_base(url)?;
+    base.own = vm.host.listen;
     check_plain(&base.host, base.tls, tls, "https://")?;
     let scheme_len = if base.tls { 8 } else { 7 };
     let tail = &url[scheme_len + base.authority.len()..];

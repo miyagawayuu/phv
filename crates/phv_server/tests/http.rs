@@ -306,6 +306,82 @@ fn scripts_send_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A page whose language std.i18n chose from `Accept-Language` varies by it,
+/// so a shared cache keeps one answer per language; one whose page chose the
+/// locale with `set_locale()` does not (R22-20: a cache served the first
+/// visitor's language to everyone).
+#[test]
+fn a_locale_chosen_from_accept_language_varies_by_it() {
+    let dir = std::env::temp_dir().join(format!("phv-http-vary-lang-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phv.toml", "[i18n]\ndefault = \"en\"\nlocales = [\"en\", \"ja\"]\n");
+    write(&dir, "lang/en.toml", "hello = \"Hello\"\n");
+    write(&dir, "lang/ja.toml", "hello = \"Konnichiwa\"\n");
+    write(&dir, "public/index.phv", "<?phv\nimport std.i18n.t;\necho t(\"hello\");\n");
+    write(
+        &dir,
+        "public/chosen.phv",
+        "<?phv\nimport std.i18n.{t, set_locale};\nset_locale(\"ja\");\necho t(\"hello\");\n",
+    );
+    write(&dir, "public/none.phv", "<?phv\necho \"no messages\";\n");
+    write(
+        &dir,
+        "public/stream.phv",
+        "<?phv\nimport std.http.response;\nimport std.i18n.t;\necho \"a\";\nresponse()->flush();\necho t(\"hello\");\n",
+    );
+    let addr = start(&dir);
+    let ask = |path: &str, lang: &str| {
+        request(
+            addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: test\r\nAccept-Language: {lang}\r\nConnection: close\r\n\r\n"),
+        )
+    };
+    let varies = |r: &Reply| r.header("vary").is_some_and(|v| v.split(',').any(|v| v.trim() == "Accept-Language"));
+    let en = ask("/", "en");
+    let ja = ask("/", "ja");
+    assert_eq!((en.body.as_str(), ja.body.as_str()), ("Hello", "Konnichiwa"));
+    assert!(varies(&en) && varies(&ja), "{:?}", en.headers);
+    let chosen = ask("/chosen", "en");
+    assert_eq!(chosen.body, "Konnichiwa");
+    assert!(!varies(&chosen), "set_locale() chose it: {:?}", chosen.headers);
+    assert!(!varies(&ask("/none", "ja")), "no locale was used");
+    let streamed = ask("/stream", "ja");
+    assert!(streamed.body.contains("Konnichiwa") && varies(&streamed), "{:?}", streamed.headers);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The bytes of `response()->file()` or an image's `send()` are output: a
+/// later Content-Type cannot retype them as HTML or JavaScript (R22-30, the
+/// file's `<b>mk1</b>` was served as `text/html`).
+#[test]
+fn a_sent_file_or_image_cannot_be_retyped_as_html() {
+    let dir = std::env::temp_dir().join(format!("phv-http-retype-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phv.toml", "[permissions]\nread = [\"data/\"]\n");
+    write(&dir, "data/up.txt", "<b>mk1</b>");
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAe0lEQVR4nO3PUQkAIBTAwBfBCEawfzpD+HEIgwW4zdrn64YLGtCCBrSgAS1oQAsa0IIGtKABLWhACxrQgga0oAEtaEALGtCCBrSgAS1oQAsa0IIGtKABLWhACxrQgga0oAEtaEALGtCCBrSgAS1oQAsa0IIGtKABLXjsAqvaAFuPwqK1AAAAAElFTkSuQmCC";
+    let body = |send: &str| {
+        format!(
+            "<?phv\nimport std.http.{{request, response}};\nimport std.image.Image;\n{send};\ntry {{\n    response()->header(\"Content-Type\", request()->query(\"t\") ?? \"\");\n}} catch (ValueError $e) {{\n    response()->file(\"data/up.txt\", \"text/plain\");\n    response()->status(409);\n}}\n"
+        )
+    };
+    write(&dir, "public/file.phv", &body("response()->file(\"data/up.txt\")"));
+    write(&dir, "public/img.phv", &body(&format!("Image::fromBase64(\"{png}\")->send()")));
+    let addr = start(&dir);
+    for page in ["file", "img"] {
+        for t in ["text%2Fhtml", "image%2Fsvg%2Bxml", "application%2Fx-unknown", "text%2Fjavascript"] {
+            let (head, _) = get_bytes(addr, &format!("/{page}?t={t}"));
+            assert!(head.starts_with("HTTP/1.1 409"), "{page} {t}: {head}");
+            assert!(!head.to_ascii_lowercase().contains("content-type: text/html"), "{page} {t}: {head}");
+        }
+        // Another type that is not run as markup or script is still fine.
+        let (head, _) = get_bytes(addr, &format!("/{page}?t=application%2Foctet-stream"));
+        assert!(head.starts_with("HTTP/1.1 200"), "{page}: {head}");
+        assert!(head.to_ascii_lowercase().contains("content-type: application/octet-stream"), "{page}: {head}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn repeated_fields_are_all_read() {
     let dir = std::env::temp_dir().join(format!("phv-http-multi-{}", std::process::id()));

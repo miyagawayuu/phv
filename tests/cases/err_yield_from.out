@@ -1,0 +1,15 @@
+error: `yield from` takes no key: it yields the keys of the values it yields
+ --> err_yield_from.phv:9:19
+  |
+9 |     yield from(6) => 1;
+  |                   ^^
+  = note: `from` after `yield` is a keyword; to yield a value of a function named `from`, put it in parentheses: `yield (from(...)) => ...;`
+
+error: `yield from` needs the values it yields: `yield from $values;`
+  --> err_yield_from.phv:12:15
+   |
+12 |     yield from;
+   |               ^
+   = note: `from` after `yield` is a keyword; to yield a value named `from`, write `yield (from);`
+
+2 errors found

@@ -1,0 +1,75 @@
+<?phv
+// A transaction that SQLite or a statement ended before transaction() did:
+// the statements after it are refused (they would run outside any
+// transaction, and stay when transaction() throws), and transaction()
+// throws instead of returning as if it had committed (19th audit).
+import std.db.Database;
+
+$db = Database::open(":memory:");
+$db->execute(sql"CREATE TABLE t (x INTEGER PRIMARY KEY)");
+$count = function () use ($db): int {
+    return $db->first(sql"SELECT count(*) AS n FROM t")?->int("n") ?? -1;
+};
+
+// An error that rolls the whole transaction back (OR ROLLBACK).
+try {
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"INSERT INTO t VALUES (1)");
+        try {
+            $db->execute(sql"INSERT OR ROLLBACK INTO t VALUES (1)");
+        } catch (DatabaseError $e) {
+            echo "caught: ", $e->getMessage(), "\n";
+        }
+        try {
+            $db->execute(sql"INSERT INTO t VALUES (2)");
+        } catch (DatabaseError $e) {
+            echo "refused: ", $e->getMessage(), "\n";
+        }
+    });
+    echo "transaction() returned\n";
+} catch (DatabaseError $e) {
+    echo "transaction() threw: ", $e->getMessage(), "\n";
+}
+echo "rows: ", $count(), "\n";
+
+// COMMIT written as SQL inside transaction().
+try {
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"INSERT INTO t VALUES (3)");
+        $db->execute(sql"COMMIT");
+        $db->execute(sql"INSERT INTO t VALUES (4)");
+    });
+    echo "transaction() returned\n";
+} catch (DatabaseError $e) {
+    echo "transaction() threw: ", $e->getMessage(), "\n";
+}
+echo "rows: ", $count(), "\n";
+
+// ROLLBACK written as SQL inside an inner transaction(): the outer one
+// cannot commit either.
+try {
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"INSERT INTO t VALUES (5)");
+        try {
+            $db->transaction(function () use ($db): void {
+                $db->execute(sql"ROLLBACK");
+            });
+        } catch (DatabaseError $e) {
+            echo "inner threw: ", $e->getMessage(), "\n";
+        }
+        $db->execute(sql"INSERT INTO t VALUES (6)");
+    });
+    echo "transaction() returned\n";
+} catch (DatabaseError $e) {
+    echo "outer threw: ", $e->getMessage(), "\n";
+}
+echo "rows: ", $count(), "\n";
+
+// Transactions work as before afterwards.
+$db->transaction(function () use ($db): void {
+    $db->execute(sql"INSERT INTO t VALUES (7)");
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"INSERT INTO t VALUES (8)");
+    });
+});
+echo "rows: ", $count(), "\n";

@@ -1,0 +1,9 @@
+<?phv
+// `Html` inserted inside `<svg>` that leaves a `<foreignObject>` (an HTML
+// integration point) open: browsers read the page after it as HTML, where it
+// was checked as SVG, so the `<script/>` after it would run the string (found
+// by the 19th assessment; see err_html_breakout_in_svg).
+$v = "document.title='mk1'";
+echo render("views/svg_icon_page.phv.html", icon: render("views/svg_fo.phv.html"), v: $v);
+?>
+not reached

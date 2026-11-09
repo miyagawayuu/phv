@@ -41,7 +41,7 @@ fn html_inside(h: HExpr, ctx: phv_syntax::ast::EchoContext) -> HExpr {
     // `watched `: where the end tag of any raw-text element may end what a
     // browser reads (found by the 1.2 audit).
     let place = match ctx {
-        EchoContext::ForeignText => "foreign",
+        EchoContext::ForeignText(place) => place,
         EchoContext::SelectText => "select",
         EchoContext::RawText(tag) => tag,
         EchoContext::Comment { bogus: false, watched: false } => "comment",
@@ -457,12 +457,15 @@ impl Checker<'_> {
             );
             return None;
         }
-        if s.out.is_some() {
-            self.error(
-                "`yield` cannot be used inside a tag, an attribute, `<script>` or other HTML that is not element text",
-                s.span,
-            )
-            .add_note("what the loop over the generator writes meanwhile would land there");
+        if let Some(ctx) = s.out {
+            // Inside a `<select>`, the loop's HTML was checked outside one
+            // (found by the 19th assessment).
+            let msg = if ctx == phv_syntax::ast::EchoContext::SelectText {
+                "`yield` cannot be used inside an open `<select>`"
+            } else {
+                "`yield` cannot be used inside a tag, an attribute, `<script>` or other HTML that is not element text"
+            };
+            self.error(msg, s.span).add_note("what the loop over the generator writes meanwhile would land there");
             return None;
         }
         Some(kv)

@@ -274,6 +274,10 @@ pub(crate) struct Checker<'a> {
     /// Bytes of trait methods copied into classes so far (see `traits::MAX_TRAIT_CODE`).
     trait_code: usize,
     reported_trait_code: bool,
+    /// What each trait gives (with what its type parameters stand for) while
+    /// the traits of one class or trait are flattened: a trait reached along
+    /// many paths is flattened at most twice (see `traits::flatten_trait`).
+    trait_memo: traits::TraitMemo<'a>,
 }
 
 /// A method of a class: its own, or one it takes from a trait (with the
@@ -422,6 +426,7 @@ impl<'a> Checker<'a> {
             func_trait: HashMap::new(),
             trait_code: 0,
             reported_trait_code: false,
+            trait_memo: HashMap::new(),
         }
     }
 
@@ -2468,6 +2473,7 @@ impl<'a> Checker<'a> {
             } else {
                 self.type_params = class_tps.clone();
                 let tm = self.trait_members(&decl.uses, Some(cid), &mut Vec::new());
+                self.trait_memo.clear();
                 self.type_params.clear();
                 tm
             };
@@ -2528,8 +2534,9 @@ impl<'a> Checker<'a> {
                 .iter()
                 .map(|m| MethodSrc { decl: m, name: m.name.clone(), vis: m.visibility, trait_: None })
                 .collect();
+            let own: HashSet<&str> = decl.methods.iter().map(|m| m.name.as_str()).collect();
             for t in from_traits.methods {
-                if !decl.methods.iter().any(|m| m.name == t.name) {
+                if !own.contains(t.name.as_str()) {
                     let trait_ = Some((t.origin, t.subst));
                     srcs.push(MethodSrc { decl: t.decl, name: t.name, vis: t.vis, trait_ });
                 }
@@ -2708,6 +2715,21 @@ impl<'a> Checker<'a> {
                         format!("`{}` changes between static and non-static when overriding", src.name),
                         m.name_span,
                     );
+                }
+                // As in PHP: an override is at least as visible as the method
+                // it replaces, which can be called through the parent's type
+                // (also when `use T { f as private; }` gives it).
+                if vis_rank(src.vis) < vis_rank(old.vis) {
+                    let parent_name = self.funcs[old.func as usize].name.clone();
+                    let (now, was) = (vis_word(src.vis), vis_word(old.vis));
+                    self.error(
+                        format!("`{class_name}::{}` is {now}, but it overrides `{parent_name}`, which is {was}", src.name),
+                        m.name_span,
+                    )
+                    .add_note(format!(
+                        "an overriding method keeps the visibility of the one it replaces or widens it: declare it `{was}`{}",
+                        if old.vis == Visibility::Protected { " or `public`" } else { "" }
+                    ));
                 }
                 if !self.compatible_override(fid, old.func, cid) {
                     let parent_name = self.funcs[old.func as usize].name.clone();
@@ -3503,4 +3525,21 @@ fn fold_binary(op: BinOp, l: &HConst, r: &HConst) -> Result<HConst, Option<&'sta
         }
         _ => return Err(None),
     })
+}
+
+/// How visible a member is, least first (for overrides: see `resolve_method`).
+fn vis_rank(v: Visibility) -> u8 {
+    match v {
+        Visibility::Private => 0,
+        Visibility::Protected => 1,
+        Visibility::Public => 2,
+    }
+}
+
+fn vis_word(v: Visibility) -> &'static str {
+    match v {
+        Visibility::Private => "private",
+        Visibility::Protected => "protected",
+        Visibility::Public => "public",
+    }
 }

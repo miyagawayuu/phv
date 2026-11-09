@@ -12,6 +12,8 @@ $try = function (Sql $s) use ($db): void {
 $db->transaction(function () use ($try): void {
     $try(sql"PREPARE TRANSACTION 'phv_prepared'");
     $try(sql"/* two phase */ prepare transaction 'phv_prepared'");
+    // PostgreSQL has no versioned comments: `/*!` is a comment (19th audit).
+    $try(sql"/*! mk1 */ PREPARE TRANSACTION 'phv_prepared'");
 });
 try { $db->executeAsync(sql"PREPARE TRANSACTION 'phv_prepared'"); echo "ok\n"; } catch (DatabaseError $e) { echo "error: ", $e->getMessage(), "\n"; }
 $try(sql"PREPARE phv_one AS SELECT 1");

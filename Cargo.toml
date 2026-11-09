@@ -77,6 +77,10 @@ libmimalloc-sys = { version = "=0.1.49", default-features = false }
 # image-webp), pinned exactly with only these codecs: no rayon (a page's work
 # stays on its own thread, where its time and memory are counted), no C.
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# The JPEG decoder `image` uses, called directly: its own header parse tells a
+# progressive JPEG apart, and its limit of scans is set from the caps. The
+# same version and features as through `image`, so nothing more is built.
+zune-jpeg = "=0.5.15"
 
 [profile.release]
 # Arithmetic bugs in the runtime become caught panics instead of silent wraps.

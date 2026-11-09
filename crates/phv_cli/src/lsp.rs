@@ -1202,6 +1202,52 @@ mod tests {
         assert_eq!(got[2]["method"], "textDocument/publishDiagnostics");
     }
 
+    /// A file whose traits reach one trait along 2^40 paths (40 levels of
+    /// `trait Ai { use Ai-1, Bi-1; }`, 2 KB) is checked at once: with it open,
+    /// a hover in another file is answered within the deadline. Each path was
+    /// walked, and the server answered nothing for days.
+    #[test]
+    fn answers_with_a_diamond_of_traits_open() {
+        let p = Project::new("diamond");
+        let mut bomb = String::from("<?phv\ntrait A0 {}\ntrait B0 {}\n");
+        for i in 1..=40 {
+            bomb += &format!(
+                "trait A{i} {{ use A{}, B{}; }}\ntrait B{i} {{ use A{}, B{}; }}\n",
+                i - 1,
+                i - 1,
+                i - 1,
+                i - 1
+            );
+        }
+        bomb += "class K { use A40; }\n";
+        let bomb_uri = path_to_uri(&p.dir.join("bomb.phv"));
+        let uri = path_to_uri(&p.dir.join("page.phv"));
+        let open = |uri: &str, text: &str| {
+            notification(
+                "textDocument/didOpen",
+                json!({ "textDocument": { "uri": uri, "languageId": "phv", "version": 0, "text": text } }),
+            )
+        };
+        let msgs = vec![
+            open(&bomb_uri, &bomb),
+            open(&uri, "<?phv\n$name = \"x\";\necho $name;\n"),
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "textDocument/hover",
+                "params": { "textDocument": { "uri": uri }, "position": { "line": 2, "character": 6 } },
+            }),
+        ];
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let got = serve_batch(msgs);
+            let _ = tx.send((got, start.elapsed()));
+        });
+        let (got, took) = rx.recv_timeout(Duration::from_secs(30)).expect("no answer in 30 s");
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+        let hover = got.iter().find(|m| m["id"] == 1).unwrap();
+        assert!(hover["result"]["contents"]["value"].as_str().unwrap_or_default().contains("string"), "{hover}");
+    }
+
     #[test]
     fn reads_on_its_own_thread_until_exit() {
         let mut stream = Vec::new();

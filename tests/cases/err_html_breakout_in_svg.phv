@@ -1,0 +1,14 @@
+<?phv
+// `Html` inserted inside `<svg>` or `<math>` may not change the SVG or MathML
+// around it: the page after it was checked as if it changed nothing. Here a
+// partial's `<p>` ends the SVG for browsers, so the page's self-closed
+// `<script/>` (read as SVG, no script text) would be an HTML script with the
+// nonce, and the escaped string after it would run (found by the 19th
+// assessment). See also err_html_breakout_in_svg_end, _fo and
+// err_html_breakout_in_math. A partial that closes what it opens is fine.
+$v = "document.title='mk1'";
+echo render("views/svg_icon_page.phv.html", icon: render("views/svg_bar.phv.html", n: 1), v: $v);
+echo render("views/svg_icon_page.phv.html", icon: render("views/svg_fo_ok.phv.html"), v: $v);
+echo render("views/svg_icon_page.phv.html", icon: render("views/svg_para.phv.html"), v: $v);
+?>
+not reached

@@ -1,0 +1,63 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs against a MySQL server:
+// insert() takes the key lastInsertId() gives only when the key column is the
+// table's AUTO_INCREMENT column (19th audit: a key made by a default took
+// another column's AUTO_INCREMENT value, another row's key, or 0).
+import std.db.Database;
+import std.orm.Repo;
+
+#[Table("phv_orm_keys")]
+class Note {
+    public ?int $id = null;
+    public string $body = "";
+}
+
+#[Table("phv_orm_log")]
+class Line {
+    public ?int $id = null;
+    public string $t = "";
+}
+
+$db = Database::connect("main");
+$db->execute(sql"DROP TABLE IF EXISTS phv_orm_keys");
+$db->execute(sql"DROP TABLE IF EXISTS phv_orm_log");
+$db->execute(sql"CREATE TABLE phv_orm_log (id int PRIMARY KEY AUTO_INCREMENT, t text NOT NULL)");
+$rows = function () use ($db): void {
+    foreach ($db->query(sql"SELECT id, body FROM phv_orm_keys ORDER BY id") as $r) {
+        echo "  row ", $r->int("id") ?? -1, " ", $r->string("body") ?? "", "\n";
+    }
+};
+$add = function (Repo<Note> $notes, string $body): void {
+    $n = new Note();
+    $n->body = $body;
+    try {
+        $notes->insert($n);
+        echo "insert(): key ", $n->id ?? -1, "\n";
+    } catch (ValueError $e) {
+        echo "insert(): ", $e->getMessage(), "\n";
+    }
+};
+
+// The key is made by a default, and another column is AUTO_INCREMENT.
+$db->execute(sql"CREATE TABLE phv_orm_keys (id int PRIMARY KEY DEFAULT (FLOOR(1000 + RAND() * 1000000)), seq int NOT NULL AUTO_INCREMENT UNIQUE, body text NOT NULL)");
+$db->execute(sql"INSERT INTO phv_orm_keys (id, seq, body) VALUES (77, 76, 'victim')");
+$notes = new Repo<Note>($db);
+$add($notes, "mk1");
+$add($notes, "mk2");
+$rows();
+
+// No AUTO_INCREMENT column at all.
+$db->execute(sql"DROP TABLE phv_orm_keys");
+$db->execute(sql"CREATE TABLE phv_orm_keys (id int PRIMARY KEY DEFAULT (FLOOR(1000 + RAND() * 1000000)), body text NOT NULL)");
+$db->execute(sql"INSERT INTO phv_orm_log (t) VALUES ('x')");
+$add(new Repo<Note>($db), "mk3");
+$rows();
+
+// The key column is the AUTO_INCREMENT column: its key is given back.
+$lines = new Repo<Line>($db);
+$l = new Line();
+$l->t = "y";
+$lines->insert($l);
+echo "line key: ", $l->id ?? -1, ", row: ", $db->first(sql"SELECT t FROM phv_orm_log WHERE id = {$l->id}")?->string("t") ?? "", "\n";
+$db->execute(sql"DROP TABLE phv_orm_keys");
+$db->execute(sql"DROP TABLE phv_orm_log");

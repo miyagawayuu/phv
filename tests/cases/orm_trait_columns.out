@@ -1,0 +1,9 @@
+u1 email=NULL email_address=u1@example.com
+u2 email=NULL email_address=u2@example.com
+u3 email=NULL email_address=u3@example.com
+found: u2@example.com
+update(u2): true
+delete(u2): true
+rows left: 2
+u1 u1@example.com
+u3 u3@example.com

@@ -1,0 +1,8 @@
+<?phv
+// Older browsers ignore `</select>` inside a `<template>` in a `<select>`, so
+// the `<select>` stays open after it: the `<title>` below would be markup
+// there (found by the 19th assessment). A `<template>` inside a `<select>` is
+// an error.
+$u = "javascript:alert(1)";
+?>
+<select name="s"><option>a</option><template></select></template><title></select><a href="<?= $u ?>">x</a></title>

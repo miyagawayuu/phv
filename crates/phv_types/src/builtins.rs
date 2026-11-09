@@ -389,7 +389,10 @@ pub static BUILTINS: &[BuiltinSig] = &[
     // empty) names the entity type `T` of a `Repo<T>` for `__orm_load`, which
     // builds a `T` from the description the checker made of it.
     internal("__orm_meta", "fn(any, string, list<any>): int"),
-    internal("__orm_epoch", "fn(): int"),
+    internal("__orm_epoch", "fn(int): int"),
+    internal("__orm_wrote", "fn(int): int"),
+    internal("__orm_made_query", "fn(int): ?Sql"),
+    internal("__orm_made", "fn(int, ?map<string, any>): void"),
     internal("__orm_select", "fn(int, ?Sql, string, ?int, int, bool): Sql"),
     internal("__orm_find", "fn(int, int | string): Sql"),
     internal("__orm_load", "fn(int, map<string, any>, list<T>): T"),

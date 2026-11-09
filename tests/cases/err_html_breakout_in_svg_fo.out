@@ -1,0 +1,3 @@
+
+--- runtime error ---
+Fatal error: `Html` inserted inside `<svg>` or `<math>` holds `<foreignobject>`, which it leaves open: browsers would build the SVG or MathML around it in another way than the page after it was checked; close every element it opens there and no other, write HTML elements only inside a `<foreignObject>` (or `<desc>`, `<title>`, a MathML text element) it opens, or insert it outside the SVG or MathML

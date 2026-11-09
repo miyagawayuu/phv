@@ -1,0 +1,10 @@
+first transaction() threw: transaction() did not commit: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+second transaction() threw: rolled back on purpose
+transaction() threw: the transaction of transaction() has ended, and nothing more runs in it: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+caught: Deadlock found when trying to get lock; try restarting transaction
+refused: the transaction of transaction() has ended, and nothing more runs in it: it was rolled back after a deadlock
+the other connection changed 8 rows
+transaction() threw: transaction() did not commit: it was rolled back after a deadlock
+caught: Lock wait timeout exceeded; try restarting transaction
+the other connection changed 1 rows
+transaction() returned

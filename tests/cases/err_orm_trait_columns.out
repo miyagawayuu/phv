@@ -1,0 +1,23 @@
+error: property `$name` of this trait is not the same as the one of `Person`
+ --> err_orm_trait_columns.phv:9:5
+  |
+9 |     #[Column("full_name")]
+  |     ^^^^^^^^^^^^^^^^^^^^^^
+  = note: a class and the traits it uses may declare a property of the same name only with the same type, visibility, `readonly`, default value, `#[Column]` and `#[Id]`
+  = note: in trait `Named`, used by `Person`
+
+error: `#[Column("bad name")]`: a name may hold only letters, digits and `_`, and may not start with a digit
+  --> err_orm_trait_columns.phv:24:14
+   |
+24 |     #[Column("bad name")]
+   |              ^^^^^^^^^^
+   = note: names are quoted in the SQL, so a keyword such as `order` or `user` can be a name
+   = note: in trait `Bad`, used by `Thing`
+
+error: `Repo<Thing>`: more than one property of `Thing` is marked `#[Id]`
+  --> err_orm_trait_columns.phv:34:11
+   |
+34 | $things = new Repo<Thing>($db);
+   |           ^^^^^^^^^^^^^^^^^^^^
+
+3 errors found

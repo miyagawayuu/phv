@@ -1,0 +1,54 @@
+<?phv
+// A Repo forgets what it kept when another Repo writes to its table, and
+// after ROLLBACK or COMMIT written as SQL: update() then writes every column
+// instead of skipping one whose row no longer holds the entity's value
+// (19th audit).
+import std.db.Database;
+import std.orm.Repo;
+
+#[Table("users")]
+class User {
+    public ?int $id = null;
+    public string $name = "";
+}
+
+#[Table("notes")]
+class Note {
+    public ?int $id = null;
+    public string $body = "";
+}
+
+$db = Database::open(":memory:");
+$db->execute(sql"CREATE TABLE users (id integer PRIMARY KEY, name text)");
+$db->execute(sql"CREATE TABLE notes (id integer PRIMARY KEY, body text)");
+$name = function () use ($db): string {
+    return $db->first(sql"SELECT name FROM users")?->string("name") ?? "";
+};
+$a = new Repo<User>($db);
+$b = new Repo<User>($db);
+$u = new User();
+$u->name = "mk1";
+$a->insert($u);
+
+// Another Repo writes the same entity.
+$u->name = "mk2";
+$b->update($u);
+$u->name = "mk1";
+echo "a->update(): ", $a->update($u) ? "true" : "false", "\n";
+echo "entity: ", $u->name, ", row: ", $name(), "\n";
+
+// A rollback written as SQL.
+$db->execute(sql"SAVEPOINT s1");
+$u->name = "mk3";
+$a->update($u);
+$db->execute(sql"ROLLBACK TO SAVEPOINT s1");
+$db->execute(sql"RELEASE SAVEPOINT s1");
+echo "a->update() after ROLLBACK TO: ", $a->update($u) ? "true" : "false", "\n";
+echo "entity: ", $u->name, ", row: ", $name(), "\n";
+
+// A Repo of another table does not make it forget: nothing changed, nothing is written.
+$notes = new Repo<Note>($db);
+$n = new Note();
+$n->body = "x";
+$notes->insert($n);
+echo "a->update() with nothing changed: ", $a->update($u) ? "true" : "false", "\n";

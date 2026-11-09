@@ -1,0 +1,15 @@
+got 1
+finally 1
+finally 2
+finally 3
+loops ended
+after loops
+got 1
+generator caught from finally
+caught: a generator closed by its loop cannot yield again
+got 1
+generator caught: a generator closed by its loop cannot yield again
+after recovers
+got 1
+caught: a generator closed by its loop cannot yield again
+done

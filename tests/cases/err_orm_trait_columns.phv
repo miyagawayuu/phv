@@ -1,0 +1,34 @@
+<?phv
+// `#[Id]` and `#[Column]` of a trait's property are the class's, and are
+// checked as the class's own: a property both declare must agree on them, a
+// column name must be a plain SQL name, and one key at most.
+import std.db.Database;
+import std.orm.Repo;
+
+trait Named {
+    #[Column("full_name")]
+    public string $name = "";
+}
+#[Table("people")]
+class Person {
+    use Named;
+    public int $id = 0;
+    public string $name = "";
+}
+
+trait Keyed {
+    #[Id]
+    public string $uuid = "";
+}
+trait Bad {
+    #[Column("bad name")]
+    public string $label = "";
+}
+#[Table("things")]
+class Thing {
+    use Keyed, Bad;
+    #[Id]
+    public int $id = 0;
+}
+$db = Database::open(":memory:");
+$things = new Repo<Thing>($db);

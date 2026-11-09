@@ -1,0 +1,5 @@
+a->update(): true
+entity: mk1, row: mk1
+a->update() after ROLLBACK TO: true
+entity: mk3, row: mk3
+a->update() with nothing changed: false

@@ -1,0 +1,5 @@
+insert(): Repo<Note>::insert(): MySQL gives back only a key its AUTO_INCREMENT column made, and the column "id" of "phv_orm_keys" is not that column; give `Note::$id` a value first
+insert(): Repo<Note>::insert(): MySQL gives back only a key its AUTO_INCREMENT column made, and the column "id" of "phv_orm_keys" is not that column; give `Note::$id` a value first
+  row 77 victim
+insert(): Repo<Note>::insert(): MySQL gives back only a key its AUTO_INCREMENT column made, and the column "id" of "phv_orm_keys" is not that column; give `Note::$id` a value first
+line key: 2, row: y

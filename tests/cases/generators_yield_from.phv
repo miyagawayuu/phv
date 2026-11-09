@@ -1,0 +1,17 @@
+<?phv
+// `yield from` is a pair of keywords, as in PHP: `from` right after `yield`
+// delegates, with or without a space before the parenthesis. A function named
+// `from` keeps its name elsewhere, and its value is yielded in parentheses.
+function from(int $x): int {
+    return $x * 10;
+}
+function g(): Generator<int, int> {
+    yield from([1, 2]);
+    yield from ([3]);
+    yield (from(6)) => from(7);
+    yield (from(8));
+}
+foreach (g() as $k => $v) {
+    echo $k, "=", $v, " ";
+}
+echo "\n", from(1), "\n";

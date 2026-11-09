@@ -255,6 +255,15 @@ impl Parser {
         PErr
     }
 
+    /// Adds `note` to the diagnostic just reported (none when parsing halted).
+    fn note_last(&mut self, note: &str) {
+        if !self.halted {
+            if let Some(d) = self.diags.last_mut() {
+                d.add_note(note);
+            }
+        }
+    }
+
     fn expect(&mut self, tok: Tok) -> PResult<Span> {
         if self.at(&tok) {
             Ok(self.bump())
@@ -408,6 +417,12 @@ impl Parser {
                 self.diags.push(d);
                 return;
             }
+            InlineCode::TemplateInSelect => {
+                let mut d = Diagnostic::error("`<template>` inside `<select>`", span);
+                d.add_note("older browsers ignore a `</select>` inside it, so the `<select>` stays open after it where this template is checked outside one; close the `<select>` first");
+                self.diags.push(d);
+                return;
+            }
             InlineCode::MetaHttpEquiv => {
                 let mut d =
                     Diagnostic::error("`http-equiv` after a value inserted into the `content` of this `<meta>`", span);
@@ -424,12 +439,16 @@ impl Parser {
     }
 
     fn check_block_html(&mut self, entry: &crate::htmlctx::HtmlTracker) {
+        let select = self.html.select_open() != entry.select_open();
         if !self.html.end_block(entry) && !self.halted {
             let span = self.span();
             let mut d = Diagnostic::error("the HTML in this block does not end where it started", span);
             d.add_note(
                 "close every tag, attribute and `<script>`/`<style>` opened inside a block, loop or function before it ends",
             );
+            if select {
+                d.add_note("a `<select>` opened or closed in a block (or a loop's body, or a function) must be closed or opened again in it: what follows would be checked inside or outside one, where older browsers read a `<title>` or `<style>` in it as markup");
+            }
             self.diags.push(d);
             self.html = entry.clone();
         }
@@ -604,8 +623,11 @@ impl Parser {
             d.add_note("a browser would read that end tag there (this template or function may be written inside a `<noscript>`); put a space after `<`, or move the code");
             self.diags.push(d);
         }
-        // Inside a `<select>`, functions may write output as in text.
-        if !matches!(ctx, EchoContext::Text | EchoContext::SelectText) && !matches!(s.kind, StmtKind::InlineHtml(..)) {
+        // Inside a `<select>` too, functions may not write output: their HTML
+        // was checked outside one, where older browsers read a `<title>` or
+        // `<style>` in it as markup (found by the 19th assessment). What a
+        // statement there writes itself is checked as it is written.
+        if ctx != EchoContext::Text && !matches!(s.kind, StmtKind::InlineHtml(..)) {
             s.out = Some(ctx);
         }
         Ok(s)
@@ -628,7 +650,8 @@ impl Parser {
                         | crate::htmlctx::InlineCode::CommentEnd
                         | crate::htmlctx::InlineCode::ForeignStructure(_)
                         | crate::htmlctx::InlineCode::CdataEnd
-                        | crate::htmlctx::InlineCode::RawTextInSelect(_) => 1,
+                        | crate::htmlctx::InlineCode::RawTextInSelect(_)
+                        | crate::htmlctx::InlineCode::TemplateInSelect => 1,
                     };
                     self.inline_code_warning(Span { start: pos, end: pos + len, ..start }, what);
                 }
@@ -786,9 +809,12 @@ impl Parser {
         Ok(Stmt { out: None, kind, span: start.to(self.prev_span()) })
     }
 
-    /// `yield $value;`, `yield $key => $value;` or `yield from $values;`. `from`
-    /// is a keyword only here (`Status::from()` and a function named `from`
-    /// keep their meaning).
+    /// `yield $value;`, `yield $key => $value;` or `yield from $values;`. As in
+    /// PHP, `yield from` is a pair of keywords: `from` right after `yield`
+    /// always delegates (so `yield from($xs);` and `yield from ($xs);` do too).
+    /// Elsewhere `from` is a name (`Status::from()`, a function `from()`); a
+    /// value starting with a function named `from` is yielded in parentheses:
+    /// `yield (from($x));`.
     fn yield_stmt(&mut self) -> PResult<StmtKind> {
         let span = self.bump();
         if self.is_template {
@@ -799,11 +825,26 @@ impl Parser {
         if matches!(self.peek(), Tok::Semi | Tok::CloseTag | Tok::Eof) {
             return Err(self.error_here("`yield` needs a value: `yield $value;`"));
         }
-        let from = matches!(self.peek(), Tok::Ident(n) if n == "from")
-            && !matches!(self.peek_at(1), Tok::Semi | Tok::CloseTag | Tok::Eof | Tok::FatArrow);
+        let from = matches!(self.peek(), Tok::Ident(n) if n == "from");
         let kind = if from {
             self.bump();
-            StmtKind::YieldFrom(self.expr()?)
+            if matches!(self.peek(), Tok::Semi | Tok::CloseTag | Tok::Eof | Tok::FatArrow) {
+                let e = self.error_here("`yield from` needs the values it yields: `yield from $values;`");
+                self.note_last(
+                    "`from` after `yield` is a keyword; to yield a value named `from`, write `yield (from);`",
+                );
+                return Err(e);
+            }
+            let values = self.expr()?;
+            if self.at(&Tok::FatArrow) {
+                let e = self.error_here("`yield from` takes no key: it yields the keys of the values it yields");
+                self.note_last(
+                    "`from` after `yield` is a keyword; to yield a value of a function named `from`, put it in \
+                     parentheses: `yield (from(...)) => ...;`",
+                );
+                return Err(e);
+            }
+            StmtKind::YieldFrom(values)
         } else {
             let first = self.expr()?;
             if self.eat(&Tok::FatArrow) {

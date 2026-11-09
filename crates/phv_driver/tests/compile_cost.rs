@@ -163,8 +163,8 @@ fn class_chains_are_limited() {
 /// A trait's members are copied into each class that uses it, and its
 /// methods are checked and compiled there: the members copied (with those
 /// inherited) and the source of the methods copied are limited, and traits
-/// that reach one trait along many paths (doubling at each level) stop at the
-/// limit instead of walking every path.
+/// that reach one trait along many paths (doubling at each level) flatten it
+/// once or twice, not once per path.
 #[test]
 fn trait_copies_are_limited() {
     // 1,000 methods in 300 classes.
@@ -196,9 +196,9 @@ fn trait_copies_are_limited() {
     }
     paths += "class D { use T30; }\necho (new D())->f();\n";
     let (out, peak, took) = compile_src("trait_paths", paths);
-    assert!(out.contains("inherit more than 200000 members in total"), "{}", &out[..out.len().min(500)]);
+    assert_eq!(out, "1");
     assert!(peak < 400 << 20, "held {} MB", peak >> 20);
-    assert!(took < Duration::from_secs(60), "took {took:?}");
+    assert!(took < Duration::from_secs(10), "took {took:?}");
     // A few levels are fine: the same method reached twice is one method.
     let mut few_src = String::from("<?phv\ntrait T0 {\n    public function f(): int { return 1; }\n}\n");
     for i in 1..=3 {
@@ -225,6 +225,58 @@ fn trait_copies_are_limited() {
         "{}",
         &out[..out.len().min(500)]
     );
+    assert!(peak < 400 << 20, "held {} MB", peak >> 20);
+}
+
+/// 40 levels of `trait Ai { use Ai-1, Bi-1; } trait Bi { use Ai-1, Bi-1; }`
+/// (1.3 KB) reach `A0` along 2^40 paths. Each path was walked, and no limit
+/// counted a trait without members: 24 levels took a minute, 40 days. Now a
+/// trait reached again is flattened from what it gave before, and every
+/// flatten counts against the limit, so such traits check in a moment, with
+/// a class that uses them or without, with members or without; and traits
+/// whose type arguments differ along each path (so that nothing is reached
+/// twice) stop at the limit.
+#[test]
+fn diamonds_of_traits_check_at_once() {
+    let diamond = |levels: usize, bottom: &str, class: &str| -> String {
+        let mut s = format!("<?phv\ntrait A0 {{ {bottom} }}\ntrait B0 {{ }}\n");
+        for i in 1..=levels {
+            let p = i - 1;
+            s += &format!("trait A{i} {{ use A{p}, B{p}; }}\ntrait B{i} {{ use A{p}, B{p}; }}\n");
+        }
+        s + class
+    };
+    for (name, src, want) in [
+        ("diamond_class", diamond(40, "", "class K { use A40; }\necho \"done\";\n"), "done"),
+        ("diamond_traits", diamond(40, "", "echo \"done\";\n"), "done"),
+        (
+            "diamond_members",
+            diamond(
+                40,
+                "public int $n = 4; const C = 2; public function f(): int { return $this->n * self::C; } abstract public function g(): int;",
+                "class K { use A40; public function g(): int { return 1; } }\necho (new K())->f() + (new K())->g();\n",
+            ),
+            "9",
+        ),
+    ] {
+        let (out, peak, took) = compile_src(name, src);
+        assert_eq!(out, want, "{name}");
+        assert!(took < Duration::from_secs(1), "{name} took {took:?}");
+        assert!(peak < 64 << 20, "{name} held {} MB", peak >> 20);
+    }
+    // Different type arguments along each path: 2^40 different traits to
+    // flatten, which stop at the limit.
+    let mut generic = String::from("<?phv\ntrait A0<T> { }\ntrait B0<T> { }\n");
+    for i in 1..=40 {
+        let p = i - 1;
+        generic += &format!(
+            "trait A{i}<T> {{ use A{p}<list<T>>, B{p}<map<string, T>>; }}\ntrait B{i}<T> {{ use A{p}<list<T>>, B{p}<map<string, T>>; }}\n"
+        );
+    }
+    generic += "class K { use A40<int>; }\necho \"done\";\n";
+    let (out, peak, took) = compile_src("diamond_generic", generic);
+    assert!(out.contains("inherit more than 200000 members in total"), "{}", &out[..out.len().min(500)]);
+    assert!(took < Duration::from_secs(20), "took {took:?}");
     assert!(peak < 400 << 20, "held {} MB", peak >> 20);
 }
 

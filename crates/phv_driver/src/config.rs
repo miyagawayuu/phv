@@ -1603,6 +1603,8 @@ pub fn parse_config_with_jobs(root: &Path, text: &str, jobs_given: Option<Vec<St
             args: Vec::new(),
             store_namespace,
             oauth,
+            // Set by `phv serve` once it knows its address.
+            listen: None,
             jobs: jobs.as_ref().map(|j| phv_vm::JobsSpec {
                 store: j.store.clone(),
                 names: job_names.clone(),

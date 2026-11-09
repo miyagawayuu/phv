@@ -42,7 +42,7 @@ pub(super) struct TraitConst<'a> {
 }
 
 /// Everything a class takes from the traits it uses (and they from theirs).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct TraitMembers<'a> {
     /// Methods with a body, one per name.
     pub(super) methods: Vec<TraitMethod<'a>>,
@@ -57,7 +57,18 @@ impl TraitMembers<'_> {
     fn has_method(&self, name: &str) -> bool {
         self.methods.iter().chain(&self.required).any(|m| m.name == name)
     }
+
+    /// How many members it holds (what a copy of it costs).
+    fn size(&self) -> usize {
+        self.methods.len() + self.required.len() + self.props.len() + self.consts.len()
+    }
 }
+
+/// What a trait gives, by the trait, what its type parameters stand for and
+/// the class (or trait) whose `use` is flattened (`self` in a type argument
+/// is that class): `None` once it was flattened, the members from the second
+/// time on (see `Checker::flatten_trait`). Emptied after each class.
+pub(super) type TraitMemo<'a> = HashMap<(ClassId, Vec<(Name, Type)>, Option<ClassId>), Option<TraitMembers<'a>>>;
 
 /// The note added to a diagnostic found in a trait's member, checked as a
 /// member of the class that uses it.
@@ -154,6 +165,7 @@ impl<'a> Checker<'a> {
             // Reported once, whether found here or in a class that uses it first.
             let mark = self.diags.len();
             self.trait_members(&decl.uses, Some(cid), &mut path);
+            self.trait_memo.clear();
             self.note_trait(mark, cid, cid);
             self.type_params.clear();
         }
@@ -295,6 +307,17 @@ impl<'a> Checker<'a> {
         // Every method with the trait it came through and where that is named.
         let mut methods: Vec<(TraitMethod<'a>, ClassId, Span)> = Vec::new();
         let mut out = TraitMembers::default();
+        // A member reached along two paths (two traits using a third) is kept
+        // once: a trait at the bottom of `n` levels of such "diamonds" is
+        // reached along 2^n paths.
+        let mut required: HashSet<(*const FunctionDecl, String, u8)> = HashSet::new();
+        let mut props: HashSet<(*const ast::PropDecl, Vec<(Name, Type)>)> = HashSet::new();
+        let mut consts: HashSet<*const ast::ConstDecl> = HashSet::new();
+        let mut add_required = |out: &mut TraitMembers<'a>, tm: TraitMethod<'a>| {
+            if required.insert((tm.decl as *const FunctionDecl, tm.name.clone(), vis_rank(tm.vis))) {
+                out.required.push(tm);
+            }
+        };
         for (t, span, m) in used {
             for mut tm in m.methods {
                 if excluded.contains(&(t, tm.name.clone())) {
@@ -312,22 +335,34 @@ impl<'a> Checker<'a> {
                 if let Some(v) = vis_change.get(&(t, tm.name.clone())) {
                     tm.vis = *v;
                 }
-                out.required.push(tm);
+                add_required(&mut out, tm);
             }
-            out.props.extend(m.props);
-            out.consts.extend(m.consts);
+            for p in m.props {
+                if props.insert((p.decl as *const ast::PropDecl, p.subst.clone())) {
+                    out.props.push(p);
+                }
+            }
+            for c in m.consts {
+                if consts.insert(c.decl as *const ast::ConstDecl) {
+                    out.consts.push(c);
+                }
+            }
         }
         for (m, abs, t, span) in aliases {
             if abs {
-                out.required.push(m);
+                add_required(&mut out, m);
             } else {
                 methods.push((m, t, span));
             }
         }
+        let mut at: HashMap<String, usize> = HashMap::new();
         for (m, t, span) in methods {
-            let earlier = out.methods.iter().position(|x| x.name == m.name);
+            let earlier = at.get(&m.name).copied();
             match earlier {
-                None => out.methods.push(m),
+                None => {
+                    at.insert(m.name.clone(), out.methods.len());
+                    out.methods.push(m);
+                }
                 // The same method reached along two paths (two traits using a third).
                 Some(i) if std::ptr::eq(out.methods[i].decl, m.decl) && out.methods[i].vis == m.vis => {}
                 Some(i) => {
@@ -378,8 +413,28 @@ impl<'a> Checker<'a> {
             return TraitMembers::default();
         }
         let Some(decl) = self.classes[t as usize].decl else { return TraitMembers::default() };
-        // Each class holds a copy of the members of the traits it uses.
-        if self.over_inherit_limit(decl.methods.len() + decl.props.len() + decl.consts.len(), decl) {
+        // A trait reached again along another path: what it gave the second
+        // time is kept, and given from the third time on. (What it gives the
+        // first time is not kept, so that a chain of traits does not hold a
+        // copy per level.) Flattened at most twice per class, the traits cost
+        // in proportion to their `use` lists, whatever the number of paths.
+        let key = (t, subst, self_class);
+        let seen = match self.trait_memo.get(&key) {
+            Some(Some(kept)) => {
+                let kept = kept.clone();
+                // Each flatten counts, the copy as the members it holds.
+                if self.over_inherit_limit(1 + kept.size(), decl) {
+                    return TraitMembers::default();
+                }
+                return kept;
+            }
+            Some(None) => true,
+            None => false,
+        };
+        let subst = key.1.clone();
+        // Each class holds a copy of the members of the traits it uses, and
+        // each flatten counts (one of a trait without members too).
+        if self.over_inherit_limit(1 + decl.methods.len() + decl.props.len() + decl.consts.len(), decl) {
             return TraitMembers::default();
         }
         // And each copy of a method is checked and compiled: their source is
@@ -418,8 +473,10 @@ impl<'a> Checker<'a> {
         self.module = module;
         path.pop();
         // A trait's own methods win over those of the traits it uses.
+        let own: HashSet<&str> =
+            decl.methods.iter().filter(|m| m.name != "__construct").map(|m| m.name.as_str()).collect();
+        out.methods.retain(|x| !own.contains(x.name.as_str()));
         for m in decl.methods.iter().filter(|m| m.name != "__construct") {
-            out.methods.retain(|x| x.name != m.name);
             let tm = TraitMethod { decl: m, name: m.name.clone(), vis: m.visibility, origin: t, subst: subst.clone() };
             if m.is_abstract {
                 out.required.push(tm);
@@ -429,6 +486,8 @@ impl<'a> Checker<'a> {
         }
         out.props.extend(decl.props.iter().map(|p| TraitProp { decl: p, origin: t, subst: subst.clone() }));
         out.consts.extend(decl.consts.iter().map(|c| TraitConst { decl: c, origin: t }));
+        let kept = seen.then(|| out.clone());
+        self.trait_memo.insert(key, kept);
         out
     }
 
@@ -490,25 +549,32 @@ impl<'a> Checker<'a> {
 
     /// Adds the properties class `cid` takes from traits (after its own): one
     /// of the same name as another of the class must be the same (type,
-    /// visibility, `readonly` and default), as in PHP; one an ancestor
-    /// declares is an error, as for any property.
+    /// visibility, `readonly`, default, and the column and key std.orm reads
+    /// from `#[Column]` and `#[Id]`), as in PHP; one an ancestor declares is
+    /// an error, as for any property. Its annotations are the class's.
     pub(super) fn add_trait_props(&mut self, cid: ClassId, props: &[TraitProp<'a>]) {
         let ci = cid as usize;
         let mut from_trait: HashMap<&str, ClassId> = HashMap::new();
         for tp in props {
             let p = tp.decl;
-            let (ty, default) = self.in_trait(tp.origin, &tp.subst, false, cid, |this| {
+            let (ty, default, ann) = self.in_trait(tp.origin, &tp.subst, false, cid, |this| {
                 let ann = this.annotations(&p.attrs, AnnTarget::Property);
-                if let Some(r) = ann.deprecated {
-                    this.deprecated_fields.insert((cid, p.name.clone()), r);
-                }
                 let ty = this.resolve_type(&p.ty, Some(cid));
                 let default = p.default.as_ref().and_then(|d| this.const_default(d, &ty, Some(cid)));
-                (ty, default)
+                (ty, default, ann)
             });
+            let key = (cid, p.name.clone());
+            if let Some(r) = ann.deprecated.clone() {
+                self.deprecated_fields.insert(key.clone(), r);
+            }
             let existing = self.classes[ci].field_slots.get(&p.name).map(|s| &self.classes[ci].fields[*s as usize]);
             if let Some(f) = existing.filter(|f| f.owner == cid) {
-                let same = f.ty == ty && f.vis == p.visibility && f.readonly == p.readonly && f.default == default;
+                let same = f.ty == ty
+                    && f.vis == p.visibility
+                    && f.readonly == p.readonly
+                    && f.default == default
+                    && self.orm_columns.get(&key) == ann.column.as_ref()
+                    && self.orm_ids.contains(&key) == ann.id;
                 if !same {
                     let other = match from_trait.get(p.name.as_str()) {
                         Some(o) => format!("trait `{}`", self.class_names[*o as usize]),
@@ -521,13 +587,21 @@ impl<'a> Checker<'a> {
                     )
                     .add_note(
                         "a class and the traits it uses may declare a property of the same name only with the same \
-                         type, visibility, `readonly` and default value",
+                         type, visibility, `readonly`, default value, `#[Column]` and `#[Id]`",
                     );
                     self.note_trait(mark, tp.origin, cid);
                 }
                 continue;
             }
             from_trait.insert(&p.name, tp.origin);
+            // `#[Id]` and `#[Column]` describe the class's property, as the
+            // class's own do (std.orm reads them for its key and columns).
+            if let Some(c) = ann.column {
+                self.orm_columns.insert(key.clone(), c);
+            }
+            if ann.id {
+                self.orm_ids.insert(key);
+            }
             let required = !ty.is_nullable() && default.is_none() && ty != Type::Error;
             let mark = self.diags.len();
             self.add_field(

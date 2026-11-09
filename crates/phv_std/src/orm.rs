@@ -36,14 +36,47 @@ const MAX_NAME: usize = 63;
 
 thread_local! {
     /// Transactions of `Database::transaction()` rolled back (or ended by an
-    /// error) on this thread so far. A `Repo` forgets the values it saw when
-    /// this changes, since the rows may no longer hold them.
+    /// error), and rollbacks written as SQL, on this thread so far. A `Repo`
+    /// forgets the values it saw when this changes, since the rows may no
+    /// longer hold them.
     static ROLLBACKS: Cell<i64> = const { Cell::new(0) };
+    /// Writes of Repos on this thread so far, by table. A `Repo` forgets the
+    /// values it saw when another Repo wrote to its table (found by the 19th
+    /// audit: a Repo that had not seen another Repo's write skipped a column
+    /// whose row no longer held the entity's value).
+    static WRITES: std::cell::RefCell<HashMap<String, i64>> = std::cell::RefCell::new(HashMap::new());
 }
+
+/// Tables whose writes are counted apart, at most; a write to another table
+/// counts as a rollback (every Repo forgets).
+const MAX_TABLES: usize = 4096;
 
 /// Notes that a transaction was rolled back (or failed to commit).
 pub(crate) fn rolled_back() {
     ROLLBACKS.with(|r| r.set(r.get().wrapping_add(1)));
+}
+
+/// What a Repo of `table` compares to know whether it must forget: both
+/// counts only grow, so their sum changes whenever either does.
+fn epoch(table: &str) -> i64 {
+    let writes = WRITES.with(|w| w.borrow().get(table).copied().unwrap_or(0));
+    ROLLBACKS.with(|r| r.get()).wrapping_add(writes)
+}
+
+/// Notes a Repo's write to `table`, and returns the epoch after it.
+fn wrote(table: &str) -> i64 {
+    WRITES.with(|w| {
+        let mut w = w.borrow_mut();
+        let full = w.len() >= MAX_TABLES;
+        match w.get_mut(table) {
+            Some(n) => *n = n.wrapping_add(1),
+            None if !full => {
+                w.insert(table.to_string(), 1);
+            }
+            None => rolled_back(),
+        }
+    });
+    epoch(table)
 }
 
 #[derive(Debug, PartialEq)]
@@ -91,6 +124,9 @@ struct Meta {
     json: HashMap<u32, Vec<Prop>>,
     defaults: Vec<Value>,
     dialect: Dialect,
+    /// MySQL: whether the key column is the table's `AUTO_INCREMENT` column,
+    /// once looked up (`made_query`).
+    auto_key: Cell<Option<bool>>,
 }
 
 /// The description of an entity as the checker writes it, before it is
@@ -212,6 +248,7 @@ fn meta_new(vm: &mut Vm, a: &[Value]) -> R {
         columns,
         json,
         defaults: list(&a[2]).to_vec(),
+        auto_key: Cell::new(None),
         dialect,
     };
     vm.resources.push(Some(Box::new(Rc::new(meta))));
@@ -655,6 +692,58 @@ fn insert_mode(vm: &mut Vm, a: &[Value]) -> R {
     }))
 }
 
+/// The error of an `insert()` on MySQL whose key column is not the table's
+/// `AUTO_INCREMENT` column: `lastInsertId()` would be another column's value
+/// (another row's key), or 0.
+fn not_auto_key(vm: &Vm, m: &Meta) -> VmError {
+    let k = m.key_column();
+    vm.throw(
+        "ValueError",
+        format!(
+            "{}::insert(): MySQL gives back only a key its AUTO_INCREMENT column made, and the column \"{}\" of \"{}\" \
+             is not that column; give `{}::${}` a value first",
+            m.what, k.name, m.table, m.entity, k.prop
+        ),
+    )
+}
+
+/// `__orm_made_query($h)`, before an `insert()` that reads its key with
+/// `lastInsertId()` (MySQL): null when the key column is known to be the
+/// table's `AUTO_INCREMENT` column, the query that tells when it is not known
+/// yet (run once per Repo, the answer given to `__orm_made`), and
+/// `ValueError` when it is known not to be (found by the 19th audit: the key
+/// was taken from `lastInsertId()`, which is any column's AUTO_INCREMENT
+/// value, or 0).
+fn made_query(vm: &mut Vm, a: &[Value]) -> R {
+    let m = meta_of(vm, &a[0])?;
+    match m.auto_key.get() {
+        Some(true) => Ok(Value::Null),
+        Some(false) => Err(not_auto_key(vm, &m)),
+        None => Ok(sql(
+            format!(
+                "SELECT EXTRA AS extra FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = {PARAM} AND COLUMN_NAME = {PARAM}"
+            ),
+            vec![Value::str(m.table.clone()), Value::str(m.key_column().name.clone())],
+        )),
+    }
+}
+
+/// `__orm_made($h, $row)`: the answer to `__orm_made_query` (its row, or null).
+fn made(vm: &mut Vm, a: &[Value]) -> R {
+    let m = meta_of(vm, &a[0])?;
+    let extra = match &a[1] {
+        Value::Map(row) => row.get(&Key::Str(Rc::new("extra".into()))).map(Value::to_display_string),
+        _ => None,
+    };
+    let auto = extra.is_some_and(|e| e.to_ascii_lowercase().split_ascii_whitespace().any(|w| w == "auto_increment"));
+    m.auto_key.set(Some(auto));
+    if !auto {
+        return Err(not_auto_key(vm, &m));
+    }
+    Ok(Value::Null)
+}
+
 /// `__orm_set_key($h, $entity, $key)`: sets the key the database made, from
 /// `lastInsertId()` or from the row `RETURNING` gave.
 fn set_key(vm: &mut Vm, a: &[Value]) -> R {
@@ -662,6 +751,8 @@ fn set_key(vm: &mut Vm, a: &[Value]) -> R {
     let k = m.key_column();
     let v = match &a[2] {
         Value::Map(row) => row.get(&k.key).cloned().unwrap_or(Value::Null),
+        // `lastInsertId()` is 0 when the statement made no AUTO_INCREMENT value.
+        Value::Int(0) => Value::Null,
         v => v.clone(),
     };
     if matches!(v, Value::Null) {
@@ -796,7 +887,10 @@ fn in_list(vm: &mut Vm, a: &[Value]) -> R {
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
     let f: BuiltinFn = match name {
         "__orm_meta" => meta_new,
-        "__orm_epoch" => |_, _| Ok(Value::Int(ROLLBACKS.with(|r| r.get()))),
+        "__orm_epoch" => |vm, a| Ok(Value::Int(epoch(&meta_of(vm, &a[0])?.table))),
+        "__orm_wrote" => |vm, a| Ok(Value::Int(wrote(&meta_of(vm, &a[0])?.table))),
+        "__orm_made_query" => made_query,
+        "__orm_made" => made,
         "__orm_select" => select,
         "__orm_find" => find,
         "__orm_load" => |vm, a| {
@@ -901,6 +995,7 @@ mod tests {
             columns: vec![column("id"), column("select")],
             json: HashMap::new(),
             defaults: Vec::new(),
+            auto_key: Cell::new(None),
             dialect,
         };
         let sqlite = meta(Dialect::Sqlite);

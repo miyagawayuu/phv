@@ -371,12 +371,25 @@ fn redis_result(c: &mut Pooled<RedisConn>, r: Result<Reply, RedisError>) -> Resu
     }
 }
 
+/// What `session_read` gives for a stored session it cannot read (its
+/// header, or its data, is not what PHV writes; only a writer of the store
+/// can make one): a session that expired long ago, so the server removes it
+/// as it removes any expired session, instead of taking it for a failure of
+/// the store that is never cleared (found by the 19th assessment: one such
+/// Redis record made `/ready` fail until another visitor's request, and
+/// stayed).
+fn damaged_session() -> SessionRow {
+    SessionRow { data: "{}".into(), created: 0, last: 0, returned: false }
+}
+
 /// The session in table `t` under `key`, if any.
 fn pg_session_row(conn: &mut PgConn, t: &str, key: &str) -> Result<Option<SessionRow>, postgres::Error> {
     let rows = conn.query_kept(&format!("SELECT data, created, last, returned FROM {t} WHERE id = $1"), &[&key])?;
     let Some(r) = rows.first() else { return Ok(None) };
+    // Text that is not UTF-8 (a database whose encoding is SQL_ASCII) is damage.
+    let Ok(data) = r.try_get::<_, String>(0) else { return Ok(Some(damaged_session())) };
     Ok(Some(SessionRow {
-        data: r.try_get(0)?,
+        data,
         created: r.try_get::<_, i64>(1)?.max(0) as u64,
         last: r.try_get::<_, i64>(2)?.max(0) as u64,
         returned: r.try_get::<_, i16>(3)? != 0,
@@ -403,15 +416,14 @@ pub fn session_read(spec: &DatabaseSpec, ns: Option<&str>, key: &str) -> Result<
         SessionConn::Redis(c) => {
             let k = redis_session_key(key);
             let Reply::Bulk(b) = redis_run(c, &[b"GET", k.as_bytes()], until)? else { return Ok(None) };
-            let damaged = || "a stored session is damaged".to_string();
             // Not UTF-8: refused like any other damage (the file store does
             // too), never read with replacement characters.
-            let text = String::from_utf8(b).map_err(|_| damaged())?;
-            let (head, data) = text.split_once('\n').ok_or_else(damaged)?;
+            let Ok(text) = String::from_utf8(b) else { return Ok(Some(damaged_session())) };
+            let Some((head, data)) = text.split_once('\n') else { return Ok(Some(damaged_session())) };
             let mut nums = head.split(' ').map(|n| n.parse::<u64>().ok());
             let (Some(Some(created)), Some(Some(last)), Some(Some(returned))) = (nums.next(), nums.next(), nums.next())
             else {
-                return Err(damaged());
+                return Ok(Some(damaged_session()));
             };
             Ok(Some(SessionRow { data: data.to_string(), created, last, returned: returned != 0 }))
         }

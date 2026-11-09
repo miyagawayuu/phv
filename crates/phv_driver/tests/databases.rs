@@ -295,6 +295,32 @@ fn orm() {
     }
 }
 
+/// A transaction the database or a statement ended before `transaction()`
+/// did is not reported as committed: on PostgreSQL a caught statement error
+/// (the `COMMIT` rolls back without an error), on MySQL a statement that
+/// commits implicitly, `BEGIN` written as SQL and a deadlock; the depth of
+/// `transaction()` stays right after an inner `COMMIT` fails, and std.orm
+/// forgets what it kept. On MySQL, `insert()` takes `lastInsertId()` as the
+/// key only from an AUTO_INCREMENT key column (found by the 19th audit).
+#[test]
+fn transactions_the_database_ended_are_not_reported_as_committed() {
+    sweep_once();
+    if let Some(url) = server("PHV_TEST_POSTGRES_URL") {
+        let host = host(&url);
+        check(&host, "postgres_tx_ended");
+        check(&host, "postgres_tx_ended_after");
+    }
+    if let Some(url) = server("PHV_TEST_MYSQL_URL") {
+        // A pool of its own, with room for the statement run in the background.
+        let spec = DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 9 };
+        let host =
+            Arc::new(Host { root: root(), databases: BTreeMap::from([("main".to_string(), spec)]), ..Host::default() });
+        check(&host, "mysql_tx_ended");
+        check(&host, "mysql_tx_ended_after");
+        check(&host, "mysql_orm_keys");
+    }
+}
+
 #[test]
 fn mysql() {
     sweep_once();

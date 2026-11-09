@@ -56,6 +56,10 @@ git push origin vX.Y.Z
 Only repository admins can create, move or delete `v*` tags (ruleset "release tags"). The tag runs
 `.github/workflows/release.yml`, which builds the four platforms and the extension and creates a **draft** release
 with `SHA256SUMS`. If a macOS job is cancelled for lack of a runner, rerun it with `gh run rerun <id> --failed`.
+Each archive holds, besides `phv` and `LICENSE`, `THIRD-PARTY-LICENSES.txt`: the licence notices of the crates built
+into `phv` for its platform (and of the C code some of them include), which their licences ask to go with the
+binary. `packaging/licenses.py` collects them from the crates' own licence files and fails when a crate has none
+(CI runs it too); the Docker image has both files in `/usr/share/licenses/phv/`.
 
 Check the draft before publishing it: download the archive for your platform, check it against `SHA256SUMS`, run
 `phv --version`, and try the fixes of this release with the published binary.

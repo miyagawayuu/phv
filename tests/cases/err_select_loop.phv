@@ -1,0 +1,9 @@
+<?phv
+// A loop's body must end with a `<select>` open exactly when it began with
+// one: this body ends by opening one, so its second run reads the `<title>`
+// (and the link in it) inside a `<select>`, where older browsers read it as
+// markup (found by the 19th assessment). An `if` may not open one either.
+list<string> $us = ["first", "javascript:alert(1)"];
+?>
+<?phv foreach ($us as $u) { ?><title></select><a href="<?= $u ?>">x</a></title><select><option><?= $u ?></option><?phv } ?></select>
+<?phv if (count($us) > 1) { ?><select><?phv } ?><option>o</option></select>

@@ -100,6 +100,10 @@ const META: Flags = 1 << 16;
 const SCRIPT: Flags = 1 << 17;
 /// `<style>`: its text is CSS.
 const STYLE: Flags = 1 << 18;
+/// `<template>`: inside `<select>`, older parsers ignore `</select>` in it
+/// (its content has its own insertion mode), so the `<select>` stays open
+/// after it (found by the 19th assessment).
+const TEMPLATE: Flags = 1 << 19;
 /// `<svg>` or `<math>`.
 const FOREIGN_ROOT: Flags = SVG_ROOT | MATH_ROOT;
 
@@ -126,6 +130,7 @@ const ELEMENTS: &[Element] = &[
     // Raw text when scripting is on (found by the 1.0.0 and 1.1.1 audits).
     Element { name: "noscript", flags: HIDES_END | NOSCRIPT },
     Element { name: "select", flags: SELECT },
+    Element { name: "template", flags: TEMPLATE },
     // Foreign content (WHATWG 13.2.6.5 "in foreign content", 13.2.6.4 integration points).
     Element { name: "svg", flags: SVG_ROOT },
     Element { name: "math", flags: MATH_ROOT },
@@ -1476,6 +1481,10 @@ pub struct HtmlTracker {
     open: Vec<Open>,
     /// `MAX_OPEN` was reached (reported once).
     too_deep: bool,
+    /// How many of `open` belong to the page around `Html` read by
+    /// `foreign_insert_problem` (0 elsewhere): an end tag must close one of
+    /// the others, which the `Html` opened.
+    base: usize,
     /// A `<select>` is open (see `IGNORED_IN_SELECT`).
     select: bool,
     /// Byte offset (in the chunk being fed) of the attribute name or value being
@@ -1553,6 +1562,9 @@ pub enum InlineCode {
     /// A raw-text element such as `<title>` or `<style>` inside `<select>`
     /// (an error: older browsers ignore it there and read its text as markup).
     RawTextInSelect(String),
+    /// `<template>` inside `<select>` (an error: older browsers ignore a
+    /// `</select>` inside it, so the `<select>` stays open after it).
+    TemplateInSelect,
 }
 
 impl Default for HtmlTracker {
@@ -1562,6 +1574,7 @@ impl Default for HtmlTracker {
             pending: None,
             open: Vec::new(),
             too_deep: false,
+            base: 0,
             select: false,
             mark: None,
             found: Vec::new(),
@@ -1664,8 +1677,9 @@ impl HtmlTracker {
             State::Bogus | State::Cdata { .. } => EchoContext::Comment { bogus: true, watched },
             // Inside SVG or MathML, browsers read inserted markup in foreign
             // content, where this tracker read it (in its own template or
-            // function) as HTML (found by the 1.1.1 audit).
-            State::Text if self.in_foreign() => EchoContext::ForeignText,
+            // function) as HTML (found by the 1.1.1 audit). The place says
+            // how browsers read it here (see `foreign_insert_problem`).
+            State::Text if self.in_foreign() => EchoContext::ForeignText(self.foreign_place()),
             // Inside `<select>`, older browsers ignore raw-text elements that
             // inserted `Html` may hold (R19-26; found by the 1.2.1 audit).
             State::Text if self.select => EchoContext::SelectText,
@@ -1834,6 +1848,11 @@ impl HtmlTracker {
         self.state == State::Text && self.pending.is_none() && !self.in_foreign() && self.carry.is_empty()
     }
 
+    /// A `<select>` is open (for the message of a block that opens or closes one).
+    pub fn select_open(&self) -> bool {
+        self.select
+    }
+
     /// Only a `<select>` keeps the output from the top level (for the message).
     pub fn only_select_open(&self) -> bool {
         self.select && self.between_elements()
@@ -1842,6 +1861,22 @@ impl HtmlTracker {
     /// Inside SVG or MathML (see `open`).
     fn in_foreign(&self) -> bool {
         !self.open.is_empty()
+    }
+
+    /// Inside SVG or MathML, the place `Html` inserted here is checked for
+    /// (`EchoContext::ForeignText`, `foreign_insert_problem`): what browsers
+    /// read it as, by the innermost open element.
+    fn foreign_place(&self) -> &'static str {
+        match self.open.last() {
+            Some(t) => match t.top() {
+                Top::Foreign if t.ns == Ns::Math => "foreign math",
+                Top::Foreign => "foreign svg",
+                Top::TextPoint => "foreign mathtext",
+                Top::AnnotationXml => "foreign annotation-xml",
+                Top::Html | Top::HtmlPoint | Top::None => "foreign html",
+            },
+            None => "foreign html",
+        }
     }
 
     /// In a comment (or CDATA section) or an attribute value.
@@ -1853,8 +1888,8 @@ impl HtmlTracker {
     }
 
     /// After a block that may run zero or more times: true if it ended in the
-    /// same place it started. The state is then merged with `entry`, keeping
-    /// whichever URL start is less decided.
+    /// same place it started (an open `<select>` included). The state is then
+    /// merged with `entry`, keeping whichever URL start is less decided.
     pub fn end_block(&mut self, entry: &HtmlTracker) -> bool {
         // An attribute name or unquoted value in progress is "between attributes".
         fn norm(s: &State) -> State {
@@ -1911,16 +1946,19 @@ impl HtmlTracker {
             && (hidden_end_tag_start(&entry.tail) || hidden_end_tag_start(&self.tail)))
             || (entry.state != State::Text && hidden_noscript_start(&entry.tail))
             || (self.state != State::Text && hidden_noscript_start(&self.tail));
+        // A `<select>` is part of the place: a block may not open or close one
+        // (found by the 19th assessment: merged, a loop's body was read once,
+        // with the state from before the loop, and a function could end
+        // inside one).
         let same = same
             && !split
             && self.pending == entry.pending
             && self.open == entry.open
+            && self.select == entry.select
             && self.noscript == entry.noscript
             && self.carry == entry.carry;
-        // A `<select>` may be open after either way. A value may or may not be
-        // the last thing written before what follows, and the block may have
-        // written nothing at the start of a loop.
-        self.select |= entry.select;
+        // A value may or may not be the last thing written before what
+        // follows, and the block may have written nothing at the start of a loop.
         self.after_comment_value |= entry.after_comment_value;
         self.loop_head |= entry.loop_head;
         self.head_ends_comment |= entry.head_ends_comment;
@@ -1994,11 +2032,14 @@ impl HtmlTracker {
                 self.noscript += 1;
             }
         }
-        // 4. `<select>`, and the raw-text elements it hides from older parsers (R19-26).
+        // 4. `<select>`, and the raw-text elements it hides from older parsers
+        //    (R19-26); a `<template>` there, in which they ignore `</select>`.
         if has(&tag, SELECT) {
             self.select = !closing;
         } else if self.select && !closing && has(&tag, IGNORED_IN_SELECT) {
             self.found.push((self.here, InlineCode::RawTextInSelect(tag.clone())));
+        } else if self.select && !closing && has(&tag, TEMPLATE) {
+            self.found.push((self.here, InlineCode::TemplateInSelect));
         }
         // 5. A raw-text element's start tag opens its text (`RAW` in HTML content,
         //    `RAW_IN_FOREIGN` inside SVG or MathML, unless self-closed there);
@@ -2102,6 +2143,29 @@ impl HtmlTracker {
 
     /// An end tag, in `open`: the first row of `END_RULES` that applies.
     fn open_end(&mut self, tag: &str) {
+        // In `Html` read by `foreign_insert_problem`: an end tag of an element
+        // it did not open would close (or be ignored for) one of the page's,
+        // which are not all known here.
+        if self.base > 0 && !self.open.get(self.base..).is_some_and(|own| own.iter().any(|n| n.name == tag)) {
+            self.found.push((
+                self.here,
+                InlineCode::ForeignStructure(format!("the end tag `</{tag}>` of an element it did not open")),
+            ));
+            return;
+        }
+        self.end_rules(tag);
+        if self.open.len() < self.base {
+            self.found.push((
+                self.here,
+                InlineCode::ForeignStructure(format!(
+                    "the end tag `</{tag}>`, which closes an element it did not open"
+                )),
+            ));
+        }
+    }
+
+    /// `open_end` by `END_RULES`.
+    fn end_rules(&mut self, tag: &str) {
         let top = self.open.last().cloned();
         let kind = top.as_ref().map_or(Top::None, Open::top);
         for rule in END_RULES {
@@ -2516,6 +2580,75 @@ impl HtmlTracker {
         self.tail = tail.chars().skip(skip).collect();
         scripts
     }
+}
+
+// ---------------------------------------------------------------------------
+// 6. `Html` inserted inside SVG or MathML
+// ---------------------------------------------------------------------------
+
+/// The open elements `Html` inserted at a `ForeignText` place is read from
+/// (for each, it must pass; an unknown place, such as the `foreign` of an
+/// older build, takes them all).
+fn foreign_starts(place: &str) -> &'static [&'static [(&'static str, Ns)]] {
+    const SVG: &[(&str, Ns)] = &[("svg", Ns::Svg)];
+    const MATH: &[(&str, Ns)] = &[("math", Ns::Math)];
+    const HTML: &[(&str, Ns)] = &[("svg", Ns::Svg), ("foreignobject", Ns::Svg)];
+    const MATHTEXT: &[(&str, Ns)] = &[("math", Ns::Math), ("mi", Ns::Math)];
+    const ANNOTATION: &[(&str, Ns)] = &[("math", Ns::Math), ("annotation-xml", Ns::Math)];
+    match place {
+        "foreign svg" => &[SVG],
+        "foreign math" => &[MATH],
+        "foreign html" => &[HTML],
+        "foreign mathtext" => &[MATHTEXT],
+        "foreign annotation-xml" => &[ANNOTATION],
+        _ => &[SVG, MATH, HTML, MATHTEXT, ANNOTATION],
+    }
+}
+
+/// Why `Html` cannot be inserted at the `ForeignText` place `place` (see
+/// `EchoContext::ForeignText`), if it cannot, as what it holds.
+///
+/// The template that made it was checked as HTML, on its own; the page
+/// around it was checked as if it changed nothing. So, read from there as
+/// browsers read it (by `START_RULES` and `END_RULES`), it must close every
+/// element it opens and no other (no end tag of an element it did not open,
+/// such as `</svg>`), and hold nothing that this tracker refuses there: a
+/// breakout element such as `<p>` right inside SVG, an element inside
+/// `<annotation-xml>`, markup in an SVG `<script>`... Otherwise the page after
+/// it would be read as HTML where it was checked as SVG or MathML, or the
+/// other way round (found by the 19th assessment: after `<p>icon</p>`,
+/// `</svg>` or an open `<foreignObject>` or `<mi>`, the page's self-closed
+/// `<script/>` was a script for browsers, with its nonce, and the escaped
+/// text after it ran).
+pub fn foreign_insert_problem(html: &str, place: &str) -> Option<String> {
+    foreign_starts(place).iter().find_map(|start| inserted_problem(html, start))
+}
+
+/// `foreign_insert_problem` from one set of open elements.
+fn inserted_problem(html: &str, start: &[(&str, Ns)]) -> Option<String> {
+    let mut t = HtmlTracker {
+        open: start.iter().map(|&(name, ns)| Open { name: name.to_string(), ns }).collect(),
+        base: start.len(),
+        ..HtmlTracker::default()
+    };
+    t.feed(html);
+    for (_, found) in t.take_inline_code() {
+        let what = match found {
+            InlineCode::ForeignStructure(msg) => msg,
+            InlineCode::ForeignCdata => "markup in a `<script>` or `<style>` of SVG or MathML".to_string(),
+            InlineCode::CdataEnd => "`>` inside a CDATA section".to_string(),
+            InlineCode::HiddenEndTag => "the end tag of a raw-text element in a comment or attribute".to_string(),
+            _ => continue,
+        };
+        return Some(what);
+    }
+    if let Some(left) = t.open.get(t.base) {
+        return Some(format!("`<{}>`, which it leaves open", left.name));
+    }
+    if t.state != State::Text || t.pending.is_some() || !t.carry.is_empty() {
+        return Some("a tag, comment or element text that it leaves open".to_string());
+    }
+    None
 }
 
 /// The index after the run of HTML whitespace at `i`.
@@ -3268,12 +3401,88 @@ mod tests {
         ] {
             assert!(found(html).is_empty(), "{html}");
         }
-        // A `<select>` opened in a block may be open after it.
+        // A block may not open a `<select>` (see `a_block_keeps_the_select_state`).
         let parse = |src: &str| crate::parse_module(src, 0, true).1;
         assert!(parse("<?phv if ($c) { ?><select><?phv } ?><title>t</title>").iter().any(|d| d.is_error()));
         assert!(parse("<?phv if ($c) { ?><select><?phv } ?><option>o</option></select><title>t</title>")
             .iter()
-            .all(|d| !d.is_error()));
+            .any(|d| d.is_error()));
+    }
+
+    /// Found by the 19th assessment: older parsers ignore `</select>` inside a
+    /// `<template>` in a `<select>` (its content has its own insertion mode),
+    /// so the `<select>` stays open after it, where the tracker had closed it.
+    #[test]
+    fn template_inside_select_is_refused() {
+        for html in [
+            "<select><template></select></template><title>",
+            "<select><option>a</option><TEMPLATE>",
+            "<select><template><select></select></template>",
+        ] {
+            assert!(found(html).contains(&InlineCode::TemplateInSelect), "{html}");
+        }
+        for html in ["<template><select></select></template>", "<select></select><template></template>"] {
+            assert!(found(html).is_empty(), "{html}");
+        }
+        let diags = crate::parse_module("<select><template></select></template><p>x</p>", 0, true).1;
+        assert!(diags.iter().any(|d| d.is_error() && d.message.contains("`<template>` inside `<select>`")));
+    }
+
+    /// Found by the 19th assessment: a `<select>` was OR-merged at the end of
+    /// a block, so a loop's body that ended by opening one was read once,
+    /// with the state from before the loop (its `<title>` as text), and a
+    /// function could end inside one. Now a block, loop body or function
+    /// must end with a `<select>` open exactly when it began with one.
+    #[test]
+    fn a_block_keeps_the_select_state() {
+        let diags = |src: &str| crate::parse_module(src, 0, true).1;
+        for src in [
+            // The reviewer's loop: its second run reads `<title>` inside the `<select>`.
+            "<?phv foreach ($us as $u) { ?><title></select><a href=\"<?= $u ?>\">x</a></title><select><option><?= $u ?></option><?phv } ?></select>",
+            "<select><?phv foreach ($us as $u) { ?></select><?phv } ?><select></select>",
+            "<?phv while ($c) { ?><select><?phv } ?></select>",
+            "<?phv function opens(): void { ?><select><?phv } ?>",
+            "<?phv $f = function(): void { ?><select><?phv }; ?>",
+            "<?phv if ($c) { ?><select><?phv } else { ?><select><?phv } ?></select>",
+        ] {
+            let d = diags(src);
+            assert!(
+                d.iter().any(|d| d.is_error() && d.notes.iter().any(|n| n.contains("a `<select>` opened or closed"))),
+                "{src}: {d:?}"
+            );
+        }
+        for src in [
+            "<select><?phv foreach ($us as $u) { ?><option><?= $u ?></option><?phv } ?></select>",
+            "<?phv foreach ($us as $u) { ?><select><option><?= $u ?></option></select><?phv } ?>",
+            "<?phv function f(): void { ?><select><option>a</option></select><?phv } ?>",
+            "<select><?phv if ($c) { ?><option>a</option><?phv } else { ?><option>b</option><?phv } ?></select>",
+        ] {
+            assert!(diags(src).iter().all(|d| !d.is_error()), "{src}");
+        }
+    }
+
+    /// Found by the 19th assessment: statements inside a `<select>` were not
+    /// guarded, so a function called there could write a `<title>` that its
+    /// own body had checked outside a `<select>`; and `yield` there put the
+    /// HTML of the loop over the generator inside the generator's `<select>`.
+    /// They are guarded now (`Stmt::out`), as inside `<svg>`: functions they
+    /// call may not write output, and the type checker refuses `yield`.
+    #[test]
+    fn statements_inside_select_are_guarded() {
+        for src in [
+            "<?phv function g(): void { ?><select><?phv f(); ?></select><?phv } ?>",
+            "<?phv function g(): void { ?><select><?phv foreach ($xs as $x) { f($x); } ?></select><?phv } ?>",
+            "<?phv function g(): void { ?><select><?phv echo $h; ?></select><?phv } ?>",
+            "<?phv function g(): void { ?><select><?= $h ?></select><?phv } ?>",
+            "<?phv function g(): void { ?><select><option>a</option><?phv yield 1; ?></select><?phv } ?>",
+        ] {
+            let (module, diags) = crate::parse_module(src, 0, false);
+            assert!(diags.iter().all(|d| !d.is_error()), "{src}: {diags:?}");
+            let crate::ast::StmtKind::Function(f) = &module.stmts[0].kind else { panic!("{src}") };
+            assert!(f.body.iter().any(|s| s.out == Some(EchoContext::SelectText)), "{src}");
+        }
+        let (module, _) = crate::parse_module("<select></select><?phv f(); ?>", 0, false);
+        assert!(module.stmts.iter().all(|s| s.out.is_none()));
     }
 
     /// Found by the 1.2.1 audit: `Html` written inside a `<select>` (a partial
@@ -3288,7 +3497,7 @@ mod tests {
         assert_eq!(ctx("<select></select>"), EchoContext::Text);
         assert_eq!(ctx("<select><option>a</option></select><p>"), EchoContext::Text);
         // Inside SVG and in attributes, the stricter contexts stay.
-        assert_eq!(ctx("<select><svg>"), EchoContext::ForeignText);
+        assert_eq!(ctx("<select><svg>"), EchoContext::ForeignText("foreign svg"));
         assert_eq!(ctx("<select><option title=\""), EchoContext::Attr);
         assert_eq!(ctx("<select><textarea>"), EchoContext::RawText("textarea"));
         for html in ["<select>", "<select><option>a</option>", "<?phv if ($c) { ?><select><?phv } ?>"] {
@@ -3304,10 +3513,11 @@ mod tests {
         assert!(!t.at_top_level() && !t.only_select_open(), "not between elements");
         // A template may not end inside a `<select>`, also one a block may have opened.
         let parse = |src: &str| crate::parse_module(src, 0, true).1;
-        for src in ["<select><option>a</option>", "<?phv if ($c) { ?><select><?phv } ?><option>o</option>"] {
-            let diags = parse(src);
-            assert!(diags.iter().any(|d| d.is_error() && d.message.contains("inside an open `<select>`")), "{src}");
-        }
+        let diags = parse("<select><option>a</option>");
+        assert!(diags.iter().any(|d| d.is_error() && d.message.contains("inside an open `<select>`")));
+        // A block may not open one either (`a_block_keeps_the_select_state`).
+        let diags = parse("<?phv if ($c) { ?><select><?phv } ?><option>o</option>");
+        assert!(diags.iter().any(|d| d.is_error() && d.message.contains("does not end where it started")));
         assert!(parse("<select><option>a</option></select>").iter().all(|d| !d.is_error()));
         // Values inside a `<select>` are checked (`HtmlEcho`), with or without `<?= ?>`.
         for src in ["<select><?= $v ?></select>", "<select><?phv echo $v; ?></select>"] {
@@ -3320,8 +3530,15 @@ mod tests {
                     .any(|s| matches!(&s.kind, crate::ast::StmtKind::HtmlEcho(_, EchoContext::SelectText))),
                 "{src}"
             );
-            // Functions called there may write output (no guard), as in text.
-            assert!(module.stmts.iter().all(|s| s.out.is_none()), "{src}");
+            // Functions called there may not write output: a guard (found by the 19th assessment).
+            assert!(
+                module
+                    .stmts
+                    .iter()
+                    .filter(|s| matches!(s.kind, crate::ast::StmtKind::HtmlEcho(..)))
+                    .all(|s| s.out == Some(EchoContext::SelectText)),
+                "{src}"
+            );
         }
     }
 
@@ -3331,11 +3548,11 @@ mod tests {
     /// tag and refused everything after as markup in a script.
     #[test]
     fn self_closed_script_in_foreign_content_opens_no_text() {
-        assert_eq!(ctx("<svg><script/><g>"), EchoContext::ForeignText);
+        assert_eq!(ctx("<svg><script/><g>"), EchoContext::ForeignText("foreign svg"));
         assert!(!found("<svg><script/><g>").contains(&InlineCode::ForeignCdata));
         assert_eq!(ctx("<svg><style/><a href=\""), EchoContext::Url);
-        assert_eq!(ctx("<math><script/><mi>"), EchoContext::ForeignText);
-        assert_eq!(ctx("<svg><script /><g>"), EchoContext::ForeignText);
+        assert_eq!(ctx("<math><script/><mi>"), EchoContext::ForeignText("foreign mathtext"));
+        assert_eq!(ctx("<svg><script /><g>"), EchoContext::ForeignText("foreign svg"));
         // Not self-closed: the script's text, as before.
         assert_eq!(ctx("<svg><script><g>"), EchoContext::Script);
         assert!(found("<svg><script><g>").contains(&InlineCode::ForeignCdata));
@@ -3345,6 +3562,93 @@ mod tests {
         assert_eq!(ctx("<svg><foreignObject><div><script/>var a = "), EchoContext::Script);
         assert_eq!(ctx("<math><mi><script/>var a = "), EchoContext::Script);
         assert_eq!(ctx("<script/>var a = "), EchoContext::Script);
+    }
+
+    /// Found by the 19th assessment: `Html` inserted inside `<svg>` or `<math>`
+    /// could end the SVG (`<p>`, `</svg>`) or leave an integration point open
+    /// (`<foreignObject>`, `<mi>`), so that the page's self-closed `<script/>`
+    /// after it, read as foreign content here (no script text, and the nonce),
+    /// was an HTML script for browsers. The place of the value says what is
+    /// open there, and `foreign_insert_problem` reads the `Html` from it.
+    #[test]
+    fn html_inserted_in_foreign_content_keeps_its_structure() {
+        // The reviewer's page: the value is `ForeignText` in SVG, and what
+        // follows is read as SVG (the `<script/>` opens no text).
+        let src =
+            "<?phv params(Html $icon, string $v) ?><svg width=\"10\"><?= $icon ?><script/><?= $v ?></script></svg>";
+        let (module, diags) = crate::parse_module(src, 0, true);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let places: Vec<EchoContext> = module
+            .stmts
+            .iter()
+            .filter_map(|s| match &s.kind {
+                crate::ast::StmtKind::HtmlEcho(_, c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(places, [EchoContext::ForeignText("foreign svg"), EchoContext::ForeignText("foreign svg")]);
+        // The places, by the innermost open element.
+        assert_eq!(ctx("<math>"), EchoContext::ForeignText("foreign math"));
+        assert_eq!(ctx("<svg><g>"), EchoContext::ForeignText("foreign svg"));
+        assert_eq!(ctx("<svg><foreignObject>"), EchoContext::ForeignText("foreign html"));
+        assert_eq!(ctx("<svg><foreignObject><div>"), EchoContext::ForeignText("foreign html"));
+        assert_eq!(ctx("<svg><desc>"), EchoContext::ForeignText("foreign html"));
+        assert_eq!(ctx("<math><mi>"), EchoContext::ForeignText("foreign mathtext"));
+        assert_eq!(ctx("<math><annotation-xml>"), EchoContext::ForeignText("foreign annotation-xml"));
+        assert_eq!(ctx("<math><mi><svg>"), EchoContext::ForeignText("foreign svg"));
+        // Refused: the reviewer's partials (`para`, `close_svg`, `fo`, `mi`), and the like.
+        let refused = |html: &str, place: &str| {
+            let why = foreign_insert_problem(html, place);
+            assert!(why.is_some(), "{html} at {place}");
+            why.unwrap()
+        };
+        assert!(refused("<p>icon</p>\n", "foreign svg").contains("`<p>`"));
+        assert!(refused("</svg>\n", "foreign svg").contains("did not open"));
+        assert!(refused("<foreignObject>\n", "foreign svg").contains("leaves open"));
+        assert!(refused("<mi>\n", "foreign math").contains("leaves open"));
+        for (html, place) in [
+            ("<desc>", "foreign svg"),
+            ("<title>", "foreign svg"),
+            ("<annotation-xml encoding=\"text/html\">", "foreign math"),
+            ("<g>", "foreign svg"),
+            ("</g>", "foreign svg"),
+            ("<g></svg>", "foreign svg"),
+            ("</math>", "foreign math"),
+            ("</p>", "foreign svg"),
+            ("<br>", "foreign svg"),
+            ("<img src=\"a.png\">", "foreign svg"),
+            ("<font color=\"red\">x</font>", "foreign svg"),
+            ("</foreignObject>", "foreign html"),
+            ("</svg>", "foreign html"),
+            ("</div>", "foreign html"),
+            ("<div>", "foreign html"),
+            ("<p>a<div>b</div>", "foreign html"),
+            ("</mi>", "foreign mathtext"),
+            ("<b></b>", "foreign annotation-xml"),
+            ("<style><b></style>", "foreign svg"),
+            ("<foreignObject><p>a</foreignObject>", "foreign svg"),
+            // An older build's place: every reading.
+            ("<p>a</p>", "foreign"),
+            ("<path/>", "foreign"),
+        ] {
+            refused(html, place);
+        }
+        // Accepted: what closes everything it opens, as browsers read it there.
+        for (html, place) in [
+            ("<path d=\"M0 0\"/>", "foreign svg"),
+            ("<g><circle r=\"1\"/><text>a &lt; b</text></g>\n", "foreign svg"),
+            ("<rect width=\"1\"><title>Bar 1</title></rect>\n<style>.bar { fill: red }</style>\n", "foreign svg"),
+            ("<foreignObject><p>a</p><div><br></div></foreignObject>", "foreign svg"),
+            ("<mi>x</mi><mo>+</mo>", "foreign math"),
+            ("<p>a</p><div><b>b</b><img src=\"a.png\"></div>", "foreign html"),
+            ("<svg><g/></svg>", "foreign html"),
+            ("<b>x</b><mglyph/>", "foreign mathtext"),
+            ("plain text &amp; more", "foreign annotation-xml"),
+            ("<!-- a comment -->", "foreign svg"),
+            ("", "foreign svg"),
+        ] {
+            assert_eq!(foreign_insert_problem(html, place), None, "{html} at {place}");
+        }
     }
 
     /// The tables are well formed: a row always matches, the contexts are in
@@ -3441,7 +3745,7 @@ mod tests {
         assert_eq!(ctx("<!-- a -->"), EchoContext::Text);
         assert_eq!(ctx("<!-- a --!>"), EchoContext::Text);
         assert_eq!(ctx("<!x >"), EchoContext::Text);
-        assert_eq!(ctx("<svg><![CDATA[ ]]>"), EchoContext::ForeignText);
+        assert_eq!(ctx("<svg><![CDATA[ ]]>"), EchoContext::ForeignText("foreign svg"));
         assert!(found("<svg><![CDATA[ ] > ]]>").contains(&InlineCode::CdataEnd));
         // Raw text rows.
         assert_eq!(ctx("<script>a <!-"), EchoContext::AfterMarkup);
@@ -3461,7 +3765,7 @@ mod tests {
         assert_eq!(ctx("<script><!-- <script></script>--></script>"), EchoContext::Text);
         // Open-element rows (the start and end tags of foreign content).
         assert_eq!(ctx("<svg/>a"), EchoContext::Text);
-        assert_eq!(ctx("<math><mi><mglyph/>"), EchoContext::ForeignText);
+        assert_eq!(ctx("<math><mi><mglyph/>"), EchoContext::ForeignText("foreign mathtext"));
         assert_eq!(structure_errors("<math><mi><mglyph></mglyph></mi></math>"), 0);
         assert_eq!(structure_errors("<math><annotation-xml><b></b></annotation-xml></math>"), 1);
         assert_eq!(ctx("<svg><title><svg/></title></svg>a"), EchoContext::Text);
@@ -3478,7 +3782,7 @@ mod tests {
         assert_eq!(structure_errors("<svg></p>"), 1);
         assert_eq!(ctx("<svg><g></svg>a"), EchoContext::Text);
         assert_eq!(structure_errors("<svg><title><b><svg></b></svg></title></svg>"), 1);
-        assert_eq!(ctx("<svg></x>"), EchoContext::ForeignText);
+        assert_eq!(ctx("<svg></x>"), EchoContext::ForeignText("foreign svg"));
         // Rows whose conditions only a corner case tells apart (each of these
         // passed with one condition of a row removed, so they stay).
         // `<scripts` is not `<script` with a delimiter after it: no double escape.

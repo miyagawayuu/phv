@@ -32,7 +32,7 @@ error: property `$name` of this trait is not the same as the one of `Clash`
    |
 42 |     public string $name = "x";
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = note: a class and the traits it uses may declare a property of the same name only with the same type, visibility, `readonly` and default value
+   = note: a class and the traits it uses may declare a property of the same name only with the same type, visibility, `readonly`, default value, `#[Column]` and `#[Id]`
    = note: in trait `Named`, used by `Clash`
 
 error: enums cannot have properties

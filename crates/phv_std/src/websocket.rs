@@ -7,7 +7,7 @@
 //! next. Only text messages are exchanged; pings are answered while reading.
 
 use crate::deadline::until;
-use crate::netio::{check_plain, describe, dial, Stream};
+use crate::netio::{check_plain, describe, dial_avoiding, Stream};
 use crate::{float, int, s};
 use phv_vm::{Value, Vm, VmError};
 use std::io::ErrorKind;
@@ -76,7 +76,12 @@ fn io_message(e: &tungstenite::Error) -> String {
     }
 }
 
-fn open(url: &str, tls_setting: Option<bool>, until: Instant) -> Result<WebSocket<Stream>, String> {
+fn open(
+    url: &str,
+    tls_setting: Option<bool>,
+    until: Instant,
+    own: Option<std::net::SocketAddr>,
+) -> Result<WebSocket<Stream>, String> {
     // The parser's own message could quote the URL, which may hold a password.
     let request = url.into_client_request().map_err(|_| "the URL is not a valid WebSocket URL".to_string())?;
     let uri = request.uri();
@@ -84,7 +89,8 @@ fn open(url: &str, tls_setting: Option<bool>, until: Instant) -> Result<WebSocke
     let host = uri.host().ok_or("the URL has no host")?.to_string();
     let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
     check_plain(&host, tls, tls_setting, "wss://")?;
-    let stream = dial(&host, port, tls, until)?;
+    // Not this server's own address (see `dial_avoiding`).
+    let stream = dial_avoiding(&host, port, tls, until, own)?;
     let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
     match tungstenite::client::client_with_config(request, stream, Some(config)) {
         Ok((ws, _)) => Ok(ws),
@@ -116,7 +122,7 @@ pub fn connect(vm: &mut Vm, a: &[Value]) -> R {
             vm.throw("NetworkError", format!("WebSocket server \"{name}\": the environment variable {var} is not set"))
         );
     };
-    let result = open(&url, spec.tls, until(vm, CONNECT_TIMEOUT));
+    let result = open(&url, spec.tls, until(vm, CONNECT_TIMEOUT), vm.host.listen);
     vm.check_limits()?;
     match result {
         Ok(ws) => {

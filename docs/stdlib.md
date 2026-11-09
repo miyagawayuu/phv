@@ -968,8 +968,10 @@ constructor, so it may only promote its parameters.
 Every statement runs through the `Database` it was given, with the limits
 of std.db. A Repo remembers what the rows of the entities it read or wrote
 held, so that `update()` writes only the columns that changed; it forgets
-that after a `transaction()` is rolled back. Nothing is kept beyond the
-Repo itself (the end of the request at the latest).
+that after a `transaction()` is rolled back or fails to commit, after
+`COMMIT` or `ROLLBACK` written as SQL, and after another Repo wrote to the
+same table. Nothing is kept beyond the Repo itself (the end of the request
+at the latest).
 
 - `public function find(int|string $key): ?T` — The entity whose key is `$key`, or null when no row has it.
 - `public function findBy(?Sql $where = null, string $orderBy = "", ?int $limit = null, int $offset = 0): list<T>` — The entities whose rows meet `$where` (every row without it), sorted by `$orderBy`: property names, each with `asc` or `desc` after it (`"name, createdAt desc"`); at most `$limit`, after skipping `$offset`. `$where` names columns: `sql"age >= {$min}"`, or `$users->column("createdAt") . sql" > {$since}"` by property.

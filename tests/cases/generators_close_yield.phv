@@ -1,0 +1,97 @@
+<?phv
+// A generator closed by its loop runs its `finally` blocks, whose code can
+// still lead back to a `yield`: there is no loop to take the value, so the
+// `yield` throws a LogicException in the generator (it was an internal error).
+
+// The `finally` continues the generator's loop, back to the `yield`: each
+// `yield` throws, and each `continue` leaves its `finally` (and the exception).
+function loops(): Generator<int> {
+    foreach ([1, 2, 3] as $i) {
+        try {
+            yield $i;
+        } finally {
+            echo "finally $i\n";
+            continue;
+        }
+    }
+    echo "loops ended\n";
+}
+foreach (loops() as $v) {
+    echo "got $v\n";
+    break;
+}
+echo "after loops\n";
+
+// The `finally` throws, a `catch` of the generator takes it and yields: the
+// LogicException leaves the generator where the loop was left.
+function catches(): Generator<int> {
+    try {
+        try {
+            yield 1;
+            yield 2;
+        } finally {
+            throw new RuntimeException("from finally");
+        }
+    } catch (RuntimeException $e) {
+        echo "generator caught ", $e->getMessage(), "\n";
+        yield 3;
+    }
+}
+try {
+    foreach (catches() as $v) {
+        echo "got $v\n";
+        break;
+    }
+    echo "not reached\n";
+} catch (LogicException $e) {
+    echo "caught: ", $e->getMessage(), "\n";
+}
+
+// The generator can catch it too, and end.
+function recovers(): Generator<int> {
+    try {
+        try {
+            yield 1;
+        } finally {
+            throw new RuntimeException("again");
+        }
+    } catch (RuntimeException) {
+        try {
+            yield 99;
+        } catch (LogicException $e) {
+            echo "generator caught: ", $e->getMessage(), "\n";
+        }
+        return;
+    }
+}
+foreach (recovers() as $v) {
+    echo "got $v\n";
+    break;
+}
+echo "after recovers\n";
+
+// Through `yield from`: the outer generator is the one closed.
+function inner(): Generator<int> {
+    yield 100;
+    yield 200;
+}
+function outer(): Generator<int> {
+    try {
+        try {
+            yield 1;
+        } finally {
+            throw new RuntimeException("x");
+        }
+    } catch (RuntimeException) {
+        yield from inner();
+    }
+}
+try {
+    foreach (outer() as $v) {
+        echo "got $v\n";
+        break;
+    }
+} catch (LogicException $e) {
+    echo "caught: ", $e->getMessage(), "\n";
+}
+echo "done\n";

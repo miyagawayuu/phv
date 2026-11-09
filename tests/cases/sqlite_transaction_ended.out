@@ -1,0 +1,10 @@
+caught: UNIQUE constraint failed: t.x
+refused: the transaction of transaction() has ended, and nothing more runs in it: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+transaction() threw: transaction() did not commit: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+rows: 0
+transaction() threw: the transaction of transaction() has ended, and nothing more runs in it: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+rows: 1
+inner threw: transaction() did not commit: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+outer threw: the transaction of transaction() has ended, and nothing more runs in it: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+rows: 1
+rows: 3

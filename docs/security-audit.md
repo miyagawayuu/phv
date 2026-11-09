@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates eighteen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, §24 an assessment of the whole implementation before 1.1.0, §25 an assessment of the whole implementation before 1.1.1, §26 an assessment of the whole implementation before 1.2.0, §27 an assessment of the whole implementation of the 1.2.0 release candidate, and §28 an assessment of the whole implementation before 1.2.1.
+This report consolidates nineteen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, §24 an assessment of the whole implementation before 1.1.0, §25 an assessment of the whole implementation before 1.1.1, §26 an assessment of the whole implementation before 1.2.0, §27 an assessment of the whole implementation of the 1.2.0 release candidate, §28 an assessment of the whole implementation before 1.2.1, and §29 an assessment of the whole implementation before 1.3.0.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§25: 2026-11-06, §26–§27: 2026-11-07, §28: 2026-11-08)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§25: 2026-11-06, §26–§27: 2026-11-07, §28: 2026-11-08, §29: 2026-11-09)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -1980,3 +1980,184 @@ Regression tests are named after what they check, in each crate's tests and in `
 
 All tests pass on Windows and on Linux, run at the same time against one PostgreSQL 17, MySQL 8.4 and Redis 7, and
 with clippy (`-D warnings`) and rustfmt.
+
+## 29. Nineteenth Assessment: the Whole Implementation (before 1.3.0)
+
+Date: 2026-11-09. Scope: everything at 8d1a290: the fixes of §28 and all of 1.3, none of which had been assessed
+before. 1.3 brought a smaller syntax tree, a parser of its own for builtin signatures, a loader that keeps the text of
+unchanged files, `phv check` over several files, a pool of page threads in place of the runtime's blocking pool,
+batched access-log writes, the JIT compiling objects, methods and `echo`; generators (`yield`, `yield from`,
+`Generator<K, V>`), traits flattened into each class at compile time, `std.i18n` with catalogs checked at compile
+time, `std.image` decoding PNG, JPEG, GIF and WebP with the `image` crate family, and `std.orm`. Every earlier fix was
+attacked again.
+
+Nine reviewers each took one area: the web server; the standard library, its clients and `std.orm`; the syntax, type
+checker, compiler, VM, JIT and loader; templates and the tracker; the tools and their supply chain (with the new
+image crates); background jobs and the stores; sign-in and tokens; the running system as a whole; and the two new
+modules that take untrusted input, `std.image` and `std.i18n`. They attacked a release build locally, with fake
+identity providers, Redis and HTTP servers on their own ports, the three databases in Docker, Chrome 157 and parse5
+for templates, and Linux builds in Docker where a question depended on the platform. Each finding was confirmed with
+a PoC. The image decoders were fuzzed in process (2.64 million inputs over every format, with overflow checks), the
+generators by 5,500 random programs run by the interpreter and the JIT, and the formatter by comparing the syntax
+trees of 298 files before and after formatting. Six groups then fixed every finding, each with regression tests.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| Critical | 1 | Fixed |
+| High | 2 | Fixed |
+| Medium | 8 | Fixed |
+| Low | 13 | Fixed |
+| Info | 11 | Fixed or documented |
+
+### Critical
+
+| # | Finding | Fix |
+|---|---|---|
+| R22-1 | Reading the header of a WebP (`Image::fromUpload()`, `open()`, `fromBase64()`) asked the decoder for the EXIF orientation, and image-webp allocated the size the EXIF chunk declares, with no limit, before reading it: an 82-byte upload committed 4 GB under a 128 MB limit, and a server that could not commit it aborted (on Windows, where memory is committed at once; on Linux under strict overcommit or an address-space limit) | Reading a header asks no decoder for metadata: the WebP chunks are walked in place and the orientation is read from the bytes that are there (PNG `eXIf` likewise, JPEG through the decoder's own bounded header parse); the upload is now read in about 4 ms within 13 MB |
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R22-2 | `password_verify` checked the Argon2 cost caps on the first occurrence of each parameter, while the argon2 crate uses the last: a stored hash `m=19456,t=2,p=1,m=4294967295` made one login allocate 4 TiB and abort `phv serve`, and a repeated `t` ran for as long as it said (9.3 seconds under a 2-second limit); only a planted hash, the case the caps exist for | A hash that names a parameter twice or names one argon2 does not know is refused, and the caps are checked on the parameters argon2 will use; the planted hashes answer "wrong password" in about 13 ms |
+| R22-3 | A trait reached through several `use` paths was flattened once per path, and neither the member limit nor the copied-code limit counted empty traits: a 1.3 KB diamond of depth 24 took about a minute in `phv check`, and depth 40 hung `phv check` and the language server, which stopped answering for the whole workspace (opening a cloned repository was enough) | The flattened members of a trait are kept per trait and substitution within one check, and every flatten counts against the member limit; the 40-level diamond checks in 0.2 seconds, and the language server answers at once |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R22-4 | On PostgreSQL, a `COMMIT` of a transaction aborted by a caught statement error is answered with the tag `ROLLBACK` and no error: `transaction()` returned normally, `enqueue()` inside it returned ids of jobs that never existed, and `std.orm` kept the uncommitted values, so the next `update()` skipped columns (a lost update). MySQL deadlocks caught inside a transaction left the statements after them running in autocommit | The outermost commit is sent as `SELECT 1; COMMIT`, so an aborted transaction answers with an error; a transaction the database ended (aborted, rolled back by a deadlock or a lock-wait timeout with `innodb_rollback_on_timeout`, ended by a statement) refuses further statements and `enqueue()`, and every level then raises "transaction() did not commit"; Repos forget |
+| R22-5 | A failed `COMMIT` or `RELEASE SAVEPOINT` left the transaction open or its depth wrong: on SQLite a commit refused by a reader left writes the script believed committed, which were rolled back when the connection was returned (the script saw three rows, the file held none); on PostgreSQL and MySQL a nested failure left the depth at 2, so a later `transaction()` that threw kept its writes | One routine for the three databases: a commit or rollback sets the depth to the level below before it runs; a failed commit rolls its level back and rethrows; at depth 0 a connection still in a transaction is closed (SQLite) or marked broken |
+| R22-6 | `#[Id]` and `#[Column]` on a property a trait brings into an entity were ignored: the key and column names fell back to the property names, and `delete()` of one entity deleted every row sharing the wrong key | Annotations of trait properties are recorded and checked as the class's own; a property declared by both must agree |
+| R22-7 | A generator closed by its loop could reach `yield` again from its own code (a `continue` in a `finally` back to the loop, or a `finally` that throws into a `catch` that yields), and the VM stopped with an internal error: a page doing it answered 500 every time | The `yield` throws a catchable `LogicException` in the generator, which goes on closing (PHP raises an `Error` there) |
+| R22-8 | `Html` inserted inside `<svg>` or `<math>` was not checked for markup that changes the foreign structure for what follows: a partial such as `<p>…</p>`, `</svg>` or an open `<foreignObject>` took the browser out of SVG while the tracker still read SVG, so a following self-closed `<script/>` got the page's nonce and a visitor's value after it ran as script in Chrome (and as CSS after `<style/>`) | The run-time check of `Html` in foreign content knows the element it lands in and reads the `Html` with the tracker's own rules: a breakout tag, an end tag of an element it did not open, an element or integration point it leaves open, or text ending inside a tag or comment is refused |
+| R22-9 | `std.image` told progressive JPEGs from baseline ones by its own walk of the segments, which stopped at the first stray byte between them, while the decoder skips such bytes: one byte took a progressive JPEG past the scan cap and the coefficient memory reserve (477 MB under 128 MB; eight concurrent uploads, 3.8 GB; 100 scans decoded in 6.4 seconds without interruption) | The kind of JPEG and its scan count come from the decoder's own header parse, and the decoder enforces the scan cap itself; the coefficients are reserved per component |
+| R22-10 | Decoders were given the memory left as their allocation limit without subtracting what was reserved for the image, and the PNG decoder inflated an `iCCP` profile even when only the header was read (296 MB under 128 MB from a 2 MB file; 4.2 GB under 2 GB); a GIF frame larger than its logical screen was not counted | Decoders get the memory left after the reservation, the header pass a fixed 1 MB; PNG chunks are read forward without allocation and metadata chunks are skipped whole; a GIF frame larger than its screen runs into the limit |
+| R22-11 | A VP8 or VP8L bitstream (or an animation frame) larger than its WebP canvas was decoded at its own size before the sizes were compared: a file reading as 16×16 took 470 MB and 2.5 seconds past the time limit | The first image chunk's header is read with the canvas, and a size that differs is refused before decoding |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R22-12 | On MySQL, `std.orm`'s `insert()` read a generated key from `lastInsertId()`, which is the AUTO_INCREMENT value of any column, or 0: the entity took another row's key, and `update()` then rewrote that row | A generated key is taken only when the key column is the table's AUTO_INCREMENT column (looked up once per Repo) and the id is not 0; otherwise `insert()` raises |
+| R22-13 | A Repo's snapshot did not see a `ROLLBACK` or `ROLLBACK TO SAVEPOINT` sent as SQL, nor writes to the same entity through another Repo, so `update()` skipped a column that had changed | Rollback statements make every Repo forget, and a write through any Repo makes the other Repos of that table forget; writes with the script's own SQL are not seen, as the specification says |
+| R22-14 | A provider configured without `issuer` accepted an `iss` naming another configured provider's issuer on a shared callback page, so its token endpoint received the other provider's code and PKCE verifier (an RFC 9207 mix-up) | Such an `iss` is refused with `invalid_issuer` before the code is exchanged |
+| R22-15 | The refusal of `XA PREPARE` and `PREPARE TRANSACTION` (R20-7) was bypassed by comments: on MySQL a versioned comment above the server's version (`/*!99999 mk1 */ XA PREPARE`), which the server skips; on PostgreSQL `/*! … */`, which PostgreSQL reads as a plain comment. A prepared MySQL transaction outlived the script and held its row locks | On PostgreSQL `/*!` is an ordinary comment; on MySQL a statement is read once with versioned comments skipped and once per version they name, and refused if any reading is refused (at most 16 versions) |
+| R22-16 | File session store: R21-9's retry polled the directory lock up to 40 times per name, so a forged or expired cookie held a worker about 180 ms while other requests saved sessions | A read that finds no session takes its session's lock once and reads both names under it; a forged cookie costs 2–3 ms under the same load, and R21-9's guarantee holds |
+| R22-17 | `phv fmt` put a trailing comma into `yield from (…)` when it wrapped the line, so the formatted file no longer compiled; the parser's comment said a function named `from` kept its meaning after `yield`, which it did not | The formatter leaves the comma out; `yield from` is a keyword pair, as in PHP, and `yield (from(…))` calls such a function |
+| R22-18 | The `<select>` state of R19-26 and R21-5 could be lost four more ways, so with a parser of the old rules a value read as `<title>` text became markup: a loop body read once with the state before the loop, a `</select>` inside a `<template>`, statements in a select whose functions wrote their own output (or ended inside the select), and `yield` inside a select | A block must end with a `<select>` open exactly when it began with one; a `<template>` inside a `<select>` is refused; functions called while a `<select>` is open may not write output (return `Html` instead); `yield` there is refused |
+| R22-19 | R21-11's refusal of services pointing at the server itself did not check `[oauth.*]` URLs, nor the unspecified address (`0.0.0.0`, `[::]`, which Linux connects through the loopback): a sign-in against the site's own address held its worker 10 seconds and stalled a bystander 9.5 seconds | Those URLs are checked at startup, the unspecified address counts as this server, and a page's connection that would reach the server's own listening address is refused when it is made (discovered endpoints, later DNS answers) |
+| R22-20 | A page whose locale `std.i18n` chose from `Accept-Language` was sent without `Vary: Accept-Language`, so a shared cache served the first visitor's language to everyone | The header is added when the locale came from the request (and to a streamed head of an `[i18n]` site whose locale is not chosen yet) |
+| R22-21 | The admin port took 64 connections with no limit per address and a 5-second header timeout: one client holding them delayed `/health` 5 seconds, enough to fail a container's liveness probe | Four connections per address (an IPv6 /64 counts as one), a 1-second header timeout, and a new connection over a limit closes the oldest connection that has sent nothing; `/health` answered within 0.03 seconds under the same flood |
+| R22-22 | An override could narrow visibility (a private method overriding a public one, also through a trait's `as private`), and the private body was then callable from anywhere through the parent type; older than 1.3 | An override narrower than the method it overrides is refused, trait copies after `as` included |
+| R22-23 | Encoding reserved 1.25 times the pixels while the PNG and lossless WebP encoders use about four times: a 16-megapixel image was written at 341 MB under 128 MB | What the encoders use is reserved before encoding (measured: PNG 3.7×, WebP 3.9×, JPEG at quality 100 2.3×) |
+| R22-24 | The file session store made every save of every session under one directory lock: about 250 saves a second per server on Windows, and pages without sessions waited for workers (480 of 40,000 requests answered 503); 1.2.1 behaved the same | 64 locks chosen by the session's hash, each with a lock file of its own; saves of one session still run one at a time; the sweep deletes each file under its own lock. The file system is now the limit, and the specification points busy sites to Redis |
+
+### Info
+
+| # | Finding | Fix |
+|---|---|---|
+| R22-25 | R21-23 was wider than documented: a sign-in started in a second tab wrote back the pending list it had read before the first tab's callback consumed its state, so that callback URL worked once more (the provider refuses the second code exchange) | Each server process remembers the digests of the states it used for their lifetime and refuses them; processes do not share that list, as the specification says |
+| R22-26 | A damaged Redis session record (invalid UTF-8, a bad header) made `/ready` answer 503 and was never removed | Read as a long-expired session and removed, not counted as a store failure; PostgreSQL data that is not UTF-8 likewise |
+| R22-27 | The Redis `phv jobs adopt` paged the shared store by rank, so jobs another client removed ahead of the cursor made it skip some of the site's jobs (left in place, not lost) | Pages start after a (score, id) cursor; after `--yes` what is left of the site's jobs is printed per name |
+| R22-28 | On MySQL, `phv jobs adopt` matched script names with the column's case- and accent-insensitive collation | Names are compared in binary, and every store keeps only exact matches |
+| R22-29 | The release archives and the Docker image carried no notices of the statically linked third-party crates (BSD-3-Clause among them since `std.image`) | `packaging/licenses.py` collects every crate's licence files from `cargo metadata`; each archive and the image carry `THIRD-PARTY-LICENSES.txt`, and CI runs the script |
+| R22-30 | Bytes from an image's `send()` or `response()->file()` could be retyped as `text/html` afterwards, where echoed output is refused | They count as written output in the Content-Type rule |
+| R22-31 | The server's check that a page's sources are unchanged compared write time and size only, so a same-size rewrite in place with the write time set back was served stale (by a writer of the project) | Windows now reads the NTFS change time, as Unix the inode change time; the specification names the file systems without one |
+| R22-32 | `t("key", [])` passed `phv check` and failed at run time for a message with placeholders | An empty list literal is checked as an empty map |
+| R22-33 | A decoder panic caught by `std.image` was still printed to standard error as raw lines | Caught panics inside the decoders are not printed; other panics are |
+| R22-34 | Encoding at the caps took longer than the specification said (JPEG at quality 100 of 48 megapixels: 2.5–2.8 seconds against 2.1) | The specification gives the measured times: the uninterruptible overshoot is about 3 seconds, 4 on a busy machine |
+| R22-35 | The memory session store unwrapped its lock, so a panic while it was held would have failed every later request (page panics are now caught on long-lived threads; R22-7 showed one) | The lock is taken through a poisoned state, and the byte count saturates |
+
+### Residual Risks
+
+- A MySQL statement that commits implicitly at the outermost level of `transaction()` is not detected (the client
+  does not see the server's transaction flag); a PostgreSQL `COMMIT` that silently rolls back the script's own
+  `BEGIN` is not raised, though `std.orm` forgets on it.
+- While processes of 1.2 and 1.3 share a session directory (a rolling upgrade), a logout in one can be undone by a
+  save in the other: they lock different files. Every process sharing a directory must be 1.3 or later.
+- The list of used sign-in states is per process.
+- A client opening thousands of connections a second from one address can have one of its own slow probes on the
+  admin port closed; probes from other addresses are not affected.
+- The decoders and encoders of `std.image` cannot be interrupted: a call at the caps runs up to about 3 seconds past
+  the time limit (4 on a busy machine).
+- A file system without a change time (FAT, exFAT, some network shares) cannot tell a rewrite with the old write
+  time; neither can a program that sets the change time back through the native interface.
+- §28's residual risks remain.
+
+### Verification
+
+The PoCs were run again against the fixed release build (before → after):
+- the 82-byte WebP whose EXIF chunk declares 0xFFFFFF00 bytes: 4,121 MB committed under a 128 MB limit, and a server
+  allowed 2 GB aborted → 13 MB, and the upload answered in 4 ms;
+- a planted Argon2 hash with a second `m=4294967295`: the server aborted at the first login; a second `t=40` or
+  `m=1048576`: 260 ms and 1,171 ms → "wrong password" in 0 ms (the hash is refused before hashing);
+- a diamond of empty traits, depth 24 and 40: over 30 seconds (stopped) → 0.09 seconds each; the language server with
+  the depth-40 file open: no answer in 89 seconds → the hover answered at once;
+- a caught statement error inside a PostgreSQL `transaction()`: returned normally and the row kept the old name while
+  the entity held the new one → `DatabaseError: transaction() did not commit`; a SQLite commit refused by a reader:
+  the script saw three rows, the file held none → the commit throws, and the two rows the script saw are on disk;
+- a trait's `#[Id]` and `#[Column("email_address")]`: `email_address` NULL and `delete()` left no row → the column
+  written and two rows left;
+- a generator whose `finally` continues back to its `yield`: the VM's internal error, 500 on every request → `got 1`,
+  `after`; the throw-and-catch shape → an uncaught `LogicException` the script can catch;
+- `Html` breaking out of `<svg>` before a self-closed `<script/>` (Chrome 157 with the CSP): the visitor's script set
+  the title, and the CSS variant fetched `/mk1css` → 500 with the reason, nothing ran or was fetched; the four new
+  `<select>` shapes: parse5 built a `javascript:` link in each → refused at check or at run time;
+- a progressive JPEG behind one stray byte: 477 MB under 128 MB, eight uploads 3,844 MB → the memory error before
+  decoding at 1 MB, eight uploads 172 MB for the whole server; 100 scans: 6.4 seconds → refused at the header;
+- a 2 MB PNG with a compressed colour profile, header only: 296 MB → 1 MB; a VP8 bitstream of 16383×16383 in a 16×16
+  canvas: 472 MB and 2.3 seconds → refused at the header in 0.04 seconds;
+- a 16-megapixel image written as PNG and WebP under 128 MB: 341 and 338 MB → the memory error before encoding;
+- MySQL `/*!99999 mk1 */ XA PREPARE`: the prepared transaction outlived the script → refused; `/*! mk1 */ PREPARE
+  TRANSACTION` on PostgreSQL: reached the server → refused;
+- a sign-in against the site's own `issuer`: logins 500 after 10 seconds and a bystander stalled 9.5 seconds → the
+  server refuses to start; a callback naming another provider's `iss`: the code went to the plain provider →
+  `invalid_issuer`; the callback URL used again after another tab's start: `ok` → `invalid_state`;
+- 64 silent connections to the admin port from one client: `/health` 4.8 seconds at worst → 0.03 seconds;
+- the file session store with 256 visitors saving: 598 → 775 saves a second back to back on the same machine; a forged
+  cookie while two clients save: 187 ms → 1.6 ms; a damaged Redis record: `/ready` 503 and the key kept → 200 and the
+  key removed;
+- the Redis `phv jobs adopt` while another client took 477 jobs: three of the site's jobs left in one run of three →
+  none in six runs.
+
+The benchmarks of `bench/`, run back to back with the binary of 8d1a290 (`bench/results/8d1a290-loaded.json`,
+`audit19-loaded.json`), are within noise: the micro-benchmarks 0.94–1.08 (`examples/bench` alternating seven times:
+0.95–1.08), the server's pages 0.97–0.99 in requests per second at their best run and their medians alike, but for the
+guestbook's best run (0.87 against one outlying run of the old binary; the medians 0.99), the editor's rows 0.77–1.06.
+Appending to a string in a loop had become 11–15% slower with no change on its path: the whole-program optimization
+inlined it differently after changes elsewhere (each group's changes alone moved it 2–7%, a changed message string
+alone did not); the append is now always inlined, and the row is back at 1.00–1.01 (1.07 with the JIT).
+
+All tests pass on Windows and on Linux (Docker), against PostgreSQL 17, MySQL 8.4 and Redis 7, with clippy
+(`-D warnings`) and rustfmt, but one: run right after the command-line `jobs` tests (as `cargo test --workspace` runs
+them) against databases reached through Docker Desktop's port forwarding, a MySQL test of keyed jobs waits past its
+limits. 8d1a290 fails the same way, in another test of keyed jobs; each passes when run alone, with its own file, or
+after a pause of 90 seconds.
+
+### Regression tests
+
+Regression tests are named after what they check, in each crate's tests and in `tests/cases` and `tests/db`
+(`err_html_breakout_in_svg`, `err_select_loop`, `err_yield_in_select`, `generators_close_yield`,
+`err_override_visibility`, `orm_trait_columns`, `orm_forgets_other_writes`, `sqlite_transaction_ended`,
+`postgres_tx_ended`, `mysql_tx_ended`, `mysql_orm_keys`). Some of the others:
+- `image.rs`: `a_webp_exif_chunk_declaring_a_gigabyte_is_not_allocated`,
+  `a_stray_byte_does_not_hide_a_progressive_jpeg`, `an_icc_profile_bomb_is_not_inflated`,
+  `a_webp_bitstream_of_another_size_than_its_canvas_is_refused`, `encoding_counts_what_the_encoders_take`;
+- `sys.rs`: `password_verify_refuses_repeated_or_unknown_argon2_parameters`;
+- `compile_cost.rs`: `diamonds_of_traits_check_at_once`; `lsp.rs`: `answers_with_a_diamond_of_traits_open`;
+- `databases.rs`: `transactions_the_database_ended_are_not_reported_as_committed`; `sqlite_pool.rs`:
+  `a_commit_that_fails_ends_the_transaction`; `netdb`: `prepared_transactions_are_refused`,
+  `redis_adopt_skips_nothing_when_others_take_jobs_meanwhile`;
+- `htmlctx.rs`: `html_inserted_in_foreign_content_keeps_its_structure`, `a_block_keeps_the_select_state`;
+- `oauth.rs`: `an_iss_of_another_provider_is_refused_by_a_plain_provider`,
+  `a_state_written_back_by_another_request_is_not_used_twice`; `selfcall.rs`:
+  `the_unspecified_address_and_oauth_urls_pointing_at_this_server_are_refused`,
+  `a_discovered_endpoint_on_this_server_is_refused_when_the_page_connects`;
+- `http.rs`: `a_locale_chosen_from_accept_language_varies_by_it`, `a_sent_file_or_image_cannot_be_retyped_as_html`;
+  `admin.rs`: `silent_connections_do_not_keep_health_waiting`;
+- `session.rs`: `saves_of_different_sessions_do_not_wait_for_each_other`, `a_forged_cookie_does_not_wait_for_saves`,
+  `a_panic_holding_the_memory_store_does_not_break_it`;
+- `format.rs`: `yield_from_takes_no_trailing_comma`; `safefs.rs`: `a_rewrite_with_the_old_write_time_changes_the_stamp`.

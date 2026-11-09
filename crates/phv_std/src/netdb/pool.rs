@@ -64,7 +64,7 @@ impl<C: Driver> Pool<C> {
             if let Some((mut c, since)) = st.idle.pop() {
                 drop(st);
                 if !c.closed() && (since.elapsed() < CHECK_AFTER || c.check()) {
-                    return Ok(Pooled { conn: Some(c), pool: self.clone(), broken: false, depth: 0 });
+                    return Ok(Pooled { conn: Some(c), pool: self.clone(), broken: false, depth: 0, ended: None });
                 }
                 drop(c);
                 st = lock(&self.state);
@@ -75,7 +75,7 @@ impl<C: Driver> Pool<C> {
                 st.open += 1;
                 drop(st);
                 return match connect() {
-                    Ok(c) => Ok(Pooled { conn: Some(c), pool: self.clone(), broken: false, depth: 0 }),
+                    Ok(c) => Ok(Pooled { conn: Some(c), pool: self.clone(), broken: false, depth: 0, ended: None }),
                     Err(e) => {
                         self.discard();
                         Err(AcquireError::Connect(e))
@@ -104,6 +104,10 @@ pub(super) struct Pooled<C: Driver> {
     pub(super) broken: bool,
     /// How many `transaction()` calls are open (inner ones are savepoints).
     pub(super) depth: u32,
+    /// Why the database ended the transaction of the open `transaction()`
+    /// calls before they did (`crate::db::Ended`): their statements are then
+    /// refused, and their `COMMIT` raises.
+    pub(super) ended: Option<crate::db::Ended>,
 }
 
 impl<C: Driver> Pooled<C> {

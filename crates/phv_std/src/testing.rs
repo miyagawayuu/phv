@@ -45,6 +45,10 @@ pub const SCRIPT_NAMESPACES: &[(&str, u8)] = &[
 /// shared and stays as it is).
 const SCRIPT_NAMES: &[&str] = &[
     "phv_items",
+    "phv_tx",
+    "phv_tx_extra",
+    "phv_orm_keys",
+    "phv_orm_log",
     "phv_async",
     "phv_pid",
     "phv_kept",

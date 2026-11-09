@@ -2,10 +2,11 @@
 
 use super::my::{my_connect, my_error, my_execute, my_query, MyConn};
 use super::pg::{pg_connect, pg_execute, pg_query, pg_run, PgConn};
-use super::pool::{AcquireError, Pooled, MY_POOLS, PG_POOLS, REDIS_POOLS};
+use super::pool::{AcquireError, Driver, Pooled, MY_POOLS, PG_POOLS, REDIS_POOLS};
 use super::query_async::{pooled, PoolUse};
 use super::redis::redis_connect;
 use super::{MAX_WAIT, R};
+use crate::db::{parts, transaction_step, Dialect, Ended, TxConn};
 use crate::redisclient::RedisConn;
 use crate::{int, s};
 use phv_vm::{Value, Vm, VmError};
@@ -147,8 +148,8 @@ pub fn query(vm: &mut Vm, a: &[Value]) -> R {
     let link = link_of(vm, &a[0])?;
     let mut link = link.borrow_mut();
     match &mut *link {
-        Link::Pg(c) => pg_query(vm, c, &a[1]),
-        Link::My(c) => my_query(vm, c, &a[1]),
+        Link::Pg(c) => guarded(vm, c, &a[1], Dialect::Postgres, |vm, c| pg_query(vm, c, &a[1])),
+        Link::My(c) => guarded(vm, c, &a[1], Dialect::MySql, |vm, c| my_query(vm, c, &a[1])),
         Link::Redis(_) => unreachable!("Redis handle used as a database"),
     }
 }
@@ -157,65 +158,143 @@ pub fn execute(vm: &mut Vm, a: &[Value]) -> R {
     let link = link_of(vm, &a[0])?;
     let mut link = link.borrow_mut();
     match &mut *link {
-        Link::Pg(c) => pg_execute(vm, c, &a[1]),
-        Link::My(c) => my_execute(vm, c, &a[1]),
+        Link::Pg(c) => guarded(vm, c, &a[1], Dialect::Postgres, |vm, c| pg_execute(vm, c, &a[1])),
+        Link::My(c) => guarded(vm, c, &a[1], Dialect::MySql, |vm, c| my_execute(vm, c, &a[1])),
         Link::Redis(_) => unreachable!("Redis handle used as a database"),
     }
 }
 
-/// `BEGIN` / `COMMIT` / `ROLLBACK` for `Database::transaction()`.
+/// Runs a script's statement inside the open `transaction()` calls, if any:
+/// refused once the database ended their transaction (it would run outside
+/// any transaction and stay when `transaction()` throws), and a statement
+/// that ends it (`COMMIT`, `ROLLBACK` written as SQL; on MySQL `BEGIN` too)
+/// is noted, so that their `COMMIT` raises (see `crate::db::Ended`).
+fn guarded<C: Driver>(
+    vm: &mut Vm,
+    c: &mut Pooled<C>,
+    q: &Value,
+    dialect: Dialect,
+    run: impl FnOnce(&mut Vm, &mut Pooled<C>) -> R,
+) -> R {
+    if c.depth == 0 {
+        return run(vm, c);
+    }
+    if let Some(ended) = c.ended {
+        return Err(vm.throw("DatabaseError", ended.refused()));
+    }
+    let r = run(vm, c);
+    if c.ended.is_none() && super::pg::ends_transaction(parts(q).0, dialect) {
+        c.ended = Some(Ended::ByStatement);
+    }
+    r
+}
+
+/// `BEGIN` / `COMMIT` / `ROLLBACK` for `Database::transaction()` (see
+/// `crate::db::transaction_step`).
 pub fn raw(vm: &mut Vm, a: &[Value]) -> R {
     let link = link_of(vm, &a[0])?;
     let mut link = link.borrow_mut();
     let cmd = s(&a[1]);
-    match &mut *link {
+    let r = match &mut *link {
         Link::Pg(c) => {
-            let (sqls, depth) = crate::db::transaction_sql(cmd, c.depth);
-            if cmd == "ROLLBACK" {
-                c.depth = depth;
-            }
-            let r = pg_run(vm, c, |c, mut prelude| {
-                for sql in &sqls {
-                    let client = &c.get().client;
-                    client.run(prelude.take(), client.client().batch_execute(sql))?;
-                }
-                Ok(())
-            });
+            let r = transaction_step(vm, &mut **c, cmd);
             // A transaction boundary: kept statements prepared before it are
             // not used inside the next transaction (see `PgConn::kept`).
             c.get().epoch += 1;
-            if depth == 0 {
-                if let Some(j) = c.get().jobs_tx.take() {
-                    j.ended();
-                }
-            }
-            r?;
-            c.depth = depth;
+            r
         }
-        Link::My(c) => {
-            use mysql::prelude::Queryable;
-            let (sqls, depth) = crate::db::transaction_sql(cmd, c.depth);
-            if cmd == "ROLLBACK" {
-                c.depth = depth;
-            }
-            let mut r = Ok(());
-            for sql in &sqls {
-                r = c.get().conn.query_drop(sql);
-                if r.is_err() {
-                    break;
-                }
-            }
-            if depth == 0 {
-                if let Some(j) = c.get().jobs_tx.take() {
-                    j.ended();
-                }
-            }
-            r.map_err(|e| my_error(vm, c, e))?;
-            c.depth = depth;
-        }
+        Link::My(c) => transaction_step(vm, &mut **c, cmd),
         Link::Redis(_) => unreachable!("Redis handle used as a database"),
+    };
+    r.map(|()| Value::Null)
+}
+
+impl TxConn for Pooled<PgConn> {
+    fn depth(&self) -> u32 {
+        self.depth
     }
-    Ok(Value::Null)
+
+    fn set_depth(&mut self, depth: u32) {
+        self.depth = depth;
+    }
+
+    fn ended(&self) -> Option<Ended> {
+        self.ended
+    }
+
+    fn set_ended(&mut self, ended: Option<Ended>) {
+        self.ended = ended;
+    }
+
+    /// A `COMMIT` or `RELEASE SAVEPOINT` refused because the transaction is
+    /// aborted (a statement in it failed) raises `Ended::Aborted`'s error.
+    fn run(&mut self, vm: &Vm, sql: &str) -> Result<(), VmError> {
+        let ends = !sql.starts_with("SAVEPOINT");
+        let mut aborted = false;
+        let r = pg_run(vm, self, |c, prelude| {
+            let client = &c.get().client;
+            let r = client.run(prelude, client.client().batch_execute(sql));
+            aborted = matches!(&r, Err(e) if e.code() == Some(&postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION));
+            r
+        });
+        match r {
+            Err(VmError::Exception(_)) if aborted && ends => {
+                Err(vm.throw("DatabaseError", Ended::Aborted.not_committed()))
+            }
+            r => r,
+        }
+    }
+
+    /// `COMMIT` of an aborted transaction rolls it back without an error
+    /// (only its command tag says `ROLLBACK`, and the client does not show
+    /// it): `SELECT 1` before it, in the same round trip, fails in an
+    /// aborted transaction, and the server then skips the `COMMIT`.
+    fn commit(&mut self, vm: &Vm) -> Result<(), VmError> {
+        self.run(vm, "SELECT 1; COMMIT")
+    }
+
+    fn finished(&mut self, _: &mut Vm, rolled_back: bool) {
+        if let Some(j) = self.get().jobs_tx.take() {
+            j.ended();
+        }
+        // Perhaps still in the transaction: not given to another script.
+        if !rolled_back {
+            self.broken = true;
+        }
+    }
+}
+
+impl TxConn for Pooled<MyConn> {
+    fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    fn set_depth(&mut self, depth: u32) {
+        self.depth = depth;
+    }
+
+    fn ended(&self) -> Option<Ended> {
+        self.ended
+    }
+
+    fn set_ended(&mut self, ended: Option<Ended>) {
+        self.ended = ended;
+    }
+
+    fn run(&mut self, vm: &Vm, sql: &str) -> Result<(), VmError> {
+        use mysql::prelude::Queryable;
+        let r = self.get().conn.query_drop(sql);
+        r.map_err(|e| my_error(vm, self, e))
+    }
+
+    fn finished(&mut self, _: &mut Vm, rolled_back: bool) {
+        if let Some(j) = self.get().jobs_tx.take() {
+            j.ended();
+        }
+        if !rolled_back {
+            self.broken = true;
+        }
+    }
 }
 
 /// The SQL dialect of a server connection handle (std.orm), or None when it

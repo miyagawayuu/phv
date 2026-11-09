@@ -1,0 +1,8 @@
+<svg width="10" height="10"><rect width="1"><title>Bar 1</title></rect>
+<style>.bar { fill: red }</style>
+<script/>document.title=&#039;mk1&#039;</script></svg>
+<svg width="10" height="10"><foreignObject width="10" height="10"><p>A <b>label</b></p></foreignObject>
+<script/>document.title=&#039;mk1&#039;</script></svg>
+
+--- runtime error ---
+Fatal error: `Html` inserted inside `<svg>` or `<math>` holds the HTML element `<p>` directly inside `<svg>` or `<math>`, where browsers end the SVG or MathML before it: browsers would build the SVG or MathML around it in another way than the page after it was checked; close every element it opens there and no other, write HTML elements only inside a `<foreignObject>` (or `<desc>`, `<title>`, a MathML text element) it opens, or insert it outside the SVG or MathML

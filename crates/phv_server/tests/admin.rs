@@ -183,6 +183,62 @@ fn metrics_need_the_token() {
 }
 
 /// `/health` answers 503 as soon as the server stops, while running requests finish.
+/// Connections that send nothing cannot keep a probe out: one client keeps
+/// at most 4 open, a new one closes the oldest silent one, and a silent one
+/// is closed after 1 s. Found by the 19th assessment (R22-21): 64 silent
+/// connections from one client, renewed as they closed, delayed `/health` by 5 s.
+#[test]
+fn silent_connections_do_not_keep_health_waiting() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+    let dir = site("silent");
+    let port = free_port();
+    write(&dir, "phv.toml", &format!("[admin]\nlisten = \"127.0.0.1:{port}\"\n"));
+    write(&dir, "public/index.phv", HOME);
+    start(&dir);
+    let admin = admin_at(port);
+
+    // A silent connection is closed within the header timeout.
+    let mut s = TcpStream::connect(admin).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let start = Instant::now();
+    let _ = s.read(&mut [0u8; 1]);
+    assert!(start.elapsed() < Duration::from_secs(3), "closed after {:?}", start.elapsed());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let holders: Vec<_> = (0..64)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    if let Ok(mut s) = TcpStream::connect(admin) {
+                        let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                        let _ = s.read(&mut [0u8; 1]);
+                    }
+                    // Renewed when closed, but not in a tight loop: the other tests run meanwhile.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+    let mut worst = Duration::ZERO;
+    for _ in 0..10 {
+        let start = Instant::now();
+        let h = get(admin, "/health", "");
+        assert_eq!((h.status, h.body.as_str()), (200, "ok\n"));
+        worst = worst.max(start.elapsed());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    stop.store(true, Ordering::SeqCst);
+    for h in holders {
+        h.join().unwrap();
+    }
+    assert!(worst < Duration::from_secs(1), "the slowest /health took {worst:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn health_turns_503_when_the_server_stops() {
     let dir = site("stop");

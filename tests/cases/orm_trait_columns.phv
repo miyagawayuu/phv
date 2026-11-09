@@ -1,0 +1,48 @@
+<?phv
+// `#[Id]` and `#[Column]` on properties a trait brings into an entity are the
+// entity's, as its own are: the key is `$uuid` (not the `$id` it also has),
+// and `$email` is the column `email_address`. They were ignored: `delete()`
+// of one row deleted every row with the same `id`.
+import std.db.Database;
+import std.orm.Repo;
+
+trait Keyed {
+    #[Id]
+    public string $uuid = "";
+    #[Column("email_address")]
+    public string $email = "";
+}
+
+#[Table("members")]
+class Member {
+    use Keyed;
+    public int $id = 0; // a team number, not unique
+    public string $name = "";
+}
+
+$db = Database::open(":memory:");
+$db->execute(sql"CREATE TABLE members (uuid text PRIMARY KEY, id integer, name text, email text, email_address text)");
+$repo = new Repo<Member>($db);
+foreach (["u1", "u2", "u3"] as $u) {
+    $m = new Member();
+    $m->uuid = $u;
+    $m->id = 7;
+    $m->name = "name-" . $u;
+    $m->email = $u . "@example.com";
+    $repo->insert($m);
+}
+foreach ($db->query(sql"SELECT uuid, email, email_address FROM members ORDER BY uuid") as $r) {
+    echo $r->string("uuid") ?? "", " email=", $r->string("email") ?? "NULL", " email_address=",
+        $r->string("email_address") ?? "NULL", "\n";
+}
+$one = $repo->find("u2");
+echo "found: ", $one?->email ?? "none", "\n";
+if ($one != null) {
+    $one->email = "new@example.com";
+    echo "update(u2): ", $repo->update($one) ? "true" : "false", "\n";
+    echo "delete(u2): ", $repo->delete($one) ? "true" : "false", "\n";
+}
+echo "rows left: ", $db->first(sql"SELECT count(*) AS n FROM members")?->int("n") ?? -1, "\n";
+foreach ($repo->findBy(sql"1 = 1") as $m) {
+    echo $m->uuid, " ", $m->email, "\n";
+}

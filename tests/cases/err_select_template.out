@@ -1,0 +1,8 @@
+error: `<template>` inside `<select>`
+ --> err_select_template.phv:8:45
+  |
+8 | <select name="s"><option>a</option><template></select></template><title></select><a href="<?= $u ?>">x</a></title>
+  |                                             ^
+  = note: older browsers ignore a `</select>` inside it, so the `<select>` stays open after it where this template is checked outside one; close the `<select>` first
+
+1 error found

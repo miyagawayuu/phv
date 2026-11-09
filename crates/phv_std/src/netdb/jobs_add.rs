@@ -868,6 +868,16 @@ pub(crate) fn job_add_in_transaction(
     // How long a held key is waited for: as outside a transaction.
     let wait = vm.deadline().map_or(JOB_WAIT, |d| d.saturating_duration_since(Instant::now()).min(JOB_WAIT));
     let key_held = || vm.check_limits().and_then(|_| Err(vm.throw("DatabaseError", format!("enqueue(): {KEY_HELD}"))));
+    // The database ended the transaction of `transaction()` (see `crate::db::Ended`):
+    // the job would be added outside it.
+    let ended = match &*link {
+        Link::Pg(c) if c.depth > 0 => c.ended,
+        Link::My(c) if c.depth > 0 => c.ended,
+        _ => None,
+    };
+    if let Some(ended) = ended {
+        return Some(Err(vm.throw("DatabaseError", format!("enqueue(): {}", ended.refused()))));
+    }
     let r = match &mut *link {
         Link::Pg(c) => {
             if !(c.depth > 0 || c.get().in_own_transaction) {

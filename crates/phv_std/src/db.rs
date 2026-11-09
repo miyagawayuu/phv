@@ -32,7 +32,7 @@ pub(crate) const IDENT_START: char = '\u{E001}';
 pub(crate) const IDENT_END: char = '\u{E002}';
 
 /// How a database writes placeholders and quoted identifiers.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Dialect {
     /// `?` and `"name"`.
     Sqlite,
@@ -89,6 +89,9 @@ struct Db {
     _dir: Option<crate::safefs::DirGuard>,
     /// How many `transaction()` calls are open (inner ones are savepoints).
     depth: std::cell::Cell<u32>,
+    /// Why SQLite ended the transaction of the open `transaction()` calls
+    /// before they did (see `Ended`).
+    ended: std::cell::Cell<Option<Ended>>,
     /// The pages an in-memory database may use (0 for a file).
     pages: usize,
     /// For a database file: the pool the connection goes back to.
@@ -830,6 +833,149 @@ pub(crate) fn transaction_sql(cmd: &str, depth: u32) -> (Vec<String>, u32) {
     }
 }
 
+/// Why the database ended the transaction of the open `transaction()` calls
+/// before the outermost one did (found by the 19th audit: on PostgreSQL a
+/// `COMMIT` after a caught statement error rolled back without an error, and
+/// `transaction()` returned as if it had committed).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Ended {
+    /// PostgreSQL: a statement in it failed (PostgreSQL ends a transaction at
+    /// its first error; its `COMMIT` then rolls back).
+    Aborted,
+    /// A statement in it ended it: `COMMIT`, `ROLLBACK` or `BEGIN` written as
+    /// SQL, a statement that commits implicitly (MySQL), or an error that
+    /// rolls the whole transaction back (SQLite).
+    ByStatement,
+    /// MySQL rolled it back after a deadlock (error 1213).
+    Deadlock,
+    /// MySQL rolled it back after a lock wait timeout (error 1205, with
+    /// `innodb_rollback_on_timeout` on).
+    LockWait,
+}
+
+impl Ended {
+    fn why(self) -> &'static str {
+        match self {
+            Ended::Aborted => {
+                "it was rolled back: a statement in it failed, and PostgreSQL ends a transaction at its first \
+                 error (an inner transaction() around the statement lets the rest go on)"
+            }
+            Ended::ByStatement => {
+                "a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits \
+                 implicitly, or an error that rolls the whole transaction back)"
+            }
+            Ended::Deadlock => "it was rolled back after a deadlock",
+            Ended::LockWait => "it was rolled back after a lock wait timeout",
+        }
+    }
+
+    /// The error of the `COMMIT` of `transaction()`.
+    pub(crate) fn not_committed(self) -> String {
+        format!("transaction() did not commit: {}", self.why())
+    }
+
+    /// The error of a statement run in it afterwards (it would run outside
+    /// any transaction, and stay when `transaction()` throws).
+    pub(crate) fn refused(self) -> String {
+        format!("the transaction of transaction() has ended, and nothing more runs in it: {}", self.why())
+    }
+}
+
+/// A connection `Database::transaction()` works on (SQLite, PostgreSQL, MySQL).
+pub(crate) trait TxConn {
+    fn depth(&self) -> u32;
+    fn set_depth(&mut self, depth: u32);
+    fn ended(&self) -> Option<Ended>;
+    fn set_ended(&mut self, ended: Option<Ended>);
+    /// Runs one statement of `transaction_sql`.
+    fn run(&mut self, vm: &Vm, sql: &str) -> Result<(), VmError>;
+    /// The outermost `COMMIT` (PostgreSQL checks the transaction was not aborted).
+    fn commit(&mut self, vm: &Vm) -> Result<(), VmError> {
+        self.run(vm, "COMMIT")
+    }
+    /// The outermost level has ended; `rolled_back` is false when its
+    /// `ROLLBACK` failed, so the connection may still be in a transaction.
+    fn finished(&mut self, vm: &mut Vm, rolled_back: bool);
+}
+
+/// `BEGIN`, `COMMIT` or `ROLLBACK` of `Database::transaction()` on `c`.
+///
+/// A `COMMIT` or `ROLLBACK` ends its level whatever happens (found by the 19th
+/// audit: a `COMMIT` that failed left the transaction open and the depth as it
+/// was, so later statements of the script, and later transactions that seemed
+/// to commit, were rolled back at its end). A `COMMIT` that fails is followed
+/// by the rollback of its level, and raises. When the database ended the
+/// transaction itself (`Ended`), its savepoints went with it: the `COMMIT`
+/// of every level raises, and the outermost level makes sure it is over.
+pub(crate) fn transaction_step(vm: &mut Vm, c: &mut dyn TxConn, cmd: &str) -> Result<(), VmError> {
+    let depth = c.depth();
+    let (sqls, after) = transaction_sql(cmd, depth);
+    if cmd == "BEGIN" {
+        if depth == 0 {
+            c.set_ended(None);
+        }
+        for sql in &sqls {
+            c.run(vm, sql)?;
+        }
+        c.set_depth(after);
+        return Ok(());
+    }
+    c.set_depth(after);
+    let (undo, _) = transaction_sql("ROLLBACK", depth);
+    let undo_all = |c: &mut dyn TxConn, vm: &Vm| undo.iter().try_for_each(|sql| c.run(vm, sql));
+    let mut rolled_back = true;
+    let r = match c.ended() {
+        Some(ended) => {
+            if after == 0 {
+                rolled_back = c.run(vm, "ROLLBACK").is_ok();
+            }
+            if cmd == "COMMIT" {
+                Err(vm.throw("DatabaseError", ended.not_committed()))
+            } else {
+                Ok(())
+            }
+        }
+        None if cmd == "COMMIT" => {
+            let r = if after == 0 { c.commit(vm) } else { sqls.iter().try_for_each(|sql| c.run(vm, sql)) };
+            match r {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let undone = undo_all(c, vm);
+                    rolled_back = undone.is_ok();
+                    match e {
+                        VmError::Fatal(_) => Err(e),
+                        // The savepoint is gone: the transaction ended before (MySQL
+                        // commits implicitly, and says only "SAVEPOINT does not exist").
+                        _ if after > 0 && undone.is_err() => {
+                            c.set_ended(Some(Ended::ByStatement));
+                            Err(vm.throw("DatabaseError", Ended::ByStatement.not_committed()))
+                        }
+                        _ => Err(e),
+                    }
+                }
+            }
+        }
+        None => match undo_all(c, vm) {
+            // The savepoint is gone with the transaction: the levels around
+            // it cannot commit (and the exception that rolls this one back
+            // goes on, not this error).
+            Err(VmError::Exception(_)) if after > 0 => {
+                c.set_ended(Some(Ended::ByStatement));
+                Ok(())
+            }
+            r => {
+                rolled_back = r.is_ok();
+                r
+            }
+        },
+    };
+    if after == 0 {
+        c.set_ended(None);
+        c.finished(vm, rolled_back);
+    }
+    r
+}
+
 /// Whether handle `h` is an SQLite database (otherwise a server connection, see `netdb`).
 fn is_sqlite(vm: &Vm, h: &Value) -> bool {
     vm.resources.get(int(h) as usize).and_then(|r| r.as_ref()).is_some_and(|b| b.is::<Db>())
@@ -1065,7 +1211,15 @@ fn open(vm: &mut Vm, a: &[Value]) -> R {
     for_script(&c, vm, &session).map_err(|e| db_error(vm, e))?;
     drop(budget);
     let lease = Lease { key, id, session: session.clone(), base };
-    let db = Db { conn: Some(c), _dir: Some(dir), depth: Cell::new(0), pages: 0, pooled: Some(lease), session };
+    let db = Db {
+        conn: Some(c),
+        _dir: Some(dir),
+        depth: Cell::new(0),
+        ended: Cell::new(None),
+        pages: 0,
+        pooled: Some(lease),
+        session,
+    };
     vm.resources.push(Some(Box::new(db)));
     Ok(Value::Int(vm.resources.len() as i64 - 1))
 }
@@ -1109,7 +1263,8 @@ fn open_memory(vm: &mut Vm, _budget: mem::Budget) -> R {
         .map_err(|e| db_error(vm, e))?;
     let session = Session::install(&c, None).map_err(|e| db_error(vm, e))?;
     for_script(&c, vm, &session).map_err(|e| db_error(vm, e))?;
-    let db = Db { conn: Some(c), _dir: None, depth: Cell::new(0), pages, pooled: None, session };
+    let db =
+        Db { conn: Some(c), _dir: None, depth: Cell::new(0), ended: Cell::new(None), pages, pooled: None, session };
     vm.resources.push(Some(Box::new(db)));
     Ok(Value::Int(vm.resources.len() as i64 - 1))
 }
@@ -1590,22 +1745,102 @@ fn real_text(f: f64) -> String {
     }
 }
 
+/// `transaction_step` on an SQLite database: its depth and `ended` are read
+/// from the `Db` and written back after the step.
+struct SqliteTx {
+    h: Value,
+    depth: u32,
+    ended: Option<Ended>,
+}
+
+impl TxConn for SqliteTx {
+    fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    fn set_depth(&mut self, depth: u32) {
+        self.depth = depth;
+    }
+
+    fn ended(&self) -> Option<Ended> {
+        self.ended
+    }
+
+    fn set_ended(&mut self, ended: Option<Ended>) {
+        self.ended = ended;
+    }
+
+    fn run(&mut self, vm: &Vm, sql: &str) -> Result<(), VmError> {
+        let db = db_of(vm, &self.h)?;
+        // Nothing to roll back once SQLite ended the transaction (an error
+        // would only keep the connection from being used again).
+        if sql == "ROLLBACK" && db.conn().is_autocommit() {
+            return Ok(());
+        }
+        db.conn().execute_batch(sql).map_err(|e| db.fail(vm, e))
+    }
+
+    /// A transaction SQLite still holds open (its `ROLLBACK` failed) would
+    /// take the script's later statements with it: the handle is closed
+    /// (its connection is rolled back, or not kept, when it goes back).
+    fn finished(&mut self, vm: &mut Vm, _: bool) {
+        let open = db_of(vm, &self.h).is_ok_and(|db| !db.conn().is_autocommit());
+        if open {
+            if let Some(slot) = vm.resources.get_mut(int(&self.h) as usize) {
+                *slot = None;
+            }
+        }
+    }
+}
+
 /// `BEGIN`, `COMMIT` or `ROLLBACK` of `Database::transaction()` (inner ones are savepoints).
-fn transaction_step(vm: &mut Vm, a: &[Value], cmd: &str) -> R {
+fn transaction_step_of(vm: &mut Vm, a: &[Value], cmd: &str) -> R {
     if !is_sqlite(vm, &a[0]) {
         return crate::netdb::raw(vm, a);
     }
     let _budget = mem::Budget::enter(vm);
     let db = db_of(vm, &a[0])?;
-    let (sqls, depth) = transaction_sql(cmd, db.depth.get());
-    if cmd == "ROLLBACK" {
-        db.depth.set(depth);
+    let mut tx = SqliteTx { h: a[0].clone(), depth: db.depth.get(), ended: db.ended.get() };
+    let r = transaction_step(vm, &mut tx, cmd);
+    if let Ok(db) = db_of(vm, &a[0]) {
+        db.depth.set(tx.depth);
+        db.ended.set(tx.ended);
     }
-    for sql in &sqls {
-        db.conn().execute_batch(sql).map_err(|e| db.fail(vm, e))?;
+    r.map(|()| Value::Null)
+}
+
+/// Runs a script's statement (`query` or `execute`) on any database. A
+/// statement that may roll back writes or ends a transaction (`ROLLBACK`,
+/// `COMMIT` written as SQL) makes std.orm forget what it kept (found by the
+/// 19th audit: only `transaction()` did). On SQLite, inside `transaction()`: a statement is
+/// refused once SQLite ended the transaction (`Ended`), and SQLite is seen
+/// to have ended it when it is back in autocommit mode after a statement.
+fn statement(vm: &mut Vm, a: &[Value], run: fn(&mut Vm, &[Value]) -> R) -> R {
+    // A `COMMIT` too: on PostgreSQL it rolls back a transaction that a failed
+    // statement aborted, without an error.
+    let text = parts(&a[1]).0;
+    let rolls_back = dialect_of(vm, &a[0])
+        .is_some_and(|d| crate::netdb::may_roll_back(text, d) || crate::netdb::ends_transaction(text, d));
+    if rolls_back {
+        crate::orm::rolled_back();
     }
-    db.depth.set(depth);
-    Ok(Value::Null)
+    if !is_sqlite(vm, &a[0]) {
+        return run(vm, a);
+    }
+    {
+        let db = db_of(vm, &a[0])?;
+        if let Some(ended) = db.ended.get().filter(|_| db.depth.get() > 0) {
+            return Err(vm.throw("DatabaseError", ended.refused()));
+        }
+    }
+    let r = run(vm, a);
+    if let Ok(db) = db_of(vm, &a[0]) {
+        if db.depth.get() > 0 && db.ended.get().is_none() && db.conn().is_autocommit() {
+            db.ended.set(Some(Ended::ByStatement));
+            crate::orm::rolled_back();
+        }
+    }
+    r
 }
 
 fn is_identifier(t: &str) -> bool {
@@ -1617,8 +1852,8 @@ fn is_identifier(t: &str) -> bool {
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
     let f: BuiltinFn = match name {
         "__db_open" => open,
-        "__db_query" => query,
-        "__db_execute" => execute,
+        "__db_query" => |vm, a| statement(vm, a, query),
+        "__db_execute" => |vm, a| statement(vm, a, execute),
         "__db_connect" => crate::netdb::connect,
         "__redis_connect" => crate::netdb::connect_redis,
         "__redis" => crate::netdb::redis_command,
@@ -1629,7 +1864,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
                 return crate::netdb::start_query(vm, a);
             }
             // SQLite runs in the script's thread: the statement is done when it returns.
-            let r = if matches!(a[2], Value::Bool(true)) { execute(vm, a) } else { query(vm, a) };
+            let r = statement(vm, a, if matches!(a[2], Value::Bool(true)) { execute } else { query });
             crate::asyncio::ready(vm, r)
         },
         "__db_last_id" => |vm, a| {
@@ -1648,7 +1883,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             if cmd == "ROLLBACK" {
                 crate::orm::rolled_back();
             }
-            let r = transaction_step(vm, a, cmd);
+            let r = transaction_step_of(vm, a, cmd);
             if r.is_err() {
                 crate::orm::rolled_back();
             }

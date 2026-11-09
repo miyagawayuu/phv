@@ -14,8 +14,9 @@ pub struct Stmt {
     pub kind: StmtKind,
     pub span: Span,
     /// Set when the statement is in HTML other than element text (a
-    /// `<script>`, an attribute, a URL, CSS...): output written by the
-    /// functions it calls would land there, escaped only for text.
+    /// `<script>`, an attribute, a URL, CSS, `<svg>`, an open `<select>`...):
+    /// output written by the functions it calls would land there, escaped
+    /// only for text.
     pub out: Option<EchoContext>,
 }
 
@@ -117,8 +118,9 @@ pub enum EchoContext {
     /// Element content inside an open `<select>`. Older browsers ignore the
     /// start tag of a raw-text element such as `<title>` or `<style>` there
     /// and read its text as markup (R19-26), so `Html` inserted here may hold
-    /// none (the template that made it was checked on its own). Otherwise as
-    /// `Text`: functions called here may write output.
+    /// none (the template that made it was checked on its own), and functions
+    /// called here may not write output (their HTML was checked outside a
+    /// `<select>`; found by the 19th assessment).
     SelectText,
     /// A quoted attribute value.
     Attr,
@@ -156,8 +158,11 @@ pub enum EchoContext {
     /// Element content or a comment inside `<svg>` or `<math>`. Browsers read
     /// markup there as foreign content, while a template's or function's
     /// output was checked as HTML: `Html` is checked when it is inserted, and
-    /// functions called there may not write output.
-    ForeignText,
+    /// functions called there may not write output. The place `__html_inside`
+    /// checks it for: what the innermost open element is (`foreign svg`,
+    /// `foreign math`, `foreign html`, `foreign mathtext` or
+    /// `foreign annotation-xml`; see `htmlctx::foreign_insert_problem`).
+    ForeignText(&'static str),
     /// The text of a raw-text element such as `<textarea>` or `<title>` (its
     /// name): `Html` inserted there may not hold its end tag, and functions
     /// called there may not write output.

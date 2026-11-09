@@ -1,0 +1,9 @@
+caught a unique violation
+transaction() threw: transaction() did not commit: it was rolled back: a statement in it failed, and PostgreSQL ends a transaction at its first error (an inner transaction() around the statement lets the rest go on)
+row of a after update(): a2 5
+inner caught a unique violation
+outer transaction() threw: transaction() did not commit: it was rolled back: a statement in it failed, and PostgreSQL ends a transaction at its first error (an inner transaction() around the statement lets the rest go on)
+insert after: 1
+inner transaction() threw a unique violation
+transaction() threw: the transaction of transaction() has ended, and nothing more runs in it: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+rows seen: 4

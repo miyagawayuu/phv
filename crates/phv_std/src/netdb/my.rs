@@ -6,7 +6,7 @@ use super::pg::{check_statement, network_cause};
 use super::pool::{lock, Driver, Pooled};
 use super::query_async::Scalar;
 use super::R;
-use crate::db::{parts, render_sql, Dialect, ResultRows};
+use crate::db::{parts, render_sql, Dialect, Ended, ResultRows};
 use phv_vm::{DatabaseSpec, Value, Vm, VmError};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -27,12 +27,28 @@ pub(super) struct MyConn {
     /// be out of step and is not reused (found by the 1.1.1 audit: resetting
     /// it waited for the read timeout again).
     failed: Arc<std::sync::atomic::AtomicBool>,
+    /// `innodb_rollback_on_timeout`, once read (`rolls_back_on_timeout`).
+    rollback_on_timeout: Option<bool>,
 }
 
 impl MyConn {
     /// Notes the errors of a store's statements (see `failed`).
     pub(super) fn watch(&self) -> MyWatch {
         MyWatch(self.failed.clone())
+    }
+
+    /// Whether a lock wait timeout rolls the whole transaction back
+    /// (`innodb_rollback_on_timeout`, a server setting read once per
+    /// connection; when it cannot be read, taken as on this time).
+    pub(super) fn rolls_back_on_timeout(&mut self) -> bool {
+        use mysql::prelude::Queryable;
+        if self.rollback_on_timeout.is_none() {
+            match self.conn.query_first::<i64, _>("SELECT @@innodb_rollback_on_timeout") {
+                Ok(v) => self.rollback_on_timeout = Some(v != Some(0)),
+                Err(_) => return true,
+            }
+        }
+        self.rollback_on_timeout != Some(false)
     }
 }
 
@@ -140,7 +156,15 @@ pub(super) fn my_connect(
     let conn =
         crate::netio::with_deadline_in(&MY_CONNECTING, Instant::now() + timeout, move || mysql::Conn::new(builder))?
             .map_err(|e| my_message(&e))?;
-    Ok(MyConn { conn, timeout_ms: None, opts, jobs_tx: None, store_kill: None, failed: Default::default() })
+    Ok(MyConn {
+        conn,
+        timeout_ms: None,
+        opts,
+        jobs_tx: None,
+        store_kill: None,
+        failed: Default::default(),
+        rollback_on_timeout: None,
+    })
 }
 
 pub(super) fn my_message(e: &mysql::Error) -> String {
@@ -328,6 +352,21 @@ pub(super) fn my_error(vm: &Vm, c: &mut Pooled<MyConn>, e: mysql::Error) -> VmEr
             if m.code == 3024 || m.code == 1317 {
                 if let Err(fatal) = vm.check_limits() {
                     return fatal;
+                }
+            }
+            // 1213 (a deadlock) rolls the whole transaction back, and 1205 (a
+            // lock wait timeout) does with `innodb_rollback_on_timeout`: the
+            // statements after it would run outside any transaction (found by
+            // the 19th audit). What std.orm kept may be undone.
+            let whole = match m.code {
+                1213 => Some(Ended::Deadlock),
+                1205 if c.get().rolls_back_on_timeout() => Some(Ended::LockWait),
+                _ => None,
+            };
+            if let Some(ended) = whole {
+                crate::orm::rolled_back();
+                if c.depth > 0 && c.ended.is_none() {
+                    c.ended = Some(ended);
                 }
             }
         }

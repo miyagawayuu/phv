@@ -64,10 +64,13 @@ jobs:
             have=$(sha256sum "dl/$name.tar.gz" | cut -d' ' -f1)
             [[ -n "$want" && "$want" == "$have" ]] || { echo "::error::$name.tar.gz does not match SHA256SUMS"; exit 1; }
             tar -xzf "dl/$name.tar.gz" -C dl
-            [[ -f "dl/$name/phv" && ! -L "dl/$name/phv" ]] || { echo "::error::$name/phv is not a regular file"; exit 1; }
-            cp "dl/$name/phv" "ctx/$1/phv"
+            for f in phv THIRD-PARTY-LICENSES.txt LICENSE; do
+              [[ -f "dl/$name/$f" && ! -L "dl/$name/$f" ]] || { echo "::error::$name/$f is not a regular file"; exit 1; }
+            done
+            cp "dl/$name/phv" "dl/$name/THIRD-PARTY-LICENSES.txt" "ctx/$1/"
           done
           cp docker/Dockerfile ctx/
+          cp "dl/phv-$version-x86_64-unknown-linux-musl/LICENSE" ctx/
           echo "VERSION=$version" >> "$GITHUB_ENV"
       - name: Build and push
         env:

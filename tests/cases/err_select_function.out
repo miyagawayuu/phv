@@ -1,0 +1,5 @@
+<select><option>a</option><option>b</option><option>c</option><option value="d">d</option>
+</select>
+<select>
+--- runtime error ---
+Fatal error: a function wrote output inside a `<script>`, an attribute, a URL, CSS, a comment, `<svg>`/`<math>`, a `<select>` or the text of an element such as `<textarea>`, where HTML escaping does not protect it (or browsers read its markup in another way); return the value (or `Html`) from the function and insert it with `<?= ?>`

@@ -1,0 +1,14 @@
+<?phv
+// An exception thrown by a statement inside an open `<select>` and caught
+// outside it drops what the `try` block wrote, as inside a tag or `<script>`:
+// otherwise the `catch` block would write inside the `<select>` it left open,
+// where older browsers read its `<title>` as markup (found by the 19th
+// assessment).
+function label(): Html { throw new RuntimeException("no label"); }
+try {
+    ?><select><option>a</option><?= label() ?></select><?phv
+} catch (RuntimeException) {
+    ?><title>caught</title><?phv
+}
+?>
+<select><option>b</option></select>

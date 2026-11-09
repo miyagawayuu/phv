@@ -1752,6 +1752,7 @@ dependencies = [
  "rustls-pki-types",
  "serde_json",
  "sha2 0.10.9",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -1798,6 +1799,7 @@ dependencies = [
  "url",
  "webpki-roots",
  "windows-sys 0.61.2",
+ "zune-jpeg",
 ]
 
 [[package]]

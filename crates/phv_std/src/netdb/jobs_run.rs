@@ -490,6 +490,16 @@ const JOB_ADOPT_REDIS_PAGE: usize = 1000;
 /// Calls of the Redis script so far in this process (for the tests).
 pub(super) static REDIS_ADOPT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(test)]
+type AdoptHook = Option<Box<dyn FnMut(&str)>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Called between two pages of the Redis adoption, with the set (for the
+    /// tests: another client of the shared store changes it there).
+    pub(super) static BETWEEN_ADOPT_PAGES: std::cell::RefCell<AdoptHook> = const { std::cell::RefCell::new(None) };
+}
+
 fn adopt_state_name(state: i64) -> &'static str {
     match state {
         0 => "waiting",
@@ -561,6 +571,8 @@ pub fn job_adopt(
             break;
         }
     }
+    // Only the exact names, whatever the store's comparison.
+    left.retain(|j| names.contains(&j.name));
     let mut out: Vec<AdoptedJob> = left
         .iter()
         .map(|j| AdoptedJob {
@@ -724,14 +736,18 @@ fn pg_left_jobs(conn: &mut PgConn, src: &str, names: &[String], after: &str) -> 
         .collect()
 }
 
-/// `pg_left_jobs` on MySQL.
+/// `pg_left_jobs` on MySQL. The names are compared byte for byte, as
+/// PostgreSQL and Redis compare them, not by the column's collation, which
+/// ignores case and accents by default (found by the 19th assessment: a
+/// shared job named `SEND_MAIL` was moved with the site's `send_mail`).
 fn my_left_jobs(conn: &mut MyConn, src: &str, names: &[String], after: &str) -> Result<Vec<LeftJob>, String> {
     use mysql::prelude::Queryable;
     let w = conn.watch();
-    let marks = vec!["?"; names.len()].join(", ");
+    let marks = vec!["CAST(? AS BINARY)"; names.len()].join(", ");
     let sql = format!(
         "SELECT id, name, state, uniq, LENGTH(payload) FROM {src} \
-         WHERE state IN (0, 1, 2) AND name IN ({marks}) AND id > ? ORDER BY id LIMIT {JOB_ADOPT_PAGE}"
+         WHERE state IN (0, 1, 2) AND CAST(name AS BINARY) IN ({marks}) AND id > ? ORDER BY id \
+         LIMIT {JOB_ADOPT_PAGE}"
     );
     let mut params: Vec<mysql::Value> = names.iter().map(|n| mysql::Value::from(n.as_str())).collect();
     params.push(mysql::Value::from(after));
@@ -944,47 +960,76 @@ fn my_job_adopt_batch(
 
 /// KEYS: the shared prefix, the site's. ARGV: "dry" | "move", the site's cap
 /// of jobs, its cap of bytes, the set to look at ("running", "due" or
-/// "dead"), the first rank and the count of ids of it to look at, what the
-/// site's store holds (jobs, bytes: -1 to count it), then the names of the
-/// site's jobs. Reply: the ids looked at, the ids removed from the set, the
-/// site's jobs and bytes after this call, then a flat list, for each job of
+/// "dead"), the place to go on from (the score and the id of the last id
+/// looked at; "" and "" for the start), the count of ids to look at, what
+/// the site's store holds (jobs, bytes: -1 to count it), then the names of
+/// the site's jobs. Reply: the ids looked at, the ids removed from the set,
+/// the site's jobs and bytes after this call, a flat list, for each job of
 /// those names: id, name, state, outcome ("moved", "running", "key",
-/// "full"). A running job is reported and left; a job whose key the site's
-/// store has, or that does not fit under its caps, is left too. Moving a job
-/// renames its hash and its key, and moves its id from one set to the other
-/// with its score; the shared byte count goes down by its payload and the
-/// site's is set to what it counted. One call looks at a page of ids, so
-/// other clients of the server wait a few milliseconds at most (found by the
-/// 18th assessment: one call over the whole store held them 0.7 s).
+/// "full"), then the score and the id of the last id looked at. A running
+/// job is reported and left; a job whose key the site's store has, or that
+/// does not fit under its caps, is left too. Moving a job renames its hash
+/// and its key, and moves its id from one set to the other with its score;
+/// the shared byte count goes down by its payload and the site's is set to
+/// what it counted. One call looks at a page of ids, so other clients of
+/// the server wait a few milliseconds at most (found by the 18th assessment:
+/// one call over the whole store held them 0.7 s). A page starts after the
+/// last id looked at, by its score and id (the set's own order), counted
+/// when the page is read: ids that another client removed meanwhile, ahead
+/// of it or the last id itself, do not make it skip any (found by the 19th
+/// assessment: paged by rank, a page started past some of the site's jobs).
 static REDIS_JOB_ADOPT: LuaScript = LuaScript::new(
     r#"
 local s, d = KEYS[1], KEYS[2]
 local move = ARGV[1] == 'move'
 local cap, capb = tonumber(ARGV[2]), tonumber(ARGV[3])
-local set, start, count = ARGV[4], tonumber(ARGV[5]), tonumber(ARGV[6])
-local n, bytes = tonumber(ARGV[7]), tonumber(ARGV[8])
+local set, after_score, after_id, count = ARGV[4], ARGV[5], ARGV[6], tonumber(ARGV[7])
+local n, bytes = tonumber(ARGV[8]), tonumber(ARGV[9])
 local names = {}
-for i = 9, #ARGV do names[ARGV[i]] = true end
+for i = 10, #ARGV do names[ARGV[i]] = true end
 if move or n < 0 then
   n = redis.call('ZCARD', d .. 'due') + redis.call('ZCARD', d .. 'running')
   bytes = math.max(tonumber(redis.call('GET', d .. 'bytes') or '0'), 0)
+end
+-- Whether a <= b, byte by byte (the order of members of one score).
+local function not_after(a, b)
+  for i = 1, math.min(#a, #b) do
+    local x, y = string.byte(a, i), string.byte(b, i)
+    if x ~= y then return x < y end
+  end
+  return #a <= #b
+end
+-- The rank of the first id after (after_score, after_id) in set z: the ids of
+-- lower scores, and those of that score up to after_id (a binary search).
+local function start_of(z)
+  if after_score == '' then return 0 end
+  local below = redis.call('ZCOUNT', z, '-inf', '(' .. after_score)
+  local lo, hi = 0, redis.call('ZCOUNT', z, after_score, after_score)
+  while lo < hi do
+    local mid = math.floor((lo + hi) / 2)
+    local m = redis.call('ZRANGEBYSCORE', z, after_score, after_score, 'LIMIT', mid, 1)[1]
+    if m and not_after(m, after_id) then lo = mid + 1 else hi = mid end
+  end
+  return below + lo
 end
 local out = {}
 local function put(id, name, state, what)
   out[#out + 1] = id; out[#out + 1] = name; out[#out + 1] = state; out[#out + 1] = what
 end
 local looked, removed, moved = 0, 0, 0
+local start = start_of(s .. set)
+local ids = redis.call('ZRANGE', s .. set, start, start + count - 1, 'WITHSCORES')
+looked = #ids / 2
+local last_score, last_id = after_score, after_id
+if looked > 0 then last_score, last_id = ids[#ids], ids[#ids - 1] end
 if set == 'running' then
-  local ids = redis.call('ZRANGE', s .. 'running', start, start + count - 1)
-  looked = #ids
-  for _, id in ipairs(ids) do
+  for i = 1, #ids, 2 do
+    local id = ids[i]
     local name = redis.call('HGET', s .. 'job:' .. id, 'name')
     if name and names[name] then put(id, name, 'running', 'running') end
   end
 else
   local state = set == 'due' and 'waiting' or 'failed'
-  local ids = redis.call('ZRANGE', s .. set, start, start + count - 1, 'WITHSCORES')
-  looked = #ids / 2
   for i = 1, #ids, 2 do
     local id = ids[i]
     local k = s .. 'job:' .. id
@@ -1021,13 +1066,13 @@ else
   end
 end
 if moved > 0 then redis.call('SET', d .. 'bytes', bytes) end
-return {looked, removed, n, bytes, out}
+return {looked, removed, n, bytes, out, last_score, last_id}
 "#,
 );
 
 /// `job_adopt` on Redis: the script (see `REDIS_JOB_ADOPT`) over each set of
-/// the shared store, a page of ids per call; the ids a call removed shift
-/// the next page's rank.
+/// the shared store, a page of ids per call, each page after the last id the
+/// call before looked at.
 fn redis_job_adopt(
     spec: &DatabaseSpec,
     ns: Option<&str>,
@@ -1055,9 +1100,10 @@ fn redis_job_adopt(
     // dry run (a move reads it from the store, which it keeps up to date).
     let (mut n, mut bytes) = (-1i64, -1i64);
     for set in ["running", "due", "dead"] {
-        let mut start = 0usize;
+        // The score and the id of the last id looked at.
+        let (mut after_score, mut after_id) = (Vec::new(), Vec::new());
         loop {
-            let (start_s, n_s, bytes_s) = (start.to_string(), n.to_string(), bytes.to_string());
+            let (n_s, bytes_s) = (n.to_string(), bytes.to_string());
             let mut args: Vec<&[u8]> = vec![
                 b"2",
                 src.as_bytes(),
@@ -1066,7 +1112,8 @@ fn redis_job_adopt(
                 jobs_cap.as_bytes(),
                 bytes_cap.as_bytes(),
                 set.as_bytes(),
-                start_s.as_bytes(),
+                &after_score,
+                &after_id,
                 page.as_bytes(),
                 n_s.as_bytes(),
                 bytes_s.as_bytes(),
@@ -1077,12 +1124,14 @@ fn redis_job_adopt(
             let Reply::Array(reply) = job_redis_result(c, r)? else {
                 return Err(invalid());
             };
-            let (Some(looked), Some(removed), Some(jobs), Some(size)) =
+            let (Some(looked), Some(_removed), Some(jobs), Some(size)) =
                 (int(reply.first()), int(reply.get(1)), int(reply.get(2)), int(reply.get(3)))
             else {
                 return Err(invalid());
             };
-            let Some(Reply::Array(items)) = reply.get(4) else {
+            let (Some(Reply::Array(items)), Some(Reply::Bulk(score)), Some(Reply::Bulk(id))) =
+                (reply.get(4), reply.get(5), reply.get(6))
+            else {
                 return Err(invalid());
             };
             (n, bytes) = (jobs, size);
@@ -1104,7 +1153,13 @@ fn redis_job_adopt(
             if looked < JOB_ADOPT_REDIS_PAGE as i64 {
                 break;
             }
-            start += (looked - removed).max(0) as usize;
+            (after_score, after_id) = (score.clone(), id.clone());
+            #[cfg(test)]
+            BETWEEN_ADOPT_PAGES.with(|h| {
+                if let Some(f) = h.borrow_mut().as_mut() {
+                    f(set)
+                }
+            });
         }
     }
     Ok(out)

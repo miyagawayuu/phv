@@ -1,0 +1,9 @@
+<?phv
+// A function may not end inside a `<select>` it opened: what follows its call
+// was checked outside one (found by the 19th assessment).
+function opens(): void {
+    ?><select><?phv
+}
+$u = "javascript:alert(1)";
+?>
+<?phv opens(); ?><title></select><a href="<?= $u ?>">x</a></title>

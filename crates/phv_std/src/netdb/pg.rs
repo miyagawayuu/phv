@@ -540,12 +540,26 @@ pub(super) fn pg_run<T>(
     Ok(r)
 }
 
+/// How `leading_words` reads comments.
+#[derive(Clone, Copy)]
+enum Comments {
+    /// PostgreSQL: every `/* */` is a comment, and they nest (`/*!` too:
+    /// PostgreSQL has no versioned comments).
+    Postgres,
+    /// MySQL: a comment ends at the first `*/`. The words of a versioned
+    /// comment (`/*!NNNNN … */`, MariaDB's `/*M!NNNNN … */`) are run by a
+    /// server of version NNNNN or later and skipped by an older one: this
+    /// reading takes them when NNNNN is at most `upto`, and records the other
+    /// versions it skipped in `skipped`. `/*!` without a version is always run.
+    MySql { upto: u64 },
+}
+
 /// The first `n` words of a statement, in upper case, after any leading
-/// comments (`--`, `#`, `/* */`; a MySQL `/*! */` is run, so its words count).
-/// Comments may also stand between words (`XA/**/PREPARE`), so they are
-/// separators wherever they are; PostgreSQL nests `/* */` comments (`nested`),
-/// MySQL ends one at the first `*/`.
-fn leading_words(text: &str, n: usize, nested: bool) -> Vec<String> {
+/// comments (`--`, `#`, `/* */`; see `Comments` for `/*!`). Comments may also
+/// stand between words (`XA/**/PREPARE`), so they are separators wherever
+/// they are.
+fn leading_words(text: &str, n: usize, comments: Comments, skipped: &mut Vec<u64>) -> Vec<String> {
+    let nested = matches!(comments, Comments::Postgres);
     let b = text.as_bytes();
     let mut words: Vec<String> = Vec::new();
     let mut word: Vec<u8> = Vec::new();
@@ -558,12 +572,33 @@ fn leading_words(text: &str, n: usize, nested: bool) -> Vec<String> {
                 word.clear();
             }
         };
-        if rest.starts_with(b"/*!") {
-            // MySQL runs the words inside: only the opener and its version number go.
+        let versioned = match comments {
+            Comments::MySql { .. } if rest.starts_with(b"/*!") => Some(3),
+            Comments::MySql { .. } if rest.starts_with(b"/*M!") => Some(4),
+            _ => None,
+        };
+        if let (Some(open), Comments::MySql { upto }) = (versioned, comments) {
             end_word(&mut word, &mut words);
-            i += 3;
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
+            i += open;
+            let digits = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+            let version = (digits > 0).then(|| {
+                b[i..i + digits].iter().fold(0u64, |v, d| v.saturating_mul(10).saturating_add((d - b'0') as u64))
+            });
+            i += digits;
+            match version {
+                // Run by this reading's server: only the opener and its version number go.
+                None => {}
+                Some(v) if v <= upto => {}
+                // Skipped by this reading's server: the whole comment goes.
+                Some(v) => {
+                    if !skipped.contains(&v) {
+                        skipped.push(v);
+                    }
+                    while i < b.len() && !b[i..].starts_with(b"*/") {
+                        i += 1;
+                    }
+                    i = (i + 2).min(b.len());
+                }
             }
         } else if rest.starts_with(b"/*") {
             end_word(&mut word, &mut words);
@@ -610,7 +645,104 @@ fn leading_words(text: &str, n: usize, nested: bool) -> Vec<String> {
 /// 1.2 audit), and `LOAD DATA LOCAL INFILE` would send the server a file of
 /// this host.
 pub(super) fn refused_statement(text: &str, kind: Kind) -> Option<String> {
-    let words = leading_words(text, 4, matches!(kind, Kind::Postgres));
+    let Some(readings) = readings(text, 4, kind) else {
+        return Some(format!(
+            "a statement that starts with versioned comments of more than {MAX_VERSIONS} versions (/*!NNNNN … */) is not allowed"
+        ));
+    };
+    // MySQL: refused when the server of any version would run a refused
+    // statement (found by the 19th audit: `/*!99999 x */ XA PREPARE 'x'` was
+    // read as `X XA PREPARE`, which a server older than 9.99.99 runs as
+    // `XA PREPARE`).
+    readings.iter().find_map(|words| refused_words(words, kind))
+}
+
+/// Distinct versions of versioned comments a MySQL statement may start with
+/// (each gives one more reading of it; see `readings`).
+const MAX_VERSIONS: usize = 16;
+
+/// The first `n` words of `text` as each server could read them: one reading
+/// on PostgreSQL; on MySQL one for each version of its versioned comments (a
+/// server runs those of its version or older: the reading that skips all of
+/// them, then one up to each version). None when the statement starts with
+/// versioned comments of more than `MAX_VERSIONS` versions.
+fn readings(text: &str, n: usize, kind: Kind) -> Option<Vec<Vec<String>>> {
+    let mut versions = Vec::new();
+    if kind != Kind::MySql {
+        return Some(vec![leading_words(text, n, Comments::Postgres, &mut versions)]);
+    }
+    // Skipping them all scans furthest: every version that any reading meets is met here.
+    let mut out = vec![leading_words(text, n, Comments::MySql { upto: 0 }, &mut versions)];
+    if versions.len() > MAX_VERSIONS {
+        return None;
+    }
+    versions.sort_unstable();
+    for &v in &versions {
+        out.push(leading_words(text, n, Comments::MySql { upto: v }, &mut Vec::new()));
+    }
+    Some(out)
+}
+
+/// Every reading of the first `n` words of a statement of `dialect` (see
+/// `readings`). SQLite ends a comment at the first `*/` and has no versioned
+/// comments: both ways of reading comments are taken.
+fn all_readings(text: &str, n: usize, dialect: Dialect) -> Vec<Vec<String>> {
+    match dialect {
+        Dialect::Postgres => readings(text, n, Kind::Postgres).unwrap_or_default(),
+        Dialect::MySql => readings(text, n, Kind::MySql)
+            .unwrap_or_else(|| vec![leading_words(text, n, Comments::MySql { upto: u64::MAX }, &mut Vec::new())]),
+        Dialect::Sqlite => vec![
+            leading_words(text, n, Comments::Postgres, &mut Vec::new()),
+            leading_words(text, n, Comments::MySql { upto: 0 }, &mut Vec::new()),
+        ],
+    }
+}
+
+/// False when the statement plainly starts with a word other than `words`
+/// (the common case, decided without reading comments); true when it starts
+/// with one of them, or with anything else than a letter (a comment).
+fn first_word_may_be(text: &str, words: &[&str]) -> bool {
+    let t = text.trim_start();
+    let len = t.bytes().take_while(|b| b.is_ascii_alphabetic()).count();
+    len == 0 || words.iter().any(|w| t[..len].eq_ignore_ascii_case(w))
+}
+
+/// Whether a statement written as SQL may undo writes of the open
+/// transaction: `ROLLBACK` (also `ROLLBACK TO SAVEPOINT`), `ABORT`,
+/// `XA ROLLBACK`. Every reading of its comments counts (std.orm then forgets
+/// too much rather than too little).
+pub(crate) fn may_roll_back(text: &str, dialect: Dialect) -> bool {
+    if !first_word_may_be(text, &["ROLLBACK", "ABORT", "XA"]) {
+        return false;
+    }
+    all_readings(text, 2, dialect).iter().any(|w| {
+        let word = |i: usize| w.get(i).map_or("", String::as_str);
+        matches!(word(0), "ROLLBACK" | "ABORT") || (word(0), word(1)) == ("XA", "ROLLBACK")
+    })
+}
+
+/// Whether a statement written as SQL ends the open transaction: `COMMIT`,
+/// `END`, `ROLLBACK`, `ABORT` (not `ROLLBACK TO`, nor `… PREPARED`), and on
+/// MySQL `BEGIN` and `START TRANSACTION`, which commit the open one. Every
+/// reading of its comments counts.
+pub(crate) fn ends_transaction(text: &str, dialect: Dialect) -> bool {
+    if !first_word_may_be(text, &["COMMIT", "END", "ROLLBACK", "ABORT", "BEGIN", "START"]) {
+        return false;
+    }
+    all_readings(text, 3, dialect).iter().any(|w| {
+        let word = |i: usize| w.get(i).map_or("", String::as_str);
+        let to = word(1) == "TO" || (matches!(word(1), "WORK" | "TRANSACTION") && word(2) == "TO");
+        match word(0) {
+            "COMMIT" | "END" | "ROLLBACK" | "ABORT" => !to && word(1) != "PREPARED",
+            "BEGIN" => dialect == Dialect::MySql,
+            "START" => dialect == Dialect::MySql && word(1) == "TRANSACTION",
+            _ => false,
+        }
+    })
+}
+
+/// `refused_statement` for one reading of a statement.
+fn refused_words(words: &[String], kind: Kind) -> Option<String> {
     let word = |i: usize| words.get(i).map_or("", String::as_str);
     let two = (word(0), word(1));
     match kind {

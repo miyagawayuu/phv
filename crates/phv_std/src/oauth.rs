@@ -435,6 +435,51 @@ fn begin(vm: &mut Vm, a: &[Value]) -> R {
     Ok(Value::str(url))
 }
 
+/// Whether `iss` is the issuer of a provider in `[oauth]` (with or without
+/// a trailing `/`).
+fn names_another_issuer(vm: &Vm, iss: &str) -> bool {
+    let bare = |s: &str| s.trim_end_matches('/').to_string();
+    vm.host.oauth.values().filter_map(|o| o.issuer.as_deref()).any(|issuer| bare(issuer) == bare(iss))
+}
+
+/// States this process used, by a digest, with when they expire; and their
+/// order, oldest first. At most `USED_MAX` are kept: past that the oldest
+/// goes (it can then be used once more, as without this list).
+struct Used {
+    seen: HashMap<[u8; 16], i64>,
+    order: std::collections::VecDeque<([u8; 16], i64)>,
+}
+
+const USED_MAX: usize = 100_000;
+
+static USED: LazyLock<Mutex<Used>> =
+    LazyLock::new(|| Mutex::new(Used { seen: HashMap::new(), order: std::collections::VecDeque::new() }));
+
+/// Marks a sign-in's state used; false if this process used it already.
+fn use_state(state: &str, started: i64) -> bool {
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&Sha256::digest(state.as_bytes())[..16]);
+    let expires = started.saturating_add(PENDING_TTL);
+    let now = now();
+    let mut used = USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Used { seen, order } = &mut *used;
+    while let Some(&(k, e)) = order.front() {
+        if e > now && order.len() < USED_MAX {
+            break;
+        }
+        order.pop_front();
+        if seen.get(&k) == Some(&e) {
+            seen.remove(&k);
+        }
+    }
+    if seen.contains_key(&key) {
+        return false;
+    }
+    seen.insert(key, expires);
+    order.push_back((key, expires));
+    true
+}
+
 fn query(vm: &Vm, k: &str) -> Option<String> {
     vm.http.query.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
 }
@@ -466,13 +511,29 @@ fn finish(vm: &mut Vm, a: &[Value]) -> R {
     };
     let p = list.remove(i);
     save_pending(vm, &list)?;
+    // The session is written whole at the end of each request, so another
+    // request of this session that read it before this one used the state
+    // (a sign-in started in a second tab) writes the state back. This process
+    // remembers the states it used for their lifetime (R22-25).
+    if !use_state(&p.state, p.started) {
+        return Ok(error_map(
+            "invalid_state",
+            "this sign-in was not started in this browser session, was already finished, or took more than 10 minutes",
+        ));
+    }
     let ep = endpoints(vm, &name, &spec)?;
     // RFC 9207: an `iss` in the answer names the provider that sent it, an
     // error answer too (so another provider's error is not shown as this
     // one's); and a provider whose discovery document says it always sends
     // `iss` must (2.4): an answer without it may be another provider's.
+    // A provider without an issuer (OAuth 2.0) has no `iss` of its own, so an
+    // answer naming the issuer of another provider of this site is that
+    // provider's (a mix-up on a shared callback page, R22-14).
     match (query(vm, "iss"), &spec.issuer) {
         (Some(iss), Some(issuer)) if &iss != issuer => {
+            return Ok(error_map("invalid_issuer", "the answer came from another provider"));
+        }
+        (Some(iss), None) if names_another_issuer(vm, &iss) => {
             return Ok(error_map("invalid_issuer", "the answer came from another provider"));
         }
         (None, Some(_)) if ep.iss_always => {

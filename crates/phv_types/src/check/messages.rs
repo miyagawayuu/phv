@@ -2,7 +2,7 @@
 //! `t_html()` (or of `Translator`'s `t()`, `tn()` and `html()`) whose key is
 //! a string literal must name a message of the default catalog, of the kind
 //! the function takes (plural for `tn()`), and, when its parameters are a
-//! map literal with literal keys (or left out), give each placeholder of the
+//! map literal with literal keys (`[]` too, or left out), give each placeholder of the
 //! message. Keys and parameters computed at run time are checked when the
 //! page runs.
 
@@ -70,6 +70,8 @@ impl Checker<'_> {
         // The parameters given, when all are known here.
         let given: Option<Vec<&str>> = match arg(args, params_at, "params").map(|e| &e.kind) {
             None => Some(Vec::new()),
+            // `[]` is read as an empty list, and is an empty map here.
+            Some(ExprKind::List(items)) if items.is_empty() => Some(Vec::new()),
             Some(ExprKind::Map(entries)) => entries
                 .iter()
                 .map(|(k, _)| match &k.kind {

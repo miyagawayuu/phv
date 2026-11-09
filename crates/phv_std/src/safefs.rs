@@ -197,19 +197,23 @@ impl DirGuard {
 pub struct FileId(u64, u64);
 
 /// What can be known of a file's content without reading it: which file it
-/// is (see `FileId`), its size and when it was last written (on Unix also
-/// when its inode last changed, which a program cannot set back). Two equal
-/// stamps taken at different times are the same file, unchanged in between,
-/// unless it was written again within the clock's resolution of the first
-/// stamp (the callers' "racy" rule) or its write time was set back (on
-/// Windows; on Unix the change time sees that too).
+/// is (see `FileId`), its size, when it was last written and when it last
+/// changed (the inode's change time on Unix, which a program cannot set back;
+/// NTFS's ChangeTime on Windows, which setting the write time back changes).
+/// Two equal stamps taken at different times are the same file, unchanged in
+/// between, unless it was written again within the clock's resolution of the
+/// first stamp (the callers' "racy" rule), or (on Windows) a program set both
+/// times back through the native API, or the file system keeps no change
+/// time (FAT and exFAT; a network share may not either).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
     file: FileId,
     len: u64,
     /// Seconds and nanoseconds since the epoch (None: before it).
     written: Option<(u64, u32)>,
-    /// The inode's change time on Unix (seconds, nanoseconds); zero on Windows.
+    /// The change time (seconds, nanoseconds since the epoch): the inode's on
+    /// Unix, the file's ChangeTime on Windows (NTFS); zero where the file
+    /// system keeps none.
     changed: (i64, i64),
     is_file: bool,
 }
@@ -234,8 +238,14 @@ impl Stamp {
         self.written
     }
 
-    /// Whether the file was last written (on Unix: changed in any way) more
-    /// than two seconds before `at` (seconds since the epoch). A file stamped
+    /// When the file last changed in any way (seconds and nanoseconds since
+    /// the epoch; zero where the file system keeps no change time).
+    pub fn changed(&self) -> (i64, i64) {
+        self.changed
+    }
+
+    /// Whether the file was last written and changed in any way more than two
+    /// seconds before `at` (seconds since the epoch). A file stamped
     /// at `at` that was not could have been written again within the clock's
     /// resolution without its stamp changing (the "racy" case). A time before
     /// the epoch is never settled.
@@ -603,7 +613,8 @@ mod imp {
     use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
     use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, GetFinalPathNameByHandleW, GetLongPathNameW, BY_HANDLE_FILE_INFORMATION,
+        FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+        GetLongPathNameW, BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO,
     };
 
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -868,11 +879,34 @@ mod imp {
         let secs = ticks / 10_000_000;
         let written = (secs >= EPOCH).then(|| (secs - EPOCH, ((ticks % 10_000_000) * 100) as u32));
         let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        // The change time (NTFS's ChangeTime, as Unix's ctime): the file
+        // system sets it on every write and on every change of the file's
+        // attributes, its write time included, so a rewrite of the same size
+        // that puts the old write time back changes it.
+        // SAFETY: `basic` is plain data of the size given, filled by the call; the handle is open.
+        let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<FILE_BASIC_INFO>() as u32;
+        let got = unsafe {
+            GetFileInformationByHandleEx(
+                f.as_raw_handle(),
+                FileBasicInfo,
+                (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                size,
+            )
+        };
+        if got == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let ticks = u64::try_from(basic.ChangeTime).unwrap_or(0);
+        let changed = match (ticks / 10_000_000).checked_sub(EPOCH) {
+            Some(secs) => (secs as i64, ((ticks % 10_000_000) * 100) as i64),
+            None => (0, 0),
+        };
         Ok(super::Stamp {
             file: super::FileId(u64::from(info.dwVolumeSerialNumber), index),
             len: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
             written,
-            changed: (0, 0),
+            changed,
             // Any reparse point counts as not a plain file here (its stamp is
             // then never taken for an earlier one's).
             is_file: info.dwFileAttributes & (ATTR_DIRECTORY | ATTR_REPARSE_POINT) == 0,
@@ -1359,6 +1393,32 @@ mod tests {
         assert!(std::fs::rename(base.join("sub"), base.join("moved")).is_err());
         drop(g);
         assert!(std::fs::rename(base.join("sub"), base.join("moved")).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A file rewritten in place with text of the same size, its old write
+    /// time then put back, has another stamp: the change time (also on
+    /// Windows, where it was left out) sees the rewrite. The loader's memo
+    /// took the two for the same file and served the old page.
+    #[test]
+    fn a_rewrite_with_the_old_write_time_changes_the_stamp() {
+        let d = tmp("stamp");
+        let path = d.join("data/page.phv");
+        std::fs::write(&path, "version-A").unwrap();
+        let old = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let before = stamp_path(&path).unwrap();
+        assert_eq!(stamp_path(&path).unwrap(), before);
+        // NTFS keeps the change time to 100 ns, ext4 to 1 ns; other file
+        // systems more coarsely.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all(b"version-B").unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+        let after = stamp_path(&path).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified(), before.modified());
+        assert_ne!(after, before, "the same stamp after a rewrite");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

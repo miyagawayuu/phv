@@ -545,3 +545,39 @@ fn idle_connections_hold_a_bounded_memory() {
     assert_eq!(site.run(&in_list("db", "data/c.db", 2000), None), "0");
     assert_eq!(reused(), before, "a connection over the cap was kept");
 }
+
+/// A `COMMIT` that fails (`database is locked`: another connection reads the
+/// file) rolls the transaction back and ends it: the script's later writes
+/// and transactions are committed (found by the 19th audit: the transaction
+/// stayed open at its depth, the script saw three rows, and the file held
+/// none once the connection was given back).
+#[test]
+fn a_commit_that_fails_ends_the_transaction() {
+    let site = Site::new("busy-commit");
+    let script = "$r = Database::open(\"data/t.db\");
+$w = Database::open(\"data/t.db\");
+$w->execute(sql\"CREATE TABLE t (name TEXT)\");
+$r->transaction(function () use ($r, $w): void {
+    $r->query(sql\"SELECT * FROM t\");
+    try {
+        $w->transaction(function () use ($w): void {
+            $w->execute(sql\"INSERT INTO t VALUES ('mk1')\");
+        });
+        echo \"committed\\n\";
+    } catch (DatabaseError $e) {
+        echo \"transaction() threw: \", $e->getMessage(), \"\\n\";
+    }
+});
+echo \"insert mk2: \", $w->execute(sql\"INSERT INTO t VALUES ('mk2')\"), \"\\n\";
+$w->transaction(function () use ($w): void {
+    $w->execute(sql\"INSERT INTO t VALUES ('mk3')\");
+});
+echo \"rows seen: \", $w->first(sql\"SELECT count(*) AS n FROM t\")?->int(\"n\") ?? -1, \"\\n\";";
+    assert_eq!(
+        site.run(script, Some(Duration::from_secs(30))),
+        "transaction() threw: database is locked\ninsert mk2: 1\nrows seen: 2\n"
+    );
+    let check = "$db = Database::open(\"data/t.db\");
+foreach ($db->query(sql\"SELECT name FROM t ORDER BY name\") as $row) { echo $row->string(\"name\") ?? \"\", \" \"; }";
+    assert_eq!(site.run(check, None), "mk2 mk3 ");
+}

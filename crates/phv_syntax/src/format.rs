@@ -493,6 +493,10 @@ fn trailing_comma_ok(toks: &[Token], o: usize) -> bool {
     // `$x->default(` / `$x->list[`: a member name may be a keyword.
     let member = matches!(prev(2), Some(Tok::Arrow | Tok::NullsafeArrow | Tok::DoubleColon));
     match toks[o].tok {
+        // `yield from (...)`: `from` after `yield` is a keyword, not a call.
+        Tok::LParen if matches!(prev(1), Some(Tok::Ident(n)) if n == "from") && matches!(prev(2), Some(Tok::Yield)) => {
+            false
+        }
         Tok::LParen => {
             member
                 || matches!(
@@ -664,6 +668,35 @@ mod tests {
         // Nothing to split: the line stays long.
         wraps(10, "$averyveryverylongname = 1;\n", "$averyveryverylongname = 1;\n");
         wraps(10, "f($averyveryverylongname);\n", "f($averyveryverylongname);\n");
+    }
+
+    /// The syntax tree of `src`, without positions.
+    fn tree(src: &str) -> String {
+        let (module, diags) = crate::parser::parse_module(src, 0, false);
+        assert!(diags.is_empty(), "{src}: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+        let mut t = format!("{module:?}");
+        // `Span { start: 1, end: 2 }` and the like.
+        while let Some(at) = t.find("Span {") {
+            let end = at + t[at..].find('}').unwrap() + 1;
+            t.replace_range(at..end, "Span");
+        }
+        t
+    }
+
+    /// `yield from (...)` is a delegation over a parenthesized value, not a
+    /// call of `from`: wrapping it adds no trailing comma (it gave
+    /// `yield from ([...],);`, which does not parse), and the program it
+    /// gives parses to the same tree.
+    #[test]
+    fn yield_from_takes_no_trailing_comma() {
+        let src = "<?phv\nfunction g(): Generator<int> {\nyield from ([300000, 400000]);\nyield from([500000, 600000]);\nyield f(100000, 200000);\n}\n";
+        let once = format_source_width(src, 12).unwrap();
+        assert_eq!(format_source_width(&once, 12).unwrap(), once, "not idempotent");
+        assert!(once.contains("yield from (\n        [\n"), "{once}");
+        assert!(!once.contains("],\n    );"), "{once}");
+        // A call is still a call.
+        assert!(once.contains("yield f(\n        100000,\n        200000,\n    );"), "{once}");
+        assert_eq!(tree(&once), tree(src));
     }
 
     #[test]

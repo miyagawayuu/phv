@@ -1,0 +1,51 @@
+<?phv
+// An override cannot be less visible than the method it replaces (as in
+// PHP): the parent's method can be called through the parent's type, which
+// would run the private body from outside its class.
+class P0 {
+    public function f(): string { return "p0"; }
+    protected function g(): string { return "p0"; }
+    public static function s(): string { return "p0"; }
+    private function h(): string { return "p0"; }
+}
+class C0 extends P0 {
+    private function f(): string { return "c0"; }
+    private function g(): string { return "c0"; }
+    protected static function s(): string { return "c0"; }
+    // A private method is not inherited: this one overrides nothing.
+    private function h(): string { return "c0"; }
+}
+class C1 extends P0 {
+    protected function f(): string { return "c1"; }
+    // Wider is allowed.
+    public function g(): string { return "c1"; }
+}
+function callF(P0 $p): string { return $p->f(); }
+
+// Through a trait: `as private` (or `as protected`) on a method that
+// overrides an inherited public one.
+trait Lower {
+    public function f(): string { return "t"; }
+}
+class C2 extends P0 {
+    use Lower { f as private; }
+}
+class C3 extends P0 {
+    use Lower { f as protected; }
+}
+// A trait's own private method overriding a public one.
+trait Hidden {
+    private function f(): string { return "t"; }
+}
+class C4 extends P0 {
+    use Hidden;
+}
+// An alias keeps the original name public: allowed.
+class C5 extends P0 {
+    use Lower { f as private lowered; }
+}
+// Deeper: the grandparent's method is public, the parent's too.
+class C6 extends C1 {
+    private function g(): string { return "c6"; }
+}
+echo callF(new C2());

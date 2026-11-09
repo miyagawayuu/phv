@@ -317,6 +317,9 @@ pub struct HttpCtx {
     /// The locale of the request for `std.i18n` (one of `[i18n] locales`):
     /// chosen by `set_locale()`, or from `Accept-Language` when first needed.
     pub locale: Option<String>,
+    /// The locale came from `Accept-Language`: the response varies by it
+    /// (`phv serve` sends `Vary: Accept-Language`).
+    pub locale_from_header: bool,
 }
 
 /// The trace of a request or job whose spans are exported (`[telemetry]`).
@@ -447,6 +450,7 @@ impl Default for HttpCtx {
             flushed: false,
             trace: None,
             locale: None,
+            locale_from_header: false,
         }
     }
 }
@@ -513,6 +517,9 @@ pub struct Host {
     pub store_namespace: Option<String>,
     /// Sign-in providers, by name (`[oauth]` in phv.toml).
     pub oauth: std::collections::BTreeMap<String, OAuthSpec>,
+    /// The address `phv serve` listens on: scripts it runs cannot connect to
+    /// it (a page waiting for its own server holds a worker). None elsewhere.
+    pub listen: Option<std::net::SocketAddr>,
 }
 
 /// `[jobs]` of phv.toml, as `std.jobs` uses it.
@@ -897,7 +904,7 @@ struct Handler {
 
 /// Why output was refused (see `Vm::guards`).
 const GUARDED_OUTPUT: &str = "a function wrote output inside a `<script>`, an attribute, a URL, CSS, a comment, \
-    `<svg>`/`<math>` or the text of an element such as `<textarea>`, where HTML escaping does not protect it (or \
+    `<svg>`/`<math>`, a `<select>` or the text of an element such as `<textarea>`, where HTML escaping does not protect it (or \
     browsers read its markup in another way); return the value (or `Html`) from the function and insert it with `<?= ?>`";
 
 /// Why a caught exception stopped the page (see `Vm::output_flushed`).
@@ -1124,13 +1131,16 @@ pub(crate) fn str_len(v: &Value) -> usize {
 }
 
 /// Returns the bytes it went over (appended, and copied when the string was shared).
+/// Always inlined: `$s .= ...` in a loop is a hot path, and whole-program
+/// optimization otherwise decides afresh with every change elsewhere.
+#[inline(always)]
 pub(crate) fn op_append(regs: &mut [Value], mem: MemLimit, d: Reg, s: Reg) -> Result<usize, usize> {
     let src = regs[s as usize].clone();
     append_value(&mut regs[d as usize], &src, mem)
 }
 
 /// `$target .= $src` on a string, in place when it is not shared (see `op_append`).
-#[inline]
+#[inline(always)]
 fn append_value(target: &mut Value, src: &Value, mem: MemLimit) -> Result<usize, usize> {
     let grow = match src {
         Value::Str(x) | Value::Html(x) => x.len(),
@@ -1629,6 +1639,14 @@ impl Vm {
     }
 
     /// Creates an instance of a built-in exception class such as `ValueError`.
+    /// The exception of a `yield` reached while the generator's loop closes it
+    /// (kept out of the dispatch loop: it is rare).
+    #[cold]
+    #[inline(never)]
+    fn yield_while_closing(&self) -> VmError {
+        self.throw("LogicException", "a generator closed by its loop cannot yield again")
+    }
+
     pub fn throw(&self, class: &str, msg: impl Into<String>) -> VmError {
         let Some(&cid) = self.prog.exc_classes.get(class) else {
             return VmError::Fatal(format!("{class}: {}", msg.into()));
@@ -3503,11 +3521,20 @@ impl Vm {
                         continue 'frame;
                     }
                     Instr::Yield { key, val, from, resume } => {
+                        let closing = self.gen_links.last().is_some_and(|l| l.frame == fi && l.end == GEN_CLOSING);
+                        if closing {
+                            // A generator closed by its loop returns from where it
+                            // waited, and runs its `finally` blocks (which cannot
+                            // hold a `yield`). Their code can still lead back to
+                            // one: a `continue` to the generator's own loop, or a
+                            // `catch` of what the block threw. There is no loop to
+                            // take the value (as in PHP, an error): the exception
+                            // is thrown in the generator, which goes on closing.
+                            tri!(Err::<(), _>(self.yield_while_closing()));
+                        }
                         let link = self.gen_links.pop().expect("phv vm: `yield` outside a running generator");
-                        if link.frame != fi || link.end == GEN_CLOSING {
-                            // A closed generator returns from where it waited; its
-                            // `finally` blocks cannot yield (a compile error).
-                            panic!("phv vm: a generator yielded while it was closed (compiler bug)");
+                        if link.frame != fi {
+                            panic!("phv vm: a generator yielded outside its frame (compiler bug)");
                         }
                         let v = std::mem::take(&mut reg!(*val));
                         let k = {

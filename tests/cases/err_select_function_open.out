@@ -1,0 +1,9 @@
+error: the HTML in this block does not end where it started
+ --> err_select_function_open.phv:6:1
+  |
+6 | }
+  | ^
+  = note: close every tag, attribute and `<script>`/`<style>` opened inside a block, loop or function before it ends
+  = note: a `<select>` opened or closed in a block (or a loop's body, or a function) must be closed or opened again in it: what follows would be checked inside or outside one, where older browsers read a `<title>` or `<style>` in it as markup
+
+1 error found

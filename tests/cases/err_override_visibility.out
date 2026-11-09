@@ -1,0 +1,60 @@
+error: `C0::f` is private, but it overrides `P0::f`, which is public
+  --> err_override_visibility.phv:12:22
+   |
+12 |     private function f(): string { return "c0"; }
+   |                      ^
+   = note: an overriding method keeps the visibility of the one it replaces or widens it: declare it `public`
+
+error: `C0::g` is private, but it overrides `P0::g`, which is protected
+  --> err_override_visibility.phv:13:22
+   |
+13 |     private function g(): string { return "c0"; }
+   |                      ^
+   = note: an overriding method keeps the visibility of the one it replaces or widens it: declare it `protected` or `public`
+
+error: `C0::s` is protected, but it overrides `P0::s`, which is public
+  --> err_override_visibility.phv:14:31
+   |
+14 |     protected static function s(): string { return "c0"; }
+   |                               ^
+   = note: an overriding method keeps the visibility of the one it replaces or widens it: declare it `public`
+
+error: `C1::f` is protected, but it overrides `P0::f`, which is public
+  --> err_override_visibility.phv:19:24
+   |
+19 |     protected function f(): string { return "c1"; }
+   |                        ^
+   = note: an overriding method keeps the visibility of the one it replaces or widens it: declare it `public`
+
+error: `C2::f` is private, but it overrides `P0::f`, which is public
+  --> err_override_visibility.phv:28:21
+   |
+28 |     public function f(): string { return "t"; }
+   |                     ^
+   = note: an overriding method keeps the visibility of the one it replaces or widens it: declare it `public`
+   = note: in trait `Lower`, used by `C2`
+
+error: `C3::f` is protected, but it overrides `P0::f`, which is public
+  --> err_override_visibility.phv:28:21
+   |
+28 |     public function f(): string { return "t"; }
+   |                     ^
+   = note: an overriding method keeps the visibility of the one it replaces or widens it: declare it `public`
+   = note: in trait `Lower`, used by `C3`
+
+error: `C4::f` is private, but it overrides `P0::f`, which is public
+  --> err_override_visibility.phv:38:22
+   |
+38 |     private function f(): string { return "t"; }
+   |                      ^
+   = note: an overriding method keeps the visibility of the one it replaces or widens it: declare it `public`
+   = note: in trait `Hidden`, used by `C4`
+
+error: `C6::g` is private, but it overrides `C1::g`, which is public
+  --> err_override_visibility.phv:49:22
+   |
+49 |     private function g(): string { return "c6"; }
+   |                      ^
+   = note: an overriding method keeps the visibility of the one it replaces or widens it: declare it `public`
+
+8 errors found

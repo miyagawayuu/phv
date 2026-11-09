@@ -1,0 +1,15 @@
+<?phv
+// Functions called inside a `<select>` may not write output: their HTML was
+// checked outside one, so this `<title>` (and the link in it) would be markup
+// for older browsers (found by the 19th assessment). Return `Html` and insert
+// it as a value, where it is checked. Options written by the statement
+// itself, or by a template rendered there, are fine.
+function opts(): Html { return raw("<option>c</option>"); }
+function ttl(string $u): void {
+    ?><title></select><a href="<?= $u ?>">x</a></title><?phv
+}
+$u = "javascript:alert(1)";
+?>
+<select><?phv foreach (["a", "b"] as $o) { ?><option><?= $o ?></option><?phv } ?><?= opts() ?><?= render("views/select_options.phv.html", v: "d") ?></select>
+<select><?phv ttl($u); ?></select>
+not reached

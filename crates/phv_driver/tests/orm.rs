@@ -91,6 +91,10 @@ while (true) {
 }
 "#;
     let (out, _, took) = run_limited("time", src, 256 << 20, Duration::from_secs(1));
-    assert!(out.contains("maximum execution time"), "{out}");
+    // The limit lands either between statements or inside a query, which says so in its own words.
+    assert!(
+        out.contains("maximum execution time") || out.contains("database query stopped: the time limit was reached"),
+        "{out}"
+    );
     assert!(took < Duration::from_secs(5), "took {took:?}");
 }

@@ -81,6 +81,13 @@ jobs:
           exe=phv
           [[ "${{ matrix.target }}" == *windows* ]] && exe=phv.exe
           cp "target/${{ matrix.target }}/release/$exe" LICENSE README.md README.ja.md SECURITY.md "dist/$name/"
+          # The licence notices of the crates built into phv for this target
+          # (the BSD and Apache licences ask for them with the binary). The
+          # script fails when a crate has none.
+          py=python3
+          command -v python3 > /dev/null || py=python
+          "$py" packaging/licenses.py ${{ matrix.target }} "dist/$name/THIRD-PARTY-LICENSES.txt"
+          grep -q "^  moxcms " "dist/$name/THIRD-PARTY-LICENSES.txt"
           cd dist
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             7z a -tzip "$name.zip" "$name" > /dev/null
@@ -114,10 +121,17 @@ jobs:
         run: |
           mkdir -p ctx/amd64 ctx/tmp
           tar -xzf dist/*.tar.gz -C dist
-          cp dist/phv-*/phv ctx/amd64/phv
-          cp docker/Dockerfile ctx/
+          cp dist/phv-*/phv dist/phv-*/THIRD-PARTY-LICENSES.txt ctx/amd64/
+          cp LICENSE docker/Dockerfile ctx/
           docker buildx build --platform linux/amd64 --load -t phv-test ctx
           docker run --rm phv-test --version
+          # The licence notices are in the image.
+          docker create --name phv-files phv-test
+          docker cp phv-files:/usr/share/licenses/phv/THIRD-PARTY-LICENSES.txt notices.txt
+          docker cp phv-files:/usr/share/licenses/phv/LICENSE license.txt
+          docker rm phv-files
+          cmp notices.txt ctx/amd64/THIRD-PARTY-LICENSES.txt
+          cmp license.txt LICENSE
           docker run --rm -v "$PWD/examples/hello:/app" --user "$(id -u):$(id -g)" phv-test run hello.phv
 
   extension:

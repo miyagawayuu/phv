@@ -1,0 +1,13 @@
+<?phv
+// `from` right after `yield` is a keyword: `yield from(6) => 1;` delegates
+// to `(6)` and cannot take a key; the value of a function named `from` is
+// yielded in parentheses.
+function from(int $x): int {
+    return $x;
+}
+function g(): Generator<int, int> {
+    yield from(6) => 1;
+}
+function h(): Generator<int, int> {
+    yield from;
+}

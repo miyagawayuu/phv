@@ -1,0 +1,10 @@
+<?phv
+// `Html` inserted inside `<math>` that leaves an `<mi>` (a text integration
+// point) open: browsers read the page after it as HTML, where it was checked
+// as MathML, so the `<script/>` after it would run the string (found by the
+// 19th assessment; see err_html_breakout_in_svg). `<mi>x</mi>` is fine.
+$v = "document.title='mk2'";
+?>
+<math><?= raw("<mi>x</mi>") ?><script/><?= $v ?></script></math>
+<math><?= render("views/math_mi.phv.html") ?><script/><?= $v ?></script></math>
+not reached

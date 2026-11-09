@@ -523,18 +523,27 @@ fn open_access_log(root: &Path, path: &Path) -> Result<std::fs::File, String> {
     dir.open_append(&name).map_err(describe)
 }
 
-/// Refuses an `[http]` or `[websockets]` service whose URL points at this
-/// server: a page that calls its own server holds a worker while it waits
-/// for one, and with every worker waiting so, nothing is answered for
-/// `QUEUE_WAIT` (found by the 18th audit). A URL points at this server when
-/// its port is the server's and its host is an address the server listens
-/// on (any address of this machine when it listens on every one). A reverse
-/// proxy in front of the server is on another port, so it is not caught.
+/// Refuses an `[http]` or `[websockets]` service, or an `[oauth]` provider,
+/// whose URL points at this server: a page that calls its own server holds a
+/// worker while it waits for one, and with every worker waiting so, nothing is
+/// answered for `QUEUE_WAIT` (found by the 18th audit; `[oauth]` by the 19th).
+/// A URL points at this server when its port is the server's and its host is
+/// an address the server listens on (any address of this machine when it
+/// listens on every one), or the unspecified address (`0.0.0.0`, `::`), which
+/// a connection takes as this machine. A reverse proxy in front of the server
+/// is on another port, so it is not caught. Names that resolve differently
+/// later, and endpoints a discovery document names, are refused when a page
+/// connects (`phv_std::reaches_listener`, through `Host::listen`).
 fn check_self_calls(config: &Config, addr: SocketAddr) -> Result<(), String> {
     let host = &config.host;
     let http = host.http.iter().map(|(n, s)| (format!("[http.{n}]"), s.url.as_deref(), s.url_env.as_deref()));
     let ws = host.websockets.iter().map(|(n, s)| (format!("[websockets.{n}]"), s.url.as_deref(), s.url_env.as_deref()));
-    for (section, url, url_env) in http.chain(ws) {
+    let oauth = host.oauth.iter().flat_map(|(n, s)| {
+        [("issuer", &s.issuer), ("authorize_url", &s.authorize_url), ("token_url", &s.token_url)]
+            .into_iter()
+            .map(move |(key, url)| (format!("[oauth.{n}] {key}"), url.as_deref(), None))
+    });
+    for (section, url, url_env) in http.chain(ws).chain(oauth) {
         let Some((name, port)) = url.and_then(url_host_port) else { continue };
         if port == addr.port() && is_this_server(&name, addr) {
             // A URL from the environment is not shown (like the other config errors).
@@ -571,20 +580,11 @@ fn url_host_port(url: &str) -> Option<(String, u16)> {
 }
 
 /// Whether `host` (a name or an address) reaches the server listening on
-/// `addr`: it resolves to the address the server is bound to, or the server
-/// is bound to every address and it resolves to one of this machine.
+/// `addr` (see `phv_std::reaches_listener`).
 fn is_this_server(host: &str, addr: SocketAddr) -> bool {
     use std::net::ToSocketAddrs;
     let Ok(resolved) = (host, addr.port()).to_socket_addrs() else { return false };
-    let listen = addr.ip().to_canonical();
-    resolved
-        .map(|a| a.ip().to_canonical())
-        .any(|ip| ip == listen || (listen.is_unspecified() && (ip.is_loopback() || is_address_of_this_machine(ip))))
-}
-
-/// Whether `ip` is an address of this machine: a socket can be bound to it.
-fn is_address_of_this_machine(ip: std::net::IpAddr) -> bool {
-    std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+    resolved.into_iter().any(|a| phv_std::reaches_listener(a.ip(), a.port(), addr))
 }
 
 fn serve_with(
@@ -601,7 +601,7 @@ fn serve_with(
         None => None,
     };
     let root = opts.root.canonicalize().map_err(|e| format!("cannot open {}: {e}", opts.root.display()))?;
-    let config = match &embedded {
+    let mut config = match &embedded {
         Some(e) => {
             // A built site's jobs are those of its bundle.
             let mut names: Vec<String> = e.jobs.keys().cloned().collect();
@@ -617,6 +617,8 @@ fn serve_with(
     };
     if let Some(addr) = addr {
         check_self_calls(&config, addr)?;
+        // Scripts of this server cannot connect to it (checked again when they do).
+        std::sync::Arc::make_mut(&mut config.host).listen = Some(addr);
     }
     let secrets = server_secrets(&config, |v| std::env::var_os(v))?;
     let admin = match &config.admin {
@@ -2792,6 +2794,14 @@ impl State {
                 h.insert("content-security-policy", v);
             }
         }
+        // std.i18n chose the language from `Accept-Language`: a shared cache must
+        // not serve this answer to a visitor who asks for another (R22-20). A
+        // streamed head (flush()) whose page has not chosen a locale yet may
+        // still choose one from the header after it is sent.
+        let may_negotiate = keep && http.locale.is_none() && self.config.i18n.is_some();
+        if http.locale_from_header || may_negotiate {
+            static_files::vary(h, "Accept-Language");
+        }
         // Personalized responses must not be stored by shared caches: those that use the
         // session or cookies, or carry a CSRF token (it is tied to the visitor's cookie).
         // A streamed page (flush()) may still make itself personal after its head
@@ -3303,6 +3313,21 @@ mod tests {
         let lan: SocketAddr = "192.0.2.1:8080".parse().unwrap();
         assert!(!is_this_server("127.0.0.1", lan), "the loopback does not reach a server bound elsewhere");
         assert!(is_this_server("192.0.2.1", lan));
+    }
+
+    /// The unspecified address is this machine to a connection (Linux takes
+    /// it through the loopback), so `0.0.0.0` or `::` on the server's port is
+    /// this server, whatever it is bound to (19th assessment, R22-19).
+    #[test]
+    fn the_unspecified_address_is_this_server() {
+        for listen in ["127.0.0.1:8080", "[::1]:8080", "0.0.0.0:8080", "[::]:8080", "192.0.2.1:8080"] {
+            let listen: SocketAddr = listen.parse().unwrap();
+            assert!(is_this_server("0.0.0.0", listen), "{listen}");
+            assert!(is_this_server("::", listen), "{listen}");
+            assert!(is_this_server("::ffff:0.0.0.0", listen), "{listen}");
+        }
+        let other_port: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        assert!(!phv_std::reaches_listener("0.0.0.0".parse().unwrap(), 8080, other_port));
     }
 
     #[test]

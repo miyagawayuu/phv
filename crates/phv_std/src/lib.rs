@@ -25,6 +25,7 @@ mod mail;
 pub mod migrate;
 mod netdb;
 mod netio;
+pub use netio::reaches_listener;
 mod numbers;
 mod oauth;
 mod orm;
@@ -162,7 +163,10 @@ fn tag_name_at(b: &[u8], at: usize, name: &str) -> bool {
 /// is markup there, and CDATA sections. So such an element may hold no `<`,
 /// and there may be no CDATA section, and no end tag of a raw-text element
 /// that the `Html` did not open (one may be open around it, in HTML that this
-/// SVG or MathML holds, such as a `<foreignObject>`).
+/// SVG or MathML holds, such as a `<foreignObject>`). And read from the place
+/// (`foreign svg`, `foreign html`...: what the innermost open element is), it
+/// must close every element it opens and no other, with no breakout element
+/// such as `<p>` right inside SVG (`htmlctx::foreign_insert_problem`).
 ///
 /// Inside `<select>` (`select`), older browsers ignore the start tag of a
 /// `<title>`, `<style>`, `<xmp>`, `<iframe>`, `<noembed>`, `<noframes>` or
@@ -231,7 +235,9 @@ fn html_inside(html: &str, place: &str) -> Option<String> {
         }
         return hidden().and_then(|t| hides(&format!("a {place}"), t));
     }
-    if place != "foreign" {
+    // `foreign svg`, `foreign html`... (`foreign` alone from an older build).
+    let foreign = place == "foreign" || place.starts_with("foreign ");
+    if !foreign {
         let at = html.match_indices("</").find(|&(i, _)| tag_name_at(b, i + 2, place));
         if at.is_some() {
             return Some(format!(
@@ -269,7 +275,19 @@ fn html_inside(html: &str, place: &str) -> Option<String> {
         }
         i += 1;
     }
-    None
+    // The elements it opens and closes, read as browsers read them where it
+    // lands: the page after it was checked as if it changed nothing there
+    // (found by the 19th assessment: `<p>icon</p>`, `</svg>` or an open
+    // `<foreignObject>` turned the page's self-closed `<script/>` into a
+    // script with the nonce).
+    phv_syntax::htmlctx::foreign_insert_problem(html, place).map(|what| {
+        format!(
+            "`Html` inserted inside `<svg>` or `<math>` holds {what}: browsers would build the SVG or MathML \
+             around it in another way than the page after it was checked; close every element it opens there and \
+             no other, write HTML elements only inside a `<foreignObject>` (or `<desc>`, `<title>`, a MathML text \
+             element) it opens, or insert it outside the SVG or MathML"
+        )
+    })
 }
 
 fn int(v: &Value) -> i64 {
@@ -804,6 +822,16 @@ const PLAIN_TYPES: &[&str] = &[
 ];
 
 fn set_type(vm: &mut Vm, ct: &str) -> Result<(), VmError> {
+    set_type_with(vm, ct, false)
+}
+
+/// The Content-Type of a body that replaces any earlier one (`response()->file()`):
+/// bytes sent before it are not sent, so they do not count as written output.
+fn set_body_type(vm: &mut Vm, ct: &str) -> Result<(), VmError> {
+    set_type_with(vm, ct, true)
+}
+
+fn set_type_with(vm: &mut Vm, ct: &str, replaces_body: bool) -> Result<(), VmError> {
     if ct.contains(',') {
         return Err(vm.throw("ValueError", "Content-Type must name a single media type"));
     }
@@ -813,6 +841,16 @@ fn set_type(vm: &mut Vm, ct: &str) -> Result<(), VmError> {
     }
     let media = ["image/", "audio/", "video/", "font/"].iter().any(|p| mime.starts_with(p)) && mime != "image/svg+xml";
     let html = !(PLAIN_TYPES.contains(&mime.as_str()) || media);
+    // Bytes of `response()->file()` or an image's `send()` are output too, and
+    // never escaped or checked: retyping them as HTML or JavaScript would serve
+    // a file or an image as markup or as a script (R22-30).
+    let body = !replaces_body && (vm.http.body_file.is_some() || vm.http.body_bytes.is_some());
+    if html && body {
+        return Err(vm.throw(
+            "ValueError",
+            format!("set the Content-Type \"{ct}\" before response()->file() or an image's send(): their bytes are not escaped and would be read as markup"),
+        ));
+    }
     if html && !vm.out[0].html && !vm.out[0].buf.trim().is_empty() {
         // What was written so far was not escaped: a browser would read it as markup
         // (found by the 1.2 audit).
@@ -843,7 +881,7 @@ fn set_type(vm: &mut Vm, ct: &str) -> Result<(), VmError> {
             | "text/x-ecmascript"
             | "text/x-javascript"
     );
-    if js && !vm.out[0].buf.trim().is_empty() {
+    if js && (body || !vm.out[0].buf.trim().is_empty()) {
         // What was written so far was not checked as JavaScript.
         return Err(vm.throw("ValueError", "set a JavaScript Content-Type before writing any output"));
     }

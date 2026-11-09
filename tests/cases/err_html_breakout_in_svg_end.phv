@@ -1,0 +1,8 @@
+<?phv
+// `Html` inserted inside `<svg>` that holds `</svg>` (an end tag of an element
+// it did not open) ends the page's SVG for browsers: the `<script/>` after it
+// would run the string (found by the 19th assessment; see err_html_breakout_in_svg).
+$v = "document.title='mk1'";
+echo render("views/svg_icon_page.phv.html", icon: render("views/svg_close.phv.html"), v: $v);
+?>
+not reached

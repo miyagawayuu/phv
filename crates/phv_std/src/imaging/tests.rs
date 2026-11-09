@@ -42,7 +42,7 @@ fn gif(frames: &[(u32, u32, [u8; 4])]) -> Vec<u8> {
 const BIG: u64 = 1 << 30;
 
 fn read_back(bytes: &[u8]) -> Result<(Pixels, u32, u32, Format), String> {
-    let (src, w, h) = probe(bytes.to_vec(), BIG)?;
+    let (src, w, h) = probe(bytes.to_vec())?;
     let px = decode(&src, BIG)?;
     Ok((px, w, h, src.format))
 }
@@ -55,7 +55,7 @@ fn formats_are_found_from_the_bytes() {
     assert_eq!(Format::sniff(b"RIFF\0\0\0\0WEBPVP8 "), Some(Format::Webp));
     for not in [&b"<svg xmlns"[..], b"BM\0\0", b"\0\0\0\x0cjP  ", b"", b"RIFF\0\0\0\0WAVE", b"\x89PNG"] {
         assert_eq!(Format::sniff(not), None, "{not:?}");
-        assert!(probe(not.to_vec(), BIG).unwrap_err().contains("not a PNG, JPEG, GIF or WebP"));
+        assert!(probe(not.to_vec()).unwrap_err().contains("not a PNG, JPEG, GIF or WebP"));
     }
 }
 
@@ -208,7 +208,7 @@ fn resampling_stops_when_the_limits_say_so() {
 
 fn base(w: u32, h: u32) -> Pipeline {
     let bytes = png(&pattern(w, h, 3));
-    let (src, w, h) = probe(bytes, BIG).unwrap();
+    let (src, w, h) = probe(bytes).unwrap();
     Pipeline { src: Rc::new(src), ops: Vec::new(), width: w, height: h }
 }
 
@@ -297,20 +297,20 @@ fn jpeg_declaring(w: u16, h: u16) -> Vec<u8> {
 fn bombs_are_refused_by_their_header() {
     let start = std::time::Instant::now();
     for (w, h) in [(20_000, 100), (100, 20_000), (10_000, 10_000), (16_384, 16_384), (0x7FFF_FFFF, 0x7FFF_FFFF)] {
-        let e = probe(png_declaring(w, h), BIG).err().unwrap_or_default();
+        let e = probe(png_declaring(w, h)).err().unwrap_or_default();
         assert!(e.contains("too large") || e.contains("pixels:"), "{w}×{h}: {e}");
     }
     for (w, h) in [(65_000, 65_000), (16_385, 8), (8_000, 8_000)] {
-        let e = probe(jpeg_declaring(w, h), BIG).err().unwrap_or_default();
+        let e = probe(jpeg_declaring(w, h)).err().unwrap_or_default();
         assert!(e.contains("too large") || e.contains("pixels:"), "{w}×{h}: {e}");
     }
     // A GIF whose screen is 65535 × 65535.
     let mut g = gif(&[(2, 2, [1, 2, 3, 255])]);
     g[6..10].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
-    assert!(probe(g, BIG).is_err());
+    assert!(probe(g).is_err());
     assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
     // Within the caps the header is fine, and the decoder refuses what lacks.
-    let (src, w, h) = probe(png_declaring(5000, 5000), BIG).unwrap();
+    let (src, w, h) = probe(png_declaring(5000, 5000)).unwrap();
     assert_eq!((w, h), (5000, 5000));
     assert!(src.need >= 100_000_000);
     assert!(decode(&src, BIG).is_err());
@@ -384,7 +384,7 @@ fn damaged_images_never_panic() {
         }
         let bytes = b.clone();
         let r = std::panic::catch_unwind(move || -> Result<(), String> {
-            let (src, _, _) = probe(bytes, 256 << 20)?;
+            let (src, _, _) = probe(bytes)?;
             if src.need > 256 << 20 {
                 return Err("too large".into());
             }
@@ -433,12 +433,19 @@ fn base64_and_data_urls_are_read() {
 #[test]
 fn progressive_jpegs_are_told_apart() {
     let j = encode(&pattern(8, 8, 3), Format::Jpeg, 80).unwrap();
-    assert!(!jpeg_progressive(&j));
+    assert!(!jpeg_head(&j).unwrap().progressive);
     let mut p = j.clone();
     let sof = p.windows(2).position(|m| m == [0xFF, 0xC0]).unwrap();
     p[sof + 1] = 0xC2;
-    assert!(jpeg_progressive(&p));
-    assert!(!jpeg_progressive(&[0xFF, 0xD8, 0xFF]));
+    assert!(jpeg_head(&p).unwrap().progressive);
+    // A stray byte between two segments is skipped by the decoder, so the
+    // frame after it is still found (it was taken for the end of the header).
+    let mut stray = p.clone();
+    let dqt = stray.windows(2).position(|m| m == [0xFF, 0xDB]).unwrap();
+    let len = u16::from_be_bytes([stray[dqt + 2], stray[dqt + 3]]) as usize;
+    stray.insert(dqt + 2 + len, 0x00);
+    assert!(jpeg_head(&stray).unwrap().progressive);
+    assert!(jpeg_head(&[0xFF, 0xD8, 0xFF]).is_err());
     assert_eq!(jpeg_scans(&j), 1);
     // A scan whose data holds a stuffed 0xFF and a restart marker, twice.
     let mut two = vec![0xFF, 0xD8];
@@ -448,4 +455,162 @@ fn progressive_jpegs_are_told_apart() {
     two.extend_from_slice(&[0xFF, 0xD9]);
     assert_eq!(jpeg_scans(&two), 2);
     assert_eq!(jpeg_scans(&two[..20]), 1);
+}
+
+/// A chunk of a RIFF file whose header declares `declared` bytes (its length when `None`).
+fn riff(out: &mut Vec<u8>, name: &[u8; 4], data: &[u8], declared: Option<u32>) {
+    out.extend_from_slice(name);
+    out.extend_from_slice(&declared.unwrap_or(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        out.push(0);
+    }
+}
+
+/// An extended WebP: a VP8X header of `w` × `h` with `flags`, then `chunks`.
+fn webp_x(w: u32, h: u32, flags: u8, chunks: &[(&[u8; 4], Vec<u8>, Option<u32>)]) -> Vec<u8> {
+    let mut body = b"WEBP".to_vec();
+    let mut x = vec![flags, 0, 0, 0];
+    x.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+    x.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+    riff(&mut body, b"VP8X", &x, None);
+    for (name, data, declared) in chunks {
+        riff(&mut body, name, data, *declared);
+    }
+    let mut out = b"RIFF".to_vec();
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// The VP8L bitstream of a lossless WebP of `p`.
+fn vp8l(p: &Pixels) -> Vec<u8> {
+    let simple = encode(p, Format::Webp, 85).unwrap();
+    assert_eq!(&simple[12..16], b"VP8L");
+    let len = u32::from_le_bytes(simple[16..20].try_into().unwrap()) as usize;
+    simple[20..20 + len].to_vec()
+}
+
+/// The start of a VP8 key frame that declares `w` × `h`.
+fn vp8_declaring(w: u16, h: u16) -> Vec<u8> {
+    let mut d = vec![0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a];
+    d.extend_from_slice(&w.to_le_bytes());
+    d.extend_from_slice(&h.to_le_bytes());
+    d.extend_from_slice(&[0; 22]);
+    d
+}
+
+/// An EXIF block (TIFF, big-endian) giving `orientation`.
+fn exif(orientation: u16) -> Vec<u8> {
+    let mut tiff = b"MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01".to_vec();
+    tiff.extend_from_slice(&orientation.to_be_bytes());
+    tiff.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    tiff
+}
+
+#[test]
+fn a_webp_exif_chunk_is_read_in_place() {
+    let p = pattern(4, 2, 4);
+    // Orientation 6: turned a quarter clockwise, so it is 2 wide and 4 tall.
+    let turned = webp_x(4, 2, 0x18, &[(b"VP8L", vp8l(&p), None), (b"EXIF", exif(6), None)]);
+    let (src, w, h) = probe(turned).unwrap();
+    assert_eq!((w, h, src.orientation), (2, 4, Orientation::Rotate90));
+    assert_eq!(decode(&src, BIG).unwrap(), turn(&p, 1, &mut none()).ok().unwrap());
+    // A chunk that declares a gigabyte and holds a few bytes: image-webp
+    // allocated what it declares before reading it (an 82-byte file made
+    // `phv serve` commit 4 GB). It is ignored, as a broken EXIF block is.
+    let bomb = webp_x(4, 2, 0x18, &[(b"VP8L", vp8l(&p), None), (b"EXIF", exif(6), Some(0x4000_0000))]);
+    let (src, w, h) = probe(bomb).unwrap();
+    assert_eq!((w, h, src.orientation), (4, 2, Orientation::NoTransforms));
+    assert_eq!(decode(&src, BIG).unwrap(), p);
+}
+
+#[test]
+fn a_webp_bitstream_of_another_size_than_its_canvas_is_refused() {
+    // image-webp decodes a VP8 frame at the size its own header gives (here
+    // 400 MB of planes) before it compares it with the canvas.
+    let big = webp_x(16, 16, 0, &[(b"VP8 ", vp8_declaring(16_383, 16_383), None)]);
+    let e = probe(big).err().unwrap_or_default();
+    assert!(e.contains("16383×16383 pixels, not 16×16"), "{e}");
+    let small = webp_x(16, 16, 0x10, &[(b"VP8L", vp8l(&pattern(4, 2, 4)), None)]);
+    let e = probe(small).err().unwrap_or_default();
+    assert!(e.contains("4×2 pixels, not 16×16"), "{e}");
+    // The first frame of an animation: after an ALPH chunk, the next chunk is
+    // decoded as VP8 whatever it is named.
+    let mut anmf = vec![0, 0, 0, 0, 0, 0, 15, 0, 0, 15, 0, 0, 100, 0, 0, 0];
+    riff(&mut anmf, b"ALPH", &[0], None);
+    riff(&mut anmf, b"XXXX", &vp8_declaring(16_383, 16_383), None);
+    let animated = webp_x(16, 16, 0x12, &[(b"ANIM", vec![0; 6], None), (b"ANMF", anmf, None)]);
+    let e = probe(animated).err().unwrap_or_default();
+    assert!(e.contains("16383×16383 pixels, not 16×16"), "{e}");
+    // A frame of the right size is read.
+    let p = pattern(16, 16, 4);
+    let (src, w, h) = probe(webp_x(16, 16, 0x10, &[(b"VP8L", vp8l(&p), None)])).unwrap();
+    assert_eq!((w, h), (16, 16));
+    assert_eq!(decode(&src, BIG).unwrap(), p);
+}
+
+/// `png` with a chunk added after its header.
+fn png_with(png: &[u8], name: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut out = png[..33].to_vec();
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let mut body = name.to_vec();
+    body.extend_from_slice(data);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(&body).to_be_bytes());
+    out.extend_from_slice(&png[33..]);
+    out
+}
+
+#[test]
+fn png_metadata_chunks_are_left_out_and_the_orientation_kept() {
+    let p = pattern(5, 4, 3);
+    let plain = png(&p);
+    let mut tagged = png_with(&plain, b"iCCP", b"icc\0\0\x78\x9c\x03\0\0\0\0\x01");
+    tagged = png_with(&tagged, b"tEXt", b"Comment\0taken at home");
+    tagged = png_with(&tagged, b"eXIf", &exif(6));
+    tagged = png_with(&tagged, b"zTXt", b"k\0\0\x78\x9c\x03\0\0\0\0\x01");
+    // What the decoder reads is the PNG without them.
+    let mut seen = Vec::new();
+    PngView::new(&tagged).read_to_end(&mut seen).unwrap();
+    assert_eq!(seen, plain);
+    let (src, w, h) = probe(tagged).unwrap();
+    assert_eq!((w, h), (4, 5));
+    assert_eq!(decode(&src, BIG).unwrap(), turn(&p, 1, &mut none()).ok().unwrap());
+    // A chunk cut short ends the walk: the rest goes to the decoder as it is.
+    let mut cut = png_with(&plain, b"iCCP", b"icc\0\0");
+    cut.truncate(40);
+    let mut seen = Vec::new();
+    PngView::new(&cut).read_to_end(&mut seen).unwrap();
+    assert_eq!(seen, cut);
+}
+
+#[test]
+fn a_caught_decoder_panic_is_not_printed() {
+    assert!(!QUIET.with(Cell::get));
+    let inner: Result<bool, Fail> = guarded("x", || {
+        let nested: Result<(), Fail> = guarded("y", || Ok(()));
+        assert!(nested.is_ok());
+        Ok(QUIET.with(Cell::get))
+    });
+    assert!(matches!(inner, Ok(true)));
+    assert!(!QUIET.with(Cell::get));
+    let r: Result<(), Fail> = guarded("send()", || panic!("a decoder bug"));
+    assert!(r.is_err());
+    // Outside `guarded`, panics are printed as before.
+    assert!(!QUIET.with(Cell::get));
+}
+
+#[test]
+fn encoding_reserves_what_the_encoders_take() {
+    let p = pattern(100, 100, 3);
+    let n = p.data.len() as u64;
+    assert!(encode_need(&p, Format::Png) >= n * 37 / 10);
+    assert!(encode_need(&p, Format::Webp) >= n * 39 / 10);
+    assert!(encode_need(&p, Format::Jpeg) >= n * 23 / 10);
+    // Gray is made RGB for WebP first, alpha flattened for JPEG.
+    let gray = pattern(100, 100, 1);
+    assert!(encode_need(&gray, Format::Webp) >= 3 * gray.data.len() as u64 * 49 / 10);
+    let rgba = pattern(100, 100, 4);
+    assert!(encode_need(&rgba, Format::Jpeg) >= 30_000 * 33 / 10);
 }

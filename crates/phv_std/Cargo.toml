@@ -40,6 +40,7 @@ tungstenite.workspace = true
 httparse.workspace = true
 toml.workspace = true
 image.workspace = true
+zune-jpeg.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

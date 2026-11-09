@@ -205,12 +205,31 @@ fn password_verify(password: &str, hash: &str) -> bool {
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
     let Ok(h) = PasswordHash::new(hash) else { return false };
     // The cost comes from the stored hash; refuse values that would let a
-    // planted hash use gigabytes of memory or minutes of CPU.
-    let param = |name: &str| h.params.get_decimal(name).unwrap_or(0);
-    if param("m") > 64 * 1024 || param("t") > 8 || param("p") > 4 {
+    // planted hash use gigabytes of memory or minutes of CPU. The caps are
+    // checked on the parameters argon2 will use (it takes the last of a
+    // repeated name, so `m=19456,…,m=4294967295` must not pass on its first
+    // `m`), and a hash that names a parameter twice, or one argon2 does not
+    // know, is refused outright.
+    if !argon2_params_allowed(&h) {
         return false;
     }
     argon2::Argon2::default().verify_password(password.as_bytes(), &h).is_ok()
+}
+
+/// Whether a stored Argon2 hash's parameters are ones `password_verify` runs:
+/// each name once, only `m`, `t`, `p`, `keyid` and `data`, and the cost that
+/// argon2 itself reads from them within the caps.
+fn argon2_params_allowed(h: &argon2::password_hash::PasswordHash<'_>) -> bool {
+    let mut seen: Vec<&str> = Vec::new();
+    for (name, _) in h.params.iter() {
+        let name = name.as_str();
+        if !matches!(name, "m" | "t" | "p" | "keyid" | "data") || seen.contains(&name) {
+            return false;
+        }
+        seen.push(name);
+    }
+    let Ok(params) = argon2::Params::try_from(h) else { return false };
+    params.m_cost() <= 64 * 1024 && params.t_cost() <= 8 && params.p_cost() <= 4
 }
 
 // ----- files and environment ------------------------------------------------
@@ -502,7 +521,7 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             if !f.metadata().is_ok_and(|m| m.is_file()) {
                 return Err(vm.throw("ValueError", format!("\"{rel}\" is not a file")));
             }
-            crate::set_type(vm, &ct)?;
+            crate::set_body_type(vm, &ct)?;
             // Sent from this open handle, so the file is not read into memory.
             vm.http.body_file = Some(std::sync::Arc::new(f));
             // The last of response()->file() and an image's send() is sent.
@@ -661,6 +680,35 @@ mod tests {
         assert!(!password_verify("wrong", &h));
         assert!(!password_verify("secret", "not a hash"));
         assert!(constant_time_eq(b"abc", b"abc") && !constant_time_eq(b"abc", b"abd"));
+    }
+
+    /// A stored hash whose cost parameters are repeated: argon2 uses the last
+    /// value, so a first value within the caps must not let a huge last one
+    /// run (it aborted the process on a 4 TiB allocation, R22-2).
+    #[test]
+    fn password_verify_refuses_repeated_or_unknown_argon2_parameters() {
+        let good = password_hash("secret");
+        assert!(password_verify("secret", &good));
+        let rest = good.strip_prefix("$argon2id$v=19$m=19456,t=2,p=1").expect("default parameters");
+        for params in [
+            "m=19456,t=2,p=1,m=4294967295",
+            "m=19456,t=2,p=1,t=4294967295",
+            "m=19456,t=2,p=1,p=255",
+            "m=19456,m=19456,t=2,p=1",
+            "m=19456,t=2,p=1,x=1",
+            "m=65537,t=2,p=1",
+            "m=19456,t=9,p=1",
+            "m=19456,t=2,p=5",
+        ] {
+            let planted = format!("$argon2id$v=19${params}{rest}");
+            let start = std::time::Instant::now();
+            assert!(!password_verify("secret", &planted), "{planted}");
+            assert!(start.elapsed() < std::time::Duration::from_millis(50), "{planted} took {:?}", start.elapsed());
+        }
+        // Still accepted: the parameters in another order, and the caps themselves.
+        assert!(password_verify("secret", &format!("$argon2id$v=19$p=1,t=2,m=19456{rest}")));
+        let capped = format!("$argon2id$v=19$m=65536,t=8,p=4{rest}");
+        assert!(argon2_params_allowed(&argon2::password_hash::PasswordHash::new(&capped).unwrap()));
     }
 
     #[test]

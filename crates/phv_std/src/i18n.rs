@@ -1150,6 +1150,8 @@ fn request_locale(vm: &mut Vm) -> Result<String, VmError> {
         .collect();
     let chosen = negotiate(&header.join(","), &locales, &locales[0]).to_string();
     vm.http.locale = Some(chosen.clone());
+    // A cache in front of the server must keep one answer per language (R22-20).
+    vm.http.locale_from_header = true;
     Ok(chosen)
 }
 

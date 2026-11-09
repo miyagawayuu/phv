@@ -41,7 +41,7 @@ pub use jobs_run::{
 };
 pub use migrate::{migration_conn, MigrationConn};
 pub(crate) use my::MAX_KILLING;
-pub(crate) use pg::pg_message;
+pub(crate) use pg::{ends_transaction, may_roll_back, pg_message};
 pub use publish::{redis_publish, redis_subscribe, Pushed, RedisSubscriber};
 pub(crate) use query_async::{detached_value, Detached};
 pub use query_async::{start_query, start_redis};
@@ -63,7 +63,7 @@ use jobs::{job_conn, job_sized, jobs_table, now_ms, JOB_SIZE_RETRY, JOB_TABLES, 
 #[cfg(test)]
 use jobs_add::job_add;
 #[cfg(test)]
-use jobs_run::REDIS_ADOPT_CALLS;
+use jobs_run::{BETWEEN_ADOPT_PAGES, REDIS_ADOPT_CALLS};
 #[cfg(test)]
 use my::{my_connect, my_statements};
 #[cfg(test)]
@@ -157,6 +157,20 @@ mod tests {
             ("LOAD DATA LOW_PRIORITY LOCAL INFILE 'f' INTO TABLE t", Kind::MySql),
             ("PREPARE TRANSACTION 'x'", Kind::Postgres),
             ("prepare transaction 'x'", Kind::Postgres),
+            // A server older than the version skips a versioned comment's words
+            // (found by the 19th audit).
+            ("/*!99999 mk1 */ XA PREPARE 'x'", Kind::MySql),
+            ("/*!99999mk1*/XA PREPARE 'x'", Kind::MySql),
+            ("XA /*!99999 mk1 */ PREPARE 'x'", Kind::MySql),
+            ("/*M!999999 mk1 */ XA PREPARE 'x'", Kind::MySql),
+            // Skipped by a newer server, run by an older one: each version is a reading.
+            ("/*!99999 mk1 */ /*!10000 XA PREPARE 'x' */", Kind::MySql),
+            ("/*!80000 XA */ /*!90000 mk1 */ PREPARE 'x'", Kind::MySql),
+            ("/*!99999 mk1 */ LOAD DATA LOCAL INFILE 'f' INTO TABLE t", Kind::MySql),
+            // PostgreSQL has no versioned comments: `/*!` is a comment.
+            ("/*! mk1 */ PREPARE TRANSACTION 'x'", Kind::Postgres),
+            ("/*!99999 mk1 */ PREPARE TRANSACTION 'x'", Kind::Postgres),
+            ("/*! /* mk1 */ */ PREPARE TRANSACTION 'x'", Kind::Postgres),
         ] {
             assert!(refused_statement(text, kind).is_some_and(|why| why.contains("is not allowed")), "{text}");
         }
@@ -175,8 +189,46 @@ mod tests {
             ("ROLLBACK PREPARED 'x'", Kind::Postgres),
             ("XA PREPARE 'x'", Kind::Postgres),
             ("PREPARE TRANSACTION 'x'", Kind::MySql),
+            ("/*!50000 SELECT */ 1", Kind::MySql),
+            ("/*!99999 SELECT 2, */ 1", Kind::MySql),
         ] {
             assert!(refused_statement(text, kind).is_none(), "{text}");
+        }
+        // Each version of versioned comments is a reading: a statement with
+        // more versions than are read is refused.
+        let many: String = (0..=16).map(|v| format!("/*!{} x */ ", 10000 + v)).collect::<String>() + "SELECT 1";
+        assert!(refused_statement(&many, Kind::MySql).is_some_and(|why| why.contains("is not allowed")));
+        let few: String = (0..16).map(|v| format!("/*!{} x */ ", 10000 + v)).collect::<String>() + "SELECT 1";
+        assert!(refused_statement(&few, Kind::MySql).is_none());
+    }
+
+    #[test]
+    fn statements_that_end_or_roll_back_a_transaction_are_told_apart() {
+        use crate::db::Dialect;
+        for (text, dialect, rolls_back, ends) in [
+            ("ROLLBACK", Dialect::Postgres, true, true),
+            ("rollback work;", Dialect::Sqlite, true, true),
+            ("ROLLBACK TO SAVEPOINT s1", Dialect::Sqlite, true, false),
+            ("ROLLBACK WORK TO s1", Dialect::MySql, true, false),
+            ("ROLLBACK TRANSACTION TO SAVEPOINT s1", Dialect::Postgres, true, false),
+            ("/* x */ ROLLBACK", Dialect::Postgres, true, true),
+            ("/*!99999 x */ ROLLBACK", Dialect::MySql, true, true),
+            ("ABORT", Dialect::Postgres, true, true),
+            ("XA/**/ROLLBACK 'x'", Dialect::MySql, true, false),
+            ("COMMIT", Dialect::Postgres, false, true),
+            ("end", Dialect::Sqlite, false, true),
+            ("COMMIT AND CHAIN", Dialect::MySql, false, true),
+            ("COMMIT PREPARED 'x'", Dialect::Postgres, false, false),
+            ("BEGIN", Dialect::MySql, false, true),
+            ("START TRANSACTION", Dialect::MySql, false, true),
+            ("BEGIN", Dialect::Postgres, false, false),
+            ("SELECT 'ROLLBACK'", Dialect::Postgres, false, false),
+            ("UPDATE t SET rollback = 1", Dialect::MySql, false, false),
+            ("RELEASE SAVEPOINT s1", Dialect::Sqlite, false, false),
+            ("", Dialect::Sqlite, false, false),
+        ] {
+            assert_eq!(may_roll_back(text, dialect), rolls_back, "{text} rolls back ({dialect:?})");
+            assert_eq!(ends_transaction(text, dialect), ends, "{text} ends a transaction ({dialect:?})");
         }
     }
 
@@ -661,6 +713,70 @@ mod tests {
         // Nothing more of the name to move; the other name stays.
         assert!(job_adopt(&spec, ns, &[mine], true, cap).unwrap().is_empty(), "{var}");
         for (store, n) in [(ns, n_mine), (None, n_theirs)] {
+            let mut ended = 0;
+            while let Some(j) = job_take(&spec, store, 60_000).unwrap() {
+                job_end(&spec, store, &j, JobEnd::Done { keyed: false }).unwrap();
+                if j.name.ends_with(run_id) {
+                    ended += 1;
+                }
+            }
+            assert_eq!(ended, n, "{var}");
+        }
+    }
+
+    /// Another client that takes jobs from the shared store while the Redis
+    /// adoption runs (a scheduler of a site still on 1.0) removes ids ahead
+    /// of the page the adoption has reached: the next page still starts
+    /// right after the last id it looked at, so no job of the site is
+    /// skipped (found by the 19th assessment: paged by rank, the adoption
+    /// left jobs behind, unreported).
+    #[test]
+    fn redis_adopt_skips_nothing_when_others_take_jobs_meanwhile() {
+        let Some((var, spec)) = test_servers().into_iter().find(|(v, _)| *v == "PHV_TEST_REDIS_URL") else {
+            return;
+        };
+        let _unnamed = crate::testing::unnamed();
+        let ns = crate::testing::namespace(0x35);
+        let ns = Some(ns.as_str());
+        let cap = JobCap { jobs: 100_000, bytes: 1 << 30 };
+        let run_id = crate::testing::run_id();
+        let (mine, theirs) = (format!("ahead_{run_id}"), format!("taken_{run_id}"));
+        let (n_mine, n_theirs) = (1500, 1500);
+        // Theirs are due first: the first page holds only theirs.
+        let now = now_ms();
+        for i in 0..n_mine + n_theirs {
+            let (name, at) = if i < n_theirs { (&theirs, now - 60_000) } else { (&mine, now - 30_000) };
+            let r = job_add(&spec, None, (&crate::random_hex(16), name, "p"), at, None, cap, None);
+            assert_eq!(r, Ok(Some(())), "{var}");
+        }
+        // After the first page of the waiting jobs, the other client takes
+        // 500 of the jobs before it.
+        let taken = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (hook_spec, hook_taken) = (spec.clone(), taken.clone());
+        BETWEEN_ADOPT_PAGES.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |set: &str| {
+                let mut taken = hook_taken.borrow_mut();
+                if set == "due" && taken.is_empty() {
+                    for _ in 0..500 {
+                        taken.push(job_take(&hook_spec, None, 60_000).unwrap().unwrap());
+                    }
+                }
+            }))
+        });
+        let moved = job_adopt(&spec, ns, std::slice::from_ref(&mine), true, cap);
+        BETWEEN_ADOPT_PAGES.with(|h| *h.borrow_mut() = None);
+        let moved = moved.unwrap();
+        let taken = taken.borrow();
+        assert_eq!(taken.len(), 500, "{var}: the other client took nothing");
+        assert!(taken.iter().all(|j| j.name != mine), "{var}: the other client took a job of the site");
+        let n_moved = moved.iter().filter(|j| j.outcome == Adopted::Moved).count();
+        assert_eq!(n_moved, n_mine, "{var}: {} of the site's jobs were skipped", n_mine - n_moved);
+        let left = job_adopt(&spec, ns, std::slice::from_ref(&mine), false, cap).unwrap();
+        assert!(left.is_empty(), "{var}: {} of the site's jobs are still in the shared store", left.len());
+        for j in taken.iter() {
+            job_end(&spec, None, j, JobEnd::Done { keyed: false }).unwrap();
+        }
+        for (store, n) in [(ns, n_mine), (None, n_theirs - 500)] {
             let mut ended = 0;
             while let Some(j) = job_take(&spec, store, 60_000).unwrap() {
                 job_end(&spec, store, &j, JobEnd::Done { keyed: false }).unwrap();

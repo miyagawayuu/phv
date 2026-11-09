@@ -1,0 +1,95 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs against a MySQL server (then
+// mysql_tx_ended_after.phv): a transaction that MySQL ended before
+// transaction() did (a statement that commits implicitly, a deadlock) is not
+// reported as committed, and the depth of transaction() stays right (19th
+// audit).
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->execute(sql"DROP TABLE IF EXISTS phv_tx");
+$db->execute(sql"DROP TABLE IF EXISTS phv_tx_extra");
+$db->execute(sql"CREATE TABLE phv_tx (id int PRIMARY KEY AUTO_INCREMENT, name varchar(20) NOT NULL UNIQUE, v int NOT NULL DEFAULT 0)");
+
+// A statement that commits implicitly inside an inner transaction().
+try {
+    $db->transaction(function () use ($db): void {
+        $db->transaction(function () use ($db): void {
+            $db->execute(sql"CREATE TABLE IF NOT EXISTS phv_tx_extra (id int)");
+        });
+    });
+    echo "transaction() returned\n";
+} catch (DatabaseError $e) {
+    echo "first transaction() threw: ", $e->getMessage(), "\n";
+}
+// A later transaction() that throws keeps nothing.
+try {
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"INSERT INTO phv_tx (name) VALUES ('rolled-back')");
+        throw new RuntimeException("rolled back on purpose");
+    });
+} catch (RuntimeException $e) {
+    echo "second transaction() threw: ", $e->getMessage(), "\n";
+}
+
+// BEGIN written as SQL commits the open transaction.
+try {
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"INSERT INTO phv_tx (name) VALUES ('sql-begin')");
+        $db->execute(sql"BEGIN");
+        $db->execute(sql"INSERT INTO phv_tx (name) VALUES ('refused')");
+    });
+    echo "transaction() returned\n";
+} catch (DatabaseError $e) {
+    echo "transaction() threw: ", $e->getMessage(), "\n";
+}
+
+// A deadlock: MySQL rolls the whole transaction back, and the statements
+// after it are refused instead of running outside any transaction.
+foreach (["d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8"] as $name) {
+    $db->execute(sql"INSERT INTO phv_tx (name) VALUES ({$name})");
+}
+$first = $db->first(sql"SELECT min(id) AS id FROM phv_tx WHERE name LIKE 'd%'")?->int("id") ?? 0;
+$last = $first + 7;
+try {
+    $db->transaction(function () use ($db, $first, $last): void {
+        $db->query(sql"SELECT id FROM phv_tx WHERE id = {$last} FOR UPDATE");
+        // Another connection changes the other rows, then waits for the
+        // last one: this transaction, which changed nothing, is the one
+        // MySQL rolls back when it then waits for the first row.
+        $other = $db->executeAsync(sql"UPDATE phv_tx SET v = 2 WHERE id >= {$first}");
+        $db->query(sql"SELECT SLEEP(0.5)");
+        try {
+            $db->execute(sql"UPDATE phv_tx SET v = 1 WHERE id = {$first}");
+        } catch (DatabaseError $e) {
+            echo "caught: ", $e->getMessage(), "\n";
+        }
+        try {
+            $db->execute(sql"INSERT INTO phv_tx (name) VALUES ('after-deadlock')");
+        } catch (DatabaseError $e) {
+            echo "refused: ", $e->getMessage(), "\n";
+        }
+        echo "the other connection changed ", $other->await(), " rows\n";
+    });
+    echo "transaction() returned\n";
+} catch (DatabaseError $e) {
+    echo "transaction() threw: ", $e->getMessage(), "\n";
+}
+
+// A lock wait timeout rolls back only its statement while
+// innodb_rollback_on_timeout is off (the default): the transaction goes on.
+$db->execute(sql"SET SESSION innodb_lock_wait_timeout = 1");
+$db->transaction(function () use ($db, $first): void {
+    $db->execute(sql"INSERT INTO phv_tx (name) VALUES ('lock-wait')");
+    // Another connection holds the first row for two seconds.
+    $other = $db->executeAsync(sql"UPDATE phv_tx SET v = 3 WHERE id = {$first} AND SLEEP(2) = 0");
+    $db->query(sql"SELECT SLEEP(0.5)");
+    try {
+        $db->execute(sql"UPDATE phv_tx SET v = 4 WHERE id = {$first}");
+    } catch (DatabaseError $e) {
+        echo "caught: ", $e->getMessage(), "\n";
+    }
+    $db->execute(sql"INSERT INTO phv_tx (name) VALUES ('after-lock-wait')");
+    echo "the other connection changed ", $other->await(), " rows\n";
+});
+echo "transaction() returned\n";

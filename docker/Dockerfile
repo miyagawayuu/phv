@@ -1,6 +1,8 @@
-# The PHV image: the static (musl) `phv` executable and nothing else. The
-# release workflows put the executable of each architecture in `<arch>/phv`
-# next to this file (`amd64`, `arm64`) and an empty `tmp` directory.
+# The PHV image: the static (musl) `phv` executable, its licence and the
+# licence notices of the crates built into it, and nothing else. The release
+# workflows put the executable of each architecture and its notices in
+# `<arch>/phv` and `<arch>/THIRD-PARTY-LICENSES.txt` next to this file
+# (`amd64`, `arm64`), with `LICENSE` and an empty `tmp` directory.
 #
 #   docker run --rm -p 8080:8080 -v "$PWD:/app" --user "$(id -u):$(id -g)" \
 #     ghcr.io/miyagawayuu/phv serve --host 0.0.0.0 --prod
@@ -16,6 +18,7 @@ LABEL org.opencontainers.image.title="PHV" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${VERSION}"
 COPY --chmod=0755 ${TARGETARCH}/phv /usr/local/bin/phv
+COPY --chmod=0644 LICENSE ${TARGETARCH}/THIRD-PARTY-LICENSES.txt /usr/share/licenses/phv/
 COPY --chmod=1777 tmp /tmp
 ENV TMPDIR=/tmp
 WORKDIR /app

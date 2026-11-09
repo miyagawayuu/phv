@@ -1,0 +1,10 @@
+<?phv
+// `yield` inside an open `<select>`: what the loop over the generator writes
+// meanwhile (checked outside a `<select>`) would land inside it (found by the
+// 19th assessment).
+function g(): Generator<int> {
+    ?><select><?phv yield 1; ?></select><?phv
+}
+$u = "javascript:alert(1)";
+?>
+<?phv foreach (g() as $_x) { ?><title></select><a href="<?= $u ?>">x</a></title><?phv } ?>

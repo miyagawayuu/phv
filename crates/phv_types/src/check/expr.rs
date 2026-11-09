@@ -375,7 +375,7 @@ impl<'a> Checker<'a> {
                 "in an attribute, write `escape(json_encode($value))` (e.g. in a `data-*` attribute)",
             ),
             // `Html` is checked when it is inserted (`html_inside`).
-            Text | SelectText | Attr | ForeignText | RawText(_) | Comment { .. } => return,
+            Text | SelectText | Attr | ForeignText(_) | RawText(_) | Comment { .. } => return,
             Unquoted => (
                 "values in attributes must be quoted",
                 "write `attr=\"<?= $value ?>\"`: escaping does not protect unquoted attribute values",

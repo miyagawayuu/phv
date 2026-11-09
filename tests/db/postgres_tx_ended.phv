@@ -1,0 +1,96 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs against a PostgreSQL server
+// (then postgres_tx_ended_after.phv): a transaction that PostgreSQL or a
+// statement ended before transaction() did is not reported as committed
+// (19th audit). A statement error aborts a PostgreSQL transaction: its
+// COMMIT rolls back without an error, which transaction() now raises, and
+// std.orm forgets what it kept.
+import std.db.Database;
+import std.orm.Repo;
+
+#[Table("phv_tx")]
+class Entry {
+    public ?int $id = null;
+    public string $name = "";
+    public int $visits = 0;
+}
+
+$db = Database::connect("main");
+$db->execute(sql"DROP TABLE IF EXISTS phv_tx");
+$db->execute(sql"CREATE TABLE phv_tx (id serial PRIMARY KEY, name text NOT NULL UNIQUE, visits int NOT NULL)");
+$repo = new Repo<Entry>($db);
+$a = new Entry();
+$a->name = "a";
+$repo->insert($a);
+$b = new Entry();
+$b->name = "b";
+$repo->insert($b);
+
+// A caught statement error inside transaction().
+try {
+    $db->transaction(function () use ($repo, $a, $b): void {
+        $a->name = "a2";
+        $repo->update($a);
+        try {
+            $b->name = "a2";
+            $repo->update($b);
+        } catch (DatabaseError $e) {
+            echo "caught a unique violation\n";
+        }
+    });
+    echo "transaction() returned\n";
+} catch (DatabaseError $e) {
+    echo "transaction() threw: ", $e->getMessage(), "\n";
+}
+$a->visits = 5;
+$repo->update($a);
+$row = $db->first(sql"SELECT name, visits FROM phv_tx WHERE id = {$a->id}");
+echo "row of a after update(): ", $row?->string("name") ?? "", " ", $row?->int("visits") ?? -1, "\n";
+
+// The same in an inner transaction(): its COMMIT raises, its savepoint is
+// rolled back, and the depth is right for what follows.
+$db->execute(sql"DELETE FROM phv_tx");
+try {
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"INSERT INTO phv_tx (name, visits) VALUES ('outer', 0)");
+        $db->transaction(function () use ($db): void {
+            try {
+                $db->execute(sql"INSERT INTO phv_tx (name, visits) VALUES ('outer', 0)");
+            } catch (DatabaseError $e) {
+                echo "inner caught a unique violation\n";
+            }
+        });
+    });
+    echo "transaction() returned\n";
+} catch (DatabaseError $e) {
+    echo "outer transaction() threw: ", $e->getMessage(), "\n";
+}
+echo "insert after: ", $db->execute(sql"INSERT INTO phv_tx (name, visits) VALUES ('after', 0)"), "\n";
+$db->transaction(function () use ($db): void {
+    $db->execute(sql"INSERT INTO phv_tx (name, visits) VALUES ('later', 0)");
+});
+
+// An inner transaction() that catches the error itself goes on.
+$db->transaction(function () use ($db): void {
+    try {
+        $db->transaction(function () use ($db): void {
+            $db->execute(sql"INSERT INTO phv_tx (name, visits) VALUES ('later', 0)");
+        });
+    } catch (DatabaseError $e) {
+        echo "inner transaction() threw a unique violation\n";
+    }
+    $db->execute(sql"INSERT INTO phv_tx (name, visits) VALUES ('kept', 0)");
+});
+
+// COMMIT written as SQL inside transaction(): what follows is refused.
+try {
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"INSERT INTO phv_tx (name, visits) VALUES ('sql-commit', 0)");
+        $db->execute(sql"COMMIT");
+        $db->execute(sql"INSERT INTO phv_tx (name, visits) VALUES ('refused', 0)");
+    });
+    echo "transaction() returned\n";
+} catch (DatabaseError $e) {
+    echo "transaction() threw: ", $e->getMessage(), "\n";
+}
+echo "rows seen: ", $db->first(sql"SELECT count(*)::int AS n FROM phv_tx")?->int("n") ?? -1, "\n";

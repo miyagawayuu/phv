@@ -1,0 +1,10 @@
+<?phv
+// Run after mysql_tx_ended.phv: what it committed.
+import std.db.Database;
+
+$db = Database::connect("main");
+foreach ($db->query(sql"SELECT name, v FROM phv_tx ORDER BY name") as $row) {
+    echo $row->string("name") ?? "", " ", $row->int("v") ?? -1, "\n";
+}
+$db->execute(sql"DROP TABLE phv_tx");
+$db->execute(sql"DROP TABLE IF EXISTS phv_tx_extra");

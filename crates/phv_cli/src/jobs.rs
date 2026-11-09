@@ -202,6 +202,22 @@ pub fn adopt(project: &Path, yes: bool, only: &[String]) -> ExitCode {
         );
     }
     if yes {
+        // What is left of this site's jobs, by name: those skipped above, and
+        // any the store got meanwhile (another site still on 1.0 adds them)
+        // or that the move did not reach, so none is left unsaid (found by
+        // the 19th assessment: two jobs were left with only the count below).
+        if let Ok(Some(left)) = store.adopt(&names, false) {
+            let mut by_name: std::collections::BTreeMap<&str, usize> = Default::default();
+            for j in &left {
+                *by_name.entry(j.name.as_str()).or_default() += 1;
+            }
+            if !by_name.is_empty() {
+                println!("left in the shared store, of this site's scripts:");
+                for (name, n) in &by_name {
+                    println!("  {}: {n} {}", short(name), plural(*n));
+                }
+            }
+        }
         if let Ok(n) = store.left_in_shared() {
             if n > 0 {
                 println!(

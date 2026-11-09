@@ -1,0 +1,17 @@
+error: the HTML in this block does not end where it started
+ --> err_select_loop.phv:8:120
+  |
+8 | <?phv foreach ($us as $u) { ?><title></select><a href="<?= $u ?>">x</a></title><select><option><?= $u ?></option><?phv } ?></select>
+  |                                                                                                                        ^
+  = note: close every tag, attribute and `<script>`/`<style>` opened inside a block, loop or function before it ends
+  = note: a `<select>` opened or closed in a block (or a loop's body, or a function) must be closed or opened again in it: what follows would be checked inside or outside one, where older browsers read a `<title>` or `<style>` in it as markup
+
+error: the HTML in this block does not end where it started
+ --> err_select_loop.phv:9:45
+  |
+9 | <?phv if (count($us) > 1) { ?><select><?phv } ?><option>o</option></select>
+  |                                             ^
+  = note: close every tag, attribute and `<script>`/`<style>` opened inside a block, loop or function before it ends
+  = note: a `<select>` opened or closed in a block (or a loop's body, or a function) must be closed or opened again in it: what follows would be checked inside or outside one, where older browsers read a `<title>` or `<style>` in it as markup
+
+2 errors found

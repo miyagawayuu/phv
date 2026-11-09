@@ -332,26 +332,40 @@ struct FileStore {
     /// `MAX_SESSIONS` and `MAX_BYTES` (smaller in tests).
     max_sessions: usize,
     max_bytes: u64,
-    /// `.phv-session.lock` in the directory, once opened. Every change to the
-    /// sessions holds it (and an OS lock on it, for other processes).
-    lock: Mutex<Option<File>>,
+    /// The session locks: `.phv-session-<xx>.lock` in the directory, one of
+    /// `LOCK_STRIPES` chosen by the session's hash (`stripe_of`), each opened
+    /// once. Every change to a session holds its lock (and an OS lock on its
+    /// file, for other processes), so the changes of one session are made one
+    /// at a time while those of other sessions go on (found by the 19th
+    /// assessment: one lock for the directory let a server save about 250
+    /// sessions a second on Windows, whatever its cores).
+    locks: Vec<Mutex<Option<File>>>,
+    /// How long each write of a session file takes longer (a slow disk, in tests).
+    #[cfg(test)]
+    write_delay: Duration,
 }
 
-/// Holds the OS lock on the session directory's lock file until dropped.
-struct DirLock<'a>(std::sync::MutexGuard<'a, Option<File>>);
+/// How many locks the sessions of a file store are spread over.
+const LOCK_STRIPES: usize = 64;
 
-impl Drop for DirLock<'_> {
+/// The lock of the session whose key (`session_key`), or whose file name,
+/// starts with `hash`: the first two hex digits of the key pick it.
+fn stripe_of(hash: &str) -> Option<usize> {
+    let hash = hash.strip_prefix('.').unwrap_or(hash);
+    let hash = hash.strip_prefix("n-").unwrap_or(hash);
+    u8::from_str_radix(hash.get(..2)?, 16).ok().map(|b| usize::from(b) % LOCK_STRIPES)
+}
+
+/// Holds a session lock, and the OS lock on its file, until dropped.
+struct SessionLock<'a>(std::sync::MutexGuard<'a, Option<File>>);
+
+impl Drop for SessionLock<'_> {
     fn drop(&mut self) {
         if let Some(f) = self.0.as_ref() {
             let _ = f.unlock();
         }
     }
 }
-
-/// How many times a read of a session file is tried while a save holds the
-/// directory lock (two yields, then a millisecond's sleep each: about 40 ms
-/// at most, paid only when a read fails while a save is in progress).
-const READ_RETRIES: usize = 40;
 
 /// Session files are `<64 hex>.json` (`n-<64 hex>.json` while new); temporary
 /// ones `.<that name>.<16 hex>`. The sweep never touches anything else in the directory.
@@ -370,38 +384,41 @@ impl Backend for FileStore {
     }
 
     fn insert(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<bool> {
-        let _held = self.lock_dir()?;
-        if self.exists(id, false) || self.exists(id, true) {
+        let _held = self.lock_session(id)?;
+        let dir = self.open_dir()?;
+        if Self::exists(&dir, id, false) || Self::exists(&dir, id, true) {
             return Ok(false);
         }
-        self.write(id, r, returned).map(|()| true)
+        self.write(&dir, id, r, returned).map(|()| true)
     }
 
     fn update(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<bool> {
-        let _held = self.lock_dir()?;
-        let (back, new) = (self.exists(id, true), self.exists(id, false));
+        let _held = self.lock_session(id)?;
+        let dir = self.open_dir()?;
+        let (back, new) = (Self::exists(&dir, id, true), Self::exists(&dir, id, false));
         if !back && !new {
             return Ok(false);
         }
         // Another request may have promoted it meanwhile.
         let returned = returned || back;
-        self.write(id, r, returned)?;
+        self.write(&dir, id, r, returned)?;
         if returned && new {
-            self.remove_file(id, false);
+            Self::remove_file(&dir, id, false);
         }
         Ok(true)
     }
 
     fn remove(&self, id: &str) -> bool {
-        let _held = self.lock_dir();
-        let removed = [false, true].map(|returned| self.remove_file(id, returned));
+        let _held = self.lock_session(id);
+        let Ok(dir) = self.open_dir() else { return false };
+        let removed = [false, true].map(|returned| Self::remove_file(&dir, id, returned));
         removed.contains(&true)
     }
 
     fn promote(&self, id: &str) -> bool {
-        match self.lock_dir() {
-            Ok(_held) => FileStore::promote(self, id),
-            Err(_) => false,
+        match (self.lock_session(id), self.open_dir()) {
+            (Ok(_held), Ok(dir)) => FileStore::promote(&dir, id),
+            _ => false,
         }
     }
 
@@ -423,50 +440,46 @@ impl FileStore {
             written: AtomicU64::new(0),
             max_sessions: MAX_SESSIONS,
             max_bytes: MAX_BYTES as u64,
-            lock: Mutex::new(None),
+            locks: (0..LOCK_STRIPES).map(|_| Mutex::new(None)).collect(),
+            #[cfg(test)]
+            write_delay: Duration::ZERO,
         }
     }
 
-    /// Locks the store against changes by other threads and processes.
-    fn lock_dir(&self) -> std::io::Result<DirLock<'_>> {
-        let mut held = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        Self::open_lock_file(&self.dir, &mut held)?.lock()?;
-        Ok(DirLock(held))
+    /// Locks the session `id` against changes by other threads and processes.
+    fn lock_session(&self, id: &str) -> std::io::Result<SessionLock<'_>> {
+        self.lock_stripe(stripe_of(&session_key(id)).unwrap_or(0))
     }
 
-    /// `lock_dir` without waiting: None when another thread or process holds
-    /// the lock (a save or the sweep is in progress).
-    fn try_lock_dir(&self) -> std::io::Result<Option<DirLock<'_>>> {
-        let mut held = match self.lock.try_lock() {
-            Ok(held) => held,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-        };
-        match Self::open_lock_file(&self.dir, &mut held)?.try_lock() {
-            Ok(()) => Ok(Some(DirLock(held))),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => Err(e),
-        }
-    }
-
-    /// `.phv-session.lock` in `dir`, opened once.
-    fn open_lock_file<'a>(dir: &Path, held: &'a mut Option<File>) -> std::io::Result<&'a File> {
+    /// Takes lock `n` of `LOCK_STRIPES`.
+    fn lock_stripe(&self, n: usize) -> std::io::Result<SessionLock<'_>> {
+        let mut held = self.locks[n].lock().unwrap_or_else(|e| e.into_inner());
         if held.is_none() {
             let fail = |e: safefs::FsError| std::io::Error::other(format!("{e:?}"));
-            let (parent, name) = safefs::open_parent(dir, Path::new(".phv-session.lock")).map_err(fail)?;
+            let name = format!(".phv-session-{n:02x}.lock");
+            let (parent, name) = safefs::open_parent(&self.dir, Path::new(&name)).map_err(fail)?;
             *held = Some(parent.open(&name, true).map_err(fail)?);
         }
-        Ok(held.as_ref().expect("opened above"))
+        held.as_ref().expect("opened above").lock()?;
+        Ok(SessionLock(held))
     }
 
-    fn exists(&self, id: &str, returned: bool) -> bool {
-        safefs::open_parent(&self.dir, Path::new(&Self::name(id, returned)))
-            .is_ok_and(|(dir, name)| dir.exists(&name).unwrap_or(false))
+    /// The session directory, opened once for the steps of one change (each
+    /// opening checks it again).
+    fn open_dir(&self) -> std::io::Result<safefs::DirGuard> {
+        safefs::open_parent(&self.dir, Path::new(".phv-session"))
+            .map(|(dir, _)| dir)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))
     }
 
-    fn remove_file(&self, id: &str, returned: bool) -> bool {
-        safefs::open_parent(&self.dir, Path::new(&Self::name(id, returned)))
-            .is_ok_and(|(dir, name)| dir.exists(&name).unwrap_or(false) && dir.remove(&name).is_ok())
+    fn exists(dir: &safefs::DirGuard, id: &str, returned: bool) -> bool {
+        dir.exists(OsStr::new(&Self::name(id, returned))).unwrap_or(false)
+    }
+
+    fn remove_file(dir: &safefs::DirGuard, id: &str, returned: bool) -> bool {
+        let name = Self::name(id, returned);
+        let name = OsStr::new(&name);
+        dir.exists(name).unwrap_or(false) && dir.remove(name).is_ok()
     }
 
     /// `<hash>.json` once the visitor came back (and for files from older
@@ -480,44 +493,39 @@ impl FileStore {
         }
     }
 
-    /// The session and whether its visitor came back. The returned name is
-    /// tried again last: another request may rename the file in between.
+    /// The session and whether its visitor came back.
+    ///
+    /// A save renames a temporary file over the session's file (and a
+    /// visitor's first request back renames `n-<hash>.json` to `<hash>.json`):
+    /// a reader that opens the file meanwhile can get the old one (on Windows
+    /// already moved away for deletion, or with another real name), land in
+    /// the rename itself, or find neither name in the directory for a moment;
+    /// under load (Windows Defender scans each new file) the moment stretches
+    /// to milliseconds (found by the 1.2.1 audit). So a read that finds no
+    /// session is not trusted: every change to a session holds the session's
+    /// lock (`lock_session`), so the read takes that lock, waiting at most
+    /// for the save under way (if any) of a session under the same lock, and
+    /// reads both names again under it; that result is final. Reads that
+    /// succeed never touch the lock. A cookie that names no session costs two
+    /// failed opens and a lock that is normally free (found by the 19th
+    /// assessment: a failed read polled the one lock of the directory, held
+    /// by every save of every session, up to 40 times a name, about 180 ms a
+    /// request with a forged cookie while any session was being saved).
     fn read(&self, id: &str) -> Option<(Record, bool)> {
-        let (back, new) = (Self::name(id, true), Self::name(id, false));
-        self.read_file(&back)
-            .map(|r| (r, true))
-            .or_else(|| self.read_file(&new).map(|r| (r, false)))
-            .or_else(|| self.read_file(&back).map(|r| (r, true)))
-    }
-
-    /// Reads a session file. A save renames a temporary file over it (and a
-    /// visitor's first request back renames `n-<hash>.json`): a reader that
-    /// opens the file meanwhile can get the old one (on Windows already moved
-    /// away for deletion, so its real name no longer matches, or still
-    /// pending deletion), find the name absent for a moment, or land in the
-    /// rename itself; under load (Windows Defender scans each new file) the
-    /// moment stretches to milliseconds. So a read that fails is not trusted
-    /// while a save may be in progress: every save holds the directory lock,
-    /// so the read is tried again while the lock is held by someone, and once
-    /// nobody holds it, read once more under the lock; that result is final
-    /// (found by the 1.2.1 audit). A cookie of a session that is gone costs
-    /// one failed open, a lock taken without waiting and one more failed
-    /// open; reads that succeed never touch the lock (they would otherwise
-    /// wait behind every save and the sweep).
-    fn read_file(&self, name: &str) -> Option<Record> {
-        let (dir, name) = safefs::open_parent(&self.dir, Path::new(name)).ok()?;
-        for attempt in 0..READ_RETRIES {
-            if let Ok(text) = Self::read_text(&dir, &name) {
-                return Record::from_json(&text);
-            }
-            match self.try_lock_dir() {
-                Ok(Some(_held)) => return Self::read_text(&dir, &name).ok().and_then(|t| Record::from_json(&t)),
-                Ok(None) if attempt < 2 => std::thread::yield_now(),
-                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
-                Err(_) => return None,
-            }
+        let (new_name, back_name) = (Self::name(id, false), Self::name(id, true));
+        let dir = self.open_dir().ok()?;
+        // The returned name first: most sessions are found there.
+        let names = [(OsStr::new(&back_name), true), (OsStr::new(&new_name), false)];
+        let read = |dir: &safefs::DirGuard| {
+            names.iter().find_map(|&(name, returned)| {
+                Self::read_text(dir, name).ok().and_then(|t| Record::from_json(&t)).map(|r| (r, returned))
+            })
+        };
+        if let Some(found) = read(&dir) {
+            return Some(found);
         }
-        None
+        let _held = self.lock_session(id).ok()?;
+        read(&dir)
     }
 
     fn read_text(dir: &safefs::DirGuard, name: &OsStr) -> Result<String, safefs::FsError> {
@@ -527,13 +535,12 @@ impl FileStore {
     }
 
     /// Writes the file atomically: a temporary file renamed over the old one.
-    fn write(&self, id: &str, r: &Record, returned: bool) -> std::io::Result<()> {
+    fn write(&self, dir: &safefs::DirGuard, id: &str, r: &Record, returned: bool) -> std::io::Result<()> {
         let text = r.to_json();
         let name = Self::name(id, returned);
-        let tmp = format!(".{name}.{}", phv_std::random_hex(8));
+        let tmp_name = format!(".{name}.{}", phv_std::random_hex(8));
         let fail = |e: safefs::FsError| std::io::Error::other(format!("{e:?}"));
-        let (dir, tmp_name) = safefs::open_parent(&self.dir, Path::new(&tmp)).map_err(fail)?;
-        let mut f = dir.open(&tmp_name, true).map_err(fail)?;
+        let mut f = dir.open(OsStr::new(&tmp_name), true).map_err(fail)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -542,6 +549,8 @@ impl FileStore {
         f.write_all(text.as_bytes())?;
         self.written.fetch_add(text.len() as u64, Ordering::Relaxed);
         drop(f);
+        #[cfg(test)]
+        std::thread::sleep(self.write_delay);
         let result = std::fs::rename(dir.path().join(&tmp_name), dir.path().join(&name));
         if result.is_err() {
             let _ = std::fs::remove_file(dir.path().join(&tmp_name));
@@ -551,19 +560,21 @@ impl FileStore {
 
     /// Renames `n-<hash>.json` to `<hash>.json` when the visitor comes back.
     /// A link or hard link is left alone, never followed or moved.
-    fn promote(&self, id: &str) -> bool {
-        let Ok((dir, new)) = safefs::open_parent(&self.dir, Path::new(&Self::name(id, false))) else {
-            return false;
-        };
-        if !dir.exists(&new).unwrap_or(false) || dir.check_plain_or_missing(&new).is_err() {
+    fn promote(dir: &safefs::DirGuard, id: &str) -> bool {
+        let new = Self::name(id, false);
+        let new = OsStr::new(&new);
+        if !dir.exists(new).unwrap_or(false) || dir.check_plain_or_missing(new).is_err() {
             return false;
         }
-        std::fs::rename(dir.path().join(&new), dir.path().join(Self::name(id, true))).is_ok()
+        std::fs::rename(dir.path().join(new), dir.path().join(Self::name(id, true))).is_ok()
     }
 
     /// Every 30 seconds, or sooner after many writes: deletes expired session
     /// files, then while there are too many or they take too much space, new
     /// sessions whose visitor never came back, then the oldest of the rest.
+    /// The directory is listed without a lock; each file is deleted under its
+    /// session's lock, and only if it is still what the listing saw (still
+    /// expired, or not written since), so a session saved meanwhile is kept.
     fn sweep(&self, ttl: Duration) {
         let now = now_secs();
         let last = self.swept.load(Ordering::Relaxed);
@@ -574,10 +585,10 @@ impl FileStore {
             return;
         }
         self.written.store(0, Ordering::Relaxed);
-        let Ok(_held) = self.lock_dir() else { return };
         let Ok(rd) = std::fs::read_dir(&self.dir) else { return };
         let limit = SystemTime::now() - ttl.min(MAX_LIFETIME);
         let mut live: Vec<(bool, SystemTime, u64, PathBuf)> = Vec::new();
+        let mut expired = Vec::new();
         for e in rd.flatten() {
             let Ok(meta) = e.metadata() else { continue };
             let name = e.file_name().to_string_lossy().into_owned();
@@ -585,19 +596,14 @@ impl FileStore {
             if !meta.is_file() || !is_session_file(&name) {
                 continue;
             }
-            if name.starts_with('.') {
-                // Temporary files left by a crash are removed once old.
-                if modified < limit {
-                    let _ = std::fs::remove_file(e.path());
-                }
-                continue;
-            }
             if modified < limit {
-                let _ = std::fs::remove_file(e.path());
-            } else {
+                // Expired, or a temporary file left by a crash.
+                expired.push((e.path(), Doomed::Before(limit)));
+            } else if !name.starts_with('.') {
                 live.push((!name.starts_with("n-"), modified, meta.len(), e.path()));
             }
         }
+        self.remove_doomed(expired);
         let mut bytes: u64 = live.iter().map(|l| l.2).sum();
         if live.len() <= self.max_sessions && bytes <= self.max_bytes {
             return;
@@ -612,7 +618,7 @@ impl FileStore {
             text.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
         };
         let now_t = SystemTime::now();
-        let mut ranked: Vec<(bool, f64, u64, PathBuf)> = live
+        let mut ranked: Vec<(bool, f64, u64, PathBuf, SystemTime)> = live
             .into_iter()
             .map(|(returned, modified, len, path)| {
                 let idle = now_t.duration_since(modified).map_or(0.0, |d| d.as_secs_f64());
@@ -622,20 +628,54 @@ impl FileStore {
                 } else {
                     -idle
                 };
-                (returned, score, len, path)
+                (returned, score, len, path, modified)
             })
             .collect();
         ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
         let mut count = ranked.len();
-        for (_, _, len, path) in ranked {
+        let mut excess = Vec::new();
+        for (_, _, len, path, at) in ranked {
             if count <= self.max_sessions * 9 / 10 && bytes <= self.max_bytes * 9 / 10 {
                 break;
             }
-            let _ = std::fs::remove_file(path);
+            excess.push((path, Doomed::Unchanged(at)));
             count -= 1;
             bytes -= len;
         }
+        self.remove_doomed(excess);
     }
+
+    /// Deletes the files of `doomed` that are still as the sweep saw them,
+    /// each under its session's lock (one lock at a time, never two).
+    fn remove_doomed(&self, doomed: Vec<(PathBuf, Doomed)>) {
+        let mut by_lock: Vec<Vec<(PathBuf, Doomed)>> = (0..LOCK_STRIPES).map(|_| Vec::new()).collect();
+        for (path, why) in doomed {
+            let n = path.file_name().and_then(|n| n.to_str()).and_then(stripe_of).unwrap_or(0);
+            by_lock[n].push((path, why));
+        }
+        for (n, files) in by_lock.into_iter().enumerate().filter(|(_, f)| !f.is_empty()) {
+            let Ok(_held) = self.lock_stripe(n) else { continue };
+            for (path, why) in files {
+                let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+                let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+                let still = match why {
+                    Doomed::Before(limit) => modified < limit,
+                    Doomed::Unchanged(at) => modified == at,
+                };
+                if meta.is_file() && still {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+}
+
+/// Why the sweep deletes a file, checked again under the session's lock.
+enum Doomed {
+    /// Last written before this time (expired).
+    Before(SystemTime),
+    /// One of the excess: not written since it was listed at this time.
+    Unchanged(SystemTime),
 }
 
 impl Store {
@@ -684,6 +724,13 @@ impl Store {
         store
     }
 
+    /// The memory store's map. A panic while it was held (a page's panic is
+    /// caught on a pool thread that lives on) leaves it as it was, not
+    /// poisoned for every later request (found by the 19th assessment).
+    fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn alive(&self, e: &Entry) -> bool {
         e.last.elapsed() < self.ttl && e.created.elapsed() < MAX_LIFETIME
     }
@@ -723,7 +770,7 @@ impl Store {
             }
             return SessionData { id: Some(id), values: r.values.into_values(), ..SessionData::default() };
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         if let Some(id) = id {
             let alive = inner.map.get(&id).map(|e| self.alive(e));
             match alive {
@@ -736,7 +783,7 @@ impl Store {
                 }
                 Some(false) => {
                     if let Some(e) = inner.map.remove(&id) {
-                        inner.bytes -= e.bytes;
+                        inner.bytes = inner.bytes.saturating_sub(e.bytes);
                     }
                 }
                 None => {}
@@ -772,7 +819,7 @@ impl Store {
         by_age.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
         for (_, _, k) in by_age.into_iter().take((MAX_SESSIONS / 10).max(1)) {
             if let Some(e) = inner.map.remove(&k) {
-                inner.bytes -= e.bytes;
+                inner.bytes = inner.bytes.saturating_sub(e.bytes);
             }
         }
     }
@@ -790,7 +837,7 @@ impl Store {
         if let Some(files) = &self.files {
             return self.save_file(files.as_ref(), s);
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         inner.requests += 1;
         if inner.requests.is_multiple_of(1024) {
             self.evict(&mut inner, 0);
@@ -798,7 +845,7 @@ impl Store {
         if s.destroyed {
             if let Some(id) = &s.id {
                 if let Some(e) = inner.map.remove(id) {
-                    inner.bytes -= e.bytes;
+                    inner.bytes = inner.bytes.saturating_sub(e.bytes);
                 }
             }
             return s.id.map(|_| self.cookie_for(None));
@@ -816,7 +863,7 @@ impl Store {
             // Gone meanwhile (logged out, regenerated or expired by another
             // request): saving would bring it back for whoever holds the old id.
             let e = inner.map.remove(old)?;
-            inner.bytes -= e.bytes;
+            inner.bytes = inner.bytes.saturating_sub(e.bytes);
             created = e.created;
             returned = e.returned;
         }
@@ -1006,6 +1053,204 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A file store in a new directory of its own, whose writes take `delay`
+    /// longer (a slow disk), with its sweep just done.
+    fn slow_file_store(tag: &str, delay: Duration) -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("phv-sess-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::new(Duration::from_secs(600), false, Some(dir.clone()));
+        let files = store.files.as_mut().unwrap().file_store().unwrap();
+        files.write_delay = delay;
+        files.swept.store(now_secs(), Ordering::Relaxed);
+        (store, dir)
+    }
+
+    /// `n` session ids whose sessions have locks of their own.
+    fn ids_of_different_locks(n: usize) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut ids = Vec::new();
+        while ids.len() < n {
+            let id = phv_std::random_hex(32);
+            if seen.insert(stripe_of(&session_key(&id)).unwrap()) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// Stores a session whose visitor came back under `id`, as a save would.
+    fn put_session(store: &Store, id: &str) {
+        let now = now_secs();
+        let mut values = IndexMap::new();
+        values.insert("user".to_string(), id[..8].to_string());
+        let r = Record { created: now, last: now, values: Stored::Map(values) };
+        assert!(store.files.as_ref().unwrap().insert(id, &r, true).unwrap());
+    }
+
+    /// Saves of different sessions do not wait for each other: 64 visitors
+    /// save at once on a disk whose writes take 100 ms, in well under 64 × 100
+    /// ms (found by the 19th assessment: every save of every session held
+    /// one lock of the directory, about 250 saves a second on Windows).
+    #[test]
+    fn saves_of_different_sessions_do_not_wait_for_each_other() {
+        let delay = Duration::from_millis(100);
+        let (store, dir) = slow_file_store("parallel", Duration::ZERO);
+        let ids = ids_of_different_locks(LOCK_STRIPES);
+        for id in &ids {
+            put_session(&store, id);
+        }
+        let mut store = store;
+        store.files.as_mut().unwrap().file_store().unwrap().write_delay = delay;
+        let loaded: Vec<SessionData> = ids.iter().map(|id| store.load(Some(&format!("PHVSESSID={id}")))).collect();
+        assert!(loaded.iter().all(|s| s.id.is_some()));
+        let barrier = std::sync::Barrier::new(loaded.len());
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for mut s in loaded {
+                let (store, barrier) = (&store, &barrier);
+                scope.spawn(move || {
+                    s.values.insert("seen".into(), "1".into());
+                    s.changed = true;
+                    barrier.wait();
+                    assert!(store.save(s).is_none(), "the same id: no cookie");
+                });
+            }
+        });
+        let took = started.elapsed();
+        assert!(took < delay * 16, "64 saves of 64 sessions took {took:?} (one at a time: {:?})", delay * 64);
+        for id in &ids {
+            let s = store.load(Some(&format!("PHVSESSID={id}")));
+            assert_eq!(s.values.get("seen").map(String::as_str), Some("1"), "{id}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The saves of one session are still made one at a time: 8 requests
+    /// of one visitor saving at once take at least 8 writes.
+    #[test]
+    fn saves_of_one_session_are_made_one_at_a_time() {
+        let delay = Duration::from_millis(40);
+        let (mut store, dir) = slow_file_store("serial", Duration::ZERO);
+        let id = phv_std::random_hex(32);
+        put_session(&store, &id);
+        store.files.as_mut().unwrap().file_store().unwrap().write_delay = delay;
+        let header = format!("PHVSESSID={id}");
+        let loaded: Vec<SessionData> = (0..8).map(|_| store.load(Some(&header))).collect();
+        let barrier = std::sync::Barrier::new(loaded.len());
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for (i, mut s) in loaded.into_iter().enumerate() {
+                let (store, barrier) = (&store, &barrier);
+                scope.spawn(move || {
+                    s.values.insert("seen".into(), i.to_string());
+                    s.changed = true;
+                    barrier.wait();
+                    assert!(store.save(s).is_none());
+                });
+            }
+        });
+        let took = started.elapsed();
+        assert!(took >= delay * 8, "8 saves of one session took {took:?}: they did not wait for each other");
+        let s = store.load(Some(&header));
+        assert!(s.values.get("seen").is_some_and(|v| v.parse::<usize>().is_ok_and(|n| n < 8)));
+        assert_eq!(s.values.get("user").map(String::as_str), Some(&id[..8]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A cookie that names no session (forged, or of a session that ended)
+    /// is answered without waiting for the saves of sessions under other
+    /// locks, and waits once at most for a save under its own (found by the
+    /// 19th assessment: such a read polled the one lock of the directory for
+    /// up to 40 ms a name, about 180 ms a request while any session was saved).
+    #[test]
+    fn a_forged_cookie_does_not_wait_for_saves() {
+        use std::sync::atomic::AtomicBool;
+        let delay = Duration::from_millis(50);
+        let (mut store, dir) = slow_file_store("forged", Duration::ZERO);
+        let forged = phv_std::random_hex(32);
+        let lock = stripe_of(&session_key(&forged)).unwrap();
+        // A visitor under the forged id's lock, and seven under others.
+        let same = loop {
+            let id = phv_std::random_hex(32);
+            if stripe_of(&session_key(&id)) == Some(lock) {
+                break id;
+            }
+        };
+        let others: Vec<String> = ids_of_different_locks(8)
+            .into_iter()
+            .filter(|id| stripe_of(&session_key(id)) != Some(lock))
+            .take(7)
+            .collect();
+        for id in others.iter().chain([&same]) {
+            put_session(&store, id);
+        }
+        store.files.as_mut().unwrap().file_store().unwrap().write_delay = delay;
+        // How many of 40 loads with the forged cookie waited, and the
+        // longest, while the visitors `ids` save their sessions without a pause.
+        let loads_while_saving = |ids: &[&String]| {
+            let saving = AtomicBool::new(true);
+            std::thread::scope(|scope| {
+                for id in ids {
+                    let (store, saving) = (&store, &saving);
+                    scope.spawn(move || {
+                        let header = format!("PHVSESSID={id}");
+                        let mut i = 0;
+                        while saving.load(Ordering::Relaxed) {
+                            let mut s = store.load(Some(&header));
+                            s.values.insert("seen".into(), i.to_string());
+                            s.changed = true;
+                            store.save(s);
+                            i += 1;
+                        }
+                    });
+                }
+                std::thread::sleep(delay);
+                let mut times = Vec::new();
+                for _ in 0..40 {
+                    let started = Instant::now();
+                    assert!(store.load(Some(&format!("PHVSESSID={forged}"))).id.is_none());
+                    times.push(started.elapsed());
+                }
+                saving.store(false, Ordering::Relaxed);
+                let waited = times.iter().filter(|t| **t >= delay / 2).count();
+                (waited, times.into_iter().max().unwrap())
+            })
+        };
+        let (waited, longest) = loads_while_saving(&others.iter().collect::<Vec<_>>());
+        assert!(waited <= 2, "{waited} of 40 loads with a forged cookie waited (the longest {longest:?})");
+        // Under the same lock: one save at most.
+        let (_, longest) = loads_while_saving(&[&same]);
+        assert!(longest < delay * 3, "a load with a forged cookie took {longest:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A panic while the memory store's map is held (a page's panic is caught
+    /// on a pool thread) does not fail every later request: sessions are
+    /// still loaded and saved (found by the 19th assessment).
+    #[test]
+    fn a_panic_holding_the_memory_store_does_not_break_it() {
+        let store = Store::new(Duration::from_secs(600), false, None);
+        let mut s = SessionData::default();
+        s.values.insert("user".into(), "ann".into());
+        s.changed = true;
+        let header = format!("PHVSESSID={}", id_of(&store.save(s).unwrap()));
+        let panicked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _held = store.inner.lock();
+                    panic!("a page panicked");
+                })
+                .join()
+        });
+        assert!(panicked.is_err() && store.inner.is_poisoned());
+        let mut s = store.load(Some(&header));
+        assert_eq!(s.values.get("user").map(String::as_str), Some("ann"));
+        s.values.insert("seen".into(), "1".into());
+        s.changed = true;
+        assert!(store.save(s).is_none());
+        assert_eq!(store.load(Some(&header)).values.get("seen").map(String::as_str), Some("1"));
+    }
+
     /// Writes raw bytes under a key in the Redis server of `url`
     /// (`redis://[[user]:password@]host[:port][/db]`), as damage would, with
     /// an expiry of a minute; or reads them back (`value` None).
@@ -1151,7 +1396,11 @@ mod tests {
 
     /// The Redis store refuses a record that is not UTF-8, as the file store
     /// does, instead of reading it with replacement characters (found by the
-    /// 1.2.1 audit). Skipped without `PHV_TEST_REDIS_URL`.
+    /// 1.2.1 audit); and a damaged record (not UTF-8, or a header that is not
+    /// PHV's) is removed like an expired one, not taken for a failure of the
+    /// store: `/ready` stays up (found by the 19th assessment: the record
+    /// stayed, and `/ready` answered 503 until another visitor came).
+    /// Skipped without `PHV_TEST_REDIS_URL`.
     #[test]
     fn a_redis_record_that_is_not_utf8_is_refused() {
         let Some(url) = std::env::var("PHV_TEST_REDIS_URL").ok().filter(|u| !u.is_empty()) else {
@@ -1161,22 +1410,27 @@ mod tests {
         let _one_at_a_time = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let spec = phv_vm::DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 2 };
         let ns = phv_std::testing::namespace(0x48);
+        let health: Arc<Health> = Arc::default();
         let store =
-            Store::with_database(Duration::from_secs(600), false, spec.clone(), Arc::default(), Some(ns.clone()));
+            Store::with_database(Duration::from_secs(600), false, spec.clone(), health.clone(), Some(ns.clone()));
         let now = now_secs();
         let id = phv_std::random_hex(32);
         let key = format!("phv:session:{}", shared_session_key(Some(&ns), &id));
-        let mut raw = format!("{now} {now} 1\n{{\"a\":\"").into_bytes();
-        raw.extend_from_slice(b"\xff\xfe\"}");
-        redis_raw(&url, key.as_bytes(), Some(&raw));
-        let s = store.load(Some(&format!("PHVSESSID={id}")));
-        assert!(s.id.is_none() && s.values.is_empty(), "a record that is not UTF-8 was read");
-        assert_eq!(redis_raw(&url, key.as_bytes(), None).as_deref(), Some(&raw[..]), "the record was touched");
+        let mut not_utf8 = format!("{now} {now} 1\n{{\"a\":\"").into_bytes();
+        not_utf8.extend_from_slice(b"\xff\xfe\"}");
         // The same bytes in the header.
-        let mut raw = format!("{now} ").into_bytes();
-        raw.extend_from_slice(b"\xff 1\n{}");
-        redis_raw(&url, key.as_bytes(), Some(&raw));
-        assert!(store.load(Some(&format!("PHVSESSID={id}"))).id.is_none());
+        let mut header = format!("{now} ").into_bytes();
+        header.extend_from_slice(b"\xff 1\n{}");
+        let not_a_number = format!("{now} x 1\n{{}}");
+        let damaged: [&[u8]; 6] =
+            [&not_utf8, &header, b"no header", b"-1 -1 1\n{}", b"1 2\n{}", not_a_number.as_bytes()];
+        for raw in damaged {
+            redis_raw(&url, key.as_bytes(), Some(raw));
+            let s = store.load(Some(&format!("PHVSESSID={id}")));
+            assert!(s.id.is_none() && s.values.is_empty(), "a damaged record was read: {raw:?}");
+            assert_eq!(redis_raw(&url, key.as_bytes(), None), None, "the damaged record was kept: {raw:?}");
+            assert!(health.down().is_empty(), "a damaged record was taken for a failure of the store: {raw:?}");
+        }
         // A record that is UTF-8 is read as before.
         redis_raw(&url, key.as_bytes(), Some(format!("{now} {now} 1\n{{\"a\":\"\u{3042}\"}}").as_bytes()));
         assert_eq!(store.load(Some(&format!("PHVSESSID={id}"))).values.get("a").map(String::as_str), Some("\u{3042}"));

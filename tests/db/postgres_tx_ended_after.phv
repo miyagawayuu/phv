@@ -1,0 +1,9 @@
+<?phv
+// Run after postgres_tx_ended.phv: what it committed.
+import std.db.Database;
+
+$db = Database::connect("main");
+foreach ($db->query(sql"SELECT name FROM phv_tx ORDER BY name") as $row) {
+    echo $row->string("name") ?? "", "\n";
+}
+$db->execute(sql"DROP TABLE phv_tx");

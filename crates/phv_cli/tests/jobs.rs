@@ -367,6 +367,10 @@ fn check_adopt(name: &str, url: &str) {
     own.add(&keyed_name, "", 3600, Some(&key)).unwrap().unwrap();
     let keyed = shared.add(&keyed_name, "", 0, Some(&key)).unwrap().unwrap();
     let theirs = shared.add(&other, "theirs", 0, None).unwrap().unwrap();
+    // A name that differs from one of the site's only in case (a writer of
+    // the shared store made it) is not the site's, on MySQL too, whose
+    // collation ignores case (found by the 19th assessment).
+    let upper = shared.add(&left.to_uppercase(), "upper", 0, None).unwrap().unwrap();
     // The ids of this run's jobs in a store.
     let ids = |store: &Store| {
         let mut ids: Vec<String> =
@@ -392,9 +396,9 @@ fn check_adopt(name: &str, url: &str) {
         out.contains(&format!("skipped  {keyed}  waiting  {keyed_name}: this site's store has a job with its key")),
         "{out}"
     );
-    assert!(!out.contains(&theirs), "{out}");
+    assert!(!out.contains(&theirs) && !out.contains(&upper), "{out}");
     assert!(out.contains("a dry run: nothing was moved; run `phv jobs adopt --yes`"), "{out}");
-    assert_eq!(ids(&shared), sorted(vec![&dead, &running, &one, &two, &keyed, &theirs]));
+    assert_eq!(ids(&shared), sorted(vec![&dead, &running, &one, &two, &keyed, &theirs, &upper]));
     assert_eq!(own.list(false).unwrap().len(), 1);
     // `--name` restricts the adoption to those of the site's job scripts.
     let (ok, out) = phv(&["jobs", "adopt", "--name", &keyed_name, &dir.to_string_lossy()]);
@@ -404,20 +408,24 @@ fn check_adopt(name: &str, url: &str) {
     assert!(ok && out.contains("would move 3 jobs (2 waiting, 1 failed):") && out.contains(&keyed), "{out}");
     let (ok, out) = phv(&["jobs", "adopt", "--name", "nosuch", "--yes", &dir.to_string_lossy()]);
     assert!(!ok && out.contains("--name nosuch: jobs/ has no job script nosuch.phv"), "{out}");
-    assert_eq!(ids(&shared), sorted(vec![&dead, &running, &one, &two, &keyed, &theirs]));
+    assert_eq!(ids(&shared), sorted(vec![&dead, &running, &one, &two, &keyed, &theirs, &upper]));
     let note = |n: usize| {
         format!("note: {n} jobs added before this site had a namespace are still in the shared store and not run")
     };
     let (ok, out) = phv(&["jobs", "list", &dir.to_string_lossy()]);
-    assert!(ok && out.contains(&note(base + 6)) && out.contains("`phv jobs adopt` moves"), "{out}");
+    assert!(ok && out.contains(&note(base + 7)) && out.contains("`phv jobs adopt` moves"), "{out}");
     // The move: this site's waiting and failed jobs, with their states.
     let (ok, out) = phv(&["jobs", "adopt", "--yes", &dir.to_string_lossy()]);
     assert!(ok, "{out}");
     assert!(out.contains("moved 3 jobs (2 waiting, 1 failed):"), "{out}");
     assert!(out.contains(&format!("skipped  {running}  running")), "{out}");
     assert!(out.contains(&format!("skipped  {keyed}  waiting")), "{out}");
-    assert!(out.contains(&format!("note: {} jobs are still in the shared store", base + 3)), "{out}");
-    assert_eq!(ids(&shared), sorted(vec![&running, &keyed, &theirs]));
+    // What is left of the site's jobs, by name (found by the 19th assessment).
+    let left_by_name =
+        format!("left in the shared store, of this site's scripts:\n  {keyed_name}: 1 job\n  {left}: 1 job\n");
+    assert!(out.contains(&left_by_name), "{out}");
+    assert!(out.contains(&format!("note: {} jobs are still in the shared store", base + 4)), "{out}");
+    assert_eq!(ids(&shared), sorted(vec![&running, &keyed, &theirs, &upper]));
     let mine = own.list(false).unwrap();
     assert_eq!(mine.len(), 4, "{mine:?}");
     let failed = mine.iter().find(|j| j.id == dead).unwrap();
@@ -427,7 +435,7 @@ fn check_adopt(name: &str, url: &str) {
     assert!(later.state == "waiting" && later.at > now + 3_000_000, "{later:?}");
     // `phv jobs list` no longer counts them.
     let (ok, out) = phv(&["jobs", "list", &dir.to_string_lossy()]);
-    assert!(ok && out.contains(&note(base + 3)) && out.contains(&one), "{out}");
+    assert!(ok && out.contains(&note(base + 4)) && out.contains(&one), "{out}");
     // The moved jobs run as the site's own: the one due now first.
     let t = own.take(Duration::from_secs(60)).unwrap().unwrap();
     assert_eq!((t.id.as_str(), t.payload.as_str(), t.attempts), (one.as_str(), "one", 1));
@@ -435,13 +443,13 @@ fn check_adopt(name: &str, url: &str) {
     // Once more: nothing more to move.
     let (ok, out) = phv(&["jobs", "adopt", "--yes", &dir.to_string_lossy()]);
     assert!(ok && !out.contains("moved 1") && !out.contains("moved 2") && out.contains("skipped"), "{out}");
-    assert_eq!(ids(&shared), sorted(vec![&running, &keyed, &theirs]));
+    assert_eq!(ids(&shared), sorted(vec![&running, &keyed, &theirs, &upper]));
     // Ended, the running job is moved too.
     shared.end(&run, End::Done { keyed: false }).unwrap();
     let kept = shared.add(&left, "five", 0, None).unwrap().unwrap();
     let (ok, out) = phv(&["jobs", "adopt", "--yes", &dir.to_string_lossy()]);
     assert!(ok && out.contains("moved 1 job (1 waiting, 0 failed):") && out.contains(&kept), "{out}");
-    assert_eq!(ids(&shared), sorted(vec![&keyed, &theirs]));
+    assert_eq!(ids(&shared), sorted(vec![&keyed, &theirs, &upper]));
     // A site without a namespace has the shared store as its own.
     write(&dir, "phv.toml", &toml(""));
     let (ok, out) = phv(&["jobs", "adopt", &dir.to_string_lossy()]);

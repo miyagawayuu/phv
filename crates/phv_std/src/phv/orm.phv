@@ -35,8 +35,10 @@ import std.db.{Database, Row};
  * Every statement runs through the `Database` it was given, with the limits
  * of std.db. A Repo remembers what the rows of the entities it read or wrote
  * held, so that `update()` writes only the columns that changed; it forgets
- * that after a `transaction()` is rolled back. Nothing is kept beyond the
- * Repo itself (the end of the request at the latest).
+ * that after a `transaction()` is rolled back or fails to commit, after
+ * `COMMIT` or `ROLLBACK` written as SQL, and after another Repo wrote to the
+ * same table. Nothing is kept beyond the Repo itself (the end of the request
+ * at the latest).
  */
 export final class Repo<T> {
     /** Never holds anything: it names the type `T` for the runtime. */
@@ -54,7 +56,7 @@ export final class Repo<T> {
      */
     public function __construct(private Database $db, string $description = "", list<any> $defaults = []) {
         $this->meta = __orm_meta($db, $description, $defaults);
-        $this->epoch = __orm_epoch();
+        $this->epoch = __orm_epoch($this->meta);
     }
 
     /** The entity whose key is `$key`, or null when no row has it. */
@@ -99,10 +101,21 @@ export final class Repo<T> {
         $this->fresh();
         $mode = __orm_insert_mode($this->meta, $entity);
         $q = __orm_insert($this->meta, $entity);
+        if ($mode == 2) {
+            // MySQL: the key is read with lastInsertId(), which only an
+            // AUTO_INCREMENT key column makes (asked once per Repo).
+            $check = __orm_made_query($this->meta);
+            if ($check != null) {
+                __orm_made($this->meta, $this->db->first($check)?->toMap());
+            }
+        }
         if ($mode == 1) {
-            __orm_set_key($this->meta, $entity, $this->db->first($q)?->toMap());
+            $row = $this->db->first($q)?->toMap();
+            $this->epoch = __orm_wrote($this->meta);
+            __orm_set_key($this->meta, $entity, $row);
         } else {
             $this->db->execute($q);
+            $this->epoch = __orm_wrote($this->meta);
             if ($mode == 2) {
                 __orm_set_key($this->meta, $entity, $this->db->lastInsertId());
             }
@@ -126,6 +139,7 @@ export final class Repo<T> {
         }
         $changed = $this->db->execute($q) > 0;
         if ($changed) {
+            $this->epoch = __orm_wrote($this->meta);
             $this->remember($entity);
         } else {
             $this->forget($key);
@@ -136,7 +150,11 @@ export final class Repo<T> {
     /** Deletes the row of `$entity`; true when there was one. `ValueError` when the key is null. */
     public function delete(T $entity): bool {
         $q = __orm_delete($this->meta, $entity);
+        $this->fresh();
         $deleted = $this->db->execute($q) > 0;
+        if ($deleted) {
+            $this->epoch = __orm_wrote($this->meta);
+        }
         $this->forget(__orm_key($this->meta, $entity) ?? "");
         return $deleted;
     }
@@ -181,9 +199,12 @@ export final class Repo<T> {
         $this->seen = $this->seen->remove($key);
     }
 
-    /** After a rollback, the rows may no longer hold what this Repo saw. */
+    /**
+     * After a rollback, or a write of another Repo to the table, the rows may
+     * no longer hold what this Repo saw.
+     */
     private function fresh(): void {
-        $now = __orm_epoch();
+        $now = __orm_epoch($this->meta);
         if ($now != $this->epoch) {
             $this->held = [];
             $this->seen = [];
