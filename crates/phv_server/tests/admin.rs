@@ -52,6 +52,16 @@ fn site(name: &str) -> PathBuf {
     dir
 }
 
+/// The tests run one at a time: each takes a free port and listens on it a
+/// moment later, and the flood of `silent_connections_do_not_keep_health_waiting`
+/// takes thousands of client ports meanwhile, so a port could be taken
+/// between the two (on Windows CI: "only one usage of each socket address"),
+/// or two tests could get the same one.
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ONE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A free port on the loopback address (for `[admin] listen`).
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
@@ -102,6 +112,7 @@ fn metric(text: &str, line_start: &str) -> f64 {
 
 #[test]
 fn health_ready_and_metrics() {
+    let _one = one_at_a_time();
     let dir = site("metrics");
     let port = free_port();
     write(&dir, "phv.toml", &format!("[admin]\nlisten = \"127.0.0.1:{port}\"\n"));
@@ -151,6 +162,7 @@ fn health_ready_and_metrics() {
 
 #[test]
 fn metrics_need_the_token() {
+    let _one = one_at_a_time();
     std::env::set_var("PHV_TEST_ADMIN_TOKEN", "t0ken-of-sixteen-bytes");
     let dir = site("token");
     let port = free_port();
@@ -189,6 +201,7 @@ fn metrics_need_the_token() {
 /// connections from one client, renewed as they closed, delayed `/health` by 5 s.
 #[test]
 fn silent_connections_do_not_keep_health_waiting() {
+    let _one = one_at_a_time();
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Instant;
@@ -264,6 +277,7 @@ fn silent_connections_do_not_keep_health_waiting() {
 
 #[test]
 fn health_turns_503_when_the_server_stops() {
+    let _one = one_at_a_time();
     let dir = site("stop");
     let port = free_port();
     write(&dir, "phv.toml", &format!("[admin]\nlisten = \"127.0.0.1:{port}\"\n"));
@@ -293,6 +307,7 @@ fn health_turns_503_when_the_server_stops() {
 
 #[test]
 fn requests_get_ids() {
+    let _one = one_at_a_time();
     let page = "<?phv\nimport std.http.request_id;\necho request_id() ?? \"none\";\nlog_info(\"seen\");\n";
     let dir = site("ids");
     write(
@@ -351,6 +366,7 @@ fn requests_get_ids() {
 /// span of their own.
 #[test]
 fn calls_to_other_services_carry_the_trace() {
+    let _one = one_at_a_time();
     // The service that echoes the trace is another server: a service cannot
     // point at the server itself (18th audit).
     let other = site("trace-other");
