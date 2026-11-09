@@ -1224,13 +1224,16 @@ mod tests {
             put_session(&store, id);
         }
         store.files.as_mut().unwrap().file_store().unwrap().write_delay = delay;
-        // How many of 40 loads with the forged cookie waited, and the
-        // longest, while the visitors `ids` save their sessions without a pause.
+        // How many of 40 loads with the forged cookie waited, the longest,
+        // and the longest save, while the visitors `ids` save their sessions
+        // without a pause (a save takes the delay and the file system's own
+        // time, which on CI's machines is far from nothing).
         let loads_while_saving = |ids: &[&String]| {
             let saving = AtomicBool::new(true);
+            let longest_save = AtomicU64::new(0);
             std::thread::scope(|scope| {
                 for id in ids {
-                    let (store, saving) = (&store, &saving);
+                    let (store, saving, longest_save) = (&store, &saving, &longest_save);
                     scope.spawn(move || {
                         let header = format!("PHVSESSID={id}");
                         let mut i = 0;
@@ -1238,7 +1241,9 @@ mod tests {
                             let mut s = store.load(Some(&header));
                             s.values.insert("seen".into(), i.to_string());
                             s.changed = true;
+                            let started = Instant::now();
                             store.save(s);
+                            longest_save.fetch_max(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             i += 1;
                         }
                     });
@@ -1252,14 +1257,16 @@ mod tests {
                 }
                 saving.store(false, Ordering::Relaxed);
                 let waited = times.iter().filter(|t| **t >= delay / 2).count();
-                (waited, times.into_iter().max().unwrap())
+                (waited, times.into_iter().max().unwrap(), Duration::from_nanos(longest_save.load(Ordering::Relaxed)))
             })
         };
-        let (waited, longest) = loads_while_saving(&others.iter().collect::<Vec<_>>());
+        let (waited, longest, _) = loads_while_saving(&others.iter().collect::<Vec<_>>());
         assert!(waited <= 2, "{waited} of 40 loads with a forged cookie waited (the longest {longest:?})");
-        // Under the same lock: one save at most.
-        let (_, longest) = loads_while_saving(&[&same]);
-        assert!(longest < delay * 3, "a load with a forged cookie took {longest:?}");
+        // Under the same lock: the save under way at most (and its own reads),
+        // not one save after another (a plain mutex let the saver take the
+        // lock again at once: 0.4 to 1 s on Linux and macOS).
+        let (_, longest, save) = loads_while_saving(&[&same]);
+        assert!(longest < save * 2 + delay, "a load with a forged cookie took {longest:?} (a save {save:?})");
         let _ = std::fs::remove_dir_all(dir);
     }
 
