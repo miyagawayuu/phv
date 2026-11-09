@@ -1,0 +1,8 @@
+error: `yield` cannot be used inside a tag, an attribute, `<script>` or other HTML that is not element text
+ --> err_yield_html.phv:4:25
+  |
+4 |     ?><a href="/x?<?phv yield 1; ?>">x</a><?phv
+  |                         ^^^^^^^^
+  = note: what the loop over the generator writes meanwhile would land there
+
+1 error found

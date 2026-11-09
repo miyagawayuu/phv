@@ -1,0 +1,33 @@
+// What std.i18n refuses at run time, with ValueError.
+import std.i18n.{Translator, t, tn, translator};
+import std.time.DateTime;
+
+function attempt(string $what, fn(): string $f): void {
+    try {
+        $r = $f();
+        echo $what, ": ", $r, "\n";
+    } catch (ValueError $e) {
+        echo $what, ": ValueError: ", $e->getMessage(), "\n";
+    }
+}
+
+$plural = "cart" . ".items";
+$text = "ti" . "tle";
+attempt("unlisted locale", fn() => Translator::of("de")->locale);
+attempt("plural with t()", fn() => t($plural));
+attempt("text with tn()", fn() => tn($text, 2));
+map<string, string> $none = [];
+$welcome = "wel" . "come";
+attempt("missing parameter", fn() => t($welcome, $none));
+map<string, string> $max = [];
+foreach (range(1, 64) as $i) {
+    $max["p{$i}"] = "x";
+}
+attempt("64 parameters", fn() => t("title", $max));
+$more = $max;
+$more["p65"] = "x";
+attempt("65 parameters", fn() => t("title", $more));
+attempt("decimals", fn() => translator()->number(1.5, 21));
+attempt("20 decimals", fn() => translator()->number(1.5, 20));
+attempt("negative decimals", fn() => translator()->percent(1.5, -1));
+attempt("date style", fn() => translator()->date(DateTime::now(), "huge"));

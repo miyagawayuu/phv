@@ -61,6 +61,9 @@ const SCRIPT_NAMES: &[&str] = &[
     "phv_flood",
     "phv_other",
     "phv_role",
+    "phv_orm_things",
+    "phv_orm_orders",
+    "phv_orm_tokens",
 ];
 
 /// `script` with the fixed names of `tests/db/*.phv` replaced by this run's:

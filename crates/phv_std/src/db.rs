@@ -835,6 +835,14 @@ fn is_sqlite(vm: &Vm, h: &Value) -> bool {
     vm.resources.get(int(h) as usize).and_then(|r| r.as_ref()).is_some_and(|b| b.is::<Db>())
 }
 
+/// The SQL dialect of an open `Database` handle (std.orm), or None when it is closed.
+pub(crate) fn dialect_of(vm: &Vm, h: &Value) -> Option<Dialect> {
+    if is_sqlite(vm, h) {
+        return Some(Dialect::Sqlite);
+    }
+    crate::netdb::dialect_of(vm, h)
+}
+
 fn db_of<'v>(vm: &'v Vm, h: &Value) -> Result<&'v Db, VmError> {
     vm.resources
         .get(int(h) as usize)
@@ -1582,6 +1590,24 @@ fn real_text(f: f64) -> String {
     }
 }
 
+/// `BEGIN`, `COMMIT` or `ROLLBACK` of `Database::transaction()` (inner ones are savepoints).
+fn transaction_step(vm: &mut Vm, a: &[Value], cmd: &str) -> R {
+    if !is_sqlite(vm, &a[0]) {
+        return crate::netdb::raw(vm, a);
+    }
+    let _budget = mem::Budget::enter(vm);
+    let db = db_of(vm, &a[0])?;
+    let (sqls, depth) = transaction_sql(cmd, db.depth.get());
+    if cmd == "ROLLBACK" {
+        db.depth.set(depth);
+    }
+    for sql in &sqls {
+        db.conn().execute_batch(sql).map_err(|e| db.fail(vm, e))?;
+    }
+    db.depth.set(depth);
+    Ok(Value::Null)
+}
+
 fn is_identifier(t: &str) -> bool {
     let mut chars = t.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
@@ -1618,20 +1644,15 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             if !matches!(cmd, "BEGIN" | "COMMIT" | "ROLLBACK") {
                 return Err(VmError::Fatal(format!("__db_raw: unexpected statement {cmd}")));
             }
-            if !is_sqlite(vm, &a[0]) {
-                return crate::netdb::raw(vm, a);
-            }
-            let _budget = mem::Budget::enter(vm);
-            let db = db_of(vm, &a[0])?;
-            let (sqls, depth) = transaction_sql(cmd, db.depth.get());
+            // What std.orm remembers of rows may be undone (see `orm::rolled_back`).
             if cmd == "ROLLBACK" {
-                db.depth.set(depth);
+                crate::orm::rolled_back();
             }
-            for sql in &sqls {
-                db.conn().execute_batch(sql).map_err(|e| db.fail(vm, e))?;
+            let r = transaction_step(vm, a, cmd);
+            if r.is_err() {
+                crate::orm::rolled_back();
             }
-            db.depth.set(depth);
-            Ok(Value::Null)
+            r
         },
         "__db_close" => |vm, a| {
             if let Some(slot) = vm.resources.get_mut(int(&a[0]) as usize) {

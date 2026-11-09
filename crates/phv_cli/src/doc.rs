@@ -21,6 +21,9 @@ const STD_MODULES: &[&str] = &[
     "std.jobs",
     "std.jwt",
     "std.oauth",
+    "std.orm",
+    "std.i18n",
+    "std.image",
 ];
 
 /// Files documented at most (the rest of a huge tree is left out).
@@ -163,6 +166,7 @@ fn class_item(c: &ClassDecl, text: &str) -> DocItem {
     let kind = match c.kind {
         ClassKind::Interface => "interface",
         ClassKind::Enum => "enum",
+        ClassKind::Trait => "trait",
         ClassKind::Abstract => "abstract class",
         ClassKind::Class => "class",
     };

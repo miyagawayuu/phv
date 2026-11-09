@@ -283,6 +283,9 @@ pub struct HttpCtx {
     /// A file sent with `response()->file()`, already opened and checked; it
     /// replaces the written output and is streamed from disk.
     pub body_file: Option<std::sync::Arc<std::fs::File>>,
+    /// Bytes made by the script that replace the written output, such as an
+    /// image from `std.image`'s `send()` (not UTF-8 text, so not output).
+    pub body_bytes: Option<Vec<u8>>,
     /// The response is for this visitor only (it carries a CSRF token), so it
     /// gets `Cache-Control: private, no-store`.
     pub personalized: bool,
@@ -311,6 +314,9 @@ pub struct HttpCtx {
     pub flushed: bool,
     /// The trace the script runs in, when traces are exported (`[telemetry]`).
     pub trace: Option<TraceCtx>,
+    /// The locale of the request for `std.i18n` (one of `[i18n] locales`):
+    /// chosen by `set_locale()`, or from `Accept-Language` when first needed.
+    pub locale: Option<String>,
 }
 
 /// The trace of a request or job whose spans are exported (`[telemetry]`).
@@ -427,6 +433,7 @@ impl Default for HttpCtx {
             resp_headers: Vec::new(),
             content_type: None,
             body_file: None,
+            body_bytes: None,
             personalized: false,
             params: Vec::new(),
             locals: Vec::new(),
@@ -439,6 +446,7 @@ impl Default for HttpCtx {
             stream: None,
             flushed: false,
             trace: None,
+            locale: None,
         }
     }
 }
@@ -802,7 +810,50 @@ struct Frame {
     /// Set on frames entered from Rust (`call_function`): returning from it
     /// leaves the interpreter loop.
     stop: bool,
+    /// The frame of a generator a loop resumed (see `GenLink`).
+    gen: bool,
 }
+
+/// A generator is an object of the prelude's class `Generator`, whose fields
+/// hold its state and, while it waits, its frame: the cycle collector sees
+/// the values the frame holds, the memory they take counts against the
+/// script's limit, and they are freed with the generator.
+const G_FUNC: usize = 0;
+/// Where it resumes.
+const G_PC: usize = 1;
+/// The `Yield` it waits at (-1 before it started): a generator closed there
+/// goes on from the next instruction.
+const G_AT: usize = 2;
+/// `G_NEW`, `G_WAITING`, `G_RUNNING` or `G_DONE`.
+const G_STATE: usize = 3;
+/// The next int key of a `yield` without one.
+const G_KEY: usize = 4;
+/// The exception handlers of its `try` blocks while it waits: their catch
+/// targets and exception registers, as a list of ints (or null).
+const G_HANDLERS: usize = 5;
+/// The registers of its frame while it waits.
+const G_REGS: usize = 6;
+/// Not iterated yet.
+const G_NEW: i64 = 0;
+/// Claimed by a loop, and waiting for it to ask for the next value.
+const G_WAITING: i64 = 1;
+const G_RUNNING: i64 = 2;
+const G_DONE: i64 = 3;
+
+/// A generator running on top of the loop that resumed it (the frame below):
+/// where its next key and value go, and where the loop goes on when it ends.
+struct GenLink {
+    /// The generator's frame.
+    frame: usize,
+    gen: Rc<RefCell<Object>>,
+    key: Reg,
+    val: Reg,
+    /// The loop's exit (`GenNext`), or `GEN_CLOSING` (`GenClose`: the loop
+    /// goes on after that instruction).
+    end: u32,
+}
+
+const GEN_CLOSING: u32 = u32::MAX;
 
 /// A closure a builtin calls once per element, from `Vm::callback`. The calls
 /// of one builtin share what `callback` checked; the closure is still a frame
@@ -944,6 +995,10 @@ pub struct Vm {
     /// may hold much memory (found by the 1.0.0 audit: the collector ran on
     /// their number only).
     gc_pressure: isize,
+    /// The generators running, innermost last (see `GenLink`).
+    gen_links: Vec<GenLink>,
+    /// The class of generators (`Generator` in the prelude), or `u32::MAX`.
+    gen_class: u32,
 }
 
 impl Drop for Vm {
@@ -1233,6 +1288,7 @@ impl Vm {
         h.write_u128(Instant::now().elapsed().as_nanos());
         let seed = h.finish() | 1;
         let nconsts = prog.consts.len();
+        let gen_class = prog.exc_classes.get("Generator").copied().unwrap_or(u32::MAX);
         Vm {
             code: Rc::new(Arc::clone(&prog)),
             prog,
@@ -1274,6 +1330,8 @@ impl Vm {
             gc_base: Cell::new(0),
             gc_visited: Cell::new(0),
             gc_pressure: limits.max_memory.map_or(isize::MAX, |m| (m / 4 * 3).min(isize::MAX as usize) as isize),
+            gen_links: Vec::new(),
+            gen_class,
             coverage: None,
             profile: None,
             debug: None,
@@ -1355,8 +1413,8 @@ impl Vm {
         self.slow_callbacks = slow;
     }
 
-    /// Whether function `func` has no `try` (so no `finally`): looked up once
-    /// per function and kept.
+    /// Whether function `func` has no `try` (so no `finally`) and is not a
+    /// generator (whose frame is kept): looked up once per function and kept.
     fn body_is_plain(&mut self, func: u32) -> bool {
         if self.plain_bodies.is_empty() {
             self.plain_bodies = vec![0; self.prog.funcs.len()];
@@ -1364,7 +1422,7 @@ impl Vm {
         let kind = &mut self.plain_bodies[func as usize];
         if *kind == 0 {
             let code = &self.prog.funcs[func as usize].code;
-            *kind = if code.iter().any(|i| matches!(i, Instr::TryBegin { .. })) { 2 } else { 1 };
+            *kind = if code.iter().any(|i| matches!(i, Instr::TryBegin { .. } | Instr::GenStart(_))) { 2 } else { 1 };
         }
         *kind == 1
     }
@@ -1396,7 +1454,7 @@ impl Vm {
         for (slot, v) in window.iter_mut().zip(caps.iter().chain(args.iter())) {
             *slot = v.clone();
         }
-        self.frames.push(Frame { func, pc: 0, base, ret: 0, stop: true });
+        self.frames.push(Frame { func, pc: 0, base, ret: 0, stop: true, gen: false });
         self.native_depth += 1;
         let r = self.exec();
         self.native_depth -= 1;
@@ -1482,7 +1540,7 @@ impl Vm {
         for (i, v) in caps.iter().chain(args.iter()).enumerate() {
             self.regs[base + i] = v.clone();
         }
-        self.frames.push(Frame { func, pc: 0, base, ret: 0, stop: true });
+        self.frames.push(Frame { func, pc: 0, base, ret: 0, stop: true, gen: false });
         self.native_depth += 1;
         let r = self.exec();
         self.native_depth -= 1;
@@ -1563,6 +1621,11 @@ impl Vm {
         room_for_twice(objects);
         self.gc_next.set((live.saturating_mul(2)).max(live + done.visited / GC_WORK).max(GC_FIRST));
         done.freed
+    }
+
+    /// The message catalogs of the program (`std.i18n`), if it has them.
+    pub fn catalogs(&self) -> Option<&Arc<crate::i18n::Catalogs>> {
+        self.code.i18n.as_ref().map(|s| &s.0)
     }
 
     /// Creates an instance of a built-in exception class such as `ValueError`.
@@ -1996,6 +2059,145 @@ impl Vm {
         Ok(())
     }
 
+    /// The generator object a register holds (the compiler gives the
+    /// generator instructions nothing else).
+    fn gen_of(&self, v: &Value) -> Rc<RefCell<Object>> {
+        match v {
+            Value::Object(o) if o.borrow().class == self.gen_class => Rc::clone(o),
+            v => bad("generator", v),
+        }
+    }
+
+    /// `GenStart` in frame `base` of function `func`: the generator, which
+    /// takes the first `n` registers (the captures and arguments) and resumes
+    /// at `pc`.
+    fn gen_start(&mut self, func: usize, pc: usize, base: usize, n: usize) -> Result<Value, VmError> {
+        let nregs = self.prog.funcs[func].num_regs as usize;
+        // Counted before it is made: a script keeping many generators stops
+        // at its memory limit.
+        self.reserve((G_REGS + nregs).saturating_mul(std::mem::size_of::<Value>()) + 64)?;
+        let mut fields = Vec::with_capacity(G_REGS + nregs);
+        fields.extend([
+            Value::Int(func as i64),
+            Value::Int(pc as i64),
+            Value::Int(-1),
+            Value::Int(G_NEW),
+            Value::Int(0),
+            Value::Null,
+        ]);
+        for i in 0..nregs {
+            // The rest of the window holds what earlier calls left there.
+            fields.push(if i < n { std::mem::take(&mut self.regs[base + i]) } else { Value::Null });
+        }
+        let o = Rc::new(RefCell::new(Object { class: self.gen_class, fields }));
+        // Its frame may hold objects (a cycle through `$this`, say).
+        self.track(&o);
+        if self.gc_due.get() {
+            self.budget = 1;
+        }
+        Ok(Value::Object(o))
+    }
+
+    /// Puts the frame of the generator of `link` on top of the stack, above
+    /// the loop's frame (the top one now), from instruction `pc`.
+    fn gen_resume(&mut self, link: GenLink, pc: u32) -> Result<(), VmError> {
+        if self.frames.len() >= self.limits.max_frames {
+            return Err(VmError::Fatal("maximum call stack depth exceeded".into()));
+        }
+        self.tick()?;
+        let below = self.frames.last().unwrap();
+        let base = below.base + self.prog.funcs[below.func as usize].num_regs as usize;
+        let mut ob = link.gen.borrow_mut();
+        let func = match ob.fields[G_FUNC] {
+            Value::Int(f) => f as u32,
+            ref v => bad("generator function", v),
+        };
+        let nregs = self.prog.funcs[func as usize].num_regs as usize;
+        if self.regs.len() < base + nregs {
+            drop(ob);
+            self.grow_regs(base + nregs)?;
+            ob = link.gen.borrow_mut();
+        }
+        for (r, v) in self.regs[base..base + nregs].iter_mut().zip(ob.fields.drain(G_REGS..)) {
+            *r = v;
+        }
+        let fi = self.frames.len();
+        let saved = std::mem::take(&mut ob.fields[G_HANDLERS]);
+        if let Value::List(hs) = &saved {
+            // Its `try` blocks, as if they began where it resumes.
+            let out_depth = self.out.len();
+            let out_len = self.out.last().map_or(0, |o| o.buf.len());
+            for pair in hs.chunks(2) {
+                if let [Value::Int(catch), Value::Int(exc)] = pair {
+                    self.handlers.push(Handler {
+                        frame: fi,
+                        catch_pc: *catch as u32,
+                        exc_reg: *exc as Reg,
+                        out_depth,
+                        out_len,
+                        in_guard: false,
+                        guards: self.guards.len(),
+                        flushes: self.flushes,
+                    });
+                }
+            }
+        }
+        ob.fields[G_STATE] = Value::Int(G_RUNNING);
+        drop(ob);
+        self.frames.push(Frame { func, pc, base, ret: 0, stop: false, gen: true });
+        self.gen_links.push(link);
+        Ok(())
+    }
+
+    /// `Yield` in frame `fi` (the generator `g`, from register `base`, with
+    /// `nregs` registers): its frame and handlers go into the generator,
+    /// which resumes at `resume` and waits at the `Yield` at `at`.
+    fn gen_suspend(&mut self, g: &Rc<RefCell<Object>>, fi: usize, base: usize, nregs: usize, resume: u32, at: i64) {
+        let mut handlers = Vec::new();
+        while matches!(self.handlers.last(), Some(h) if h.frame == fi) {
+            let h = self.handlers.pop().unwrap();
+            handlers.push(Value::Int(h.exc_reg as i64));
+            handlers.push(Value::Int(h.catch_pc as i64));
+        }
+        while matches!(self.guards.last(), Some(g) if g.0 >= fi) {
+            self.guards.pop();
+        }
+        let mut ob = g.borrow_mut();
+        ob.fields[G_HANDLERS] = if handlers.is_empty() {
+            Value::Null
+        } else {
+            handlers.reverse();
+            Value::list(handlers)
+        };
+        ob.fields.truncate(G_REGS);
+        ob.fields.extend(self.regs[base..base + nregs].iter_mut().map(std::mem::take));
+        ob.fields[G_PC] = Value::Int(resume as i64);
+        ob.fields[G_AT] = Value::Int(at);
+        ob.fields[G_STATE] = Value::Int(G_WAITING);
+    }
+
+    /// The generator is done: its frame is freed.
+    fn gen_done(&self, g: &Rc<RefCell<Object>>) {
+        let frame = {
+            let mut ob = g.borrow_mut();
+            ob.fields[G_STATE] = Value::Int(G_DONE);
+            ob.fields[G_HANDLERS] = Value::Null;
+            let frame = ob.fields.split_off(G_REGS);
+            ob.fields.shrink_to_fit();
+            frame
+        };
+        drop(frame);
+    }
+
+    /// The generators whose frames an exception (or a fatal error) left are
+    /// done: they cannot resume.
+    fn gens_left(&mut self) {
+        while matches!(self.gen_links.last(), Some(l) if l.frame >= self.frames.len()) {
+            let link = self.gen_links.pop().unwrap();
+            self.gen_done(&link.gen);
+        }
+    }
+
     /// `CallVirtual`'s way into native code (`Call` has its own, as in 1.2.1),
     /// kept out of `dispatch`: inlined there a second time, it slowed the
     /// interpreter's other paths by a few percent. Runs `func` natively with
@@ -2341,6 +2543,7 @@ impl Vm {
                                 return Err(VmError::Fatal(FLUSHED_GUARD.to_string()));
                             }
                             self.frames.truncate(h.frame + 1);
+                            self.gens_left();
                             self.out.truncate(h.out_depth);
                             if h.in_guard || self.guards.len() > h.guards {
                                 if let Some(o) = self.out.last_mut() {
@@ -2374,6 +2577,7 @@ impl Vm {
     fn unwind_to(&mut self, stop_at: usize) {
         let base = self.frames[stop_at].base;
         self.frames.truncate(stop_at);
+        self.gens_left();
         self.handlers.retain(|h| h.frame < stop_at);
         self.guards.retain(|g| g.0 < stop_at);
         self.regs.truncate(base);
@@ -2559,7 +2763,7 @@ impl Vm {
                         self.regs[new_base + caps.len() + i] = v;
                     }
                     self.frames[fi].pc = pc as u32;
-                    self.frames.push(Frame { func: callee, pc: 0, base: new_base, ret: $dst, stop: false });
+                    self.frames.push(Frame { func: callee, pc: 0, base: new_base, ret: $dst, stop: false, gen: false });
                     continue 'frame;
                 }};
             }
@@ -2573,6 +2777,16 @@ impl Vm {
                         self.guards.pop();
                     }
                     let fr = self.frames.pop().unwrap();
+                    if fr.gen {
+                        // A generator ended: the loop over it goes to its exit.
+                        drop(v);
+                        let link = self.gen_links.pop().expect("phv vm: a generator frame without its link");
+                        self.gen_done(&link.gen);
+                        if link.end != GEN_CLOSING {
+                            self.frames.last_mut().unwrap().pc = link.end;
+                        }
+                        continue 'frame;
+                    }
                     // The callee's registers are left as they are: the next
                     // call overwrites them, and the type checker guarantees
                     // registers are written before they are read. (Clearing
@@ -3220,6 +3434,111 @@ impl Vm {
                         }
                     }
                     Instr::PushOut => self.out.push(OutBuf { buf: String::new(), html: true }),
+
+                    Instr::GenStart(n) => {
+                        let v = tri!(self.gen_start(fid, pc, base, *n as usize));
+                        ret!(v)
+                    }
+                    Instr::GenInit(it) => {
+                        let g = self.gen_of(&reg!(*it));
+                        let mut ob = g.borrow_mut();
+                        if matches!(ob.fields[G_STATE], Value::Int(G_NEW)) {
+                            ob.fields[G_STATE] = Value::Int(G_WAITING);
+                        } else {
+                            drop(ob);
+                            tri!(Err(self.throw("LogicException", "a generator can be iterated only once")));
+                        }
+                    }
+                    Instr::GenNext { it, key, val, end } => {
+                        let g = self.gen_of(&reg!(*it));
+                        let state = match g.borrow().fields[G_STATE] {
+                            Value::Int(s) => s,
+                            ref v => bad("generator state", v),
+                        };
+                        match state {
+                            G_DONE => pc = *end as usize,
+                            G_WAITING => {
+                                let at = match g.borrow().fields[G_PC] {
+                                    Value::Int(p) => p as u32,
+                                    ref v => bad("generator pc", v),
+                                };
+                                self.frames[fi].pc = pc as u32;
+                                let link = GenLink { frame: fi + 1, gen: g, key: *key, val: *val, end: *end };
+                                tri!(self.gen_resume(link, at));
+                                continue 'frame;
+                            }
+                            _ => {
+                                tri!(Err(self.throw("LogicException", "a generator cannot be iterated while it runs")))
+                            }
+                        }
+                    }
+                    Instr::GenClose(it) => {
+                        let Value::Object(_) = &reg!(*it) else { continue };
+                        let g = self.gen_of(&reg!(*it));
+                        let (state, at, gfunc) = {
+                            let ob = g.borrow();
+                            match (&ob.fields[G_STATE], &ob.fields[G_AT], &ob.fields[G_FUNC]) {
+                                (Value::Int(s), Value::Int(a), Value::Int(f)) => (*s, *a, *f as usize),
+                                _ => bad("generator", &Value::Null),
+                            }
+                        };
+                        if state == G_DONE || state == G_RUNNING {
+                            continue;
+                        }
+                        // Waiting at a `yield` whose way out runs code (a `finally`
+                        // block, or the closing of a generator it loops over): it
+                        // runs from there; otherwise it is done at once.
+                        let next = at.checked_add(1).and_then(|n| usize::try_from(n).ok());
+                        let runs = state == G_WAITING
+                            && next
+                                .and_then(|n| prog.funcs[gfunc].code.get(n))
+                                .is_some_and(|i| !matches!(i, Instr::RetNull));
+                        if !runs {
+                            self.gen_done(&g);
+                            continue;
+                        }
+                        self.frames[fi].pc = pc as u32;
+                        let link = GenLink { frame: fi + 1, gen: g, key: NO_REG, val: NO_REG, end: GEN_CLOSING };
+                        tri!(self.gen_resume(link, next.unwrap_or(0) as u32));
+                        continue 'frame;
+                    }
+                    Instr::Yield { key, val, from, resume } => {
+                        let link = self.gen_links.pop().expect("phv vm: `yield` outside a running generator");
+                        if link.frame != fi || link.end == GEN_CLOSING {
+                            // A closed generator returns from where it waited; its
+                            // `finally` blocks cannot yield (a compile error).
+                            panic!("phv vm: a generator yielded while it was closed (compiler bug)");
+                        }
+                        let v = std::mem::take(&mut reg!(*val));
+                        let k = {
+                            let mut ob = link.gen.borrow_mut();
+                            let next = match ob.fields[G_KEY] {
+                                Value::Int(n) => n,
+                                ref v => bad("generator key", v),
+                            };
+                            if *key == NO_REG {
+                                ob.fields[G_KEY] = Value::Int(next.saturating_add(1));
+                                Value::Int(next)
+                            } else {
+                                let k = std::mem::take(&mut reg!(*key));
+                                // As in PHP: a key `n` makes the next key without one `n + 1`.
+                                if let (false, Value::Int(n)) = (*from, &k) {
+                                    if *n >= next {
+                                        ob.fields[G_KEY] = Value::Int(n.saturating_add(1));
+                                    }
+                                }
+                                k
+                            }
+                        };
+                        self.gen_suspend(&link.gen, fi, base, func.num_regs as usize, *resume, pc as i64 - 1);
+                        self.frames.pop();
+                        let consumer = self.frames.last().unwrap().base;
+                        if link.key != NO_REG {
+                            self.regs[consumer + link.key as usize] = k;
+                        }
+                        self.regs[consumer + link.val as usize] = v;
+                        continue 'frame;
+                    }
                     Instr::PopOutHtml(d) => {
                         let buf = self.out.pop().map(|o| o.buf).unwrap_or_default();
                         reg!(*d) = Value::html(buf);

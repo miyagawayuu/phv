@@ -38,6 +38,7 @@ pub fn compile_with(h: &HProgram, sources: &SourceMap, opts: Options) -> Result<
         builtin_ids: HashMap::new(),
         methods: Vec::new(),
         method_ids: HashMap::new(),
+        gen_class: h.exc_classes.get("Generator").copied(),
     };
     let funcs = h.funcs.iter().map(|f| FnC::compile(&mut pc, f)).collect::<Result<Vec<_>, _>>()?;
     for c in &h.classes {
@@ -135,6 +136,8 @@ struct ProgCtx {
     builtin_ids: HashMap<String, u32>,
     methods: Vec<String>,
     method_ids: HashMap<String, u32>,
+    /// The class of generators (`Generator` in the prelude).
+    gen_class: Option<u32>,
 }
 
 impl ProgCtx {
@@ -329,6 +332,12 @@ impl<'a> FnC<'a> {
                 }
             }
         }
+        let generator = has_yield(&f.body);
+        if generator {
+            // The call makes the generator; the body runs when a loop asks.
+            let n = c.num_params(f);
+            c.emit(Instr::GenStart(n));
+        }
         match f.kind {
             FuncKind::Template => {
                 c.emit(Instr::PushOut);
@@ -356,7 +365,7 @@ impl<'a> FnC<'a> {
             .collect();
         Ok(Function {
             locals,
-            native: native_sig(f),
+            native: if generator { None } else { native_sig(f) },
             name: f.name.clone(),
             file: f.file,
             num_params: (f.captures.len() + f.params.len()) as u16,
@@ -367,6 +376,19 @@ impl<'a> FnC<'a> {
     }
 
     // ----- helpers -------------------------------------------------------
+
+    /// The registers a call fills: the captures, then the parameters.
+    fn num_params(&mut self, f: &HFunc) -> u16 {
+        u16::try_from(f.captures.len() + f.params.len()).unwrap_or_else(|_| {
+            self.too_big = true;
+            0
+        })
+    }
+
+    /// Whether values of type `t` are generators.
+    fn is_generator(&self, t: &Type) -> bool {
+        matches!(t, Type::Class(c, _) if Some(*c) == self.pc.gen_class)
+    }
 
     /// Past `MAX_CODE` instructions the function is reported as too large;
     /// the code is not kept growing meanwhile (and is discarded).
@@ -441,7 +463,8 @@ impl<'a> FnC<'a> {
             | Instr::JumpIfLeIImm(_, _, t)
             | Instr::JumpIfEq(_, _, t)
             | Instr::JumpIfNotEq(_, _, t) => *t = target,
-            Instr::IterNext { end, .. } => *end = target,
+            Instr::IterNext { end, .. } | Instr::GenNext { end, .. } => *end = target,
+            Instr::Yield { resume, .. } => *resume = target,
             Instr::TryBegin { catch, .. } => *catch = target,
             other => panic!("cannot patch {other:?}"),
         }
@@ -1190,6 +1213,58 @@ impl<'a> FnC<'a> {
                 self.patch(exit, end);
                 self.end_loop(lp, end, cont);
             }
+            HStmt::Foreach { subject, key, val, body } if self.is_generator(&subject.ty) => {
+                // A loop over a generator closes it however the loop is left
+                // (its end, `break`, `return`, an exception): as if in
+                // `try { loop } finally { close }`, so a generator waiting at a
+                // `yield` runs its `finally` blocks.
+                let it = self.alloc();
+                self.expr_into(subject, it);
+                self.off = subject.span.start;
+                self.emit(Instr::GenInit(it));
+                let fval = self.alloc();
+                let why = self.alloc();
+                let fin = FinallyCtx { why, val: fval, entries: Vec::new(), exits: Vec::new() };
+                let begin = self.emit(Instr::TryBegin { catch: 0, exc: fval });
+                self.tries.push(TryCtx { active: 1, finally: Some(fin) });
+                let top = self.here();
+                let key = key.map(|k| self.reg(k)).unwrap_or(NO_REG);
+                let val = self.reg(*val);
+                let next = self.emit(Instr::GenNext { it, key, val, end: 0 });
+                self.loops.push(LoopCtx::new(self.tries.len(), Some(it)));
+                self.block(body);
+                self.emit(Instr::Jump(top));
+                let end = self.here();
+                let lp = self.loops.pop().unwrap();
+                self.patch(next, end);
+                self.end_loop(lp, end, top);
+                let ctx = self.tries.pop().unwrap();
+                if let Some(fin) = ctx.finally {
+                    self.finally_block(begin, fin, |c| {
+                        c.emit(Instr::GenClose(it));
+                        c.emit(Instr::Null(it));
+                    });
+                }
+            }
+            HStmt::Yield { key, val, from } => {
+                // Moved out by `Yield`: copies, so that a variable keeps its value.
+                let k = match key {
+                    Some(k) => {
+                        let t = self.alloc();
+                        self.expr_into(k, t);
+                        t
+                    }
+                    None => NO_REG,
+                };
+                let v = self.alloc();
+                self.expr_into(val, v);
+                self.off = val.span.start;
+                let at = self.emit(Instr::Yield { key: k, val: v, from: *from, resume: 0 });
+                // Where a generator closed here goes on: a `return`.
+                self.leave(Exit::RetNull, 0);
+                let resume = self.here();
+                self.patch(at, resume);
+            }
             HStmt::Foreach { subject, key, val, body } => {
                 let it = self.alloc_n(2);
                 self.expr_into(subject, it);
@@ -1292,41 +1367,46 @@ impl<'a> FnC<'a> {
                 self.patch_all(ends, after);
                 let ctx = self.tries.pop().unwrap();
                 if let (Some(begin), Some(f), Some(fin)) = (begin_f, finally, ctx.finally) {
-                    // TryEnd, why = 0; start: the block; then by `why`: on (0),
-                    // rethrow (1), or continue an exit (2 and up). The handler sets 1.
-                    let FinallyCtx { why, val, entries, exits } = fin;
-                    self.emit(Instr::TryEnd(1));
-                    self.emit(Instr::Int(why, 0));
-                    let start = self.here();
-                    self.patch_all(entries, start);
-                    self.block(f);
-                    let on = self.emit(Instr::JumpIfLtIImm(why, 1, 0));
-                    let to_exits =
-                        if exits.is_empty() { None } else { Some(self.emit(Instr::JumpIfNotLtIImm(why, 2, 0))) };
-                    self.emit(Instr::Throw(val));
-                    if let Some(j) = to_exits {
-                        let at = self.here();
-                        self.patch(j, at);
-                    }
-                    let n = exits.len();
-                    for (k, exit) in exits.into_iter().enumerate() {
-                        // `why` is at least k + 2 here.
-                        let next = (k + 1 < n).then(|| self.emit(Instr::JumpIfNotLtIImm(why, k as i32 + 3, 0)));
-                        self.leave(exit, val);
-                        if let Some(j) = next {
-                            let at = self.here();
-                            self.patch(j, at);
-                        }
-                    }
-                    let handler = self.here();
-                    self.patch(begin, handler);
-                    self.emit(Instr::Int(why, 1));
-                    self.emit(Instr::Jump(start));
-                    let end = self.here();
-                    self.patch(on, end);
+                    self.finally_block(begin, fin, |c| c.block(f));
                 }
             }
         }
+    }
+
+    /// The end of a `try` with a `finally` block, whose handler was installed
+    /// at `begin` and whose code `block` emits: TryEnd, why = 0; start: the
+    /// block; then by `why`: on (0), rethrow (1), or continue an exit (2 and
+    /// up). The handler sets 1.
+    fn finally_block(&mut self, begin: usize, fin: FinallyCtx, block: impl FnOnce(&mut Self)) {
+        let FinallyCtx { why, val, entries, exits } = fin;
+        self.emit(Instr::TryEnd(1));
+        self.emit(Instr::Int(why, 0));
+        let start = self.here();
+        self.patch_all(entries, start);
+        block(self);
+        let on = self.emit(Instr::JumpIfLtIImm(why, 1, 0));
+        let to_exits = if exits.is_empty() { None } else { Some(self.emit(Instr::JumpIfNotLtIImm(why, 2, 0))) };
+        self.emit(Instr::Throw(val));
+        if let Some(j) = to_exits {
+            let at = self.here();
+            self.patch(j, at);
+        }
+        let n = exits.len();
+        for (k, exit) in exits.into_iter().enumerate() {
+            // `why` is at least k + 2 here.
+            let next = (k + 1 < n).then(|| self.emit(Instr::JumpIfNotLtIImm(why, k as i32 + 3, 0)));
+            self.leave(exit, val);
+            if let Some(j) = next {
+                let at = self.here();
+                self.patch(j, at);
+            }
+        }
+        let handler = self.here();
+        self.patch(begin, handler);
+        self.emit(Instr::Int(why, 1));
+        self.emit(Instr::Jump(start));
+        let end = self.here();
+        self.patch(on, end);
     }
 
     /// Leaves enclosing `try` statements with `return` (the value in `val`),
@@ -1439,6 +1519,23 @@ impl<'a> FnC<'a> {
     }
 }
 
+/// Whether a function's body has a `yield` (it is a generator). A closure's
+/// body is a function of its own.
+fn has_yield(stmts: &[HStmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        HStmt::Yield { .. } => true,
+        HStmt::If(_, a, b) => has_yield(a) || has_yield(b),
+        HStmt::Loop { body, step, .. } => has_yield(body) || has_yield(step),
+        HStmt::ForRange { body, .. } | HStmt::Foreach { body, .. } | HStmt::Guarded(body) => has_yield(body),
+        HStmt::Try { body, catches, finally } => {
+            has_yield(body)
+                || catches.iter().any(|c| has_yield(&c.body))
+                || finally.as_ref().is_some_and(|f| has_yield(f))
+        }
+        _ => false,
+    })
+}
+
 /// Where a statement starts, for coverage: its first expression.
 fn stmt_span(s: &HStmt) -> Option<phv_syntax::Span> {
     Some(match s {
@@ -1449,6 +1546,7 @@ fn stmt_span(s: &HStmt) -> Option<phv_syntax::Span> {
         HStmt::ForRange { from, .. } => from.span,
         HStmt::Foreach { subject, .. } => subject.span,
         HStmt::Return(_, span) => *span,
+        HStmt::Yield { val, .. } => val.span,
         _ => return None,
     })
 }

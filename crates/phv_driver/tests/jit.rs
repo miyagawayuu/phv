@@ -422,6 +422,8 @@ fn golden_jit_cases_are_compiled() {
             "jit_string.phv",
             &["repeat", "numbered", "describe", "order", "lengths", "reverse", "longest", "fail_inside"],
         ),
+        // A trait's method, in two classes whose properties are laid out differently.
+        ("traits.phv", &["Small::total", "Wide::total", "Clicks::bump", "Square::report"]),
     ] {
         let mut c = compile(&cases(), &cases().join(case)).unwrap_or_else(|e| panic!("{}", e.render(false)));
         c.enable_jit_all();
@@ -1311,4 +1313,119 @@ echo $root->sum(), " ", $root->depth(50), " ", fib(20), "\n";
     assert!(!compiled("Node::sum"), "a recursion that walks objects is left to the interpreter");
     assert!(compiled("Node::depth"), "a recursion of arithmetic is compiled, method or not");
     assert!(compiled("fib"));
+}
+
+/// Generators (functions with `yield`) and the loops over them run in the
+/// interpreter: a generator's frame is kept between its values, which native
+/// frames are not. The functions they call are compiled as usual, and the
+/// results are the same.
+#[test]
+fn generators_run_in_the_interpreter() {
+    let src = r#"<?phv
+function square(int $x): int {
+    $s = 0;
+    for ($i = 0; $i < $x; $i++) {
+        $s += $x;
+    }
+    return $s;
+}
+function squares(int $n): Generator<int> {
+    for ($i = 0; $i < $n; $i++) {
+        yield square($i);
+    }
+}
+function total(int $n): int {
+    $t = 0;
+    foreach (squares($n) as $k => $v) {
+        $t += $k * $v;
+    }
+    return $t;
+}
+echo total(200), " ", count(squares(50)->toList()), "\n";
+"#;
+    let out = run_both("generators", src, Limits::default(), &["square"]);
+    assert_eq!(out, "396010000 50\n");
+    if std::env::var("PHV_JIT").is_ok_and(|v| v == "0") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("phv-jit-test-{}-generators-all", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("main.phv");
+    std::fs::write(&entry, src).unwrap();
+    let mut c = compile(&dir, &entry).unwrap_or_else(|e| panic!("{}", e.render(false)));
+    c.enable_jit_all();
+    let _ = std::fs::remove_dir_all(&dir);
+    for name in ["squares", "total", "Generator::toList"] {
+        let i = c.program.funcs.iter().position(|f| f.name == name).unwrap_or_else(|| panic!("no function {name}"));
+        assert!(!c.jit.as_ref().is_some_and(|j| j.is_compiled(i as u32)), "{name} was compiled");
+    }
+}
+
+/// A trait's method is copied into each class that uses it and compiled there
+/// as that class's own method, with the class's slots and kinds of
+/// properties: the same text reading a property that is an int in one class
+/// and a float in another, at other slots, gives what the interpreter gives
+/// in both. Between programs, the code is shared only when the classes have
+/// the same layout (the unit key holds the layout, not the trait's text).
+#[test]
+fn trait_methods_are_compiled_in_each_class() {
+    let reads = r#"trait Reads {
+    public function twice(int $n): string {
+        $s = "";
+        for ($i = 0; $i < $n; $i++) {
+            $s .= $this->v . ",";
+        }
+        return $s;
+    }
+    public function total(): int {
+        $t = 0;
+        foreach ($this->values as $x) {
+            $t += $x * 2;
+        }
+        return $t;
+    }
+}
+"#;
+    let src = format!(
+        r#"<?phv
+{reads}class P {{
+    public list<int> $values = [];
+    public int $v = 7;
+    use Reads;
+}}
+class Q {{
+    public float $v = 1.5;
+    public string $pad = "-";
+    public list<int> $values = [];
+    use Reads;
+}}
+$p = new P();
+$q = new Q();
+$p->values = [1, 2];
+$q->values = [3, 4, 5];
+echo $p->twice(3), " ", $q->twice(2), " ", $p->total(), " ", $q->total(), "\n";
+"#
+    );
+    let out =
+        run_exact("trait_layouts", &src, Limits::default(), false, &["P::twice", "Q::twice", "P::total", "Q::total"]);
+    assert_eq!(out, "7,7,7, 1.5,1.5, 6 24\n");
+
+    let program = |decl: &str| {
+        format!(
+            "<?phv\n{reads}class P {{\n    {decl}\n    public list<int> $values = [];\n    use Reads;\n}}\necho (new P())->twice(2);\n"
+        )
+    };
+    let (out_a, ca) = run_as_shipped("trait_layout_a", &program("public int $v = 7;"));
+    let (out_b, cb) = run_as_shipped("trait_layout_b", &program("public float $v = 1.5;"));
+    let (out_c, cc) = run_as_shipped("trait_layout_c", &program("public int $v = 3;"));
+    assert_eq!((out_a.as_str(), out_b.as_str(), out_c.as_str()), ("7,7,", "1.5,1.5,", "3,3,"));
+    if std::env::var("PHV_JIT").is_ok_and(|v| v == "0") {
+        return;
+    }
+    let entry = |c: &phv_driver::Compiled| {
+        let id = c.program.funcs.iter().position(|f| f.name == "P::twice").unwrap() as u32;
+        c.jit.as_ref().unwrap().entry(id).unwrap().entry as usize
+    };
+    assert_ne!(entry(&ca), entry(&cb), "a property of another kind: another unit");
+    assert_eq!(entry(&ca), entry(&cc), "the same layout: one unit");
 }

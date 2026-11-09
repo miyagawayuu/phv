@@ -1,0 +1,5 @@
+<?phv
+// `yield` inside an attribute: what the loop writes meanwhile would land there.
+function links(): Generator<int> {
+    ?><a href="/x?<?phv yield 1; ?>">x</a><?phv
+}

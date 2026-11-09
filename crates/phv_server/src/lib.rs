@@ -2623,6 +2623,7 @@ impl State {
                         let answered = !outcome.output.is_empty()
                             || outcome.http.status != 200
                             || outcome.http.body_file.is_some()
+                            || outcome.http.body_bytes.is_some()
                             || outcome.http.flushed;
                         if answered {
                             let teardown = outcome.teardown.take();
@@ -2724,6 +2725,9 @@ impl State {
                 }
                 Err(Err(_)) => RespBody::full(Bytes::new()),
             }
+        } else if let Some(bytes) = http.body_bytes.take() {
+            // Bytes the script made (an image from std.image), counted as output is.
+            RespBody::counted(bytes, &self.buffered)
         } else {
             let mut output = outcome.output;
             if self.watch && http.content_type.as_deref().is_none_or(|c| c.starts_with("text/html")) {

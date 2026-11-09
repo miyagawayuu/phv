@@ -1,0 +1,91 @@
+--- insert and find
+key set: 1
+1: first count=3 ratio=0.5 active=yes maybe=[null,null,null,null,null] tags=["x","y"] scores={"math":90} names={"7":"seven"} ids=[3,1] words=["hi"] home={"x":1,"y":2} path=[{"x":3,"y":4}] extra={"any":[1,true]} email=a@example.com status=open level=2 mood=Happy code=a1
+2: second count=1 ratio=0 active=no maybe=[5,2.5,"text",false,"open"] tags=[] scores={} names={} ids=[] words=[] home=null path=[] extra=null email=b@example.com status=closed level=1 mood=Sad code=c
+3: third count=2 ratio=0 active=no maybe=[null,null,null,null,null] tags=[] scores={} names={} ids=[] words=[] home=null path=[] extra=null email=c@example.com status=open level=1 mood=Happy code=c
+missing row: null
+the row as stored: {"id":1,"count":3,"ratio":0.5,"name":"first","active":1,"maybeInt":null,"maybeFloat":null,"maybeText":null,"maybeBool":null,"maybeStatus":null,"tags":"[\"x\",\"y\"]","scores":"{\"math\":90}","names":"{\"7\":\"seven\"}","ids":"[3,1]","words":"[\"hi\"]","home":"{\"x\":1,\"y\":2}","path":"[{\"x\":3,\"y\":4}]","extra":"{\"any\":[1,true]}","mail":"a@example.com","status":"open","level":2,"mood":"Happy","code":"a1"}
+--- conditions, ordering, paging, count
+count: 3 2
+by name desc: third second first
+by status, count: second third first
+page 2: third
+offset only: second third
+limit 0: 0
+where: second
+by column: third
+none: none
+in: first third
+in enums: second
+in levels: 1
+in pure enums: 1
+in nothing: 0
+a comment ends a condition: 3
+a join: first third 
+--- updates write the columns that changed
+unchanged: nothing
+changed: written
+again: nothing
+row: {"name":"renamed elsewhere","count":30,"tags":"[\"x\",\"y\",\"z\"]"}
+not read here: written
+2: replaced count=0 ratio=0 active=no maybe=[null,null,null,null,null] tags=[] scores={} names={} ids=[] words=[] home=null path=[] extra=null email=b@example.com status=closed level=1 mood=Sad code=z9
+no such row: nothing
+--- keys
+keyword names: A-1 5 null
+update: written
+ordered: 1
+string key made: tok-made
+string key given: given count 2
+deleted: yes again: no
+--- a unique violation
+DatabaseError: UNIQUE constraint failed: things.mail
+no key set: null
+--- a transaction rolled back
+rolled back: stop
+rows: 3 name in the row: third
+after the rollback: written
+name in the row: renamed in the transaction
+committed: 9
+--- rows that do not fit the class
+DatabaseError: Repo<Thing>: the column "count" of "things" holds a string, but `Thing::$count` is `int`
+DatabaseError: Repo<Thing>: the column "count" of "things" holds a float, but `Thing::$count` is `int`
+DatabaseError: Repo<Thing>: the column "name" of "things" holds NULL, but `Thing::$name` is `string`
+DatabaseError: Repo<Thing>: the column "ratio" of "things" holds a string, but `Thing::$ratio` is `float`
+DatabaseError: Repo<Thing>: the column "active" of "things" holds the integer 2, but `Thing::$active` is `bool`
+DatabaseError: Repo<Thing>: the column "status" of "things" holds "lost", which is not a value of Status (`Thing::$status`)
+DatabaseError: Repo<Thing>: the column "level" of "things" holds 3, which is not a value of Level (`Thing::$level`)
+DatabaseError: Repo<Thing>: the column "mood" of "things" holds "Angry", which is not a case name of Mood (`Thing::$mood`)
+DatabaseError: Repo<Thing>: the column "tags" of "things" does not hold JSON (unexpected character at offset 0)
+DatabaseError: Repo<Thing>: the JSON in the column "tags" of "things": expected a string, found a number at $[0]
+fits
+DatabaseError: Repo<Thing>: the column "maybeInt" of "things" holds a string, but `Thing::$maybeInt` is `?int`
+home with a default: {"x":5,"y":0}
+DatabaseError: Repo<Thing>: the row has no column "count" (for `Thing::$count`); select every column of "things"
+DatabaseError: no such column: emial in SELECT COUNT(*) AS `n` FROM `things` WHERE (`emial` = 'emial') at offset 44
+DatabaseError: no such column: emial in SELECT `id`, `emial` FROM `things` at offset 13
+--- refusals and limits
+ValueError: Repo<Thing>: Thing has no property "nope" (it has id, count, ratio, name, active, maybeInt, maybeFloat, maybeText, maybeBool, maybeStatus, tags, scores, names, ids, words, home, path, extra, email, status, level, mood, code)
+ValueError: Repo<Thing>: orderBy: expected `asc` or `desc` after "name;", found "DROP"
+ValueError: Repo<Thing>: orderBy: expected `asc` or `desc` after "name", found "sideways"
+ValueError: Repo<Thing>: orderBy has an empty term
+ValueError: Repo<Thing>: orderBy has more than 16 terms
+accepted
+ValueError: Repo<Thing>: orderBy is longer than 1024 characters
+ValueError: Repo<Thing>::findBy(): limit and offset cannot be negative
+ValueError: Repo<Thing>::findBy(): limit and offset cannot be negative
+ValueError: Repo<Thing>: Thing has no property "mail" (it has id, count, ratio, name, active, maybeInt, maybeFloat, maybeText, maybeBool, maybeStatus, tags, scores, names, ids, words, home, path, extra, email, status, level, mood, code)
+ValueError: Repo<Thing>: Thing has no property "email\" OR 1=1" (it has id, count, ratio, name, active, maybeInt, maybeFloat, maybeText, maybeBool, maybeStatus, tags, scores, names, ids, words, home, path, extra, email, status, level, mood, code)
+ValueError: Repo<Thing>: Thing has no property "nope" (it has id, count, ratio, name, active, maybeInt, maybeFloat, maybeText, maybeBool, maybeStatus, tags, scores, names, ids, words, home, path, extra, email, status, level, mood, code)
+ValueError: Repo<Thing>::in(): `Thing::$tags` is kept as JSON and cannot be compared
+ValueError: Repo<Thing>::in(): `Thing::$id` is `?int`, found a string
+ValueError: Repo<Thing>::in(): `Thing::$status` is `Status`, found a string
+ValueError: Repo<Thing>::in(): `Thing::$status` is `Status`, found a Level
+ValueError: Repo<Thing>::in(): 1001 values, more than 1000; split the list
+accepted
+ValueError: Repo<Thing>::find(): the key `Thing::$id` is an int, found a string
+ValueError: Repo<Order>::find(): the key `Order::$number` is a string, found an integer
+ValueError: Repo<Thing>::update(): the entity has no key (`Thing::$id` is null); insert() it first
+ValueError: Repo<Thing>::delete(): the entity has no key (`Thing::$id` is null); insert() it first
+--- delete
+deleted: yes again: no
+left: 2

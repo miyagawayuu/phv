@@ -1,0 +1,51 @@
+error: there is no message `nope` in lang/en.toml
+ --> keys.phv:6:8
+  |
+6 | echo t("nope");
+  |        ^^^^^^
+  = note: keys are checked against the catalog of the default locale of [i18n]
+
+error: `title` is not a plural message: use t()
+ --> keys.phv:7:9
+  |
+7 | echo tn("title", 2);
+  |         ^^^^^^^
+
+error: `cart.items` is a plural message: use tn() with a count
+ --> keys.phv:8:8
+  |
+8 | echo t("cart.items");
+  |        ^^^^^^^^^^^^
+
+error: the message `welcome` needs the parameter `name`
+ --> keys.phv:9:8
+  |
+9 | echo t("welcome");
+  |        ^^^^^^^^^
+
+error: the message `welcome` needs the parameter `name`
+  --> keys.phv:10:8
+   |
+10 | echo t("welcome", ["nam" => "x"]);
+   |        ^^^^^^^^^
+
+error: the message `inbox.unread` needs the parameter `name`
+  --> keys.phv:11:9
+   |
+11 | echo tn("inbox.unread", 3);
+   |         ^^^^^^^^^^^^^^
+
+error: the message `terms` needs the parameter `site`
+  --> keys.phv:12:13
+   |
+12 | echo t_html("terms", ["link" => raw("x")]);
+   |             ^^^^^^^
+
+error: there is no message `nope.either` in lang/en.toml
+  --> keys.phv:14:13
+   |
+14 | echo $tr->t("nope.either");
+   |             ^^^^^^^^^^^^^
+   = note: keys are checked against the catalog of the default locale of [i18n]
+
+8 errors found

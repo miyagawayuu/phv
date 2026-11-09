@@ -1,0 +1,9 @@
+<?phv
+// A template loops over a generator like over a list; what the generator
+// echoes lands where the loop asks for the next row.
+function counts(): Generator<string, int> {
+    foreach (["<b>tea</b>" => 3, "cake" => 1] as $name => $n) {
+        yield $name => $n;
+    }
+}
+echo render("views/generated_rows.phv.html", rows: counts());

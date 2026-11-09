@@ -13,12 +13,6 @@ changes in the same commit (§18 says what may change); a change that touches pe
 before/after `bench/results/*.json`; and the security-critical items are done first in a cycle and assessed again
 before the release.
 
-## 1.3 (the next minor release)
-
-| Item | Code | Change | Risk | Measure | Size |
-|---|---|---|---|---|---|
-| Generators, traits, i18n, images, an ORM | the language and `crates/phv_std` | As the roadmap says: additions only, each with its spec section | Each is a new surface for the assessment | — | L each |
-
 ## Later
 
 | Item | Code | Change | Risk | Measure | Size |

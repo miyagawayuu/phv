@@ -1,0 +1,10 @@
+// The locale of a request (crates/phv_driver/tests/i18n.rs runs it with
+// several Accept-Language headers; alone, it has the default).
+import std.i18n.{locale, set_locale, t};
+import std.http.request;
+
+$lang = request()->query("lang");
+if ($lang != null) {
+    set_locale($lang);
+}
+echo locale(), " ", t("title");

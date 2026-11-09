@@ -1,0 +1,8 @@
+error: std.i18n needs an [i18n] section in phv.toml
+ --> i18n_unset.phv:2:1
+  |
+2 | import std.i18n.t;
+  | ^^^^^^^^^^^^^^^^^^
+  = note: for example `[i18n]` with `default = "en"` and `locales = ["en", "ja"]`, and the catalogs lang/en.toml and lang/ja.toml
+
+1 error found

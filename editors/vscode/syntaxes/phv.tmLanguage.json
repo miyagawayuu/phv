@@ -169,6 +169,20 @@
           }
         },
         {
+          "match": "\\b(trait)\\s+([A-Za-z_][A-Za-z0-9_]*)(?=\\s*[{<])",
+          "captures": {
+            "1": { "name": "storage.type.class.phv" },
+            "2": { "name": "entity.name.type.class.phv" }
+          }
+        },
+        {
+          "match": "\\b(insteadof)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.modifier.phv" },
+            "2": { "name": "entity.name.type.class.phv" }
+          }
+        },
+        {
           "match": "\\b(extends|implements|new)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": { "name": "storage.modifier.phv" },
@@ -180,7 +194,7 @@
     "keywords": {
       "patterns": [
         {
-          "match": "\\b(if|elseif|else|endif|while|endwhile|do|for|endfor|foreach|endforeach|as|break|continue|return|match|default|try|catch|finally|throw|echo|is|instanceof|case)\\b",
+          "match": "\\b(if|elseif|else|endif|while|endwhile|do|for|endfor|foreach|endforeach|as|break|continue|return|match|default|try|catch|finally|throw|yield(?:\\s+from)?|echo|is|instanceof|case)\\b",
           "name": "keyword.control.phv"
         },
         {

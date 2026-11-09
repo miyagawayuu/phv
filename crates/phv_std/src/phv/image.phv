@@ -1,0 +1,123 @@
+// std.image — reading, resizing and writing images: PNG, JPEG, GIF and WebP.
+//
+//   import std.http.request;
+//   import std.image.Image;
+//
+//   $file = request()->file("avatar");
+//   if ($file != null) {
+//       $img = Image::fromUpload($file);          // ValueError if it is not an image
+//       $img->cover(256, 256)->saveTo("storage/avatars/7.webp");
+//   }
+//   Image::open("storage/photos/1.jpg")->fit(800)->send(quality: 80);
+//
+// The format is found from the bytes, never from a file name or a declared type.
+// An image is checked when it is read (its format and size, from its header);
+// its pixels are decoded only when it is written, so reading many uploads and
+// making several sizes of each keeps one decoded image in memory at a time.
+// What is written never carries the source's metadata (EXIF, GPS, comments).
+
+import std.http.UploadedFile;
+
+/** An image: its size and format, and the steps that make it from its source. It never changes; each step returns a new one. */
+export final class Image {
+    private function __construct(
+        private int $handle,
+        /** Width in pixels, upright (after the EXIF orientation). */
+        public readonly int $width,
+        /** Height in pixels, upright. */
+        public readonly int $height,
+        /** The format it was read in: "png", "jpeg", "gif" or "webp". */
+        public readonly string $format,
+    ) {}
+
+    private static function wrap(int $h): Image {
+        $size = __img_size($h);
+        return new Image($h, $size[0], $size[1], __img_format($h));
+    }
+
+    /**
+     * The image of an uploaded file. Throws ValueError when it is not a PNG,
+     * JPEG, GIF or WebP image, or is larger than 16,384 pixels a side or
+     * 50,000,000 pixels.
+     */
+    public static function fromUpload(UploadedFile $file): Image {
+        return Image::wrap(__img_upload($file->index));
+    }
+
+    /** The image in a file of the project (`[permissions].read` or `write`); up to 32 MB. */
+    public static function open(string $path): Image {
+        return Image::wrap(__img_open($path));
+    }
+
+    /** The image in Base64 text, or in a `data:` URL such as a canvas's `toDataURL()` gives. */
+    public static function fromBase64(string $data): Image {
+        return Image::wrap(__img_base64($data));
+    }
+
+    /**
+     * Scaled down to fit inside `$width` × `$height` (any height when it is
+     * null), keeping its proportions. A smaller image is not enlarged.
+     */
+    public function fit(int $width, ?int $height = null): Image {
+        return Image::wrap(__img_op($this->handle, "fit", $width, $height ?? 0, 0, 0));
+    }
+
+    /** Exactly `$width` × `$height`: scaled to cover it, keeping its proportions, and the middle kept. */
+    public function cover(int $width, int $height): Image {
+        return Image::wrap(__img_op($this->handle, "cover", $width, $height, 0, 0));
+    }
+
+    /** Exactly `$width` × `$height`, stretched if the proportions differ. */
+    public function resize(int $width, int $height): Image {
+        return Image::wrap(__img_op($this->handle, "resize", $width, $height, 0, 0));
+    }
+
+    /** The part `$width` × `$height` from (`$x`, `$y`), the top left being (0, 0). It must lie inside. */
+    public function crop(int $x, int $y, int $width, int $height): Image {
+        return Image::wrap(__img_op($this->handle, "crop", $x, $y, $width, $height));
+    }
+
+    /** Turned clockwise by a multiple of 90 degrees (-90 turns it back). */
+    public function rotate(int $degrees): Image {
+        return Image::wrap(__img_op($this->handle, "rotate", $degrees, 0, 0, 0));
+    }
+
+    /** Mirrored left to right. */
+    public function flipHorizontal(): Image {
+        return Image::wrap(__img_op($this->handle, "fliph", 0, 0, 0, 0));
+    }
+
+    /** Mirrored top to bottom. */
+    public function flipVertical(): Image {
+        return Image::wrap(__img_op($this->handle, "flipv", 0, 0, 0, 0));
+    }
+
+    /**
+     * Sends the image as the response, with its Content-Type: its bytes replace
+     * everything the page writes. `$format` is "png", "jpeg" (or "jpg") or
+     * "webp" (lossless); "" keeps the format it was read in (a GIF is sent as
+     * PNG). `$quality` (1 to 100) is for JPEG. JPEG has no transparency: what is
+     * transparent becomes white.
+     */
+    public function send(string $format = "", int $quality = 85): void {
+        __img_send($this->handle, $format, $quality);
+    }
+
+    /**
+     * Writes the image to a file of the project (`[permissions].write`). Without
+     * `$format`, the extension of `$path` (.png, .jpg, .jpeg, .webp) gives it.
+     */
+    public function saveTo(string $path, string $format = "", int $quality = 85): void {
+        __img_save($this->handle, $path, $format, $quality);
+    }
+
+    /** The image's bytes in Base64, in `$format` as for `send()`. */
+    public function toBase64(string $format = "", int $quality = 85): string {
+        return __img_to_base64($this->handle, $format, $quality);
+    }
+
+    /** A `data:` URL of the image, for `<img src="...">` (the default CSP allows `data:` images). */
+    public function toDataUrl(string $format = "", int $quality = 85): SafeUrl {
+        return __img_data_url($this->handle, $format, $quality);
+    }
+}

@@ -1,0 +1,8 @@
+error: `yield` is a statement in PHV, not an expression
+ --> err_yield_expr.phv:4:13
+  |
+4 |     $sent = yield 1;
+  |             ^^^^^
+  = note: write `yield $value;` on its own: a generator does not receive values (there is no `send()`)
+
+1 error found

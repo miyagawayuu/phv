@@ -1,0 +1,80 @@
+lazy:
+made, nothing ran yet
+  (numbers starts)
+  (makes 1)
+got 0 => 10
+  (makes 2)
+got 1 => 20
+  (makes 3)
+got 2 => 30
+  (numbers ends)
+keys:
+tea costs 2.5
+cake costs 4
+5:a 6:b 2:c 7:d 
+yield from:
+0=start 0=x 1=y 0=l0 1=l1 0=s 1=end 
+one=1 two=2 three=3 
+start,x,y,l0,l1,s,end
+finally:
+  (to the end starts)
+got 1
+got 2
+got 3
+  (to the end: finally)
+  (break starts)
+got 1
+got 2
+  (break: finally)
+after break
+  (return starts)
+  (return: finally)
+first over 1: 2
+  (break 2 starts)
+round 1 got 1
+  (break 2: finally)
+after break 2
+  (continue starts)
+got 1
+got 3
+  (continue: finally)
+  (inner starts)
+wrapped 1
+  (inner: finally)
+  (wrapper: finally)
+exceptions:
+  (loop throws starts)
+  (loop throws: finally)
+caught: from the loop at 1
+got 1
+caught: from the generator
+got 5
+got division by zero
+got 2
+once:
+  (numbers starts)
+  (makes 1)
+got 10
+  (numbers ends)
+caught: a generator can be iterated only once
+objects, methods and closures:
+root
+  a
+    a1
+  b
+root a a1 b
+3 2 1
+2
+generic:
+0: #0
+1: #1
+2: #2
+  (taken starts)
+took 1
+took 2
+  (taken: finally)
+callbacks:
+1 10
+2 20
+3 30
+a1 a2 b1 b2 

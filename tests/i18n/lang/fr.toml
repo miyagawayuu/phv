@@ -1,0 +1,6 @@
+title = "Boutique"
+
+[cart.items]
+one = "{count} article"
+many = "{count} d’articles"
+other = "{count} articles"

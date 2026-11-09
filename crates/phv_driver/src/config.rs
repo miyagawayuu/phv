@@ -105,6 +105,67 @@ struct File {
     schedule: Vec<ScheduleSection>,
     #[serde(default)]
     telemetry: Option<TelemetrySection>,
+    #[serde(default)]
+    i18n: Option<I18nSection>,
+}
+
+/// `[i18n]`: the locales of `std.i18n`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct I18nSection {
+    default: String,
+    locales: Vec<String>,
+    /// The directory of the catalogs (default "lang").
+    #[serde(default)]
+    dir: Option<String>,
+}
+
+/// `[i18n]`, checked: the locales, the default one among them, and the
+/// directory of their catalogs (`<dir>/<locale>.toml`), relative to the project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct I18n {
+    pub default: String,
+    pub locales: Vec<String>,
+    pub dir: String,
+}
+
+/// `[i18n]`, checked.
+fn i18n_config(s: I18nSection) -> Result<I18n, String> {
+    use phv_std::i18n::{valid_locale, MAX_LOCALES};
+    if s.locales.is_empty() || s.locales.len() > MAX_LOCALES {
+        return Err(format!("[i18n].locales: list 1 to {MAX_LOCALES} locales"));
+    }
+    for (i, l) in s.locales.iter().enumerate() {
+        // A locale names its catalog's file: `con` would name a device on Windows.
+        if !valid_locale(l) || !phv_std::safefs::valid_name(&format!("{l}.toml")) {
+            return Err(format!(
+                "[i18n].locales: \"{l}\" is not a locale like \"en\", \"pt-BR\" or \"zh-Hant\" \
+                 (a language in lowercase, then a script or region)"
+            ));
+        }
+        if s.locales[..i].iter().any(|o| o.eq_ignore_ascii_case(l)) {
+            return Err(format!("[i18n].locales: \"{l}\" is listed twice"));
+        }
+    }
+    if !s.locales.contains(&s.default) {
+        return Err(format!("[i18n].default: \"{}\" must be one of [i18n].locales", s.default));
+    }
+    let dir = s.dir.unwrap_or_else(|| "lang".into());
+    let p = Path::new(&dir);
+    let ok = !dir.contains('~')
+        && !p.is_absolute()
+        && p.components().all(|c| match c {
+            std::path::Component::Normal(n) => n.to_str().is_some_and(phv_std::safefs::valid_name),
+            std::path::Component::CurDir => true,
+            _ => false,
+        })
+        && p.components().any(|c| matches!(c, std::path::Component::Normal(_)));
+    if !ok {
+        return Err(format!(
+            "[i18n].dir: \"{dir}\" must be a directory inside the project (no `..`, not absolute, no `~`)"
+        ));
+    }
+    Ok(I18n { default: s.default, locales: s.locales, dir })
 }
 
 /// `[telemetry]`: traces sent to an OpenTelemetry collector.
@@ -979,6 +1040,8 @@ pub struct Config {
     pub schedules: Vec<Schedule>,
     /// `[telemetry]`: traces sent to an OpenTelemetry collector.
     pub telemetry: Option<Telemetry>,
+    /// `[i18n]`: the locales of `std.i18n`.
+    pub i18n: Option<I18n>,
 }
 
 /// `[server] tls_cert` / `tls_key`, resolved against the project root.
@@ -1022,6 +1085,7 @@ impl Config {
             jobs: None,
             schedules: Vec::new(),
             telemetry: None,
+            i18n: None,
         }
     }
 }
@@ -1514,6 +1578,7 @@ pub fn parse_config_with_jobs(root: &Path, text: &str, jobs_given: Option<Vec<St
         hidden.extend(h.headers_env.iter().map(|(_, var)| var.clone()));
     }
     hidden.extend(oauth.values().filter_map(|o| o.client_secret_env.clone()));
+    let i18n = file.i18n.map(i18n_config).transpose()?;
     let telemetry = match file.telemetry {
         Some(t) => {
             hidden.extend(t.endpoint_env.iter().cloned());
@@ -1574,6 +1639,7 @@ pub fn parse_config_with_jobs(root: &Path, text: &str, jobs_given: Option<Vec<St
         jobs,
         schedules,
         telemetry,
+        i18n,
     })
 }
 

@@ -38,21 +38,23 @@ echo greet($name);                                 // Web ページでは自動�
 - **PHP から引き継いだもの**: `$変数`、`[1, 2]` / `["k" => v]`、`echo`、`foreach`、`match`、HTML への埋め込み、
   ファイル単位のルーティング、保存したらすぐ反映、リクエストごとに何も共有しない実行モデル
 - **型安全**: 変数の型は最初の代入で固定。暗黙の型変換なし、`==` は常に厳密、truthiness なし、null 安全(`?T`)、
-  interface・abstract・`final`・enum(すべてのケースを扱う必要がある `match`)・制約付きのジェネリック関数と
+  interface・trait・abstract・`final`・enum(すべてのケースを扱う必要がある `match`)・制約付きのジェネリック関数と
   クラス(`<T: Shape>`)・型エイリアス・`finally`。使われない変数や import、到達しないコードは警告になる
 - **書きやすい構文**: 分割代入(`[$a, $b] = ...`)、可変長引数と `...` による展開、関数を値として使う
-  (`strlen(...)`)、定数式、`import ... as`、ヒアドキュメント、原因とトレースを持つ例外
+  (`strlen(...)`)、定数式、`import ... as`、ヒアドキュメント、ジェネレータ(`yield`)、原因とトレースを持つ例外
 - **Web アプリケーション**: パラメータ付きのルート(`public/posts/[id].phv`)、ミドルウェア(`_middleware.phv`)、
-  独自のエラーページ、レイアウト、入力の検証(`std.validate`)、メール(`std.mail`)、データベースのマイグレーション
+  独自のエラーページ、レイアウト、入力の検証(`std.validate`)、メール(`std.mail`)、翻訳(`std.i18n`)、データベースのマイグレーション
   (`phv db migrate`)、静的ファイルのキャッシュと範囲リクエスト、gzip、CORS、アクセスログ、穏やかな停止、ページの実行中に
   送るレスポンス(`response()->flush()`)
 - **Web サービス**: 複数のサーバープロセスやマシンが、セッション、レート制限、CSRF トークン(`secret_env`)、
   WebSocket と Server-Sent Events への `publish()`(`publish_store`)を共有する。再試行と cron 形式のスケジュールを持つ
   バックグラウンドジョブ(`std.jobs`、`phv jobs`)。管理用ポートのヘルスチェックと Prometheus のメトリクス、リクエスト ID、
   OpenTelemetry へのトレースの送信(`[telemetry]`)。OAuth 2.0 と OpenID Connect によるサインイン(`std.oauth`)
+- **画像**: アップロードされた PNG・JPEG・GIF・WebP を読み、縮小・切り抜きをして、メタデータなしで書き出す(`std.image`)
 - **標準ライブラリ**: 正規表現(`std.regex`)、コンパイル時に検査する `format()`、タイムゾーン付きの日時(`std.time`)、
   型付きのクラスへの JSON のデコード(`json_decode_as`)、暗号化・署名付きトークン、RS256・ES256・EdDSA・HS256 で
-  署名した JSON Web Token と鍵セット(`std.jwt`)、list と map のメソッド、
+  署名した JSON Web Token と鍵セット(`std.jwt`)、
+  テーブルの行を型付きのオブジェクトとして読み書きするクラスごとのリポジトリ(`std.orm`)、list と map のメソッド、
   数学関数、UUID、CSV、URL、ディレクトリ、ログ、スクリプトの引数と標準入力
 - **セキュリティ**:
   - **XSS 対策**: 出力は自動でエスケープされる。加えて、エスケープでは守れない場所(引用符なしの属性、URL、

@@ -138,6 +138,10 @@ pub(crate) struct FnCtx {
     pub finally_depth: u32,
     /// Incremented whenever property narrowings are cleared (by a call).
     pub prop_gen: u64,
+    /// The key and value types of a generator (a function with `yield`).
+    pub gen: Option<(Type, Type)>,
+    /// How many `finally` blocks enclose this point (`yield` is refused there).
+    pub in_finally: u32,
     temps: u32,
 }
 
@@ -159,6 +163,8 @@ impl FnCtx {
             continues: Vec::new(),
             finally_depth: 0,
             prop_gen: 0,
+            gen: None,
+            in_finally: 0,
             temps: 0,
         }
     }
@@ -310,6 +316,28 @@ pub(crate) fn assigned_vars(stmts: &[Stmt], out: &mut HashSet<String>) {
             _ => {}
         }
     }
+}
+
+/// Where the first `yield` of a function body is, if it has one (not inside
+/// closures, which are functions of their own): the function is a generator.
+pub(crate) fn first_yield(stmts: &[Stmt]) -> Option<Span> {
+    stmts.iter().find_map(|s| match &s.kind {
+        StmtKind::Yield { .. } | StmtKind::YieldFrom(_) => Some(s.span),
+        StmtKind::If { then, elifs, els, .. } => first_yield(then)
+            .or_else(|| elifs.iter().find_map(|(_, b)| first_yield(b)))
+            .or_else(|| els.as_ref().and_then(|b| first_yield(b))),
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::Foreach { body, .. }
+        | StmtKind::Block(body) => first_yield(body),
+        StmtKind::For { init, step, body, .. } => {
+            first_yield(init).or_else(|| first_yield(step)).or_else(|| first_yield(body))
+        }
+        StmtKind::Try { body, catches, finally } => first_yield(body)
+            .or_else(|| catches.iter().find_map(|c| first_yield(&c.body)))
+            .or_else(|| finally.as_ref().and_then(|f| first_yield(f))),
+        _ => None,
+    })
 }
 
 /// The variables an assignment to `e` changes: its base variable, or every

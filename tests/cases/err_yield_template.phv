@@ -1,0 +1,3 @@
+<?phv
+// A template cannot `yield`; it can loop over a generator.
+echo render("views/yields.phv.html", items: ["a", "b"]);

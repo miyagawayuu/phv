@@ -218,6 +218,18 @@ pub fn raw(vm: &mut Vm, a: &[Value]) -> R {
     Ok(Value::Null)
 }
 
+/// The SQL dialect of a server connection handle (std.orm), or None when it
+/// is closed or a Redis connection.
+pub(crate) fn dialect_of(vm: &Vm, h: &Value) -> Option<crate::db::Dialect> {
+    let link = link_of(vm, h).ok()?;
+    let link = link.borrow();
+    match &*link {
+        Link::Pg(_) => Some(crate::db::Dialect::Postgres),
+        Link::My(_) => Some(crate::db::Dialect::MySql),
+        Link::Redis(_) => None,
+    }
+}
+
 pub fn last_insert_id(vm: &mut Vm, a: &[Value]) -> R {
     let link = link_of(vm, &a[0])?;
     let mut link = link.borrow_mut();

@@ -62,8 +62,9 @@ It is not compatible with existing PHP code, but it aims to be something PHP pro
     every line, and a line indented less than it is an error.
 - Reserved words: `function fn return if elseif else endif while endwhile do for endfor foreach endforeach as break continue
   echo class extends new public private protected readonly static true false null match default try catch finally
-  throw import export use is instanceof interface implements abstract final enum case const`. `type` is a keyword only
-  where it starts a type alias (§4).
+  throw yield import export use is instanceof interface implements abstract final enum case const`. `type` is a keyword
+  only where it starts a type alias (§4), `from` only after `yield` (§8), `trait` only where it starts a trait and
+  `insteadof` only in the rules of a `use` (§9).
 
 ## 4. Types
 
@@ -85,6 +86,7 @@ It is not compatible with existing PHP code, but it aims to be something PHP pro
 | `?T` | `T` or `null` (same as `T|null`) |
 | `A|B` | Union type |
 | `fn(A, B): R` | Function (closure) type |
+| `Generator<K, V>` | What a function with `yield` returns (§8). `Generator<V>` is `Generator<int, V>` |
 | Class name | The type of an object. `self` is the class itself |
 
 PHP's `array` is split into `list<T>` and `map<K, V>`, and `set<T>` holds distinct values. `mixed` is `any`.
@@ -364,6 +366,64 @@ $counter = function () use ($start): int { return $start + 1; };
 - The body of `fn() =>` extends as far as possible: `fn($n) => $n > 0 ? "+" : "-"` returns the whole conditional.
 - Closure parameters cannot have default values or be variadic, because a function type (`fn(int): int`) has neither.
 
+### Generators
+
+```phv
+function lines(string $text): Generator<string> {
+    foreach ($text->split("\n") as $line) {
+        if (!$line->trim()->isEmpty()) {
+            yield $line->trim();
+        }
+    }
+}
+
+function totals(list<Order> $orders): Generator<string, float> {
+    foreach ($orders as $o) {
+        yield $o->customer => $o->total();
+    }
+}
+
+foreach (lines($input) as $i => $line) { ... }        // $i is 0, 1, 2, ...
+foreach (totals($orders) as $customer => $total) { ... }
+$all = lines($input)->toList();                       // list<string>
+```
+
+A function, method or closure whose body has `yield` is a **generator**. Calling it runs none of its body: it returns a
+`Generator<K, V>` (`Generator<V>` is short for `Generator<int, V>`). The body runs as a `foreach` over the generator
+asks for values: up to the next `yield`, which hands the loop a key and a value and waits there until the loop's next
+pass.
+
+- The return type is declared, as for every function: `Generator<V>` or `Generator<K, V>` (a closure's can also come
+  from the function type it is passed as). Each value yielded must be a `V`, and each key a `K`.
+- `yield $value;` gives the next int key: 0, then one more each time (as in PHP, after `yield 5 => $v` the next is 6).
+  A generator whose keys are not `int` gives each value its key: `yield $key => $value;`.
+- `yield from $values;` yields each key and value of a list (its indexes are the keys), a map, a set or another
+  generator, which must fit `K` and `V`. As in PHP, those keys do not move the generator's own int keys on.
+- `return;` ends a generator. It cannot return a value, and `yield` is a statement, not an expression: a generator
+  does not receive values. PHP's `send()` and `getReturn()` are left out, so a generator's type needs only its keys and
+  values.
+- A generator is iterated once: a second `foreach` over it (or `toList()`) throws `LogicException`.
+  `$g->toList()` runs it to its end and gives its values as a `list<V>`.
+- An exception thrown in a generator leaves it at the `foreach` that asked for the value (the generator is then
+  done). One thrown in the loop's body does not enter the generator.
+- When the loop over a generator ends before the generator does (`break`, `return`, an exception, or a `break 2` out
+  of it), the generator is closed: one that waits at a `yield` inside a `try` with `finally` (or inside a loop over
+  another generator, as in `yield from`) continues from there as if that `yield` were `return;`. So its `finally`
+  blocks run then, innermost first, before the statement after the loop. An exception thrown by such a block is
+  thrown where the loop was left (it replaces one the loop was left by, as a `finally` does). A generator that never
+  started has nothing to run. PHP runs these blocks when the generator is destroyed; PHV runs them when the loop is
+  left, a point the code shows (a fatal error, such as the time limit, runs no `finally` block, here as anywhere).
+- `yield` is refused in a `finally` block (a closed generator could not wait there), in a constructor, in a template,
+  outside a function, and in HTML other than element text (inside a tag, an attribute or `<script>`), where what the
+  loop writes while the generator waits would land.
+- A generator keeps its frame (its variables, where it waits, its open `try` blocks) while it waits. That memory counts
+  against the memory limit, the time limit stops a long generator as it stops any code, the cycle collector sees the
+  values the frame holds (an object holding a generator of its own method is freed), and a generator a loop resumes is
+  a call for the call-depth limit, so a deep recursion through `yield from` stops at it.
+- Generators and the loops over them run in the interpreter (§17).
+- `yield` is a reserved word from 1.3; a method can still be named `yield`. A project's own class named `Generator`
+  hides the built-in one in the files that declare or import it.
+
 ## 9. Classes
 
 ```phv
@@ -571,6 +631,91 @@ Box<float> $f = new Box(1);       // from the declared type: Box<float>
 - A method's own type parameters are its own: a method `m<T>` and a class parameter `T` are different types, also in
   an override, and a caller's type parameter never takes the place of a method's parameter of the same name.
 
+### Traits
+
+```phv
+trait HasName {
+    const SEP = ": ";
+    private string $name = "";
+
+    abstract public function kind(): string;
+
+    public function rename(string $name): self {
+        $this->name = $name;
+        return $this;
+    }
+
+    public function label(): string {
+        return $this->kind() . self::SEP . $this->name;
+    }
+}
+
+class User extends Model {
+    use HasName;
+
+    public function kind(): string {
+        return "user";
+    }
+}
+
+echo (new User())->rename("ann")->label();   // "user: ann"
+```
+
+A trait holds methods (public, protected, private, static and abstract ones), typed properties and constants, which
+classes take with `use T;` or `use A, B;` in their body. Abstract classes and enums can use traits too (an enum takes
+no properties), and so can a trait. A trait is exported and imported like a class. As anywhere, it has no static
+properties.
+
+- The members are copied into the class: each method is a method of the class, `$this` and `self` are the class
+  (also in a static method: `new self()`), `parent::` is its parent, and the names a method uses (functions, classes,
+  constants) are those of the trait's module. In a stack trace a trait's method is named after the class, as in
+  PHP (`User::label`), at its line in the trait's file. PHV has no `static::` (late static binding).
+- A trait's methods are checked as methods of each class that uses them, so they can use what the class declares
+  (`$this->id`, `$this->save()`). An error in one is shown at the trait's source with a note naming the class (once,
+  also when several classes use the trait). A trait that no class uses is checked for its declarations (members
+  declared twice, a constructor, the traits it uses), not for its method bodies.
+- Precedence, as in PHP: a method the class declares wins over a trait's, which wins over an inherited one. A trait's
+  method that replaces an inherited one is an override: it keeps the parameter types and a compatible return type,
+  and cannot replace a `final` method.
+- An abstract method of a trait is met by the class's method of that name (its own, another trait's or an inherited
+  one) with the same parameter types and a compatible return type. A concrete class without one is an error, as for
+  an abstract class. A trait's abstract method cannot be static.
+- Two traits that give a method of the same name are an error, unless the `use` picks one:
+
+  ```phv
+  class Talker {
+      use Hello, Hey {
+          Hello::hi insteadof Hey;        // Hello's hi(), not Hey's
+          Hey::hi as hey;                 // and Hey's as hey()
+          secret as public;               // another visibility
+          Hello::hi as protected quiet;   // a copy with another name and visibility
+      }
+  }
+  ```
+
+  `A::m insteadof B, C;` keeps the method of `A`. `[A::]m as [visibility] [name];` adds a copy under another name
+  (with that visibility, if given), or without a name changes the visibility of `m`. A rule names only traits of the
+  class's `use`, and `m` written without a trait must be a method of one of them only. The same method reached along
+  two paths (two traits that use a third) is no conflict.
+- Properties and constants are added to the class's own. A property of the same name as one of the class (or of
+  another trait) must be the same, as in PHP: the same type, visibility, `readonly` and default value; otherwise,
+  and when an ancestor declares it (as for any property), it is an error. A constant of the same name must have the
+  same value. A trait cannot declare a constructor: the class's constructor initializes the trait's properties that
+  need it (§9). Annotations of a trait's members apply in each class (`#[Override]` is checked there).
+- A trait is not a type: `function f(HasName $x)`, `new HasName()`, `$x is HasName`, `HasName::label()`,
+  `HasName::SEP`, `extends HasName` and `implements HasName` are errors. Declare an interface for the type, and
+  implement it in the classes that use the trait (a trait cannot implement an interface; the class's methods taken
+  from the trait can).
+- A trait can take type parameters (up to 4, with bounds) and is then used with its type arguments:
+  `trait Holds<T> { ... }` and `use Holds<User>;`, or `use Holds<V>;` in `class Box<V>`. In the members the class
+  takes, `T` is the argument. Static methods do not see the parameters, as in a class.
+- `trait` is a keyword only where it starts a declaration (`trait Name {` or `trait Name<`), and `insteadof` only in a
+  rule of a `use`, so names that use them stay valid.
+- The JIT compiles a trait's method in each class as that class's own method, with the class's layout (two classes
+  that use one trait with their properties in other places get their own code).
+- Each class holds a copy of what it takes from traits: those copies count against the members all classes inherit
+  together, and the methods copied may have 32 MB of source in all (§17).
+
 ### Annotations
 
 ```phv
@@ -592,6 +737,9 @@ can be given as `#[A, B]` or on separate lines. PHV knows these (any other name 
 | `#[Override]` | method | An error unless a parent class or an interface declares a method of that name (not a private one) |
 | `#[Test]` | function | `phv test` runs it, whatever its name (§16) |
 | `#[Skip]`, `#[Skip("reason")]` | function | `phv test` reports it as skipped instead of running it |
+| `#[Table("name")]` | class | The table of an entity (std.orm, §14) |
+| `#[Column("name")]` | property | The column of an entity's property (std.orm) |
+| `#[Id]` | property | The key of an entity (std.orm) |
 
 Annotations are checked at compile time and are not available at run time.
 
@@ -638,10 +786,10 @@ import lib.legacy.render as render_legacy;
 
 - `import a.b.{x, y};` loads `a/b.phv` relative to the project root (the directory that contains `phv.toml`, or, if there is none,
   the directory of the file being run).
-- The top level of an imported module can contain only declarations (`function`, `class`, `interface`, `enum`, `const`, `type`, `import`).
+- The top level of an imported module can contain only declarations (`function`, `class`, `interface`, `enum`, `trait`, `const`, `type`, `import`).
   Loading a module has no side effects.
 - `std.*` are the standard modules (`std.http`, `std.db`, `std.net`, `std.async`, `std.validate`, `std.mail`,
-  `std.testing`, `std.regex`, `std.time`, `std.ws`, `std.jobs`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
+  `std.testing`, `std.regex`, `std.time`, `std.ws`, `std.jobs`, `std.orm`, `std.i18n`, `std.image`). Packages listed in `[dependencies]` are loaded with `import package_name.module`.
 - Only files inside the project and package directories can be loaded (symbolic links cannot be used to escape them).
   A module, template, package or `phv.toml` that is a symbolic link or junction to another machine (a network share
   such as `\\host\share`, a network drive, or an object path such as `\GLOBAL??\UNC\host\share`), or lies behind one,
@@ -1276,6 +1424,72 @@ The path needs `[permissions].read` or `write`. Without `$type`, the Content-Typ
 audio, video, fonts, PDF, txt, csv, json); HTML, SVG, XML and unknown extensions are sent as `application/octet-stream`
 so that an uploaded file cannot run as a page on the site.
 
+### Images (std.image)
+
+```phv
+import std.http.request;
+import std.image.Image;
+
+$file = request()->file("avatar");                       // ?UploadedFile
+if ($file != null) {
+    $img = Image::fromUpload($file);                      // ValueError if it is not an image
+    echo $img->width, "×", $img->height, " ", $img->format;   // 4032×3024 jpeg
+    $img->cover(256, 256)->saveTo("storage/avatars/7.webp");  // requires [permissions].write
+}
+Image::open("storage/photos/1.jpg")->fit(800)->send(quality: 80);   // the response is the image
+$thumb = Image::fromBase64($dataUrl)->fit(64)->toDataUrl();         // SafeUrl, for <img src="...">
+```
+
+| Member | Description |
+|---|---|
+| `Image::fromUpload($file)`, `Image::open($path)`, `Image::fromBase64($text)` | An uploaded file; a file of the project (`[permissions].read` or `write`); Base64 text or a `data:` URL (what a canvas's `toDataURL()` gives) |
+| `width`, `height`, `format` | The size in pixels, upright (see below), and the format it was read in: `"png"`, `"jpeg"`, `"gif"` or `"webp"` |
+| `fit($width, $height = null)` | Scaled down to fit inside the box (any height when it is null), keeping its proportions. A smaller image is not enlarged |
+| `cover($width, $height)` | Exactly that size: scaled to cover the box, keeping its proportions, and the middle kept |
+| `resize($width, $height)` | Exactly that size, stretched if the proportions differ |
+| `crop($x, $y, $width, $height)` | The part from (`$x`, `$y`), the top left being (0, 0); a part not inside the image is a `ValueError` |
+| `rotate($degrees)`, `flipHorizontal()`, `flipVertical()` | Turned clockwise by a multiple of 90 degrees (`-90` turns it back); mirrored |
+| `send($format = "", $quality = 85)` | Sends the image as the response with its Content-Type: its bytes replace everything the page writes, as with `response()->file()` (the last of the two is sent) |
+| `saveTo($path, $format = "", $quality = 85)` | Writes it to a file (`[permissions].write`); without `$format`, the extension of `$path` (`.png`, `.jpg`, `.jpeg`, `.webp`) gives it |
+| `toBase64($format = "", $quality = 85)`, `toDataUrl(...)` | Its bytes in Base64 (`string`), or as a `data:` URL (`SafeUrl`; the default CSP allows `data:` images) |
+
+- The format is found from the first bytes, never from the file's name or the Content-Type the client sent. PNG
+  (an APNG: its first image), JPEG (baseline and progressive), GIF (its first frame) and WebP (lossy and lossless; an
+  animation: its first frame) are read; anything else, such as SVG, AVIF, HEIC, BMP or TIFF, is a `ValueError`.
+- Images are written as PNG, JPEG (`$quality` 1 to 100; what is transparent becomes white) or WebP (lossless: no
+  encoder of lossy WebP is written in Rust). `$format` `""` keeps the format the image was read in; a GIF is written
+  as PNG. `"jpg"` is the same as `"jpeg"`.
+- An image is upright: the EXIF orientation of a photo is applied when it is read, as browsers do, so `width` and
+  `height` are those of the upright image.
+- What is written holds the pixels only: no EXIF (with its GPS position), XMP, comments or ICC profile of the source
+  is passed on. Colors are taken as sRGB, so a photo in another color space (Display P3, as recent phones take) looks
+  a little less saturated once written.
+- An `Image` never changes; each step returns a new one. Reading an image reads its header (its format, size and
+  orientation); its pixels are decoded when it is written (`send()`, `saveTo()`, `toBase64()`, `toDataUrl()`), and
+  again at each write, so a damaged file can also throw `ValueError` there. A script that reads many uploads holds
+  their bytes, and one decoded image at a time.
+- Resizing uses a Lanczos filter with 3 lobes, with the colors weighed by their alpha (transparent pixels do not
+  bleed into their neighbors).
+- An image has at most 16,384 pixels a side and 50,000,000 pixels in all, whether it is read or made, from a file of
+  at most 32 MB (an upload is also limited by the 8 MB of a request body), and is made with at most 64 steps. Past
+  them, `ValueError`, before anything is decoded: a small file that declares a huge size (an image bomb) is refused
+  by its header.
+- The memory decoding takes counts toward the memory limit before decoding starts: 3 bytes a pixel (4 with
+  transparency), what the decoder works with (a progressive JPEG keeps its coefficients: 6 bytes a pixel more), and
+  each step's result (resizing keeps only a few rows of its work). Past the limit the script ends with the usual
+  memory error. Making a thumbnail of a 12-megapixel photo takes about 45 MB; of a 50-megapixel one about 210 MB (a
+  progressive JPEG 430 MB, a lossless WebP 370 MB): raise `memory_limit_mb` for photos that large.
+- A progressive JPEG goes over its whole image at each scan, so it may have at most 1,000,000,000 ÷ its pixels scans
+  (20 at the cap, 83 for 12 megapixels; encoders write about 10), 10 at least and 100 at most; one with more is refused
+  by its header (`ValueError`).
+- Decoding and encoding cannot be interrupted, so the caps bound them. Measured on a desktop (Windows, a release
+  build, while other builds ran): decoding a 50-megapixel image takes 0.1 to 0.6 seconds (PNG, JPEG, GIF, a progressive
+  JPEG of 20 scans; a lossless WebP 1.1), and encoding one 0.5 (WebP) to 2.1 seconds (JPEG at quality 100). So a
+  script can pass its time limit by about 2 seconds at the caps. Resizing, cropping and turning check the time limit
+  every 16 rows. A typical upload, a 4000×3000 JPEG made 800 pixels wide, takes 0.3 to 0.5 seconds.
+- A decoder that fails on a damaged file in a way its authors did not foresee (a panic) is a `ValueError`; it never
+  ends the page's worker or the server.
+
 ### JSON
 
 ```phv
@@ -1513,6 +1727,100 @@ returns their replies in order, as `any`.
   size, the elements of a list, the nesting) hold for each.
 - A pipeline is not a transaction: the server may run other clients' commands between its commands, and a command
   that fails does not undo the ones before it.
+
+### Entities (std.orm)
+
+```phv
+import std.db.Database;
+import std.orm.Repo;
+
+enum Role: string {
+    case Member = "member";
+    case Admin = "admin";
+}
+
+#[Table("users")]
+class User {
+    public ?int $id = null;                  // the key: null until insert(), which the database makes it in
+    public string $name = "";
+    #[Column("email_address")]
+    public string $email = "";
+    public list<string> $tags = [];          // kept as JSON text
+    public function __construct(public Role $role) {}
+}
+
+$users = new Repo<User>(Database::connect("main"));
+$u = new User(Role::Member);
+$u->name = "Ann";
+$users->insert($u);                                        // sets $u->id
+$found = $users->find($id);                                // ?User
+$page = $users->findBy(sql"name LIKE {$q}", orderBy: "name, id desc", limit: 20, offset: 40);
+$admins = $users->count($users->in("role", [Role::Admin]));
+$u->name = "Anna";
+$users->update($u);                                        // UPDATE "users" SET "name" = ? WHERE "id" = ?
+$users->delete($u);
+```
+
+A `Repo<T>` reads and writes the rows of a table as objects of the entity class `T`, through a `Database` (§14
+"Database"): every statement runs with the limits of std.db (time limits, the 16 MB text, the weights of SQLite
+statements, refused statements, results within the memory left to the script).
+
+- An entity is a class marked `#[Table("name")]`. Its public properties are the table's columns, named like the
+  properties or by `#[Column("name")]`. Its key is the property marked `#[Id]`, or else `$id`: an `int` or a `string`.
+  When the key is nullable and null, `insert()` lets the database make it and sets it on the object (`RETURNING` on
+  SQLite and PostgreSQL, `lastInsertId()` on MySQL, which gives back integer keys only: a `string` key must then be
+  given, else `ValueError`). One property is the key (no composite keys).
+- `new Repo<User>($db)` is checked when the program is checked (a compile error says why a class is not an entity):
+  `User` is a plain, non-generic class whose properties are all public, whose constructor, if it has one, only
+  promotes its parameters (rows become objects without calling it, as `json_decode_as` builds them), and whose readonly
+  properties are constructor parameters; a nullable key is not readonly. Property types: `int`, `float`, `string`,
+  `bool`, enums (a backed enum kept as its value, a pure enum as its case name) and their nullable forms; `list`,
+  `map`, `set`, classes and `any` are kept as JSON text and read back as `json_decode_as` reads them. `Html`,
+  `SafeUrl` and `SafeJs` are refused (what a column holds would be trusted as HTML), and so are unions and functions.
+- Table and column names come only from the class and its annotations: letters, digits and `_`, not starting with a
+  digit, at most 63 characters (checked when the program is checked; another name is a compile error). They are
+  quoted in every statement (`"name"`; on MySQL and SQLite `` `name` ``, so that SQLite reports a name that is not a
+  column instead of reading it as a string), so keywords such as `order` or `user` are names too. Being quoted, they
+  must be written as the table has them: a PostgreSQL column created as `createdAt` without quotes is `createdat`.
+  Tables are made by migrations (`phv db migrate`, §16): std.orm does not make or change them.
+- Conditions are `Sql` values, so every value is a parameter; they name columns. `$repo->column("createdAt")` is the
+  quoted column of a property (`$users->column("createdAt") . sql" > {$since}"`); `$repo->in("role", $values)` is
+  `"role" IN (?, ...)`: the values must fit the property (an enum case for an enum), at most 1,000 (`ValueError`), and
+  an empty list gives a condition no row meets; a JSON property cannot be compared. `in()` loads the related rows of
+  many entities in one query (`$users->findBy($users->in("id", $posts->map(fn($p) => $p->authorId)))`) instead of
+  one query each; std.orm has no relations of its own.
+- `orderBy` names properties, each followed by `asc` or `desc`, separated by commas (`"name, createdAt desc"`); at
+  most 16 terms and 1,024 characters. Anything else raises `ValueError`, so the name may come from a request
+  (`orderBy: request()->query("sort") ?? "name"`). `limit` (null: every row) and `offset` cannot be negative
+  (`ValueError`).
+- Each column of a row must fit its property: NULL only for a nullable property, an integer for `int`, an integer or a
+  float for `float`, a boolean or 0 or 1 for `bool`, a string for `string`, a value or case name of the enum, JSON of
+  the property's type. Anything else raises `DatabaseError` naming the column, the table, the property and its type
+  (`the column "age" of "users" holds a string, but ... is int`). PostgreSQL `numeric` and MySQL
+  `DECIMAL` are read as strings (§14 "PostgreSQL and MySQL"). Other columns of the row are ignored; `fromRow($row)`
+  makes an entity from a row of a query of one's own (a join) that has each of its columns.
+- A Repo keeps, for each entity it read or wrote, what its row then held, as long as the Repo lives (the end of the
+  request at the latest; the memory counts against the script), and `update()` writes only the properties that
+  differ: a column another request changed meanwhile is not written back with an old value, and nothing is sent when
+  nothing changed (`update()` returns false). An entity the Repo did not read (another Repo's, or one made with `new`
+  with its key set) has every column written. After a `transaction()` is rolled back or fails to commit, every Repo
+  forgets what it kept, since the rows may no longer hold it. `update()` finds the row by the key, which it never
+  changes. A Repo shares nothing with other Repos or requests.
+
+| Method | Does |
+|---|---|
+| `find(int\|string $key): ?T` | The entity with the key (`ValueError` for a key of the wrong type), or null |
+| `findBy(?Sql $where = null, string $orderBy = "", ?int $limit = null, int $offset = 0): list<T>` | The entities whose rows meet `$where` (all without it) |
+| `findOneBy(?Sql $where = null, string $orderBy = ""): ?T` | The first of `findBy()`, or null |
+| `count(?Sql $where = null): int` | The number of rows that meet `$where` |
+| `insert(T $entity): void` | Adds its row; sets a key the database made |
+| `update(T $entity): bool` | Writes the changed properties; true when the database changed a row (MySQL counts a row that already held the values as unchanged) |
+| `delete(T $entity): bool` | Deletes its row; true when there was one |
+| `in(string $property, list<K> $values): Sql`, `column(string $property): Sql` | Conditions by property (above) |
+| `fromRow(Row $row): T` | The entity a row holds |
+
+`update()` and `delete()` of an entity whose key is null raise `ValueError`. Transactions are those of the database:
+`$db->transaction(function () use ($users, $u): void { ... })`.
 
 ### WebSocket server (std.ws)
 
@@ -1951,6 +2259,98 @@ A `DateTime` is an instant (`timestamp`, seconds since 1970-01-01 UTC) seen in a
   two differ across a change of clocks.
 - An unknown zone throws `ValueError`.
 
+### Translations (std.i18n)
+
+```toml
+[i18n]
+default = "en"
+locales = ["en", "ja", "pt", "pt-BR"]
+# dir = "lang"          # the catalogs: lang/en.toml, lang/ja.toml...
+```
+
+```toml
+# lang/en.toml
+welcome = "Welcome, {name}!"
+terms = "I accept the {link}."
+
+[cart]
+empty = "Your cart is empty."
+
+[cart.items]            # a plural message: one form per CLDR category
+one = "{count} item"
+other = "{count} items"
+```
+
+```phv
+import std.i18n.{Translator, t, tn, t_html, set_locale, translator};
+import std.http.request;
+
+echo t("welcome", ["name" => $name]);                 // "Welcome, Ada!", "ようこそ、Ada さん!"
+echo tn("cart.items", $count);                        // "1 item", "3 items"; {count} is "1,234"
+echo t_html("terms", ["link" => render("views/terms_link.phv.html")]);   // Html
+set_locale(request()->cookie("lang") ?? "");          // the page's choice, if it is listed
+translator()->number(1234.5, 1);                      // "1,234.5", "1.234,5", "1 234,5"
+translator()->percent(0.25);                          // "25%", "25 %"
+translator()->date($order->placed, "long");           // "November 5, 2026", "2026年11月5日"
+Translator::of("ja")->t("cart.empty");                // another locale (a mail to another user)
+```
+
+- Each locale of `[i18n] locales` has a catalog, `<dir>/<locale>.toml`. A locale is a language of two or three
+  lowercase letters, then optionally a script (`Hant`) and a region (`BR`, `419`): `en`, `pt-BR`, `zh-Hant` (not a
+  name Windows keeps for a device, such as `con`). The default locale is one of them.
+- The catalogs are read and checked when a page or script that imports `std.i18n` is compiled, like its modules (inside
+  the project, never through a link to another machine; a change compiles it again), so a missing or malformed catalog
+  is a compile error shown in the file, not an error at a visitor's request. The default catalog has every key; a key of
+  another catalog that it lacks is an error, as is a message that is plural in one catalog and not in another, or a
+  translation that uses a placeholder the default message does not (a plural one may use `{count}`).
+- A message is a string. Keys are the TOML keys joined by `.` (`cart.empty`), made of letters, digits, `_` and `-`.
+  `{name}` is a placeholder (letters, digits and `_`); `{{` and `}}` write a brace, and any other brace is an error.
+- A table whose keys are all CLDR plural categories (`zero`, `one`, `two`, `few`, `many`, `other`) is a plural message.
+  It has exactly the categories its locale uses: `en` and `de` one, other; `fr`, `es`, `it` and `pt` one, many,
+  other; `ru` and `pl` one, few, many, other; `ar` all six; `ja`, `zh` and `ko` other. `tn()` picks the form with the
+  CLDR 49 rules of the catalog the message comes from, for the count's absolute value. The rules are built in for
+  `ar`, `de`, `en`, `es`, `fr`, `it`, `ja`, `ko`, `pl`, `pt`, `pt-PT`, `ru` and `zh` (a regional locale uses its
+  language's, as `pt-BR` uses `pt`'s); a plural message in another locale is a compile error.
+- A message is looked for in the locale's catalog, then in the listed locales its tag shortens to (`pt-BR` → `pt`), then
+  in the default catalog. A key that no catalog has gives the key itself (in development and in production). A key
+  written as a string literal in `t()`, `tn()`, `t_html()` and `Translator`'s `t()`, `tn()` and `html()` is checked when
+  the page is compiled: it must be in the default catalog, plural for `tn()` and not for the others, and when the
+  parameters are a map literal (or left out), each placeholder of the message must be given. A key or parameters
+  computed at run time are checked when they are used: a plural message with `t()`, a message that is not plural with
+  `tn()`, or a placeholder without a parameter throws `ValueError`. `has($key)` tells whether a key is there.
+- **No markup from a translator.** Parameters and results are `string`, escaped on output like any string, so a message
+  holding `<b>` shows `<b>`. `t_html()` returns `Html`: it escapes the message's text and inserts its parameters, which
+  are `Html` the page made (`render()`, `escape()`), as they are. Nothing in `std.i18n` takes a message as markup (and `raw()`
+  should never be given one): catalogs are often written by people outside the project, and a message would be a way
+  into every page.
+- The request's locale (`locale()`) is the one `set_locale()` chose, or else the best of the listed locales for the
+  request's `Accept-Language`, chosen when it is first needed and kept in the request (middleware and the page share it;
+  nothing is kept between requests). Outside a request it is the default locale. `set_locale($tag)` takes a listed
+  locale in any letter case, with `-` or `_`, and returns `false` for anything else (a cookie or a path segment from a
+  visitor cannot choose an unlisted locale). Where the choice comes from is the page's business.
+- `Accept-Language` is read up to 1 KB (at the last comma before it; several fields are read as one) and 32 entries.
+  An entry is a tag of at most 35 letters, digits and `-` (or `*`) with an optional `q` from 0 to 1 with at most three
+  decimals; an entry with another `q` or another tag is skipped, and `q=0` refuses a locale. Entries are tried by `q`,
+  then in the order written: a listed locale equal to the tag (in any case), then to a shorter form of it (`de-CH` →
+  `de`), then the first listed locale of its language (`pt` → `pt-BR`); `*` gives the default. When nothing matches, the
+  default locale. `best_locale($header)` makes the same choice for any value.
+- `number($n, $decimals = 0)` writes an `int` exactly and a `float` rounded half away from zero, with the locale's
+  decimal and group separators and minus sign (CLDR 49, including `minimumGroupingDigits`: Spanish, Italian, Polish and
+  European Portuguese write `1234` but `12.345`); `percent($ratio, $decimals = 0)` writes `$ratio × 100` with the
+  locale's percent pattern. `$decimals` is 0 to 20 (`ValueError`). An infinity is `∞`, not a number `NaN`.
+- `date($d, $style = "medium")` writes a `std.time` `DateTime`, in its zone, in the locale's `full`, `long`, `medium` or
+  `short` style, with the locale's month and weekday names (CLDR 49 Gregorian formats; another style is a `ValueError`).
+- The formats are built in for `ar`, `de`, `en`, `en-GB`, `es`, `fr`, `it`, `ja`, `ko`, `pl`, `pt`, `pt-PT`, `ru`
+  and `zh` (a regional locale uses its language's). Another locale writes numbers as CLDR's root locale (`1,234.5`,
+  `25%`) and dates as `2026-11-05` in every style. Digits are always ASCII (CLDR's default for these locales, `ar`
+  included). Times of day, currencies, compact numbers (`1.2K`), relative times (`3 days ago`), lists, other calendars,
+  ordinals and the plural of decimal numbers are left out: write them in messages, or with `DateTime::format()`.
+- Limits: at most 32 locales; a catalog of at most 2 MB and 20,000 messages, 16 MB for all the catalogs; a key of at most
+  200 bytes and 8 parts; a message (each form of a plural one) of at most 8 KB with at most 16 different placeholders,
+  each named in at most 64 bytes; forms of a plural message are strings (they do not nest); at most 64 parameters in one
+  call (`ValueError`). Past a limit, a catalog is a compile error; at most 50 errors are shown. The catalogs are kept
+  once per process for all the pages compiled from the same files; a message's result counts toward the memory limit.
+
 ### Background jobs (std.jobs)
 
 Work that should not hold up a page (sending mail, resizing a report, calling a slow service) goes into a **job**: a
@@ -2318,6 +2718,10 @@ redirect_uri = "https://example.com/auth/google"
 
 [telemetry]
 endpoint = "http://localhost:4318"   # send traces to an OpenTelemetry collector (see "Tracing")
+
+[i18n]
+default = "en"          # translations: lang/en.toml, lang/ja.toml (see std.i18n)
+locales = ["en", "ja"]
 
 [fmt]
 width = 100             # phv fmt wraps longer lines
@@ -2735,6 +3139,9 @@ It then runs the type checker and shows the places that need manual work, such a
 3. Compilation to register-based bytecode (type-specialized instructions such as `AddI`, `LtI`, and `JumpIfNotLtIImm`)
 4. Execution
    - **Interpreter**: written entirely in safe Rust. Strings, lists, and maps use reference counting + copy-on-write.
+     A generator (§8) is an object that holds its frame while it waits: the registers, where it resumes and its open
+     `try` blocks. A loop that asks for its next value puts the frame back on top of the call stack, above the loop's,
+     and `yield` takes it off again.
      Objects that reach each other in a cycle (`$node->next = $node`, or an object holding a closure that captured
      it) are freed while the script runs: a cycle collector runs between instructions each time the number of live
      objects has doubled since its last run (first at 4,096), and it looks at no more than 16 values per object made
@@ -2762,7 +3169,8 @@ It then runs the type checker and shows the places that need manual work, such a
      writes around it. Properties are read and written by their slot in the class, objects are made and output is
      written by the interpreter's own code (field defaults, the cycle collector's list, the escaping of the buffer
      written and the checks of a function's output in HTML other than element text). Closures, exceptions (`throw`,
-     `try`), and builtins other than those named stay in the interpreter, with the functions that use them.
+     `try`), generators and the loops over them, and builtins other than those named stay in the interpreter, with
+     the functions that use them.
      A function with a loop or recursion is compiled when the program is loaded, together with the functions it calls
      (those calls are direct); a function with neither that no compiled function calls stays in the interpreter, since
      entering native code would cost more than its body. A recursive function without a loop is compiled on its
@@ -2828,12 +3236,17 @@ It then runs the type checker and shows the places that need manual work, such a
 | A JSON Web Token (std.jwt) | 256 KB, its header 8 KB | `verify()` returns null |
 | A JWKS | 512 KB, 64 keys read; 32 sets kept per process | `NetworkError` (`fetch`), `ValueError` (`fromJson`) |
 | Sign-ins a session has started (std.oauth) | 4, each for 10 minutes | the oldest is forgotten |
+| `Repo::in()` (std.orm) | 1,000 values | `ValueError` |
+| `orderBy` of `Repo::findBy()` (std.orm) | 16 terms, 1,024 characters | `ValueError` |
+| An image (std.image) | 16,384 pixels a side and 50,000,000 pixels, read from at most 32 MB, made with at most 64 steps; its pixels count toward the memory limit before they are decoded | `ValueError` (the memory limit: Fatal error) |
 | Spans a script records (`[telemetry]`) | 1,000 | not recorded |
 | Spans waiting to be exported | 8,192 and 16 MB; a span's name or text attribute 1,024 bytes | dropped (`phv_telemetry_dropped_spans_total`); longer texts are cut |
 | Source file (module, template, script) | 8 MB | Compile error (`phv lsp`: a larger open document is not checked or formatted, and renames are refused while it is open) |
 | Tokens of one source file (the code inside its strings included) | 1,000,000 | Compile error (the file is not parsed) |
 | All the files of one program (a page or script with what it imports and renders, std included) | 2,000,000 tokens, 32 MB of source, 2,000 files | Compile error (the program is not checked; between requests `phv lsp` keeps the analyses of open documents up to 250,000 tokens and 16 MB of source in all, the least recently used dropped first, each for at most 2 seconds) |
-| Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits) |
+| Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits and of what it takes from traits) |
+| Source of the trait methods copied into classes, all classes together | 32 MB | Compile error (each copy is checked and compiled) |
+| Levels of traits used inside each other | 256 | Compile error |
 | Levels of classes and interfaces above a class (`extends`, `implements`) | 256 | Compile error |
 | Ancestors, interfaces and the type arguments given to them, all classes together | 2,000,000 (a type argument given to an ancestor: 10,000 type nodes) | Compile error (each class lists all of its ancestors) |
 | Variables and temporary values of one function | 65,534 | Compile error (split the function) |

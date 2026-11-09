@@ -224,9 +224,17 @@ impl Checker<'_> {
             StmtKind::Return(value) => {
                 let ret = self.cx().ret.clone();
                 let kind = self.cx().kind;
+                let generator = self.cx().gen.is_some();
                 let h = match (value, &ret) {
                     _ if kind == FuncKind::Template => {
                         self.error("templates cannot `return`", s.span);
+                        None
+                    }
+                    (None, _) if generator => None,
+                    (Some(e), _) if generator => {
+                        self.error("a generator cannot return a value", e.span)
+                            .add_note("`return;` ends it; hand values to the loop with `yield`");
+                        self.expr(e, None);
                         None
                     }
                     (None, Type::Void) => None,
@@ -261,6 +269,74 @@ impl Checker<'_> {
                 let h = self.throwable(e);
                 out.push(HStmt::Throw(h));
                 self.cx().flow.dead = true;
+            }
+            StmtKind::Yield { key, value } => {
+                let Some((kt, vt)) = self.yield_types(s) else {
+                    if let Some(k) = key {
+                        self.expr(k, None);
+                    }
+                    self.expr(value, None);
+                    return;
+                };
+                let hk = match key {
+                    Some(k) => Some(self.expr_to(k, &kt)),
+                    None => {
+                        if !matches!(kt, Type::Int | Type::Error) {
+                            let msg = format!("this generator's keys are `{}`: give each value a key", self.tn(&kt));
+                            self.error(msg, value.span).add_note("write `yield $key => $value;`");
+                        }
+                        None
+                    }
+                };
+                let hv = self.expr_to(value, &vt);
+                // The loop over the generator runs until it asks for the next
+                // value, and may change any property.
+                self.clear_prop_facts();
+                out.push(HStmt::Yield { key: hk, val: hv, from: false });
+            }
+            StmtKind::YieldFrom(e) => {
+                let Some((kt, vt)) = self.yield_types(s) else {
+                    self.expr(e, None);
+                    return;
+                };
+                let hs = self.expr(e, None);
+                let (ikt, ivt) = match &hs.ty {
+                    Type::List(t) | Type::Set(t) => (Type::Int, (**t).clone()),
+                    Type::Map(k, v) => ((**k).clone(), (**v).clone()),
+                    Type::Error => (Type::Error, Type::Error),
+                    t => match self.generator_args(t) {
+                        Some(kv) => kv,
+                        None => {
+                            let msg = format!("cannot `yield from` a value of type `{}`", self.tn(t));
+                            self.error(msg, e.span)
+                                .add_note("`yield from` takes a list, a map, a set or another generator");
+                            (Type::Error, Type::Error)
+                        }
+                    },
+                };
+                let mut ok = true;
+                for (what, inner, outer) in [("keys", &ikt, &kt), ("values", &ivt, &vt)] {
+                    if !self.assignable(inner, outer) {
+                        let msg = format!(
+                            "`yield from` gives {what} of type `{}`, but this generator's {what} are `{}`",
+                            self.tn(inner),
+                            self.tn(outer)
+                        );
+                        self.error(msg, e.span);
+                        ok = false;
+                    }
+                }
+                // `foreach ($e as $k => $v) yield $k => $v;`, where the keys do
+                // not move the generator's own int keys on (as in PHP).
+                let (ikt, ivt) = if ok { (ikt, ivt) } else { (Type::Error, Type::Error) };
+                let k = self.cx().temp(ikt.clone());
+                let v = self.cx().temp(ivt.clone());
+                let span = e.span;
+                let hk = self.coerce(HExpr { kind: HExprKind::Local(k), ty: ikt, span }, &kt);
+                let hv = self.coerce(HExpr { kind: HExprKind::Local(v), ty: ivt, span }, &vt);
+                self.clear_prop_facts();
+                let body = vec![HStmt::Yield { key: Some(hk), val: hv, from: true }];
+                out.push(HStmt::Foreach { subject: hs, key: Some(k), val: v, body });
             }
             StmtKind::Try { body, catches, finally } => {
                 let mut names = HashSet::new();
@@ -323,7 +399,9 @@ impl Checker<'_> {
                         written.iter().filter_map(|n| self.cx().names.get(n).copied()).collect();
                     let gen = self.cx().prop_gen;
                     let mut hf = Vec::new();
+                    self.cx().in_finally += 1;
                     self.block(f, &mut hf);
+                    self.cx().in_finally -= 1;
                     ids.extend(written.iter().filter_map(|n| self.cx().names.get(n).copied()));
                     let calls = self.cx().prop_gen != gen;
                     let fin = std::mem::take(&mut self.cx().flow);
@@ -353,6 +431,41 @@ impl Checker<'_> {
                 self.error("`params(...)` must be at the top level of a template", s.span);
             }
         }
+    }
+
+    /// The key and value types `yield` (or `yield from`) statement `s` hands
+    /// on, or None after an error: `yield` belongs to a function (not the main
+    /// script), not in a `finally` block (a generator closed early runs its
+    /// `finally` blocks, and could not wait there), and not in HTML other than
+    /// element text (what the loop over the generator writes meanwhile would
+    /// land there).
+    fn yield_types(&mut self, s: &Stmt) -> Option<(Type, Type)> {
+        let cx = self.cx();
+        let (gen, kind, in_finally) = (cx.gen.clone(), cx.kind, cx.in_finally);
+        let Some(kv) = gen else {
+            let msg = if kind == FuncKind::Main {
+                "`yield` can only be used inside a function"
+            } else {
+                "`yield` cannot be used here"
+            };
+            self.error(msg, s.span);
+            return None;
+        };
+        if in_finally > 0 {
+            self.error("`yield` cannot be used in a `finally` block", s.span).add_note(
+                "a generator that a loop leaves early runs its `finally` blocks, which cannot wait for the loop",
+            );
+            return None;
+        }
+        if s.out.is_some() {
+            self.error(
+                "`yield` cannot be used inside a tag, an attribute, `<script>` or other HTML that is not element text",
+                s.span,
+            )
+            .add_note("what the loop over the generator writes meanwhile would land there");
+            return None;
+        }
+        Some(kv)
     }
 
     /// `[$a, $b] = $list;`, `[$first, ...$rest] = $list;` and
@@ -554,10 +667,12 @@ impl Checker<'_> {
             return;
         }
         let hs = self.expr(subject, None);
+        let generator = self.generator_args(&hs.ty);
         let (kt, vt) = match &hs.ty {
             Type::List(t) | Type::Set(t) => (Type::Int, (**t).clone()),
             Type::Map(k, v) => ((**k).clone(), (**v).clone()),
             Type::Error => (Type::Error, Type::Error),
+            _ if generator.is_some() => generator.unwrap(),
             t => {
                 let msg = format!("cannot iterate over `{}`", self.tn(t));
                 let e = self.error(msg, subject.span);

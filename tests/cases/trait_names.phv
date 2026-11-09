@@ -1,0 +1,37 @@
+<?phv
+// `trait` and `insteadof` are keywords only where a trait is declared or a
+// rule of a `use` is written: other names keep them.
+function trait(int $x): int {
+    return $x + 1;
+}
+
+function insteadof(): string {
+    return "i";
+}
+
+class Rules {
+    public function trait(): string {
+        return "m";
+    }
+
+    public function insteadof(): string {
+        return "n";
+    }
+}
+
+trait Words {
+    public function as(): string {
+        return "as";
+    }
+}
+
+class Uses {
+    use Words {
+        as as protected;
+        Words::as as public word;
+    }
+}
+
+$trait = trait(1);
+$r = new Rules();
+echo $trait, insteadof(), $r->trait(), $r->insteadof(), (new Uses())->word(), "\n";

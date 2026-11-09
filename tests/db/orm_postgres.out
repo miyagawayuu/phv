@@ -1,0 +1,46 @@
+--- insert and find
+key set: 1
+1: first count=3 ratio=0.5 active=yes maybe=[null,null,null,null,null] tags=["x","y"] scores={"math":90} names={"7":"seven"} ids=[3,1] words=["hi"] home={"x":1,"y":2} path=[{"x":3,"y":4}] extra={"any":[1,true]} email=a@example.com status=open level=2 mood=Happy code=a1
+2: second count=1 ratio=0 active=no maybe=[9000000000,2.5,"text",false,"open"] tags=[] scores={} names={} ids=[] words=[] home=null path=[] extra=null email=b@example.com status=closed level=1 mood=Sad code=c
+3: third count=2 ratio=0 active=no maybe=[null,null,null,null,null] tags=[] scores={} names={} ids=[] words=[] home=null path=[] extra=null email=c@example.com status=open level=1 mood=Happy code=c
+missing row: null
+--- conditions, ordering, paging, count
+count: 3 2
+by name desc: third second first
+by status, count: second third first
+page 2: third
+offset only: second third
+where: second
+json operator: first
+in: first third
+in enums: second
+in levels: 1
+in a camel-case column: 1
+by column: second third
+--- updates write the columns that changed
+unchanged: nothing
+changed: written
+again: nothing
+row: {"name":"renamed elsewhere","count":30,"tags":"[\"x\", \"y\", \"z\"]"}
+--- keys
+keyword names: A-1 5 null
+update: written
+ordered: 1
+uuid key made: 36 characters, found: made by the database
+DatabaseError: error serializing parameter 0: "not a uuid" is not a UUID
+--- a unique violation
+DatabaseError: duplicate key
+no key set: null
+--- a transaction rolled back
+rolled back: stop
+rows: 3 name in the row: third
+after the rollback: written
+name in the row: renamed in the transaction
+--- rows that do not fit the class
+DatabaseError: Repo<Wrong>: the column "count" of "phv_orm_things" holds the integer 30, but `Wrong::$count` is `string`
+DatabaseError: Repo<Thing>: the column "count" of "phv_orm_things" holds a string, but `Thing::$count` is `int`
+DatabaseError: Repo<Thing>: the column "count" of "phv_orm_things" holds a string, but `Thing::$count` is `int` (a NUMERIC or DECIMAL column is read as a string: give the property the type `string`, or the column an integer or floating-point type)
+DatabaseError: Repo<Thing>: the JSON in the column "tags" of "phv_orm_things": expected an array, found an object at $
+--- delete
+deleted: yes again: no
+left: 2

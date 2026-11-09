@@ -5,7 +5,8 @@
 
 export class UploadedFile {
     public function __construct(
-        private int $index,
+        /** Its place among the request's files (`Image::fromUpload()` of std.image reads it by it). */
+        public readonly int $index,
         public readonly string $field,
         /** The client's file name (directory parts removed). Do not trust it as a path. */
         public readonly string $name,

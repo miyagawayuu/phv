@@ -1,0 +1,169 @@
+error: `#[Table("users\"; DROP TABLE users; --")]`: a name may hold only letters, digits and `_`, and may not start with a digit
+ --> err_orm.phv:6:9
+  |
+6 | #[Table("users\"; DROP TABLE users; --")]
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: names are quoted in the SQL, so a keyword such as `order` or `user` can be a name
+
+error: `#[Table("has space")]`: a name may hold only letters, digits and `_`, and may not start with a digit
+  --> err_orm.phv:11:9
+   |
+11 | #[Table("has space")]
+   |         ^^^^^^^^^^^
+   = note: names are quoted in the SQL, so a keyword such as `order` or `user` can be a name
+
+error: `#[Column("a`b")]`: a name may hold only letters, digits and `_`, and may not start with a digit
+  --> err_orm.phv:14:14
+   |
+14 |     #[Column("a`b")]
+   |              ^^^^^
+   = note: names are quoted in the SQL, so a keyword such as `order` or `user` can be a name
+
+error: `#[Column("1st")]`: a name may hold only letters, digits and `_`, and may not start with a digit
+  --> err_orm.phv:16:14
+   |
+16 |     #[Column("1st")]
+   |              ^^^^^
+   = note: names are quoted in the SQL, so a keyword such as `order` or `user` can be a name
+
+error: `#[Column]` takes the column's name, a string literal
+  --> err_orm.phv:18:7
+   |
+18 |     #[Column]
+   |       ^^^^^^
+
+error: `#[Id]` takes no arguments
+  --> err_orm.phv:20:7
+   |
+20 |     #[Id("x")]
+   |       ^^^^^^^
+
+error: `#[Table("way_too_long_a_name_for_a_table_in_postgresql_which_allows_63_bytes")]`: a name may be at most 63 characters long
+  --> err_orm.phv:24:9
+   |
+24 | #[Table("way_too_long_a_name_for_a_table_in_postgresql_which_allows_63_bytes")]
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: names are quoted in the SQL, so a keyword such as `order` or `user` can be a name
+
+error: `#[Column]` cannot be written before a class
+  --> err_orm.phv:29:3
+   |
+29 | #[Column("x")]
+   |   ^^^^^^
+
+error: `#[Table]` cannot be written before a property
+  --> err_orm.phv:31:7
+   |
+31 |     #[Table("t")]
+   |       ^^^^^
+
+error: `Repo<Quoted>`: `Quoted` names no table; write `#[Table("...")]` before `class Quoted`
+   --> err_orm.phv:122:6
+    |
+122 | $a = new Repo<Quoted>($db);
+    |      ^^^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<NoTable>`: `NoTable` names no table; write `#[Table("...")]` before `class NoTable`
+   --> err_orm.phv:123:6
+    |
+123 | $b = new Repo<NoTable>($db);
+    |      ^^^^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<Page>`: `Page::$body`: `?Html` cannot be read from a database: what a column holds would be trusted as HTML; store a `string` (it is escaped when it is output)
+   --> err_orm.phv:124:6
+    |
+124 | $c = new Repo<Page>($db);
+    |      ^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<Link>`: `Link::$href`: `?SafeUrl` cannot be read from a database: what a column holds would be trusted as HTML; store a `string` (it is escaped when it is output)
+   --> err_orm.phv:125:6
+    |
+125 | $d = new Repo<Link>($db);
+    |      ^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<Mixed>`: `Mixed::$either`: `int|string` cannot be kept in a column
+   --> err_orm.phv:126:6
+    |
+126 | $e = new Repo<Mixed>($db);
+    |      ^^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<Callback>`: `Callback::$run`: `fn(): void` cannot be kept in a column
+   --> err_orm.phv:127:6
+    |
+127 | $f = new Repo<Callback>($db);
+    |      ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<Secret>`: `Secret` has the non-public property `$hash`; an entity's properties are its columns, and are public
+   --> err_orm.phv:128:6
+    |
+128 | $g = new Repo<Secret>($db);
+    |      ^^^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<TwoKeys>`: more than one property of `TwoKeys` is marked `#[Id]`
+   --> err_orm.phv:129:6
+    |
+129 | $h = new Repo<TwoKeys>($db);
+    |      ^^^^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<NoKey>`: `NoKey` has no key; mark the property that holds it `#[Id]`, or name it `$id`
+   --> err_orm.phv:130:6
+    |
+130 | $i = new Repo<NoKey>($db);
+    |      ^^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<FloatKey>`: the key `FloatKey::$id` must be an `int` or a `string` (`?int` or `?string` when the database makes it), not `float`
+   --> err_orm.phv:131:6
+    |
+131 | $j = new Repo<FloatKey>($db);
+    |      ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<ReadonlyKey>`: the key `ReadonlyKey::$id` may be made by the database (it is nullable) and is then set by `insert()`, so it cannot be readonly
+   --> err_orm.phv:132:6
+    |
+132 | $k = new Repo<ReadonlyKey>($db);
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<SameColumn>`: `SameColumn::$name` and `SameColumn::$other` are both the column `NAME`
+   --> err_orm.phv:133:6
+    |
+133 | $l = new Repo<SameColumn>($db);
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<Checked>`: the constructor of `Checked` runs code, which reading a row would skip (an entity's constructor may only promote its parameters)
+   --> err_orm.phv:134:6
+    |
+134 | $m = new Repo<Checked>($db);
+    |      ^^^^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<Box<int>>`: `Box` is generic
+   --> err_orm.phv:135:6
+    |
+135 | $n = new Repo<Box<int>>($db);
+    |      ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `Repo<int>`: `int` is not a class; an entity is a class marked `#[Table("...")]`
+   --> err_orm.phv:136:6
+    |
+136 | $o = new Repo<int>($db);
+    |      ^^^^^^^^^^^^^^^^^^
+
+error: `new Repo<...>()` takes the database only, e.g. `new Repo<User>($db)`
+   --> err_orm.phv:137:6
+    |
+137 | $p = new Repo<NoKey>($db, "E\t1\tusers\t0\t1");
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: cannot infer the type arguments of `Repo`
+   --> err_orm.phv:138:10
+    |
+138 | $q = new Repo($db);
+    |          ^^^^
+    = note: write them, e.g. `new Repo<int>(...)`
+
+error: `Repo<Stamp>`: `Stamp` has the readonly property `$at`, which is not a constructor parameter and so cannot be read from a row
+   --> err_orm.phv:139:6
+    |
+139 | $r = new Repo<Stamp>($db);
+    |      ^^^^^^^^^^^^^^^^^^^^
+
+27 errors found

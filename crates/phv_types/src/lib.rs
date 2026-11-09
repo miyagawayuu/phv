@@ -7,4 +7,4 @@ pub mod index;
 pub mod query;
 pub mod types;
 
-pub use check::{check, check_for_editor, CheckInput, ModuleInput, ModuleKind};
+pub use check::{check, check_for_editor, CheckInput, MessageKey, Messages, ModuleInput, ModuleKind};

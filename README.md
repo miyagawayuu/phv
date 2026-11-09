@@ -39,22 +39,25 @@ echo greet($name);                                 // HTML-escaped automatically
 - **What comes from PHP**: `$variables`, `[1, 2]` / `["k" => v]`, `echo`, `foreach`, `match`, embedding in HTML,
   routing by file name, changes take effect on save, and a share-nothing model where each request starts fresh.
 - **Type safety**: a variable's type is fixed by its first assignment. No implicit conversions, `==` is always
-  strict, no truthiness, null safety (`?T`), interfaces, abstract and `final` classes, enums with `match` that must
-  handle every case, generic functions and classes with bounds (`<T: Shape>`), type aliases, `finally`. Unused
-  variables and imports and unreachable code are reported as warnings.
+  strict, no truthiness, null safety (`?T`), interfaces, traits, abstract and `final` classes, enums with `match`
+  that must handle every case, generic functions and classes with bounds (`<T: Shape>`), type aliases, `finally`.
+  Unused variables and imports and unreachable code are reported as warnings.
 - **Convenient syntax**: destructuring (`[$a, $b] = ...`), variadic parameters and `...` spreading, functions as values
-  (`strlen(...)`), constant expressions, `import ... as`, heredoc strings, and exceptions with a cause and a trace.
+  (`strlen(...)`), constant expressions, `import ... as`, heredoc strings, generators (`yield`), and exceptions
+  with a cause and a trace.
 - **Web applications**: routes with parameters (`public/posts/[id].phv`), middleware (`_middleware.phv`), custom
-  error pages, layouts, form validation (`std.validate`), mail (`std.mail`), database migrations (`phv db migrate`),
+  error pages, layouts, form validation (`std.validate`), mail (`std.mail`), translations (`std.i18n`), database migrations (`phv db migrate`),
   caching and range requests for static files, gzip, CORS, access logs, a graceful stop, and responses streamed while
   the page runs (`response()->flush()`).
 - **Web services**: several server processes or machines share sessions, rate limits, CSRF tokens (`secret_env`) and
   `publish()` to WebSockets and Server-Sent Events (`publish_store`); background jobs with retries and cron-like
   schedules (`std.jobs`, `phv jobs`); health checks and Prometheus metrics on an admin port, request ids, and traces
   exported to OpenTelemetry (`[telemetry]`); sign-in with OAuth 2.0 and OpenID Connect (`std.oauth`).
+- **Images**: uploads read as PNG, JPEG, GIF or WebP, resized, cropped and written without their metadata (`std.image`).
 - **Standard library**: regular expressions (`std.regex`), `format()` checked at compile time, dates in time zones
   (`std.time`), JSON decoded into typed classes (`json_decode_as`), encryption, signed tokens, JSON Web Tokens signed
-  with RS256, ES256, EdDSA or HS256 and key sets (`std.jwt`), list and map
+  with RS256, ES256, EdDSA or HS256 and key sets (`std.jwt`),
+  the rows of tables as typed objects with a repository per class (`std.orm`), list and map
   methods, mathematics, UUIDs, CSV, URLs, directories, logging, and arguments and standard input for scripts.
 - **Security**:
   - **XSS**: output is escaped automatically, and inserting a value where escaping cannot protect it (unquoted

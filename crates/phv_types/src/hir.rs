@@ -192,6 +192,14 @@ pub enum HStmt {
     Continue(u32),
     Return(Option<HExpr>, Span),
     Throw(HExpr),
+    /// `yield`: hands a key (none: the next int key) and a value to the loop
+    /// over the generator, and waits until it asks for the next. `from`: one
+    /// of the values of `yield from`, whose keys do not move the int keys on.
+    Yield {
+        key: Option<HExpr>,
+        val: HExpr,
+        from: bool,
+    },
     Try {
         body: Vec<HStmt>,
         catches: Vec<HCatch>,

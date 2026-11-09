@@ -1,0 +1,5 @@
+<?phv
+// `yield` is a statement: a generator does not receive values (no `send()`).
+function numbers(): Generator<int> {
+    $sent = yield 1;
+}

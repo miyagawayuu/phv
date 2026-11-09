@@ -1,0 +1,4 @@
+// std.i18n needs [i18n] in phv.toml (this directory has none).
+import std.i18n.t;
+
+echo t("hello");

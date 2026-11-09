@@ -1,0 +1,12 @@
+got 1
+inner finally
+outer finally
+caught: from finally
+inner finally
+outer finally
+caught: from finally
+g2 finally
+700
+n=1 calls=11
+n=12 calls=22
+n=23 calls=33

@@ -1,0 +1,17 @@
+# The default catalog: every key is here.
+welcome = "Welcome, {name}!"
+title = "Shop"
+markup = "<b>Bold</b> & {name}"
+terms = "I accept the {link} of {site}."
+braces = "{{literal}} braces"
+
+[cart]
+empty = "Your cart is empty."
+
+[cart.items]
+one = "{count} item"
+other = "{count} items"
+
+[inbox]
+unread.one = "{name}, you have one new message"
+unread.other = "{name}, you have {count} new messages"

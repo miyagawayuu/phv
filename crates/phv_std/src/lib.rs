@@ -16,6 +16,8 @@ mod crypt;
 mod db;
 pub(crate) mod deadline;
 mod httpclient;
+pub mod i18n;
+mod imaging;
 pub mod jobs;
 mod jsonas;
 mod jwt;
@@ -25,6 +27,7 @@ mod netdb;
 mod netio;
 mod numbers;
 mod oauth;
+mod orm;
 mod pgmeter;
 pub mod ratelimit;
 mod re;
@@ -103,6 +106,9 @@ pub fn std_module(name: &str) -> Option<&'static str> {
         "std.jobs" => Some(include_str!("phv/jobs.phv")),
         "std.jwt" => Some(include_str!("phv/jwt.phv")),
         "std.oauth" => Some(include_str!("phv/oauth.phv")),
+        "std.orm" => Some(include_str!("phv/orm.phv")),
+        "std.i18n" => Some(include_str!("phv/i18n.phv")),
+        "std.image" => Some(include_str!("phv/image.phv")),
         _ => None,
     }
 }
@@ -968,6 +974,9 @@ const PROVIDERS: &[fn(&str) -> Option<BuiltinFn>] = &[
     jobs::lookup,
     jwt::lookup,
     oauth::lookup,
+    orm::lookup,
+    i18n::lookup,
+    imaging::lookup,
 ];
 
 pub fn lookup(name: &str) -> Option<BuiltinFn> {
@@ -1480,6 +1489,9 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
             }
             if vm.http.body_file.is_some() {
                 return Err(vm.throw("ValueError", "response()->flush() cannot send output after response()->file()"));
+            }
+            if vm.http.body_bytes.is_some() {
+                return Err(vm.throw("ValueError", "response()->flush() cannot send output after an image's send()"));
             }
             let Some(mut sink) = vm.http.stream.take() else { return Ok(Value::Bool(true)) };
             let mut chunk = std::mem::take(&mut vm.out[0].buf).into_bytes();

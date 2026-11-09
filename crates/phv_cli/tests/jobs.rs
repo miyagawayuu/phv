@@ -6,6 +6,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// The tests that use a database server run one at a time: several of them
+/// move thousands of jobs, some through a slow proxy, and each store operation
+/// has a 10-second budget, so run together on a loaded machine they ran out of
+/// it (connections closed by the statement timeout) although each passes alone.
+static ONE_DATABASE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn one_database_test() -> std::sync::MutexGuard<'static, ()> {
+    ONE_DATABASE_TEST.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn write(dir: &Path, rel: &str, text: &str) {
     let p = dir.join(rel);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -120,6 +130,7 @@ fn jobs_run_list_and_retry_with_redis() {
         eprintln!("PHV_TEST_REDIS_URL is not set: skipped");
         return;
     };
+    let _one = one_database_test();
     let dir = base("redis");
     // A store namespace of this test run: other test processes use the server too.
     let site = phv_std::testing::run_id();
@@ -247,6 +258,7 @@ fn list_counts_the_jobs_left_in_the_shared_store_with_redis() {
         eprintln!("PHV_TEST_REDIS_URL is not set: skipped");
         return;
     };
+    let _one = one_database_test();
     let url = match url.split_once("://") {
         Some((scheme, rest)) => match rest.split_once('/') {
             Some((server, _)) => format!("{scheme}://{server}/11"),
@@ -267,6 +279,7 @@ fn list_counts_the_jobs_left_in_the_shared_store_with_postgres() {
         eprintln!("PHV_TEST_POSTGRES_URL is not set: skipped");
         return;
     };
+    let _one = one_database_test();
     let tag = run_tag();
     let schema = format!("phv_left_{tag}");
     let spec = phv_vm::DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 1 };
@@ -285,6 +298,7 @@ fn list_counts_the_jobs_left_in_the_shared_store_with_mysql() {
         eprintln!("PHV_TEST_MYSQL_URL is not set: skipped");
         return;
     };
+    let _one = one_database_test();
     let _unnamed = phv_std::testing::unnamed();
     check_left_in_shared("left-mysql", &url);
 }
@@ -445,6 +459,7 @@ fn adopt_moves_the_jobs_left_in_the_shared_store_with_redis() {
         eprintln!("PHV_TEST_REDIS_URL is not set: skipped");
         return;
     };
+    let _one = one_database_test();
     let url = match url.split_once("://") {
         Some((scheme, rest)) => match rest.split_once('/') {
             Some((server, _)) => format!("{scheme}://{server}/12"),
@@ -464,6 +479,7 @@ fn adopt_moves_the_jobs_left_in_the_shared_store_with_postgres() {
         eprintln!("PHV_TEST_POSTGRES_URL is not set: skipped");
         return;
     };
+    let _one = one_database_test();
     let tag = run_tag();
     let schema = format!("phv_adopt_{tag}");
     let spec = phv_vm::DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 1 };
@@ -481,6 +497,7 @@ fn adopt_moves_the_jobs_left_in_the_shared_store_with_mysql() {
         eprintln!("PHV_TEST_MYSQL_URL is not set: skipped");
         return;
     };
+    let _one = one_database_test();
     let _unnamed = phv_std::testing::unnamed();
     check_adopt("adopt-mysql", &url);
 }
@@ -616,6 +633,7 @@ fn adopt_moves_many_jobs_through_a_slow_store_with_postgres() {
         eprintln!("PHV_TEST_POSTGRES_URL is not set: skipped");
         return;
     };
+    let _one = one_database_test();
     let tag = run_tag();
     let schema = format!("phv_many_{tag}");
     let spec = phv_vm::DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 1 };
@@ -641,6 +659,7 @@ fn adopt_moves_many_jobs_through_a_slow_store_with_mysql() {
         eprintln!("PHV_TEST_MYSQL_URL is not set: skipped");
         return;
     };
+    let _one = one_database_test();
     let _unnamed = phv_std::testing::unnamed();
     let tag = run_tag();
     let spec = phv_vm::DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 1 };

@@ -121,11 +121,11 @@ pub(super) fn instantiate(t: &Type, tps: &[Name]) -> Type {
     }
 }
 
-fn hconst(c: HConst, ty: Type, span: Span) -> HExpr {
+pub(super) fn hconst(c: HConst, ty: Type, span: Span) -> HExpr {
     HExpr { kind: HExprKind::Const(c), ty, span }
 }
 
-fn err(span: Span) -> HExpr {
+pub(super) fn err(span: Span) -> HExpr {
     HExpr { kind: HExprKind::Const(HConst::Null), ty: Type::Error, span }
 }
 
@@ -632,6 +632,10 @@ impl<'a> Checker<'a> {
             "map" => TestKind::Map,
             "set" => TestKind::Set,
             other => match self.class_ref(other, ty.span) {
+                Some(c) if self.is_trait(c) => {
+                    self.refuse_trait(c, "`is` cannot test for it", ty.span);
+                    return None;
+                }
                 Some(c) => TestKind::Class(c),
                 None => {
                     self.error(format!("unknown type `{other}`"), ty.span);
@@ -1412,6 +1416,7 @@ impl<'a> Checker<'a> {
         args: &[Arg],
         span: Span,
     ) -> (Vec<HExpr>, Type, Vec<Type>) {
+        self.check_message_call(fid, args);
         let owner = self.funcs[fid as usize].class;
         // The warning's text is made only for a deprecated function.
         if let Some(reason) = self.deprecated_funcs.get(&fid).cloned() {
@@ -1683,7 +1688,7 @@ impl<'a> Checker<'a> {
     /// value or, for a pure enum, by case name), `cN` (class N, whose public
     /// properties are listed in `defs` as `name:X`, `name!:X` when required, or
     /// `name=K:X` when a constructor parameter gives the default `defaults[K]`).
-    fn json_shape(
+    pub(super) fn json_shape(
         &self,
         t: &Type,
         defs: &mut Vec<(ClassId, String)>,
@@ -2278,6 +2283,13 @@ impl<'a> Checker<'a> {
             }
         } else {
             match self.class_ref(class, class_span) {
+                Some(c) if self.is_trait(c) => {
+                    self.refuse_trait(c, "its methods are called through a class that uses it", class_span);
+                    for a in args {
+                        self.expr(&a.value, None);
+                    }
+                    return err(span);
+                }
                 Some(c) => c,
                 None => {
                     self.error(format!("unknown class `{class}`"), class_span);
@@ -2352,6 +2364,10 @@ impl<'a> Checker<'a> {
             self.error(format!("unknown class `{class}`"), class_span);
             return err(span);
         };
+        if self.is_trait(cid) {
+            self.refuse_trait(cid, "its constants are read through a class that uses it", class_span);
+            return err(span);
+        }
         self.note_site(name_span, &Type::class(cid), true);
         if let Some(def) = self.member_const_span(cid, name) {
             self.note_ref(name_span, def);
@@ -2405,6 +2421,7 @@ impl<'a> Checker<'a> {
             ClassKind::Abstract => Some("an abstract class"),
             ClassKind::Interface => Some("an interface"),
             ClassKind::Enum => Some("an enum"),
+            ClassKind::Trait => Some("a trait"),
             ClassKind::Class => None,
         };
         if let Some(what) = what {
@@ -2448,6 +2465,8 @@ impl<'a> Checker<'a> {
                         (hargs, targs)
                     }
                 };
+                // `new Repo<User>($db)` (std.orm): the description of `User` is passed too.
+                let hargs = if self.is_orm_repo(cid) { self.orm_repo_args(hargs, &targs, args, span) } else { hargs };
                 HExpr { kind: HExprKind::New(cid, Some(fid), hargs), ty: Type::Class(cid, targs), span }
             }
             None => {
@@ -2532,6 +2551,13 @@ impl<'a> Checker<'a> {
 
         let mut ctx = FnCtx::new(ret_known.clone().unwrap_or(Type::Infer), class, FuncKind::Closure);
         ctx.auto_capture = c.arrow;
+        if let ClosureBody::Block(stmts) = &c.body {
+            if let Some(at) = super::flow::first_yield(stmts) {
+                let ret = ret_known.clone().unwrap_or(Type::Void);
+                ctx.gen = Some(self.generator_of(&ret, FuncKind::Closure, ret_known.is_some(), at));
+            }
+        }
+        let generator = ctx.gen.is_some();
         for (u, uspan) in &c.uses {
             if let Some((outer, ty)) = self.read_var(u, *uspan) {
                 let id = ctx.declare(u, ty, *uspan);
@@ -2563,11 +2589,15 @@ impl<'a> Checker<'a> {
             }
             ClosureBody::Block(stmts) => {
                 if ret_known.is_none() {
-                    self.cx().ret = Type::Void;
+                    self.cx().ret = if generator { Type::Error } else { Type::Void };
                 }
                 self.block(stmts, &mut body);
                 let rt = self.cx().ret.clone();
-                if !self.cx().flow.dead && !matches!(rt, Type::Void | Type::Error) && !self.reported_type_nodes {
+                if !self.cx().flow.dead
+                    && !matches!(rt, Type::Void | Type::Error)
+                    && !generator
+                    && !self.reported_type_nodes
+                {
                     let msg = format!("this closure must return a value of type `{}` on every path", self.tn(&rt));
                     self.error(msg, span);
                 }
@@ -2821,6 +2851,10 @@ impl<'a> Checker<'a> {
                     self.error(format!("unknown class `{class}`"), *class_span);
                     return None;
                 };
+                if self.is_trait(cid) {
+                    self.refuse_trait(cid, "its methods are called through a class that uses it", *class_span);
+                    return None;
+                }
                 match self.classes[cid as usize].methods.get(name).cloned() {
                     Some(m) if m.is_static => Some((user(self, m.func, &[])?, None)),
                     Some(_) => {

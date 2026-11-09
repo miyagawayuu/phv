@@ -1,0 +1,4 @@
+# The project of the std.i18n tests (crates/phv_driver/tests/i18n.rs).
+[i18n]
+default = "en"
+locales = ["en", "ja", "pt", "pt-BR", "ru", "ar", "fr"]

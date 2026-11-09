@@ -1,0 +1,343 @@
+<?phv
+import lib.traits.Greets;
+
+// Methods, a property and a constant; `$this` and `self` are the class that
+// uses the trait, also in a static method.
+trait Counter {
+    const STEP = 2;
+    private int $count = 0;
+
+    public function bump(): self {
+        $this->count += self::STEP;
+        return $this;
+    }
+
+    public function count(): int {
+        return $this->count;
+    }
+
+    public static function fresh(): self {
+        return new self();
+    }
+
+    public static function describe(): string {
+        return "counts by " . self::STEP;
+    }
+}
+
+class Clicks {
+    use Counter;
+
+    // The same constant as the trait's: allowed, as in PHP.
+    const STEP = 2;
+}
+
+$c = new Clicks();
+echo $c->bump()->bump()->count(), " ", Clicks::describe(), " ", Clicks::fresh()->bump()->count(), " ", Clicks::STEP, "\n";
+
+// An abstract method: the class implements it, or inherits it.
+trait Area {
+    abstract public function area(): float;
+
+    public function report(): string {
+        return "area " . $this->area();
+    }
+}
+
+class Square {
+    use Area;
+
+    public function __construct(private float $side) {}
+
+    public function area(): float {
+        return $this->side * $this->side;
+    }
+}
+
+class Shape {
+    public function area(): float {
+        return 1.5;
+    }
+}
+
+class Unit extends Shape {
+    use Area;
+}
+
+$sq = new Square(3.0);
+$un = new Unit();
+echo $sq->report(), " ", $un->report(), "\n";
+
+// Two traits with the same method: `insteadof` picks one, `as` keeps the
+// other under another name, and changes a visibility.
+trait Hello {
+    public function hi(): string {
+        return "hello";
+    }
+}
+
+trait Hey {
+    public function hi(): string {
+        return "hey";
+    }
+
+    protected function secret(): string {
+        return "secret";
+    }
+}
+
+class Talker {
+    use Hello, Hey {
+        Hello::hi insteadof Hey;
+        Hey::hi as hey;
+        secret as public;
+        Hello::hi as private quiet;
+    }
+
+    public function all(): string {
+        return $this->hi() . "/" . $this->hey() . "/" . $this->quiet();
+    }
+}
+
+$t = new Talker();
+echo $t->all(), " ", $t->secret(), "\n";
+
+// The class's own method wins over the trait's, which wins over the parent's
+// (and can call it with `parent::`).
+class Animal {
+    public function sound(): string {
+        return "parent sound";
+    }
+
+    public function move(): string {
+        return "parent move";
+    }
+
+    public function eat(): string {
+        return "parent eat";
+    }
+}
+
+trait Loud {
+    public function sound(): string {
+        return "trait sound";
+    }
+
+    public function move(): string {
+        return "trait move after " . parent::move();
+    }
+}
+
+class Dog extends Animal {
+    use Loud;
+
+    public function sound(): string {
+        return "class sound";
+    }
+}
+
+function moves(Animal $a): string {
+    return $a->sound() . ", " . $a->move() . ", " . $a->eat();
+}
+
+echo moves(new Dog()), "\n";
+echo moves(new Animal()), "\n";
+
+// A trait that uses traits; the same trait reached twice is no conflict.
+trait One {
+    public function one(): int {
+        return 1;
+    }
+
+    public function name(): string {
+        return "one";
+    }
+}
+
+trait Two {
+    use One;
+
+    public function two(): int {
+        return $this->one() + 1;
+    }
+
+    public function name(): string {
+        return "two";
+    }
+}
+
+trait Three {
+    use One;
+
+    public function three(): int {
+        return $this->one() + 2;
+    }
+}
+
+class Numbers {
+    use Two, Three {
+        Two::name insteadof Three;
+    }
+}
+
+$n = new Numbers();
+echo $n->one(), $n->two(), $n->three(), " ", $n->name(), "\n";
+
+// A generic trait, given a type and a class's own type parameter.
+trait Holds<T> {
+    private list<T> $items = [];
+
+    public function add(T $item): self {
+        $this->items[] = $item;
+        return $this;
+    }
+
+    public function all(): list<T> {
+        return $this->items;
+    }
+
+    public function first(): ?T {
+        return $this->items->isEmpty() ? null : $this->items[0];
+    }
+}
+
+class Names {
+    use Holds<string>;
+}
+
+class Bag<V> {
+    use Holds<V>;
+}
+
+$names = new Names();
+$names->add("ann")->add("bob");
+$bag = new Bag<int>();
+$bag->add(7)->add(8);
+echo $names->all()->join(","), " ", $bag->first() ?? 0, " ", count($bag->all()), "\n";
+
+// An interface implemented by the trait's methods, and a trait of another module.
+interface Greeter {
+    public function greet(string $who): string;
+}
+
+class Host implements Greeter {
+    use Greets;
+
+    public function name(): string {
+        return "the host";
+    }
+}
+
+function welcome(Greeter $g): string {
+    return $g->greet("you");
+}
+
+echo welcome(new Host()), "\n";
+
+// The same trait in two classes whose properties are laid out differently.
+trait Sums {
+    public list<int> $values = [];
+
+    public function total(): int {
+        $t = 0;
+        foreach ($this->values as $v) {
+            $t += $v;
+        }
+        return $t;
+    }
+}
+
+class Small {
+    use Sums;
+}
+
+class Wide {
+    public string $label = "wide";
+    public float $scale = 1.5;
+    use Sums;
+}
+
+$s = new Small();
+$s->values = [1, 2, 3];
+$w = new Wide();
+$w->values = [10, 20];
+echo $s->total(), " ", $w->total(), " ", $w->label, "\n";
+
+// An enum can use a trait (without properties).
+trait Labels {
+    public function label(): string {
+        return "<" . $this->name . ">";
+    }
+}
+
+enum Suit {
+    use Labels;
+    case Hearts;
+    case Spades;
+}
+
+echo Suit::Hearts->label(), Suit::Spades->label(), "\n";
+
+// Closures and generators in a generic trait's methods; an abstract class
+// that uses a trait, and a subclass that meets another trait's abstract method.
+trait Keeps<T> {
+    private list<T> $kept = [];
+
+    public function keep(T $item): self {
+        $this->kept[] = $item;
+        return $this;
+    }
+
+    public function mapped(fn(T): string $f): list<string> {
+        list<string> $out = [];
+        foreach ($this->kept as $i) {
+            $g = fn(T $x): string => "[" . $f($x) . "]";
+            $out[] = $g($i);
+        }
+        return $out;
+    }
+
+    public function each(): Generator<T> {
+        foreach ($this->kept as $i) {
+            yield $i;
+        }
+    }
+}
+
+abstract class Store {
+    use Keeps<int>;
+
+    abstract public function kind(): string;
+}
+
+trait Shouts {
+    abstract public function kind(): string;
+
+    public function shout(): string {
+        return $this->kind() . "!";
+    }
+}
+
+class IntStore extends Store {
+    use Shouts;
+
+    public function kind(): string {
+        return "ints";
+    }
+}
+
+$st = new IntStore();
+$st->keep(1)->keep(2);
+echo $st->mapped(fn(int $x): string => (string)($x * 10))->join(","), " ", $st->shout(), " ";
+foreach ($st->each() as $k => $v) {
+    echo $k, "=", $v, ";";
+}
+echo "\n";
+
+// The trace of an exception thrown in a trait's method names the class's
+// method and the trait's file.
+try {
+    (new Host())->fail(2);
+} catch (RuntimeException $e) {
+    echo $e->getMessage(), "\n", $e->getTraceAsString(), "\n";
+}

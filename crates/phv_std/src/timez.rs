@@ -7,13 +7,13 @@ use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveDateTime, Offset, 
 use chrono_tz::Tz;
 use phv_vm::{BuiltinFn, Value, Vm, VmError};
 
-fn zone(vm: &mut Vm, name: &str) -> Result<Tz, VmError> {
+pub(crate) fn zone(vm: &mut Vm, name: &str) -> Result<Tz, VmError> {
     name.parse::<Tz>().map_err(|_| {
         vm.throw("ValueError", format!("unknown time zone `{name}` (use a name like \"Asia/Tokyo\" or \"UTC\")"))
     })
 }
 
-fn instant(vm: &mut Vm, ts: i64, tz: Tz) -> Result<DateTime<Tz>, VmError> {
+pub(crate) fn instant(vm: &mut Vm, ts: i64, tz: Tz) -> Result<DateTime<Tz>, VmError> {
     match Utc.timestamp_opt(ts, 0) {
         LocalResult::Single(t) => Ok(t.with_timezone(&tz)),
         _ => Err(vm.throw("ValueError", "the time is out of range")),

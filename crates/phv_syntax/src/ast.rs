@@ -86,6 +86,13 @@ pub enum StmtKind {
     Continue(u32),
     Return(Option<Expr>),
     Throw(Expr),
+    /// `yield $value;` or `yield $key => $value;` (the function is a generator).
+    Yield {
+        key: Option<Expr>,
+        value: Expr,
+    },
+    /// `yield from $values;`: each key and value of a list, map, set or generator.
+    YieldFrom(Expr),
     Try {
         body: Vec<Stmt>,
         catches: Vec<Catch>,
@@ -232,6 +239,41 @@ pub enum ClassKind {
     Abstract,
     Interface,
     Enum,
+    /// `trait T { ... }`: its members are copied into the classes that `use` it.
+    Trait,
+}
+
+/// `use A, B<int> { A::hello insteadof B; B::hello as protected helloB; }`
+/// in the body of a class, an enum or a trait.
+#[derive(Debug, Clone)]
+pub struct TraitUse {
+    pub traits: Vec<TraitRef>,
+    pub rules: Vec<TraitRule>,
+    pub span: Span,
+}
+
+/// A trait named in a `use`, with its type arguments.
+#[derive(Debug, Clone)]
+pub struct TraitRef {
+    pub name: String,
+    pub span: Span,
+    pub args: Vec<TypeExpr>,
+}
+
+/// A rule in the `{ ... }` of a `use`.
+#[derive(Debug, Clone)]
+pub enum TraitRule {
+    /// `A::m insteadof B, C;`: the method `m` of `A`, not those of `B` and `C`.
+    Insteadof { from: (String, Span), method: (String, Span), excluded: Vec<(String, Span)>, span: Span },
+    /// `[A::]m as [visibility] [alias];`: with an alias, a copy of `m` under that
+    /// name; without one, `m` with another visibility.
+    As {
+        from: Option<(String, Span)>,
+        method: (String, Span),
+        vis: Option<Visibility>,
+        alias: Option<(String, Span)>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +295,8 @@ pub struct ClassDecl {
     pub interfaces: Vec<(String, Span)>,
     /// Type arguments of each entry of `interfaces`.
     pub interface_args: Vec<Vec<TypeExpr>>,
+    /// `use T;` in the body: the traits whose members it takes.
+    pub uses: Vec<TraitUse>,
     pub props: Vec<PropDecl>,
     pub methods: Vec<FunctionDecl>,
     pub consts: Vec<ConstDecl>,

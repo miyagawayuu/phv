@@ -1,0 +1,12 @@
+welcome = "ようこそ、{name} さん!"
+title = "ショップ"
+terms = "{site} の{link}に同意します。"
+
+[cart]
+empty = "カートは空です。"
+
+[cart.items]
+other = "{count} 点"
+
+[inbox.unread]
+other = "{name} さん、新しいメッセージが {count} 件あります"

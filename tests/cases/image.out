@@ -1,0 +1,38 @@
+read: 40×30 png
+data url: 40×30 png
+fit 20: 20×15 png
+fit 100 (not enlarged): 40×30 png
+fit 30×10: 13×10 png
+cover 10×10: 10×10 png
+resize 7×90: 7×90 png
+crop: 10×20 png
+rotate 90: 30×40 png
+rotate -270: 30×40 png
+rotate 180: 40×30 png
+flips: 40×30 png
+chain: 32×16 png
+written as "png": 16×12 png
+written as "jpeg": 16×12 jpeg
+written as "jpg": 16×12 jpeg
+written as "webp": 16×12 webp
+written as "": 16×12 png
+data:image/webp;base64,
+data url back: 4×3 webp
+source: 40×30 png
+lossless
+same each time
+a 30000×30000 PNG: Image::fromBase64(): the image is too large: images may have at most 16,384 pixels a side and 50,000,000 pixels
+not an image: Image::fromBase64(): not a PNG, JPEG, GIF or WebP image
+not base64: Image::fromBase64(): the text is not Base64
+a cut PNG: Image::fromBase64(): the PNG image is damaged or not supported (unexpected end of file)
+fit 0: fit(): the width must be at least 1, not 0
+resize too large: resize(): 20000×10 is not a size an image may have: images may have at most 16,384 pixels a side and 50,000,000 pixels
+too many pixels: resize(): 10000×10000 is not a size an image may have: images may have at most 16,384 pixels a side and 50,000,000 pixels
+crop outside: crop(): the part 10×10 at (35, 0) is not inside the image of 40×30
+rotate 45: rotate(): 45 is not a multiple of 90 degrees
+gif: toBase64(): GIF is not written; use "png"
+bmp: toBase64(): unknown format "bmp" ("png", "jpeg" or "webp")
+quality 0: toBase64(): the quality must be 1 to 100, not 0
+quality 101: toBase64(): the quality must be 1 to 100, not 101
+saveTo: write access to "out.png" is not allowed; keep files in a directory listed in [permissions].write in phv.toml (e.g. "data/")
+open: read access to "photo.jpg" is not allowed; keep files in a directory listed in [permissions].read in phv.toml (e.g. "data/")

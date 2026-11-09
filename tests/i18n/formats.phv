@@ -1,0 +1,17 @@
+// Numbers and dates as each locale writes them.
+import std.i18n.Translator;
+import std.time.DateTime;
+
+$d = DateTime::of(2026, 11, 5, 23, 30, 0, "Asia/Tokyo");
+foreach (["en", "ja", "pt", "pt-BR", "ru", "ar", "fr"] as $l) {
+    $tr = Translator::of($l);
+    $numbers = [$tr->number(1234567), $tr->number(-1234.567, 2), $tr->number(1234)];
+    echo $l, ": ", $numbers->join(" "), " ", $tr->percent(0.256), " ", $tr->percent(0.5, 1), "\n";
+    $dates = ["full", "long", "medium", "short"]->map(fn($s) => $tr->date($d, $s));
+    echo "  ", $dates->join(" | "), "\n";
+}
+// The date is the one of the DateTime's zone.
+echo Translator::of("en")->date($d->inZone("America/New_York"), "full"), "\n";
+echo Translator::of("en")->number(9223372036854775807), "\n";
+$en = Translator::of("en");
+echo $en->number(0.5), " ", $en->number(2.5), " ", $en->number(-0.001, 2), "\n";

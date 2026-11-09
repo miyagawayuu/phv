@@ -1,0 +1,9 @@
+<?phv
+import std.i18n.{t, tn, t_html};
+params(string $name, int $count);
+?>
+<h1 title="<?= t("title") ?>"><?= t("welcome", ["name" => $name]) ?></h1>
+<p><?= tn("cart.items", $count) ?></p>
+<p><?= t("markup", ["name" => $name]) ?></p>
+<p><?= t_html("terms", ["link" => raw("<a href=\"/terms\">terms</a>"), "site" => escape($name)]) ?></p>
+<p title="<?= t_html("markup", ["name" => escape($name)]) ?>">x</p>

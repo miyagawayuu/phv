@@ -1,0 +1,137 @@
+// std.i18n — translations: the messages of the project's catalogs in the
+// request's language, plurals, and numbers and dates as a language writes them.
+//
+//   import std.i18n.{t, tn, set_locale, translator};
+//   echo t("welcome", ["name" => $name]);         // "Welcome, Ada" or "ようこそ、Ada さん"
+//   echo tn("cart.items", $count);                // "1 item", "3 items"
+//   echo translator()->date($order->placed);      // "Nov 5, 2026", "2026/11/05"
+//
+// `[i18n]` in phv.toml lists the locales; each has a catalog `lang/<locale>.toml`,
+// read and checked when the page is compiled. The locale of a request is the
+// best of them for its `Accept-Language`, unless the page chooses one with
+// `set_locale()` (from a cookie, or a part of the path).
+//
+// Messages are text: parameters and results are strings, escaped on output
+// like any string, so a translation cannot add markup. `t_html()` escapes the
+// message and inserts `Html` parameters (a link inside a sentence).
+
+import std.time.DateTime;
+
+/** The messages and formats of one locale. */
+export final class Translator {
+    private function __construct(
+        /** One of the locales of `[i18n]`, as written there (`pt-BR`). */
+        public readonly string $locale,
+    ) {}
+
+    /**
+     * The translator of `$locale`, one of the locales of `[i18n]` (in any letter
+     * case, with `-` or `_`). Throws ValueError for another.
+     */
+    public static function of(string $locale): Translator {
+        return new Translator(__i18n_check($locale));
+    }
+
+    /**
+     * The message `$key` with its `{name}` placeholders replaced by `$params`.
+     * It is taken from this locale's catalog, else from the locales it falls back
+     * to (`pt-BR`, then `pt`, then the default locale). A key in no catalog gives
+     * the key itself. Throws ValueError for a plural message, or when a
+     * placeholder has no parameter.
+     */
+    public function t(string $key, map<string, string> $params = []): string {
+        return __i18n_t($this->locale, $key, $params);
+    }
+
+    /**
+     * The plural message `$key` in the form the locale uses for `$count` (CLDR
+     * plural rules). `{count}` is the count as the locale writes it, unless
+     * `$params` has `count`.
+     */
+    public function tn(string $key, int $count, map<string, string> $params = []): string {
+        return __i18n_tn($this->locale, $key, $count, $params);
+    }
+
+    /**
+     * Like `t()`, as `Html`: the message's text is escaped, and `$params` are
+     * inserted as they are (`["link" => render(...)]`).
+     */
+    public function html(string $key, map<string, Html> $params = []): Html {
+        return __i18n_html($this->locale, $key, $params);
+    }
+
+    /** Whether `$key` is in this locale's catalog or one it falls back to. */
+    public function has(string $key): bool {
+        return __i18n_has($this->locale, $key);
+    }
+
+    /** `$n` with the locale's decimal and group separators: `1,234.5`, `1.234,5`. */
+    public function number(int|float $n, int $decimals = 0): string {
+        if ($n is int) {
+            return __i18n_int($this->locale, $n, $decimals);
+        }
+        return __i18n_float($this->locale, $n, $decimals);
+    }
+
+    /** `$ratio` as a percentage: `0.25` is `25%` (`25 %` in French). */
+    public function percent(float $ratio, int $decimals = 0): string {
+        return __i18n_percent($this->locale, $ratio, $decimals);
+    }
+
+    /**
+     * The date of `$d` (in its zone) in the locale's `"full"`, `"long"`,
+     * `"medium"` (default) or `"short"` style: `Thursday, November 5, 2026`,
+     * `November 5, 2026`, `Nov 5, 2026`, `11/5/26`.
+     */
+    public function date(DateTime $d, string $style = "medium"): string {
+        return __i18n_date($this->locale, $d->timestamp, $d->zone, $style);
+    }
+}
+
+/** The translator of the request's locale (see `locale()`). */
+export function translator(): Translator {
+    return Translator::of(__i18n_locale());
+}
+
+/**
+ * The request's locale: the one `set_locale()` chose, or the best of `[i18n]
+ * locales` for the request's `Accept-Language` (the default locale outside a
+ * request).
+ */
+export function locale(): string {
+    return __i18n_locale();
+}
+
+/** The locales of `[i18n]`, the default one first. */
+export function locales(): list<string> {
+    return __i18n_locales();
+}
+
+/**
+ * Uses `$locale` for the rest of the request if it is one of the locales of
+ * `[i18n]` (in any letter case, with `-` or `_`), and returns whether it is.
+ * Another value (from a cookie or the path) leaves the locale as it was.
+ */
+export function set_locale(string $locale): bool {
+    return __i18n_set_locale($locale);
+}
+
+/** The best of the locales of `[i18n]` for an `Accept-Language` value, or the default. */
+export function best_locale(string $acceptLanguage): string {
+    return __i18n_negotiate($acceptLanguage);
+}
+
+/** `translator()->t(...)`: the message `$key` in the request's locale. */
+export function t(string $key, map<string, string> $params = []): string {
+    return __i18n_t(__i18n_locale(), $key, $params);
+}
+
+/** `translator()->tn(...)`: the plural message `$key` for `$count`. */
+export function tn(string $key, int $count, map<string, string> $params = []): string {
+    return __i18n_tn(__i18n_locale(), $key, $count, $params);
+}
+
+/** `translator()->html(...)`: the message escaped, with `Html` parameters. */
+export function t_html(string $key, map<string, Html> $params = []): Html {
+    return __i18n_html(__i18n_locale(), $key, $params);
+}

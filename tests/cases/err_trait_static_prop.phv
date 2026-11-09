@@ -1,0 +1,5 @@
+<?phv
+// A trait has no static properties, as a class has none.
+trait Cache {
+    public static int $hits = 0;
+}

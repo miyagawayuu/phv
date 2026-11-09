@@ -1,0 +1,274 @@
+// Run by crates/phv_driver/tests/databases.rs against a MySQL server:
+// std.orm (tests/cases/orm.phv does the same on SQLite).
+import std.db.Database;
+import std.orm.Repo;
+
+enum Status: string {
+    case Open = "open";
+    case Closed = "closed";
+}
+
+enum Level: int {
+    case Low = 1;
+    case High = 2;
+}
+
+enum Mood {
+    case Happy;
+    case Sad;
+}
+
+class Point {
+    public function __construct(public int $x = 0, public int $y = 0) {}
+}
+
+/** Every type a property can have. */
+#[Table("phv_orm_things")]
+class Thing {
+    public ?int $id = null;
+    public int $count = 0;
+    public float $ratio = 0.0;
+    public string $name = "";
+    public bool $active = false;
+    public ?int $maybeInt = null;
+    public ?float $maybeFloat = null;
+    public ?string $maybeText = null;
+    public ?bool $maybeBool = null;
+    public ?Status $maybeStatus = null;
+    public list<string> $tags = [];
+    public map<string, int> $scores = [];
+    public map<int, string> $names = [];
+    public set<int> $ids = [];
+    public set<string> $words = [];
+    public ?Point $home = null;
+    public list<Point> $path = [];
+    public any $extra = null;
+    #[Column("mail")]
+    public string $email = "";
+
+    public function __construct(
+        public Status $status,
+        public Level $level,
+        public Mood $mood,
+        public readonly string $code = "c",
+    ) {}
+}
+
+/** The same table read with the wrong types. */
+#[Table("phv_orm_things")]
+class Wrong {
+    public ?int $id = null;
+    public string $count = "";
+    public int $ratio = 0;
+    public int $active = 0;
+    #[Column("mail")]
+    public int $email = 0;
+}
+
+/** A key the program gives, and column names that are SQL keywords. */
+#[Table("phv_orm_orders")]
+class Order {
+    #[Id, Column("select")]
+    public string $number = "";
+    #[Column("group")]
+    public int $from = 0;
+    public ?string $where = null;
+}
+
+/** A string key the database makes. */
+#[Table("phv_orm_tokens")]
+class Token {
+    public ?string $id = null;
+    public string $label = "";
+}
+
+$db = Database::connect("main");
+$db->execute(sql"DROP TABLE IF EXISTS phv_orm_things");
+$db->execute(sql"DROP TABLE IF EXISTS phv_orm_orders");
+$db->execute(sql"DROP TABLE IF EXISTS phv_orm_tokens");
+$db->execute(sql"CREATE TABLE phv_orm_things (
+    id int AUTO_INCREMENT PRIMARY KEY, count int NOT NULL, ratio double, name text, active tinyint(1),
+    maybeInt bigint, maybeFloat float, maybeText varchar(20), maybeBool tinyint(1), maybeStatus varchar(10),
+    tags json, scores json, names text, ids json, words text, home json, path text, extra json,
+    mail varchar(100) UNIQUE, status enum('open', 'closed'), level smallint, mood varchar(10), code varchar(10)
+)");
+$db->execute(sql"CREATE TABLE phv_orm_orders (`select` varchar(20) PRIMARY KEY, `group` int, `where` text)");
+$db->execute(sql"CREATE TABLE phv_orm_tokens (id varchar(40) PRIMARY KEY, label text)");
+$things = new Repo<Thing>($db);
+
+function show(Thing $t): void {
+    echo $t->id ?? 0, ": ", $t->name, " count=", $t->count, " ratio=", $t->ratio, " active=", $t->active ? "yes" : "no",
+        " maybe=", json_encode([$t->maybeInt, $t->maybeFloat, $t->maybeText, $t->maybeBool, $t->maybeStatus]),
+        " tags=", json_encode($t->tags), " scores=", json_encode($t->scores), " names=", json_encode($t->names),
+        " ids=", json_encode($t->ids), " words=", json_encode($t->words), " home=", json_encode($t->home),
+        " path=", json_encode($t->path), " extra=", json_encode($t->extra), " email=", $t->email,
+        " status=", $t->status->value, " level=", $t->level->value, " mood=", $t->mood->name, " code=", $t->code, "\n";
+}
+
+function names(list<Thing> $ts): string {
+    return implode(" ", $ts->map(fn($t) => $t->name));
+}
+
+echo "--- insert and find\n";
+$a = new Thing(Status::Open, Level::High, Mood::Happy, "a1");
+$a->count = 3;
+$a->ratio = 0.5;
+$a->name = "first";
+$a->active = true;
+$a->tags = ["x", "y"];
+$a->scores = ["math" => 90];
+$a->names = [7 => "seven"];
+$a->ids = set([3, 1]);
+$a->words = set(["hi"]);
+$a->home = new Point(1, 2);
+$a->path = [new Point(3, 4)];
+$a->extra = ["any" => [1, true]];
+$a->email = "a@example.com";
+$things->insert($a);
+echo "key set: ", $a->id ?? 0, "\n";
+$b = new Thing(Status::Closed, Level::Low, Mood::Sad);
+$b->name = "second";
+$b->count = 1;
+$b->maybeInt = 9000000000;
+$b->maybeFloat = 2.5;
+$b->maybeText = "text";
+$b->maybeBool = false;
+$b->maybeStatus = Status::Open;
+$b->email = "b@example.com";
+$things->insert($b);
+$c = new Thing(Status::Open, Level::Low, Mood::Happy);
+$c->name = "third";
+$c->count = 2;
+$c->email = "c@example.com";
+$things->insert($c);
+foreach ([1, 2, 3] as $id) {
+    $t = $things->find($id);
+    if ($t != null) {
+        show($t);
+    }
+}
+echo "missing row: ", $things->find(99) == null ? "null" : "found", "\n";
+
+echo "--- conditions, ordering, paging, count\n";
+$min = 2;
+echo "count: ", $things->count(), " ", $things->count(sql"count >= {$min}"), "\n";
+echo "by name desc: ", names($things->findBy(orderBy: "name desc")), "\n";
+echo "by status, count: ", names($things->findBy(orderBy: "status ASC, count")), "\n";
+echo "page 2: ", names($things->findBy(orderBy: "id", limit: 2, offset: 2)), "\n";
+echo "offset only: ", names($things->findBy(orderBy: "id", offset: 1)), "\n";
+$no = false;
+echo "where: ", names($things->findBy(sql"count < {$min} AND active = {$no}", "name")), "\n";
+echo "json function: ", names($things->findBy(sql"JSON_CONTAINS(tags, '\"x\"')")), "\n";
+echo "in: ", names($things->findBy($things->in("id", [3, 1]), "id")), "\n";
+echo "in enums: ", names($things->findBy($things->in("status", [Status::Closed]))), "\n";
+echo "in levels: ", $things->count($things->in("level", [Level::High])), "\n";
+echo "in a camel-case column: ", $things->count($things->in("maybeInt", [9000000000])), "\n";
+$since = 1;
+echo "by column: ", names($things->findBy($things->column("maybeBool") . sql" IS NOT NULL OR " . $things->column("id") . sql" > {$since}", "id")), "\n";
+
+echo "--- updates write the columns that changed\n";
+$t = $things->find(1);
+if ($t != null) {
+    echo "unchanged: ", $things->update($t) ? "written" : "nothing", "\n";
+    $db->execute(sql"UPDATE phv_orm_things SET name = 'renamed elsewhere' WHERE id = 1");
+    $t->count = 30;
+    $t->tags[] = "z";
+    echo "changed: ", $things->update($t) ? "written" : "nothing", "\n";
+    echo "again: ", $things->update($t) ? "written" : "nothing", "\n";
+    echo "row: ", json_encode($db->first(sql"SELECT name, count, tags FROM phv_orm_things WHERE id = 1")?->toMap()), "\n";
+}
+
+echo "--- keys\n";
+$orders = new Repo<Order>($db);
+$o = new Order();
+$o->number = "A-1";
+$o->from = 5;
+$orders->insert($o);
+$o2 = $orders->find("A-1");
+echo "keyword names: ", $o2?->number ?? "-", " ", $o2?->from ?? 0, " ", $o2?->where ?? "null", "\n";
+if ($o2 != null) {
+    $o2->where = "here";
+    echo "update: ", $orders->update($o2) ? "written" : "nothing", "\n";
+}
+echo "ordered: ", count($orders->findBy(orderBy: "from desc, where")), "\n";
+$tokens = new Repo<Token>($db);
+$k = new Token();
+$k->label = "made by the database";
+try {
+    $tokens->insert($k);
+} catch (ValueError $e) {
+    echo "ValueError: ", $e->getMessage(), "\n";
+}
+$k->id = "given";
+$tokens->insert($k);
+echo "string key given: ", $tokens->find("given")?->label ?? "-", "\n";
+
+echo "--- a unique violation\n";
+$dup = new Thing(Status::Open, Level::Low, Mood::Happy);
+$dup->email = "a@example.com";
+try {
+    $things->insert($dup);
+} catch (DatabaseError $e) {
+    echo "DatabaseError: ", $e->getMessage()->contains("Duplicate entry") ? "Duplicate entry" : $e->getMessage(), "\n";
+}
+echo "no key set: ", $dup->id ?? "null", "\n";
+
+echo "--- a transaction rolled back\n";
+$t = $things->find(3);
+if ($t != null) {
+    try {
+        $db->transaction(function () use ($things, $t): void {
+            $n = new Thing(Status::Open, Level::Low, Mood::Happy);
+            $n->email = "rolled@example.com";
+            $things->insert($n);
+            $t->name = "renamed in the transaction";
+            $things->update($t);
+            throw new RuntimeException("stop");
+        });
+    } catch (RuntimeException $e) {
+        echo "rolled back: ", $e->getMessage(), "\n";
+    }
+    echo "rows: ", $things->count(), " name in the row: ", $db->first(sql"SELECT name FROM phv_orm_things WHERE id = 3")?->string("name") ?? "-", "\n";
+    echo "after the rollback: ", $things->update($t) ? "written" : "nothing", "\n";
+    echo "name in the row: ", $db->first(sql"SELECT name FROM phv_orm_things WHERE id = 3")?->string("name") ?? "-", "\n";
+}
+
+echo "--- rows that do not fit the class\n";
+$wrong = new Repo<Wrong>($db);
+try {
+    $wrong->find(1);
+} catch (DatabaseError $e) {
+    echo "DatabaseError: ", $e->getMessage(), "\n";
+}
+$db->execute(sql"ALTER TABLE phv_orm_things MODIFY count text");
+$db->execute(sql"UPDATE phv_orm_things SET count = 'many' WHERE id = 2");
+try {
+    $things->find(2);
+} catch (DatabaseError $e) {
+    echo "DatabaseError: ", $e->getMessage(), "\n";
+}
+$db->execute(sql"UPDATE phv_orm_things SET count = '2.5' WHERE id = 2");
+$db->execute(sql"ALTER TABLE phv_orm_things MODIFY count decimal(5, 1)");
+try {
+    $things->find(2);
+} catch (DatabaseError $e) {
+    echo "DatabaseError: ", $e->getMessage(), "\n";
+}
+$db->execute(sql"UPDATE phv_orm_things SET maybeInt = NULL, count = 2 WHERE id = 2");
+$db->execute(sql"ALTER TABLE phv_orm_things MODIFY count int");
+$db->execute(sql"UPDATE phv_orm_things SET tags = '{\"not\": \"a list\"}' WHERE id = 2");
+try {
+    $things->find(2);
+} catch (DatabaseError $e) {
+    echo "DatabaseError: ", $e->getMessage(), "\n";
+}
+
+echo "--- delete\n";
+$t = $things->find(1);
+if ($t != null) {
+    echo "deleted: ", $things->delete($t) ? "yes" : "no", " again: ", $things->delete($t) ? "yes" : "no", "\n";
+}
+echo "left: ", $things->count(), "\n";
+$db->execute(sql"DROP TABLE phv_orm_things");
+$db->execute(sql"DROP TABLE phv_orm_orders");
+$db->execute(sql"DROP TABLE phv_orm_tokens");

@@ -1,0 +1,8 @@
+error: `yield` cannot be used in a template
+ --> views/yields.phv.html:5:7
+  |
+5 | <?phv yield $item; ?>
+  |       ^^^^^
+  = note: write the generator in a `.phv` module and loop over it in the template
+
+1 error found

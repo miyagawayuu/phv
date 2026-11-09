@@ -31,7 +31,7 @@ mod redis;
 mod sessions;
 
 pub use handle::{connect, connect_redis, execute, last_insert_id, query, raw};
-pub(crate) use handle::{is_local_host, tls_init};
+pub(crate) use handle::{dialect_of, is_local_host, tls_init};
 pub use jobs::{JobCap, JobInfo, JobRow, JOB_MAX_DEAD, JOB_MAX_KEPT};
 pub(crate) use jobs_add::job_add_in_transaction;
 pub use jobs_add::{job_add_by, JobAdder, JOB_KEY_WAITERS};

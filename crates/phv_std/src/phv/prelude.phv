@@ -50,3 +50,19 @@ class PermissionError extends Exception {}
 class DatabaseError extends RuntimeException {}
 class NetworkError extends RuntimeException {}
 class AssertionError extends Exception {}
+
+// What a function with `yield` returns: its keys and values, made one at a time
+// as a `foreach` asks for them. `Generator<V>` is short for `Generator<int, V>`.
+// Only calling such a function makes one, and it can be iterated once.
+final class Generator<K, V> {
+    private function __construct() {}
+
+    // Runs the generator to its end and gives its values, in order (the keys are dropped).
+    public function toList(): list<V> {
+        list<V> $values = [];
+        foreach ($this as $value) {
+            $values[] = $value;
+        }
+        return $values;
+    }
+}

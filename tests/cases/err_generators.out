@@ -1,0 +1,94 @@
+error: expected `int`, found `string`
+ --> err_generators.phv:5:11
+  |
+5 |     yield "one";
+  |           ^^^^^
+  = note: strings are never converted to numbers implicitly; use `->toInt()` or `->toFloat()`
+
+error: a function with `yield` must declare its return type `Generator<...>`
+ --> err_generators.phv:9:5
+  |
+9 |     yield 1;
+  |     ^^^^^^^^
+  = note: e.g. `function numbers(): Generator<int>` (or `Generator<string, int>` with keys)
+
+error: a function with `yield` returns `Generator<...>`, but this one is declared to return `list<int>`
+  --> err_generators.phv:13:5
+   |
+13 |     yield 1;
+   |     ^^^^^^^^
+   = note: e.g. `function numbers(): Generator<int>` (or `Generator<string, int>` with keys)
+
+error: a generator cannot return a value
+  --> err_generators.phv:18:12
+   |
+18 |     return 5;
+   |            ^
+   = note: `return;` ends it; hand values to the loop with `yield`
+
+error: this generator's keys are `string`: give each value a key
+  --> err_generators.phv:22:11
+   |
+22 |     yield 1;
+   |           ^
+   = note: write `yield $key => $value;`
+
+error: expected `string`, found `int`
+  --> err_generators.phv:26:11
+   |
+26 |     yield 1 => 1;
+   |           ^
+   = note: use `(string)$value` or string interpolation
+
+error: `yield` cannot be used in a `finally` block
+  --> err_generators.phv:33:9
+   |
+33 |         yield 2;
+   |         ^^^^^^^^
+   = note: a generator that a loop leaves early runs its `finally` blocks, which cannot wait for the loop
+
+error: `yield from` gives values of type `int`, but this generator's values are `string`
+  --> err_generators.phv:38:16
+   |
+38 |     yield from [1, 2];
+   |                ^^^^^^
+
+error: `yield from` gives keys of type `int`, but this generator's keys are `string`
+  --> err_generators.phv:42:16
+   |
+42 |     yield from [1, 2];
+   |                ^^^^^^
+
+error: cannot `yield from` a value of type `int`
+  --> err_generators.phv:46:16
+   |
+46 |     yield from 5;
+   |                ^
+   = note: `yield from` takes a list, a map, a set or another generator
+
+error: a constructor cannot be a generator
+  --> err_generators.phv:51:9
+   |
+51 |         yield 1;
+   |         ^^^^^^^^
+
+error: a function with `yield` must declare its return type `Generator<...>`
+  --> err_generators.phv:56:5
+   |
+56 |     yield 1;
+   |     ^^^^^^^^
+   = note: e.g. `function numbers(): Generator<int>` (or `Generator<string, int>` with keys)
+
+error: expected `list<string>`, found `list<int>`
+  --> err_generators.phv:65:27
+   |
+65 |     list<string> $words = wrong_value()->toList();
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `yield` can only be used inside a function
+  --> err_generators.phv:69:1
+   |
+69 | yield 3;
+   | ^^^^^^^^
+
+14 errors found

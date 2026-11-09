@@ -1,0 +1,8 @@
+error: static properties are not supported (they would share state between requests)
+ --> err_trait_static_prop.phv:4:5
+  |
+4 |     public static int $hits = 0;
+  |     ^^^^^^
+  = note: use a class constant (`const MAX = 10;`) for fixed values
+
+1 error found

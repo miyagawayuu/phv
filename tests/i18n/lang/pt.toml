@@ -1,0 +1,7 @@
+welcome = "Bem-vindo, {name}!"
+title = "Loja"
+
+[cart.items]
+one = "{count} item"
+many = "{count} de itens"
+other = "{count} itens"

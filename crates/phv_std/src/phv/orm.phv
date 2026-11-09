@@ -1,0 +1,193 @@
+// std.orm — entities: classes whose objects are the rows of a table (std.db).
+//
+//   import std.db.Database;
+//   import std.orm.Repo;
+//   #[Table("users")]
+//   class User {
+//       public ?int $id = null;          // the key; null until insert(), which the database makes it in
+//       public string $name = "";
+//       #[Column("email_address")]
+//       public string $email = "";
+//   }
+//   $users = new Repo<User>(Database::connect("main"));
+//   $u = new User();
+//   $u->name = "Ann";
+//   $users->insert($u);                              // sets $u->id
+//   $found = $users->find(1);                        // ?User
+//   $page = $users->findBy(sql"name LIKE {$q}", orderBy: "name", limit: 20);
+//   $u->name = "Anna";
+//   $users->update($u);                              // writes the columns that changed
+//   $users->delete($u);
+//
+// Table and column names come only from the class and its annotations, and
+// values are always bound parameters.
+
+import std.db.{Database, Row};
+
+/**
+ * The rows of a table as objects of the entity class `T`: a class marked
+ * `#[Table("name")]` whose public properties are the table's columns (named
+ * like the properties, or by `#[Column("name")]`). The key is the property
+ * marked `#[Id]`, or else `$id`; when it is nullable and null, `insert()` lets
+ * the database make it. Rows become objects without a call to the
+ * constructor, so it may only promote its parameters.
+ *
+ * Every statement runs through the `Database` it was given, with the limits
+ * of std.db. A Repo remembers what the rows of the entities it read or wrote
+ * held, so that `update()` writes only the columns that changed; it forgets
+ * that after a `transaction()` is rolled back. Nothing is kept beyond the
+ * Repo itself (the end of the request at the latest).
+ */
+export final class Repo<T> {
+    /** Never holds anything: it names the type `T` for the runtime. */
+    private list<T> $none = [];
+    private int $meta;
+    /** The entities this Repo read or wrote, by key, and what their rows held then. */
+    private map<string, T> $held = [];
+    private map<string, map<string, any>> $seen = [];
+    /** The rollbacks counted when `$seen` was last right. */
+    private int $epoch;
+
+    /**
+     * `new Repo<User>($db)`: the rows of `User`'s table in `$db`. Write only
+     * the database: the type checker gives the description of `User`.
+     */
+    public function __construct(private Database $db, string $description = "", list<any> $defaults = []) {
+        $this->meta = __orm_meta($db, $description, $defaults);
+        $this->epoch = __orm_epoch();
+    }
+
+    /** The entity whose key is `$key`, or null when no row has it. */
+    public function find(int|string $key): ?T {
+        $row = $this->db->first(__orm_find($this->meta, $key));
+        if ($row == null) {
+            return null;
+        }
+        return $this->fromRow($row);
+    }
+
+    /**
+     * The entities whose rows meet `$where` (every row without it), sorted by
+     * `$orderBy`: property names, each with `asc` or `desc` after it
+     * (`"name, createdAt desc"`); at most `$limit`, after skipping `$offset`.
+     * `$where` names columns: `sql"age >= {$min}"`, or
+     * `$users->column("createdAt") . sql" > {$since}"` by property.
+     */
+    public function findBy(?Sql $where = null, string $orderBy = "", ?int $limit = null, int $offset = 0): list<T> {
+        list<T> $out = [];
+        foreach ($this->db->query(__orm_select($this->meta, $where, $orderBy, $limit, $offset, false)) as $row) {
+            $out[] = $this->fromRow($row);
+        }
+        return $out;
+    }
+
+    /** The first entity `findBy($where, $orderBy)` gives, or null. */
+    public function findOneBy(?Sql $where = null, string $orderBy = ""): ?T {
+        return $this->findBy($where, $orderBy, 1)->first();
+    }
+
+    /** The number of rows that meet `$where` (of every row without it). */
+    public function count(?Sql $where = null): int {
+        return $this->db->first(__orm_select($this->meta, $where, "", null, 0, true))?->int("n") ?? 0;
+    }
+
+    /**
+     * Adds the row of `$entity`. When its key is null, the database makes
+     * one and it is set on `$entity` (an integer on MySQL).
+     */
+    public function insert(T $entity): void {
+        $this->fresh();
+        $mode = __orm_insert_mode($this->meta, $entity);
+        $q = __orm_insert($this->meta, $entity);
+        if ($mode == 1) {
+            __orm_set_key($this->meta, $entity, $this->db->first($q)?->toMap());
+        } else {
+            $this->db->execute($q);
+            if ($mode == 2) {
+                __orm_set_key($this->meta, $entity, $this->db->lastInsertId());
+            }
+        }
+        $this->remember($entity);
+    }
+
+    /**
+     * Writes the properties of `$entity` that changed since this Repo read or
+     * wrote its row (every property of an entity it did not) to the row with
+     * its key. True when the database changed a row; false when nothing
+     * changed or no row has the key (MySQL also counts a row that already
+     * held the values as unchanged). `ValueError` when the key is null.
+     */
+    public function update(T $entity): bool {
+        $this->fresh();
+        $key = __orm_key($this->meta, $entity) ?? "";
+        $q = __orm_update($this->meta, $entity, $this->held[$key] ?? null, $this->seen[$key] ?? null);
+        if ($q == null) {
+            return false;
+        }
+        $changed = $this->db->execute($q) > 0;
+        if ($changed) {
+            $this->remember($entity);
+        } else {
+            $this->forget($key);
+        }
+        return $changed;
+    }
+
+    /** Deletes the row of `$entity`; true when there was one. `ValueError` when the key is null. */
+    public function delete(T $entity): bool {
+        $q = __orm_delete($this->meta, $entity);
+        $deleted = $this->db->execute($q) > 0;
+        $this->forget(__orm_key($this->meta, $entity) ?? "");
+        return $deleted;
+    }
+
+    /**
+     * `"column" IN (...)`, the column of `$property` and each of `$values` as
+     * a parameter, for `findBy()` and `count()`: loads the related rows of
+     * many entities in one query (`$users->findBy($users->in("id", $ids))`).
+     * At most 1,000 values (`ValueError`); none gives a condition no row meets.
+     */
+    public function in<K>(string $property, list<K> $values): Sql {
+        return __orm_in($this->meta, $property, $values);
+    }
+
+    /** The column of `$property`, quoted, to write a condition with. */
+    public function column(string $property): Sql {
+        return __orm_column($this->meta, $property);
+    }
+
+    /**
+     * The entity a row holds: from `$db->query()` with a query of your own
+     * (a join, say). The row has each of the entity's columns, by name;
+     * others are ignored.
+     */
+    public function fromRow(Row $row): T {
+        $this->fresh();
+        $entity = __orm_load($this->meta, $row->toMap(), $this->none);
+        $this->remember($entity);
+        return $entity;
+    }
+
+    private function remember(T $entity): void {
+        $key = __orm_key($this->meta, $entity);
+        if ($key != null) {
+            $this->held[$key] = $entity;
+            $this->seen[$key] = __orm_values($this->meta, $entity);
+        }
+    }
+
+    private function forget(string $key): void {
+        $this->held = $this->held->remove($key);
+        $this->seen = $this->seen->remove($key);
+    }
+
+    /** After a rollback, the rows may no longer hold what this Repo saw. */
+    private function fresh(): void {
+        $now = __orm_epoch();
+        if ($now != $this->epoch) {
+            $this->held = [];
+            $this->seen = [];
+            $this->epoch = $now;
+        }
+    }
+}

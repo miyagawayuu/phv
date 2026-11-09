@@ -651,6 +651,8 @@ struct Loader {
     text: usize,
     /// Set when the program passed a budget: nothing more is loaded, and it is not checked.
     too_large: bool,
+    /// The first `import std.i18n` of the program: its catalogs are loaded.
+    i18n_import: Option<Span>,
 }
 
 impl Loader {
@@ -822,6 +824,9 @@ impl Loader {
             if name.starts_with("std.") || name == "std" {
                 match phv_std::std_module(&name) {
                     Some(src) => {
+                        if name == "std.i18n" {
+                            self.i18n_import.get_or_insert(span);
+                        }
                         let file = format!("<std>/{}.phv", name.trim_start_matches("std."));
                         // Reserve the name first so import cycles terminate.
                         self.imports.insert(name.clone(), usize::MAX);
@@ -949,6 +954,114 @@ impl Loader {
     }
 }
 
+impl Loader {
+    /// The catalogs of `[i18n]`, for a program that imports `std.i18n`: each
+    /// `<dir>/<locale>.toml`, read like a source file (inside the project, not
+    /// on another machine, recorded as a dependency so that a change compiles
+    /// the program again), and checked (`phv_std::i18n::build`). What is wrong
+    /// is reported in the catalog, or at the import. Built once per process
+    /// for the same files (`phv_std::i18n::intern`).
+    fn load_catalogs(&mut self, config: &Config) -> Option<Arc<phv_vm::i18n::Catalogs>> {
+        use phv_std::i18n::{MAX_CATALOGS_BYTES, MAX_CATALOG_BYTES};
+        use sha2::Digest;
+        let span = self.i18n_import?;
+        let Some(cfg) = config.i18n.clone() else {
+            self.diags.push(Diagnostic::error("std.i18n needs an [i18n] section in phv.toml", span).note(
+                "for example `[i18n]` with `default = \"en\"` and `locales = [\"en\", \"ja\"]`, \
+                     and the catalogs lang/en.toml and lang/ja.toml",
+            ));
+            return None;
+        };
+        let root_c = self.root.canonicalize().ok();
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(cfg.default.as_bytes());
+        let mut files = Vec::new();
+        let mut total = 0usize;
+        let mut failed = false;
+        for locale in &cfg.locales {
+            hasher.update([0u8]);
+            hasher.update(locale.as_bytes());
+            let path = self.root.join(&cfg.dir).join(format!("{locale}.toml"));
+            let shown = display_name(&self.root, &path);
+            let what = format!("the catalog of `{locale}`");
+            if self.remote(&path, span, &what) {
+                failed = true;
+                continue;
+            }
+            let canonical = match path.canonicalize() {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = if e.kind() == std::io::ErrorKind::NotFound {
+                        format!("{what} not found (looked for {shown})")
+                    } else {
+                        format!("cannot read {what} at {shown}")
+                    };
+                    self.diags.push(Diagnostic::error(msg, span).note("each locale of [i18n] has a catalog"));
+                    self.deps.push(Dep::hashed(&self.root, &path, None, None));
+                    failed = true;
+                    continue;
+                }
+            };
+            if !root_c.as_ref().is_some_and(|r| canonical.starts_with(r)) {
+                self.diags
+                    .push(Diagnostic::error(format!("{what} {shown} resolves to a file outside the project"), span));
+                failed = true;
+                continue;
+            }
+            let overlaid = self.overlay.get(&canonical).cloned().map(Source::of);
+            let source = match overlaid.map_or_else(|| read_known(&path), Ok) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.diags.push(Diagnostic::error(format!("cannot read {what} at {shown}: {e}"), span));
+                    failed = true;
+                    continue;
+                }
+            };
+            self.deps.push(Dep::hashed(&self.root, &path, Some(source.hash), source.stamp.as_ref()));
+            total += source.text.len();
+            if source.text.len() > MAX_CATALOG_BYTES {
+                let mb = MAX_CATALOG_BYTES >> 20;
+                self.diags.push(Diagnostic::error(format!("{what} ({shown}) is larger than {mb} MB"), span));
+                failed = true;
+                continue;
+            }
+            if total > MAX_CATALOGS_BYTES {
+                let mb = MAX_CATALOGS_BYTES >> 20;
+                self.diags
+                    .push(Diagnostic::error(format!("the catalogs of [i18n] have more than {mb} MB in all"), span));
+                return None;
+            }
+            hasher.update(source.hash);
+            files.push(self.sources.add(shown, Some(path), source.text));
+        }
+        if failed {
+            return None;
+        }
+        let hash: [u8; 32] = hasher.finalize().into();
+        let texts: Vec<&str> = files.iter().map(|f| self.sources.get(*f).text.as_str()).collect();
+        match phv_std::i18n::intern(hash, || phv_std::i18n::build(&cfg.locales, &cfg.default, &texts, hash)) {
+            Ok(c) => Some(c),
+            Err(errors) => {
+                for e in errors {
+                    let at = Span::new(files[e.catalog], e.span.start as u32, e.span.end as u32);
+                    self.diags.push(Diagnostic::error(e.message, at));
+                }
+                None
+            }
+        }
+    }
+}
+
+/// What the type checker learns of the default catalog (see `Messages`).
+fn messages_of(config: &Config, c: &phv_vm::i18n::Catalogs) -> Option<phv_types::Messages> {
+    let cfg = config.i18n.as_ref()?;
+    let keys = phv_std::i18n::message_index(c)
+        .into_iter()
+        .map(|(k, m)| (k, phv_types::MessageKey { plural: m.plural, params: m.params }))
+        .collect();
+    Some(phv_types::Messages { catalog: format!("{}/{}.toml", cfg.dir, cfg.default), keys })
+}
+
 /// The result of loading and type-checking a program (without compiling it).
 pub struct Analysis {
     pub sources: SourceMap,
@@ -962,6 +1075,8 @@ pub struct Analysis {
     /// The tokens of all its files (see `MAX_PROGRAM_TOKENS`).
     pub tokens: usize,
     deps: Vec<Dep>,
+    /// The catalogs of `[i18n]`, when it imports `std.i18n`.
+    catalogs: Option<Arc<phv_vm::i18n::Catalogs>>,
 }
 
 /// Directory of each package listed in `[dependencies]`.
@@ -1089,6 +1204,7 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
         tokens: 0,
         text: 0,
         too_large: false,
+        i18n_import: None,
     };
     let toml = root.join("phv.toml");
     // Bounded like every source file (a huge phv.toml would be read whole on each keystroke).
@@ -1148,6 +1264,7 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
                 index: None,
                 deps: Vec::new(),
                 tokens: 0,
+                catalogs: None,
             };
         }
     };
@@ -1170,8 +1287,10 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
             index: None,
             deps: loader.deps,
             tokens: loader.tokens,
+            catalogs: None,
         };
     }
+    let catalogs = loader.load_catalogs(&config);
     // With syntax or loading errors the program cannot run, but the files that
     // loaded cleanly are still checked, so their type errors show up as well.
     let broken = !editor && loader.diags.iter().any(|d| d.is_error());
@@ -1183,6 +1302,7 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
             .collect(),
         imports: loader.imports.clone(),
         templates: loader.templates.clone(),
+        messages: catalogs.as_ref().and_then(|c| messages_of(&config, c)),
     };
     let (hir, diags, index) = if editor {
         let (hir, diags, index) = phv_types::check_for_editor(&input);
@@ -1215,6 +1335,7 @@ fn analyze_with(root: &Path, entry: &Path, overlay: HashMap<PathBuf, String>, ed
         index,
         deps: loader.deps,
         tokens: loader.tokens,
+        catalogs,
     }
 }
 
@@ -1300,10 +1421,11 @@ fn compile_full(
     let mut warnings: Vec<Diagnostic> = a.diags.iter().filter(|d| !d.is_error()).cloned().collect();
     warnings.sort_by_key(|d| (d.span.file, d.span.start));
     let warnings = diag::render(&a.sources, &warnings, false);
-    let program = match phv_compiler::compile_with(&hir, &a.sources, opts) {
+    let mut program = match phv_compiler::compile_with(&hir, &a.sources, opts) {
         Ok(p) => p,
         Err(d) => return Err(CompileError { sources: a.sources, diags: vec![d], messages: Vec::new() }),
     };
+    program.i18n = a.catalogs.map(phv_vm::i18n::Shared);
     let marked_tests = hir.tests.iter().map(|(f, skip)| (*f, skip.clone())).collect();
     let test_hooks = hir.hooks.clone();
     let builtins = phv_std::link(&program.builtin_names).map_err(|m| CompileError {

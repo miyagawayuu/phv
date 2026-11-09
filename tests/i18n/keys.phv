@@ -1,0 +1,21 @@
+// Keys written as literals are checked against the default catalog when the
+// page is compiled.
+import std.i18n.{Translator, t, tn, t_html};
+
+echo t("title");
+echo t("nope");
+echo tn("title", 2);
+echo t("cart.items");
+echo t("welcome");
+echo t("welcome", ["nam" => "x"]);
+echo tn("inbox.unread", 3);
+echo t_html("terms", ["link" => raw("x")]);
+$tr = Translator::of("ja");
+echo $tr->t("nope.either");
+echo $tr->tn("cart.items", 2, ["unused" => "x"]);
+echo $tr->html(key: "welcome", params: ["name" => escape("x")]);
+// Not literals: checked when the page runs.
+$k = "nope";
+echo t($k);
+map<string, string> $p = [];
+echo t("welcome", $p);

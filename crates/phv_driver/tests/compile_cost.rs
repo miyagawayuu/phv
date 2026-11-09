@@ -160,6 +160,74 @@ fn class_chains_are_limited() {
     assert!(peak < 400 << 20, "held {} MB", peak >> 20);
 }
 
+/// A trait's members are copied into each class that uses it, and its
+/// methods are checked and compiled there: the members copied (with those
+/// inherited) and the source of the methods copied are limited, and traits
+/// that reach one trait along many paths (doubling at each level) stop at the
+/// limit instead of walking every path.
+#[test]
+fn trait_copies_are_limited() {
+    // 1,000 methods in 300 classes.
+    let mut wide = String::from("<?phv\ntrait Wide {\n");
+    for i in 0..1000 {
+        wide += &format!("    public function m{i}(): int {{ return {i}; }}\n");
+    }
+    wide += "}\n";
+    for i in 0..300 {
+        wide += &format!("class C{i} {{ use Wide; }}\n");
+    }
+    let (out, peak, _) = compile_src("trait_wide", wide);
+    assert!(out.contains("inherit more than 200000 members in total"), "{}", &out[..out.len().min(500)]);
+    assert!(peak < 400 << 20, "held {} MB", peak >> 20);
+    // A method of 300 KB in 120 classes: 36 MB to check.
+    let big = format!(
+        "<?phv\ntrait Big {{\n    public function text(): string {{\n        return \"{}\";\n    }}\n}}\n{}",
+        "x".repeat(300_000),
+        (0..120).map(|i| format!("class B{i} {{ use Big; }}\n")).collect::<String>()
+    );
+    let (out, _, took) = compile_src("trait_big", big);
+    assert!(out.contains("copy more than 32 MB of methods"), "{}", &out[..out.len().min(500)]);
+    assert!(took < Duration::from_secs(60), "took {took:?}");
+    // T30 reaches T0 along 2^30 paths.
+    let mut paths = String::from("<?phv\ntrait T0 {\n    public function f(): int { return 1; }\n}\n");
+    for i in 1..=30 {
+        let p = i - 1;
+        paths += &format!("trait L{i} {{ use T{p}; }}\ntrait R{i} {{ use T{p}; }}\ntrait T{i} {{ use L{i}, R{i}; }}\n");
+    }
+    paths += "class D { use T30; }\necho (new D())->f();\n";
+    let (out, peak, took) = compile_src("trait_paths", paths);
+    assert!(out.contains("inherit more than 200000 members in total"), "{}", &out[..out.len().min(500)]);
+    assert!(peak < 400 << 20, "held {} MB", peak >> 20);
+    assert!(took < Duration::from_secs(60), "took {took:?}");
+    // A few levels are fine: the same method reached twice is one method.
+    let mut few_src = String::from("<?phv\ntrait T0 {\n    public function f(): int { return 1; }\n}\n");
+    for i in 1..=3 {
+        let p = i - 1;
+        few_src +=
+            &format!("trait L{i} {{ use T{p}; }}\ntrait R{i} {{ use T{p}; }}\ntrait T{i} {{ use L{i}, R{i}; }}\n");
+    }
+    few_src += "class D { use T3; }\necho (new D())->f();\n";
+    let (out, _, _) = compile_src("trait_few_paths", few_src);
+    assert_eq!(out, "1");
+    // Traits used inside each other: 256 levels, as classes.
+    let chain = |n: usize| -> String {
+        let mut s = String::from("<?phv\ntrait U0 {\n    public function f(): int { return 7; }\n}\n");
+        for i in 1..n {
+            s += &format!("trait U{i} {{ use U{}; }}\n", i - 1);
+        }
+        s + &format!("class E {{ use U{}; }}\necho (new E())->f();\n", n - 1)
+    };
+    let (out, _, _) = compile_src("trait_chain_ok", chain(256));
+    assert_eq!(out, "7");
+    let (out, peak, _) = compile_src("trait_chain_long", chain(5000));
+    assert!(
+        out.contains("traits are used inside each other more than 256 levels deep"),
+        "{}",
+        &out[..out.len().min(500)]
+    );
+    assert!(peak < 400 << 20, "held {} MB", peak >> 20);
+}
+
 /// The type arguments a class gives its ancestors double with each level of
 /// `class C<T> extends B<fn(T): T>` (25 lines took 7 GB): they are measured
 /// before they are built.

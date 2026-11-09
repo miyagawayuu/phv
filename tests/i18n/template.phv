@@ -1,0 +1,7 @@
+// Messages in a template: the text of messages and parameters is escaped,
+// and t_html() inserts only the Html it is given.
+import std.i18n.set_locale;
+
+echo render("views/cart.phv.html", name: "<Ada & \"Bo\">", count: 1);
+set_locale("ja");
+echo render("views/cart.phv.html", name: "Ada", count: 3);

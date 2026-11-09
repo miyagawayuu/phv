@@ -156,8 +156,10 @@ fn reindent(src: &str) -> Result<String, String> {
     let mut ti = 0;
     let mut blank_run = 0;
     let mut last_kept = false;
-    // Openers unmatched when the current `echo` statement began.
+    // Openers unmatched when the current `echo` statement (or `use` list of
+    // traits, `trait_list`) began.
     let mut echo_at: Option<usize> = None;
+    let mut trait_list = false;
     for (line_no, raw) in src.split_inclusive('\n').enumerate() {
         let line_start = starts[line_no] as usize;
         let line_end = line_start + raw.len();
@@ -200,7 +202,17 @@ fn reindent(src: &str) -> Result<String, String> {
                 Role::None => {}
             }
             match toks[k].tok {
-                Tok::Echo if echo_at.is_none() => echo_at = Some(stack.len()),
+                Tok::Echo if echo_at.is_none() => {
+                    echo_at = Some(stack.len());
+                    trait_list = false;
+                }
+                // `use A, B` of traits in a class body: its later lines continue
+                // it, as those of `echo`; a `{` of rules ends the list.
+                Tok::Use if echo_at.is_none() && k == first_tok => {
+                    echo_at = Some(stack.len());
+                    trait_list = true;
+                }
+                Tok::LBrace if trait_list && echo_at == Some(stack.len() - 1) => echo_at = None,
                 Tok::Semi | Tok::CloseTag if echo_at == Some(stack.len()) => echo_at = None,
                 _ if echo_at.is_some_and(|n| stack.len() < n) => echo_at = None,
                 _ => {}
@@ -547,6 +559,26 @@ mod tests {
         let src = "$xs->sortBy(function ($a, $b): int {\nreturn $a <=> $b;\n});\nif ($ok):\necho 1;\nelse:\necho 2;\nendif;\n?string $x = null;\n";
         let want = "$xs->sortBy(function ($a, $b): int {\n    return $a <=> $b;\n});\nif ($ok):\n    echo 1;\nelse:\n    echo 2;\nendif;\n?string $x = null;\n";
         assert_eq!(format_source(src).unwrap(), want);
+    }
+
+    /// A trait declaration is a block like a class; a `use` list of traits
+    /// continues on the lines it is wrapped on, and its `{ ... }` of rules is a
+    /// block.
+    #[test]
+    fn formats_traits_and_use_lists() {
+        let src = "<?phv\ntrait Hello<T> {\npublic function hi(): string {\nreturn \"hi\";\n}\n  abstract protected function name(): string;\n}\nclass Talker {\nuse Hello<int>, Hey {\nHello::hi insteadof Hey;\n      Hey::hi as protected hey;\n}\nuse One,\nTwo;\npublic function f(): void {\n}\n}\n";
+        let want = "<?phv\ntrait Hello<T> {\n    public function hi(): string {\n        return \"hi\";\n    }\n    abstract protected function name(): string;\n}\nclass Talker {\n    use Hello<int>, Hey {\n        Hello::hi insteadof Hey;\n        Hey::hi as protected hey;\n    }\n    use One,\n        Two;\n    public function f(): void {\n    }\n}\n";
+        assert_eq!(format_source(src).unwrap(), want);
+        assert_eq!(format_source(want).unwrap(), want);
+        // A long list is wrapped after a comma, and its next line indented.
+        wraps(
+            40,
+            "class C {\n    use FirstTrait, SecondTrait, ThirdTrait;\n}\n",
+            "class C {\n    use FirstTrait, SecondTrait,\n        ThirdTrait;\n}\n",
+        );
+        // A closure's `use` is not a list of traits.
+        let src = "$f = function () use ($x): int {\nreturn $x;\n};\n$g = 1;\n";
+        assert_eq!(format_source(src).unwrap(), "$f = function () use ($x): int {\n    return $x;\n};\n$g = 1;\n");
     }
 
     #[test]

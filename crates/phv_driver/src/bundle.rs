@@ -46,8 +46,11 @@ impl Page {
     /// The page ready to run (built-in functions linked, native code compiled).
     pub fn into_compiled(self) -> Result<Compiled, String> {
         let builtins = phv_std::link(&self.program.builtin_names)?;
+        let mut program = self.program;
+        // The pages of a built site share one copy of the catalogs.
+        program.i18n = program.i18n.map(|c| phv_vm::i18n::Shared(phv_std::i18n::share(c.0)));
         let mut c = Compiled {
-            program: Arc::new(self.program),
+            program: Arc::new(program),
             builtins: builtins.into(),
             deps: Vec::new(),
             warnings: String::new(),

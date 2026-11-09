@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-enum Shape {
+pub(crate) enum Shape {
     Int,
     Float,
     Str,
@@ -38,7 +38,7 @@ enum Shape {
     },
 }
 
-enum Missing {
+pub(crate) enum Missing {
     /// Keeps the property's own default.
     Default,
     Required,
@@ -46,13 +46,13 @@ enum Missing {
     Param(usize),
 }
 
-struct Prop {
+pub(crate) struct Prop {
     name: String,
     missing: Missing,
     shape: Shape,
 }
 
-fn shape(d: &mut std::str::Chars) -> Option<Shape> {
+pub(crate) fn shape(d: &mut std::str::Chars) -> Option<Shape> {
     Some(match d.next()? {
         'i' => Shape::Int,
         'f' => Shape::Float,
@@ -84,6 +84,11 @@ fn shape(d: &mut std::str::Chars) -> Option<Shape> {
 fn parse_desc(desc: &str) -> Option<(Shape, HashMap<u32, Vec<Prop>>)> {
     let mut lines = desc.split('\n');
     let top = shape(&mut lines.next()?.chars())?;
+    Some((top, parse_classes(lines)?))
+}
+
+/// The class lines of a description (`cN name:shape,...`).
+pub(crate) fn parse_classes<'a>(lines: impl Iterator<Item = &'a str>) -> Option<HashMap<u32, Vec<Prop>>> {
     let mut classes = HashMap::new();
     for line in lines {
         let (id, fields) = line.strip_prefix('c')?.split_once(' ')?;
@@ -99,7 +104,7 @@ fn parse_desc(desc: &str) -> Option<(Shape, HashMap<u32, Vec<Prop>>)> {
         }
         classes.insert(id.parse().ok()?, props);
     }
-    Some((top, classes))
+    Some(classes)
 }
 
 fn kind(v: &Value) -> &'static str {
@@ -114,13 +119,16 @@ fn kind(v: &Value) -> &'static str {
     }
 }
 
-struct Builder<'a> {
-    classes: &'a HashMap<u32, Vec<Prop>>,
-    defaults: &'a [Value],
+pub(crate) struct Builder<'a> {
+    pub(crate) classes: &'a HashMap<u32, Vec<Prop>>,
+    pub(crate) defaults: &'a [Value],
+    /// What a mismatch is reported as: the exception class and the start of
+    /// its message (`json_decode_as()`).
+    pub(crate) error: (&'static str, &'a str),
     /// Where in the document the value being built is: `$.items[2].name`.
-    path: String,
+    pub(crate) path: String,
     /// Values built so far: the limits are checked every `CHECK_EVERY`.
-    built: usize,
+    pub(crate) built: usize,
 }
 
 /// The time and memory limits are checked after this many values (found by
@@ -138,14 +146,15 @@ impl Builder<'_> {
         } else {
             self.path.clone()
         };
-        vm.throw("ValueError", format!("json_decode_as(): {what} at {path}"))
+        let (class, start) = self.error;
+        vm.throw(class, format!("{start}: {what} at {path}"))
     }
 
     fn expected(&self, vm: &Vm, want: &str, got: &Value) -> VmError {
         self.fail(vm, &format!("expected {want}, found {}", kind(got)))
     }
 
-    fn build(&mut self, vm: &mut Vm, v: &Value, sh: &Shape) -> Result<Value, VmError> {
+    pub(crate) fn build(&mut self, vm: &mut Vm, v: &Value, sh: &Shape) -> Result<Value, VmError> {
         self.built += 1;
         if self.built.is_multiple_of(CHECK_EVERY) {
             vm.check_limits()?;
@@ -308,7 +317,8 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             let v =
                 json_decode_in(vm, s(&a[0]))?.map_err(|e| vm.throw("ValueError", format!("json_decode_as(): {e}")))?;
             let defaults = super::list(&a[2]).clone();
-            Builder { classes: &classes, defaults: &defaults, path: "$".into(), built: 0 }.build(vm, &v, &top)
+            let error = ("ValueError", "json_decode_as()");
+            Builder { classes: &classes, defaults: &defaults, error, path: "$".into(), built: 0 }.build(vm, &v, &top)
         },
         _ => return None,
     };

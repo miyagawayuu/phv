@@ -1,0 +1,185 @@
+error: `Child1::hello` overrides `Parent1::hello` with an incompatible signature
+ --> err_traits.phv:3:21
+  |
+3 |     public function hello(): string {
+  |                     ^^^^^
+  = note: overriding methods must keep the same parameter types and a compatible return type
+  = note: in trait `A`, used by `Child1`
+
+error: method `hello` comes from both trait `A` and trait `B`
+  --> err_traits.phv:16:12
+   |
+16 |     use A, B;
+   |            ^
+   = note: pick one in the `use`: `{ A::hello insteadof B; }`, and keep the other under another name if needed: `B::hello as helloB;`
+
+error: class `NoArea` does not implement Shape::area
+  --> err_traits.phv:28:7
+   |
+28 | class NoArea {
+   |       ^^^^^^
+   = note: implement the methods, or declare the class `abstract`
+
+error: `WrongArea::area` does not match the signature of abstract method `Shape::area`
+  --> err_traits.phv:36:21
+   |
+36 |     public function area(float $scale): float {
+   |                     ^^^^
+   = note: trait `Shape` declares it `(int $scale): float`; the method must keep its parameter types and a compatible return type
+
+error: property `$name` of this trait is not the same as the one of `Clash`
+  --> err_traits.phv:42:5
+   |
+42 |     public string $name = "x";
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: a class and the traits it uses may declare a property of the same name only with the same type, visibility, `readonly` and default value
+   = note: in trait `Named`, used by `Clash`
+
+error: enums cannot have properties
+  --> err_traits.phv:42:5
+   |
+42 |     public string $name = "x";
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: in trait `Named`, used by `Size`
+
+error: `Named` is a trait: it cannot be used as a type
+  --> err_traits.phv:53:15
+   |
+53 | function show(Named $n): void {
+   |               ^^^^^
+   = note: a trait is not a class or a type; its members are copied into the classes that `use Named;`, and an interface they implement can be the type
+
+error: cannot create an instance of `Named`: it is a trait
+  --> err_traits.phv:56:10
+   |
+56 | $x = new Named();
+   |          ^^^^^
+
+error: `Named` is a trait: `is` cannot test for it
+  --> err_traits.phv:58:11
+   |
+58 | if ($y is Named) {
+   |           ^^^^^
+   = note: a trait is not a class or a type; its members are copied into the classes that `use Named;`, and an interface they implement can be the type
+
+error: `A` is a trait: its methods are called through a class that uses it
+  --> err_traits.phv:61:6
+   |
+61 | echo A::hello();
+   |      ^
+   = note: a trait is not a class or a type; its members are copied into the classes that `use A;`, and an interface they implement can be the type
+
+error: a class cannot extend a trait; write `use A;` in its body
+  --> err_traits.phv:63:19
+   |
+63 | class Ext extends A {
+   |                   ^
+
+error: `A` is not an interface
+  --> err_traits.phv:66:23
+   |
+66 | class Impl implements A {
+   |                       ^
+   = note: a trait is used in the class body: `use A;`
+
+error: `Ext` is not a trait
+  --> err_traits.phv:70:9
+   |
+70 |     use Ext;
+   |         ^^^
+
+error: trait `Loop` uses itself
+  --> err_traits.phv:74:9
+   |
+74 |     use Loop;
+   |         ^^^^
+
+error: a trait cannot declare a constructor
+  --> err_traits.phv:78:21
+   |
+78 |     public function __construct() {
+   |                     ^^^^^^^^^^^
+   = note: declare the constructor in the class that uses the trait; it initializes the trait's properties
+
+error: class `HasMissing` has no method `missing`
+  --> err_traits.phv:85:23
+   |
+85 |         return $this->missing();
+   |                       ^^^^^^^
+   = note: in trait `Uses`, used by `HasMissing`
+
+error: method `hello` comes from both trait `A` and trait `B`
+  --> err_traits.phv:94:12
+   |
+94 |     use A, B {
+   |            ^
+   = note: pick one in the `use`: `{ A::hello insteadof B; }`, and keep the other under another name if needed: `B::hello as helloB;`
+
+error: trait `C` is not used here
+  --> err_traits.phv:95:9
+   |
+95 |         C::hello insteadof A;
+   |         ^
+   = note: a rule can name only the traits of this class's `use`
+
+error: `hello` is a method of both `A` and `B`
+  --> err_traits.phv:96:9
+   |
+96 |         hello as hi;
+   |         ^^^^^
+   = note: name the trait: `A::hello as ...;`
+
+error: trait `A` has no method `bye`
+  --> err_traits.phv:97:12
+   |
+97 |         A::bye as hello2;
+   |            ^^^
+
+error: an abstract method of a trait cannot be static
+   --> err_traits.phv:120:37
+    |
+120 |     abstract public static function make(): int;
+    |                                     ^^^^
+
+error: `Holds` takes 1 type argument
+   --> err_traits.phv:130:9
+    |
+130 |     use Holds;
+    |         ^^^^^
+
+error: `int` has no methods
+   --> err_traits.phv:140:20
+    |
+140 |         return $x->area();
+    |                    ^^^^
+    = note: in trait `Measures`, used by `Ruler`
+
+error: unknown type `T`
+   --> err_traits.phv:143:33
+    |
+143 |     public static function make(T $x): int {
+    |                                 ^
+    = note: in trait `Measures`, used by `Ruler`
+
+error: `int` does not satisfy the bound `T: Shaped` of `Measures`
+   --> err_traits.phv:149:9
+    |
+149 |     use Measures<int>;
+    |         ^^^^^^^^
+
+error: constant `MAX` of this trait is not the same as the one of `Capped`
+   --> err_traits.phv:154:11
+    |
+154 |     const MAX = 1;
+    |           ^^^
+    = note: a class and the traits it uses may declare a constant of the same name only with the same value
+    = note: in trait `Limits`, used by `Capped`
+
+error: method `hello` comes from both trait `A` and trait `B`
+   --> err_traits.phv:165:12
+    |
+165 |     use A, B;
+    |            ^
+    = note: pick one in the `use`: `{ A::hello insteadof B; }`, and keep the other under another name if needed: `B::hello as helloB;`
+
+27 errors found

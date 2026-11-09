@@ -1,0 +1,337 @@
+<?phv
+// std.orm on SQLite: entities, every property type, conditions, ordering and
+// paging, updates of changed columns, keys, rollbacks, mismatches and limits.
+// (tests/db/orm_postgres.phv and orm_mysql.phv do the same on the servers.)
+import std.db.Database;
+import std.orm.Repo;
+
+enum Status: string {
+    case Open = "open";
+    case Closed = "closed";
+}
+
+enum Level: int {
+    case Low = 1;
+    case High = 2;
+}
+
+enum Mood {
+    case Happy;
+    case Sad;
+}
+
+class Point {
+    public function __construct(public int $x = 0, public int $y = 0) {}
+}
+
+type Email = string;
+
+/** Every type a property can have. */
+#[Table("things")]
+class Thing {
+    public ?int $id = null;
+    public int $count = 0;
+    public float $ratio = 0.0;
+    public string $name = "";
+    public bool $active = false;
+    public ?int $maybeInt = null;
+    public ?float $maybeFloat = null;
+    public ?string $maybeText = null;
+    public ?bool $maybeBool = null;
+    public ?Status $maybeStatus = null;
+    public list<string> $tags = [];
+    public map<string, int> $scores = [];
+    public map<int, string> $names = [];
+    public set<int> $ids = [];
+    public set<string> $words = [];
+    public ?Point $home = null;
+    public list<Point> $path = [];
+    public any $extra = null;
+    #[Column("mail")]
+    public Email $email = "";
+
+    public function __construct(
+        public Status $status,
+        public Level $level,
+        public Mood $mood,
+        public readonly string $code = "c",
+    ) {}
+}
+
+/** A key the program gives, and names that are SQL keywords. */
+#[Table("order")]
+class Order {
+    #[Id, Column("select")]
+    public string $number = "";
+    #[Column("group")]
+    public int $from = 0;
+    public ?string $where = null;
+}
+
+/** A column the table does not have: an error, not a string (SQLite reads an unknown "name" as one). */
+#[Table("things")]
+class Misspelled {
+    public ?int $id = null;
+    #[Column("emial")]
+    public string $email = "";
+}
+
+/** A string key the database makes. */
+#[Table("tokens")]
+class Token {
+    public ?string $id = null;
+    public string $label = "";
+}
+
+$db = Database::open(":memory:");
+$db->execute(sql"CREATE TABLE things (
+    id INTEGER PRIMARY KEY, count INTEGER NOT NULL, ratio REAL, name TEXT, active INTEGER,
+    maybeInt INTEGER, maybeFloat REAL, maybeText TEXT, maybeBool INTEGER, maybeStatus TEXT,
+    tags TEXT, scores TEXT, names TEXT, ids TEXT, words TEXT, home TEXT, path TEXT, extra TEXT,
+    mail TEXT UNIQUE, status TEXT, level INTEGER, mood TEXT, code TEXT
+)");
+$db->execute(sql"CREATE TABLE \"order\" (\"select\" TEXT PRIMARY KEY, \"group\" INTEGER, \"where\" TEXT)");
+$db->execute(sql"CREATE TABLE tokens (id TEXT PRIMARY KEY DEFAULT 'tok-made', label TEXT)");
+$things = new Repo<Thing>($db);
+
+function show(Thing $t): void {
+    echo $t->id ?? 0, ": ", $t->name, " count=", $t->count, " ratio=", $t->ratio, " active=", $t->active ? "yes" : "no",
+        " maybe=", json_encode([$t->maybeInt, $t->maybeFloat, $t->maybeText, $t->maybeBool, $t->maybeStatus]),
+        " tags=", json_encode($t->tags), " scores=", json_encode($t->scores), " names=", json_encode($t->names),
+        " ids=", json_encode($t->ids), " words=", json_encode($t->words), " home=", json_encode($t->home),
+        " path=", json_encode($t->path), " extra=", json_encode($t->extra), " email=", $t->email,
+        " status=", $t->status->value, " level=", $t->level->value, " mood=", $t->mood->name, " code=", $t->code, "\n";
+}
+
+function names(list<Thing> $ts): string {
+    return implode(" ", $ts->map(fn($t) => $t->name));
+}
+
+echo "--- insert and find\n";
+$a = new Thing(Status::Open, Level::High, Mood::Happy, "a1");
+$a->count = 3;
+$a->ratio = 0.5;
+$a->name = "first";
+$a->active = true;
+$a->tags = ["x", "y"];
+$a->scores = ["math" => 90];
+$a->names = [7 => "seven"];
+$a->ids = set([3, 1]);
+$a->words = set(["hi"]);
+$a->home = new Point(1, 2);
+$a->path = [new Point(3, 4)];
+$a->extra = ["any" => [1, true]];
+$a->email = "a@example.com";
+$things->insert($a);
+echo "key set: ", $a->id ?? 0, "\n";
+$b = new Thing(Status::Closed, Level::Low, Mood::Sad);
+$b->name = "second";
+$b->count = 1;
+$b->maybeInt = 5;
+$b->maybeFloat = 2.5;
+$b->maybeText = "text";
+$b->maybeBool = false;
+$b->maybeStatus = Status::Open;
+$b->email = "b@example.com";
+$things->insert($b);
+$c = new Thing(Status::Open, Level::Low, Mood::Happy);
+$c->name = "third";
+$c->count = 2;
+$c->email = "c@example.com";
+$things->insert($c);
+foreach ([1, 2, 3] as $id) {
+    $t = $things->find($id);
+    if ($t != null) {
+        show($t);
+    }
+}
+echo "missing row: ", $things->find(99) == null ? "null" : "found", "\n";
+echo "the row as stored: ", json_encode($db->first(sql"SELECT * FROM things WHERE id = 1")?->toMap()), "\n";
+
+echo "--- conditions, ordering, paging, count\n";
+$min = 2;
+echo "count: ", $things->count(), " ", $things->count(sql"count >= {$min}"), "\n";
+echo "by name desc: ", names($things->findBy(orderBy: "name desc")), "\n";
+echo "by status, count: ", names($things->findBy(orderBy: "status ASC, count")), "\n";
+echo "page 2: ", names($things->findBy(orderBy: "id", limit: 2, offset: 2)), "\n";
+echo "offset only: ", names($things->findBy(orderBy: "id", offset: 1)), "\n";
+echo "limit 0: ", count($things->findBy(limit: 0)), "\n";
+echo "where: ", names($things->findBy(sql"count < {$min}", "name")), "\n";
+$mail = "c@example.com";
+echo "by column: ", $things->findOneBy($things->column("email") . sql" = {$mail}")?->name ?? "none", "\n";
+echo "none: ", $things->findOneBy(sql"1 = 0")?->name ?? "none", "\n";
+echo "in: ", names($things->findBy($things->in("id", [3, 1]), "id")), "\n";
+echo "in enums: ", names($things->findBy($things->in("status", [Status::Closed]))), "\n";
+echo "in levels: ", $things->count($things->in("level", [Level::High])), "\n";
+echo "in pure enums: ", $things->count($things->in("mood", [Mood::Sad])), "\n";
+list<int> $noIds = [];
+echo "in nothing: ", $things->count($things->in("id", $noIds)), "\n";
+echo "a comment ends a condition: ", $things->count(sql"count > 0 -- a comment"), "\n";
+echo "a join: ";
+foreach ($db->query(sql"SELECT t.* FROM things t JOIN things u ON u.id = t.id WHERE t.count > 1 ORDER BY t.id") as $row) {
+    echo $things->fromRow($row)->name, " ";
+}
+echo "\n";
+
+echo "--- updates write the columns that changed\n";
+$t = $things->find(1);
+if ($t != null) {
+    echo "unchanged: ", $things->update($t) ? "written" : "nothing", "\n";
+    // Another writer changes the name meanwhile; this update writes only `count`.
+    $db->execute(sql"UPDATE things SET name = 'renamed elsewhere' WHERE id = 1");
+    $t->count = 30;
+    $t->tags[] = "z";
+    echo "changed: ", $things->update($t) ? "written" : "nothing", "\n";
+    echo "again: ", $things->update($t) ? "written" : "nothing", "\n";
+    echo "row: ", json_encode($db->first(sql"SELECT name, count, tags FROM things WHERE id = 1")?->toMap()), "\n";
+}
+// An entity this Repo did not read: every column is written.
+$fresh = new Thing(Status::Closed, Level::Low, Mood::Sad, "z9");
+$fresh->id = 2;
+$fresh->name = "replaced";
+$fresh->email = "b@example.com";
+echo "not read here: ", $things->update($fresh) ? "written" : "nothing", "\n";
+show($things->find(2) ?? $fresh);
+$gone = new Thing(Status::Open, Level::Low, Mood::Happy);
+$gone->id = 77;
+echo "no such row: ", $things->update($gone) ? "written" : "nothing", "\n";
+
+echo "--- keys\n";
+$orders = new Repo<Order>($db);
+$o = new Order();
+$o->number = "A-1";
+$o->from = 5;
+$orders->insert($o);
+$o2 = $orders->find("A-1");
+echo "keyword names: ", $o2?->number ?? "-", " ", $o2?->from ?? 0, " ", $o2?->where ?? "null", "\n";
+if ($o2 != null) {
+    $o2->where = "here";
+    echo "update: ", $orders->update($o2) ? "written" : "nothing", "\n";
+}
+echo "ordered: ", count($orders->findBy(orderBy: "from desc, where")), "\n";
+$tokens = new Repo<Token>($db);
+$k = new Token();
+$k->label = "made by the database";
+$tokens->insert($k);
+echo "string key made: ", $k->id ?? "null", "\n";
+$k2 = new Token();
+$k2->id = "given";
+$tokens->insert($k2);
+echo "string key given: ", $tokens->find("given")?->id ?? "null", " count ", $tokens->count(), "\n";
+echo "deleted: ", $tokens->delete($k2) ? "yes" : "no", " again: ", $tokens->delete($k2) ? "yes" : "no", "\n";
+
+echo "--- a unique violation\n";
+$dup = new Thing(Status::Open, Level::Low, Mood::Happy);
+$dup->email = "a@example.com";
+try {
+    $things->insert($dup);
+} catch (DatabaseError $e) {
+    echo "DatabaseError: ", $e->getMessage(), "\n";
+}
+echo "no key set: ", $dup->id ?? "null", "\n";
+
+echo "--- a transaction rolled back\n";
+$t = $things->find(3);
+if ($t != null) {
+    try {
+        $db->transaction(function () use ($things, $t): void {
+            $n = new Thing(Status::Open, Level::Low, Mood::Happy);
+            $n->email = "rolled@example.com";
+            $things->insert($n);
+            $t->name = "renamed in the transaction";
+            $things->update($t);
+            throw new RuntimeException("stop");
+        });
+    } catch (RuntimeException $e) {
+        echo "rolled back: ", $e->getMessage(), "\n";
+    }
+    echo "rows: ", $things->count(), " name in the row: ", $db->first(sql"SELECT name FROM things WHERE id = 3")?->string("name") ?? "-", "\n";
+    // What the Repo saw inside the transaction is forgotten: the name is written again.
+    echo "after the rollback: ", $things->update($t) ? "written" : "nothing", "\n";
+    echo "name in the row: ", $db->first(sql"SELECT name FROM things WHERE id = 3")?->string("name") ?? "-", "\n";
+    $db->transaction(function () use ($things, $t): void {
+        $t->count = 9;
+        $things->update($t);
+    });
+    echo "committed: ", $things->find(3)?->count ?? 0, "\n";
+}
+
+echo "--- rows that do not fit the class\n";
+function bad(Repo<Thing> $things, Database $db, Sql $change): void {
+    $db->execute($change);
+    try {
+        $things->find(3);
+        echo "fits\n";
+    } catch (DatabaseError $e) {
+        echo "DatabaseError: ", $e->getMessage(), "\n";
+    }
+    $db->execute(sql"UPDATE things SET count = 1, name = 'x', ratio = 0.5, active = 0, status = 'open', level = 1, mood = 'Happy', tags = '[]', maybeInt = NULL WHERE id = 3");
+}
+bad($things, $db, sql"UPDATE things SET count = 'many' WHERE id = 3");
+bad($things, $db, sql"UPDATE things SET count = 1.5 WHERE id = 3");
+bad($things, $db, sql"UPDATE things SET name = NULL WHERE id = 3");
+bad($things, $db, sql"UPDATE things SET ratio = 'high' WHERE id = 3");
+bad($things, $db, sql"UPDATE things SET active = 2 WHERE id = 3");
+bad($things, $db, sql"UPDATE things SET status = 'lost' WHERE id = 3");
+bad($things, $db, sql"UPDATE things SET level = 3 WHERE id = 3");
+bad($things, $db, sql"UPDATE things SET mood = 'Angry' WHERE id = 3");
+bad($things, $db, sql"UPDATE things SET tags = 'not json' WHERE id = 3");
+bad($things, $db, sql"UPDATE things SET tags = '[1, 2]' WHERE id = 3");
+bad($things, $db, sql"UPDATE things SET home = '{\"x\": 5}' WHERE id = 3");
+bad($things, $db, sql"UPDATE things SET maybeInt = 'x' WHERE id = 3");
+echo "home with a default: ", json_encode($things->find(3)?->home), "\n";
+try {
+    foreach ($db->query(sql"SELECT id, name FROM things") as $row) {
+        $things->fromRow($row);
+    }
+} catch (DatabaseError $e) {
+    echo "DatabaseError: ", $e->getMessage(), "\n";
+}
+
+$misspelled = new Repo<Misspelled>($db);
+foreach ([fn() => $misspelled->count($misspelled->column("email") . sql" = 'emial'"), fn() => count($misspelled->findBy())] as $f) {
+    try {
+        $n = $f();
+        echo "counted ", $n, "\n";
+    } catch (DatabaseError $e) {
+        echo "DatabaseError: ", $e->getMessage(), "\n";
+    }
+}
+
+echo "--- refusals and limits\n";
+function refused(fn(): void $f): void {
+    try {
+        $f();
+        echo "accepted\n";
+    } catch (ValueError $e) {
+        echo "ValueError: ", $e->getMessage(), "\n";
+    }
+}
+refused(fn() => $things->findBy(orderBy: "nope"));
+refused(fn() => $things->findBy(orderBy: "name; DROP TABLE things"));
+refused(fn() => $things->findBy(orderBy: "name sideways"));
+refused(fn() => $things->findBy(orderBy: "name,"));
+refused(fn() => $things->findBy(orderBy: implode(", ", range(1, 17)->map(fn($i) => "name"))));
+refused(fn() => $things->findBy(orderBy: implode(", ", range(1, 16)->map(fn($i) => "name"))));
+refused(fn() => $things->findBy(orderBy: str_repeat(" ", 1020) . "name "));
+refused(fn() => $things->findBy(limit: -1));
+refused(fn() => $things->findBy(offset: -1));
+refused(fn() => $things->column("mail"));
+refused(fn() => $things->column("email\" OR 1=1"));
+refused(fn() => $things->in("nope", [1]));
+refused(fn() => $things->in("tags", ["x"]));
+refused(fn() => $things->in("id", ["1"]));
+refused(fn() => $things->in("status", ["open"]));
+refused(fn() => $things->in("status", [Level::Low]));
+refused(fn() => $things->in("id", range(1, 1001)));
+refused(fn() => $things->count($things->in("id", range(1, 1000))));
+refused(fn() => $things->find("1"));
+refused(fn() => $orders->find(1));
+refused(fn() => $things->update(new Thing(Status::Open, Level::Low, Mood::Happy)));
+refused(fn() => $things->delete(new Thing(Status::Open, Level::Low, Mood::Happy)));
+echo "--- delete\n";
+$t = $things->find(1);
+if ($t != null) {
+    echo "deleted: ", $things->delete($t) ? "yes" : "no", " again: ", $things->delete($t) ? "yes" : "no", "\n";
+}
+echo "left: ", $things->count(), "\n";

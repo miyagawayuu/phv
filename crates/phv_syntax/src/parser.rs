@@ -717,6 +717,7 @@ impl Parser {
                 self.semi()?;
                 StmtKind::Throw(e)
             }
+            Tok::Yield => self.yield_stmt()?,
             Tok::LBrace => StmtKind::Block(self.block()?),
             Tok::Semi => {
                 self.bump();
@@ -743,6 +744,9 @@ impl Parser {
             Tok::Class | Tok::Interface | Tok::Enum | Tok::Abstract | Tok::Final => {
                 StmtKind::Class(Box::new(self.class_decl(false)?))
             }
+            Tok::Ident(ref name) if name == "trait" && self.at_trait(0) => {
+                StmtKind::Class(Box::new(self.class_decl(false)?))
+            }
             Tok::Const => StmtKind::Const(Box::new(self.const_decl(false)?)),
             Tok::Ident(ref name) if name == "type" && self.at_type_alias(0) => {
                 StmtKind::TypeAlias(Box::new(self.type_alias(false)?))
@@ -754,6 +758,9 @@ impl Parser {
                         StmtKind::Function(Box::new(self.function_decl(true, Visibility::Public, false)?))
                     }
                     Tok::Class | Tok::Interface | Tok::Enum | Tok::Abstract | Tok::Final => {
+                        StmtKind::Class(Box::new(self.class_decl(true)?))
+                    }
+                    Tok::Ident(name) if name == "trait" && self.at_trait(0) => {
                         StmtKind::Class(Box::new(self.class_decl(true)?))
                     }
                     Tok::Const => StmtKind::Const(Box::new(self.const_decl(true)?)),
@@ -777,6 +784,36 @@ impl Parser {
             }
         };
         Ok(Stmt { out: None, kind, span: start.to(self.prev_span()) })
+    }
+
+    /// `yield $value;`, `yield $key => $value;` or `yield from $values;`. `from`
+    /// is a keyword only here (`Status::from()` and a function named `from`
+    /// keep their meaning).
+    fn yield_stmt(&mut self) -> PResult<StmtKind> {
+        let span = self.bump();
+        if self.is_template {
+            let mut d = Diagnostic::error("`yield` cannot be used in a template", span);
+            d.add_note("write the generator in a `.phv` module and loop over it in the template");
+            self.diags.push(d);
+        }
+        if matches!(self.peek(), Tok::Semi | Tok::CloseTag | Tok::Eof) {
+            return Err(self.error_here("`yield` needs a value: `yield $value;`"));
+        }
+        let from = matches!(self.peek(), Tok::Ident(n) if n == "from")
+            && !matches!(self.peek_at(1), Tok::Semi | Tok::CloseTag | Tok::Eof | Tok::FatArrow);
+        let kind = if from {
+            self.bump();
+            StmtKind::YieldFrom(self.expr()?)
+        } else {
+            let first = self.expr()?;
+            if self.eat(&Tok::FatArrow) {
+                StmtKind::Yield { key: Some(first), value: self.expr()? }
+            } else {
+                StmtKind::Yield { key: None, value: first }
+            }
+        };
+        self.semi()?;
+        Ok(kind)
     }
 
     /// Assignment, increment/decrement, typed declaration or expression statement.
@@ -1100,10 +1137,16 @@ impl Parser {
                     .note("an abstract class must be extended to be used"),
             );
         }
+        let is_trait = matches!(self.peek(), Tok::Ident(n) if n == "trait");
         match self.peek() {
             Tok::Interface | Tok::Enum if is_final => {
                 let what = if self.at(&Tok::Interface) { "interfaces" } else { "enums" };
                 self.diags.push(Diagnostic::error(format!("{what} cannot be `final`"), start));
+            }
+            _ if is_trait && (is_final || kind == ClassKind::Abstract) => {
+                self.diags.push(Diagnostic::error("a trait cannot be `abstract` or `final`", start).note(
+                    "a trait is never instantiated or extended: its members are copied into the classes that use it",
+                ));
             }
             _ => {}
         }
@@ -1111,6 +1154,7 @@ impl Parser {
             Tok::Interface => kind = ClassKind::Interface,
             Tok::Enum => kind = ClassKind::Enum,
             Tok::Class => {}
+            _ if is_trait => kind = ClassKind::Trait,
             other => {
                 let found = other.describe();
                 return Err(self.error_here(format!("expected `class`, `interface` or `enum`, found {found}")));
@@ -1127,6 +1171,12 @@ impl Parser {
         let mut parent_args = Vec::new();
         let mut interfaces = Vec::new();
         let mut interface_args = Vec::new();
+        if kind == ClassKind::Trait && matches!(self.peek(), Tok::Extends | Tok::Implements) {
+            self.diags.push(
+                Diagnostic::error("a trait cannot extend a class or implement an interface", self.span())
+                    .note("the classes that use the trait can: `class C extends B implements I { use T; }`"),
+            );
+        }
         if self.eat(&Tok::Extends) {
             if kind == ClassKind::Interface {
                 loop {
@@ -1155,6 +1205,7 @@ impl Parser {
         let mut methods = Vec::new();
         let mut consts = Vec::new();
         let mut cases = Vec::new();
+        let mut uses = Vec::new();
         while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
             let member_start = self.pos;
             let mstart = self.span();
@@ -1165,6 +1216,21 @@ impl Parser {
                     continue;
                 }
             };
+            if self.at(&Tok::Use) {
+                if let Some(a) = attrs.first() {
+                    self.diags.push(Diagnostic::error("annotations cannot be written before `use`", a.span));
+                }
+                if kind == ClassKind::Interface {
+                    self.diags.push(Diagnostic::error("an interface cannot use traits", mstart).note(
+                        "an interface declares methods without bodies; use the trait in the classes that implement it",
+                    ));
+                }
+                match self.trait_use() {
+                    Ok(u) => uses.push(u),
+                    Err(_) => self.recover(member_start),
+                }
+                continue;
+            }
             if let (Some(a), Tok::Case | Tok::RBrace) = (attrs.first(), self.peek()) {
                 self.diags.push(Diagnostic::error("annotations cannot be written before an enum case", a.span));
             }
@@ -1276,6 +1342,7 @@ impl Parser {
             parent_args,
             interfaces,
             interface_args,
+            uses,
             props,
             methods,
             consts,
@@ -1284,6 +1351,88 @@ impl Parser {
             exported,
             span: start.to(self.prev_span()),
         })
+    }
+
+    /// `trait Name {` or `trait Name<`: `trait` is only a keyword here.
+    fn at_trait(&self, at: usize) -> bool {
+        matches!(self.peek_at(at + 1), Tok::Ident(_)) && matches!(self.peek_at(at + 2), Tok::LBrace | Tok::Lt)
+    }
+
+    /// `use A, B<int>;` or `use A, B { A::m insteadof B; B::m as protected n; }`
+    /// in a class body.
+    fn trait_use(&mut self) -> PResult<TraitUse> {
+        let start = self.expect(Tok::Use)?;
+        let mut traits = Vec::new();
+        loop {
+            let (name, span) = self.expect_ident("a trait name")?;
+            let args = self.type_args()?;
+            traits.push(TraitRef { name, span, args });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        let mut rules = Vec::new();
+        if self.eat(&Tok::LBrace) {
+            while !self.at(&Tok::RBrace) && !self.at(&Tok::Eof) {
+                let rule_start = self.pos;
+                match self.trait_rule() {
+                    Ok(r) => rules.push(r),
+                    Err(_) => self.recover(rule_start),
+                }
+            }
+            self.expect(Tok::RBrace)?;
+            // PHP writes no `;` after the block; one is allowed.
+            self.eat(&Tok::Semi);
+        } else {
+            self.expect(Tok::Semi)?;
+        }
+        Ok(TraitUse { traits, rules, span: start.to(self.prev_span()) })
+    }
+
+    /// One rule of a `use` block: `A::m insteadof B, C;` or `[A::]m as [visibility] [alias];`.
+    fn trait_rule(&mut self) -> PResult<TraitRule> {
+        let start = self.span();
+        let (from, method) = if matches!(self.peek_at(1), Tok::DoubleColon) {
+            let from = self.expect_ident("a trait name")?;
+            self.bump();
+            (Some(from), self.member_name()?)
+        } else {
+            (None, self.member_name()?)
+        };
+        if matches!(self.peek(), Tok::Ident(n) if n == "insteadof") {
+            self.bump();
+            let Some(from) = from else {
+                return Err(self.error_here("`insteadof` needs the trait whose method is kept: `A::name insteadof B;`"));
+            };
+            let mut excluded = Vec::new();
+            loop {
+                excluded.push(self.expect_ident("a trait name")?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::Semi)?;
+            return Ok(TraitRule::Insteadof { from, method, excluded, span: start.to(self.prev_span()) });
+        }
+        if !self.eat(&Tok::As) {
+            let found = self.peek().describe();
+            return Err(self.error_here(format!("expected `insteadof` or `as`, found {found}")));
+        }
+        let vis = match self.peek() {
+            Tok::Public => Some(Visibility::Public),
+            Tok::Protected => Some(Visibility::Protected),
+            Tok::Private => Some(Visibility::Private),
+            _ => None,
+        };
+        if vis.is_some() {
+            self.bump();
+        }
+        let alias = if self.at(&Tok::Semi) { None } else { Some(self.member_name()?) };
+        if vis.is_none() && alias.is_none() {
+            return Err(self.error_here("expected a visibility or a new name after `as`"));
+        }
+        self.expect(Tok::Semi)?;
+        Ok(TraitRule::As { from, method, vis, alias, span: start.to(self.prev_span()) })
     }
 
     /// `type Name =` or `type Name<`: `type` is only a keyword here.
@@ -1647,6 +1796,16 @@ impl Parser {
                 self.bump();
                 ExprKind::Throw(Box::new(self.expr_bp(0)?))
             }
+            Tok::Yield => {
+                if !self.halted {
+                    let mut d = Diagnostic::error("`yield` is a statement in PHV, not an expression", start);
+                    d.add_note(
+                        "write `yield $value;` on its own: a generator does not receive values (there is no `send()`)",
+                    );
+                    self.diags.push(d);
+                }
+                return Err(PErr);
+            }
             _ => return self.postfix(),
         };
         Ok(Expr { kind, span: start.to(self.prev_span()) })
@@ -1794,6 +1953,7 @@ impl Parser {
             | Tok::Try
             | Tok::Catch
             | Tok::Throw
+            | Tok::Yield
             | Tok::Interface
             | Tok::Enum
             | Tok::Case

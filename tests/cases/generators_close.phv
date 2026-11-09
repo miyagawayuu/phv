@@ -1,0 +1,63 @@
+<?phv
+function g(): Generator<int> {
+    try {
+        try {
+            yield 1;
+            yield 2;
+        } catch (Exception $e) {
+            echo "never caught here: ", $e->getMessage(), "\n";
+        } finally {
+            echo "inner finally\n";
+            throw new ValueError("from finally");
+        }
+    } finally {
+        echo "outer finally\n";
+    }
+}
+try {
+    foreach (g() as $v) {
+        echo "got $v\n";
+        break;
+    }
+    echo "not reached\n";
+} catch (ValueError $e) {
+    echo "caught: ", $e->getMessage(), "\n";
+}
+// The loop's own exception is replaced by the one the closing throws, as a `finally` would.
+try {
+    foreach (g() as $v) {
+        throw new RuntimeException("from the loop");
+    }
+} catch (Exception $e) {
+    echo "caught: ", $e->getMessage(), "\n";
+}
+// A generator closed while the loop returns a value.
+function pick(): int {
+    foreach (g2() as $v) {
+        return $v * 100;
+    }
+    return 0;
+}
+function g2(): Generator<int> {
+    try {
+        yield 7;
+    } finally {
+        echo "g2 finally\n";
+    }
+}
+echo pick(), "\n";
+// Captured variables and $this survive suspension.
+class Counter {
+    public int $calls = 0;
+    public function up(int $to): Generator<int> {
+        for ($i = 0; $i < $to; $i++) {
+            $this->calls++;
+            yield $this->calls;
+        }
+    }
+}
+$c = new Counter();
+foreach ($c->up(3) as $n) {
+    $c->calls += 10;
+    echo "n=$n calls=", $c->calls, "\n";
+}

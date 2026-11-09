@@ -10,15 +10,19 @@
 
 mod expr;
 mod flow;
+mod messages;
+mod orm;
 mod pmap;
 mod sig;
 mod stmt;
+mod traits;
 
 use crate::builtins::{BuiltinSig, Recv, BUILTINS};
 use crate::hir::*;
 use crate::index::{EditorIndex, Item, ItemKind, Member, MemberSite, VarScope};
 use crate::types::*;
 use flow::FnCtx;
+pub use messages::{MessageKey, Messages};
 use phv_syntax::ast::{
     self, BinOp, ClassDecl, ClassKind, ExprKind, FunctionDecl, StmtKind, TypeExpr, TypeExprKind, UnOp, Visibility,
 };
@@ -53,6 +57,9 @@ pub struct CheckInput<'a> {
     pub imports: HashMap<String, usize>,
     /// Normalized template path to module index.
     pub templates: HashMap<String, usize>,
+    /// The messages of the default catalog of `[i18n]`, when the program
+    /// imports `std.i18n` (see `messages`).
+    pub messages: Option<Messages>,
 }
 
 pub fn check(input: &CheckInput) -> (HProgram, Vec<Diagnostic>) {
@@ -229,6 +236,12 @@ pub(crate) struct Checker<'a> {
     /// `#[Test]` and `#[Skip]` functions.
     tests: Vec<(FuncId, Option<String>)>,
     hooks: Vec<(FuncId, bool)>,
+    /// std.orm: the table of each class marked `#[Table]`, the columns of
+    /// properties marked `#[Column]` and the properties marked `#[Id]`
+    /// (`(owner, name)`).
+    orm_tables: HashMap<ClassId, String>,
+    orm_columns: HashMap<(ClassId, String), String>,
+    orm_ids: HashSet<(ClassId, String)>,
     /// Names each module has looked up in its own scope (`(module, name)`),
     /// to tell which imports are used. Lookups take `&self`, hence the cell.
     /// The names each module used (only the project's modules are recorded).
@@ -252,6 +265,24 @@ pub(crate) struct Checker<'a> {
     /// Nodes of the large types of expressions so far (see `MAX_TYPE_TOTAL`).
     type_nodes: usize,
     reported_type_nodes: bool,
+    /// While a member of a generic trait is resolved or checked for a class
+    /// that uses it: what the trait's type parameters stand for.
+    trait_subst: Vec<(Name, Type)>,
+    /// The methods copied from a trait: the trait that declares each, and what
+    /// its type parameters stand for in the class.
+    func_trait: HashMap<FuncId, (ClassId, Vec<(Name, Type)>)>,
+    /// Bytes of trait methods copied into classes so far (see `traits::MAX_TRAIT_CODE`).
+    trait_code: usize,
+    reported_trait_code: bool,
+}
+
+/// A method of a class: its own, or one it takes from a trait (with the
+/// trait and what its type parameters stand for).
+struct MethodSrc<'a> {
+    decl: &'a FunctionDecl,
+    name: String,
+    vis: Visibility,
+    trait_: Option<(ClassId, Vec<(Name, Type)>)>,
 }
 
 /// What an annotation can be written before.
@@ -273,10 +304,14 @@ struct Annotations {
     skip: Option<String>,
     before: bool,
     after: bool,
+    /// std.orm: `#[Table("users")]`, `#[Column("user_name")]`, `#[Id]`.
+    table: Option<String>,
+    column: Option<String>,
+    id: bool,
 }
 
 /// Annotations PHV knows; any other name is an error (a typo would otherwise be ignored).
-const ANNOTATIONS: &str = "Deprecated, Override, Test, Skip, Before, After";
+const ANNOTATIONS: &str = "Deprecated, Override, Test, Skip, Before, After, Table, Column, Id";
 
 /// Members (fields, methods, constants) all classes may inherit together.
 const MAX_INHERITED_MEMBERS: usize = 200_000;
@@ -368,6 +403,9 @@ impl<'a> Checker<'a> {
             deprecated_fields: HashMap::new(),
             tests: Vec::new(),
             hooks: Vec::new(),
+            orm_tables: HashMap::new(),
+            orm_columns: HashMap::new(),
+            orm_ids: HashSet::new(),
             used_names: RefCell::new(HashMap::new()),
             prelude_module: input.modules.iter().position(|m| m.kind == ModuleKind::Prelude),
             aliases: Vec::new(),
@@ -380,6 +418,10 @@ impl<'a> Checker<'a> {
             const_bytes: 0,
             type_nodes: 0,
             reported_type_nodes: false,
+            trait_subst: Vec::new(),
+            func_trait: HashMap::new(),
+            trait_code: 0,
+            reported_trait_code: false,
         }
     }
 
@@ -397,6 +439,8 @@ impl<'a> Checker<'a> {
                 "Deprecated" => &[AnnTarget::Function, AnnTarget::Method, AnnTarget::Class, AnnTarget::Property],
                 "Override" => &[AnnTarget::Method],
                 "Test" | "Skip" | "Before" | "After" => &[AnnTarget::Function],
+                "Table" => &[AnnTarget::Class],
+                "Column" | "Id" => &[AnnTarget::Property],
                 _ => {
                     self.error(format!("unknown annotation `#[{}]`", a.name), a.name_span)
                         .add_note(format!("PHV knows {ANNOTATIONS}"));
@@ -412,6 +456,32 @@ impl<'a> Checker<'a> {
                     AnnTarget::Const => "a constant",
                 };
                 self.error(format!("`#[{}]` cannot be written before {what}", a.name), a.name_span);
+                continue;
+            }
+            // `Table` and `Column` take a name (std.orm).
+            if matches!(a.name.as_str(), "Table" | "Column") {
+                let what = if a.name == "Table" { "table" } else { "column" };
+                let name = match a.args.as_slice() {
+                    [arg] if arg.name.is_none() => match &arg.value.kind {
+                        ExprKind::Str(s) => Some((s.clone(), arg.value.span)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some((name, span)) = name else {
+                    self.error(format!("`#[{}]` takes the {what}'s name, a string literal", a.name), a.span);
+                    continue;
+                };
+                if let Err(why) = orm::sql_name(&name) {
+                    self.error(format!("`#[{}(\"{}\")]`: {why}", a.name, name.escape_debug()), span)
+                        .add_note("names are quoted in the SQL, so a keyword such as `order` or `user` can be a name");
+                    continue;
+                }
+                if a.name == "Table" {
+                    out.table = Some(name);
+                } else {
+                    out.column = Some(name);
+                }
                 continue;
             }
             // `Deprecated` and `Skip` take an optional reason; the others nothing.
@@ -441,6 +511,7 @@ impl<'a> Checker<'a> {
                 "Test" => out.test = true,
                 "Before" => out.before = true,
                 "After" => out.after = true,
+                "Id" => out.id = true,
                 _ => out.skip = Some(text),
             }
         }
@@ -706,6 +777,7 @@ impl<'a> Checker<'a> {
             let kind = match c.kind {
                 ClassKind::Interface => ItemKind::Interface,
                 ClassKind::Enum => ItemKind::Enum,
+                ClassKind::Trait => ItemKind::Trait,
                 ClassKind::Class | ClassKind::Abstract => ItemKind::Class,
             };
             let detail = c.ctor.map(|f| self.signature(f)).unwrap_or_default();
@@ -803,6 +875,7 @@ impl<'a> Checker<'a> {
                 let kind = match info.kind {
                     ClassKind::Interface => ItemKind::Interface,
                     ClassKind::Enum => ItemKind::Enum,
+                    ClassKind::Trait => ItemKind::Trait,
                     ClassKind::Class | ClassKind::Abstract => ItemKind::Class,
                 };
                 let detail = info.ctor.map(|f| self.signature(f)).unwrap_or_default();
@@ -1242,10 +1315,32 @@ impl<'a> Checker<'a> {
         self.prelude().and_then(|p| self.scopes[p].classes.get("Exception").copied())
     }
 
+    /// The prelude's `Generator<K, V>`: what a function with `yield` returns.
+    pub(crate) fn generator_class(&self) -> Option<ClassId> {
+        self.prelude().and_then(|p| self.scopes[p].classes.get("Generator").copied())
+    }
+
+    /// The key and value types of a generator type, `Generator<K, V>`.
+    pub(crate) fn generator_args(&self, t: &Type) -> Option<(Type, Type)> {
+        match t {
+            Type::Class(c, args) if args.len() == 2 && Some(*c) == self.generator_class() => {
+                Some((args[0].resolve_open(true), args[1].resolve_open(true)))
+            }
+            _ => None,
+        }
+    }
+
     fn resolve_type(&mut self, t: &TypeExpr, self_class: Option<ClassId>) -> Type {
         match &t.kind {
             TypeExprKind::Named(n, args) => {
                 let simple = |ty: Type| (ty, 0usize);
+                // A type parameter of the trait whose member this is, for the class that uses it.
+                if let Some(ty) = self.trait_subst.iter().find(|(p, _)| &**p == n.as_str()).map(|(_, ty)| ty.clone()) {
+                    if !args.is_empty() {
+                        self.error(format!("type parameter `{n}` does not take type arguments"), t.span);
+                    }
+                    return ty;
+                }
                 // The parameter's own name is shared by the types that mention it.
                 if let Some(p) = self.type_params.iter().find(|p| &***p == n.as_str()).cloned() {
                     if !args.is_empty() {
@@ -1321,6 +1416,15 @@ impl<'a> Checker<'a> {
                         return Type::Error;
                     }
                     other => match self.class_ref(other, t.span) {
+                        // `Generator<V>` is `Generator<int, V>`.
+                        Some(c) if args.len() == 1 && Some(c) == self.generator_class() => {
+                            let v = self.resolve_type(&args[0], self_class);
+                            return Type::Class(c, vec![Type::Int, v]);
+                        }
+                        Some(c) if self.is_trait(c) => {
+                            self.refuse_trait(c, "it cannot be used as a type", t.span);
+                            return Type::Error;
+                        }
                         Some(c) => {
                             let args = self.class_args(c, args, self_class, t.span);
                             return Type::Class(c, args);
@@ -1475,6 +1579,10 @@ impl<'a> Checker<'a> {
                     self.error(format!("unknown class `{class}`"), *class_span);
                     return None;
                 };
+                if self.is_trait(cid) {
+                    self.refuse_trait(cid, "its constants are read through a class that uses it", *class_span);
+                    return None;
+                }
                 if let Some(def) = self.member_const_span(cid, name) {
                     self.note_ref(*name_span, def);
                 }
@@ -1733,8 +1841,14 @@ impl<'a> Checker<'a> {
                         if let Some(r) = ann.deprecated {
                             self.deprecated_classes.insert(cid, r);
                         }
+                        if let Some(t) = ann.table {
+                            self.orm_tables.insert(cid, t);
+                        }
+                        // A project's own `Generator` (a name the prelude took in 1.3)
+                        // hides the prelude's in the files that declare or import it.
                         let exists = self.scopes[mi].classes.insert(d.name.clone(), cid).is_some()
                             || (m.kind != ModuleKind::Prelude
+                                && d.name != "Generator"
                                 && self.prelude().is_some_and(|p| self.scopes[p].classes.contains_key(&d.name)));
                         if exists {
                             self.error(format!("class `{}` is defined more than once", d.name), d.name_span);
@@ -2086,6 +2200,10 @@ impl<'a> Checker<'a> {
                     self.error(format!("type parameter `{n}` is declared more than once"), *s);
                 }
             }
+            if kind == ClassKind::Trait {
+                self.check_trait_decl(cid, decl);
+                continue;
+            }
             // Each class lists all of its ancestors and interfaces: a long chain
             // would take memory and time in proportion to the square of its length.
             let c = &self.classes[ci];
@@ -2187,6 +2305,11 @@ impl<'a> Checker<'a> {
                         let span = decl.parent.as_ref().unwrap().1;
                         self.error("enums cannot be extended", span);
                     }
+                    ClassKind::Trait => {
+                        let span = decl.parent.as_ref().unwrap().1;
+                        let tname = self.classes[p as usize].name.clone();
+                        self.error(format!("a class cannot extend a trait; write `use {tname};` in its body"), span);
+                    }
                     _ => {}
                 }
                 if self.classes[p as usize].decl.is_some_and(|d| d.is_final) {
@@ -2217,7 +2340,11 @@ impl<'a> Checker<'a> {
             for (i, (_, ispan)) in self.classes[ci].ifaces.clone().into_iter().zip(&decl.interfaces) {
                 if self.classes[i as usize].kind != ClassKind::Interface {
                     let iname = self.classes[i as usize].name.clone();
-                    self.error(format!("`{iname}` is not an interface"), *ispan);
+                    let is_trait = self.classes[i as usize].kind == ClassKind::Trait;
+                    let e = self.error(format!("`{iname}` is not an interface"), *ispan);
+                    if is_trait {
+                        e.add_note(format!("a trait is used in the class body: `use {iname};`"));
+                    }
                     continue;
                 }
                 if keep {
@@ -2335,6 +2462,22 @@ impl<'a> Checker<'a> {
             } else if let Some(case) = decl.cases.first() {
                 self.error("`case` can only be used in an enum", case.span);
             }
+            // What the traits it uses give (an interface cannot use one: reported by the parser).
+            let from_traits = if decl.uses.is_empty() || kind == ClassKind::Interface {
+                traits::TraitMembers::default()
+            } else {
+                self.type_params = class_tps.clone();
+                let tm = self.trait_members(&decl.uses, Some(cid), &mut Vec::new());
+                self.type_params.clear();
+                tm
+            };
+            if kind == ClassKind::Enum {
+                if let Some(p) = from_traits.props.first() {
+                    let mark = self.diags.len();
+                    self.error("enums cannot have properties", p.decl.span);
+                    self.note_trait(mark, p.origin, cid);
+                }
+            }
             for c in &decl.consts {
                 self.annotations(&c.attrs, AnnTarget::Const);
                 let Some(value) = self.literal_const(&c.value, c.ty.as_ref(), Some(cid)) else { continue };
@@ -2344,11 +2487,18 @@ impl<'a> Checker<'a> {
                 }
                 self.classes[ci].consts.insert(c.name.clone(), value);
             }
+            self.add_trait_consts(cid, &from_traits.consts);
             self.type_params = class_tps.clone();
             for prop in &decl.props {
                 let ann = self.annotations(&prop.attrs, AnnTarget::Property);
                 if let Some(r) = ann.deprecated {
                     self.deprecated_fields.insert((cid, prop.name.clone()), r);
+                }
+                if let Some(c) = ann.column {
+                    self.orm_columns.insert((cid, prop.name.clone()), c);
+                }
+                if ann.id {
+                    self.orm_ids.insert((cid, prop.name.clone()));
                 }
                 let ty = self.resolve_type(&prop.ty, Some(cid));
                 let default = prop.default.as_ref().and_then(|d| self.const_default(d, &ty, Some(cid)));
@@ -2367,177 +2517,33 @@ impl<'a> Checker<'a> {
                     },
                 );
             }
-            let mut own_ctor = false;
-            for m in &decl.methods {
-                let type_params: Vec<Name> = m.type_params.iter().map(|(n, _)| Name::from(n.as_str())).collect();
-                for (n, s) in &m.type_params {
-                    if class_tps.iter().any(|c| &**c == n.as_str()) {
-                        self.error(format!("type parameter `{n}` is already a type parameter of `{class_name}`"), *s);
-                    }
-                }
-                // Static methods do not belong to an instance, so the class's parameters are not in scope.
-                let instance = !m.is_static || m.name == "__construct";
-                self.type_params = if instance { class_tps.clone() } else { Vec::new() };
-                self.type_params.extend(type_params.iter().cloned());
-                self.set_bounds(instance.then_some(cid), &[], &[]);
-                let bounds = self.resolve_bounds(&m.type_bounds, Some(cid));
-                self.set_bounds(instance.then_some(cid), &type_params, &bounds);
-                let params = self.resolve_params(&m.params, Some(cid));
-                let is_ctor = m.name == "__construct";
-                let ret = match &m.ret {
-                    Some(t) => self.resolve_type(t, Some(cid)),
-                    None => Type::Void,
-                };
-                self.type_params.clear();
-                self.bounds.clear();
-                if type_params.len() > 4 {
-                    self.error("at most 4 type parameters are supported", m.name_span);
-                }
-                if is_ctor && matches!(kind, ClassKind::Interface | ClassKind::Enum) {
-                    self.error("interfaces and enums cannot have constructors", m.name_span);
-                }
-                if m.is_abstract && matches!(kind, ClassKind::Class | ClassKind::Enum) {
-                    self.error(
-                        format!("`{class_name}` must be declared `abstract` to have abstract methods"),
-                        m.name_span,
-                    );
-                }
-                if m.is_static && kind == ClassKind::Interface {
-                    self.error("interface methods cannot be static", m.name_span);
-                }
-                if is_ctor && ret != Type::Void {
-                    self.error("constructors cannot declare a return type", m.name_span);
-                }
-                if is_ctor && m.is_static {
-                    self.error("constructors cannot be static", m.name_span);
-                }
-                let fid = self.add_func(FuncInfo {
-                    name: format!("{class_name}::{}", m.name),
-                    type_params,
-                    is_abstract: m.is_abstract,
-                    params: params.clone(),
-                    ret: ret.clone(),
-                    body: Body::Function(m),
-                    module: self.module,
-                    class: Some(cid),
-                    // A `static` constructor was reported above; its body is checked as a constructor.
-                    is_static: m.is_static && !is_ctor,
-                    kind: if is_ctor { FuncKind::Ctor } else { FuncKind::Method },
-                    span: m.name_span,
-                });
-                if bounds.iter().any(Option::is_some) {
-                    self.func_bounds.insert(fid, bounds);
-                }
-                let ann = self.annotations(&m.attrs, AnnTarget::Method);
-                if let Some(r) = ann.deprecated {
-                    self.deprecated_funcs.insert(fid, r);
-                }
-                if ann.is_override {
-                    let overrides = !is_ctor
-                        && self.classes[ci]
-                            .methods
-                            .get(&m.name)
-                            .is_some_and(|old| old.owner != cid && old.vis != Visibility::Private);
-                    if !overrides {
-                        self.error(
-                            format!("`{class_name}::{}` is marked `#[Override]` but overrides nothing", m.name),
-                            m.name_span,
-                        )
-                        .add_note("no parent class or interface declares a method with this name");
-                    }
-                }
-                if is_ctor {
-                    if let Some(old) = self.classes[ci].ctor.filter(|f| self.func_is_final(*f)) {
-                        let parent_name = self.funcs[old as usize].name.clone();
-                        self.error(
-                            format!("`{class_name}::__construct` overrides `{parent_name}`, which is `final`"),
-                            m.name_span,
-                        );
-                    }
-                    own_ctor = true;
-                    for (p, ap) in params.iter().zip(&m.params) {
-                        if let Some((vis, readonly)) = p.promote {
-                            self.add_field(
-                                cid,
-                                FieldInfo {
-                                    name: p.name.clone(),
-                                    ty: p.ty.clone(),
-                                    vis,
-                                    readonly,
-                                    owner: cid,
-                                    default: None,
-                                    required: !p.ty.is_nullable() && p.ty != Type::Error,
-                                    span: ap.span,
-                                },
-                            );
-                        }
-                    }
-                    self.classes[ci].ctor = Some(fid);
-                    self.classes[ci].ctor_access = (m.visibility, cid);
-                    continue;
-                }
-                for (p, ap) in params.iter().zip(&m.params) {
-                    if p.promote.is_some() {
-                        self.error("only constructor parameters can be promoted to properties", ap.span);
-                    }
-                }
-                let existing = self.classes[ci].methods.get(&m.name).cloned();
-                let slot = match existing {
-                    Some(old) if old.owner == cid => {
-                        self.error(format!("method `{}` is declared more than once", m.name), m.name_span);
-                        continue;
-                    }
-                    Some(old) if old.vis != Visibility::Private => {
-                        if self.func_is_final(old.func) {
-                            let parent_name = self.funcs[old.func as usize].name.clone();
-                            self.error(
-                                format!("`{class_name}::{}` overrides `{parent_name}`, which is `final`", m.name),
-                                m.name_span,
-                            );
-                        }
-                        if old.is_static != m.is_static {
-                            self.error(
-                                format!("`{}` changes between static and non-static when overriding", m.name),
-                                m.name_span,
-                            );
-                        }
-                        if !self.compatible_override(fid, old.func, cid) {
-                            let parent_name = self.funcs[old.func as usize].name.clone();
-                            self.error(
-                                format!(
-                                    "`{class_name}::{}` overrides `{parent_name}` with an incompatible signature",
-                                    m.name
-                                ),
-                                m.name_span,
-                            )
-                            .add_note(
-                                "overriding methods must keep the same parameter types and a compatible return type",
-                            );
-                        }
-                        old.slot
-                    }
-                    _ => None,
-                };
-                let slot = if m.is_static {
-                    None
-                } else {
-                    match slot {
-                        Some(s) => {
-                            self.classes[ci].vtable[s as usize] = fid;
-                            Some(s)
-                        }
-                        None => {
-                            let c = &mut self.classes[ci];
-                            c.vtable.push(fid);
-                            Some(c.vtable.len() as u32 - 1)
-                        }
-                    }
-                };
-                self.classes[ci].methods.insert(
-                    m.name.clone(),
-                    MethodInfo { func: fid, slot, vis: m.visibility, is_static: m.is_static, owner: cid },
-                );
+            self.type_params.clear();
+            if !matches!(kind, ClassKind::Interface | ClassKind::Enum) {
+                self.add_trait_props(cid, &from_traits.props);
             }
+            let mut own_ctor = false;
+            // The class's own methods win over those of its traits.
+            let mut srcs: Vec<MethodSrc<'a>> = decl
+                .methods
+                .iter()
+                .map(|m| MethodSrc { decl: m, name: m.name.clone(), vis: m.visibility, trait_: None })
+                .collect();
+            for t in from_traits.methods {
+                if !decl.methods.iter().any(|m| m.name == t.name) {
+                    let trait_ = Some((t.origin, t.subst));
+                    srcs.push(MethodSrc { decl: t.decl, name: t.name, vis: t.vis, trait_ });
+                }
+            }
+            for src in &srcs {
+                match &src.trait_ {
+                    None => self.resolve_method(cid, src, &mut own_ctor),
+                    Some((t, subst)) => {
+                        let is_static = src.decl.is_static;
+                        self.in_trait(*t, subst, is_static, cid, |this| this.resolve_method(cid, src, &mut own_ctor));
+                    }
+                }
+            }
+            self.add_trait_requirements(cid, &from_traits.required);
             if matches!(kind, ClassKind::Class | ClassKind::Enum) {
                 self.check_implemented(cid);
             }
@@ -2559,6 +2565,183 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+    }
+
+    /// Resolves method `src` of class `cid` (its own, or one it takes from a
+    /// trait): its signature, its slot in the method table and the checks of an
+    /// override.
+    fn resolve_method(&mut self, cid: ClassId, src: &MethodSrc<'a>, own_ctor: &mut bool) {
+        let ci = cid as usize;
+        let m = src.decl;
+        let kind = self.classes[ci].kind;
+        let class_name = self.classes[ci].name.clone();
+        let class_tps = self.classes[ci].type_params.clone();
+        let type_params: Vec<Name> = m.type_params.iter().map(|(n, _)| Name::from(n.as_str())).collect();
+        for (n, s) in &m.type_params {
+            if src.trait_.is_none() && class_tps.iter().any(|c| &**c == n.as_str()) {
+                self.error(format!("type parameter `{n}` is already a type parameter of `{class_name}`"), *s);
+            }
+        }
+        // Static methods do not belong to an instance, so the class's parameters are not in scope;
+        // a trait's method sees the trait's, as the class gives them (`trait_subst`).
+        let instance = !m.is_static || m.name == "__construct";
+        self.type_params = if instance && src.trait_.is_none() { class_tps.clone() } else { Vec::new() };
+        self.type_params.extend(type_params.iter().cloned());
+        self.set_bounds(instance.then_some(cid), &[], &[]);
+        let bounds = self.resolve_bounds(&m.type_bounds, Some(cid));
+        self.set_bounds(instance.then_some(cid), &type_params, &bounds);
+        let params = self.resolve_params(&m.params, Some(cid));
+        let is_ctor = m.name == "__construct";
+        let ret = match &m.ret {
+            Some(t) => self.resolve_type(t, Some(cid)),
+            None => Type::Void,
+        };
+        self.type_params.clear();
+        self.bounds.clear();
+        if type_params.len() > 4 {
+            self.error("at most 4 type parameters are supported", m.name_span);
+        }
+        if is_ctor && matches!(kind, ClassKind::Interface | ClassKind::Enum) {
+            self.error("interfaces and enums cannot have constructors", m.name_span);
+        }
+        if m.is_abstract && matches!(kind, ClassKind::Class | ClassKind::Enum) {
+            self.error(format!("`{class_name}` must be declared `abstract` to have abstract methods"), m.name_span);
+        }
+        if m.is_static && kind == ClassKind::Interface {
+            self.error("interface methods cannot be static", m.name_span);
+        }
+        if is_ctor && ret != Type::Void {
+            self.error("constructors cannot declare a return type", m.name_span);
+        }
+        if is_ctor && m.is_static {
+            self.error("constructors cannot be static", m.name_span);
+        }
+        let fid = self.add_func(FuncInfo {
+            name: format!("{class_name}::{}", src.name),
+            type_params,
+            is_abstract: m.is_abstract,
+            params: params.clone(),
+            ret: ret.clone(),
+            body: Body::Function(m),
+            module: self.module,
+            class: Some(cid),
+            // A `static` constructor was reported above; its body is checked as a constructor.
+            is_static: m.is_static && !is_ctor,
+            kind: if is_ctor { FuncKind::Ctor } else { FuncKind::Method },
+            span: m.name_span,
+        });
+        if bounds.iter().any(Option::is_some) {
+            self.func_bounds.insert(fid, bounds);
+        }
+        if let Some(t) = &src.trait_ {
+            self.func_trait.insert(fid, t.clone());
+        }
+        let ann = self.annotations(&m.attrs, AnnTarget::Method);
+        if let Some(r) = ann.deprecated {
+            self.deprecated_funcs.insert(fid, r);
+        }
+        if ann.is_override {
+            let overrides = !is_ctor
+                && self.classes[ci]
+                    .methods
+                    .get(&src.name)
+                    .is_some_and(|old| old.owner != cid && old.vis != Visibility::Private);
+            if !overrides {
+                self.error(
+                    format!("`{class_name}::{}` is marked `#[Override]` but overrides nothing", src.name),
+                    m.name_span,
+                )
+                .add_note("no parent class or interface declares a method with this name");
+            }
+        }
+        if is_ctor {
+            if let Some(old) = self.classes[ci].ctor.filter(|f| self.func_is_final(*f)) {
+                let parent_name = self.funcs[old as usize].name.clone();
+                self.error(
+                    format!("`{class_name}::__construct` overrides `{parent_name}`, which is `final`"),
+                    m.name_span,
+                );
+            }
+            *own_ctor = true;
+            for (p, ap) in params.iter().zip(&m.params) {
+                if let Some((vis, readonly)) = p.promote {
+                    self.add_field(
+                        cid,
+                        FieldInfo {
+                            name: p.name.clone(),
+                            ty: p.ty.clone(),
+                            vis,
+                            readonly,
+                            owner: cid,
+                            default: None,
+                            required: !p.ty.is_nullable() && p.ty != Type::Error,
+                            span: ap.span,
+                        },
+                    );
+                }
+            }
+            self.classes[ci].ctor = Some(fid);
+            self.classes[ci].ctor_access = (m.visibility, cid);
+            return;
+        }
+        for (p, ap) in params.iter().zip(&m.params) {
+            if p.promote.is_some() {
+                self.error("only constructor parameters can be promoted to properties", ap.span);
+            }
+        }
+        let existing = self.classes[ci].methods.get(&src.name).cloned();
+        let slot = match existing {
+            Some(old) if old.owner == cid => {
+                self.error(format!("method `{}` is declared more than once", src.name), m.name_span);
+                return;
+            }
+            Some(old) if old.vis != Visibility::Private => {
+                if self.func_is_final(old.func) {
+                    let parent_name = self.funcs[old.func as usize].name.clone();
+                    self.error(
+                        format!("`{class_name}::{}` overrides `{parent_name}`, which is `final`", src.name),
+                        m.name_span,
+                    );
+                }
+                if old.is_static != m.is_static {
+                    self.error(
+                        format!("`{}` changes between static and non-static when overriding", src.name),
+                        m.name_span,
+                    );
+                }
+                if !self.compatible_override(fid, old.func, cid) {
+                    let parent_name = self.funcs[old.func as usize].name.clone();
+                    self.error(
+                        format!(
+                            "`{class_name}::{}` overrides `{parent_name}` with an incompatible signature",
+                            src.name
+                        ),
+                        m.name_span,
+                    )
+                    .add_note("overriding methods must keep the same parameter types and a compatible return type");
+                }
+                old.slot
+            }
+            _ => None,
+        };
+        let slot = if m.is_static {
+            None
+        } else {
+            match slot {
+                Some(s) => {
+                    self.classes[ci].vtable[s as usize] = fid;
+                    Some(s)
+                }
+                None => {
+                    let c = &mut self.classes[ci];
+                    c.vtable.push(fid);
+                    Some(c.vtable.len() as u32 - 1)
+                }
+            }
+        };
+        self.classes[ci]
+            .methods
+            .insert(src.name.clone(), MethodInfo { func: fid, slot, vis: src.vis, is_static: m.is_static, owner: cid });
     }
 
     /// A concrete class must implement every abstract and interface method.
@@ -2697,7 +2880,9 @@ impl<'a> Checker<'a> {
         let mut fid = 0;
         // Past the budget of large types (an error was reported), the rest is not checked.
         while fid < self.funcs.len() && !self.reported_type_nodes {
-            if !matches!(self.funcs[fid].body, Body::Done) {
+            // Past the limit of trait code (an error was reported), the copies are not checked.
+            let skipped = self.reported_trait_code && self.func_trait.contains_key(&(fid as FuncId));
+            if !matches!(self.funcs[fid].body, Body::Done) && !skipped {
                 self.check_func(fid as FuncId);
             }
             fid += 1;
@@ -2732,13 +2917,26 @@ impl<'a> Checker<'a> {
         let name = info.name.clone();
         let is_abstract = info.is_abstract;
         self.type_params = info.type_params.clone();
-        if let (Some(c), false) = (class, is_static) {
+        let from_trait = self.func_trait.get(&fid).cloned();
+        if let (Some(c), false, None) = (class, is_static, &from_trait) {
             let mut tps = self.classes[c as usize].type_params.clone();
             tps.append(&mut self.type_params);
             self.type_params = tps;
         }
+        // A trait's method sees the trait's type parameters, as the class gives them.
+        let mark = self.diags.len();
+        if let Some((_, subst)) = &from_trait {
+            if !is_static {
+                self.trait_subst = subst.clone();
+            }
+        }
 
         let mut ctx = FnCtx::new(ret.clone(), class, kind);
+        if let Body::Function(d) = body {
+            if let Some(at) = flow::first_yield(&d.body) {
+                ctx.gen = Some(self.generator_of(&ret, kind, d.ret.is_some(), at));
+            }
+        }
         let mut param_ids = Vec::new();
         let mut this = None;
         if matches!(kind, FuncKind::Method | FuncKind::Ctor) && !is_static {
@@ -2847,6 +3045,7 @@ impl<'a> Checker<'a> {
         if !ctx.flow.dead
             && !matches!(ret, Type::Void | Type::Error)
             && kind != FuncKind::Template
+            && ctx.gen.is_none()
             && !is_abstract
             && !self.reported_type_nodes
         {
@@ -2865,6 +3064,38 @@ impl<'a> Checker<'a> {
             ret,
         });
         self.funcs[fid as usize].body = Body::Done;
+        if let (Some((t, _)), Some(c)) = (from_trait, class) {
+            self.trait_subst.clear();
+            self.note_trait(mark, t, c);
+        }
+    }
+
+    /// The key and value types of a function with `yield` (first at `at`),
+    /// whose return type is `ret` (`declared`: written, not the default
+    /// `void`). A generator is declared to return `Generator<...>`, as every
+    /// function declares what it returns.
+    pub(crate) fn generator_of(&mut self, ret: &Type, kind: FuncKind, declared: bool, at: Span) -> (Type, Type) {
+        if kind == FuncKind::Ctor {
+            self.error("a constructor cannot be a generator", at);
+            return (Type::Error, Type::Error);
+        }
+        if *ret == Type::Error {
+            return (Type::Error, Type::Error);
+        }
+        if let Some(kv) = self.generator_args(ret) {
+            return kv;
+        }
+        let msg = if declared {
+            format!(
+                "a function with `yield` returns `Generator<...>`, but this one is declared to return `{}`",
+                self.tn(ret)
+            )
+        } else {
+            "a function with `yield` must declare its return type `Generator<...>`".to_string()
+        };
+        self.error(msg, at)
+            .add_note("e.g. `function numbers(): Generator<int>` (or `Generator<string, int>` with keys)");
+        (Type::Error, Type::Error)
     }
 
     /// Checks that a constructor initializes the fields that need it.

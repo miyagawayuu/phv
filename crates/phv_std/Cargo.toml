@@ -38,6 +38,8 @@ num-bigint.workspace = true
 tokio.workspace = true
 tungstenite.workspace = true
 httparse.workspace = true
+toml.workspace = true
+image.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

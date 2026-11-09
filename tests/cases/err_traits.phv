@@ -1,0 +1,174 @@
+<?phv
+trait A {
+    public function hello(): string {
+        return "A";
+    }
+}
+
+trait B {
+    public function hello(): string {
+        return "B";
+    }
+}
+
+// Two traits give `hello`: an error until one is picked.
+class Both {
+    use A, B;
+}
+
+trait Shape {
+    abstract public function area(int $scale): float;
+
+    public function twice(): float {
+        return $this->area(1) * 2.0;
+    }
+}
+
+// The abstract method is missing.
+class NoArea {
+    use Shape;
+}
+
+// The abstract method is there, with another signature.
+class WrongArea {
+    use Shape;
+
+    public function area(float $scale): float {
+        return $scale;
+    }
+}
+
+trait Named {
+    public string $name = "x";
+}
+
+// The same property with another default value.
+class Clash {
+    use Named;
+
+    public string $name = "y";
+}
+
+// A trait is not a type, and not a class.
+function show(Named $n): void {
+}
+
+$x = new Named();
+$y = 5;
+if ($y is Named) {
+    echo "no";
+}
+echo A::hello();
+
+class Ext extends A {
+}
+
+class Impl implements A {
+}
+
+class NotATrait {
+    use Ext;
+}
+
+trait Loop {
+    use Loop;
+}
+
+trait Builds {
+    public function __construct() {
+    }
+}
+
+// An error in a trait's method, found in the class that uses it.
+trait Uses {
+    public function run(): int {
+        return $this->missing();
+    }
+}
+
+class HasMissing {
+    use Uses;
+}
+
+class Rules {
+    use A, B {
+        C::hello insteadof A;
+        hello as hi;
+        A::bye as hello2;
+    }
+}
+
+// A trait's method overrides the parent's with another signature.
+class Parent1 {
+    public function hello(int $x): string {
+        return "p";
+    }
+}
+
+class Child1 extends Parent1 {
+    use A;
+}
+
+// An enum cannot take properties from a trait; an abstract method of a trait
+// is not static.
+enum Size {
+    use Named;
+    case Small;
+}
+
+trait Factory {
+    abstract public static function make(): int;
+}
+
+// A generic trait is used with its type arguments.
+trait Holds<T> {
+    public function put(T $x): void {
+    }
+}
+
+class NoArgs {
+    use Holds;
+}
+
+// Its bounds are checked, and its static methods do not see its type parameters.
+interface Shaped {
+    public function area(): float;
+}
+
+trait Measures<T: Shaped> {
+    public function measure(T $x): float {
+        return $x->area();
+    }
+
+    public static function make(T $x): int {
+        return 1;
+    }
+}
+
+class Ruler {
+    use Measures<int>;
+}
+
+// A constant of the same name with another value.
+trait Limits {
+    const MAX = 1;
+}
+
+class Capped {
+    use Limits;
+
+    const MAX = 2;
+}
+
+// A conflict inside a trait is reported once, also when classes use it.
+trait Mixed {
+    use A, B;
+}
+
+class UsesMixed {
+    use Mixed;
+}
+
+class AlsoMixed {
+    use Mixed;
+}

@@ -14,6 +14,8 @@ pub enum ItemKind {
     Class,
     Interface,
     Enum,
+    /// A trait: its members are listed with each class that uses it.
+    Trait,
     EnumCase,
     Constant,
     Variable,

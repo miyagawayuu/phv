@@ -232,6 +232,38 @@ pub enum Instr {
     /// Jumps when the two registers are equal (`==`), or are not.
     JumpIfEq(Reg, Reg, u32),
     JumpIfNotEq(Reg, Reg, u32),
+
+    /// The first instruction of a generator (a function with `yield`): the
+    /// call makes the generator, which keeps the frame (the first `n`
+    /// registers, the captures and arguments), and returns it. The body runs
+    /// from the next instruction when a loop asks for the first value.
+    GenStart(u16),
+    /// `foreach` over the generator in the register: claims it for this loop
+    /// (a generator is iterated once; one claimed before throws).
+    GenInit(Reg),
+    /// Runs the generator in `it` until it yields (its key and value go to
+    /// `key` and `val`) or ends (jumps to `end`).
+    GenNext {
+        it: Reg,
+        key: Reg,
+        val: Reg,
+        end: u32,
+    },
+    /// The loop over the generator in the register is left: a generator that
+    /// waits at a `yield` runs from there as if it returned (its `finally`
+    /// blocks run), and is done.
+    GenClose(Reg),
+    /// In a generator: hands `key` (`NO_REG`: the next int key) and `val` to
+    /// the loop over it and waits; the loop's next pass resumes at `resume`.
+    /// The instructions after it return from the generator (with its
+    /// `finally` blocks): where a generator closed at this `yield` goes on.
+    /// `from`: a value of `yield from`, whose key does not move the int keys.
+    Yield {
+        key: Reg,
+        val: Reg,
+        from: bool,
+        resume: u32,
+    },
 }
 
 /// Kinds of values a natively compiled function takes and returns.
@@ -364,6 +396,8 @@ pub struct Program {
     /// on first use.
     #[serde(skip)]
     pub cheap_builtins: std::sync::OnceLock<Vec<bool>>,
+    /// The message catalogs of `[i18n]`, when the program imports `std.i18n`.
+    pub i18n: Option<crate::i18n::Shared>,
 }
 
 /// Builtins of the standard library that take constant time and allocate

@@ -168,8 +168,10 @@ fn load(root: &Path, entry: &Path, key: &[u8; 32], stamp: &str) -> Option<Compil
         return None;
     }
     let builtins = phv_std::link(&e.program.builtin_names).ok()?;
+    let mut program = e.program;
+    program.i18n = program.i18n.map(|c| phv_vm::i18n::Shared(phv_std::i18n::share(c.0)));
     Some(Compiled {
-        program: Arc::new(e.program),
+        program: Arc::new(program),
         builtins: builtins.into(),
         deps: e.deps,
         warnings: e.warnings,

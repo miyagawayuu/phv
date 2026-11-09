@@ -13,6 +13,9 @@
 - [std.jobs](#stdjobs)
 - [std.jwt](#stdjwt)
 - [std.oauth](#stdoauth)
+- [std.orm](#stdorm)
+- [std.i18n](#stdi18n)
+- [std.image](#stdimage)
 
 ## std.http
 
@@ -29,10 +32,12 @@ $name = request()->query("name") ?? "world";
 class UploadedFile
 ```
 
+- `public readonly int $index` — Its place among the request's files (`Image::fromUpload()` of std.image reads it by it).
 - `public readonly string $field`
 - `public readonly string $name` — The client's file name (directory parts removed). Do not trust it as a path.
 - `public readonly string $type`
 - `public readonly int $size`
+- `public function __construct(public readonly int $index, public readonly string $field, public readonly string $name, public readonly string $type, public readonly int $size)`
 - `public function text(): string` — The contents as text (invalid UTF-8 is replaced).
 - `public function saveTo(string $path): void` — Saves the file; the path must be inside a [permissions].write directory.
 
@@ -916,4 +921,226 @@ A sign-in provider named `[oauth.<name>]` in phv.toml.
 - `public function authorizationUrl(map<string, string> $params = []): string` — The provider's URL that starts a sign-in, with extra parameters such as `["prompt" => "select_account"]` or `["login_hint" => $email]` (the ones of the flow itself are set by PHV). Each call starts a new sign-in in the session.
 - `public function redirect(map<string, string> $params = []): void` — Sends the visitor to the provider (a 302 response).
 - `public function callback(): SignIn` — Finishes the sign-in on the redirect URI: checks the answer, exchanges the code for tokens and verifies the ID token. Throws OAuthError when the sign-in failed, NetworkError when the provider cannot be reached. Call `session()->regenerate()` before you store who signed in. It must come before `response()->flush()` (the sign-in is kept in the session); after it, it throws ValueError.
+
+
+## std.orm
+
+std.orm — entities: classes whose objects are the rows of a table (std.db).
+
+```phv
+import std.db.Database;
+import std.orm.Repo;
+#[Table("users")]
+class User {
+public ?int $id = null;          // the key; null until insert(), which the database makes it in
+public string $name = "";
+#[Column("email_address")]
+public string $email = "";
+}
+$users = new Repo<User>(Database::connect("main"));
+$u = new User();
+$u->name = "Ann";
+$users->insert($u);                              // sets $u->id
+$found = $users->find(1);                        // ?User
+$page = $users->findBy(sql"name LIKE {$q}", orderBy: "name", limit: 20);
+$u->name = "Anna";
+$users->update($u);                              // writes the columns that changed
+$users->delete($u);
+```
+
+
+Table and column names come only from the class and its annotations, and
+values are always bound parameters.
+
+### class Repo
+
+```phv
+final class Repo<T>
+```
+
+The rows of a table as objects of the entity class `T`: a class marked
+`#[Table("name")]` whose public properties are the table's columns (named
+like the properties, or by `#[Column("name")]`). The key is the property
+marked `#[Id]`, or else `$id`; when it is nullable and null, `insert()` lets
+the database make it. Rows become objects without a call to the
+constructor, so it may only promote its parameters.
+
+Every statement runs through the `Database` it was given, with the limits
+of std.db. A Repo remembers what the rows of the entities it read or wrote
+held, so that `update()` writes only the columns that changed; it forgets
+that after a `transaction()` is rolled back. Nothing is kept beyond the
+Repo itself (the end of the request at the latest).
+
+- `public function find(int|string $key): ?T` — The entity whose key is `$key`, or null when no row has it.
+- `public function findBy(?Sql $where = null, string $orderBy = "", ?int $limit = null, int $offset = 0): list<T>` — The entities whose rows meet `$where` (every row without it), sorted by `$orderBy`: property names, each with `asc` or `desc` after it (`"name, createdAt desc"`); at most `$limit`, after skipping `$offset`. `$where` names columns: `sql"age >= {$min}"`, or `$users->column("createdAt") . sql" > {$since}"` by property.
+- `public function findOneBy(?Sql $where = null, string $orderBy = ""): ?T` — The first entity `findBy($where, $orderBy)` gives, or null.
+- `public function count(?Sql $where = null): int` — The number of rows that meet `$where` (of every row without it).
+- `public function insert(T $entity): void` — Adds the row of `$entity`. When its key is null, the database makes one and it is set on `$entity` (an integer on MySQL).
+- `public function update(T $entity): bool` — Writes the properties of `$entity` that changed since this Repo read or wrote its row (every property of an entity it did not) to the row with its key. True when the database changed a row; false when nothing changed or no row has the key (MySQL also counts a row that already held the values as unchanged). `ValueError` when the key is null.
+- `public function delete(T $entity): bool` — Deletes the row of `$entity`; true when there was one. `ValueError` when the key is null.
+- `public function in<K>(string $property, list<K> $values): Sql` — `"column" IN (...)`, the column of `$property` and each of `$values` as a parameter, for `findBy()` and `count()`: loads the related rows of many entities in one query (`$users->findBy($users->in("id", $ids))`). At most 1,000 values (`ValueError`); none gives a condition no row meets.
+- `public function column(string $property): Sql` — The column of `$property`, quoted, to write a condition with.
+- `public function fromRow(Row $row): T` — The entity a row holds: from `$db->query()` with a query of your own (a join, say). The row has each of the entity's columns, by name; others are ignored.
+
+
+## std.i18n
+
+std.i18n — translations: the messages of the project's catalogs in the
+request's language, plurals, and numbers and dates as a language writes them.
+
+```phv
+import std.i18n.{t, tn, set_locale, translator};
+echo t("welcome", ["name" => $name]);         // "Welcome, Ada" or "ようこそ、Ada さん"
+echo tn("cart.items", $count);                // "1 item", "3 items"
+echo translator()->date($order->placed);      // "Nov 5, 2026", "2026/11/05"
+```
+
+
+`[i18n]` in phv.toml lists the locales; each has a catalog `lang/<locale>.toml`,
+read and checked when the page is compiled. The locale of a request is the
+best of them for its `Accept-Language`, unless the page chooses one with
+`set_locale()` (from a cookie, or a part of the path).
+
+Messages are text: parameters and results are strings, escaped on output
+like any string, so a translation cannot add markup. `t_html()` escapes the
+message and inserts `Html` parameters (a link inside a sentence).
+
+### class Translator
+
+```phv
+final class Translator
+```
+
+The messages and formats of one locale.
+
+- `public readonly string $locale` — One of the locales of `[i18n]`, as written there (`pt-BR`).
+- `public static function of(string $locale): Translator` — The translator of `$locale`, one of the locales of `[i18n]` (in any letter case, with `-` or `_`). Throws ValueError for another.
+- `public function t(string $key, map<string, string> $params = []): string` — The message `$key` with its `{name}` placeholders replaced by `$params`. It is taken from this locale's catalog, else from the locales it falls back to (`pt-BR`, then `pt`, then the default locale). A key in no catalog gives the key itself. Throws ValueError for a plural message, or when a placeholder has no parameter.
+- `public function tn(string $key, int $count, map<string, string> $params = []): string` — The plural message `$key` in the form the locale uses for `$count` (CLDR plural rules). `{count}` is the count as the locale writes it, unless `$params` has `count`.
+- `public function html(string $key, map<string, Html> $params = []): Html` — Like `t()`, as `Html`: the message's text is escaped, and `$params` are inserted as they are (`["link" => render(...)]`).
+- `public function has(string $key): bool` — Whether `$key` is in this locale's catalog or one it falls back to.
+- `public function number(int|float $n, int $decimals = 0): string` — `$n` with the locale's decimal and group separators: `1,234.5`, `1.234,5`.
+- `public function percent(float $ratio, int $decimals = 0): string` — `$ratio` as a percentage: `0.25` is `25%` (`25 %` in French).
+- `public function date(DateTime $d, string $style = "medium"): string` — The date of `$d` (in its zone) in the locale's `"full"`, `"long"`, `"medium"` (default) or `"short"` style: `Thursday, November 5, 2026`, `November 5, 2026`, `Nov 5, 2026`, `11/5/26`.
+
+### function translator
+
+```phv
+function translator(): Translator
+```
+
+The translator of the request's locale (see `locale()`).
+
+### function locale
+
+```phv
+function locale(): string
+```
+
+The request's locale: the one `set_locale()` chose, or the best of `[i18n]
+locales` for the request's `Accept-Language` (the default locale outside a
+request).
+
+### function locales
+
+```phv
+function locales(): list<string>
+```
+
+The locales of `[i18n]`, the default one first.
+
+### function set_locale
+
+```phv
+function set_locale(string $locale): bool
+```
+
+Uses `$locale` for the rest of the request if it is one of the locales of
+`[i18n]` (in any letter case, with `-` or `_`), and returns whether it is.
+Another value (from a cookie or the path) leaves the locale as it was.
+
+### function best_locale
+
+```phv
+function best_locale(string $acceptLanguage): string
+```
+
+The best of the locales of `[i18n]` for an `Accept-Language` value, or the default.
+
+### function t
+
+```phv
+function t(string $key, map<string, string> $params = []): string
+```
+
+`translator()->t(...)`: the message `$key` in the request's locale.
+
+### function tn
+
+```phv
+function tn(string $key, int $count, map<string, string> $params = []): string
+```
+
+`translator()->tn(...)`: the plural message `$key` for `$count`.
+
+### function t_html
+
+```phv
+function t_html(string $key, map<string, Html> $params = []): Html
+```
+
+`translator()->html(...)`: the message escaped, with `Html` parameters.
+
+
+## std.image
+
+std.image — reading, resizing and writing images: PNG, JPEG, GIF and WebP.
+
+```phv
+import std.http.request;
+import std.image.Image;
+```
+
+
+```phv
+$file = request()->file("avatar");
+if ($file != null) {
+$img = Image::fromUpload($file);          // ValueError if it is not an image
+$img->cover(256, 256)->saveTo("storage/avatars/7.webp");
+}
+Image::open("storage/photos/1.jpg")->fit(800)->send(quality: 80);
+```
+
+
+The format is found from the bytes, never from a file name or a declared type.
+An image is checked when it is read (its format and size, from its header);
+its pixels are decoded only when it is written, so reading many uploads and
+making several sizes of each keeps one decoded image in memory at a time.
+What is written never carries the source's metadata (EXIF, GPS, comments).
+
+### class Image
+
+```phv
+final class Image
+```
+
+An image: its size and format, and the steps that make it from its source. It never changes; each step returns a new one.
+
+- `public readonly int $width` — Width in pixels, upright (after the EXIF orientation).
+- `public readonly int $height` — Height in pixels, upright.
+- `public readonly string $format` — The format it was read in: "png", "jpeg", "gif" or "webp".
+- `public static function fromUpload(UploadedFile $file): Image` — The image of an uploaded file. Throws ValueError when it is not a PNG, JPEG, GIF or WebP image, or is larger than 16,384 pixels a side or 50,000,000 pixels.
+- `public static function open(string $path): Image` — The image in a file of the project (`[permissions].read` or `write`); up to 32 MB.
+- `public static function fromBase64(string $data): Image` — The image in Base64 text, or in a `data:` URL such as a canvas's `toDataURL()` gives.
+- `public function fit(int $width, ?int $height = null): Image` — Scaled down to fit inside `$width` × `$height` (any height when it is null), keeping its proportions. A smaller image is not enlarged.
+- `public function cover(int $width, int $height): Image` — Exactly `$width` × `$height`: scaled to cover it, keeping its proportions, and the middle kept.
+- `public function resize(int $width, int $height): Image` — Exactly `$width` × `$height`, stretched if the proportions differ.
+- `public function crop(int $x, int $y, int $width, int $height): Image` — The part `$width` × `$height` from (`$x`, `$y`), the top left being (0, 0). It must lie inside.
+- `public function rotate(int $degrees): Image` — Turned clockwise by a multiple of 90 degrees (-90 turns it back).
+- `public function flipHorizontal(): Image` — Mirrored left to right.
+- `public function flipVertical(): Image` — Mirrored top to bottom.
+- `public function send(string $format = "", int $quality = 85): void` — Sends the image as the response, with its Content-Type: its bytes replace everything the page writes. `$format` is "png", "jpeg" (or "jpg") or "webp" (lossless); "" keeps the format it was read in (a GIF is sent as PNG). `$quality` (1 to 100) is for JPEG. JPEG has no transparency: what is transparent becomes white.
+- `public function saveTo(string $path, string $format = "", int $quality = 85): void` — Writes the image to a file of the project (`[permissions].write`). Without `$format`, the extension of `$path` (.png, .jpg, .jpeg, .webp) gives it.
+- `public function toBase64(string $format = "", int $quality = 85): string` — The image's bytes in Base64, in `$format` as for `send()`.
+- `public function toDataUrl(string $format = "", int $quality = 85): SafeUrl` — A `data:` URL of the image, for `<img src="...">` (the default CSP allows `data:` images).
 

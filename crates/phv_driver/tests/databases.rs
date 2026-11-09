@@ -283,6 +283,18 @@ fn a_connection_whose_type_lookups_a_script_deallocated_is_not_reused() {
     assert_eq!(run_script(&seen, "postgres_typeinfo_drop", limit), "done\n");
 }
 
+/// std.orm on each server (`tests/cases/orm.phv` runs it on SQLite).
+#[test]
+fn orm() {
+    sweep_once();
+    if let Some(url) = server("PHV_TEST_POSTGRES_URL") {
+        check(&host(&url), "orm_postgres");
+    }
+    if let Some(url) = server("PHV_TEST_MYSQL_URL") {
+        check(&host(&url), "orm_mysql");
+    }
+}
+
 #[test]
 fn mysql() {
     sweep_once();

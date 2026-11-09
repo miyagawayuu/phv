@@ -1,0 +1,38 @@
+// Messages, fallbacks and plurals of the catalogs in lang/.
+import std.i18n.{Translator, t, tn, locale, locales, set_locale, best_locale, translator};
+
+echo locale(), " of ", locales()->join(", "), "\n";
+echo t("welcome", ["name" => "Ada"]), "\n";
+echo t("braces"), "\n";
+
+$counts = [0, 1, 2, 3, 5, 11, 21, 22, 101, 1000, 1000000];
+foreach (locales() as $l) {
+    $tr = Translator::of($l);
+    echo "{$l}: ", $tr->t("title"), " | ", $tr->t("welcome", ["name" => "Ada"]), " | ",
+        $tr->t("cart.empty"), "\n";
+    $forms = $counts->map(fn($n) => $tr->tn("cart.items", $n));
+    echo "  ", $forms->join(" / "), "\n";
+}
+
+// {count} is the count as the locale writes it, unless a parameter gives it.
+echo Translator::of("ru")->tn("cart.items", 12345), "\n";
+echo tn("cart.items", 2, ["count" => "two"]), "\n";
+echo tn("inbox.unread", 1, ["name" => "Ada"]), " | ", tn("inbox.unread", 7, ["name" => "Ada"]),
+    "\n";
+echo Translator::of("ja")->tn("inbox.unread", 7, ["name" => "Ada"]), "\n";
+
+// A key computed at run time that no catalog has gives the key.
+$key = "no.such" . ".key";
+echo t($key), " ", translator()->has($key) ? "has" : "has not", " ",
+    translator()->has("title") ? "has" : "has not", "\n";
+echo Translator::of("pt-BR")->has("cart.empty") ? "pt-BR falls back to en\n" : "no\n";
+
+// The request's locale.
+echo set_locale("PT_br") ? "set " : "not set ", locale(), "\n";
+echo t("title"), " ", t("welcome", ["name" => "Bo"]), "\n";
+echo set_locale("de") ? "set " : "not set ", locale(), "\n";
+echo set_locale("") ? "set " : "not set ", locale(), "\n";
+echo best_locale("ja-JP,en;q=0.5"), " ", best_locale("de, fr;q=0.1"), " ", best_locale("*"), "\n";
+
+// Text in messages and parameters is plain text: escaped where it is output.
+echo t("markup", ["name" => "<i>"]), "\n";

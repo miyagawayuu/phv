@@ -638,6 +638,7 @@ fn token_type(k: ItemKind) -> Option<u32> {
     Some(match k {
         ItemKind::Class => 0,
         ItemKind::Interface => 1,
+        ItemKind::Trait => 0,
         ItemKind::Enum => 2,
         ItemKind::EnumCase => 3,
         ItemKind::Function => 4,

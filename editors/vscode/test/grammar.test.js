@@ -114,6 +114,25 @@ function expect(tokens, text, scope) {
   expect(newer, "RAW", "punctuation.definition.string.end.phv");
   expect(newer, "strlen", "entity.name.function.phv");
 
+  const traits = await tokenize(
+    "source.phv",
+    [
+      "<?phv",
+      "trait Greets {",
+      "}",
+      "class Host {",
+      "    use Greets, Waves {",
+      "        Greets::hi insteadof Waves;",
+      "    }",
+      "}",
+    ].join("\n"),
+  );
+  expect(traits, "trait", "storage.type.class.phv");
+  expect(traits, "Greets", "entity.name.type.class.phv");
+  expect(traits, "use", "keyword.control.import.phv");
+  expect(traits, "insteadof", "storage.modifier.phv");
+  expect(traits, "Waves", "entity.name.type");
+
   const template = await tokenize(
     "text.html.phv",
     ['<a href="<?= safe_url($u) ?>">link</a>', "<?phv foreach ($items as $i): ?>", "<li><?= $i ?></li>", "<?phv endforeach; ?>"].join("\n"),

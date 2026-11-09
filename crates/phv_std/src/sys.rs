@@ -505,6 +505,8 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             crate::set_type(vm, &ct)?;
             // Sent from this open handle, so the file is not read into memory.
             vm.http.body_file = Some(std::sync::Arc::new(f));
+            // The last of response()->file() and an image's send() is sent.
+            vm.http.body_bytes = None;
             Ok(Value::Null)
         },
         "file_put_contents" => |vm, a| {

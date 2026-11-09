@@ -1,0 +1,29 @@
+en of en, ja, pt, pt-BR, ru, ar, fr
+Welcome, Ada!
+{literal} braces
+en: Shop | Welcome, Ada! | Your cart is empty.
+  0 items / 1 item / 2 items / 3 items / 5 items / 11 items / 21 items / 22 items / 101 items / 1,000 items / 1,000,000 items
+ja: ショップ | ようこそ、Ada さん! | カートは空です。
+  0 点 / 1 点 / 2 点 / 3 点 / 5 点 / 11 点 / 21 点 / 22 点 / 101 点 / 1,000 点 / 1,000,000 点
+pt: Loja | Bem-vindo, Ada! | Your cart is empty.
+  0 item / 1 item / 2 itens / 3 itens / 5 itens / 11 itens / 21 itens / 22 itens / 101 itens / 1.000 itens / 1.000.000 de itens
+pt-BR: Lojinha | Bem-vindo, Ada! | Your cart is empty.
+  0 item / 1 item / 2 itens / 3 itens / 5 itens / 11 itens / 21 itens / 22 itens / 101 itens / 1.000 itens / 1.000.000 de itens
+ru: Магазин | Welcome, Ada! | Your cart is empty.
+  0 товаров / 1 товар / 2 товара / 3 товара / 5 товаров / 11 товаров / 21 товар / 22 товара / 101 товар / 1 000 товаров / 1 000 000 товаров
+ar: متجر | Welcome, Ada! | Your cart is empty.
+  لا عناصر / عنصر واحد / عنصران / 3 عناصر / 5 عناصر / 11 عنصرًا / 21 عنصرًا / 22 عنصرًا / 101 عنصر / 1,000 عنصر / 1,000,000 عنصر
+fr: Boutique | Welcome, Ada! | Your cart is empty.
+  0 article / 1 article / 2 articles / 3 articles / 5 articles / 11 articles / 21 articles / 22 articles / 101 articles / 1 000 articles / 1 000 000 d’articles
+12 345 товаров
+two items
+Ada, you have one new message | Ada, you have 7 new messages
+Ada さん、新しいメッセージが 7 件あります
+no.such.key has not has
+pt-BR falls back to en
+set pt-BR
+Lojinha Bem-vindo, Bo!
+not set pt-BR
+not set pt-BR
+ja fr en
+<b>Bold</b> & <i>

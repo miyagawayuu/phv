@@ -1,0 +1,266 @@
+<?phv
+// Generators: a function with `yield` runs only as a loop asks for its values.
+
+function numbers(int $n): Generator<int> {
+    echo "  (numbers starts)\n";
+    for ($i = 1; $i <= $n; $i++) {
+        echo "  (makes $i)\n";
+        yield $i * 10;
+    }
+    echo "  (numbers ends)\n";
+}
+
+echo "lazy:\n";
+$g = numbers(3);
+echo "made, nothing ran yet\n";
+foreach ($g as $k => $v) {
+    echo "got $k => $v\n";
+}
+
+echo "keys:\n";
+function prices(): Generator<string, float> {
+    yield "tea" => 2.5;
+    yield "cake" => 4;
+}
+foreach (prices() as $item => $price) {
+    echo "$item costs $price\n";
+}
+// As in PHP, a key `n` makes the next key without one `n + 1`.
+function keyed(): Generator<string> {
+    yield 5 => "a";
+    yield "b";
+    yield 2 => "c";
+    yield "d";
+}
+foreach (keyed() as $k => $v) {
+    echo "$k:$v ";
+}
+echo "\n";
+
+echo "yield from:\n";
+function letters(): Generator<string> {
+    yield "x";
+    yield "y";
+}
+function everything(): Generator<string> {
+    yield "start";
+    yield from letters();
+    yield from ["l0", "l1"];
+    yield from set(["s"]);
+    yield "end";
+}
+foreach (everything() as $k => $v) {
+    echo "$k=$v ";
+}
+echo "\n";
+function pairs(): Generator<string, int> {
+    yield from ["one" => 1, "two" => 2];
+    yield "three" => 3;
+}
+foreach (pairs() as $k => $v) {
+    echo "$k=$v ";
+}
+echo "\n";
+echo implode(",", everything()->toList()), "\n";
+
+echo "finally:\n";
+function guarded(string $name): Generator<int> {
+    try {
+        echo "  ($name starts)\n";
+        yield 1;
+        yield 2;
+        yield 3;
+    } finally {
+        echo "  ($name: finally)\n";
+    }
+}
+foreach (guarded("to the end") as $v) {
+    echo "got $v\n";
+}
+foreach (guarded("break") as $v) {
+    echo "got $v\n";
+    if ($v == 2) {
+        break;
+    }
+}
+echo "after break\n";
+function first_over(int $limit): int {
+    foreach (guarded("return") as $v) {
+        if ($v > $limit) {
+            return $v;
+        }
+    }
+    return -1;
+}
+$first = first_over(1);
+echo "first over 1: $first\n";
+foreach ([1, 2] as $round) {
+    foreach (guarded("break 2") as $v) {
+        if ($v == 2) {
+            break 2;
+        }
+        echo "round $round got $v\n";
+    }
+}
+echo "after break 2\n";
+foreach (guarded("continue") as $v) {
+    if ($v == 2) {
+        continue;
+    }
+    echo "got $v\n";
+}
+// Never iterated: nothing ran, so there is no `finally` to run.
+$_unused = guarded("never started");
+// Closing a generator closes the one it waits in through `yield from`.
+function wrapper(): Generator<int> {
+    try {
+        yield from guarded("inner");
+    } finally {
+        echo "  (wrapper: finally)\n";
+    }
+}
+foreach (wrapper() as $v) {
+    echo "wrapped $v\n";
+    break;
+}
+
+echo "exceptions:\n";
+try {
+    foreach (guarded("loop throws") as $v) {
+        throw new ValueError("from the loop at $v");
+    }
+} catch (ValueError $e) {
+    echo "caught: ", $e->getMessage(), "\n";
+}
+function failing(): Generator<int> {
+    yield 1;
+    throw new RuntimeException("from the generator");
+}
+try {
+    foreach (failing() as $v) {
+        echo "got $v\n";
+    }
+} catch (RuntimeException $e) {
+    echo "caught: ", $e->getMessage(), "\n";
+}
+function recovering(): Generator<string> {
+    foreach ([2, 0, 5] as $d) {
+        try {
+            yield (string)intdiv(10, $d);
+        } catch (DivisionByZeroError) {
+            yield "division by zero";
+        }
+    }
+}
+foreach (recovering() as $s) {
+    echo "got $s\n";
+}
+
+echo "once:\n";
+$once = numbers(1);
+foreach ($once as $v) {
+    echo "got $v\n";
+}
+try {
+    foreach ($once as $v) {
+        echo "never\n";
+    }
+} catch (LogicException $e) {
+    echo "caught: ", $e->getMessage(), "\n";
+}
+
+echo "objects, methods and closures:\n";
+class Node {
+    public function __construct(public string $name, public list<Node> $kids = []) {}
+
+    public function walk(int $depth = 0): Generator<string> {
+        yield str_repeat("  ", $depth) . $this->name;
+        foreach ($this->kids as $kid) {
+            yield from $kid->walk($depth + 1);
+        }
+    }
+
+    public function nodes(): Generator<Node> {
+        yield $this;
+        foreach ($this->kids as $kid) {
+            yield from $kid->nodes();
+        }
+    }
+}
+$tree = new Node("root", [new Node("a", [new Node("a1")]), new Node("b")]);
+foreach ($tree->walk() as $line) {
+    echo $line, "\n";
+}
+list<string> $names = [];
+foreach ($tree->nodes() as $node) {
+    $names[] = $node->name;
+}
+echo implode(" ", $names), "\n";
+$countdown = function (int $from): Generator<int> {
+    while ($from > 0) {
+        yield $from;
+        $from--;
+    }
+};
+echo implode(" ", $countdown(3)->toList()->map(fn($n) => (string)$n)), "\n";
+$fixed = 7;
+$repeat = function () use ($fixed): Generator<int> {
+    yield $fixed;
+    yield $fixed;
+};
+echo count($repeat()->toList()), "\n";
+
+echo "generic:\n";
+function take<T>(Generator<T> $source, int $n): Generator<T> {
+    if ($n <= 0) {
+        return;
+    }
+    foreach ($source as $v) {
+        yield $v;
+        $n--;
+        if ($n == 0) {
+            return;
+        }
+    }
+}
+function naturals(): Generator<int> {
+    $i = 0;
+    while (true) {
+        yield $i;
+        $i++;
+    }
+}
+function mapped<T, U>(Generator<T> $source, fn(T): U $f): Generator<U> {
+    foreach ($source as $v) {
+        yield $f($v);
+    }
+}
+foreach (take(mapped(naturals(), fn(int $n): string => "#$n"), 3) as $i => $s) {
+    echo "$i: $s\n";
+}
+foreach (take(guarded("taken"), 2) as $v) {
+    echo "took $v\n";
+}
+
+echo "callbacks:\n";
+// A closure that is a generator, called by a builtin once per element: each
+// call makes a generator with its own frame.
+$gens = [1, 2, 3]->map(function (int $n): Generator<int> {
+    yield $n;
+    yield $n * 10;
+});
+foreach ($gens as $g) {
+    echo implode(" ", $g->toList()->map(fn($v) => (string)$v)), "\n";
+}
+$lazy = ["a", "b"]->map(fn(string $s) => lines_of($s, 2));
+function lines_of(string $s, int $n): Generator<string> {
+    for ($i = 1; $i <= $n; $i++) {
+        yield "$s$i";
+    }
+}
+foreach ($lazy as $g) {
+    foreach ($g as $line) {
+        echo $line, " ";
+    }
+}
+echo "\n";

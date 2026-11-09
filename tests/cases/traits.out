@@ -1,0 +1,16 @@
+4 counts by 2 2 2
+area 9 area 1.5
+hello/hey/hello secret
+class sound, trait move after parent move, parent eat
+parent sound, parent move, parent eat
+123 two
+ann,bob 7 2
+Hello, you, from the host
+6 30 wide
+<Hearts><Spades>
+[10],[20] ints! 0=1;1=2;
+failed in a trait
+at Host::fail (lib/traits.phv:14)
+at Host::fail (lib/traits.phv:16)
+at Host::fail (lib/traits.phv:16)
+at {main} (traits.phv:340)

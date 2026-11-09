@@ -337,6 +337,7 @@ fn completion_kind(k: ItemKind) -> u32 {
         ItemKind::Property => 10,
         ItemKind::Class => 7,
         ItemKind::Interface => 8,
+        ItemKind::Trait => 7,
         ItemKind::Enum => 13,
         ItemKind::EnumCase => 20,
         ItemKind::Constant => 21,
@@ -1320,6 +1321,33 @@ mod tests {
             Some(("view.phv.html".into(), String::new()))
         );
         assert_eq!(def("echo 1|;\n"), None);
+    }
+
+    /// The members a class takes from a trait are completed through the class
+    /// (private ones inside it only), and lead to their declaration in the
+    /// trait; so does the trait's name in `use`. Hover gives the type the
+    /// member has in the class.
+    #[test]
+    fn completes_and_finds_trait_members_through_the_class() {
+        let p = Project::new("traits");
+        let named = "export trait Named {\n    public string $label = \"x\";\n    public function title(): string {\n        return $this->label;\n    }\n    private function hidden(): int {\n        return 1;\n    }\n}\n";
+        std::fs::write(p.dir.join("lib/named.phv"), named).unwrap();
+        let src = "<?phv\nimport lib.named.Named;\nclass Page {\n    use Named;\n    public function own(): int {\n        return 2;\n    }\n}\n$p = new Page();\n";
+        let got = p.complete("page.phv", &format!("{src}$p->|\necho 1;\n"));
+        assert_eq!(got, ["label", "own", "title"]);
+        let inside = "<?phv\nimport lib.named.Named;\nclass Page {\n    use Named;\n    public function own(): int {\n        return $this->|;\n    }\n}\n";
+        assert_eq!(p.complete("page.phv", inside), ["label", "hidden", "own", "title"]);
+        let named_at = |s: &str| Some(("named.phv".to_string(), s.to_string()));
+        assert_eq!(p.definition("page.phv", &format!("{src}echo $p->ti|tle();\n")), named_at("title"));
+        assert_eq!(
+            p.definition("page.phv", &format!("{src}echo $p->lab|el;\n")),
+            named_at("public string $label = \"x\";")
+        );
+        let use_at = src.replace("use Named;", "use Na|med;");
+        assert_eq!(p.definition("page.phv", &use_at), named_at("Named"));
+        let (server, path, line, character) = p.open("page.phv", &format!("{src}$t = $p->tit|le();\n"));
+        let hover = server.hover(&path, line, character);
+        assert!(hover["contents"]["value"].as_str().unwrap_or_default().contains("string"), "{hover}");
     }
 
     #[test]

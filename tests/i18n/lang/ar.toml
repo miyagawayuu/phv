@@ -1,0 +1,9 @@
+title = "متجر"
+
+[cart.items]
+zero = "لا عناصر"
+one = "عنصر واحد"
+two = "عنصران"
+few = "{count} عناصر"
+many = "{count} عنصرًا"
+other = "{count} عنصر"

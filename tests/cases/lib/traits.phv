@@ -1,0 +1,22 @@
+// A trait for the trait tests (traits.phv), in a module of its own: its
+// methods use this module's names (`prefix` is not exported), and an
+// exception thrown in one has a trace that names the class and this file.
+
+export trait Greets {
+    abstract public function name(): string;
+
+    public function greet(string $who): string {
+        return prefix() . ", " . $who . ", from " . $this->name();
+    }
+
+    public function fail(int $n): int {
+        if ($n == 0) {
+            throw new RuntimeException("failed in a trait");
+        }
+        return $this->fail($n - 1) + 1;
+    }
+}
+
+function prefix(): string {
+    return "Hello";
+}

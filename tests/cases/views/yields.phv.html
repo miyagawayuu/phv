@@ -1,0 +1,7 @@
+<?phv params(list<string> $items); ?>
+<ul>
+<?phv foreach ($items as $item): ?>
+  <li><?= $item ?></li>
+<?phv yield $item; ?>
+<?phv endforeach; ?>
+</ul>

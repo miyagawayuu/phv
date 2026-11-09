@@ -62,8 +62,9 @@ PHV は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋
     それより浅くインデントした行はエラー。
 - 予約語: `function fn return if elseif else endif while endwhile do for endfor foreach endforeach as break continue
   echo class extends new public private protected readonly static true false null match default try catch finally
-  throw import export use is instanceof interface implements abstract final enum case const`。`type` は型エイリアスの
-  先頭(§4)でだけキーワードになる。
+  throw yield import export use is instanceof interface implements abstract final enum case const`。`type` は型エイリアスの
+  先頭(§4)で、`from` は `yield` の後(§8)で、`trait` はトレイトの宣言の先頭で、`insteadof` は `use` の規則の中(§9)で
+  だけキーワードになる。
 
 ## 4. 型
 
@@ -85,6 +86,7 @@ PHV は、PHP の「保存してすぐ動く」「Web に特化」「HTML に埋
 | `?T` | `T` または `null`(`T|null` と同じ) |
 | `A|B` | ユニオン型 |
 | `fn(A, B): R` | 関数(クロージャ)の型 |
+| `Generator<K, V>` | `yield` のある関数が返すもの(§8)。`Generator<V>` は `Generator<int, V>` |
 | クラス名 | オブジェクトの型。`self` はそのクラス自身 |
 
 PHP の `array` は `list<T>` と `map<K, V>` に分かれています。重複しない値の集まりには `set<T>` を使います。`mixed` は `any` です。
@@ -363,6 +365,62 @@ $counter = function () use ($start): int { return $start + 1; };
 - `fn() =>` の本体はできるだけ長く続く: `fn($n) => $n > 0 ? "+" : "-"` は条件式全体を返す。
 - 関数型(`fn(int): int`)にはデフォルト値も可変長引数もないので、クロージャの引数はどちらも持てない。
 
+### ジェネレータ
+
+```phv
+function lines(string $text): Generator<string> {
+    foreach ($text->split("\n") as $line) {
+        if (!$line->trim()->isEmpty()) {
+            yield $line->trim();
+        }
+    }
+}
+
+function totals(list<Order> $orders): Generator<string, float> {
+    foreach ($orders as $o) {
+        yield $o->customer => $o->total();
+    }
+}
+
+foreach (lines($input) as $i => $line) { ... }        // $i は 0, 1, 2, ...
+foreach (totals($orders) as $customer => $total) { ... }
+$all = lines($input)->toList();                       // list<string>
+```
+
+本体に `yield` のある関数・メソッド・クロージャは**ジェネレータ**になる。呼び出しても本体は何も実行されず、
+`Generator<K, V>`(`Generator<V>` は `Generator<int, V>` の略)を返す。本体は、ジェネレータに対する `foreach` が値を
+求めるたびに次の `yield` まで実行される。`yield` はループにキーと値を渡し、ループの次の回までそこで待つ。
+
+- 戻り値の型は、ほかの関数と同じく宣言する: `Generator<V>` か `Generator<K, V>`(クロージャでは、渡す先の関数型から
+  決まってもよい)。`yield` する値はどれも `V`、キーは `K` でなければならない。
+- `yield $value;` は次の int のキーを付ける: 0 から、1 つずつ増える(PHP と同じく、`yield 5 => $v` の次は 6)。
+  キーが `int` でないジェネレータは、値ごとにキーを付ける: `yield $key => $value;`。
+- `yield from $values;` は、list(添字がキー)、map、set、または別のジェネレータのキーと値を 1 つずつ `yield` する。
+  それらは `K` と `V` に合わなければならない。PHP と同じく、そのキーでジェネレータ自身の int のキーは進まない。
+- `return;` でジェネレータは終わる。値は返せない。`yield` は式ではなく文で、ジェネレータは値を受け取らない。
+  PHP の `send()` と `getReturn()` はないので、ジェネレータの型にはキーと値の型だけがあればよい。
+- ジェネレータを回せるのは 1 度だけ: 2 度目の `foreach`(や `toList()`)は `LogicException` を投げる。
+  `$g->toList()` は最後まで実行して、値を `list<V>` で返す。
+- ジェネレータの中で投げられた例外は、値を求めた `foreach` のところに出てくる(ジェネレータはそこで終わる)。
+  ループの本体で投げられた例外はジェネレータには入らない。
+- ジェネレータより先にループが終わると(`break`、`return`、例外、外への `break 2`)、ジェネレータは閉じられる:
+  `finally` のある `try` の中(または `yield from` のように、別のジェネレータを回すループの中)の `yield` で待っている
+  ジェネレータは、その `yield` が `return;` だったかのようにそこから続く。つまりその `finally` ブロックが内側から順に、
+  ループの次の文より前に実行される。そのブロックが投げた例外は、ループを出たところで投げられる(`finally` と同じく、
+  ループを出る理由だった例外に代わる)。まだ始まっていないジェネレータには実行するものはない。PHP はジェネレータが
+  破棄されるときにこれらのブロックを実行するが、PHV はコードから分かる場所、つまりループを出るときに実行する(実行時間の
+  上限などの致命的なエラーでは、ほかの場所と同じく `finally` ブロックは実行されない)。
+- `yield` は `finally` ブロックの中(閉じられたジェネレータはそこで待てない)、コンストラクタ、テンプレート、関数の外、
+  要素のテキスト以外の HTML(タグ、属性、`<script>` の中)では使えない。最後の場合、ジェネレータが待つ間にループが
+  書く出力がそこに入ってしまう。
+- 待っている間、ジェネレータはフレーム(変数、待っている場所、開いている `try` ブロック)を保つ。そのメモリはメモリの
+  上限に数え、長いジェネレータは他のコードと同じく実行時間の上限で止まり、循環参照の回収はフレームが持つ値も見る
+  (自分のメソッドのジェネレータを持つオブジェクトも解放される)。ループがジェネレータを再開するのは呼び出しの深さの
+  上限に数えるので、`yield from` による深い再帰はそこで止まる。
+- ジェネレータとそれを回すループはインタプリタで実行される(§17)。
+- `yield` は 1.3 から予約語(メソッドの名前には使える)。プロジェクト自身の `Generator` という名前のクラスは、それを
+  宣言するかインポートするファイルでは組み込みのものを隠す。
+
 ## 9. クラス
 
 ```phv
@@ -565,6 +623,90 @@ Box<float> $f = new Box(1);       // 宣言した型から: Box<float>
 - メソッド自身の型パラメーターはそのメソッドのもの: メソッド `m<T>` とクラスのパラメーター `T` は、オーバーライドでも
   別の型。呼び出し側の型パラメーターが、同じ名前のメソッドのパラメーターに置き換わることもない。
 
+### トレイト
+
+```phv
+trait HasName {
+    const SEP = ": ";
+    private string $name = "";
+
+    abstract public function kind(): string;
+
+    public function rename(string $name): self {
+        $this->name = $name;
+        return $this;
+    }
+
+    public function label(): string {
+        return $this->kind() . self::SEP . $this->name;
+    }
+}
+
+class User extends Model {
+    use HasName;
+
+    public function kind(): string {
+        return "user";
+    }
+}
+
+echo (new User())->rename("ann")->label();   // "user: ann"
+```
+
+トレイトはメソッド(public・protected・private・static・abstract のもの)、型付きのプロパティ、定数を持ち、クラスは
+本体に `use T;` や `use A, B;` と書いてそれを取り込む。abstract クラスと enum もトレイトを使え(enum はプロパティを
+取り込めない)、トレイトもほかのトレイトを使える。トレイトはクラスと同じように export・import する。どこでも同じく、
+static プロパティはない。
+
+- メンバーはクラスに写される: 各メソッドはそのクラスのメソッドで、`$this` と `self` はそのクラス(static メソッドでも:
+  `new self()`)、`parent::` はその親。メソッドが使う名前(関数、クラス、定数)はトレイトのモジュールのもの。スタック
+  トレースでは、PHP と同じくトレイトのメソッドもクラスの名前で示され(`User::label`)、位置はトレイトのファイルの行。
+  PHV に `static::`(遅延静的束縛)はない。
+- トレイトのメソッドは、それを使う各クラスのメソッドとして検査される。そのためクラスが宣言しているもの
+  (`$this->id`、`$this->save()`)を使える。そこで見つかったエラーはトレイトのソースの位置に、クラスの名前を挙げた
+  注記を付けて示す(いくつものクラスが使っていても 1 回)。どのクラスも使っていないトレイトは、宣言(2 回宣言した
+  メンバー、コンストラクタ、使っているトレイト)を検査し、メソッドの本体は検査しない。
+- 優先順位は PHP と同じ: クラスが宣言したメソッドがトレイトのものより、トレイトのものが継承したものより優先する。
+  継承したメソッドを置き換えるトレイトのメソッドはオーバーライドで、引数の型を同じに、戻り値の型を互換に保ち、
+  `final` のメソッドは置き換えられない。
+- トレイトの abstract メソッドは、その名前のクラスのメソッド(自身のもの、別のトレイトのもの、継承したもの)が、
+  同じ引数の型と互換な戻り値の型で満たす。それがない具象クラスは、abstract クラスと同じくエラー。トレイトの abstract
+  メソッドは static にできない。
+- 同じ名前のメソッドを 2 つのトレイトが持つとエラー。`use` でどちらかを選ぶ:
+
+  ```phv
+  class Talker {
+      use Hello, Hey {
+          Hello::hi insteadof Hey;        // Hey ではなく Hello の hi()
+          Hey::hi as hey;                 // Hey のものは hey() として
+          secret as public;               // 可視性を変える
+          Hello::hi as protected quiet;   // 名前と可視性を変えた写し
+      }
+  }
+  ```
+
+  `A::m insteadof B, C;` は `A` のメソッドを残す。`[A::]m as [可視性] [名前];` は別の名前の写しを(可視性を書けば
+  その可視性で)加え、名前がなければ `m` の可視性を変える。規則に書けるのはそのクラスの `use` にあるトレイトだけで、
+  トレイトを書かない `m` はそのうち 1 つだけのメソッドでなければならない。2 つの道筋で届く同じメソッド(3 つ目を使う
+  2 つのトレイト)は衝突ではない。
+- プロパティと定数はクラス自身のものに加わる。クラス(か別のトレイト)と同じ名前のプロパティは、PHP と同じく同じもの
+  (型、可視性、`readonly`、デフォルト値が同じ)でなければならない。そうでないときと、祖先が宣言しているとき(どの
+  プロパティとも同じく)はエラー。同じ名前の定数は同じ値でなければならない。トレイトはコンストラクタを宣言できない:
+  初期化の要るトレイトのプロパティは、クラスのコンストラクタが初期化する(§9)。トレイトのメンバーのアノテーションは
+  各クラスで働く(`#[Override]` もそこで検査する)。
+- トレイトは型ではない: `function f(HasName $x)`、`new HasName()`、`$x is HasName`、`HasName::label()`、
+  `HasName::SEP`、`extends HasName`、`implements HasName` はエラー。型には interface を宣言し、トレイトを使うクラスで
+  実装する(トレイトは interface を実装できないが、トレイトから取り込んだクラスのメソッドは実装できる)。
+- トレイトは型パラメーター(最大 4 個、制約も付けられる)を持て、そのときは型引数を付けて使う: `trait Holds<T> { ... }`
+  と `use Holds<User>;`、あるいは `class Box<V>` の中で `use Holds<V>;`。クラスが取り込んだメンバーでは `T` は
+  その引数になる。クラスと同じく、static メソッドからはパラメーターは見えない。
+- `trait` は宣言の先頭(`trait Name {` か `trait Name<`)でだけ、`insteadof` は `use` の規則の中でだけキーワードなので、
+  これらを使った名前はそのまま使える。
+- JIT はトレイトのメソッドを、各クラスでそのクラス自身のメソッドとして、そのクラスのレイアウトでコンパイルする
+  (1 つのトレイトを使う 2 つのクラスでプロパティの位置が違えば、それぞれのコードになる)。
+- 各クラスはトレイトから取り込んだものの写しを持つ: 写しは全クラスが継承するメンバーの合計に数え、写したメソッドの
+  ソースは合わせて 32 MB まで(§17)。
+
 ### アノテーション
 
 ```phv
@@ -586,6 +728,9 @@ class Square extends Shape {
 | `#[Override]` | メソッド | 親クラスかインターフェースに同じ名前のメソッド(private を除く)がなければエラー |
 | `#[Test]` | 関数 | 名前に関係なく `phv test` が実行する(§16) |
 | `#[Skip]`、`#[Skip("理由")]` | 関数 | `phv test` は実行せず、スキップしたと報告する |
+| `#[Table("名前")]` | クラス | エンティティのテーブル(std.orm、§14) |
+| `#[Column("名前")]` | プロパティ | エンティティのプロパティの列(std.orm) |
+| `#[Id]` | プロパティ | エンティティのキー(std.orm) |
 
 アノテーションはコンパイル時に検査され、実行時には参照できない。
 
@@ -632,9 +777,9 @@ import lib.legacy.render as render_legacy;
 
 - `import a.b.{x, y};` は、プロジェクトのルート(`phv.toml` のあるディレクトリ、なければ実行するファイルの
   ディレクトリ)からの `a/b.phv` を読み込む。
-- import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`const`、`type`、`import`)
+- import されるモジュールのトップレベルには宣言(`function`、`class`、`interface`、`enum`、`trait`、`const`、`type`、`import`)
   しか書けない。モジュールを読み込んでも副作用は起きない。
-- `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`、`std.async`、`std.validate`、`std.mail`、`std.testing`、`std.regex`、`std.time`、`std.ws`、`std.jobs`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
+- `std.*` は標準モジュール(`std.http`、`std.db`、`std.net`、`std.async`、`std.validate`、`std.mail`、`std.testing`、`std.regex`、`std.time`、`std.ws`、`std.jobs`、`std.orm`、`std.i18n`、`std.image`)。`[dependencies]` に書いたパッケージは `import パッケージ名.モジュール` で読み込む。
 - 読み込めるのはプロジェクトとパッケージのディレクトリの中のファイルだけ(シンボリックリンクで外に出ることはできない)。
   別のマシン(`\\host\share` のようなネットワーク共有、ネットワークドライブ、`\GLOBAL??\UNC\host\share` のような
   オブジェクトのパス)を指すシンボリックリンクやジャンクションであるか、その先にあるモジュール、テンプレート、パッケージ、
@@ -1246,6 +1391,69 @@ if ($file != null) {
 フォント・PDF・txt・csv・json）。HTML・SVG・XML と未知の拡張子は、アップロードされたファイルがサイト上のページとして
 動かないよう `application/octet-stream` で送る。
 
+### 画像(std.image)
+
+```phv
+import std.http.request;
+import std.image.Image;
+
+$file = request()->file("avatar");                       // ?UploadedFile
+if ($file != null) {
+    $img = Image::fromUpload($file);                      // 画像でなければ ValueError
+    echo $img->width, "×", $img->height, " ", $img->format;   // 4032×3024 jpeg
+    $img->cover(256, 256)->saveTo("storage/avatars/7.webp");  // [permissions].write が必要
+}
+Image::open("storage/photos/1.jpg")->fit(800)->send(quality: 80);   // レスポンスがその画像になる
+$thumb = Image::fromBase64($dataUrl)->fit(64)->toDataUrl();         // SafeUrl。<img src="..."> に
+```
+
+| メンバー | 説明 |
+|---|---|
+| `Image::fromUpload($file)`、`Image::open($path)`、`Image::fromBase64($text)` | アップロードされたファイル、プロジェクトのファイル(`[permissions].read` か `write`)、Base64 のテキストか `data:` URL(canvas の `toDataURL()` が返すもの) |
+| `width`、`height`、`format` | ピクセル単位の大きさ(向きを直した後。下記)と、読んだときの形式: `"png"`、`"jpeg"`、`"gif"`、`"webp"` |
+| `fit($width, $height = null)` | 縦横比を保ったまま、枠に収まるよう縮小する(null なら高さは問わない)。小さい画像は拡大しない |
+| `cover($width, $height)` | ちょうどその大きさ。縦横比を保って枠を覆うよう拡大縮小し、中央を残す |
+| `resize($width, $height)` | ちょうどその大きさ。縦横比が違えば伸び縮みする |
+| `crop($x, $y, $width, $height)` | 左上を (0, 0) として (`$x`, `$y`) からの部分。画像の中に収まらない部分は `ValueError` |
+| `rotate($degrees)`、`flipHorizontal()`、`flipVertical()` | 90 度の倍数だけ時計回りに回す(`-90` で戻る)。左右・上下の反転 |
+| `send($format = "", $quality = 85)` | その画像をレスポンスとして Content-Type 付きで送る。`response()->file()` と同じく、ページが書いた出力の代わりにそのバイト列が送られる(2 つのうち後に呼んだほうが送られる) |
+| `saveTo($path, $format = "", $quality = 85)` | ファイルに書く(`[permissions].write`)。`$format` を省くと `$path` の拡張子(`.png`、`.jpg`、`.jpeg`、`.webp`)で決まる |
+| `toBase64($format = "", $quality = 85)`、`toDataUrl(...)` | バイト列の Base64(`string`)、または `data:` URL(`SafeUrl`。既定の CSP は `data:` の画像を許す) |
+
+- 形式は先頭のバイト列で判断する。ファイル名やクライアントが送った Content-Type は使わない。読めるのは PNG(APNG は
+  最初の画像)、JPEG(ベースラインとプログレッシブ)、GIF(最初のフレーム)、WebP(非可逆と可逆。アニメーションは最初の
+  フレーム)。SVG・AVIF・HEIC・BMP・TIFF などそれ以外は `ValueError`。
+- 書き出せるのは PNG、JPEG(`$quality` は 1〜100。透明な部分は白になる)、WebP(可逆のみ。非可逆の WebP の
+  エンコーダーで Rust で書かれたものはない)。`$format` が `""` なら読んだときの形式で、GIF は PNG で書く。`"jpg"` は
+  `"jpeg"` と同じ。
+- 画像は正しい向きになる。写真の EXIF の向きは、ブラウザーと同じく読むときに適用するので、`width` と `height` は
+  向きを直した画像のもの。
+- 書き出すのはピクセルだけ。元の画像の EXIF(GPS の位置を含む)、XMP、コメント、ICC プロファイルは引き継がない。
+  色は sRGB とみなすので、別の色空間の写真(最近のスマートフォンが撮る Display P3 など)は書き出すと少し色が淡くなる。
+- `Image` は変わらない。それぞれの操作は新しい `Image` を返す。画像を読むときはヘッダー(形式・大きさ・向き)だけを
+  読み、ピクセルは書き出すとき(`send()`、`saveTo()`、`toBase64()`、`toDataUrl()`)に、書き出すたびにデコードする。
+  そのため壊れたファイルはそこで `ValueError` になることもある。多くのアップロードを読むスクリプトが持つのは
+  それらのバイト列と、一度に 1 つのデコードした画像だけ。
+- 縮小・拡大は 3 ローブの Lanczos フィルターで、色をアルファで重み付けして行う(透明なピクセルの色がにじまない)。
+- 画像は読むものも作るものも 1 辺 16,384 ピクセル、全体で 50,000,000 ピクセルまで。読むファイルは 32 MB まで
+  (アップロードはリクエスト本文の 8 MB でも制限される)、作る手順は 64 まで。超えると何もデコードする前に
+  `ValueError`。小さなファイルで巨大な大きさをうたうもの(画像爆弾)はヘッダーで拒否する。
+- デコードに要るメモリは、デコードを始める前にメモリ制限に数える: 1 ピクセル 3 バイト(透明度があれば 4)、
+  デコーダーの作業用のメモリ(プログレッシブ JPEG は係数を保持する: 1 ピクセル 6 バイト増える)、各手順の結果
+  (縮小・拡大が保持する作業用の行は数行だけ)。制限を超えるといつものメモリのエラーでスクリプトが終わる。
+  1,200 万画素の写真のサムネイルを作るには約 45 MB、5,000 万画素の写真では約 210 MB(プログレッシブ JPEG は 430 MB、
+  可逆の WebP は 370 MB)要る。そうした大きな写真を扱うなら `memory_limit_mb` を上げる。
+- プログレッシブ JPEG はスキャンごとに画像全体をたどるので、スキャンは 1,000,000,000 ÷ ピクセル数まで(上限の大きさで
+  20、1,200 万画素で 83。エンコーダーが書くのは 10 前後)。少なくとも 10、多くても 100。それより多いものはヘッダーで拒否する
+  (`ValueError`)。
+- デコードとエンコードは途中で止められないので、上限で抑える。デスクトップ(Windows、リリースビルド、ほかのビルドが
+  動いている状態)での測定では、5,000 万画素の画像のデコードは 0.1〜0.6 秒(PNG、JPEG、GIF、20 スキャンのプログレッシブ
+  JPEG。可逆の WebP は 1.1 秒)、エンコードは 0.5 秒(WebP)〜2.1 秒(品質 100 の JPEG)。そのため上限の画像では、
+  スクリプトが制限時間を 2 秒ほど超えることがある。縮小・切り抜き・回転は 16 行ごとに制限時間を確かめる。よくある
+  アップロード(4000×3000 の JPEG を幅 800 ピクセルにする)は 0.3〜0.5 秒。
+- 壊れたファイルでデコーダーが作者の想定外の止まり方(panic)をしても `ValueError` になる。ページのワーカーや
+  サーバーが終わることはない。
+
 ### JSON
 
 ```phv
@@ -1473,6 +1681,99 @@ $p->set("greeting", "hello", 60)->incr("visits")->get("name");
   前の応答が残した分の中で読み、1 つの応答の上限(大きさ、リストの要素数、入れ子)はそれぞれに適用する。
 - パイプラインはトランザクションではない。コマンドの間にほかのクライアントのコマンドが走ることがあり、失敗した
   コマンドがその前のコマンドを取り消すこともない。
+
+### エンティティ(std.orm)
+
+```phv
+import std.db.Database;
+import std.orm.Repo;
+
+enum Role: string {
+    case Member = "member";
+    case Admin = "admin";
+}
+
+#[Table("users")]
+class User {
+    public ?int $id = null;                  // キー。insert() までは null で、データベースが作る
+    public string $name = "";
+    #[Column("email_address")]
+    public string $email = "";
+    public list<string> $tags = [];          // JSON のテキストで持つ
+    public function __construct(public Role $role) {}
+}
+
+$users = new Repo<User>(Database::connect("main"));
+$u = new User(Role::Member);
+$u->name = "Ann";
+$users->insert($u);                                        // $u->id が入る
+$found = $users->find($id);                                // ?User
+$page = $users->findBy(sql"name LIKE {$q}", orderBy: "name, id desc", limit: 20, offset: 40);
+$admins = $users->count($users->in("role", [Role::Admin]));
+$u->name = "Anna";
+$users->update($u);                                        // UPDATE "users" SET "name" = ? WHERE "id" = ?
+$users->delete($u);
+```
+
+`Repo<T>` は、テーブルの行をエンティティのクラス `T` のオブジェクトとして、`Database`(§14「データベース」)を
+通して読み書きする。どの文も std.db の制限の下で実行する(制限時間、16 MB のテキスト、SQLite の文の重み、拒否する文、
+スクリプトに残っているメモリに収まる結果)。
+
+- エンティティは `#[Table("名前")]` を付けたクラス。public なプロパティがテーブルの列で、列の名前はプロパティの
+  名前か `#[Column("名前")]`。キーは `#[Id]` を付けたプロパティ、なければ `$id` で、`int` か `string`。キーが
+  nullable で null のとき、`insert()` はキーをデータベースに作らせ、オブジェクトに入れる(SQLite と PostgreSQL は
+  `RETURNING`、MySQL は `lastInsertId()`。MySQL が返せるのは整数のキーだけなので、`string` のキーは値を入れておく。
+  入れていなければ `ValueError`)。キーは 1 つのプロパティ(複合キーはない)。
+- `new Repo<User>($db)` はプログラムを検査するときに検査する(エンティティにならないクラスは、その理由をコンパイル
+  エラーで示す)。`User` は総称でない普通のクラスで、プロパティはすべて public、コンストラクタがあれば引数を
+  プロパティにするだけのもの(行は `json_decode_as` と同じく、コンストラクタを呼ばずにオブジェクトにする)、readonly
+  のプロパティはコンストラクタの引数であること。nullable なキーは readonly にできない。プロパティの型は `int`、
+  `float`、`string`、`bool`、enum(値のある enum は値で、純粋な enum はケースの名前で持つ)とその nullable。
+  `list`、`map`、`set`、クラス、`any` は JSON のテキストで持ち、`json_decode_as` と同じように読み戻す。`Html`、
+  `SafeUrl`、`SafeJs` は拒否する(列の中身を HTML として信用することになるため)。共用体型と関数型も拒否する。
+- テーブルと列の名前は、クラスとそのアノテーションからだけ来る。英数字と `_` で、数字で始まらず、63 文字まで
+  (プログラムの検査で調べ、ほかの名前はコンパイルエラー)。どの文でも名前を引用符で囲む(`"name"`。MySQL と SQLite
+  では `` `name` ``。SQLite が列でない名前を文字列として読まずにエラーにするように)ので、`order` や `user` などの
+  キーワードも名前にできる。囲むので、名前はテーブルのとおりに書く: PostgreSQL で引用符なしで作った列 `createdAt` は
+  `createdat`。テーブルはマイグレーション(`phv db migrate`、§16)で作る。std.orm はテーブルを作りも変えもしない。
+- 条件は `Sql` の値なので、値はすべてパラメータになる。条件には列の名前を書く。`$repo->column("createdAt")` は
+  プロパティの列を囲んだもの(`$users->column("createdAt") . sql" > {$since}"`)。`$repo->in("role", $values)` は
+  `"role" IN (?, ...)`。値はプロパティに合うもの(enum ならそのケース)で 1,000 個まで(`ValueError`)。空のリストは
+  どの行も満たさない条件になる。JSON のプロパティは比べられない。`in()` を使うと、多くのエンティティに関係する行を
+  エンティティごとに 1 回ではなく 1 回のクエリで読める(`$users->findBy($users->in("id", $posts->map(fn($p) => $p->authorId)))`)。
+  std.orm 自身にはリレーションはない。
+- `orderBy` にはプロパティの名前を、それぞれ後ろに `asc` か `desc` を付けて、カンマで区切って書く
+  (`"name, createdAt desc"`)。16 項目、1,024 文字まで。ほかのものは `ValueError` なので、リクエストから来た名前を
+  渡してよい(`orderBy: request()->query("sort") ?? "name"`)。`limit`(null ならすべての行)と `offset` は負にできない
+  (`ValueError`)。
+- 行の各列はプロパティに合っていなければならない。NULL は nullable なプロパティだけ、`int` には整数、
+  `float` には整数か浮動小数点数、`bool` には真偽値か 0 か 1、`string` には文字列、enum にはその値かケースの名前、JSON
+  にはプロパティの型の JSON。それ以外は、列・テーブル・プロパティとその型を示す `DatabaseError` になる
+  (`the column "age" of "users" holds a string, but ... is int`)。PostgreSQL の `numeric` と MySQL の `DECIMAL` は
+  文字列として読む(§14「PostgreSQL と MySQL」)。行のほかの列は無視する。`fromRow($row)` は、自分で書いたクエリ
+  (結合など)の行で、エンティティの列をすべて持つものからエンティティを作る。
+- Repo は、読んだか書いたエンティティごとに、そのとき行が持っていた値を覚えておく(Repo がある間だけ。遅くとも
+  リクエストの終わりまでで、メモリはスクリプトに数える)。`update()` は値が変わったプロパティだけを書く: その間に
+  ほかのリクエストが変えた列を古い値で書き戻さず、何も変わっていなければ何も送らない(`update()` は false を返す)。
+  Repo が読んでいないエンティティ(ほかの Repo のものや、キーを入れて `new` で作ったもの)は、すべての列を書く。
+  `transaction()` がロールバックされたかコミットに失敗したあとは、行がもう覚えた値を持っていないかもしれないので、
+  どの Repo も覚えた値を忘れる。`update()` はキーで行を探し、キーは変えない。Repo はほかの Repo やリクエストと
+  何も共有しない。
+
+| メソッド | すること |
+|---|---|
+| `find(int\|string $key): ?T` | キーのエンティティ(型の合わないキーは `ValueError`)、なければ null |
+| `findBy(?Sql $where = null, string $orderBy = "", ?int $limit = null, int $offset = 0): list<T>` | 行が `$where` を満たすエンティティ(なければすべて) |
+| `findOneBy(?Sql $where = null, string $orderBy = ""): ?T` | `findBy()` の最初のもの、なければ null |
+| `count(?Sql $where = null): int` | `$where` を満たす行の数 |
+| `insert(T $entity): void` | 行を加える。データベースが作ったキーを入れる |
+| `update(T $entity): bool` | 変わったプロパティを書く。データベースが行を変えたら true(MySQL は、すでにその値だった行を変わっていないと数える) |
+| `delete(T $entity): bool` | 行を消す。あったら true |
+| `in(string $property, list<K> $values): Sql`、`column(string $property): Sql` | プロパティによる条件(上記) |
+| `fromRow(Row $row): T` | 行の持つエンティティ |
+
+キーが null のエンティティの `update()` と `delete()` は `ValueError`。トランザクションはデータベースのものを使う:
+`$db->transaction(function () use ($users, $u): void { ... })`。
 
 ### WebSocket サーバー (std.ws)
 
@@ -1893,6 +2194,97 @@ DateTime::parse("2026-11-05 09:30", "Asia/Tokyo");    // ?DateTime
 - `plus(Duration::days(1))` はちょうど 24 時間後、`addDays(1)` は翌日の同じ現地時刻で、時計の切り替えをまたぐと両者は異なる。
 - 不明なタイムゾーンは `ValueError`。
 
+### 翻訳(std.i18n)
+
+```toml
+[i18n]
+default = "en"
+locales = ["en", "ja", "pt", "pt-BR"]
+# dir = "lang"          # カタログ: lang/en.toml、lang/ja.toml...
+```
+
+```toml
+# lang/en.toml
+welcome = "Welcome, {name}!"
+terms = "I accept the {link}."
+
+[cart]
+empty = "Your cart is empty."
+
+[cart.items]            # 複数形のメッセージ: CLDR のカテゴリーごとに 1 つの形
+one = "{count} item"
+other = "{count} items"
+```
+
+```phv
+import std.i18n.{Translator, t, tn, t_html, set_locale, translator};
+import std.http.request;
+
+echo t("welcome", ["name" => $name]);                 // "Welcome, Ada!"、"ようこそ、Ada さん!"
+echo tn("cart.items", $count);                        // "1 item"、"3 items"。{count} は "1,234"
+echo t_html("terms", ["link" => render("views/terms_link.phv.html")]);   // Html
+set_locale(request()->cookie("lang") ?? "");          // ページが選んだロケール(一覧にあれば)
+translator()->number(1234.5, 1);                      // "1,234.5"、"1.234,5"、"1 234,5"
+translator()->percent(0.25);                          // "25%"、"25 %"
+translator()->date($order->placed, "long");           // "November 5, 2026"、"2026年11月5日"
+Translator::of("ja")->t("cart.empty");                // 別のロケール(別の利用者へのメールなど)
+```
+
+- `[i18n] locales` の各ロケールにカタログ `<dir>/<locale>.toml` がある。ロケールは 2 文字か 3 文字の小文字の言語に、
+  必要なら文字体系(`Hant`)と地域(`BR`、`419`)を続けたもの: `en`、`pt-BR`、`zh-Hant`(Windows がデバイスに
+  使う名前、たとえば `con` は除く)。既定のロケールはその一つ。
+- カタログは、`std.i18n` を import するページやスクリプトをコンパイルするときに、モジュールと同じように読んで検査する
+  (プロジェクトの中だけ、別のマシンへのリンクは通らない、変更すればコンパイルし直す)。そのため、カタログがない・壊れて
+  いることは、訪問者のリクエストのときではなく、ファイルの中を示すコンパイルエラーになる。既定のカタログにはすべての
+  キーがある。ほかのカタログにあって既定のカタログにないキー、あるカタログでは複数形でほかでは違うメッセージ、既定の
+  メッセージにないプレースホルダーを使う翻訳(複数形なら `{count}` は使える)はエラー。
+- メッセージは文字列。キーは TOML のキーを `.` でつないだもの(`cart.empty`)で、英字・数字・`_`・`-` からなる。
+  `{name}` はプレースホルダー(英字・数字・`_`)。`{{` と `}}` は波かっこそのもので、それ以外の波かっこはエラー。
+- キーがすべて CLDR の複数形のカテゴリー(`zero`、`one`、`two`、`few`、`many`、`other`)であるテーブルは複数形の
+  メッセージ。そのロケールが使うカテゴリーをちょうど持つ: `en` と `de` は one・other、`fr`・`es`・`it`・`pt` は
+  one・many・other、`ru` と `pl` は one・few・many・other、`ar` は 6 つすべて、`ja`・`zh`・`ko` は other。`tn()` は、
+  メッセージを取ったカタログの CLDR 49 の規則で、数の絶対値から形を選ぶ。規則を組み込んであるのは `ar`、`de`、`en`、
+  `es`、`fr`、`it`、`ja`、`ko`、`pl`、`pt`、`pt-PT`、`ru`、`zh`(地域付きのロケールは言語のものを使う。`pt-BR` は
+  `pt` のもの)。ほかのロケールの複数形のメッセージはコンパイルエラー。
+- メッセージは、そのロケールのカタログ、タグを短くした一覧にあるロケール(`pt-BR` → `pt`)、既定のカタログの順に
+  探す。どのカタログにもないキーは、キーそのものになる(開発時も本番も)。`t()`、`tn()`、`t_html()`、`Translator` の
+  `t()`、`tn()`、`html()` に文字列リテラルで書いたキーは、ページのコンパイル時に検査する: 既定のカタログにあること、
+  `tn()` なら複数形でほかは複数形でないこと、パラメーターが map リテラル(または省略)なら、メッセージのプレースホルダー
+  がすべて与えられていること。実行時に作ったキーやパラメーターは使うときに検査し、`t()` に複数形のメッセージ、`tn()` に
+  複数形でないメッセージ、パラメーターのないプレースホルダーは `ValueError`。キーがあるかは `has($key)` で分かる。
+- **翻訳者はマークアップを書けない。** パラメーターと結果は `string` で、ほかの文字列と同じく出力時にエスケープされる。
+  `<b>` を含むメッセージは `<b>` と表示される。`t_html()` は `Html` を返す: メッセージの文字はエスケープし、パラメーター
+  (ページが作った `Html`。`render()`、`escape()`)はそのまま入れる。`std.i18n` にはメッセージをマークアップとして扱う
+  ものはない(`raw()` にメッセージを渡してはいけない)。カタログはプロジェクトの外の人が書くことが多く、メッセージが
+  すべてのページへの入り口になってしまうため。
+- リクエストのロケール(`locale()`)は、`set_locale()` で選んだもの、なければリクエストの `Accept-Language` に一覧の
+  中でいちばん合うもの。初めて必要になったときに選び、リクエストの中に保つ(ミドルウェアとページで共通、リクエストの
+  間では何も保たない)。リクエストの外では既定のロケール。`set_locale($tag)` は一覧にあるロケールを大文字小文字を問わず
+  `-` でも `_` でも受け取り、それ以外には `false` を返す(訪問者からの Cookie やパスの一部で一覧にないロケールを選ぶ
+  ことはできない)。どこから選ぶかはページが決める。
+- `Accept-Language` は 1 KB まで(その手前の最後のコンマまで。複数のフィールドは一つとして読む)、32 項目まで読む。
+  項目は 35 文字までの英字・数字・`-` のタグ(または `*`)に、0 から 1 で小数 3 桁までの `q` を付けられるもの。ほかの
+  `q` やタグの項目は飛ばし、`q=0` はそのロケールを拒む。項目は `q` の順、同じなら書かれた順に試す: タグと等しい
+  (大文字小文字を問わない)一覧のロケール、タグを短くしたもの(`de-CH` → `de`)、その言語の一覧で最初のロケール
+  (`pt` → `pt-BR`)。`*` は既定のロケール。どれにも合わなければ既定のロケール。`best_locale($header)` は任意の値に
+  同じ選び方をする。
+- `number($n, $decimals = 0)` は `int` を正確に、`float` を 0 から遠いほうへ丸めて、ロケールの小数点・桁区切り・
+  マイナス記号で書く(CLDR 49。`minimumGroupingDigits` を含む: スペイン語・イタリア語・ポーランド語・ヨーロッパの
+  ポルトガル語は `1234` だが `12.345`)。`percent($ratio, $decimals = 0)` は `$ratio × 100` をロケールのパーセントの
+  形で書く。`$decimals` は 0 から 20(`ValueError`)。無限大は `∞`、非数は `NaN`。
+- `date($d, $style = "medium")` は `std.time` の `DateTime` を、そのタイムゾーンで、ロケールの `full`、`long`、`medium`、
+  `short` の形で、ロケールの月と曜日の名前を使って書く(CLDR 49 のグレゴリオ暦の形。ほかの形は `ValueError`)。
+- 形を組み込んであるのは `ar`、`de`、`en`、`en-GB`、`es`、`fr`、`it`、`ja`、`ko`、`pl`、`pt`、`pt-PT`、`ru`、`zh`
+  (地域付きのロケールは言語のものを使う)。ほかのロケールでは、数は CLDR のルートロケールの形(`1,234.5`、`25%`)、
+  日付はどの形でも `2026-11-05`。数字はいつも ASCII(`ar` も含め、これらのロケールでの CLDR の既定)。時刻、通貨、
+  短縮した数(`1.2K`)、相対時間(`3 日前`)、列挙、ほかの暦、序数、小数の複数形は扱わない: メッセージに書くか、
+  `DateTime::format()` を使う。
+- 制限: ロケールは 32 個まで。カタログは 2 MB・20,000 メッセージまで、すべてのカタログで 16 MB まで。キーは 200 バイト・
+  8 階層まで。メッセージ(複数形ならそれぞれの形)は 8 KB まで、異なるプレースホルダーは 16 個まで、その名前は 64 バイト
+  まで。複数形の形は文字列(入れ子にならない)。1 回の呼び出しのパラメーターは 64 個まで(`ValueError`)。制限を超えた
+  カタログはコンパイルエラーで、エラーは 50 個まで表示する。カタログは同じファイルからコンパイルしたすべてのページの
+  ためにプロセスに 1 つだけ保つ。メッセージの結果はメモリ制限に数える。
+
 ### バックグラウンドジョブ(std.jobs)
 
 ページを待たせたくない仕事(メールの送信、レポートの作成、遅いサービスの呼び出し)は**ジョブ**にする。`jobs/` に置いた
@@ -2251,6 +2643,10 @@ redirect_uri = "https://example.com/auth/google"
 
 [telemetry]
 endpoint = "http://localhost:4318"   # OpenTelemetry のコレクターにトレースを送る(「トレース」)
+
+[i18n]
+default = "en"          # 翻訳: lang/en.toml、lang/ja.toml(std.i18n)
+locales = ["en", "ja"]
 
 [fmt]
 width = 100             # phv fmt はこれより長い行を折り返す
@@ -2658,6 +3054,8 @@ phv migrate legacy/page.php      # page.phv を書き出す
 3. レジスタ型バイトコードへのコンパイル(`AddI`、`LtI`、`JumpIfNotLtIImm` などの型に特化した命令)
 4. 実行
    - **インタプリタ**: 安全な Rust だけで書かれている。文字列・list・map は参照カウント + コピーオンライト。
+     ジェネレータ(§8)は、待っている間そのフレーム(レジスタ、再開する場所、開いている `try` ブロック)を持つ
+     オブジェクト。ループが次の値を求めるとフレームを呼び出しスタックのループのフレームの上に戻し、`yield` がまた外す。
      互いを参照して循環するオブジェクト(`$node->next = $node` や、自分をキャプチャしたクロージャを持つオブジェクト)は
      スクリプトの実行中に解放される。循環参照の回収は、生きているオブジェクトの数が前回の回収から 2 倍になるたびに
      (初回は 4,096 個)命令の合間に行われ、前回から作られたオブジェクト 1 個あたり 16 個までの値しか調べない。
@@ -2684,8 +3082,8 @@ phv migrate legacy/page.php      # page.phv を書き出す
      もの。後者は、呼び出しを受けうるすべてのクラスがその位置にコンパイルされた同じ種類を返すメソッドを持つとき)。
      そして `echo` と、関数がその周りに書く HTML。プロパティはクラスの中の位置で読み書きし、オブジェクトの作成と出力は
      インタプリタと同じコードが行う(フィールドの初期値、循環回収のための記録、書き込む先のバッファのエスケープ、
-     要素のテキスト以外の HTML の中での関数の出力の検査)。クロージャ、例外(`throw`、`try`)、ここに挙げた以外の
-     組み込み関数は、それを使う関数ごとインタプリタのままになる。
+     要素のテキスト以外の HTML の中での関数の出力の検査)。クロージャ、例外(`throw`、`try`)、ジェネレータとそれを
+     回すループ、ここに挙げた以外の組み込み関数は、それを使う関数ごとインタプリタのままになる。
      ループか再帰のある関数は、プログラムの読み込み時に、それが呼ぶ関数と一緒にコンパイルされる(その呼び出しは直接に
      なる)。どちらもなく、コンパイルされた関数からも呼ばれない関数はインタプリタのままになる(ネイティブコードに入る
      コストが本体より大きいため)。ループのない再帰関数は、本体でネイティブコードがそのまま実行する命令(算術、比較、
@@ -2745,12 +3143,17 @@ phv migrate legacy/page.php      # page.phv を書き出す
 | JSON Web Token(std.jwt) | 256 KB、ヘッダーは 8 KB | `verify()` が null を返す |
 | JWKS | 512 KB、読む鍵は 64 個。プロセスごとに保持する鍵セットは 32 個 | `NetworkError`(`fetch`)、`ValueError`(`fromJson`) |
 | セッションが始めたサインイン(std.oauth) | 4 つ、それぞれ 10 分 | いちばん古いものを忘れる |
+| `Repo::in()`(std.orm) | 1,000 個の値 | `ValueError` |
+| `Repo::findBy()` の `orderBy`(std.orm) | 16 項目、1,024 文字 | `ValueError` |
+| 画像(std.image) | 1 辺 16,384 ピクセル、全体で 50,000,000 ピクセル。読むファイルは 32 MB まで、作る手順は 64 まで。ピクセルはデコードする前にメモリ制限に数える | `ValueError`(メモリ制限は致命的エラー) |
 | スクリプトが記録するスパン(`[telemetry]`) | 1,000 | 記録しない |
 | 送信を待つスパン | 8,192 個かつ 16 MB。スパンの名前・文字列の属性は 1,024 バイト | 捨てる(`phv_telemetry_dropped_spans_total`)。長い文字列は切る |
 | ソースファイル(モジュール、テンプレート、スクリプト) | 8 MB | コンパイルエラー(`phv lsp`: それより大きい開いた文書は検査も整形もせず、開いている間は名前の変更を拒む) |
 | 1 つのソースファイルのトークン(文字列の中のコードを含む) | 1,000,000 | コンパイルエラー(そのファイルは構文解析しない) |
 | 1 つのプログラムのすべてのファイル(ページかスクリプトと、それが import・描画するもの。std を含む) | トークン 2,000,000 個、ソース 32 MB、ファイル 2,000 個 | コンパイルエラー(そのプログラムは型検査しない。`phv lsp` がリクエストの間に保持する開いたドキュメントの解析結果は、すべて合わせてトークン 250,000 個、ソース 16 MB まで。使われていない時間が最も長いものから捨て、どれも 2 秒まで) |
-| 全クラスが継承するメンバーの合計 | 200,000 | コンパイルエラー(各クラスは継承したものの写しを持つ) |
+| 全クラスが継承するメンバーの合計 | 200,000 | コンパイルエラー(各クラスは継承したものと、トレイトから取り込んだものの写しを持つ) |
+| クラスに写したトレイトのメソッドのソース(全クラスの合計) | 32 MB | コンパイルエラー(写しはそれぞれ検査・コンパイルされる) |
+| 入れ子に使われるトレイトの段数 | 256 | コンパイルエラー |
 | クラスの上にあるクラスとインターフェースの段数(`extends`、`implements`) | 256 | コンパイルエラー |
 | 全クラスの祖先・インターフェースと、それらに渡す型引数の合計 | 2,000,000(祖先に渡す 1 つの型引数は 10,000 個の型の要素まで) | コンパイルエラー(各クラスは祖先をすべて並べて持つ) |
 | 1 つの関数の変数と一時的な値 | 65,534 | コンパイルエラー(関数を分ける) |

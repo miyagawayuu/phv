@@ -1,0 +1,84 @@
+import std.image.Image;
+
+// 40 × 30: left half red, right half blue, the top left pixel transparent.
+$png = "iVBORw0KGgoAAAANSUhEUgAAACgAAAAeCAYAAABe3VzdAAAAOUlEQVR42u3OQQ0AMAwDsSIJf1Dlsg1EXpNPur9nXpuc1slWr+IAAQEBAQEBAQEBAQEBAQEBAf8CXlC/ykG59FM8AAAAAElFTkSuQmCC";
+
+function show(string $label, Image $i): void {
+    echo $label, ": ", $i->width, "×", $i->height, " ", $i->format, "\n";
+}
+
+$img = Image::fromBase64($png);
+show("read", $img);
+show("data url", Image::fromBase64("data:image/png;base64," . $png));
+show("fit 20", $img->fit(20));
+show("fit 100 (not enlarged)", $img->fit(100, 100));
+show("fit 30×10", $img->fit(30, 10));
+show("cover 10×10", $img->cover(10, 10));
+show("resize 7×90", $img->resize(7, 90));
+show("crop", $img->crop(5, 5, 10, 20));
+show("rotate 90", $img->rotate(90));
+show("rotate -270", $img->rotate(-270));
+show("rotate 180", $img->rotate(180));
+show("flips", $img->flipHorizontal()->flipVertical());
+show("chain", $img->rotate(90)->cover(64, 64)->crop(0, 0, 32, 16));
+
+// What is written reads back as the same size, in the format asked for.
+foreach (["png", "jpeg", "jpg", "webp", ""] as $f) {
+    $out = Image::fromBase64($img->fit(16)->toBase64($f, 70));
+    show("written as \"{$f}\"", $out);
+}
+$url = $img->fit(4)->toDataUrl("webp");
+echo ((string)$url)->slice(0, 23), "\n";
+show("data url back", Image::fromBase64((string)$url));
+// The source does not change.
+show("source", $img);
+// Lossless formats keep the pixels.
+$same = Image::fromBase64($img->toBase64("webp"))->toBase64("png");
+echo $same == Image::fromBase64($img->toBase64("png"))->toBase64("png") ? "lossless\n" : "changed\n";
+echo $img->toBase64("png") == $img->toBase64("png") ? "same each time\n" : "differs\n";
+
+// Refusals.
+$bomb = "iVBORw0KGgoAAAANSUhEUgAAdTAAAHUwCAYAAABmJ/i6AAAAeElEQVR42u3BMQEAAADCoPVPbQ0PoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIBXA4avAAEakw3bAAAAAElFTkSuQmCC";
+$tries = [
+    "a 30000×30000 PNG" => fn() => Image::fromBase64($bomb),
+    "not an image" => fn() => Image::fromBase64(base64_encode("<svg xmlns=\"http://www.w3.org/2000/svg\"/>")),
+    "not base64" => fn() => Image::fromBase64("%%%"),
+    "a cut PNG" => fn() => Image::fromBase64($png->slice(0, 20)),
+    "fit 0" => fn() => $img->fit(0),
+    "resize too large" => fn() => $img->resize(20000, 10),
+    "too many pixels" => fn() => $img->resize(10000, 10000),
+    "crop outside" => fn() => $img->crop(35, 0, 10, 10),
+    "rotate 45" => fn() => $img->rotate(45),
+];
+foreach ($tries as $what => $try) {
+    try {
+        $try();
+        echo $what, ": accepted\n";
+    } catch (ValueError $e) {
+        echo $what, ": ", $e->getMessage(), "\n";
+    }
+}
+$writes = [
+    "gif" => fn() => $img->toBase64("gif"),
+    "bmp" => fn() => $img->toBase64("bmp"),
+    "quality 0" => fn() => $img->toBase64("jpeg", 0),
+    "quality 101" => fn() => $img->toBase64("jpeg", 101),
+];
+foreach ($writes as $what => $try) {
+    try {
+        $try();
+        echo $what, ": accepted\n";
+    } catch (ValueError $e) {
+        echo $what, ": ", $e->getMessage(), "\n";
+    }
+}
+try {
+    $img->saveTo("out.png");
+} catch (PermissionError $e) {
+    echo "saveTo: ", $e->getMessage(), "\n";
+}
+try {
+    Image::open("photo.jpg");
+} catch (PermissionError $e) {
+    echo "open: ", $e->getMessage(), "\n";
+}

@@ -136,6 +136,12 @@ impl<'a> Finder<'a> {
                 self.expr(subject);
                 self.stmts(body);
             }
+            HStmt::Yield { key, val, .. } => {
+                if let Some(k) = key {
+                    self.expr(k);
+                }
+                self.expr(val);
+            }
             HStmt::Return(e, _) => {
                 if let Some(e) = e {
                     self.expr(e);

@@ -1,0 +1,139 @@
+<?phv
+// std.orm: entities the type checker refuses, and annotations used wrongly (all errors).
+import std.db.Database;
+import std.orm.Repo;
+
+#[Table("users\"; DROP TABLE users; --")]
+class Quoted {
+    public ?int $id = null;
+}
+
+#[Table("has space")]
+class Spaced {
+    public ?int $id = null;
+    #[Column("a`b")]
+    public string $name = "";
+    #[Column("1st")]
+    public string $first = "";
+    #[Column]
+    public string $bare = "";
+    #[Id("x")]
+    public string $code = "";
+}
+
+#[Table("way_too_long_a_name_for_a_table_in_postgresql_which_allows_63_bytes")]
+class Long {
+    public ?int $id = null;
+}
+
+#[Column("x")]
+class Misplaced {
+    #[Table("t")]
+    public ?int $id = null;
+}
+
+class NoTable {
+    public ?int $id = null;
+}
+
+#[Table("pages")]
+class Page {
+    public ?int $id = null;
+    public ?Html $body = null;
+}
+
+#[Table("stamps")]
+class Stamp {
+    public ?int $id = null;
+    public readonly int $at = 0;
+}
+
+#[Table("links")]
+class Link {
+    public ?int $id = null;
+    public ?SafeUrl $href = null;
+}
+
+#[Table("mixed")]
+class Mixed {
+    public ?int $id = null;
+    public int|string $either = 0;
+}
+
+#[Table("callbacks")]
+class Callback {
+    public ?int $id = null;
+    public ?fn(): void $run = null;
+}
+
+#[Table("secrets")]
+class Secret {
+    public ?int $id = null;
+    private string $hash = "";
+}
+
+#[Table("keys")]
+class TwoKeys {
+    #[Id]
+    public int $a = 0;
+    #[Id]
+    public int $b = 0;
+}
+
+#[Table("keys")]
+class NoKey {
+    public int $number = 0;
+}
+
+#[Table("keys")]
+class FloatKey {
+    public float $id = 0.0;
+}
+
+#[Table("keys")]
+class ReadonlyKey {
+    public function __construct(public readonly ?int $id = null) {}
+}
+
+#[Table("same")]
+class SameColumn {
+    public ?int $id = null;
+    public string $name = "";
+    #[Column("NAME")]
+    public string $other = "";
+}
+
+#[Table("checked")]
+class Checked {
+    public ?int $id = null;
+    public function __construct(public string $name) {
+        if ($name == "") {
+            throw new ValueError("empty");
+        }
+    }
+}
+
+#[Table("generic")]
+class Box<T> {
+    public ?int $id = null;
+}
+
+$db = Database::open(":memory:");
+$a = new Repo<Quoted>($db);
+$b = new Repo<NoTable>($db);
+$c = new Repo<Page>($db);
+$d = new Repo<Link>($db);
+$e = new Repo<Mixed>($db);
+$f = new Repo<Callback>($db);
+$g = new Repo<Secret>($db);
+$h = new Repo<TwoKeys>($db);
+$i = new Repo<NoKey>($db);
+$j = new Repo<FloatKey>($db);
+$k = new Repo<ReadonlyKey>($db);
+$l = new Repo<SameColumn>($db);
+$m = new Repo<Checked>($db);
+$n = new Repo<Box<int>>($db);
+$o = new Repo<int>($db);
+$p = new Repo<NoKey>($db, "E\t1\tusers\t0\t1");
+$q = new Repo($db);
+$r = new Repo<Stamp>($db);

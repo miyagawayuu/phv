@@ -1,0 +1,6 @@
+<?phv params(Generator<string, int> $rows); ?>
+<table>
+<?phv foreach ($rows as $name => $count): ?>
+  <tr><td><?= $name ?></td><td><?= $count ?></td></tr>
+<?phv endforeach; ?>
+</table>

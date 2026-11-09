@@ -3,7 +3,7 @@ error: unknown annotation `#[Deprecatd]`
   |
 4 | #[Deprecatd]
   |   ^^^^^^^^^
-  = note: PHV knows Deprecated, Override, Test, Skip, Before, After
+  = note: PHV knows Deprecated, Override, Test, Skip, Before, After, Table, Column, Id
 
 error: `#[Override]` cannot be written before a function
  --> err_annotations.phv:7:3
