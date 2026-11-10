@@ -104,3 +104,7 @@ fine-grained token with read and write access to the contents of those two repos
   archive, so a release asset replaced later is not used), push it, and deploy the demo
   (`fly deploy -a phv-demo` from `examples/demo`). Check that every page of https://demo.phv-lang.org/ answers.
 - The website is deployed by `.github/workflows/website.yml` when `docs/` or `website/` change on `main`.
+  Before switching to this workflow, add `PHV_WEBSITE_API_TOKEN` (Cloudflare Pages: Edit) and
+  `PHV_WEBSITE_ACCOUNT_ID` to the `website-production` environment, whose only deployment branch is `main`.
+  After verifying the first production deployment through the environment, remove the old repository secrets
+  `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.

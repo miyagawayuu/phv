@@ -1,9 +1,9 @@
 name: Website
 
 # Builds phv-lang.org and deploys it to Cloudflare Pages (project `phv-lang`).
-# Needs two repository secrets: CLOUDFLARE_API_TOKEN (a token with the
-# "Cloudflare Pages: Edit" permission) and CLOUDFLARE_ACCOUNT_ID. Without them
-# the site is still built, and the deploy step is skipped.
+# The main-only website-production environment holds PHV_WEBSITE_API_TOKEN
+# (Cloudflare Pages: Edit) and PHV_WEBSITE_ACCOUNT_ID. Without them the site
+# is still built, and the deploy step is skipped.
 on:
   push:
     branches: [main]
@@ -49,6 +49,7 @@ jobs:
   deploy:
     needs: build
     if: github.ref == 'refs/heads/main'
+    environment: website-production
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -66,11 +67,11 @@ jobs:
       - name: Deploy to Cloudflare Pages
         working-directory: .github/deploy
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PHV_WEBSITE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PHV_WEBSITE_ACCOUNT_ID }}
         run: |
           if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "::notice::CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID are not set; skipping the deploy"
+            echo "::notice::PHV_WEBSITE_API_TOKEN / PHV_WEBSITE_ACCOUNT_ID are not set in website-production; skipping the deploy"
             exit 0
           fi
           # Checks that explain a failure without printing either secret.

@@ -99,3 +99,7 @@ amd64 と arm64 の `ghcr.io/miyagawayuu/phv:X.Y.Z` と `:latest` をプッシ�
   拒むので、後から差し替えられたリリースのファイルは使われない）プッシュし、デモをデプロイする
   (`examples/demo` で `fly deploy -a phv-demo`)。https://demo.phv-lang.org/ のすべてのページが応答するか確かめる。
 - Web サイトは、`main` の `docs/` か `website/` が変わると `.github/workflows/website.yml` がデプロイする。
+  このワークフローへ切り替える前に、デプロイを `main` に限定した `website-production` 環境へ
+  `PHV_WEBSITE_API_TOKEN` (Cloudflare Pages: Edit) と `PHV_WEBSITE_ACCOUNT_ID` を登録する。
+  この環境からの最初の本番デプロイを確認したら、旧リポジトリシークレット `CLOUDFLARE_API_TOKEN` と
+  `CLOUDFLARE_ACCOUNT_ID` を削除する。
