@@ -569,7 +569,7 @@ pub unsafe extern "C" fn phv_jit_index(ctx: *mut JitCtx, d: i64, l: i64, i: i64,
         return 0;
     };
     let item = match usize::try_from(i).ok().and_then(|x| list.get(x)) {
-        Some(v) => v.clone(),
+        Some(v) => v,
         None => {
             let msg = format!("list index {i} is out of range (length {})", list.len());
             throw(ctx, "IndexError", msg);
@@ -577,11 +577,11 @@ pub unsafe extern "C" fn phv_jit_index(ctx: *mut JitCtx, d: i64, l: i64, i: i64,
         }
     };
     match (kind, item) {
-        (JIT_ELEM_INT, Value::Int(n)) => n,
-        (JIT_ELEM_INT, Value::Bool(b)) => b as i64,
+        (JIT_ELEM_INT, Value::Int(n)) => *n,
+        (JIT_ELEM_INT, Value::Bool(b)) => *b as i64,
         (JIT_ELEM_FLOAT, Value::Float(f)) => f.to_bits() as i64,
-        (JIT_ELEM_STR, v @ Value::Str(_)) => {
-            w[d as usize] = v;
+        (JIT_ELEM_STR, Value::Str(s)) => {
+            w[d as usize] = Value::Str(s.clone());
             0
         }
         _ => {
@@ -621,6 +621,14 @@ pub unsafe extern "C" fn phv_jit_set_index(ctx: *mut JitCtx, r: i64, i: i64, pus
     }
     let v = w[val as usize].clone();
     let push = push != 0;
+    if !push {
+        let Value::List(items) = &mut w[r as usize] else { unreachable!("list checked above") };
+        // A unique list can replace an existing slot without copying or growing.
+        if let Some(slot) = Rc::get_mut(items).and_then(|items| items.get_mut(usize::try_from(i).ok()?)) {
+            *slot = v;
+            return;
+        }
+    }
     let key = [Value::Int(i)];
     let keys: &[Value] = if push { &[] } else { &key };
     let cost = copy_cost(&w[r as usize], keys, push);

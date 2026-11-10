@@ -630,6 +630,12 @@ function at(list<int> $xs, int $i): int {
     return $xs[$i];
 }
 
+function write_local(int $i): int {
+    list<int> $xs = [1, 2, 3];
+    $xs[$i] = 9;
+    return $xs[0];
+}
+
 function pow_of(int $a, int $b): int {
     return $a ** $b;
 }
@@ -644,6 +650,14 @@ try {
 } catch (IndexError $e) {
     echo "IndexError: ", $e->getMessage(), "\n";
 }
+echo write_local(0), "\n";
+foreach ([-1, 3] as $i) {
+    try {
+        echo write_local($i);
+    } catch (IndexError $e) {
+        echo "IndexError: ", $e->getMessage(), "\n";
+    }
+}
 try {
     echo pow_of(2, -1);
 } catch (ArithmeticError $e) {
@@ -655,12 +669,17 @@ try {
     echo $e->getMessage(), "\n";
 }
 "#;
-    let out =
-        run_both("lists", src, Limits::default(), &["sieve", "bubble", "total", "words", "squares", "at", "pow_of"]);
+    let out = run_both(
+        "lists",
+        src,
+        Limits::default(),
+        &["sieve", "bubble", "total", "words", "squares", "at", "write_local", "pow_of"],
+    );
     assert_eq!(
         out,
         "168 1,3,5,7,9 5,3,9,1,7\n6.75 0=a 1=b 2=c 3\n1,4,9,16,25 2 81\n\
          IndexError: list index 5 is out of range (length 3)\n\
+         9\nIndexError: list index -1 is out of range (length 3)\nIndexError: list index 3 is out of range (length 3)\n\
          negative exponent in int ** int; use a float base, e.g. 2.0 ** -1\ninteger overflow\n"
     );
 }

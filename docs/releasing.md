@@ -84,6 +84,7 @@ Each of these workflows checks out the release's tag (never a branch of the same
 not the latest, so users are never moved back to an older version. Their environments (`marketplace`, `docker`,
 `package-managers`) should allow deployments from `v*` tags only (Settings → Environments → Deployment branches and
 tags); `package-managers` holds a token, so give it a required reviewer too.
+When dispatching a deployment manually, select the same release tag as the workflow ref and the `tag` input.
 
 It also runs `.github/workflows/docker.yml`, which downloads the release's static (musl) archives, checks them
 against `SHA256SUMS`, and pushes `ghcr.io/miyagawayuu/phv:X.Y.Z` and `:latest` for amd64 and arm64 (the image was

@@ -79,6 +79,7 @@ gh release edit vX.Y.Z --notes-file notes.md --draft=false --latest
 ので、利用者が古いバージョンに戻されることはない。それぞれの環境(`marketplace`、`docker`、`package-managers`)は、`v*` の
 タグからのデプロイだけを許すこと(Settings → Environments → Deployment branches and tags)。`package-managers` はトークンを
 持つので、承認者も付ける。
+手動で再実行するときは、実行元の ref と入力の `tag` の両方に同じリリースタグを指定する。
 
 `.github/workflows/docker.yml` も動き、リリースの静的リンク(musl)のアーカイブをダウンロードして `SHA256SUMS` と照合し、
 amd64 と arm64 の `ghcr.io/miyagawayuu/phv:X.Y.Z` と `:latest` をプッシュする(同じ実行ファイルからのイメージは、リリースの

@@ -894,9 +894,19 @@ impl Callback {
     #[inline]
     pub fn call(&self, vm: &mut Vm, args: &[Value]) -> Result<Value, VmError> {
         if self.fast {
-            vm.call_fast(self.clo.func, &self.clo.caps, args)
+            vm.call_fast(self.clo.func, &self.clo.caps, args.iter())
         } else {
             vm.call_inner(self.clo.func, &self.clo.caps, args)
+        }
+    }
+
+    /// Calls the closure with two borrowed values, such as a sort comparison.
+    #[inline]
+    pub fn call_pair(&self, vm: &mut Vm, left: &Value, right: &Value) -> Result<Value, VmError> {
+        if self.fast {
+            vm.call_fast(self.clo.func, &self.clo.caps, [left, right].into_iter())
+        } else {
+            vm.call_inner(self.clo.func, &self.clo.caps, &[left.clone(), right.clone()])
         }
     }
 }
@@ -1090,7 +1100,7 @@ fn memory_error(limit: usize) -> VmError {
 /// `ToStr`: the string form of a scalar.
 pub(crate) fn op_to_str(regs: &mut [Value], d: Reg, a: Reg) {
     let v = match &regs[a as usize] {
-        Value::Str(s) => Value::Str(s.clone()),
+        Value::Str(s) | Value::Html(s) => Value::Str(s.clone()),
         other => Value::str(other.to_display_string()),
     };
     regs[d as usize] = v;
@@ -1476,7 +1486,12 @@ impl Vm {
     /// it). The captures and arguments are bound, the frame is pushed (an
     /// exception's trace reads it) and the time limit is ticked as in every
     /// call.
-    fn call_fast(&mut self, func: u32, caps: &[Value], args: &[Value]) -> Result<Value, VmError> {
+    fn call_fast<'a>(
+        &mut self,
+        func: u32,
+        caps: &'a [Value],
+        args: impl ExactSizeIterator<Item = &'a Value>,
+    ) -> Result<Value, VmError> {
         if self.frames.len() >= self.limits.max_frames {
             return Err(VmError::Fatal("maximum call stack depth exceeded".into()));
         }
@@ -1486,14 +1501,16 @@ impl Vm {
             None => 0,
         };
         let nregs = self.prog.funcs[func as usize].num_regs as usize;
-        let need = base + nregs.max(caps.len() + args.len());
+        let bound = caps.len() + args.len();
+        let need = base + nregs.max(bound);
         if self.regs.len() < need {
             self.grow_regs(need)?;
         }
-        let window = &mut self.regs[base..need];
         // The captures again at each call: the body may change its copy
         // (`$count++`), and every call starts from the captured value.
-        for (slot, v) in window.iter_mut().zip(caps.iter().chain(args.iter())) {
+        let (capture_slots, argument_slots) = self.regs[base..base + bound].split_at_mut(caps.len());
+        capture_slots.clone_from_slice(caps);
+        for (slot, v) in argument_slots.iter_mut().zip(args) {
             *slot = v.clone();
         }
         self.frames.push(Frame { func, pc: 0, base, ret: 0, stop: true, gen: false });
@@ -4032,7 +4049,7 @@ fn short_repr(v: &Value) -> String {
 }
 
 #[cfg(test)]
-mod append_tests {
+mod string_ops_tests {
     use super::*;
 
     #[test]
@@ -4047,6 +4064,18 @@ mod append_tests {
 
         assert_eq!(op_append(&mut regs, mem, 1, 1), Ok(4));
         assert!(matches!(&regs[1], Value::Str(s) if s.as_str() == "abab"));
+    }
+
+    #[test]
+    fn casting_html_keeps_plain_text_separate_on_write() {
+        let mut regs = [Value::html("Tom &amp; Jerry"), Value::Null, Value::str("!")];
+        op_to_str(&mut regs, 1, 0);
+        assert!(matches!((&regs[0], &regs[1]), (Value::Html(html), Value::Str(text)) if Rc::ptr_eq(html, text)));
+
+        let mem = MemLimit { max: None, base: crate::alloc::thread_allocated() };
+        assert!(op_append(&mut regs, mem, 1, 2).is_ok());
+        assert!(matches!(&regs[0], Value::Html(s) if s.as_str() == "Tom &amp; Jerry"));
+        assert!(matches!(&regs[1], Value::Str(s) if s.as_str() == "Tom &amp; Jerry!"));
     }
 }
 

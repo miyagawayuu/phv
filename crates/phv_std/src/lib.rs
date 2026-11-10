@@ -1268,7 +1268,7 @@ fn core_lookup(name: &str) -> Option<BuiltinFn> {
         "list_sort_by" => |vm, a| {
             let f = vm.callback(&a[1]);
             let items = list(&a[0]).as_ref().clone();
-            let sorted = merge_sort(items, &mut |x, y| match f.call(vm, &[x.clone(), y.clone()])? {
+            let sorted = merge_sort(items, &mut |x, y| match f.call_pair(vm, x, y)? {
                 Value::Int(i) => Ok(i),
                 other => Err(VmError::Fatal(format!("sortBy callback returned {}", other.type_name()))),
             })?;
