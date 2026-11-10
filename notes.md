@@ -17,6 +17,13 @@ Windows x64 のリリースビルドで、オブジェクトを扱うページ�
 
 画像変換は16ワーカーで6枠です。v1.3.0 以前から更新して共有セッションを使う場合は、v1.3.1 で追加された OAuth の使用済み state 記録を全プロセスが使うよう、一斉に切り替えてください。共有ファイルセッションを使う v1.2 の全プロセスは、新版の起動前に停止してください。[v1.3.1 の移行手順](https://github.com/miyagawayuu/phv/releases/tag/v1.3.1)
 
+### セキュリティと検証
+
+- VS Code 拡張は、既定の PATH 検索で、ドットで始まる名前を含むワークスペースの子ディレクトリも除外します。
+- Web サイトのデプロイは `main` 限定の GitHub Environment を使います。GitHub リリースのドラフト作成には既存タグが必要です。
+- Redis 7、PostgreSQL 17、MySQL 8.4 の共有ストア試験では、異常停止からの再起動後と、複製済みの待機系への切り替え後に、使用済み記録が保持され、PHV のストア API が重複登録を拒否しました。使用済み記録を失う可能性がある復旧では、コールバックを再開する前に対象サイトのセッションを無効化してください。[仕様](https://github.com/miyagawayuu/phv/blob/v1.3.2/docs/spec.ja.md)
+- 候補 `49b3a84` の CI と配布ビルドが通過し、Windows 実機と Linux ARM64 エミュレーションで、既定・JIT 無効・切り戻し・試験設定の出力が一致しました。[CI](https://github.com/miyagawayuu/phv/actions/runs/42825612305) · [配布ビルド](https://github.com/miyagawayuu/phv/actions/runs/42825618324)
+
 ## English
 
 - **JIT.** Eligible loops reuse checked reads of non-nullable `int`, `bool`, and `float` properties when the JIT can prove the property remains unchanged. Set `PHV_JIT_LOOP_PROP_CACHE=0` to disable this optimization or `PHV_JIT=0` to use the interpreter.
@@ -33,6 +40,13 @@ On Windows x64 release builds, at 600 requests per second, the median request p9
 ### Upgrading
 
 Image conversion uses six slots with 16 workers. When upgrading from v1.3.0 or earlier with a shared session store, switch all processes together so that they share the consumed OAuth state records introduced in v1.3.1. Stop all v1.2 processes that use a shared file session directory before starting the new version. [v1.3.1 migration instructions](https://github.com/miyagawayuu/phv/releases/tag/v1.3.1)
+
+### Security and verification
+
+- The VS Code extension excludes dot-prefixed workspace subdirectories from its default executable search on PATH.
+- The website deploys through a GitHub Environment restricted to `main`. Draft GitHub releases require an existing tag.
+- In tests with Redis 7, PostgreSQL 17, and MySQL 8.4, consumed-state records survived restart after an unclean stop and failover to a replica confirmed to have the records. PHV's store API rejected duplicate claims after recovery. If recovery may have lost consumed-state records, invalidate the affected site's sessions before resuming callbacks. [Specification](https://github.com/miyagawayuu/phv/blob/v1.3.2/docs/spec.md)
+- CI and distribution builds passed for candidate `49b3a84`. Output matched on native Windows and emulated Linux ARM64 in the default, interpreter, rollback, and experimental configurations. [CI](https://github.com/miyagawayuu/phv/actions/runs/42825612305) · [Distribution build](https://github.com/miyagawayuu/phv/actions/runs/42825618324)
 
 ## インストール / Installing
 
