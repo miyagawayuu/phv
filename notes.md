@@ -4,6 +4,7 @@
 
 - **JIT**。ループ内で変化しないことを確認できる非 nullable な `int`、`bool`、`float` のプロパティ読み取りを再利用します。`PHV_JIT_LOOP_PROP_CACHE=0` でこの最適化を無効にし、`PHV_JIT=0` でインタープリターに切り替えられます。
 - **ジェネレーター**。キーと値をそのまま渡す `yield from` の中継処理を短縮し、停止・再開をまたいで例外ハンドラーの保存領域を再利用します。切り戻しには、それぞれ `PHV_VM_YIELD_FROM_FORWARD=0` と `PHV_VM_REUSE_GEN_HANDLERS=0` を使えます。
+- **文字列追記**。追記元と追記先が別レジスタの場合、追記元の値を複製せずに処理します。
 - **試験設定**。`PHV_VM_COMPACT_NEW_GENERATORS=1` は、初回再開まで引数とキャプチャだけを保持します。`PHV_VM_PRUNE_GEN_REGS=1` は別の試験設定で、対象の停止中フレームに再開・終了・例外処理で必要なレジスタだけを保存します。
 - **PHP 8.5 との比較**。同じ入力でプロパティ読み取りとジェネレーターを計測し、JIT 有効・無効の結果とチェックサムを記録する CLI ベンチマークを追加しました。[手順と v1.3.1 の比較結果](https://github.com/miyagawayuu/phv/blob/v1.3.2/bench/README.ja.md)
 
@@ -19,6 +20,7 @@ Windows x64 のリリースビルドで、オブジェクトを扱うページ�
 
 - **JIT.** Eligible loops reuse checked reads of non-nullable `int`, `bool`, and `float` properties when the JIT can prove the property remains unchanged. Set `PHV_JIT_LOOP_PROP_CACHE=0` to disable this optimization or `PHV_JIT=0` to use the interpreter.
 - **Generators.** The VM forwards keys and values through transparent `yield from` chains and reuses the exception-handler buffer across suspension and resumption. Set `PHV_VM_YIELD_FROM_FORWARD=0` or `PHV_VM_REUSE_GEN_HANDLERS=0` to disable the respective optimizations.
+- **String appends.** The VM borrows the source value when the source and destination occupy separate registers.
 - **Experimental settings.** `PHV_VM_COMPACT_NEW_GENERATORS=1` retains only arguments and captures until the first resume. The separate `PHV_VM_PRUNE_GEN_REGS=1` setting keeps only the registers needed for resumption, closing, and exception handling in eligible suspended frames.
 - **PHP 8.5 comparison.** A CLI benchmark measures typed property reads and generators with the same inputs, records checksums, and compares runs with and without JIT. [Instructions and v1.3.1 results](https://github.com/miyagawayuu/phv/blob/v1.3.2/bench/README.md)
 

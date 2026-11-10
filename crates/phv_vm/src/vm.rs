@@ -1157,8 +1157,13 @@ pub(crate) fn str_len(v: &Value) -> usize {
 /// optimization otherwise decides afresh with every change elsewhere.
 #[inline(always)]
 pub(crate) fn op_append(regs: &mut [Value], mem: MemLimit, d: Reg, s: Reg) -> Result<usize, usize> {
-    let src = regs[s as usize].clone();
-    append_value(&mut regs[d as usize], &src, mem)
+    if let Ok([target, source]) = regs.get_disjoint_mut([d as usize, s as usize]) {
+        append_value(target, source, mem)
+    } else {
+        // Self-append needs a snapshot before making the destination unique.
+        let src = regs[s as usize].clone();
+        append_value(&mut regs[d as usize], &src, mem)
+    }
 }
 
 /// `$target .= $src` on a string, in place when it is not shared (see `op_append`).
@@ -4023,6 +4028,25 @@ fn short_repr(v: &Value) -> String {
         Value::Int(_) | Value::Float(_) | Value::Bool(_) => v.to_display_string(),
         Value::Null => "null".into(),
         other => other.type_name().into(),
+    }
+}
+
+#[cfg(test)]
+mod append_tests {
+    use super::*;
+
+    #[test]
+    fn append_preserves_shared_source_and_supports_self_append() {
+        let original = Value::str("ab");
+        let mut regs = [original.clone(), original];
+        let mem = MemLimit { max: None, base: crate::alloc::thread_allocated() };
+
+        assert_eq!(op_append(&mut regs, mem, 0, 1), Ok(4));
+        assert!(matches!(&regs[0], Value::Str(s) if s.as_str() == "abab"));
+        assert!(matches!(&regs[1], Value::Str(s) if s.as_str() == "ab"));
+
+        assert_eq!(op_append(&mut regs, mem, 1, 1), Ok(4));
+        assert!(matches!(&regs[1], Value::Str(s) if s.as_str() == "abab"));
     }
 }
 
