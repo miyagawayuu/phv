@@ -99,6 +99,44 @@ differences of a few percent in the micro-benchmarks, and more in the server's p
 `--name <label>` writes `results/<label>.json` instead of `<short-sha>.json` (the uncommitted state
 of a branch, say) and is accepted by `serve` too (`lsp.py` takes `--out <file>`).
 
+## Comparing PHV with PHP 8.5
+
+Use a PHV release binary, Python 3.9 or later, and PHP 8.5 CLI with OPcache loaded.
+Pass `--php` if the PHP 8.5 executable is outside PATH. On Windows, pass the path to `phv.exe`.
+
+```bash
+python3 bench/compare_php.py --phv /path/to/phv --php /path/to/php --output bench/results/php85.json
+```
+
+The comparison uses the same typed property reads and five generator workloads from `runtime.phv`,
+with the same inputs and timing boundaries. It rotates four CLI modes over seven rounds by default:
+PHV JIT, PHV interpreter, PHP OPcache with tracing JIT, and PHP OPcache with JIT disabled.
+Each sample uses a fresh process and times the workload inside the script, including any JIT
+work that happens during the timed interval. The runner checks that all modes produce the same
+checksums, prints the median in milliseconds, and saves every sample, the versions and host
+metadata to a separate JSON file. These timings cover CLI execution.
+
+Measured on Windows 11 x64 with an AMD Ryzen 9 5950X using the published PHV v1.3.1 binary
+and PHP 8.5.12 NTS. Values are medians in milliseconds from seven runs per mode.
+
+| Workload | PHV JIT | PHV interpreter | PHP tracing JIT | PHP OPcache, JIT off |
+|---|---:|---:|---:|---:|
+| Typed property reads | 21.345 | 113.128 | 2.820 | 48.349 |
+| Simple `yield` | 10.419 | 10.314 | 4.083 | 4.294 |
+| `yield` with more locals | 17.520 | 17.523 | 3.713 | 4.324 |
+| `yield` inside `try/finally` | 17.886 | 18.010 | 3.668 | 4.653 |
+| Nested `yield from` | 87.628 | 88.345 | 3.324 | 4.605 |
+| Early generator exit | 37.724 | 37.680 | 7.637 | 8.274 |
+
+[Raw samples and checksums](results/php85-v1.3.1-windows-x64.json)
+
+The [CLI profiling report (Japanese)](php85-profile.ja.md) separates the cost of property reads,
+generator suspension, and nested delegation. The Windows x64 experiments for v1.3.2 have separate
+results for [HTTP loop property reads](results/v1.3.2-loop-property-http-windows-x64.json),
+[`yield from` forwarding](results/v1.3.2-yield-from-windows-x64.json),
+[handler buffer reuse](results/v1.3.2-generator-handlers-windows-x64.json), and
+[compact unstarted generators](results/v1.3.2-new-generator-windows-x64.json).
+
 ## Files
 
 `performance.py` compares two release binaries in seven alternating pairs by default. It saves the samples and

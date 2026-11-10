@@ -3,6 +3,7 @@
 pub mod alloc;
 pub mod bytecode;
 mod cycles;
+mod gen_registers;
 pub mod i18n;
 pub mod jit;
 mod stack;

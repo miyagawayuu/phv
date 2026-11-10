@@ -427,6 +427,14 @@ pass.
   against the memory limit, the time limit stops a long generator as it stops any code, the cycle collector sees the
   values the frame holds (an object holding a generator of its own method is freed), and a generator a loop resumes is
   a call for the call-depth limit, so a deep recursion through `yield from` stops at it.
+  By default, when `yield from` passes a generator's keys and values through unchanged, the VM can forward them
+  while the intermediate registers remain saved. Set `PHV_VM_YIELD_FROM_FORWARD=0` to disable this optimization.
+  By default, the VM reuses the buffer that saves exception handlers across yields.
+  Set `PHV_VM_REUSE_GEN_HANDLERS=0` to disable buffer reuse.
+  Set `PHV_VM_COMPACT_NEW_GENERATORS=1` to retain only arguments and captures until the first resume.
+  With this experimental setting, allocation of the full register window is checked against the memory limit at
+  first resume. `PHV_VM_PRUNE_GEN_REGS=1` separately enables experimental register pruning for eligible suspended
+  frames, keeping the registers required by resumption, closing, and exception handling.
 - Generators and the loops over them run in the interpreter (§17).
 - `yield` is a reserved word from 1.3; a method can still be named `yield`. A project's own class named `Generator`
   hides the built-in one in the files that declare or import it.
@@ -3293,8 +3301,10 @@ It then runs the type checker and shows the places that need manual work, such a
      not kept for a rerun, so changing them never copies them). Functions with more than 1,024 registers or 16,384
      instructions are left to the interpreter (compiling them would take much memory). Before compiling, the JIT checks
      every instruction and the kind of every register on every path, so bytecode from the cache is never trusted;
-     helpers check the value they read from a property or an element against the kind they deliver. It can be
-     disabled with `PHV_JIT=0`. An exception raised in native code has the stack trace it has in the interpreter:
+     helpers check the value they read from a property or an element against the kind they deliver. By default, the
+     JIT can reuse a checked read of an unchanged, non-nullable `int`, `bool` or `float` property in eligible loops.
+     Set `PHV_JIT_LOOP_PROP_CACHE=0` to disable this optimization, or `PHV_JIT=0` to disable the JIT.
+     An exception raised in native code has the stack trace it has in the interpreter:
      each native call it leaves notes its function and position.
 5. **Bytecode cache**: `phv run` and `phv serve` save compiled output in `.phv-cache/` and reuse it
    if neither the source files nor the `phv` binary have changed.

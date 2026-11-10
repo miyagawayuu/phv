@@ -1136,26 +1136,96 @@ fn writes_args(f: &Function) -> bool {
 /// Whether `f` has a loop: a branch to an earlier instruction (the compiler
 /// branches back only for loops).
 fn has_loop(f: &Function) -> bool {
+    f.code.iter().enumerate().any(|(i, ins)| back_target(i, ins).is_some())
+}
+
+fn back_target(i: usize, ins: &Instr) -> Option<usize> {
     use Instr::*;
-    f.code.iter().enumerate().any(|(i, ins)| {
-        let t = match *ins {
-            Jump(t)
-            | JumpIfFalse(_, t)
-            | JumpIfTrue(_, t)
-            | JumpIfNull(_, t)
-            | JumpIfNotNull(_, t)
-            | JumpIfNotLtI(_, _, t)
-            | JumpIfNotLeI(_, _, t)
-            | JumpIfEq(_, _, t)
-            | JumpIfNotEq(_, _, t)
-            | JumpIfNotLtIImm(_, _, t)
-            | JumpIfNotLeIImm(_, _, t)
-            | JumpIfLtIImm(_, _, t)
-            | JumpIfLeIImm(_, _, t) => t,
-            _ => return false,
+    let t = match *ins {
+        Jump(t)
+        | JumpIfFalse(_, t)
+        | JumpIfTrue(_, t)
+        | JumpIfNull(_, t)
+        | JumpIfNotNull(_, t)
+        | JumpIfNotLtI(_, _, t)
+        | JumpIfNotLeI(_, _, t)
+        | JumpIfEq(_, _, t)
+        | JumpIfNotEq(_, _, t)
+        | JumpIfNotLtIImm(_, _, t)
+        | JumpIfNotLeIImm(_, _, t)
+        | JumpIfLtIImm(_, _, t)
+        | JumpIfLeIImm(_, _, t) => t as usize,
+        _ => return None,
+    };
+    (t <= i).then_some(t)
+}
+
+/// Scalar reads of object parameters inside a single loop. Restrict the
+/// entire function to operations that cannot replace those parameters or
+/// mutate their objects, even through aliases.
+fn loop_prop_reads(prog: &Program, f: &Function, checked: &Checked) -> Vec<usize> {
+    use phv_vm::bytecode::Const as Literal;
+    use Instr::*;
+    let params = &f.native.as_ref().expect("checked").params;
+    let object_param = |r: Reg| matches!(params.get(r as usize), Some(ValKind::Object(_)));
+    if !params.iter().any(|p| matches!(p, ValKind::Object(_))) {
+        return Vec::new();
+    }
+    let mut back_edges = f.code.iter().enumerate().filter_map(|(i, ins)| {
+        checked.kinds[i].as_ref()?;
+        back_target(i, ins).map(|start| start..=i)
+    });
+    let Some(body) = back_edges.next() else { return Vec::new() };
+    if back_edges.next().is_some() {
+        return Vec::new();
+    }
+    let mut reads = Vec::new();
+    for (i, (ins, state)) in f.code.iter().zip(&checked.kinds).enumerate() {
+        let Some(state) = state else { continue };
+        let dst = match *ins {
+            GetProp(d, o, slot)
+                if matches!(field_kind(prog, state[o as usize], slot), Some(K::Int | K::Bool | K::Float)) =>
+            {
+                if object_param(o) && body.contains(&i) {
+                    reads.push(i);
+                }
+                d
+            }
+            Const(d, c)
+                if matches!(prog.consts[c as usize], Literal::Int(_) | Literal::Bool(_) | Literal::Float(_)) =>
+            {
+                d
+            }
+            Move(d, s) if matches!(state[s as usize], K::Int | K::Bool | K::Float) => d,
+            Int(d, _)
+            | Bool(d, _)
+            | AddI(d, _, _)
+            | AddIImm(d, _, _)
+            | SubI(d, _, _)
+            | SubIImm(d, _, _)
+            | MulI(d, _, _)
+            | ModI(d, _, _)
+            | IncI(d, _)
+            | AddF(d, _, _)
+            | SubF(d, _, _)
+            | MulF(d, _, _)
+            | DivF(d, _, _)
+            | IntToFloat(d, _)
+            | LtI(d, _, _)
+            | LeI(d, _, _)
+            | EqI(d, _, _)
+            | Not(d, _) => d,
+            Jump(_) | JumpIfFalse(..) | JumpIfTrue(..) | JumpIfNotLtI(..) | JumpIfNotLeI(..) | JumpIfNotLtIImm(..)
+            | JumpIfNotLeIImm(..) | JumpIfLtIImm(..) | JumpIfLeIImm(..) | Ret(_) | RetNull => continue,
+            _ => return Vec::new(),
         };
-        t as usize <= i
-    })
+        if object_param(dst) {
+            return Vec::new();
+        }
+    }
+    // Bound the extra live native values in the loop.
+    reads.truncate(4);
+    reads
 }
 
 /// Per function: whether it may call itself again, directly or through other
@@ -1835,11 +1905,13 @@ fn shared_put(key: Vec<u8>, unit: Arc<Unit>) -> Arc<Unit> {
 /// compiled). `PHV_JIT_STATS=1` reports each compilation on stderr.
 fn compile_root(prog: &Program, root: u32) -> Vec<(u32, Installed)> {
     let start = std::time::Instant::now();
-    let canon = canonical(prog, root);
+    let loop_prop_cache = !std::env::var_os("PHV_JIT_LOOP_PROP_CACHE").is_some_and(|v| v == "0");
+    let mut canon = canonical(prog, root);
+    canon.key.push(u8::from(loop_prop_cache));
     let (unit, hit) = match shared_get(&canon.key) {
         Some(u) => (u, true),
         None => {
-            let unit = Arc::new(compile_unit(&canon.prog));
+            let unit = Arc::new(compile_unit(&canon.prog, loop_prop_cache));
             (shared_put(canon.key, unit), false)
         }
     };
@@ -1882,18 +1954,18 @@ fn compile_root(prog: &Program, root: u32) -> Vec<(u32, Installed)> {
 
 /// Compiles the eligible functions of canonical program `prog` into one
 /// unit; function 0 is the root.
-fn compile_unit(prog: &Program) -> Unit {
+fn compile_unit(prog: &Program, loop_prop_cache: bool) -> Unit {
     let none = Unit { code: None, entries: vec![None; prog.funcs.len()] };
     let checked = eligible(prog);
     if !checked.contains_key(&0) {
         return none;
     }
-    build(prog, &checked).unwrap_or(none)
+    build(prog, &checked, loop_prop_cache).unwrap_or(none)
 }
 
 /// Compiles the functions in `checked` (see `compile_unit`); `None` if
 /// Cranelift refuses something.
-fn build(prog: &Program, checked: &HashMap<u32, Checked>) -> Option<Unit> {
+fn build(prog: &Program, checked: &HashMap<u32, Checked>, loop_prop_cache: bool) -> Option<Unit> {
     let mut jb = JITBuilder::with_isa(isa()?, default_libcall_names());
     for (name, addr, ..) in helpers() {
         jb.symbol(name, addr);
@@ -1967,7 +2039,7 @@ fn build(prog: &Program, checked: &HashMap<u32, Checked>) -> Option<Unit> {
                 }
             }
             let t = Translator::new(&mut b, prog, func, &checked[&f], helpers, callees, f);
-            t.translate();
+            t.translate(loop_prop_cache);
             b.seal_all_blocks();
             b.finalize(config);
         }
@@ -2208,6 +2280,30 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.check(e);
     }
 
+    fn read_scalar_prop(&mut self, object: Reg, slot: u16, kind: i64, cache: Option<(Variable, Variable)>) -> Value {
+        let Some((ready, bits)) = cache else {
+            let value = self.call_regs(H::GetPropScalar, &[object as i64, slot as i64, kind]).unwrap();
+            self.check_ctx();
+            return value;
+        };
+
+        // Read at the original instruction on its first visit. A skipped
+        // branch or zero-trip loop must not perform the read or raise its error.
+        let read = self.b.create_block();
+        let done = self.b.create_block();
+        let initialized = self.b.use_var(ready);
+        self.b.ins().brif(initialized, done, &[], read, &[]);
+        self.b.switch_to_block(read);
+        let value = self.call_regs(H::GetPropScalar, &[object as i64, slot as i64, kind]).unwrap();
+        self.check_ctx();
+        self.b.def_var(bits, value);
+        let one = self.iconst(1);
+        self.b.def_var(ready, one);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
+        self.b.use_var(bits)
+    }
+
     /// Element `i` (a machine value) of the list in slot `l`, into register
     /// `d` (a machine register, or slot `d` for a string).
     fn element(&mut self, d: Reg, l: Reg, i: Value, e: E) {
@@ -2423,7 +2519,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         }
     }
 
-    fn translate(mut self) {
+    fn translate(mut self, loop_prop_cache: bool) {
         let code = &self.func.code;
         let nparams = self.sig.params.len();
         let entry = self.b.create_block();
@@ -2438,6 +2534,16 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.ctx = self.b.block_params(entry)[0];
         let args_base = self.b.block_params(entry)[1];
         let zero = self.iconst(0);
+        let mut cached_props = HashMap::new();
+        if loop_prop_cache {
+            for i in loop_prop_reads(self.prog, self.func, self.checked) {
+                let ready = self.b.declare_var(I64);
+                let bits = self.b.declare_var(I64);
+                self.b.def_var(ready, zero);
+                self.b.def_var(bits, zero);
+                cached_props.insert(i, (ready, bits));
+            }
+        }
         let fzero = self.b.ins().f64const(0.0);
         for r in 0..nregs {
             let (mut i, mut f) = (zero, fzero);
@@ -3100,11 +3206,14 @@ impl<'a, 'b> Translator<'a, 'b> {
                     let fk = field_kind(self.prog, k(o), slot).expect("checked");
                     let (code, nullable) = fk.elem().expect("checked");
                     let v = if matches!(fk, K::Int | K::Bool | K::Float) {
-                        self.call_regs(H::GetPropScalar, &[o as i64, slot as i64, code]).unwrap()
+                        self.read_scalar_prop(o, slot, code, cached_props.get(&i).copied())
                     } else {
-                        self.call_regs(H::GetProp, &[d as i64, o as i64, slot as i64, code, nullable as i64]).unwrap()
+                        let value = self
+                            .call_regs(H::GetProp, &[d as i64, o as i64, slot as i64, code, nullable as i64])
+                            .unwrap();
+                        self.check_ctx();
+                        value
                     };
-                    self.check_ctx();
                     match fk {
                         K::Float | K::Opt(E::Float) => {
                             let f = self.b.ins().bitcast(F64, MemFlagsData::new(), v);

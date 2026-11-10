@@ -1,0 +1,780 @@
+{
+  "versions": {
+    "phv": "phv 1.3.1",
+    "php": "8.5.12"
+  },
+  "platform": "Windows-11-10.0.26300-SP0",
+  "machine": "AMD64",
+  "samples": {
+    "phv_jit": [
+      {
+        "property_reads": {
+          "ms": 22.066,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 11.115,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 18.599,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 18.865,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 93.904,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 40.217,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 22.465,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 10.917,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 18.8,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 18.715,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 90.463,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 38.405,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 21.785,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 11.112,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 18.452,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 18.973,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 93.725,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 39.975,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 21.147,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 10.419,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 17.52,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 17.6,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 87.033,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 37.361,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 20.387,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 10.104,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 17.453,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 17.886,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 87.628,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 37.283,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 20.353,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 10.06,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 17.386,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 17.559,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 87.365,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 37.724,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 21.345,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 10.2,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 17.471,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 17.496,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 87.053,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 37.035,
+          "checksum": "120000"
+        }
+      }
+    ],
+    "php_jit": [
+      {
+        "property_reads": {
+          "ms": 2.872,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 4.018,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 3.631,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 3.62,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 3.19,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 7.81,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 3.559,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 5.071,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 4.33,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 4.137,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 3.41,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 8.141,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 2.845,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 4.27,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 3.853,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 3.954,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 3.443,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 8.081,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 2.755,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 4.083,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 3.713,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 3.668,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 3.324,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 7.637,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 2.82,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 4.0,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 3.538,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 3.585,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 3.19,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 7.352,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 2.819,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 4.428,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 3.946,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 3.98,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 3.336,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 7.465,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 2.706,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 3.914,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 3.579,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 3.567,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 3.128,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 7.264,
+          "checksum": "120000"
+        }
+      }
+    ],
+    "phv_interp": [
+      {
+        "property_reads": {
+          "ms": 113.128,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 10.752,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 18.479,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 18.784,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 90.696,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 38.537,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 114.712,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 10.473,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 18.073,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 18.01,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 88.028,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 37.68,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 115.574,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 10.481,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 17.941,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 18.118,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 89.412,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 38.072,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 112.133,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 10.08,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 17.449,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 17.75,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 88.032,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 37.133,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 111.656,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 10.108,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 17.523,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 17.853,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 88.345,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 37.305,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 111.544,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 10.052,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 17.488,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 18.47,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 88.801,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 37.141,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 138.125,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 10.314,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 17.257,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 17.472,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 87.809,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 38.686,
+          "checksum": "120000"
+        }
+      }
+    ],
+    "php_opcache": [
+      {
+        "property_reads": {
+          "ms": 49.734,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 4.361,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 4.298,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 4.674,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 4.565,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 7.959,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 47.366,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 4.271,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 4.324,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 4.41,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 4.605,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 8.167,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 53.353,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 4.567,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 4.545,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 5.175,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 4.831,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 8.546,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 51.481,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 4.243,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 4.247,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 4.381,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 4.595,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 8.274,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 47.802,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 4.288,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 4.485,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 4.653,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 4.631,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 8.306,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 48.349,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 4.35,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 4.302,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 4.473,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 4.454,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 7.991,
+          "checksum": "120000"
+        }
+      },
+      {
+        "property_reads": {
+          "ms": 47.898,
+          "checksum": "9000000"
+        },
+        "generator_yield": {
+          "ms": 4.294,
+          "checksum": "4999950000"
+        },
+        "generator_wide_frame": {
+          "ms": 4.489,
+          "checksum": "4999950000"
+        },
+        "generator_active_handler": {
+          "ms": 4.786,
+          "checksum": "4999950000"
+        },
+        "generator_delegated": {
+          "ms": 4.721,
+          "checksum": "4999950000"
+        },
+        "generator_close": {
+          "ms": 8.444,
+          "checksum": "120000"
+        }
+      }
+    ]
+  },
+  "median_ms": {
+    "phv_jit": {
+      "property_reads": 21.345,
+      "generator_yield": 10.419,
+      "generator_wide_frame": 17.52,
+      "generator_active_handler": 17.886,
+      "generator_delegated": 87.628,
+      "generator_close": 37.724
+    },
+    "php_jit": {
+      "property_reads": 2.82,
+      "generator_yield": 4.083,
+      "generator_wide_frame": 3.713,
+      "generator_active_handler": 3.668,
+      "generator_delegated": 3.324,
+      "generator_close": 7.637
+    },
+    "phv_interp": {
+      "property_reads": 113.128,
+      "generator_yield": 10.314,
+      "generator_wide_frame": 17.523,
+      "generator_active_handler": 18.01,
+      "generator_delegated": 88.345,
+      "generator_close": 37.68
+    },
+    "php_opcache": {
+      "property_reads": 48.349,
+      "generator_yield": 4.294,
+      "generator_wide_frame": 4.324,
+      "generator_active_handler": 4.653,
+      "generator_delegated": 4.605,
+      "generator_close": 8.274
+    }
+  }
+}

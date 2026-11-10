@@ -136,6 +136,151 @@ foreach (deep(50000) as $v) {
     assert_eq!(out, "ok 0\nFatal error: maximum call stack depth exceeded", "{out}");
 }
 
+#[test]
+fn nested_delegation_preserves_keys_and_unwinds_after_resuming() {
+    let src = r#"<?phv
+function leaf(bool $fail): Generator<int> {
+    try {
+        yield 5 => 10;
+        yield 20;
+        if ($fail) {
+            throw new RuntimeException("leaf failed");
+        }
+        yield 2 => 30;
+        yield 40;
+    } finally {
+        echo "leaf finally\n";
+    }
+}
+
+function relay(int $depth, bool $fail): Generator<int> {
+    try {
+        if ($depth == 0) {
+            yield from leaf($fail);
+        } else {
+            yield from relay($depth - 1, $fail);
+        }
+        yield 99;
+    } finally {
+        echo "relay $depth finally\n";
+    }
+}
+
+function item(int $key, int $value): void {
+    echo "$key:$value\n";
+}
+
+foreach (relay(1, false) as $key => $value) {
+    item($key, $value);
+}
+foreach (relay(1, false) as $key => $value) {
+    item($key, $value);
+    if ($value == 20) {
+        break;
+    }
+}
+try {
+    foreach (relay(1, true) as $key => $value) {
+        item($key, $value);
+    }
+} catch (RuntimeException $e) {
+    echo $e->getMessage(), "\n";
+}
+"#;
+    let (out, _) = run_limited("forward", src, Limits::default());
+    assert_eq!(
+        out,
+        concat!(
+            "5:10\n6:20\n2:30\n7:40\nleaf finally\n0:99\nrelay 0 finally\n0:99\nrelay 1 finally\n",
+            "5:10\n6:20\nleaf finally\nrelay 0 finally\nrelay 1 finally\n",
+            "5:10\n6:20\nleaf finally\nrelay 0 finally\nrelay 1 finally\nleaf failed\n",
+        ),
+    );
+}
+
+#[test]
+fn suspended_handlers_follow_the_current_try_nesting() {
+    let src = r#"<?phv
+function changing_handlers(): Generator<int> {
+    try {
+        yield 1;
+        try {
+            yield 2;
+            throw new ValueError("inner");
+        } catch (ValueError $e) {
+            echo $e->getMessage(), "\n";
+            yield 3;
+        } finally {
+            echo "inner finally\n";
+        }
+        yield 4;
+    } finally {
+        echo "outer finally\n";
+    }
+    yield 5;
+    throw new ValueError("outside");
+}
+
+try {
+    foreach (changing_handlers() as $value) {
+        echo $value, "\n";
+    }
+} catch (ValueError $e) {
+    echo $e->getMessage(), "\n";
+}
+foreach (changing_handlers() as $value) {
+    echo $value, "\n";
+    if ($value == 3) {
+        break;
+    }
+}
+"#;
+    let (out, _) = run_limited("changing_handlers", src, Limits::default());
+    assert_eq!(
+        out,
+        concat!(
+            "1\n2\ninner\n3\ninner finally\n4\nouter finally\n5\noutside\n",
+            "1\n2\ninner\n3\ninner finally\nouter finally\n",
+        ),
+    );
+}
+
+#[test]
+fn wide_generator_keeps_values_needed_by_close_and_catch() {
+    let src = r#"<?phv
+function wide(): Generator<int> {
+    $a = 1;
+    $b = 2;
+    $c = 3;
+    $d = 4;
+    $e = 5;
+    $f = 6;
+    $g = 7;
+    $h = 8;
+    echo $a + $b + $c + $d + $e + $f + $g + $h, "\n";
+    $close = 91;
+    $caught = 72;
+    try {
+        yield 10;
+        throw new ValueError("leaf");
+    } catch (ValueError) {
+        echo $caught, "\n";
+    } finally {
+        echo $close, "\n";
+    }
+}
+foreach (wide() as $value) {
+    echo $value, "\n";
+}
+foreach (wide() as $value) {
+    echo $value, "\n";
+    break;
+}
+"#;
+    let (out, _) = run_limited("wide_close_catch", src, Limits::default());
+    assert_eq!(out, "36\n10\n72\n91\n36\n10\n91\n");
+}
+
 /// An object holding a generator whose frame holds the object is a cycle:
 /// the cycle collector frees it while the script runs.
 #[test]

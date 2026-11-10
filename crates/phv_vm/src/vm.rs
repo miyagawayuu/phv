@@ -9,6 +9,7 @@ pub use crate::jit::{Installed, JitCtx, JitEntry, JitLimits, JitTable};
 use crate::value::*;
 use indexmap::IndexMap;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -841,7 +842,7 @@ const G_PC: usize = 1;
 /// The `Yield` it waits at (-1 before it started): a generator closed there
 /// goes on from the next instruction.
 const G_AT: usize = 2;
-/// `G_NEW`, `G_WAITING`, `G_RUNNING` or `G_DONE`.
+/// One of the generator states below.
 const G_STATE: usize = 3;
 /// The next int key of a `yield` without one.
 const G_KEY: usize = 4;
@@ -856,6 +857,8 @@ const G_NEW: i64 = 0;
 const G_WAITING: i64 = 1;
 const G_RUNNING: i64 = 2;
 const G_DONE: i64 = 3;
+/// Waiting after a delegated yield. Its resumption may forward from a child.
+const G_FORWARD_WAITING: i64 = 4;
 
 /// A generator running on top of the loop that resumed it (the frame below):
 /// where its next key and value go, and where the loop goes on when it ends.
@@ -868,6 +871,10 @@ struct GenLink {
     /// The loop's exit (`GenNext`), or `GEN_CLOSING` (`GenClose`: the loop
     /// goes on after that instruction).
     end: u32,
+    /// A pure `yield from` relay whose registers remain in its generator.
+    forwarding: Option<(Reg, Reg)>,
+    /// This generator was resumed by a relay with saved registers.
+    parent_forwarding: bool,
 }
 
 const GEN_CLOSING: u32 = u32::MAX;
@@ -1014,6 +1021,11 @@ pub struct Vm {
     gc_pressure: isize,
     /// The generators running, innermost last (see `GenLink`).
     gen_links: Vec<GenLink>,
+    forward_yield_from: bool,
+    reuse_gen_handlers: bool,
+    prune_gen_regs: bool,
+    compact_new_generators: bool,
+    gen_register_plans: HashMap<usize, Option<crate::gen_registers::SavedRegisters>>,
     /// The class of generators (`Generator` in the prelude), or `u32::MAX`.
     gen_class: u32,
 }
@@ -1351,6 +1363,11 @@ impl Vm {
             gc_visited: Cell::new(0),
             gc_pressure: limits.max_memory.map_or(isize::MAX, |m| (m / 4 * 3).min(isize::MAX as usize) as isize),
             gen_links: Vec::new(),
+            forward_yield_from: !std::env::var_os("PHV_VM_YIELD_FROM_FORWARD").is_some_and(|v| v == "0"),
+            reuse_gen_handlers: !std::env::var_os("PHV_VM_REUSE_GEN_HANDLERS").is_some_and(|v| v == "0"),
+            prune_gen_regs: std::env::var_os("PHV_VM_PRUNE_GEN_REGS").is_some_and(|v| v == "1"),
+            compact_new_generators: std::env::var_os("PHV_VM_COMPACT_NEW_GENERATORS").is_some_and(|v| v == "1"),
+            gen_register_plans: HashMap::new(),
             gen_class,
             coverage: None,
             profile: None,
@@ -2101,10 +2118,29 @@ impl Vm {
     /// at `pc`.
     fn gen_start(&mut self, func: usize, pc: usize, base: usize, n: usize) -> Result<Value, VmError> {
         let nregs = self.prog.funcs[func].num_regs as usize;
+        let mut capacity = nregs;
+        if self.prune_gen_regs && (8..=128).contains(&nregs) && self.debug.is_none() && self.profile.is_none() {
+            if !self.gen_register_plans.contains_key(&func) {
+                let code = &self.prog.funcs[func].code;
+                let yields = code.iter().filter(|ins| matches!(ins, Instr::Yield { .. })).count();
+                // Analysis is optional when memory is tight. Allow for the
+                // mask list and the map entry before creating either one.
+                if self.reserve(yields.saturating_mul(64).saturating_add(256)).is_ok() {
+                    let plan = crate::gen_registers::SavedRegisters::analyze(&self.prog.funcs[func], n);
+                    self.gen_register_plans.insert(func, plan);
+                }
+            }
+            if let Some(Some(plan)) = self.gen_register_plans.get(&func) {
+                capacity = plan.capacity;
+            }
+        }
+        if self.compact_new_generators {
+            capacity = n;
+        }
         // Counted before it is made: a script keeping many generators stops
         // at its memory limit.
-        self.reserve((G_REGS + nregs).saturating_mul(std::mem::size_of::<Value>()) + 64)?;
-        let mut fields = Vec::with_capacity(G_REGS + nregs);
+        self.reserve((G_REGS + capacity).saturating_mul(std::mem::size_of::<Value>()) + 64)?;
+        let mut fields = Vec::with_capacity(G_REGS + capacity);
         fields.extend([
             Value::Int(func as i64),
             Value::Int(pc as i64),
@@ -2113,7 +2149,8 @@ impl Vm {
             Value::Int(0),
             Value::Null,
         ]);
-        for i in 0..nregs {
+        let initial = if capacity < nregs { n } else { nregs };
+        for i in 0..initial {
             // The rest of the window holds what earlier calls left there.
             fields.push(if i < n { std::mem::take(&mut self.regs[base + i]) } else { Value::Null });
         }
@@ -2126,32 +2163,161 @@ impl Vm {
         Ok(Value::Object(o))
     }
 
-    /// Puts the frame of the generator of `link` on top of the stack, above
-    /// the loop's frame (the top one now), from instruction `pc`.
-    fn gen_resume(&mut self, link: GenLink, pc: u32) -> Result<(), VmError> {
-        if self.frames.len() >= self.limits.max_frames {
-            return Err(VmError::Fatal("maximum call stack depth exceeded".into()));
+    /// Recognizes the compiler's generator foreach followed by a pure
+    /// re-yield. Coercions, user loop bodies and closing paths use dispatch.
+    fn forwarding_child(&self, ob: &Object, func: u32, pc: u32) -> Option<(GenLink, u32, u32)> {
+        let Value::Int(at) = ob.fields[G_AT] else { return None };
+        let at = usize::try_from(at).ok()?;
+        let code = &self.prog.funcs[func as usize].code;
+        let Instr::Jump(next) = *code.get(pc as usize)? else { return None };
+        if next as usize != at.checked_sub(3)? {
+            return None;
         }
-        self.tick()?;
-        let below = self.frames.last().unwrap();
-        let base = below.base + self.prog.funcs[below.func as usize].num_regs as usize;
-        let mut ob = link.gen.borrow_mut();
-        let func = match ob.fields[G_FUNC] {
-            Value::Int(f) => f as u32,
-            ref v => bad("generator function", v),
+        let [Instr::GenNext { it, key, val, end }, Instr::Move(k, ks), Instr::Move(v, vs), Instr::Yield { key: yk, val: yv, from: true, resume }] =
+            code.get(next as usize..=at)?
+        else {
+            return None;
         };
-        let nregs = self.prog.funcs[func as usize].num_regs as usize;
-        if self.regs.len() < base + nregs {
+        if *resume != pc
+            || key != ks
+            || val != vs
+            || k != yk
+            || v != yv
+            || key == val
+            || [key, val, k, v].contains(&it)
+            || [key, val].contains(&k)
+            || [key, val, k].contains(&v)
+        {
+            return None;
+        }
+        let Value::Object(child) = ob.fields.get(G_REGS + *it as usize)? else { return None };
+        let child_state = child.try_borrow().ok()?;
+        if child_state.class != self.gen_class {
+            return None;
+        }
+        let (Value::Int(G_WAITING | G_FORWARD_WAITING), Value::Int(child_pc)) =
+            (&child_state.fields[G_STATE], &child_state.fields[G_PC])
+        else {
+            return None;
+        };
+        let link = GenLink {
+            frame: self.frames.len() + 1,
+            gen: Rc::clone(child),
+            key: *key,
+            val: *val,
+            end: *end,
+            forwarding: None,
+            parent_forwarding: true,
+        };
+        Some((link, *child_pc as u32, next + 1))
+    }
+
+    /// Enters a generator above its consumer. A transparent relay keeps
+    /// its saved registers but still has a stack frame and live handlers,
+    /// so limits and unwinding see the original logical stack.
+    fn gen_resume(&mut self, mut link: GenLink, mut pc: u32) -> Result<(), VmError> {
+        loop {
+            if self.frames.len() >= self.limits.max_frames {
+                return Err(VmError::Fatal("maximum call stack depth exceeded".into()));
+            }
+            self.tick()?;
+            let below = self.frames.last().unwrap();
+            let base = below.base + self.prog.funcs[below.func as usize].num_regs as usize;
+            let mut ob = link.gen.borrow_mut();
+            let func = match ob.fields[G_FUNC] {
+                Value::Int(f) => f as u32,
+                ref v => bad("generator function", v),
+            };
+            let nregs = self.prog.funcs[func as usize].num_regs as usize;
+            if self.regs.len() < base + nregs {
+                drop(ob);
+                self.grow_regs(base + nregs)?;
+                ob = link.gen.borrow_mut();
+            }
+            let relay = if matches!(ob.fields[G_STATE], Value::Int(G_FORWARD_WAITING))
+                && link.end != GEN_CLOSING
+                && self.debug.is_none()
+                && self.profile.is_none()
+            {
+                self.forwarding_child(&ob, func, pc)
+            } else {
+                None
+            };
+            if relay.is_some() {
+                // The normal restore would overwrite anything a call by
+                // the consumer left in the register window.
+                self.regs[base..base + nregs].fill(Value::Null);
+            } else if ob.fields.len() == G_REGS + nregs {
+                let window = &mut self.regs[base..base + nregs];
+                for (r, v) in window.iter_mut().zip(ob.fields.drain(G_REGS..)) {
+                    *r = v;
+                }
+            } else {
+                let Value::Int(at) = ob.fields[G_AT] else { unreachable!("generator suspension point") };
+                if at < 0 {
+                    let saved = ob.fields.len() - G_REGS;
+                    if self.compact_new_generators {
+                        // Allocate the storage for later yields before moving
+                        // arguments or marking the generator as running.
+                        let capacity = self
+                            .gen_register_plans
+                            .get(&(func as usize))
+                            .and_then(Option::as_ref)
+                            .map_or(nregs, |plan| plan.capacity);
+                        let needed = G_REGS + capacity;
+                        if ob.fields.capacity() < needed {
+                            self.reserve(needed * std::mem::size_of::<Value>())?;
+                            ob.fields.reserve_exact(capacity - saved);
+                        }
+                    }
+                    let window = &mut self.regs[base..base + nregs];
+                    for (r, v) in window.iter_mut().zip(ob.fields.drain(G_REGS..)) {
+                        *r = v;
+                    }
+                    window[saved..].fill(Value::Null);
+                } else {
+                    let mask = self.gen_register_plans[&(func as usize)]
+                        .as_ref()
+                        .and_then(|plan| plan.at(at as usize))
+                        .expect("saved register layout");
+                    let window = &mut self.regs[base..base + nregs];
+                    let mut start = 0;
+                    let mut saved = ob.fields.drain(G_REGS..);
+                    for range in crate::gen_registers::ranges(mask) {
+                        window[start..range.start].fill(Value::Null);
+                        start = range.end;
+                        for r in &mut window[range] {
+                            *r = saved.next().expect("saved register");
+                        }
+                    }
+                    window[start..].fill(Value::Null);
+                }
+            }
+            ob.fields[G_STATE] = Value::Int(G_RUNNING);
+            let fi = self.frames.len();
+            self.gen_restore_handlers(fi, &ob.fields[G_HANDLERS]);
+            if !self.reuse_gen_handlers && relay.is_none() {
+                ob.fields[G_HANDLERS] = Value::Null;
+            }
             drop(ob);
-            self.grow_regs(base + nregs)?;
-            ob = link.gen.borrow_mut();
+            if let Some((child, child_pc, trace_pc)) = relay {
+                link.forwarding = Some((child.key, child.val));
+                self.frames.push(Frame { func, pc: trace_pc, base, ret: 0, stop: false, gen: true });
+                self.gen_links.push(link);
+                // The re-yield's back edge normally ticks before GenNext.
+                self.tick()?;
+                link = child;
+                pc = child_pc;
+            } else {
+                self.frames.push(Frame { func, pc, base, ret: 0, stop: false, gen: true });
+                self.gen_links.push(link);
+                return Ok(());
+            }
         }
-        for (r, v) in self.regs[base..base + nregs].iter_mut().zip(ob.fields.drain(G_REGS..)) {
-            *r = v;
-        }
-        let fi = self.frames.len();
-        let saved = std::mem::take(&mut ob.fields[G_HANDLERS]);
-        if let Value::List(hs) = &saved {
+    }
+
+    fn gen_restore_handlers(&mut self, fi: usize, saved: &Value) {
+        if let Value::List(hs) = saved {
             // Its `try` blocks, as if they began where it resumes.
             let out_depth = self.out.len();
             let out_len = self.out.last().map_or(0, |o| o.buf.len());
@@ -2170,38 +2336,131 @@ impl Vm {
                 }
             }
         }
-        ob.fields[G_STATE] = Value::Int(G_RUNNING);
-        drop(ob);
-        self.frames.push(Frame { func, pc, base, ret: 0, stop: false, gen: true });
-        self.gen_links.push(link);
-        Ok(())
+    }
+
+    /// The child finished or an exception reached the relay. Restore the
+    /// top frame before its instructions or exception register are used.
+    fn gen_materialize_relay(&mut self) {
+        let Some(link) = self.gen_links.last_mut() else { return };
+        if link.frame + 1 != self.frames.len() || link.forwarding.take().is_none() {
+            return;
+        }
+        let base = self.frames[link.frame].base;
+        let mut ob = link.gen.borrow_mut();
+        for (r, v) in self.regs[base..].iter_mut().zip(ob.fields.drain(G_REGS..)) {
+            *r = v;
+        }
+        if !self.reuse_gen_handlers {
+            ob.fields[G_HANDLERS] = Value::Null;
+        }
+    }
+
+    #[inline(never)]
+    fn gen_forward_value(&mut self, mut link: GenLink, key: &Value, val: &Value) -> GenLink {
+        while link.parent_forwarding {
+            let relay = self.gen_links.pop().expect("relay for a forwarding child");
+            debug_assert_eq!(relay.frame + 1, self.frames.len());
+            let (key_reg, val_reg) = relay.forwarding.expect("saved relay registers");
+            {
+                let mut ob = relay.gen.borrow_mut();
+                ob.fields[G_REGS + key_reg as usize] = key.clone();
+                ob.fields[G_REGS + val_reg as usize] = val.clone();
+                ob.fields[G_STATE] = Value::Int(G_FORWARD_WAITING);
+            }
+            while self.handlers.last().is_some_and(|h| h.frame == relay.frame) {
+                self.handlers.pop();
+            }
+            self.frames.pop();
+            link = relay;
+        }
+        link
     }
 
     /// `Yield` in frame `fi` (the generator `g`, from register `base`, with
     /// `nregs` registers): its frame and handlers go into the generator,
     /// which resumes at `resume` and waits at the `Yield` at `at`.
-    fn gen_suspend(&mut self, g: &Rc<RefCell<Object>>, fi: usize, base: usize, nregs: usize, resume: u32, at: i64) {
-        let mut handlers = Vec::new();
-        while matches!(self.handlers.last(), Some(h) if h.frame == fi) {
-            let h = self.handlers.pop().unwrap();
-            handlers.push(Value::Int(h.exc_reg as i64));
-            handlers.push(Value::Int(h.catch_pc as i64));
+    fn gen_suspend(
+        &mut self,
+        g: &Rc<RefCell<Object>>,
+        fi: usize,
+        base: usize,
+        nregs: usize,
+        resume: u32,
+        at: i64,
+    ) -> Result<(), VmError> {
+        let mut ob = g.borrow_mut();
+        if self.reuse_gen_handlers {
+            self.gen_save_handlers(fi, &mut ob.fields[G_HANDLERS])?;
+        } else {
+            let mut handlers = Vec::new();
+            while matches!(self.handlers.last(), Some(h) if h.frame == fi) {
+                let h = self.handlers.pop().unwrap();
+                handlers.push(Value::Int(h.exc_reg as i64));
+                handlers.push(Value::Int(h.catch_pc as i64));
+            }
+            ob.fields[G_HANDLERS] = if handlers.is_empty() {
+                Value::Null
+            } else {
+                handlers.reverse();
+                Value::list(handlers)
+            };
         }
         while matches!(self.guards.last(), Some(g) if g.0 >= fi) {
             self.guards.pop();
         }
-        let mut ob = g.borrow_mut();
-        ob.fields[G_HANDLERS] = if handlers.is_empty() {
-            Value::Null
-        } else {
-            handlers.reverse();
-            Value::list(handlers)
-        };
         ob.fields.truncate(G_REGS);
-        ob.fields.extend(self.regs[base..base + nregs].iter_mut().map(std::mem::take));
+        let window = &mut self.regs[base..base + nregs];
+        let plan = if self.prune_gen_regs && nregs >= 8 {
+            self.gen_register_plans.get(&(self.frames[fi].func as usize)).and_then(Option::as_ref)
+        } else {
+            None
+        };
+        if let Some(mask) = plan.and_then(|plan| plan.at(at as usize)) {
+            let mut start = 0;
+            for range in crate::gen_registers::ranges(mask) {
+                window[start..range.start].fill(Value::Null);
+                start = range.end;
+                ob.fields.extend(window[range].iter_mut().map(std::mem::take));
+            }
+            window[start..].fill(Value::Null);
+        } else {
+            ob.fields.extend(window.iter_mut().map(std::mem::take));
+        }
         ob.fields[G_PC] = Value::Int(resume as i64);
         ob.fields[G_AT] = Value::Int(at);
         ob.fields[G_STATE] = Value::Int(G_WAITING);
+        Ok(())
+    }
+
+    /// Retain the generator's buffer across resume. Write only handler
+    /// targets and exception registers, in the order they were installed.
+    fn gen_save_handlers(&mut self, fi: usize, saved: &mut Value) -> Result<(), VmError> {
+        if !self.handlers.last().is_some_and(|h| h.frame == fi) {
+            *saved = Value::Null;
+            return Ok(());
+        }
+        let count = self.handlers.iter().rev().take_while(|h| h.frame == fi).count();
+        let needed = 2 * count;
+        let can_reuse = match saved {
+            Value::List(items) => Rc::get_mut(items).is_some_and(|items| items.capacity() >= needed),
+            _ => false,
+        };
+        if !can_reuse {
+            self.reserve(
+                needed * std::mem::size_of::<Value>()
+                    + std::mem::size_of::<Vec<Value>>()
+                    + 2 * std::mem::size_of::<usize>(),
+            )?;
+            *saved = Value::list(Vec::with_capacity(needed));
+        }
+        let Value::List(items) = saved else { unreachable!("handler buffer") };
+        let items = Rc::get_mut(items).expect("exclusive handler buffer");
+        items.clear();
+        let start = self.handlers.len() - count;
+        items.extend(
+            self.handlers.drain(start..).flat_map(|h| [Value::Int(h.catch_pc as i64), Value::Int(h.exc_reg as i64)]),
+        );
+        Ok(())
     }
 
     /// The generator is done: its frame is freed.
@@ -2572,6 +2831,7 @@ impl Vm {
                             }
                             self.frames.truncate(h.frame + 1);
                             self.gens_left();
+                            self.gen_materialize_relay();
                             self.out.truncate(h.out_depth);
                             if h.in_guard || self.guards.len() > h.guards {
                                 if let Some(o) = self.out.last_mut() {
@@ -2810,6 +3070,7 @@ impl Vm {
                         drop(v);
                         let link = self.gen_links.pop().expect("phv vm: a generator frame without its link");
                         self.gen_done(&link.gen);
+                        self.gen_materialize_relay();
                         if link.end != GEN_CLOSING {
                             self.frames.last_mut().unwrap().pc = link.end;
                         }
@@ -3485,13 +3746,21 @@ impl Vm {
                         };
                         match state {
                             G_DONE => pc = *end as usize,
-                            G_WAITING => {
+                            G_WAITING | G_FORWARD_WAITING => {
                                 let at = match g.borrow().fields[G_PC] {
                                     Value::Int(p) => p as u32,
                                     ref v => bad("generator pc", v),
                                 };
                                 self.frames[fi].pc = pc as u32;
-                                let link = GenLink { frame: fi + 1, gen: g, key: *key, val: *val, end: *end };
+                                let link = GenLink {
+                                    frame: fi + 1,
+                                    gen: g,
+                                    key: *key,
+                                    val: *val,
+                                    end: *end,
+                                    forwarding: None,
+                                    parent_forwarding: false,
+                                };
                                 tri!(self.gen_resume(link, at));
                                 continue 'frame;
                             }
@@ -3517,7 +3786,7 @@ impl Vm {
                         // block, or the closing of a generator it loops over): it
                         // runs from there; otherwise it is done at once.
                         let next = at.checked_add(1).and_then(|n| usize::try_from(n).ok());
-                        let runs = state == G_WAITING
+                        let runs = matches!(state, G_WAITING | G_FORWARD_WAITING)
                             && next
                                 .and_then(|n| prog.funcs[gfunc].code.get(n))
                                 .is_some_and(|i| !matches!(i, Instr::RetNull));
@@ -3526,7 +3795,15 @@ impl Vm {
                             continue;
                         }
                         self.frames[fi].pc = pc as u32;
-                        let link = GenLink { frame: fi + 1, gen: g, key: NO_REG, val: NO_REG, end: GEN_CLOSING };
+                        let link = GenLink {
+                            frame: fi + 1,
+                            gen: g,
+                            key: NO_REG,
+                            val: NO_REG,
+                            end: GEN_CLOSING,
+                            forwarding: None,
+                            parent_forwarding: false,
+                        };
                         tri!(self.gen_resume(link, next.unwrap_or(0) as u32));
                         continue 'frame;
                     }
@@ -3567,8 +3844,19 @@ impl Vm {
                                 k
                             }
                         };
-                        self.gen_suspend(&link.gen, fi, base, func.num_regs as usize, *resume, pc as i64 - 1);
+                        if let Err(err) =
+                            self.gen_suspend(&link.gen, fi, base, func.num_regs as usize, *resume, pc as i64 - 1)
+                        {
+                            // Keep the active generator visible to normal unwinding.
+                            self.gen_links.push(link);
+                            self.frames[fi].pc = pc as u32;
+                            return Err(err);
+                        }
+                        if *from && self.forward_yield_from {
+                            link.gen.borrow_mut().fields[G_STATE] = Value::Int(G_FORWARD_WAITING);
+                        }
                         self.frames.pop();
+                        let link = if link.parent_forwarding { self.gen_forward_value(link, &k, &v) } else { link };
                         let consumer = self.frames.last().unwrap().base;
                         if link.key != NO_REG {
                             self.regs[consumer + link.key as usize] = k;
@@ -3735,5 +4023,82 @@ fn short_repr(v: &Value) -> String {
         Value::Int(_) | Value::Float(_) | Value::Bool(_) => v.to_display_string(),
         Value::Null => "null".into(),
         other => other.type_name().into(),
+    }
+}
+
+#[cfg(test)]
+mod compact_generator_tests {
+    use super::*;
+
+    fn vm_with_generator_window() -> Vm {
+        let prog = Program {
+            funcs: vec![
+                Function { num_regs: 1, ..Function::default() },
+                Function { num_regs: 32, ..Function::default() },
+            ],
+            ..Program::default()
+        };
+        let mut vm = Vm::new(Arc::new(prog), Arc::from([]), false, Limits::default());
+        vm.compact_new_generators = true;
+        vm.prune_gen_regs = false;
+        vm.regs.resize(33, Value::Null);
+        vm.frames.push(Frame { func: 0, pc: 0, base: 0, ret: 0, stop: true, gen: false });
+        vm
+    }
+
+    #[test]
+    fn first_resume_checks_storage_before_consuming_arguments() {
+        let mut vm = vm_with_generator_window();
+        vm.regs[1] = Value::Int(42);
+        vm.regs[2] = Value::Int(99);
+        let Ok(value) = vm.gen_start(1, 1, 1, 1) else { panic!("generator") };
+        let gen = vm.gen_of(&value);
+        drop(value);
+        gen.borrow_mut().fields[G_STATE] = Value::Int(G_WAITING);
+        let link = || GenLink {
+            frame: 1,
+            gen: Rc::clone(&gen),
+            key: NO_REG,
+            val: 0,
+            end: 3,
+            forwarding: None,
+            parent_forwarding: false,
+        };
+        vm.budget = 10;
+        vm.limits.max_memory = Some(0);
+        assert!(matches!(vm.gen_resume(link(), 1), Err(VmError::Fatal(message)) if message.contains("memory size")));
+        assert_eq!(vm.frames.len(), 1);
+        assert!(vm.gen_links.is_empty());
+        {
+            let obj = gen.borrow();
+            assert!(matches!(obj.fields[G_STATE], Value::Int(G_WAITING)));
+            assert!(matches!(obj.fields[G_REGS..], [Value::Int(42)]));
+        }
+
+        vm.limits.max_memory = None;
+        assert!(vm.gen_resume(link(), 1).is_ok());
+        assert!(matches!(vm.regs[1], Value::Int(42)));
+        assert!(vm.regs[2..].iter().all(|v| matches!(v, Value::Null)));
+        let capacity = gen.borrow().fields.capacity();
+        assert!(capacity >= G_REGS + 32);
+        assert!(vm.gen_suspend(&gen, 1, 1, 32, 2, 1).is_ok());
+        assert_eq!(gen.borrow().fields.len(), G_REGS + 32);
+        assert_eq!(gen.borrow().fields.capacity(), capacity);
+    }
+
+    #[test]
+    fn discarding_an_unstarted_generator_releases_its_capture() {
+        let mut vm = vm_with_generator_window();
+        let capture = Rc::new(String::from("captured"));
+        let weak = Rc::downgrade(&capture);
+        vm.regs[1] = Value::Str(capture);
+        let Ok(value) = vm.gen_start(1, 1, 1, 1) else { panic!("generator") };
+        let gen = vm.gen_of(&value);
+        drop(value);
+        assert_eq!(gen.borrow().fields.len(), G_REGS + 1);
+        assert!(weak.upgrade().is_some());
+        drop(gen);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(vm.frames.len(), 1);
     }
 }

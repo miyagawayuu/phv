@@ -93,6 +93,43 @@ JIT ありで `runs` 回(既定で 5 回)、JIT なし(`PHV_JIT=0`)で `runs` �
 の代わりに `results/<label>.json` に書きます(ブランチの未コミットの状態など)。`serve` にもあります
 (`lsp.py` は `--out <file>`)。
 
+## PHV と PHP 8.5 の比較
+
+PHV のリリースバイナリ、Python 3.9 以降、OPcache を読み込んだ PHP 8.5 CLI を使います。
+PHP 8.5 に PATH が通っていない場合は `--php` で実行ファイルを指定します。
+
+```powershell
+python bench/compare_php.py --phv .\target\release\phv.exe --php php --output bench/results/php85.json
+```
+
+`runtime.phv` の型付きプロパティ読み取りとジェネレーター 5 項目を、同じ入力と計測範囲で比較します。
+PHV の JIT とインタープリター、PHP の OPcache を有効にした状態でのトレーシング JIT あり・なしを、
+実行順を入れ替えながら既定で各 7 回測ります。毎回新しいプロセスを起動し、スクリプト内で処理時間を測ります。
+計測区間中に JIT が行った処理も時間に含まれます。全モードのチェックサムが一致することを確認し、
+ミリ秒単位の中央値を表示します。各回の測定値、バージョン、実行環境は別の JSON に保存します。計測対象は CLI 実行です。
+
+Windows 11 x64、AMD Ryzen 9 5950X で、公開済みの PHV v1.3.1 と PHP 8.5.12 NTS を実測しました。
+各モード 7 回の中央値をミリ秒で示します。
+
+| 項目 | PHV JIT | PHV インタープリター | PHP トレーシング JIT | PHP OPcache（JIT 無効） |
+|---|---:|---:|---:|---:|
+| 型付きプロパティ読み取り | 21.345 | 113.128 | 2.820 | 48.349 |
+| 単純な `yield` | 10.419 | 10.314 | 4.083 | 4.294 |
+| ローカル変数を増やした `yield` | 17.520 | 17.523 | 3.713 | 4.324 |
+| `try/finally` 内の `yield` | 17.886 | 18.010 | 3.668 | 4.653 |
+| 入れ子の `yield from` | 87.628 | 88.345 | 3.324 | 4.605 |
+| ジェネレーターの早期終了 | 37.724 | 37.680 | 7.637 | 8.274 |
+
+[全測定値とチェックサム](results/php85-v1.3.1-windows-x64.json)
+
+[CLI プロファイル報告](php85-profile.ja.md)では、プロパティ読み取り、ジェネレーターの停止・再開、入れ子の委譲を切り分けました。
+v1.3.2 の Windows x64 での計測結果は、[プロパティ読み取りを行う HTTP ページ](results/v1.3.2-loop-property-http-windows-x64.json)、
+[`yield from` の中継](results/v1.3.2-yield-from-windows-x64.json)、
+[例外ハンドラーの保存領域の再利用](results/v1.3.2-generator-handlers-windows-x64.json)、
+[未実行ジェネレーターの省メモリ設定](results/v1.3.2-new-generator-windows-x64.json)に分けています。
+
+型付きプロパティ読み取りとジェネレーターの内訳は [CLI プロファイルと高速化案](php85-profile.ja.md) を参照してください。
+
 ## ファイル
 
 `performance.py` は、同じ入力でリリースバイナリを既定 7 組交互に比較する。`runtime.phv` の各測定値と中央値を

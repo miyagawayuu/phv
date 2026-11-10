@@ -51,16 +51,21 @@ def command(args, cwd, env):
     return result.stdout
 
 
+def runtime_rows(output):
+    rows = {}
+    for key, elapsed, checksum in re.findall(r"^(\w+): ([\d,.]+) ms \(([^)]+)\)$", output, re.M):
+        rows[key] = {"ms": float(elapsed.replace(",", "")), "checksum": checksum}
+    if rows.keys() != RUNTIME_ROWS:
+        raise RuntimeError(output)
+    return rows
+
+
 def runtime(binary, root, scalar, existing):
     result = {}
     for mode, jit in (("jit", True), ("interp", False)):
         env = environment(jit, scalar)
         output = command([binary, "run", "runtime.phv"], root, env)
-        rows = {}
-        for key, elapsed, checksum in re.findall(r"^(\w+): ([\d,.]+) ms \(([^)]+)\)$", output, re.M):
-            rows[key] = {"ms": float(elapsed.replace(",", "")), "checksum": checksum}
-        if rows.keys() != RUNTIME_ROWS:
-            raise RuntimeError(output)
+        rows = runtime_rows(output)
         if existing:
             output = command([binary, "run", "bench.phv"], root, env)
             times = re.findall(r"([\d,.]+) ms\s*$", output, re.M)

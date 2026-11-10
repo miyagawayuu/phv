@@ -1,0 +1,163 @@
+{
+  "binary_sha256": "24df997b1686f6e5ac7c42739e92d0d715b61402e45507a776600a3ee396ea9a",
+  "workers": 16,
+  "max_client_connections": 16,
+  "rate_per_s": 600,
+  "measured_seconds": 5,
+  "warmup_seconds": 1,
+  "path": "/bench-object",
+  "runs": {
+    "default": [
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.535967,
+        "request_p99_ms": 0.6553,
+        "dispatch_p99_ms": 1.116067
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.366334,
+        "request_p99_ms": 0.6229,
+        "dispatch_p99_ms": 0.917667
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.5355,
+        "request_p99_ms": 0.5942,
+        "dispatch_p99_ms": 1.139334
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.221034,
+        "request_p99_ms": 0.5617,
+        "dispatch_p99_ms": 0.814567
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.2697,
+        "request_p99_ms": 0.5507,
+        "dispatch_p99_ms": 0.8854
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.198934,
+        "request_p99_ms": 0.6179,
+        "dispatch_p99_ms": 0.733434
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.335367,
+        "request_p99_ms": 0.5943,
+        "dispatch_p99_ms": 0.933134
+      }
+    ],
+    "cache_off": [
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.639067,
+        "request_p99_ms": 0.8786,
+        "dispatch_p99_ms": 1.004467
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.5172,
+        "request_p99_ms": 0.8911,
+        "dispatch_p99_ms": 0.898534
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.643534,
+        "request_p99_ms": 0.6038,
+        "dispatch_p99_ms": 1.231767
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.5253,
+        "request_p99_ms": 0.8755,
+        "dispatch_p99_ms": 0.9151
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.4704,
+        "request_p99_ms": 0.8418,
+        "dispatch_p99_ms": 0.815667
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.286967,
+        "request_p99_ms": 0.64,
+        "dispatch_p99_ms": 0.797067
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.325,
+        "request_p99_ms": 0.7393,
+        "dispatch_p99_ms": 0.7989
+      }
+    ],
+    "interpreter": [
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 2.0146,
+        "request_p99_ms": 1.3376,
+        "dispatch_p99_ms": 0.882334
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 2.228834,
+        "request_p99_ms": 1.7196,
+        "dispatch_p99_ms": 0.7176
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.774467,
+        "request_p99_ms": 1.2584,
+        "dispatch_p99_ms": 0.650734
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 2.211167,
+        "request_p99_ms": 1.5017,
+        "dispatch_p99_ms": 0.842134
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 2.0915,
+        "request_p99_ms": 1.4831,
+        "dispatch_p99_ms": 0.839934
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 2.058534,
+        "request_p99_ms": 1.3825,
+        "dispatch_p99_ms": 0.9347
+      },
+      {
+        "successful": 3000,
+        "arrival_p99_ms": 1.9782,
+        "request_p99_ms": 1.482,
+        "dispatch_p99_ms": 0.7231
+      }
+    ]
+  },
+  "median": {
+    "default": {
+      "successful": 3000,
+      "arrival_p99_ms": 1.335367,
+      "request_p99_ms": 0.5943,
+      "dispatch_p99_ms": 0.917667
+    },
+    "cache_off": {
+      "successful": 3000,
+      "arrival_p99_ms": 1.5172,
+      "request_p99_ms": 0.8418,
+      "dispatch_p99_ms": 0.898534
+    },
+    "interpreter": {
+      "successful": 3000,
+      "arrival_p99_ms": 2.058534,
+      "request_p99_ms": 1.482,
+      "dispatch_p99_ms": 0.839934
+    }
+  }
+}

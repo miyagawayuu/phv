@@ -210,6 +210,9 @@ published.
 The harness in [bench/](bench/README.md) reproduces these numbers (min of 5 runs) and measures the server and the
 language server too; a change that touches performance comes with its before/after `bench/results/*.json`.
 
+[PHP 8.5 comparison results](bench/README.md#comparing-phv-with-php-85) cover typed property reads
+and generators, with and without JIT.
+
 | Benchmark | PHV (JIT) | PHV (interpreter) | CPython 3.13 |
 |---|---:|---:|---:|
 | `fib(30)` (recursive calls) | 7.2 ms | 84 ms | 99 ms |

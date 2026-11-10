@@ -202,6 +202,9 @@ CI(`.github/workflows/ci.yml`)は Linux / Windows / macOS でこれらと clippy
 [bench/](bench/README.ja.md) のハーネスでこの数値を再現でき(5 回の最小値)、サーバーと言語サーバーも測れます。
 性能に関わる変更には、変更前と変更後の `bench/results/*.json` を添えます。
 
+型付きプロパティの読み取りとジェネレーターの
+[PHP 8.5 との実測比較](bench/README.ja.md#phv-と-php-85-の比較)では、JIT の有無ごとに結果を掲載しています。
+
 | 項目 | PHV (JIT) | PHV (インタプリタ) | CPython 3.13 |
 |---|---:|---:|---:|
 | `fib(30)`(再帰呼び出し) | 7.2 ms | 84 ms | 99 ms |
