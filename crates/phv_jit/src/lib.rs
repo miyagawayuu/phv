@@ -1067,11 +1067,12 @@ enum H {
     Guard,
     EchoNonce,
     SetPropScalar,
+    GetPropScalar,
 }
 
 /// Name, address, number of i64 arguments after `ctx` (None: `(f64, f64) -> f64`)
 /// and whether it returns an i64, in the order of `H`.
-fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 44] {
+fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 45] {
     [
         ("phv_jit_tick", phv_jit_tick as *const u8, Some(0), true),
         ("phv_jit_enter", phv_jit_enter as *const u8, Some(3), true),
@@ -1117,6 +1118,7 @@ fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 44] {
         ("phv_jit_guard", phv_jit_guard as *const u8, Some(1), false),
         ("phv_jit_echo_nonce", phv_jit_echo_nonce as *const u8, Some(0), true),
         ("phv_jit_set_prop_scalar", phv_jit_set_prop_scalar as *const u8, Some(4), false),
+        ("phv_jit_get_prop_scalar", phv_jit_get_prop_scalar as *const u8, Some(3), true),
     ]
 }
 
@@ -3097,8 +3099,11 @@ impl<'a, 'b> Translator<'a, 'b> {
                 Instr::GetProp(d, o, slot) => {
                     let fk = field_kind(self.prog, k(o), slot).expect("checked");
                     let (code, nullable) = fk.elem().expect("checked");
-                    let args = [d as i64, o as i64, slot as i64, code, nullable as i64];
-                    let v = self.call_regs(H::GetProp, &args).unwrap();
+                    let v = if matches!(fk, K::Int | K::Bool | K::Float) {
+                        self.call_regs(H::GetPropScalar, &[o as i64, slot as i64, code]).unwrap()
+                    } else {
+                        self.call_regs(H::GetProp, &[d as i64, o as i64, slot as i64, code, nullable as i64]).unwrap()
+                    };
                     self.check_ctx();
                     match fk {
                         K::Float | K::Opt(E::Float) => {

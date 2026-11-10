@@ -101,6 +101,15 @@ of a branch, say) and is accepted by `serve` too (`lsp.py` takes `--out <file>`)
 
 ## Files
 
+`performance.py` compares two release binaries in seven alternating pairs by default. It saves the samples and
+medians from `runtime.phv` as JSON. Pass the current `load` example binary with `--load` to include production HTTP,
+mixed image traffic and concurrent first requests. For older candidate binaries that required an opt-in,
+`--scalar-properties` enables scalar property reads on the candidate only.
+
+```bash
+python3 bench/performance.py --baseline /path/to/v1.3.0/phv --candidate /path/to/candidate/phv --load /path/to/load --output results.json
+```
+
 | File | Purpose |
 |---|---|
 | `run.ps1`, `run.sh` | Micro-benchmarks and `--compare` |

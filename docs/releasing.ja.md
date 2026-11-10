@@ -65,6 +65,9 @@ git push origin vX.Y.Z
 
 リリースノート(直したもの。セキュリティの修正があればその節。新しいもの。インストールの表)を書いて、ドラフトを公開する:
 
+共有 OAuth state の記録を追加するリリースでは、[仕様](spec.ja.md)の共有セッション更新手順を記載する。
+ファイルセッションのディレクトリを共有する場合は、新版の起動前に 1.2 の全プロセスを停止する。
+
 ```bash
 gh release edit vX.Y.Z --notes-file notes.md --draft=false --latest
 ```

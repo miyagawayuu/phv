@@ -991,6 +991,26 @@ pub unsafe extern "C" fn phv_jit_get_prop(
     }
 }
 
+/// Reads a non-null numeric or boolean property without moving a `Value`
+/// through the generic result path.
+///
+/// # Safety
+/// See `rt`. The checked bytecode supplies the object register and slot.
+pub unsafe extern "C" fn phv_jit_get_prop_scalar(ctx: *mut JitCtx, o: i64, slot: i64, kind: i64) -> i64 {
+    if let Value::Object(object) = &rt(ctx).top()[o as usize] {
+        if let Ok(object) = object.try_borrow() {
+            match (kind, object.fields.get(slot as usize)) {
+                (JIT_ELEM_INT, Some(Value::Int(n))) => return *n,
+                (JIT_ELEM_INT, Some(Value::Bool(b))) => return i64::from(*b),
+                (JIT_ELEM_FLOAT, Some(Value::Float(f))) => return f.to_bits() as i64,
+                _ => {}
+            }
+        }
+    }
+    wrong_value(ctx);
+    0
+}
+
 /// `SetProp`: the value in slot `v` into property `slot` of the object in slot `o`.
 ///
 /// # Safety

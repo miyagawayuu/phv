@@ -48,8 +48,8 @@ pub use query_async::{start_query, start_redis};
 pub use ratelimit::{redis_command, redis_pipeline};
 pub(crate) use ratelimit::{redis_hit, redis_reset, redis_value};
 pub use sessions::{
-    session_insert, session_read, session_remove, session_sweep, session_update, SessionLimits, SessionRow,
-    SESSIONS_OF_1_1,
+    session_claim_oauth, session_insert, session_read, session_remove, session_sweep, session_update, OAuthClaims,
+    SessionLimits, SessionRow, SESSIONS_OF_1_1,
 };
 
 #[cfg(test)]

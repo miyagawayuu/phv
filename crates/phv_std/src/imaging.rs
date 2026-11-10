@@ -51,6 +51,7 @@ use std::cell::Cell;
 use std::io::{BufRead, Cursor, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
@@ -1257,10 +1258,27 @@ fn apply(p: Pixels, op: Op, tick: &mut Tick) -> Result<Pixels, VmError> {
     })
 }
 
+/// Returns a server slot even when conversion unwinds.
+struct ImageSlot<'a>(&'a AtomicUsize);
+
+impl Drop for ImageSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Decodes the source of `pipe`, runs its steps and encodes the result, within
 /// the script's limits.
 fn render(vm: &Vm, what: &str, pipe: &Pipeline, format: Format, quality: u8) -> Result<Vec<u8>, Fail> {
     vm.check_limits()?;
+    let _slot = if let Some(slots) = &vm.http.image_slots {
+        slots
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1))
+            .map_err(|_| vm.throw("RuntimeException", "all image conversion slots are busy"))?;
+        Some(ImageSlot(slots))
+    } else {
+        None
+    };
     let need = pipe.src.need;
     vm.reserve(need.min(usize::MAX as u64) as usize)?;
     // `reserve` only checks: the decoders that take a limit get what is left
@@ -1368,26 +1386,49 @@ fn written(vm: &Vm, what: &str, h: &Value, format: &str, quality: i64) -> Result
 }
 
 /// Text from Base64 or a `data:` URL, decoded.
-fn from_base64(text: &str) -> Result<Vec<u8>, String> {
+fn from_base64(text: &str, reserve: impl Fn(usize) -> Result<(), VmError>) -> Result<Vec<u8>, Fail> {
     let data = match text.strip_prefix("data:") {
         Some(rest) => {
-            let (head, data) = rest.split_once(',').ok_or("the data: URL has no data")?;
-            if !head.to_ascii_lowercase().ends_with(";base64") {
-                return Err("the data: URL is not in Base64".into());
+            let (head, data) = rest.split_once(',').ok_or_else(|| "the data: URL has no data".to_string())?;
+            let suffix = &head.as_bytes()[head.len().saturating_sub(7)..];
+            if !suffix.eq_ignore_ascii_case(b";base64") {
+                return Err("the data: URL is not in Base64".to_string().into());
             }
             data
         }
         None => text,
     };
+    let too_large = || format!("images are read from at most {} MB", MAX_INPUT >> 20);
     if data.len() > MAX_INPUT / 3 * 4 + 4096 {
-        return Err(format!("images are read from at most {} MB", MAX_INPUT >> 20));
+        return Err(too_large().into());
     }
-    let clean: Vec<u8> = data.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let digits = || data.bytes().filter(|b| !b.is_ascii_whitespace());
+    let len = digits().count();
+    let padding = digits().rev().take(2).take_while(|&b| b == b'=').count();
+    if (len - padding) * 6 / 8 > MAX_INPUT {
+        return Err(too_large().into());
+    }
+    let output = len.div_ceil(4) * 3;
+    let mut clean = Vec::new();
+    if len != data.len() {
+        reserve(len + output)?;
+        clean = Vec::with_capacity(len);
+        clean.extend(digits());
+    } else {
+        reserve(output)?;
+    }
+    let input = if len == data.len() { data.as_bytes() } else { &clean };
     const LENIENT: GeneralPurposeConfig =
         GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent);
     const STD: GeneralPurpose = GeneralPurpose::new(&alphabet::STANDARD, LENIENT);
     const URL: GeneralPurpose = GeneralPurpose::new(&alphabet::URL_SAFE, LENIENT);
-    STD.decode(&clean).or_else(|_| URL.decode(&clean)).map_err(|_| "the text is not Base64".to_string())
+    let mut bytes = vec![0; output];
+    let written = STD
+        .decode_slice(input, &mut bytes)
+        .or_else(|_| URL.decode_slice(input, &mut bytes))
+        .map_err(|_| "the text is not Base64".to_string())?;
+    bytes.truncate(written);
+    Ok(bytes)
 }
 
 /// The file at the project path `rel`, read within the caps.
@@ -1432,8 +1473,10 @@ pub(crate) fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "__img_base64" => |vm, a| {
             let what = "Image::fromBase64()";
-            vm.reserve(s(&a[0]).len())?;
-            let bytes = from_base64(s(&a[0])).map_err(|e| vm.throw("ValueError", format!("{what}: {e}")))?;
+            let bytes = from_base64(s(&a[0]), |n| vm.reserve(n)).map_err(|e| match e {
+                Fail::Vm(e) => e,
+                Fail::Msg(m) => vm.throw("ValueError", format!("{what}: {m}")),
+            })?;
             read(vm, what, bytes)
         },
         "__img_size" => |vm, a| {
@@ -1484,9 +1527,15 @@ pub(crate) fn lookup(name: &str) -> Option<BuiltinFn> {
         },
         "__img_data_url" => |vm, a| {
             let (bytes, format) = written(vm, "toDataUrl()", &a[0], s(&a[1]), int(&a[2]))?;
-            vm.reserve(bytes.len() / 3 * 4 + 64)?;
+            let capacity = 5 + format.mime().len() + 8 + bytes.len().div_ceil(3) * 4;
+            vm.reserve(capacity)?;
+            let mut url = String::with_capacity(capacity);
+            url.push_str("data:");
+            url.push_str(format.mime());
+            url.push_str(";base64,");
+            STANDARD.encode_string(&bytes, &mut url);
             // Base64 and the media type hold nothing that HTML escaping changes.
-            Ok(Value::html(format!("data:{};base64,{}", format.mime(), STANDARD.encode(&bytes))))
+            Ok(Value::html(url))
         },
         _ => return None,
     };

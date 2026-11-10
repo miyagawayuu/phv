@@ -69,6 +69,9 @@ Check the draft before publishing it: download the archive for your platform, ch
 Write the release notes (what is fixed, with a security section when there is one; what is new; the install table)
 and publish the draft:
 
+For the release that adds shared OAuth state claims, include the shared-session upgrade instructions in the
+[specification](spec.md). Stop all 1.2 processes before starting the new release if they share a file session directory.
+
 ```bash
 gh release edit vX.Y.Z --notes-file notes.md --draft=false --latest
 ```

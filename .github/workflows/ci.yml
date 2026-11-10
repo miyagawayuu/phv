@@ -88,6 +88,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests (golden, JIT, formatting, HTTP, fuzz, unit)
         run: cargo test --workspace
+      - name: JIT regression suite with the interpreter
+        env:
+          PHV_JIT: "0"
+        run: cargo test --locked -p phv_driver --test jit
       - name: PHV formatting and tests of the examples
         shell: bash
         run: |

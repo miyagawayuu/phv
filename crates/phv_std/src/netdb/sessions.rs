@@ -182,6 +182,214 @@ fn session_conn(spec: &DatabaseSpec, ns: Option<&str>) -> Result<(SessionConn, I
     Ok((conn, until, t))
 }
 
+#[derive(Default)]
+pub struct OAuthClaims(std::collections::BTreeMap<String, i64>);
+const OAUTH_CLAIMS_PER_SHARD: usize = 512;
+// Leave time for callbacks already in progress and small clock differences
+// between servers. The callback still refuses states past their own expiry.
+const OAUTH_CLAIM_GRACE: i64 = 30;
+
+fn oauth_now(now: i64) -> i64 {
+    now.max(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
+}
+
+impl OAuthClaims {
+    pub fn claim(&mut self, digest: &str, now: i64, expires: i64) -> bool {
+        let now = oauth_now(now);
+        self.0.retain(|_, expiry| *expiry > now.saturating_sub(OAUTH_CLAIM_GRACE));
+        if expires <= now || self.0.len() >= OAUTH_CLAIMS_PER_SHARD || self.0.contains_key(digest) {
+            return false;
+        }
+        self.0.insert(digest.to_string(), expires);
+        true
+    }
+
+    pub fn decode(text: &str) -> Result<Self, &'static str> {
+        let mut claims = Self::default();
+        for line in text.lines() {
+            let invalid = "invalid OAuth claim record";
+            let (key, expiry) = line.split_once(' ').ok_or(invalid)?;
+            if key.len() != 64
+                || !key.bytes().all(|b| b.is_ascii_hexdigit())
+                || claims.0.len() >= OAUTH_CLAIMS_PER_SHARD
+            {
+                return Err(invalid);
+            }
+            let expiry = expiry.parse().map_err(|_| invalid)?;
+            if claims.0.insert(key.to_string(), expiry).is_some() {
+                return Err(invalid);
+            }
+        }
+        Ok(claims)
+    }
+
+    pub fn encode(&self) -> String {
+        use std::fmt::Write;
+        let mut text = String::new();
+        for (key, expiry) in &self.0 {
+            let _ = writeln!(text, "{key} {expiry}");
+        }
+        text
+    }
+}
+
+static REDIS_OAUTH_CLAIM: LazyLock<LuaScript> = LazyLock::new(|| {
+    LuaScript::new(
+        r#"
+local now = math.max(tonumber(redis.call('TIME')[1]), tonumber(ARGV[2]))
+local expires = tonumber(ARGV[3])
+local grace = tonumber(ARGV[5])
+if expires <= now or redis.call('EXISTS', KEYS[2]) == 0 then return 0 end
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - grace)
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[4]) then return 0 end
+local added = redis.call('ZADD', KEYS[1], 'NX', expires, ARGV[1])
+if added == 1 then
+    local last = redis.call('ZRANGE', KEYS[1], -1, -1, 'WITHSCORES')
+    redis.call('EXPIREAT', KEYS[1], tonumber(last[2]) + grace)
+end
+return added
+"#,
+    )
+});
+
+/// Claims a state in one of 64 bounded shards for the site. The records live
+/// separately from session data, so a stale session save cannot undo a claim.
+pub fn session_claim_oauth(
+    spec: &DatabaseSpec,
+    ns: Option<&str>,
+    session: &str,
+    digest: &str,
+    now: i64,
+    expires: i64,
+) -> Result<bool, String> {
+    let shard = session.get(..2).and_then(|s| u8::from_str_radix(s, 16).ok()).ok_or("invalid session key")? % 64;
+    let (mut conn, until, sessions) = session_conn(spec, ns)?;
+    if let SessionConn::Redis(c) = &mut conn {
+        let key = format!("{}oauth:{shard}", redis_sessions_prefix(ns));
+        let session = redis_session_key(session);
+        let now = now.to_string();
+        let expires = expires.to_string();
+        let cap = OAUTH_CLAIMS_PER_SHARD.to_string();
+        let grace = OAUTH_CLAIM_GRACE.to_string();
+        let args = [
+            b"2".as_slice(),
+            key.as_bytes(),
+            session.as_bytes(),
+            digest.as_bytes(),
+            now.as_bytes(),
+            expires.as_bytes(),
+            cap.as_bytes(),
+            grace.as_bytes(),
+        ];
+        return match redis_script(c, &REDIS_OAUTH_CLAIM, &args, until)? {
+            Reply::Int(n) => Ok(n == 1),
+            _ => Err("the server sent an invalid reply".into()),
+        };
+    }
+
+    // A versioned update serializes competing claims without holding a SQL
+    // transaction across decoding. Each write also checks the session.
+    const TABLE: &str = "phv_oauth_states";
+    const CREATE: &str = "CREATE TABLE IF NOT EXISTS phv_oauth_states \
+        (id varchar(64) PRIMARY KEY, version bigint NOT NULL, data text NOT NULL)";
+    let key = crate::sha256_hex(format!("{sessions}:{shard}").as_bytes());
+    let made = format!("{}|{TABLE}", spec.url.as_deref().unwrap_or_default());
+    let create = !lock(&SESSION_TABLES).contains(&made);
+    if create {
+        match &mut conn {
+            SessionConn::Pg(c) => c.get().store_create(CREATE).map_err(|e| pg_message(&e))?,
+            SessionConn::My(c) => {
+                use mysql::prelude::Queryable;
+                let w = c.get().watch();
+                c.get().conn.query_drop(CREATE).map_err(|e| w.msg(e))?;
+            }
+            SessionConn::Redis(_) => unreachable!(),
+        }
+        lock(&SESSION_TABLES).insert(made);
+    }
+    for _ in 0..8 {
+        if Instant::now() >= until {
+            break;
+        }
+        let read = format!("SELECT version, data FROM {TABLE} WHERE id =");
+        let row: Option<(i64, String)> = match &mut conn {
+            SessionConn::Pg(c) => c
+                .get()
+                .query_kept(&format!("{read} $1"), &[&key])
+                .and_then(|rows| rows.first().map(|r| Ok((r.try_get(0)?, r.try_get(1)?))).transpose())
+                .map_err(|e| pg_message(&e))?,
+            SessionConn::My(c) => {
+                use mysql::prelude::Queryable;
+                let w = c.get().watch();
+                c.get().conn.exec_first(format!("{read} ?"), (&key,)).map_err(|e| w.msg(e))?
+            }
+            SessionConn::Redis(_) => unreachable!(),
+        };
+        let (version, mut claims) = match row {
+            Some((version, text)) => (Some(version), OAuthClaims::decode(&text)?),
+            None => (None, OAuthClaims::default()),
+        };
+        if !claims.claim(digest, now, expires) {
+            return Ok(false);
+        }
+        let data = claims.encode();
+        let written = match &mut conn {
+            SessionConn::Pg(c) => {
+                let conn = c.get();
+                match version {
+                    Some(version) => conn.execute_kept(
+                        &format!(
+                            "UPDATE {TABLE} SET version = version + 1, data = $1 \
+                        WHERE id = $2 AND version = $3 AND EXISTS (SELECT 1 FROM {sessions} WHERE id = $4)"
+                        ),
+                        &[&data, &key, &version, &session],
+                    ),
+                    None => conn.execute_kept(
+                        &format!(
+                            "INSERT INTO {TABLE} (id, version, data) SELECT $1, 1, $2 \
+                        WHERE EXISTS (SELECT 1 FROM {sessions} WHERE id = $3) ON CONFLICT (id) DO NOTHING"
+                        ),
+                        &[&key, &data, &session],
+                    ),
+                }
+                .map_err(|e| pg_message(&e))?
+                    > 0
+            }
+            SessionConn::My(c) => {
+                use mysql::prelude::Queryable;
+                let w = c.get().watch();
+                let conn = &mut c.get().conn;
+                let result = match version {
+                    Some(version) => conn.exec_drop(
+                        format!(
+                            "UPDATE {TABLE} SET version = version + 1, data = ? \
+                        WHERE id = ? AND version = ? AND EXISTS (SELECT 1 FROM {sessions} WHERE id = ?)"
+                        ),
+                        (&data, &key, version, session),
+                    ),
+                    None => conn.exec_drop(
+                        format!(
+                            "INSERT INTO {TABLE} (id, version, data) SELECT ?, 1, ? \
+                        WHERE EXISTS (SELECT 1 FROM {sessions} WHERE id = ?)"
+                        ),
+                        (&key, &data, session),
+                    ),
+                };
+                match result {
+                    Ok(()) => conn.affected_rows() > 0,
+                    Err(mysql::Error::MySqlError(e)) if e.code == 1062 => false,
+                    Err(e) => return Err(w.msg(e)),
+                }
+            }
+            SessionConn::Redis(_) => unreachable!(),
+        };
+        if written {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether a statement failed because its table does not exist (the shared
 /// table of 1.1, on a database 1.1 never used).
 pub(super) fn pg_no_table(e: &postgres::Error) -> bool {

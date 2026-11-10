@@ -78,8 +78,8 @@ pub use asyncio::running as async_running;
 pub use crypt::{hmac_sha256, server_key, store_namespace};
 pub use httpclient::{check_header_name, check_header_value, check_http_url, check_oauth_url, post_telemetry};
 pub use netdb::{
-    redis_publish, redis_subscribe, session_insert, session_read, session_remove, session_sweep, session_update,
-    Pushed, RedisSubscriber, SessionLimits, SessionRow, SESSIONS_OF_1_1,
+    redis_publish, redis_subscribe, session_claim_oauth, session_insert, session_read, session_remove, session_sweep,
+    session_update, OAuthClaims, Pushed, RedisSubscriber, SessionLimits, SessionRow, SESSIONS_OF_1_1,
 };
 pub use sys::{constant_time_eq, sha256_hex};
 pub use web::{csrf_expected, csrf_matches, json_decode, mask_csrf, random_hex};

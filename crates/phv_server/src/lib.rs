@@ -118,7 +118,8 @@ struct State {
     dev: bool,
     time_limit: Duration,
     config: Config,
-    sessions: session::Store,
+    sessions: Arc<session::Store>,
+    image_slots: Arc<std::sync::atomic::AtomicUsize>,
     /// Key for CSRF tokens: derived from `[security] secret_env`, or new on
     /// every start (open forms then need a reload).
     csrf_secret: Vec<u8>,
@@ -215,9 +216,10 @@ impl State {
         getrandom::fill(&mut secret).expect("operating system random number generator failed");
         let csp_plain = config.csp.header(None).and_then(|c| HeaderValue::from_str(&c).ok());
         let metrics = Arc::new(metrics::Metrics::default());
+        let image_slots = if config.workers == 16 { 6 } else { (config.workers / 4).max(1) };
         State {
             public: root.join("public"),
-            sessions: match config.session_db.as_ref().and_then(|n| config.host.databases.get(n)) {
+            sessions: Arc::new(match config.session_db.as_ref().and_then(|n| config.host.databases.get(n)) {
                 Some(spec) => session::Store::with_database(
                     Duration::from_secs(config.session_ttl),
                     config.secure_cookies,
@@ -230,12 +232,13 @@ impl State {
                     config.secure_cookies,
                     config.session_dir.clone(),
                 ),
-            },
+            }),
             csrf_cookie: if config.secure_cookies { "__Host-PHVCSRF" } else { "PHVCSRF" },
             csrf_secret: secret,
             csrf_old: None,
             secret: None,
             workers: Arc::new(tokio::sync::Semaphore::new(config.workers)),
+            image_slots: Arc::new(std::sync::atomic::AtomicUsize::new(image_slots)),
             pages: pool::Pool::new(),
             body_budget: Arc::new(tokio::sync::Semaphore::new(config.workers.max(1) * (MAX_BODY / 1024))),
             buffered: Arc::new(AtomicUsize::new(0)),
@@ -2557,6 +2560,9 @@ impl State {
             headers,
             files,
             session,
+            oauth_states: (!self.config.host.oauth.is_empty())
+                .then(|| self.sessions.clone() as Arc<dyn phv_vm::OAuthStates>),
+            image_slots: Some(self.image_slots.clone()),
             csrf_secret: self.csrf_secret.clone(),
             csrf_cookie,
             remote_ip: ip,
@@ -2587,6 +2593,7 @@ impl State {
         drop(body);
         // What the error page of this request gets: the request line and headers, nothing sent in it.
         let error_ctx = || HttpCtx {
+            image_slots: Some(self.image_slots.clone()),
             method: parts.method.as_str().to_string(),
             path: percent_encoding::percent_decode_str(parts.uri.path()).decode_utf8_lossy().into_owned(),
             headers: parts
@@ -3291,6 +3298,18 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_conversion_slots_follow_the_worker_count() {
+        let root = PathBuf::from(".");
+        for workers in 1..=1024 {
+            let mut config = Config::default_for(&root);
+            config.workers = workers;
+            let state = State::new(root.clone(), false, Duration::from_secs(5), config);
+            let expected = if workers == 16 { 6 } else { (workers / 4).max(1) };
+            assert_eq!(state.image_slots.load(Ordering::Relaxed), expected, "{workers} workers");
+        }
+    }
 
     /// A service URL points at this server when its port is the server's and
     /// its host is an address the server listens on (18th audit, H-3).

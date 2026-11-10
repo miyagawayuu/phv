@@ -418,16 +418,45 @@ fn guarded_turns_a_panic_into_a_refusal() {
 
 #[test]
 fn base64_and_data_urls_are_read() {
+    let decode = |text: &str| from_base64(text, |_| Ok(()));
     let bytes = png(&pattern(3, 3, 3));
     let b64 = STANDARD.encode(&bytes);
-    assert_eq!(from_base64(&b64).unwrap(), bytes);
-    assert_eq!(from_base64(b64.trim_end_matches('=')).unwrap(), bytes);
-    assert_eq!(from_base64(&format!("data:image/png;base64,{b64}")).unwrap(), bytes);
+    assert_eq!(decode(&b64).ok().unwrap(), bytes);
+    assert_eq!(decode(b64.trim_end_matches('=')).ok().unwrap(), bytes);
+    assert_eq!(decode(&format!("data:image/png;base64,{b64}")).ok().unwrap(), bytes);
     let wrapped: String = b64.as_bytes().chunks(10).map(|c| format!("{}\n", std::str::from_utf8(c).unwrap())).collect();
-    assert_eq!(from_base64(&wrapped).unwrap(), bytes);
-    assert!(from_base64("data:image/png,abc").is_err());
-    assert!(from_base64("not base64!").is_err());
-    assert!(from_base64(&"A".repeat(MAX_INPUT / 3 * 4 + 8192)).unwrap_err().contains("at most 32 MB"));
+    assert_eq!(decode(&wrapped).ok().unwrap(), bytes);
+    assert!(decode("data:image/png,abc").is_err());
+    assert!(decode("not base64!").is_err());
+    assert!(matches!(decode(&"A".repeat(MAX_INPUT / 3 * 4 + 8192)), Err(Fail::Msg(m)) if m.contains("at most 32 MB")));
+}
+
+#[test]
+fn wrapped_base64_counts_both_buffers_before_decoding() {
+    let result = from_base64("YW Jj\n", |bytes| {
+        assert_eq!(bytes, 7);
+        Err(VmError::Fatal("budget refused".into()))
+    });
+    assert!(matches!(result, Err(Fail::Vm(VmError::Fatal(message))) if message == "budget refused"));
+}
+
+#[test]
+fn a_conversion_releases_its_slot_on_success_and_error() {
+    use std::sync::Arc;
+
+    let (src, width, height) = probe(png(&pattern(3, 3, 3))).unwrap();
+    let mut pipe = Pipeline { src: Rc::new(src), ops: Vec::new(), width, height };
+    let mut vm = Vm::new(Arc::default(), Arc::from([]), false, phv_vm::Limits::default());
+    let slots = Arc::new(AtomicUsize::new(0));
+    vm.http.image_slots = Some(slots.clone());
+    let busy = render(&vm, "send()", &pipe, Format::Png, 85);
+    assert!(matches!(busy, Err(Fail::Vm(VmError::Fatal(message))) if message.contains("slots are busy")));
+    slots.store(1, Ordering::Relaxed);
+    assert!(render(&vm, "send()", &pipe, Format::Png, 85).is_ok());
+    assert_eq!(slots.load(Ordering::Relaxed), 1);
+    Rc::get_mut(&mut pipe.src).unwrap().bytes.clear();
+    assert!(render(&vm, "send()", &pipe, Format::Png, 85).is_err());
+    assert_eq!(slots.load(Ordering::Relaxed), 1);
 }
 
 #[test]

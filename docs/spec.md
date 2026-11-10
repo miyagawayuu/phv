@@ -1534,6 +1534,9 @@ $thumb = Image::fromBase64($dataUrl)->fit(64)->toDataUrl();         // SafeUrl, 
   quality 100, of noise: the slowest case). So a script can pass its time limit by about 3 seconds at the caps (4 on
   a busy machine). Resizing, cropping and turning check the time limit every 16 rows. A typical upload, a 4000×3000
   JPEG made 800 pixels wide, takes 0.3 to 0.5 seconds.
+- HTTP pages share six concurrent conversion slots per server when `workers = 16`. For other worker counts, the
+  number of slots is `max(1, workers / 4)` with integer division. When all slots are busy, writing an image throws
+  `RuntimeException` before pixel decoding begins.
 - A decoder that fails on a damaged file in a way its authors did not foresee (a panic) is a `ValueError`; it never
   ends the page's worker or the server, and nothing of it is printed to the error output.
 
@@ -2181,13 +2184,13 @@ response()->redirect("/");
   random `state`, an OpenID Connect `nonce` and the PKCE verifier in the visitor's session, for 10 minutes and one use;
   a session may have 4 sign-ins started at once (tabs). Extra parameters such as `["prompt" => "select_account"]` can be
   given, but not those of the flow itself.
-- The session is saved whole at the end of each request, so a request of the same session that read it before a
-  callback used its `state` (a sign-in started in a second tab meanwhile) writes the `state` back. The server process
-  therefore also remembers the states it used, for their 10 minutes (at most 100,000; past that the oldest are
-  forgotten), and refuses them with `invalid_state`. Several server processes do not share that list: there, a
-  callback finished while another request of the session runs can be finished once more on another process (the
-  provider then refuses the code a second time). The same overlap the other way loses a sign-in started meanwhile
-  (`invalid_state`; it is started again).
+- Before exchanging the code, `callback()` records the state atomically in the session store, separately from the
+  session values. Servers sharing that store see the same claims. The store keeps up to 512 claims in each of 64
+  shards, retains live claims when full, and refuses new claims with `invalid_state`. A store failure also refuses
+  the callback. SQL session stores create `phv_oauth_states` when first used. Use a Redis policy that preserves live
+  keys (`noeviction`) and switch all processes that share a session store together when upgrading to this version.
+  When upgrading from 1.2 with file sessions, stop every 1.2 process before starting the new version because the
+  session lock files differ. Concurrent session saves can still lose a sign-in started in another tab; start it again.
 - `callback()` accepts only a `state` this session started for this provider, so a sign-in cannot be finished in
   another browser, and another site cannot sign a visitor in to an account of its own. It refuses an `iss` parameter
   that names another issuer (RFC 9207; an error answer too); a provider without an issuer (OAuth 2.0) has none of its

@@ -217,8 +217,10 @@ mod tests {
                 let _ = tx.send(std::thread::current().id());
             });
             rx.await.unwrap();
+            // The response can arrive before the thread returns to the idle list.
+            let _permit = workers.acquire().await.unwrap();
+            assert_eq!(pool.shared.idle.lock().unwrap().as_ref().map(Vec::len), Some(1));
         });
-        assert_eq!(pool.shared.idle.lock().unwrap().as_ref().map(Vec::len), Some(1));
         pool.close();
     }
 }

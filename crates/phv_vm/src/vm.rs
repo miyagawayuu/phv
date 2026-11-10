@@ -269,6 +269,10 @@ pub struct HttpCtx {
     pub body: String,
     pub files: Vec<UploadedFile>,
     pub session: SessionData,
+    /// Records a consumed OAuth state in the session store before token exchange.
+    pub oauth_states: Option<std::sync::Arc<dyn OAuthStates>>,
+    /// Available image conversion slots, shared by the HTTP server's pages.
+    pub image_slots: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     /// Server secret for CSRF tokens (HMAC key).
     pub csrf_secret: Vec<u8>,
     /// The browser's CSRF cookie, if it sent a valid one.
@@ -428,6 +432,8 @@ impl Default for HttpCtx {
             body: String::new(),
             files: Vec::new(),
             session: SessionData::default(),
+            oauth_states: None,
+            image_slots: None,
             csrf_secret: Vec::new(),
             csrf_cookie: None,
             new_csrf_cookie: None,
@@ -483,6 +489,10 @@ pub struct Permissions {
     /// `[websockets]` and `[mail]` (found by the 1.1 audit: `env = ["APP_*"]`
     /// gave scripts `APP_SECRET`).
     pub hidden_env: Vec<String>,
+}
+
+pub trait OAuthStates: Send + Sync {
+    fn claim(&self, session: &str, digest: &str, now: i64, expires: i64) -> bool;
 }
 
 #[derive(Clone, Default, Debug)]

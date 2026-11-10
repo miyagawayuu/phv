@@ -31,7 +31,7 @@ code --install-extension phv-lang.phv-language
 Or download `phv-<version>.vsix` from the [releases](https://github.com/miyagawayuu/phv/releases) and install it:
 
 ```bash
-code --install-extension phv-1.3.0.vsix
+code --install-extension phv-1.3.1.vsix
 ```
 
 Or, in VS Code, run **Extensions: Install from VSIX...** from the Command Palette.
@@ -64,5 +64,5 @@ nothing is found, a message says so.
 npm install
 npm test          # checks the grammars and how phv is found
 npx vsce package  # writes phv-language-<version>.vsix
-code --install-extension phv-language-1.3.0.vsix
+code --install-extension phv-language-1.3.1.vsix
 ```

@@ -71,6 +71,7 @@ struct Inner {
     map: HashMap<String, Entry>,
     bytes: usize,
     requests: u64,
+    oauth: HashMap<usize, phv_std::OAuthClaims>,
 }
 
 pub struct Store {
@@ -84,6 +85,7 @@ pub struct Store {
 
 /// Where sessions are kept when not in memory: files, or a database.
 trait Backend: Send + Sync {
+    fn claim_oauth(&self, id: &str, digest: &str, now: i64, expires: i64) -> std::io::Result<bool>;
     /// The session and whether its visitor came back.
     fn read(&self, id: &str) -> Option<(Record, bool)>;
     /// Stores a session under a new id; false if the id is taken.
@@ -222,6 +224,11 @@ impl DbStore {
 }
 
 impl Backend for DbStore {
+    fn claim_oauth(&self, id: &str, digest: &str, now: i64, expires: i64) -> std::io::Result<bool> {
+        self.seen(phv_std::session_claim_oauth(&self.spec, self.ns(), &self.key(id), digest, now, expires))
+            .map_err(std::io::Error::other)
+    }
+
     fn read(&self, id: &str) -> Option<(Record, bool)> {
         // Sessions made before the site had a namespace (1.0) are not read: a
         // site that could read them could read those of any site without one.
@@ -407,6 +414,35 @@ fn is_session_file(name: &str) -> bool {
 }
 
 impl Backend for FileStore {
+    fn claim_oauth(&self, id: &str, digest: &str, now: i64, expires: i64) -> std::io::Result<bool> {
+        let shard = stripe_of(&session_key(id)).expect("session hash");
+        let _held = self.lock_stripe(shard)?;
+        let dir = self.open_dir()?;
+        if !Self::exists(&dir, id, true) && !Self::exists(&dir, id, false) {
+            return Ok(false);
+        }
+        let name = format!(".phv-oauth-{shard:02x}.claims");
+        let path = OsStr::new(&name);
+        let fail = |e: safefs::FsError| std::io::Error::other(format!("{e:?}"));
+        let mut claims = if dir.exists(path).map_err(fail)? {
+            let file = dir.open(path, false).map_err(fail)?;
+            let mut text = String::new();
+            file.take(64 * 1024 + 1).read_to_string(&mut text)?;
+            if text.len() > 64 * 1024 {
+                return Err(std::io::Error::other("invalid OAuth claim record"));
+            }
+            phv_std::OAuthClaims::decode(&text).map_err(std::io::Error::other)?
+        } else {
+            phv_std::OAuthClaims::default()
+        };
+        if !claims.claim(digest, now, expires) {
+            return Ok(false);
+        }
+        let text = claims.encode();
+        Self::write_atomic(&dir, &name, &text, || {})?;
+        Ok(true)
+    }
+
     fn read(&self, id: &str) -> Option<(Record, bool)> {
         FileStore::read(self, id)
     }
@@ -577,20 +613,33 @@ impl FileStore {
     fn write(&self, dir: &safefs::DirGuard, id: &str, r: &Record, returned: bool) -> std::io::Result<()> {
         let text = r.to_json();
         let name = Self::name(id, returned);
+        Self::write_atomic(dir, &name, &text, || {
+            self.written.fetch_add(text.len() as u64, Ordering::Relaxed);
+            #[cfg(test)]
+            std::thread::sleep(self.write_delay);
+        })
+    }
+
+    fn write_atomic(
+        dir: &safefs::DirGuard,
+        name: &str,
+        text: &str,
+        before_rename: impl FnOnce(),
+    ) -> std::io::Result<()> {
         let tmp_name = format!(".{name}.{}", phv_std::random_hex(8));
         let fail = |e: safefs::FsError| std::io::Error::other(format!("{e:?}"));
-        let mut f = dir.open(OsStr::new(&tmp_name), true).map_err(fail)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        f.write_all(text.as_bytes())?;
-        self.written.fetch_add(text.len() as u64, Ordering::Relaxed);
-        drop(f);
-        #[cfg(test)]
-        std::thread::sleep(self.write_delay);
-        let result = std::fs::rename(dir.path().join(&tmp_name), dir.path().join(&name));
+        let result = (|| {
+            let mut f = dir.open(OsStr::new(&tmp_name), true).map_err(fail)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            f.write_all(text.as_bytes())?;
+            drop(f);
+            before_rename();
+            std::fs::rename(dir.path().join(&tmp_name), dir.path().join(name))
+        })();
         if result.is_err() {
             let _ = std::fs::remove_file(dir.path().join(&tmp_name));
         }
@@ -717,6 +766,23 @@ enum Doomed {
     Unchanged(SystemTime),
 }
 
+impl phv_vm::OAuthStates for Store {
+    fn claim(&self, session: &str, digest: &str, now: i64, expires: i64) -> bool {
+        if !valid_id(session) || expires <= now {
+            return false;
+        }
+        if let Some(backend) = &self.files {
+            return backend.claim_oauth(session, digest, now, expires).unwrap_or(false);
+        }
+        let mut inner = self.inner();
+        if !inner.map.get(session).is_some_and(|entry| self.alive(entry)) {
+            return false;
+        }
+        let shard = stripe_of(&session_key(session)).expect("session hash");
+        inner.oauth.entry(shard).or_default().claim(digest, now, expires)
+    }
+}
+
 impl Store {
     pub fn new(ttl: Duration, secure: bool, dir: Option<PathBuf>) -> Store {
         let files = dir.map(|dir| {
@@ -732,7 +798,7 @@ impl Store {
             ttl,
             cookie: if secure { "__Host-PHVSESSID" } else { "PHVSESSID" },
             secure,
-            inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, requests: 0 }),
+            inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, requests: 0, oauth: HashMap::new() }),
             files,
         }
     }
@@ -1544,6 +1610,8 @@ mod tests {
     /// `PHV_TEST_POSTGRES_URL` and `PHV_TEST_MYSQL_URL` (skipped without them).
     #[test]
     fn database_stores_keep_the_same_rules() {
+        use phv_vm::OAuthStates;
+
         let _one_at_a_time = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         for var in ["PHV_TEST_REDIS_URL", "PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
             let Some(url) = std::env::var(var).ok().filter(|u| !u.is_empty()) else {
@@ -1564,11 +1632,22 @@ mod tests {
             // (found by the 1.1 audit).
             let other = Store::with_database(Duration::from_secs(60), false, spec.clone(), Arc::default(), ns(0x41));
             assert!(other.load(Some(&header)).id.is_none(), "{var}: another site took the session");
+            let peer = Store::with_database(Duration::from_secs(60), false, spec.clone(), Arc::default(), ns(0x40));
+            let id = peer.load(Some(&header)).id.unwrap();
+            let now = now_secs() as i64;
+            let digest = phv_std::random_hex(32);
+            let claim = |store: &Store| store.claim(&id, &digest, now, now + 60);
+            let claimed = std::thread::scope(|scope| {
+                let other = scope.spawn(|| claim(&peer));
+                [claim(&store), other.join().unwrap()]
+            });
+            assert_ne!(claimed[0], claimed[1], "{var}: exactly one backend can claim the state");
             // Logged out while a slow request still holds it: it stays gone.
             let mut slow = store.load(Some(&header));
             let mut logout = store.load(Some(&header));
             logout.destroyed = true;
             store.save(logout);
+            assert!(!peer.claim(&id, &phv_std::random_hex(32), now, now + 60), "{var}: session was destroyed");
             slow.values.insert("seen".into(), "1".into());
             slow.changed = true;
             assert!(store.save(slow).is_none(), "{var}");
@@ -2197,5 +2276,37 @@ mod tests {
         assert!(again.save(s).unwrap().contains("Max-Age=0"));
         assert!(again.load(Some(&header2)).id.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_oauth_claim_is_shared_and_survives_reopening_the_store() {
+        use phv_vm::OAuthStates;
+
+        let dir = std::env::temp_dir().join(format!("phv-oauth-claims-{}", phv_std::random_hex(8)));
+        let open = || Store::new(Duration::from_secs(60), false, Some(dir.clone()));
+        let (first, second) = (open(), open());
+        let mut session = SessionData { changed: true, ..SessionData::default() };
+        session.values.insert("user".into(), "ann".into());
+        let cookie = first.save(session).unwrap();
+        let header = cookie.split(';').next().unwrap();
+        let id = second.load(Some(header)).id.unwrap();
+        let digest = "a".repeat(64);
+        let now = now_secs() as i64;
+        let claim = |store: &Store| store.claim(&id, &digest, now, now + 60);
+        let results = std::thread::scope(|scope| {
+            let other = scope.spawn(|| claim(&second));
+            [claim(&first), other.join().unwrap()]
+        });
+        assert_ne!(results[0], results[1]);
+        drop((first, second));
+
+        let reopened = open();
+        assert!(!claim(&reopened));
+        let mut session = reopened.load(Some(header));
+        session.destroyed = true;
+        reopened.save(session);
+        assert!(!reopened.claim(&id, &"b".repeat(64), now, now + 60));
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

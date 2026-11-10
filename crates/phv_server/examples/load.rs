@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 struct Args {
     url: String,
     path: String,
+    image_path: Option<String>,
     connections: usize,
     requests: usize,
     warmup: usize,
@@ -30,12 +31,13 @@ struct Args {
 }
 
 const USAGE: &str = "usage: load --url http://HOST:PORT [--path /] [--connections 16] [--requests 500] [--warmup 50] \
-                     [--cookie NAME=VALUE] [--json]";
+                     [--cookie NAME=VALUE] [--image-path PATH] [--json]";
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         url: String::new(),
         path: "/".into(),
+        image_path: None,
         connections: 16,
         requests: 500,
         warmup: 50,
@@ -48,6 +50,7 @@ fn parse_args() -> Result<Args, String> {
         match a.as_str() {
             "--url" => args.url = value("--url")?,
             "--path" => args.path = value("--path")?,
+            "--image-path" => args.image_path = Some(value("--image-path")?),
             "--connections" => {
                 args.connections = value("--connections")?.parse().map_err(|e| format!("--connections: {e}"))?
             }
@@ -166,39 +169,59 @@ struct Run {
     start: Instant,
     end: Instant,
     latencies: Vec<Duration>,
-    errors: usize,
+    statuses: std::collections::BTreeMap<u16, usize>,
+    image_statuses: std::collections::BTreeMap<u16, usize>,
 }
 
-fn worker(addr: &str, req: &[u8], warmup: usize, n: usize, barrier: &Barrier) -> Result<Run, String> {
-    let mut conn = Conn::open(addr)?;
+fn worker(
+    addr: &str,
+    req: &[u8],
+    image: Option<&[u8]>,
+    offset: usize,
+    warmup: usize,
+    n: usize,
+    barrier: &Barrier,
+) -> Result<Run, String> {
     let mut body = Vec::new();
-    let send = |conn: &mut Conn, body: &mut Vec<u8>| -> Result<u16, String> {
+    let send = |req: &[u8], conn: &mut Conn, body: &mut Vec<u8>| -> Result<u16, String> {
         let (status, close) = conn.request(req, body)?;
         if close {
             *conn = Conn::open(addr)?;
         }
         Ok(status)
     };
-    for _ in 0..warmup {
-        send(&mut conn, &mut body)?;
-    }
+    let image_at = |i: usize| image.filter(|_| (i + offset).is_multiple_of(10));
+    let prepared = (|| {
+        let mut conn = Conn::open(addr)?;
+        for i in 0..warmup {
+            send(image_at(i).unwrap_or(req), &mut conn, &mut body)?;
+        }
+        Ok::<_, String>(conn)
+    })();
     barrier.wait();
+    let mut conn = prepared?;
     let start = Instant::now();
     let mut latencies = Vec::with_capacity(n);
-    let mut errors = 0;
-    for _ in 0..n {
+    let mut statuses = std::collections::BTreeMap::new();
+    let mut image_statuses = std::collections::BTreeMap::new();
+    for i in 0..n {
         let t = Instant::now();
-        let status = send(&mut conn, &mut body)?;
-        latencies.push(t.elapsed());
-        if status != 200 {
-            errors += 1;
+        if let Some(image) = image_at(i) {
+            *image_statuses.entry(send(image, &mut conn, &mut body)?).or_default() += 1;
+        } else {
+            let status = send(req, &mut conn, &mut body)?;
+            latencies.push(t.elapsed());
+            *statuses.entry(status).or_default() += 1;
         }
     }
-    Ok(Run { start, end: Instant::now(), latencies, errors })
+    Ok(Run { start, end: Instant::now(), latencies, statuses, image_statuses })
 }
 
 /// Nearest-rank percentile of sorted durations, in milliseconds.
 fn percentile(sorted: &[Duration], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
     let rank = ((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
     sorted[rank - 1].as_secs_f64() * 1000.0
 }
@@ -219,19 +242,23 @@ fn main() {
         }
     };
     let cookie = args.cookie.as_ref().map_or(String::new(), |c| format!("Cookie: {c}\r\n"));
-    let req = Arc::new(
+    let request = |path: &str| {
         format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: phv-bench-load\r\nAccept: text/html,application/json\r\n{cookie}\r\n",
-            args.path, addr
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: phv-bench-load\r\nAccept: text/html,application/json\r\n{cookie}\r\n",
         )
-        .into_bytes(),
-    );
+        .into_bytes()
+    };
+    let req = Arc::new(request(&args.path));
+    let image = args.image_path.as_deref().map(request).map(Arc::new);
     let barrier = Arc::new(Barrier::new(args.connections));
     let handles: Vec<_> = (0..args.connections)
-        .map(|_| {
+        .map(|offset| {
             let (addr, req, barrier) = (addr.clone(), req.clone(), barrier.clone());
+            let image = image.clone();
             let (warmup, n) = (args.warmup, args.requests);
-            std::thread::spawn(move || worker(&addr, &req, warmup, n, &barrier))
+            std::thread::spawn(move || {
+                worker(&addr, &req, image.as_deref().map(Vec::as_slice), offset, warmup, n, &barrier)
+            })
         })
         .collect();
     let mut runs = Vec::new();
@@ -251,10 +278,25 @@ fn main() {
     let start = runs.iter().map(|r| r.start).min().unwrap();
     let end = runs.iter().map(|r| r.end).max().unwrap();
     let seconds = (end - start).as_secs_f64();
-    let errors: usize = runs.iter().map(|r| r.errors).sum();
+    let mut statuses = std::collections::BTreeMap::new();
+    let mut image_statuses = std::collections::BTreeMap::new();
+    for run in &runs {
+        for (&status, &count) in &run.statuses {
+            *statuses.entry(status).or_insert(0usize) += count;
+        }
+        for (&status, &count) in &run.image_statuses {
+            *image_statuses.entry(status).or_insert(0usize) += count;
+        }
+    }
+    let errors = statuses.iter().filter(|(&status, _)| status != 200).map(|(_, count)| count).sum::<usize>()
+        + image_statuses
+            .iter()
+            .filter(|(&status, _)| status != 200 && status != 429)
+            .map(|(_, count)| count)
+            .sum::<usize>();
     let mut latencies: Vec<Duration> = runs.into_iter().flat_map(|r| r.latencies).collect();
     latencies.sort();
-    let total = latencies.len();
+    let total = latencies.len() + image_statuses.values().sum::<usize>();
     let per_second = total as f64 / seconds;
     let (p50, p99) = (percentile(&latencies, 0.5), percentile(&latencies, 0.99));
     if args.json {
@@ -268,6 +310,9 @@ fn main() {
             "p50_ms": (p50 * 1000.0).round() / 1000.0,
             "p99_ms": (p99 * 1000.0).round() / 1000.0,
             "errors": errors,
+            "statuses": statuses,
+            "image_statuses": image_statuses,
+            "successful_requests_per_s": statuses.get(&200).copied().unwrap_or(0) as f64 / seconds,
         });
         println!("{out}");
     } else {

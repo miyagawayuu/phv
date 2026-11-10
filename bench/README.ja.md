@@ -95,6 +95,14 @@ JIT ありで `runs` 回(既定で 5 回)、JIT なし(`PHV_JIT=0`)で `runs` �
 
 ## ファイル
 
+`performance.py` は、同じ入力でリリースバイナリを既定 7 組交互に比較する。`runtime.phv` の各測定値と中央値を
+JSON に保存する。`--load` に現行の `load` 例のバイナリを渡すと、本番 HTTP、画像混在負荷、同時初回アクセスも測る。
+型が確定したプロパティの JIT 最適化に明示的な有効化が必要だった旧候補バイナリには `--scalar-properties` を指定する。
+
+```powershell
+python bench/performance.py --baseline <v1.3.0のphv> --candidate <候補のphv> --load <load> --output <結果.json>
+```
+
 | ファイル | 役割 |
 |---|---|
 | `run.ps1`, `run.sh` | マイクロベンチマークと `--compare` |

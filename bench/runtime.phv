@@ -1,0 +1,103 @@
+<?phv
+
+final class BenchPoint {
+    public function __construct(public int $x, public float $y, public bool $ready) {}
+}
+
+function read_properties(BenchPoint $point, int $count): float {
+    $total = 0.0;
+    for ($i = 0; $i < $count; $i++) {
+        if ($point->ready) {
+            $total += $point->x + $point->y;
+        }
+    }
+    return $total;
+}
+
+function numbers(int $count): Generator<int, int> {
+    for ($i = 0; $i < $count; $i++) {
+        yield $i;
+    }
+}
+
+function wide_numbers(int $count): Generator<int, int> {
+    $a = 0;
+    $b = 0;
+    $c = 0;
+    $d = 0;
+    $e = 0;
+    $f = 0;
+    $g = 0;
+    $h = 0;
+    for ($i = 0; $i < $count; $i++) {
+        yield $i;
+    }
+    if ($a + $b + $c + $d + $e + $f + $g + $h != 0) {
+        yield -1;
+    }
+}
+
+function protected_numbers(int $count): Generator<int, int> {
+    try {
+        for ($i = 0; $i < $count; $i++) {
+            yield $i;
+        }
+    } finally {
+        $count = 0;
+    }
+}
+
+function delegated(int $count, int $depth): Generator<int, int> {
+    if ($depth == 0) {
+        yield from numbers($count);
+    } else {
+        yield from delegated($count, $depth - 1);
+    }
+}
+
+function guarded_numbers(int $count): Generator<int, int> {
+    try {
+        yield from numbers($count);
+    } finally {
+        $count = 0;
+    }
+}
+
+function sum_generator(Generator<int, int> $values): int {
+    $sum = 0;
+    foreach ($values as $value) {
+        $sum += $value;
+    }
+    return $sum;
+}
+
+function close_generators(int $count): int {
+    $sum = 0;
+    for ($i = 0; $i < $count; $i++) {
+        foreach (guarded_numbers($count) as $value) {
+            $sum += $value;
+            if ($value == 3) {
+                break;
+            }
+        }
+    }
+    return $sum;
+}
+
+function report(string $id, float $start, float $checksum): void {
+    echo $id, ": ", number_format((microtime() - $start) * 1000, 3), " ms (", $checksum, ")\n";
+}
+
+$point = new BenchPoint(3, 1.5, true);
+$start = microtime();
+report("property_reads", $start, read_properties($point, 2000000));
+$start = microtime();
+report("generator_yield", $start, (float)sum_generator(numbers(100000)));
+$start = microtime();
+report("generator_wide_frame", $start, (float)sum_generator(wide_numbers(100000)));
+$start = microtime();
+report("generator_active_handler", $start, (float)sum_generator(protected_numbers(100000)));
+$start = microtime();
+report("generator_delegated", $start, (float)sum_generator(delegated(100000, 3)));
+$start = microtime();
+report("generator_close", $start, (float)close_generators(20000));
