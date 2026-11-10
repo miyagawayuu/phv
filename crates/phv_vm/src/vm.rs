@@ -2908,6 +2908,9 @@ impl Vm {
     }
 
     fn set_path(&mut self, base: usize, p: &PathSet) -> Result<(), VmError> {
+        if p.keys.is_empty() {
+            return self.set_path_with(base, p, &[]);
+        }
         let keys = self.take_keys(base, p);
         let r = self.set_path_with(base, p, &keys);
         self.put_keys(keys);
@@ -2915,6 +2918,9 @@ impl Vm {
     }
 
     fn append_path(&mut self, base: usize, p: &PathSet, cur: Reg) -> Result<(), VmError> {
+        if p.keys.is_empty() {
+            return self.append_path_with(base, p, cur, &[]);
+        }
         let keys = self.take_keys(base, p);
         let r = self.append_path_with(base, p, cur, &keys);
         self.put_keys(keys);
