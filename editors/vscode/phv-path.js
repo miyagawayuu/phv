@@ -22,7 +22,7 @@ function isInside(p, folder, win) {
     b = b.toLowerCase();
   }
   const rel = path.relative(b, a);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
 }
 
 function defaultIsFile(p) {

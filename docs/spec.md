@@ -2195,8 +2195,10 @@ response()->redirect("/");
 - Before exchanging the code, `callback()` records the state atomically in the session store, separately from the
   session values. Servers sharing that store see the same claims. The store keeps up to 512 claims in each of 64
   shards, retains live claims when full, and refuses new claims with `invalid_state`. A store failure also refuses
-  the callback. SQL session stores create `phv_oauth_states` when first used. Use a Redis policy that preserves live
-  keys (`noeviction`) and switch all processes that share a session store together when upgrading to this version.
+  the callback. SQL session stores create `phv_oauth_states` when first used. Use Redis with `noeviction`. The
+  one-use guarantee requires acknowledged claims to survive recovery. If an unplanned shutdown, failover or
+  backup restore can lose acknowledged claims, invalidate the affected site's sessions before resuming callbacks
+  and ask users to start sign-in again. Switch all processes that share a session store together when upgrading to this version.
   When upgrading from 1.2 with file sessions, stop every 1.2 process before starting the new version because the
   session lock files differ. Concurrent session saves can still lose a sign-in started in another tab; start it again.
 - `callback()` accepts only a `state` this session started for this provider, so a sign-in cannot be finished in

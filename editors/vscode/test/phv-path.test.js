@@ -5,7 +5,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { resolvePhv, childEnv } = require("../phv-path");
+const { resolvePhv, childEnv, isInside } = require("../phv-path");
 
 let failures = 0;
 function check(name, got, want) {
@@ -21,6 +21,11 @@ function checkError(name, r) {
     console.error(`FAIL: ${name}: want an error, got ${JSON.stringify(r)}`);
   }
 }
+
+check("Windows child with a dot-prefixed name", isInside("C:\\work\\..cache", "C:\\work", true), true);
+check("Windows parent", isInside("C:\\", "C:\\work", true), false);
+check("Unix child with a dot-prefixed name", isInside("/work/..cache", "/work", false), true);
+check("Unix sibling", isInside("/other", "/work", false), false);
 
 // Windows, with a made-up file system (works on any machine).
 {

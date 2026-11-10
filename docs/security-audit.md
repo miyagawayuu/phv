@@ -2174,3 +2174,37 @@ Regression tests are named after what they check, in each crate's tests and in `
 - `session.rs`: `saves_of_different_sessions_do_not_wait_for_each_other`, `a_forged_cookie_does_not_wait_for_saves`,
   `a_panic_holding_the_memory_store_does_not_break_it`;
 - `format.rs`: `yield_from_takes_no_trailing_comma`; `safefs.rs`: `a_rewrite_with_the_old_write_time_changes_the_stamp`.
+
+## 30. Independent security review of the v1.3.2 candidate
+
+Reviewed on 2026-11-10. The target was `319b9bf78ea89a8e9add064f4178ca8aa0f28328`. This review traced external
+inputs, privileges, persistent state and resource limits across all nine crates and the distribution and deployment paths.
+
+| Area | Paths reviewed |
+| --- | --- |
+| Syntax, types and compiler | Token and nesting limits, HTML contexts, inheritance and property slots, exception and generator instructions |
+| VM and JIT | Typed property loads and reuse, native helpers, delegation frames and handlers, time, memory and stack limits |
+| Standard library | OAuth and JWT, outbound HTTP and WebSocket, filesystem boundaries, SQLite and shared DB sessions, image decoding, memory estimates and conversion slots |
+| Driver and HTTP server | Source loading and bundles, routing and static files, body limits, CSRF and CORS, admin port and session-store failures |
+| CLI and VS Code | Git configuration for package fetches, LSP input and analysis cache, DAP startup and executable selection |
+| CI, distribution, website and samples | Workflow triggers and privileges, artifacts and checksums, website HTML generation and headers, sample sessions and runtime identities |
+
+| ID | Severity | Finding and disposition |
+| --- | --- | --- |
+| RC32-01 | Medium | The OAuth claim and the session values are stored separately. Atomic claims limit exchanges during normal operation, and write failures stop the callback before exchange. Recovery that preserves an older session but loses an acknowledged claim voids the one-use guarantee. Redis `noeviction` does not provide durability, and the file store replaces the claim file without syncing it first. The specification now requires operators to invalidate affected sessions before resuming callbacks if recovery may have lost claims. [OAuth](../crates/phv_std/src/oauth.rs#L474) · [Shared stores](../crates/phv_std/src/netdb/sessions.rs#L236) · [File store](../crates/phv_server/src/session.rs#L623) |
+| RC32-02 | Medium | The VS Code extension treated some dot-prefixed child directories as outside the workspace. This affected the workspace exclusion in the default PATH search. The check now treats parent traversal as a path component. Windows and Unix path classification tests cover the change. [Fix](../editors/vscode/phv-path.js#L16) |
+| RC32-03 | Medium | A manually dispatched website workflow could deploy from its selected ref. The deploy job now requires `main`. Moving the Cloudflare credentials to a GitHub Environment restricted to `main` remains an operational control to verify. [Fix](../.github/workflows/website.yml#L49) |
+| RC32-04 | Low | The draft-release command could create a tag if the remote tag was missing. It now requires an existing tag. Tag creation, update and deletion restrictions and prepublication draft verification still apply. [Fix](../.github/workflows/release.yml#L195) |
+
+Existing evidence for `319b9bf` includes eight passing CI jobs and nine passing distribution build jobs. RustSec
+and the production npm dependency audits for the website and VS Code extension reported zero findings. The grammar
+and path tests passed after the extension fix. The limits on interrupting a codec call and on MySQL implicit commits
+remain as previously documented.
+
+In local Redis 7, PostgreSQL 17 and MySQL 8.4 environments, a test claim written through PHV's store API survived
+both restart after an unclean stop and failover to a replica confirmed to hold the claim. A separate process was
+refused when registering the same marker after each recovery, and the promoted replicas accepted a new marker.
+The test did not count token exchanges through OAuth callbacks or cover failover with lost, unreplicated claims.
+
+New attack reproduction and production deployment verification remain outstanding. The full-audit gate in the
+[release procedure](releasing.md) remains open.
