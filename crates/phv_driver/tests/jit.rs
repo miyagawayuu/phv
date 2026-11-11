@@ -1502,3 +1502,60 @@ echo push(new A(), $n), " ", pick(range(0, $n), [1], $n);
     // Copying the list at every pass copies 800 million elements in each function.
     assert!(took[1] < took[0] * 10 + Duration::from_millis(500), "interpreted {:?}, native {:?}", took[0], took[1]);
 }
+
+/// Native code keeps a returned function's register window, emptied, for the
+/// next call at that depth. Functions with more and fewer registers called
+/// in turn (and after a call that threw) must each find their slots empty,
+/// and a value a call left must be let go when it returns: the list passed
+/// to `peek()` is appended to in place afterwards (see `linear.rs`).
+#[test]
+fn a_register_window_is_reused_empty() {
+    let src = r#"
+function wide(string $a, string $b): string {
+    $x = $a . "-" . $b;
+    $y = $x . "!";
+    $z = $y . $x;
+    return $z . strlen($y);
+}
+function narrow(string $a): string {
+    return $a . "?";
+}
+function fails(string $a, int $n): string {
+    if ($n > 2) {
+        throw new RuntimeException("no " . $a);
+    }
+    return $a . $n;
+}
+function peek(list<int> $xs): int {
+    return count($xs);
+}
+function grow(int $n): int {
+    list<int> $xs = [];
+    $seen = 0;
+    for ($i = 0; $i < $n; $i++) {
+        $xs[] = $i;
+        $seen += peek($xs);
+    }
+    return $seen;
+}
+function turns(int $n): string {
+    $out = "";
+    for ($i = 0; $i < $n; $i++) {
+        $out .= wide("a" . $i, "b") . narrow("n" . $i);
+        try {
+            $out .= fails("f", $i);
+        } catch (RuntimeException $e) {
+            $out .= "[" . $e->getMessage() . "]";
+        }
+    }
+    return $out;
+}
+echo turns(5), "\n", grow(60000), "\n";
+"#;
+    let limits = Limits { max_time: Some(Duration::from_secs(10)), ..Limits::default() };
+    let out = run_both("windows", src, limits, &["wide", "narrow", "peek", "grow"]);
+    assert_eq!(
+        out,
+        "a0-b!a0-b5n0?f0a1-b!a1-b5n1?f1a2-b!a2-b5n2?f2a3-b!a3-b5n3?[no f]a4-b!a4-b5n4?[no f]\n1800030000\n"
+    );
+}

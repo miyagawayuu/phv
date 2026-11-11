@@ -320,6 +320,20 @@ unsafe fn rt<'a>(ctx: *mut JitCtx) -> &'a mut JitRt {
     &mut *(*ctx).rt
 }
 
+/// Writes `v` to a window slot. Most slots written hold a number or nothing:
+/// only a string, collection, object or closure there is dropped (the drop
+/// of a `Value` is a call, and these writes are most of what a call that
+/// passes an object costs).
+#[inline(always)]
+fn store(slot: &mut Value, v: Value) {
+    let old = std::mem::replace(slot, v);
+    if old.is_boxed() {
+        drop(old);
+    } else {
+        std::mem::forget(old);
+    }
+}
+
 /// The memory limit of the running call.
 ///
 /// # Safety
@@ -336,25 +350,30 @@ unsafe fn mem(ctx: *mut JitCtx) -> MemLimit {
 /// # Safety
 /// See `rt` and `mem`.
 pub unsafe extern "C" fn phv_jit_enter(ctx: *mut JitCtx, nregs: i64, args: i64, mask: i64) -> i64 {
-    let mem = mem(ctx);
     let rt = rt(ctx);
     let i = rt.used;
     if rt.windows.len() == i {
         rt.windows.push(Vec::new());
     }
-    let mut w = std::mem::take(&mut rt.windows[i]);
-    if w.capacity() < nregs as usize && mem.reserve(nregs as usize * std::mem::size_of::<Value>()).is_err() {
-        rt.windows[i] = w;
-        return JIT_ERR_MEMORY;
-    }
-    w.resize(nregs as usize, Value::Null);
-    let caller = &mut rt.windows[i - 1];
-    for k in 0..16 {
-        if mask >> k & 1 != 0 {
-            w[k] = std::mem::take(&mut caller[args as usize + k]);
+    let (below, above) = rt.windows.split_at_mut(i);
+    let (caller, w) = (&mut below[i - 1], &mut above[0]);
+    // A window keeps its slots, all empty, when its function returns
+    // (`phv_jit_leave`): the next call of a function with as many registers
+    // at this depth (the same one, in a loop) finds it ready.
+    let n = nregs as usize;
+    if w.len() != n {
+        if w.capacity() < n && mem(ctx).reserve(n * std::mem::size_of::<Value>()).is_err() {
+            return JIT_ERR_MEMORY;
         }
+        w.truncate(n);
+        w.resize_with(n, Value::default);
     }
-    rt.windows[i] = w;
+    let mut left = mask as u64 & 0xffff;
+    while left != 0 {
+        let k = left.trailing_zeros() as usize;
+        left &= left - 1;
+        store(&mut w[k], std::mem::take(&mut caller[args as usize + k]));
+    }
     rt.used = i + 1;
     0
 }
@@ -368,9 +387,15 @@ pub unsafe extern "C" fn phv_jit_leave(ctx: *mut JitCtx, ret: i64) {
     let rt = rt(ctx);
     let w = &mut rt.windows[rt.used - 1];
     if ret >= 0 {
-        rt.ret = std::mem::take(&mut w[ret as usize]);
+        store(&mut rt.ret, std::mem::take(&mut w[ret as usize]));
     }
-    w.clear();
+    // The values are let go and the slots kept, empty, for the next call
+    // at this depth (see `phv_jit_enter`).
+    for v in w.iter_mut() {
+        if v.is_boxed() {
+            *v = Value::Null;
+        }
+    }
     rt.used -= 1;
 }
 
@@ -381,7 +406,7 @@ pub unsafe extern "C" fn phv_jit_leave(ctx: *mut JitCtx, ret: i64) {
 pub unsafe extern "C" fn phv_jit_take_ret(ctx: *mut JitCtx, d: i64) {
     let rt = rt(ctx);
     let v = std::mem::take(&mut rt.ret);
-    rt.top()[d as usize] = v;
+    store(&mut rt.top()[d as usize], v);
 }
 
 /// `Const`: constant `c` of the unit (a string, or an empty list or map) into
@@ -409,7 +434,8 @@ pub unsafe extern "C" fn phv_jit_const(ctx: *mut JitCtx, d: i64, c: i64) {
 /// See `rt`.
 pub unsafe extern "C" fn phv_jit_move(ctx: *mut JitCtx, d: i64, s: i64) {
     let w = rt(ctx).top();
-    w[d as usize] = w[s as usize].clone();
+    let v = w[s as usize].clone();
+    store(&mut w[d as usize], v);
 }
 
 /// Stores a number or boolean (`JIT_PUT_*`) in slot `r`, so a string
@@ -418,12 +444,13 @@ pub unsafe extern "C" fn phv_jit_move(ctx: *mut JitCtx, d: i64, s: i64) {
 /// # Safety
 /// See `rt`.
 pub unsafe extern "C" fn phv_jit_put(ctx: *mut JitCtx, r: i64, kind: i64, bits: i64) {
-    rt(ctx).top()[r as usize] = match kind {
+    let v = match kind {
         JIT_PUT_INT => Value::Int(bits),
         JIT_PUT_FLOAT => Value::Float(f64::from_bits(bits as u64)),
         JIT_PUT_NULL => Value::Null,
         _ => Value::Bool(bits != 0),
     };
+    store(&mut rt(ctx).top()[r as usize], v);
 }
 
 /// `ToStr`.
@@ -965,7 +992,7 @@ pub unsafe extern "C" fn phv_jit_new(ctx: *mut JitCtx, d: i64, class: i64) {
     let class = *(*ctx).classes.add(class as usize);
     let v = with_vm(ctx, |vm| Ok(((class as usize) < vm.prog.classes.len()).then(|| vm.new_object(class))));
     match v {
-        Some(Some(v)) => rt(ctx).top()[d as usize] = v,
+        Some(Some(v)) => store(&mut rt(ctx).top()[d as usize], v),
         _ => wrong_value(ctx),
     }
 }

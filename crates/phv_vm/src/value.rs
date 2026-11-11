@@ -137,8 +137,31 @@ fn holds_values(v: &Value) -> bool {
 /// Dropping a deeply nested value must not recurse (a list nested a million
 /// levels deep would overflow the stack and abort the process). Children of
 /// containers we hold the last reference to are moved onto a heap worklist.
+///
+/// Most drops are of a scalar, a string or a value that is still shared: those
+/// are decided here, inline, and only the last reference to a value that may
+/// hold others takes the worklist's path (`drop_last`).
 impl Drop for Value {
+    #[inline]
     fn drop(&mut self) {
+        let last = match self {
+            Value::List(l) => Rc::strong_count(l) == 1,
+            Value::Map(m) => Rc::strong_count(m) == 1,
+            Value::Object(o) => Rc::strong_count(o) == 1,
+            Value::Closure(c) => Rc::strong_count(c) == 1,
+            _ => false,
+        };
+        if last {
+            drop_last(self);
+        }
+    }
+}
+
+/// The drop of the last reference to a list, map, object or closure (see
+/// `Drop for Value`).
+#[inline(never)]
+fn drop_last(this: &mut Value) {
+    {
         fn take_children(v: &mut Value, out: &mut Vec<Value>) {
             match v {
                 // Only values that hold others go on the worklist; the rest
@@ -169,11 +192,8 @@ impl Drop for Value {
                 _ => {}
             }
         }
-        if !matches!(self, Value::List(_) | Value::Map(_) | Value::Object(_) | Value::Closure(_)) {
-            return;
-        }
         let mut stack = Vec::new();
-        take_children(self, &mut stack);
+        take_children(this, &mut stack);
         while let Some(mut v) = stack.pop() {
             take_children(&mut v, &mut stack);
             // `v` is now childless (or shared), so dropping it does not recurse.
