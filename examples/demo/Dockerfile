@@ -4,11 +4,11 @@
 # The release binary is built on Ubuntu 24.04, so it needs its glibc. The
 # image is pinned by digest (Dependabot keeps it current).
 FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS fetch
-ARG PHV_VERSION=1.3.0
+ARG PHV_VERSION=1.3.2
 # The archive's SHA-256, written here when the version is set (from the
 # SHA256SUMS checked before the release was published), so a release asset
 # replaced later is refused.
-ARG PHV_SHA256=7d56c6a320d8dffe7a20b22fbfb2902c0d2d18256c2fc220653febee5bc229dc
+ARG PHV_SHA256=30edc620b3baf3ee793777532420d839a23e027fb5cdcac73201aaa8474716d3
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
