@@ -339,6 +339,43 @@ fn a_connection_made_for_a_shorter_time_limit_is_not_used_for_a_longer_one() {
     assert_eq!(run_script(&host, "mysql_pool_long", Some(Duration::from_secs(30))), "0");
 }
 
+/// Nor is a connection made for a much longer limit used for a short one: its
+/// socket would wait that long for a server that stopped answering (found by
+/// the 20th audit: a page could take a connection a job with a one-hour limit
+/// made). One made for a somewhat longer limit is.
+#[test]
+fn a_connection_made_for_a_much_longer_time_limit_is_not_used_for_a_short_one() {
+    sweep_once();
+    let Some(url) = server("PHV_TEST_MYSQL_URL") else { return };
+    // A pool of its own (pool_size 13), with one connection.
+    let spec = DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 13 };
+    let host =
+        Arc::new(Host { root: root(), databases: BTreeMap::from([("main".to_string(), spec)]), ..Host::default() });
+    let id = |secs: u64| run_script(&host, "mysql_pool_id", Some(Duration::from_secs(secs)));
+    let job = id(3600);
+    let page = id(30);
+    assert_ne!(job, page, "a page was given the connection of a one-hour job");
+    assert_eq!(id(20), page, "a connection made for 30 seconds serves 20");
+    assert!(id(3600) != page, "a job was given a page's connection");
+}
+
+/// `queryAsync()` makes its connections with the script's limits, so that a
+/// later script with the same limits uses them (found by the 20th audit: made
+/// with the time and memory left, they never fit a script and were closed).
+#[test]
+fn a_connection_queryasync_made_serves_the_next_script() {
+    sweep_once();
+    let Some(url) = server("PHV_TEST_MYSQL_URL") else { return };
+    // A pool of its own (pool_size 14).
+    let spec = DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 14 };
+    let host =
+        Arc::new(Host { root: root(), databases: BTreeMap::from([("main".to_string(), spec)]), ..Host::default() });
+    let limit = Some(Duration::from_secs(30));
+    let made = run_script(&host, "mysql_pool_async_id", limit);
+    assert!(made.parse::<u64>().is_ok_and(|id| id > 0), "{made}");
+    assert_eq!(run_script(&host, "mysql_pool_id", limit), made, "the connection queryAsync() made was not used");
+}
+
 #[test]
 fn mysql() {
     sweep_once();

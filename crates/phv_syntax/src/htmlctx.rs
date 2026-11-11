@@ -104,6 +104,12 @@ const STYLE: Flags = 1 << 18;
 /// (its content has its own insertion mode), so the `<select>` stays open
 /// after it (found by the 19th assessment).
 const TEMPLATE: Flags = 1 << 19;
+/// What its start tag does depends on the insertion mode of the HTML around
+/// it (the parts of a table, frames, and the document's `<html>`, `<head>`
+/// and `<body>`): inside a table cell a `<td>` closes the cell, and with it
+/// an `<svg>` in it; in body it is ignored. Inside SVG or MathML, where that
+/// mode is not known here, it is refused (found by the 20th assessment).
+const NEEDS_MODE: Flags = 1 << 20;
 /// `<svg>` or `<math>`.
 const FOREIGN_ROOT: Flags = SVG_ROOT | MATH_ROOT;
 
@@ -155,9 +161,9 @@ const ELEMENTS: &[Element] = &[
     Element { name: "basefont", flags: VOID },
     Element { name: "bgsound", flags: VOID },
     Element { name: "br", flags: VOID | BREAKOUT },
-    Element { name: "col", flags: VOID },
+    Element { name: "col", flags: VOID | NEEDS_MODE },
     Element { name: "embed", flags: VOID | BREAKOUT },
-    Element { name: "frame", flags: VOID },
+    Element { name: "frame", flags: VOID | NEEDS_MODE },
     Element { name: "hr", flags: VOID | BREAKOUT },
     Element { name: "image", flags: VOID },
     Element { name: "img", flags: VOID | BREAKOUT },
@@ -173,7 +179,7 @@ const ELEMENTS: &[Element] = &[
     Element { name: "b", flags: BREAKOUT },
     Element { name: "big", flags: BREAKOUT },
     Element { name: "blockquote", flags: BREAKOUT },
-    Element { name: "body", flags: BREAKOUT },
+    Element { name: "body", flags: BREAKOUT | NEEDS_MODE },
     Element { name: "center", flags: BREAKOUT },
     Element { name: "code", flags: BREAKOUT },
     Element { name: "dd", flags: BREAKOUT },
@@ -188,7 +194,7 @@ const ELEMENTS: &[Element] = &[
     Element { name: "h4", flags: BREAKOUT },
     Element { name: "h5", flags: BREAKOUT },
     Element { name: "h6", flags: BREAKOUT },
-    Element { name: "head", flags: BREAKOUT },
+    Element { name: "head", flags: BREAKOUT | NEEDS_MODE },
     Element { name: "i", flags: BREAKOUT },
     Element { name: "li", flags: BREAKOUT },
     Element { name: "listing", flags: BREAKOUT },
@@ -205,11 +211,23 @@ const ELEMENTS: &[Element] = &[
     Element { name: "strong", flags: BREAKOUT },
     Element { name: "sub", flags: BREAKOUT },
     Element { name: "sup", flags: BREAKOUT },
-    Element { name: "table", flags: BREAKOUT },
+    Element { name: "table", flags: BREAKOUT | NEEDS_MODE },
     Element { name: "tt", flags: BREAKOUT },
     Element { name: "u", flags: BREAKOUT },
     Element { name: "ul", flags: BREAKOUT },
     Element { name: "var", flags: BREAKOUT },
+    // Start tags that act by the insertion mode around them (`NEEDS_MODE`; the
+    // 20th assessment): the rest of the table parts, `<frameset>` and `<html>`.
+    Element { name: "caption", flags: NEEDS_MODE },
+    Element { name: "colgroup", flags: NEEDS_MODE },
+    Element { name: "tbody", flags: NEEDS_MODE },
+    Element { name: "thead", flags: NEEDS_MODE },
+    Element { name: "tfoot", flags: NEEDS_MODE },
+    Element { name: "tr", flags: NEEDS_MODE },
+    Element { name: "td", flags: NEEDS_MODE },
+    Element { name: "th", flags: NEEDS_MODE },
+    Element { name: "frameset", flags: NEEDS_MODE },
+    Element { name: "html", flags: NEEDS_MODE },
 ];
 
 /// The flags of an element (none for one not in the table).
@@ -259,6 +277,12 @@ const URL_ATTRS: &[&str] = &[
     "longdesc",
     "lowsrc",
     "dynsrc",
+    // `<link rel=preload as=image imagesrcset>`, attribution reporting, and
+    // `<object archive>` fetch URLs too (found by the re-attack of the 20th
+    // assessment's fixes).
+    "imagesrcset",
+    "attributionsrc",
+    "archive",
 ];
 
 /// On an `ANIMATION` element, attributes that name or set `href`.
@@ -274,8 +298,31 @@ const DESCRIBING_ATTRS: &[&str] = &["name", "property", "itemprop"];
 
 /// Attributes that hold a list of URLs: after the separator, a URL starts
 /// again (each candidate of `srcset`; each value of an animation's `values`).
-/// The element must have the flags (0: any element).
-const URL_LISTS: &[(&str, char, Flags)] = &[("srcset", ',', 0), ("values", ';', ANIMATION)];
+/// The element must have the flags (0: any element). A value inserted
+/// anywhere in such a list may hold the separator and start an item of its
+/// own (escaping leaves `,` and `;` alone), so every value is checked as a
+/// URL start, not only one after a literal separator (found by the 20th
+/// assessment). The last column says what may go there: `Url` a `SafeUrl`
+/// or a number (`safe_url()` drops whitespace, without which a `srcset`
+/// URL cannot end and no candidate can start); `Number` a number only (a
+/// `SafeUrl` may hold `;`, which alone starts another value).
+const URL_LISTS: &[(&str, char, Flags, ListItem)] = &[
+    ("srcset", ',', 0, ListItem::Url),
+    ("imagesrcset", ',', 0, ListItem::Url),
+    ("values", ';', ANIMATION, ListItem::Number),
+];
+
+/// What may be inserted into a list of `URL_LISTS`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ListItem {
+    Url,
+    Number,
+}
+
+/// The `URL_LISTS` row of the attribute `name` of `tag`, if it is one.
+fn url_list(tag: &str, name: &str) -> Option<(char, ListItem)> {
+    URL_LISTS.iter().find(|(attr, _, needs, _)| name == *attr && has(tag, *needs)).map(|&(_, sep, _, item)| (sep, item))
+}
 
 /// Schemes that run code or hold a document: a URL that starts with one is
 /// `ScriptUrl`. Only the first two are inline code for the CSP warning
@@ -352,6 +399,11 @@ enum State {
     Tag {
         name: String,
         closing: bool,
+        /// The last character read was a `/` (the WHATWG self-closing start
+        /// tag state): a `>` right after it, also in the next piece of text
+        /// after a statement, closes the tag self-closed (found by the 20th
+        /// assessment: `<svg/<?phv ?>>` opened an SVG here, none for browsers).
+        slash: bool,
     },
     AttrName {
         tag: String,
@@ -433,7 +485,7 @@ impl State {
     /// The tag and whether it is an end tag, inside one.
     fn take_tag(self) -> (String, bool) {
         match self {
-            State::Tag { name, closing } => (name, closing),
+            State::Tag { name, closing, .. } => (name, closing),
             State::AttrName { tag, closing, .. }
             | State::BeforeValue { tag, closing, .. }
             | State::Quoted { tag, closing, .. }
@@ -548,6 +600,8 @@ enum Then {
     NameEnd,
     /// `>`: the tag is complete (`close_tag`).
     Close(SelfClosing),
+    /// Between attributes: whether the character is `/` (`State::Tag`'s `slash`).
+    Slash,
     /// Start an attribute name with this character.
     AttrName,
     /// `=`: the attribute has a value.
@@ -578,7 +632,8 @@ enum Then {
 /// Whether `<tag ... />` is self-closing when its `>` is read.
 #[derive(Clone, Copy, Debug)]
 enum SelfClosing {
-    /// Yes if the character before `>` is `/` (between attributes).
+    /// Yes if the character read before `>` is `/` (between attributes;
+    /// `State::Tag`'s `slash`, kept across pieces of text).
     IfSlashBefore,
     /// Never (`>` ends an unquoted value or follows `=`).
     Never,
@@ -656,7 +711,7 @@ const RULES: &[(Ctx, &[Rule])] = &[
         Ctx::Tag,
         &[
             Rule { on: On::Is('>'), when: &[], then: Then::Close(SelfClosing::IfSlashBefore), read: One },
-            Rule { on: On::In(SpaceOrSlash), when: &[], then: Then::Stay, read: One },
+            Rule { on: On::In(SpaceOrSlash), when: &[], then: Then::Slash, read: One },
             Rule { on: On::Any, when: &[], then: Then::AttrName, read: One },
         ],
     ),
@@ -856,6 +911,8 @@ enum TagIs {
     ForeignOpenAbove,
     /// An HTML element of this name is open.
     HtmlOpen,
+    /// An element of this name (HTML, SVG or MathML) is open.
+    Open,
 }
 
 /// What a row does to the open elements.
@@ -897,6 +954,15 @@ enum Wrong {
     BreakoutEnd,
     /// An end tag inside foreign content that an HTML element around it is open for.
     EndAround,
+    /// A start tag inside SVG or MathML that acts by the insertion mode
+    /// around it (`NEEDS_MODE`; the 20th assessment).
+    NeedsMode,
+    /// An end tag in HTML inside SVG or MathML of an element open below the
+    /// innermost one (the 20th assessment).
+    EndOrder,
+    /// An end tag inside SVG or MathML that closes no element opened there
+    /// (the 20th assessment).
+    EndNothing,
 }
 
 /// Whether `<tag ... />` was self-closing (start rules only).
@@ -938,6 +1004,17 @@ const START_RULES: &[OpenRule] = &[
     // `<annotation-xml>` holds HTML or MathML depending on its `encoding`, which is
     // not followed here; `<svg>` is SVG either way (R19-8). Read on as HTML.
     OpenRule::new(&[Top::AnnotationXml], TagIs::Lacks(SVG_ROOT), Closed::Any, Wrong::AnnotationXml, Stack::Continue),
+    // HTML inside SVG or MathML is read by the insertion mode of the HTML around
+    // the SVG, which is not followed here: a `<td>` in a `<foreignObject>` in a
+    // table cell closes the cell and the SVG with it; in body, browsers ignore it
+    // (found by the 20th assessment). Refused, and read on as written.
+    OpenRule::new(
+        &[Top::Html, Top::HtmlPoint, Top::TextPoint],
+        TagIs::Has(NEEDS_MODE),
+        Closed::Any,
+        Wrong::NeedsMode,
+        Stack::Continue,
+    ),
     // HTML content: `<svg>` and `<math>` nest (not when self-closed); browsers
     // ignore `/>` on HTML elements, so only void elements stay closed.
     OpenRule::new(HTML_CONTENT, TagIs::AnyOf(FOREIGN_ROOT), Closed::Yes, Wrong::None, Stack::Nothing),
@@ -949,6 +1026,9 @@ const START_RULES: &[OpenRule] = &[
     // and read on as if it were in a `<foreignObject>`.
     OpenRule::new(&[Top::Foreign], TagIs::Has(BREAKOUT | VOID), Closed::Any, Wrong::Breakout, Stack::Nothing),
     OpenRule::new(&[Top::Foreign], TagIs::Has(BREAKOUT), Closed::Any, Wrong::Breakout, Stack::PushHtml),
+    // Right inside SVG or MathML these are SVG or MathML elements for browsers,
+    // but refused all the same: one rule for all of SVG and MathML.
+    OpenRule::new(&[Top::Foreign], TagIs::Has(NEEDS_MODE), Closed::Any, Wrong::NeedsMode, Stack::Continue),
     // Other elements open in the namespace of their parent (`<path/>` opens nothing).
     OpenRule::new(&[Top::Foreign], TagIs::Any, Closed::Yes, Wrong::None, Stack::Nothing),
     OpenRule::new(&[Top::Foreign], TagIs::Any, Closed::No, Wrong::None, Stack::PushSameNs),
@@ -956,14 +1036,25 @@ const START_RULES: &[OpenRule] = &[
 
 /// What an end tag does to the open elements (`open_end`). Columns: top,
 /// tag, self-closing (any), reported, done.
+///
+/// Inside SVG or MathML, browsers that find no element of an end tag's name
+/// in the SVG or MathML (or in the HTML of an integration point, within its
+/// scope) go on to the HTML around it, and act on the tag by the insertion
+/// mode there: `</a>`, `</div>`, `</li>`, `</td>`, `</template>`... may close
+/// an element opened before the `<svg>`, and the SVG with it. What is open
+/// there is not known here, so an end tag must close an element opened
+/// inside the SVG or MathML (in HTML, the innermost one), or be one that no
+/// browser acts on there (found by the 20th assessment).
 const END_RULES: &[OpenRule] = &[
     OpenRule::new(&[Top::None], TagIs::Any, Closed::Any, Wrong::None, Stack::Nothing),
-    // Browsers close an HTML element at its end tag; other end tags here (that
-    // browsers may or may not act on) leave it open, so a later `</svg>` is
-    // refused and read as if it closed (R19-8).
+    // Browsers close an HTML element at its end tag.
     OpenRule::new(&[Top::Html], TagIs::TopName, Closed::Any, Wrong::None, Stack::Pop),
+    // `</svg>` and `</math>` here are ignored by browsers, which read on as SVG
+    // or MathML: refused, and read as if it closed (R19-8).
     OpenRule::new(&[Top::Html], TagIs::AnyOf(FOREIGN_ROOT), Closed::Any, Wrong::IgnoredEnd, Stack::CloseForeignNamed),
-    OpenRule::new(&[Top::Html], TagIs::Any, Closed::Any, Wrong::None, Stack::Nothing),
+    // An element open below the innermost one: browsers may close both (or,
+    // for `</template>`, one around the SVG); refused, and read as nothing.
+    OpenRule::new(&[Top::Html], TagIs::Open, Closed::Any, Wrong::EndOrder, Stack::Nothing),
     // `</p>` and `</br>` directly in foreign content end it for browsers.
     OpenRule::new(
         &[Top::AnnotationXml, Top::Foreign],
@@ -979,7 +1070,35 @@ const END_RULES: &[OpenRule] = &[
     // An HTML element of that name around it: browsers may close it, with the
     // SVG or MathML inside it; refused, and read as if it closed.
     OpenRule::new(FOREIGN_TOPS, TagIs::HtmlOpen, Closed::Any, Wrong::EndAround, Stack::CloseHtmlNamed),
-    OpenRule::new(FOREIGN_TOPS, TagIs::Any, Closed::Any, Wrong::None, Stack::Nothing),
+    // In HTML (an element in an integration point, or the point itself), `</p>`
+    // with no `<p>` open makes an empty `<p>` there, and `</br>` a `<br>`: the
+    // scope a `<p>` is looked for in ends at the integration point.
+    OpenRule::new(
+        &[Top::Html, Top::HtmlPoint, Top::TextPoint],
+        TagIs::Named(&["p", "br"]),
+        Closed::Any,
+        Wrong::None,
+        Stack::Nothing,
+    ),
+    // No HTML element is named `svg` or `math`, and none around the SVG can be a
+    // raw-text element (its text holds no elements): browsers ignore these
+    // (`<svg><script/>...</script>`).
+    OpenRule::new(FOREIGN_TOPS, TagIs::AnyOf(FOREIGN_ROOT), Closed::Any, Wrong::None, Stack::Nothing),
+    OpenRule::new(
+        &[Top::Html, Top::HtmlPoint, Top::TextPoint, Top::AnnotationXml, Top::Foreign],
+        TagIs::Has(RAW),
+        Closed::Any,
+        Wrong::None,
+        Stack::Nothing,
+    ),
+    // Any other end tag closes no element opened here: refused.
+    OpenRule::new(
+        &[Top::Html, Top::HtmlPoint, Top::TextPoint, Top::AnnotationXml, Top::Foreign],
+        TagIs::Any,
+        Closed::Any,
+        Wrong::EndNothing,
+        Stack::Nothing,
+    ),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1724,12 +1843,16 @@ impl HtmlTracker {
         } else if name == "srcdoc" {
             EchoContext::Srcdoc
         } else {
+            // In a list of URLs, a value anywhere may start an item (`URL_LISTS`).
+            let list = url.is_some().then(|| url_list(tag, name)).flatten().map(|(_, item)| item);
             match url {
+                Some(UrlState::Script) => EchoContext::ScriptUrl,
+                _ if list == Some(ListItem::Number) => EchoContext::UrlListNumber,
                 // After a literal `&`, a value would continue a character
                 // reference (`&` + `#x6a;avascript:`; found by the 1.0.0 audit).
                 Some(UrlState::Undecided(ps)) if ps.iter().any(|p| p == "&") => EchoContext::UrlReference,
                 Some(UrlState::Undecided(_)) => EchoContext::Url,
-                Some(UrlState::Script) => EchoContext::ScriptUrl,
+                _ if list == Some(ListItem::Url) => EchoContext::Url,
                 _ => EchoContext::Attr,
             }
         }
@@ -1895,7 +2018,7 @@ impl HtmlTracker {
         fn norm(s: &State) -> State {
             match s {
                 State::AttrName { tag, closing, .. } | State::Unquoted { tag, closing, .. } => {
-                    State::Tag { name: tag.clone(), closing: *closing }
+                    State::Tag { name: tag.clone(), closing: *closing, slash: false }
                 }
                 s => s.clone(),
             }
@@ -2007,8 +2130,11 @@ impl HtmlTracker {
 
     /// The `>` of a tag: what the tag does, in order.
     fn close_tag(&mut self, tag: String, closing: bool, self_closing: bool) {
+        // The element's flags, looked up once (`ELEMENTS` is read in order).
+        let flags = flags(&tag);
+        let is = |mask: Flags| flags & mask == mask;
         // 1. A `<meta>` whose `content` took a value as text may not have `http-equiv` (found by the 1.0 audit).
-        if std::mem::take(&mut self.meta_text) && has(&tag, META) && self.attrs.iter().any(|a| a == "http-equiv") {
+        if std::mem::take(&mut self.meta_text) && is(META) && self.attrs.iter().any(|a| a == "http-equiv") {
             self.found.push((self.here, InlineCode::MetaHttpEquiv));
         }
         // 2. The open elements of foreign content (`START_RULES`, `END_RULES`).
@@ -2019,13 +2145,13 @@ impl HtmlTracker {
             && self_closing
             && matches!(self.open.last().map_or(Top::None, Open::top), Top::Foreign | Top::AnnotationXml);
         if closing {
-            self.open_end(&tag);
+            self.open_end(&tag, flags);
         } else {
-            self.open_start(&tag, self_closing);
+            self.open_start(&tag, flags, self_closing);
         }
         // 3. `<noscript>` depth, outside foreign content. Browsers ignore `/>` on
         //    HTML elements: `<noscript/>` opens one.
-        if !self.in_foreign() && has(&tag, NOSCRIPT) {
+        if !self.in_foreign() && is(NOSCRIPT) {
             if closing {
                 self.noscript = self.noscript.saturating_sub(1);
             } else {
@@ -2034,17 +2160,26 @@ impl HtmlTracker {
         }
         // 4. `<select>`, and the raw-text elements it hides from older parsers
         //    (R19-26); a `<template>` there, in which they ignore `</select>`.
-        if has(&tag, SELECT) {
+        if is(SELECT) {
             self.select = !closing;
-        } else if self.select && !closing && has(&tag, IGNORED_IN_SELECT) {
+        } else if self.select && !closing && is(IGNORED_IN_SELECT) {
             self.found.push((self.here, InlineCode::RawTextInSelect(tag.clone())));
-        } else if self.select && !closing && has(&tag, TEMPLATE) {
+        } else if self.select && !closing && is(TEMPLATE) {
             self.found.push((self.here, InlineCode::TemplateInSelect));
+        } else if self.select && !closing && !self_closing && flags & FOREIGN_ROOT != 0 {
+            // Older parsers ignore `<svg>` and `<math>` there and read what they hold
+            // as HTML; newer ones let an end tag inside close the `<select>` (found
+            // by the 20th assessment).
+            self.found.push((
+                self.here,
+                InlineCode::ForeignStructure(format!(
+                    "`<{tag}>` inside `<select>`, which older browsers ignore there (reading what it holds as HTML)"
+                )),
+            ));
         }
         // 5. A raw-text element's start tag opens its text (`RAW` in HTML content,
         //    `RAW_IN_FOREIGN` inside SVG or MathML, unless self-closed there);
         //    anything else returns to text.
-        let flags = flags(&tag);
         let raw = flags & if self.in_foreign() { RAW_IN_FOREIGN } else { RAW } != 0 && !foreign_self_closed;
         self.state =
             if !closing && raw { State::Raw { tag, flags, escape: 0, js: Js::default() } } else { State::Text };
@@ -2075,26 +2210,40 @@ impl HtmlTracker {
                 "`</{tag}>` inside SVG or MathML that an HTML element `<{tag}>` around it is open for, where \
                  browsers may close that element and the SVG or MathML inside it"
             ),
+            Wrong::NeedsMode => format!(
+                "`<{tag}>` inside `<svg>` or `<math>`, which browsers read by the HTML around the SVG or MathML \
+                 (in a table it may close the cell, and the SVG or MathML with it; elsewhere it is ignored)"
+            ),
+            Wrong::EndOrder => format!(
+                "`</{tag}>` while the HTML element `<{}>` opened after it inside SVG or MathML is still open, \
+                 where browsers may close both, or an element around the SVG or MathML",
+                top.map_or("", |t| t.name.as_str())
+            ),
+            Wrong::EndNothing => format!(
+                "`</{tag}>` inside SVG or MathML that closes no element opened inside it, where browsers may \
+                 close an HTML element around the SVG or MathML, and the SVG or MathML with it"
+            ),
         };
         self.found.push((self.here, InlineCode::ForeignStructure(msg)));
     }
 
     /// Whether `tag` is in the class, for the open elements as they are.
-    fn tag_is(&self, class: TagIs, tag: &str) -> bool {
+    fn tag_is(&self, class: TagIs, tag: &str, flags: Flags) -> bool {
         match class {
             TagIs::Any => true,
-            TagIs::Has(mask) => has(tag, mask),
-            TagIs::AnyOf(mask) => flags(tag) & mask != 0,
-            TagIs::Lacks(mask) => flags(tag) & mask == 0,
+            TagIs::Has(mask) => flags & mask == mask,
+            TagIs::AnyOf(mask) => flags & mask != 0,
+            TagIs::Lacks(mask) => flags & mask == 0,
             TagIs::Named(names) => names.contains(&tag),
             TagIs::TopName => self.open.last().is_some_and(|t| t.name == tag),
             TagIs::ForeignOpenAbove => self.open.iter().rev().take_while(|n| n.ns != Ns::Html).any(|n| n.name == tag),
             TagIs::HtmlOpen => self.open.iter().any(|n| n.ns == Ns::Html && n.name == tag),
+            TagIs::Open => self.open.iter().any(|n| n.name == tag),
         }
     }
 
     /// A start tag, in `open`: the first row of `START_RULES` that applies.
-    fn open_start(&mut self, tag: &str, self_closing: bool) {
+    fn open_start(&mut self, tag: &str, flags: Flags, self_closing: bool) {
         let top = self.open.last().cloned();
         // Blocks copy and compare the open elements: their number is bounded
         // (far above what SVG uses; unclosed elements such as `<path>` without
@@ -2113,7 +2262,7 @@ impl HtmlTracker {
         let kind = top.as_ref().map_or(Top::None, Open::top);
         for rule in START_RULES {
             if !rule.top.contains(&kind)
-                || !self.tag_is(rule.tag, tag)
+                || !self.tag_is(rule.tag, tag, flags)
                 || (rule.self_closing == Closed::Yes && !self_closing)
                 || (rule.self_closing == Closed::No && self_closing)
             {
@@ -2124,7 +2273,7 @@ impl HtmlTracker {
                 Stack::Continue => continue,
                 Stack::Nothing => return,
                 Stack::PushRoot => {
-                    if has(tag, SVG_ROOT) {
+                    if flags & SVG_ROOT != 0 {
                         Ns::Svg
                     } else {
                         Ns::Math
@@ -2142,7 +2291,7 @@ impl HtmlTracker {
     }
 
     /// An end tag, in `open`: the first row of `END_RULES` that applies.
-    fn open_end(&mut self, tag: &str) {
+    fn open_end(&mut self, tag: &str, flags: Flags) {
         // In `Html` read by `foreign_insert_problem`: an end tag of an element
         // it did not open would close (or be ignored for) one of the page's,
         // which are not all known here.
@@ -2153,7 +2302,7 @@ impl HtmlTracker {
             ));
             return;
         }
-        self.end_rules(tag);
+        self.end_rules(tag, flags);
         if self.open.len() < self.base {
             self.found.push((
                 self.here,
@@ -2165,11 +2314,11 @@ impl HtmlTracker {
     }
 
     /// `open_end` by `END_RULES`.
-    fn end_rules(&mut self, tag: &str) {
+    fn end_rules(&mut self, tag: &str, flags: Flags) {
         let top = self.open.last().cloned();
         let kind = top.as_ref().map_or(Top::None, Open::top);
         for rule in END_RULES {
-            if !rule.top.contains(&kind) || !self.tag_is(rule.tag, tag) {
+            if !rule.top.contains(&kind) || !self.tag_is(rule.tag, tag, flags) {
                 continue;
             }
             self.report(rule.wrong, tag, top.as_ref());
@@ -2373,11 +2522,11 @@ impl HtmlTracker {
                 self.attrs.clear();
                 self.meta_text = false;
                 self.maybe_undescribed = false;
-                self.state = State::Tag { name: tag, closing };
+                self.state = State::Tag { name: tag, closing, slash: false };
             }
             Then::Close(sc) => {
                 let self_closing = match sc {
-                    SelfClosing::IfSlashBefore => i > 0 && chars[i - 1] == '/',
+                    SelfClosing::IfSlashBefore => matches!(self.state, State::Tag { slash: true, .. }),
                     SelfClosing::Never => false,
                 };
                 let (tag, closing) = std::mem::replace(&mut self.state, State::Text).take_tag();
@@ -2403,12 +2552,12 @@ impl HtmlTracker {
             Then::AttrDone => {
                 if let State::AttrName { tag, closing, name } = std::mem::replace(&mut self.state, State::Text) {
                     self.attrs.push(name);
-                    self.state = State::Tag { name: tag, closing };
+                    self.state = State::Tag { name: tag, closing, slash: c == '/' };
                 }
             }
             Then::ToTag => {
                 let (tag, closing) = std::mem::replace(&mut self.state, State::Text).take_tag();
-                self.state = State::Tag { name: tag, closing };
+                self.state = State::Tag { name: tag, closing, slash: false };
             }
             Then::Quoted => {
                 if let State::BeforeValue { tag, closing, name } = std::mem::replace(&mut self.state, State::Text) {
@@ -2422,6 +2571,11 @@ impl HtmlTracker {
                     self.state = State::Unquoted { tag, closing, name };
                 }
             }
+            Then::Slash => {
+                if let State::Tag { slash, .. } = &mut self.state {
+                    *slash = c == '/';
+                }
+            }
             Then::UrlChar => self.url_char(c),
             Then::Escape(n) => {
                 if let State::Raw { escape, .. } = &mut self.state {
@@ -2430,7 +2584,7 @@ impl HtmlTracker {
             }
             Then::CloseRaw => {
                 if let State::Raw { tag, .. } = std::mem::replace(&mut self.state, State::Text) {
-                    self.state = State::Tag { name: tag, closing: true };
+                    self.state = State::Tag { name: tag, closing: true, slash: false };
                 }
             }
             Then::ForeignMarkup => self.found.push((offset, InlineCode::ForeignCdata)),
@@ -2492,7 +2646,7 @@ impl HtmlTracker {
                 }
             }
             // A list of URLs (`URL_LISTS`): after the separator, a URL starts again.
-            let next_url = URL_LISTS.iter().any(|(attr, sep, needs)| name == attr && c == *sep && has(tag, *needs));
+            let next_url = (c == ',' || c == ';') && url_list(tag, name).is_some_and(|(sep, _)| c == sep);
             if next_url && !matches!(url, Some(UrlState::Script)) {
                 *url = Some(UrlState::Undecided(vec![String::new()]));
             }
@@ -3126,14 +3280,32 @@ mod tests {
         assert_eq!(t.context(), EchoContext::Attr);
     }
 
-    /// Each URL of `srcset` and of an animation's `values` is checked.
+    /// Each URL of `srcset` and of an animation's `values` is checked; and
+    /// (found by the 20th assessment) a value anywhere in such a list, which
+    /// may hold the separator and start an item of its own: in `srcset` it is
+    /// a URL start (a `SafeUrl`, which has no whitespace to end a URL, or a
+    /// number), in `values` only a number goes (a `SafeUrl` may hold `;`).
     #[test]
     fn every_url_of_a_list_is_checked() {
         for (text, ctx) in [
             ("<img srcset=\"/a.png 1x, ", EchoContext::Url),
-            ("<img srcset=\"/a.png 1x, /b.png 2x", EchoContext::Attr),
-            ("<svg><animate attributeName=\"href\" values=\"/a;", EchoContext::Url),
+            ("<img srcset=\"/a.png 1x, /b.png 2x", EchoContext::Url),
+            ("<img srcset=\"/img/", EchoContext::Url),
+            ("<img srcset=\"https://example.com/a.png?v=", EchoContext::Url),
+            ("<source srcset=\"javascript:", EchoContext::ScriptUrl),
+            ("<link rel=\"preload\" as=\"image\" imagesrcset=\"", EchoContext::Url),
+            ("<link rel=\"preload\" as=\"image\" imagesrcset=\"/a.png 1x, ", EchoContext::Url),
+            ("<img attributionsrc=\"", EchoContext::Url),
+            ("<object archive=\"", EchoContext::Url),
+            ("<svg><animate attributeName=\"href\" values=\"", EchoContext::UrlListNumber),
+            ("<svg><animate attributeName=\"href\" values=\"/a;", EchoContext::UrlListNumber),
+            ("<svg><animate attributeName=\"href\" values=\"/a;/search?q=", EchoContext::UrlListNumber),
+            ("<svg><set attributeName=\"href\" values=\"/home;/b", EchoContext::UrlListNumber),
             ("<svg><animate attributeName=\"href\" values=\"/a;javascript:x", EchoContext::ScriptUrl),
+            // Elsewhere, and in other attributes, as before.
+            ("<p values=\"a;", EchoContext::Attr),
+            ("<svg><animate attributeName=\"href\" to=\"/a;", EchoContext::Attr),
+            ("<img src=\"/a.png?v=", EchoContext::Attr),
         ] {
             let mut t = HtmlTracker::default();
             t.feed(text);
@@ -3195,7 +3367,8 @@ mod tests {
         assert_eq!(ctx("<a href=\"#"), EchoContext::Attr);
         assert_eq!(ctx("<a href=\" JavaScript:go("), EchoContext::ScriptUrl);
         assert_eq!(ctx("<a href=\"data:text/html,"), EchoContext::ScriptUrl);
-        assert_eq!(ctx("<svg><animate attributeName=\"href\" values=\""), EchoContext::Url);
+        assert_eq!(ctx("<svg><animate attributeName=\"href\" to=\""), EchoContext::Url);
+        assert_eq!(ctx("<svg><animate attributeName=\"href\" values=\""), EchoContext::UrlListNumber);
         let mut t = HtmlTracker::default();
         t.feed("<a href=\"");
         t.inserted();
@@ -3282,7 +3455,7 @@ mod tests {
             // An end tag that closes an HTML element around nested SVG.
             "<svg><foreignObject><div><svg></div></svg></foreignObject></svg>",
         ] {
-            assert_eq!(structure_errors(html), 1, "{html}");
+            assert!(structure_errors(html) >= 1, "{html}");
         }
         // What browsers read as written: closed HTML in integration points,
         // SVG and MathML elements, nested SVG and void elements.
@@ -3682,9 +3855,13 @@ mod tests {
             assert_eq!(e.flags & HIDES_END != 0, e.flags & (RAW | NOSCRIPT) != 0, "{}", e.name);
             assert!(e.flags & NO_END_TAG == 0 || e.flags & RAW != 0, "{}", e.name);
         }
+        // The last start rule reports nothing; the last end rule refuses an end
+        // tag inside SVG or MathML that closes nothing opened there.
+        assert!(matches!(START_RULES.last().unwrap().wrong, Wrong::None));
+        assert!(matches!(END_RULES.last().unwrap().wrong, Wrong::EndNothing));
         for rules in [START_RULES, END_RULES] {
             let last = rules.last().unwrap();
-            assert!(matches!(last.tag, TagIs::Any) && matches!(last.wrong, Wrong::None));
+            assert!(matches!(last.tag, TagIs::Any));
             assert!(!rules.iter().any(|r| matches!((r.then, r.wrong), (Stack::Continue, Wrong::None))));
             // Every top, self-closing or not, is covered by a row that matches any tag.
             for top in [Top::None, Top::Html, Top::HtmlPoint, Top::TextPoint, Top::AnnotationXml, Top::Foreign] {
@@ -3779,10 +3956,17 @@ mod tests {
         assert_eq!(ctx("<svg><g></g></svg>a"), EchoContext::Text);
         assert_eq!(structure_errors("<svg><title><b></svg>"), 1);
         assert_eq!(ctx("<svg><title><b></i></b></title></svg>a"), EchoContext::Text);
+        assert_eq!(structure_errors("<svg><title><b></i></b></title></svg>"), 1);
+        assert_eq!(structure_errors("<svg><title><b><i></b></i></b></title></svg>"), 1);
+        assert_eq!(structure_errors("<svg><title><b></p></br></b></p></title></svg>"), 0);
+        assert_eq!(structure_errors("<svg><g></script></style></g></svg>"), 0);
+        assert_eq!(structure_errors("<svg><foreignObject><td>"), 1);
+        assert_eq!(structure_errors("<svg><td></td></svg>"), 1);
         assert_eq!(structure_errors("<svg></p>"), 1);
         assert_eq!(ctx("<svg><g></svg>a"), EchoContext::Text);
         assert_eq!(structure_errors("<svg><title><b><svg></b></svg></title></svg>"), 1);
         assert_eq!(ctx("<svg></x>"), EchoContext::ForeignText("foreign svg"));
+        assert_eq!(structure_errors("<svg></x>"), 1);
         // Rows whose conditions only a corner case tells apart (each of these
         // passed with one condition of a row removed, so they stay).
         // `<scripts` is not `<script` with a delimiter after it: no double escape.
@@ -3796,5 +3980,173 @@ mod tests {
         assert_eq!(ctx("<a x href=\""), EchoContext::Url);
         // `--` is carried only in the escaped states.
         assert_eq!(ctx("<script>a--"), EchoContext::Script);
+    }
+
+    /// Found by the 20th assessment: inside `<svg>` or `<math>`, an end tag
+    /// that closed no element opened there was read as nothing, while
+    /// browsers act on it by the HTML around the SVG: `</a>`, `</div>`,
+    /// `</td>`, `</template>`... closed an element opened before the `<svg>`,
+    /// and the SVG with it, and the page's self-closed `<script/>` after it
+    /// (read as SVG here, with the nonce) was an HTML script. The same for an
+    /// end tag in HTML inside SVG of an element below the innermost one.
+    #[test]
+    fn end_tags_inside_foreign_content_close_only_what_it_opened() {
+        let parse = |src: &str| crate::parse_module(src, 0, true).1;
+        for html in [
+            // The reviewer's pages (Chrome and parse5 ran the value after them).
+            "<a href=\"/\"><svg viewBox=\"0 0 10 10\"><path d=\"M0 0h10v10z\"/></a><script/>x</script></svg>",
+            "<select name=\"s\"><option>a</option><svg></select><script/>x</script></svg>",
+            "<div class=\"icon\"><svg viewBox=\"0 0 10 10\"><path d=\"M0 0h10v10z\"/></div><style/><text>x</text></svg>",
+            "<table><tr><td><svg><path/></td></tr></table><script/>x</script></svg>",
+            "<template><svg></template><script/>x</script></svg>",
+            "<h1><svg></h2><script/>x</script></svg>",
+            "<ul><li><svg></li><script/>x</script></svg>",
+            "<div><math></div><script/>x</script></math>",
+            "<noscript><svg></noscript>",
+            // Any other end tag that closes nothing opened inside.
+            "<svg></x>",
+            "<svg><g></g></g></svg>",
+            "<math><mi></td></mi></math>",
+            "<svg><foreignObject></template></foreignObject></svg>",
+            "<svg><foreignObject><b></table></b></foreignObject></svg>",
+            "<math><annotation-xml></span>",
+            // In HTML inside SVG, the end tag of an element below the innermost one.
+            "<div><svg><foreignObject><div><b></div></b></div></foreignObject><script/>x</script></svg></div>",
+            "<template><svg><foreignObject><template><b></template></b></template></foreignObject></svg></template>",
+            "<svg><foreignObject><p><b></p></b></p></foreignObject></svg>",
+            "<math><mi><b></mi>",
+            "<svg><foreignObject><b></foreignObject>",
+        ] {
+            assert!(structure_errors(html) >= 1, "{html}");
+            assert!(parse(html).iter().any(|d| d.is_error()), "{html}");
+        }
+        // What closes what it opened, and what no browser acts on there.
+        for html in [
+            "<a href=\"/\"><svg viewBox=\"0 0 10 10\"><path d=\"M0 0h10v10z\"/></svg></a>",
+            "<svg><g><circle r=\"1\"></circle></g><text>a</text></svg>",
+            "<svg><script/>x</script><style/></style></svg>",
+            "<svg></math><g></g></svg>",
+            "<math></svg><mi>x</mi></math>",
+            "<svg><foreignObject></p><br></br><div><p>a</p></div></foreignObject></svg>",
+            "<svg><foreignObject><div></p></div></foreignObject></svg>",
+            "<svg><foreignObject><b><svg><g></g></svg></b></foreignObject></svg>",
+            "<math><mi><b>x</b></mi><mtext></p></mtext></math>",
+        ] {
+            assert_eq!(structure_errors(html), 0, "{html}");
+            let mut t = HtmlTracker::default();
+            t.feed(html);
+            assert!(t.at_top_level(), "{html}");
+        }
+        // `Html` inserted inside SVG may not hold one either.
+        for (html, place) in [("</x>", "foreign svg"), ("<b></i></b>", "foreign html"), ("<g></g></g>", "foreign svg")]
+        {
+            assert!(foreign_insert_problem(html, place).is_some(), "{html} at {place}");
+        }
+    }
+
+    /// Found by the 20th assessment: older parsers ignore `<svg>` and
+    /// `<math>` inside `<select>` and read what they hold as HTML (a
+    /// `<script/>` there is an HTML script); newer ones let an end tag inside
+    /// close the `<select>`.
+    #[test]
+    fn svg_and_math_inside_select_are_refused() {
+        for html in [
+            "<select><svg><script/>x</script></svg></select>",
+            "<select><option>a</option><math><mi>x</mi></math></select>",
+            "<SELECT><option><SVG viewBox=\"0 0 1 1\"></svg></option></select>",
+        ] {
+            assert!(structure_errors(html) >= 1, "{html}");
+        }
+        for html in ["<select><svg/></select>", "<select></select><svg></svg>", "<svg></svg><select></select>"] {
+            assert_eq!(structure_errors(html), 0, "{html}");
+        }
+        let diags = crate::parse_module("<select><svg></svg></select>", 0, true).1;
+        assert!(diags.iter().any(|d| d.is_error() && d.message.contains("`<svg>` inside `<select>`")));
+    }
+
+    /// Found by the 20th assessment: HTML inside an integration point is read
+    /// by browsers in the insertion mode of the HTML around the SVG, which is
+    /// not followed here: a `<td>` in a `<foreignObject>` in a table cell
+    /// closes the cell and the SVG; in body it is ignored, so its end tag
+    /// was read differently. These start tags are refused inside SVG and
+    /// MathML, in the page and in `Html` inserted there.
+    #[test]
+    fn table_parts_inside_foreign_content_are_refused() {
+        let names = [
+            "table", "caption", "col", "colgroup", "tbody", "thead", "tfoot", "tr", "td", "th", "frame", "frameset",
+            "head", "body", "html",
+        ];
+        for name in names {
+            for html in [
+                format!("<svg><foreignObject><{name}>"),
+                format!("<svg><desc><b><{name}>"),
+                format!("<math><mi><{name}>"),
+                format!("<svg><{name}>"),
+                format!("<math><{name}/>"),
+            ] {
+                assert!(structure_errors(&html) >= 1, "{html}");
+            }
+            for place in ["foreign svg", "foreign math", "foreign html", "foreign mathtext"] {
+                let html = format!("<{name}>x</{name}>");
+                assert!(foreign_insert_problem(&html, place).is_some(), "{html} at {place}");
+            }
+        }
+        // The reviewer's pages and partials.
+        let page =
+            "<table><tr><td><svg><foreignObject><td>x</td></foreignObject><script/>x</script></svg></td></tr></table>";
+        assert!(structure_errors(page) >= 1);
+        let fo = "<foreignObject><td></foreignObject><p>x</p></td></foreignObject>";
+        assert!(foreign_insert_problem(fo, "foreign svg").is_some());
+        assert!(foreign_insert_problem("<td>x</td>", "foreign html").is_some());
+        assert!(foreign_insert_problem("<td>x</td>", "foreign mathtext").is_some());
+        // A table around the SVG, and one outside it, are fine.
+        for html in [
+            "<table><tr><td><svg><path/></svg></td></tr></table>",
+            "<svg><foreignObject><div>a</div></foreignObject></svg><table><tr><td>b</td></tr></table>",
+        ] {
+            assert_eq!(structure_errors(html), 0, "{html}");
+        }
+    }
+
+    /// Found by the 20th assessment: `/` and `>` split by a statement
+    /// (`<svg/<?phv ?>>`) was not read as a self-closing tag: an SVG was open
+    /// here where browsers opened none, and the `<script/>` after it, read as
+    /// SVG with the nonce, was an HTML script for browsers.
+    #[test]
+    fn a_statement_between_slash_and_gt_keeps_the_tag_self_closed() {
+        let mut t = HtmlTracker::default();
+        t.feed("<svg viewBox=\"0 0 10 10\"/");
+        t.feed(">");
+        assert!(t.at_top_level());
+        t.feed("<script/>");
+        assert_eq!(t.context(), EchoContext::Script);
+        // In one text, as before; `/` with a space after it is not self-closing.
+        assert_eq!(ctx("<svg/><a href=\""), EchoContext::Url);
+        assert_eq!(ctx("<svg / ><script/>"), EchoContext::ForeignText("foreign svg"));
+        let mut t = HtmlTracker::default();
+        t.feed("<svg /");
+        t.feed(" ");
+        t.feed(">");
+        assert!(!t.at_top_level());
+        // In a template: the value after `<script/>` is in a script.
+        for src in [
+            "<svg/<?phv ?>><script/><?= $v ?></script></svg>",
+            "<svg viewBox=\"0 0 10 10\"/<?phv if ($wide) { } ?>><script/><?= $v ?></script></svg>",
+            "<svg/<?phv $z = 1; ?>><script/><?= $v ?></script></svg>",
+        ] {
+            let (module, _) = crate::parse_module(src, 0, true);
+            let places: Vec<EchoContext> = module
+                .stmts
+                .iter()
+                .filter_map(|s| match &s.kind {
+                    crate::ast::StmtKind::HtmlEcho(_, c) => Some(*c),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(places, [EchoContext::Script], "{src}");
+        }
+        // A block may not end between `/` and `>` where it began elsewhere.
+        let diags = crate::parse_module("<svg/<?phv if ($c) { ?> <?phv } ?>><g/></svg>", 0, true).1;
+        assert!(diags.iter().any(|d| d.is_error()), "{diags:?}");
     }
 }

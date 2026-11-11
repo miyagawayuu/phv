@@ -1,0 +1,71 @@
+error: `</a>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_end_around.phv:12:64
+   |
+12 | <a href="/"><svg viewBox="0 0 10 10"><path d="M0 0h10v10z"/></a><script/><text><?= $v ?></text></svg>
+   |                                                                ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</div>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_end_around.phv:13:72
+   |
+13 | <div class="icon"><svg viewBox="0 0 10 10"><path d="M0 0h10v10z"/></div><style/><text><?= $v ?></text></svg>
+   |                                                                        ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</td>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_end_around.phv:14:32
+   |
+14 | <table><tr><td><svg><path/></td></tr></table><text><?= $v ?></text></svg>
+   |                                ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</tr>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_end_around.phv:14:37
+   |
+14 | <table><tr><td><svg><path/></td></tr></table><text><?= $v ?></text></svg>
+   |                                     ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</table>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_end_around.phv:14:45
+   |
+14 | <table><tr><td><svg><path/></td></tr></table><text><?= $v ?></text></svg>
+   |                                             ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</template>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_end_around.phv:15:26
+   |
+15 | <template><svg></template><text><?= $v ?></text></svg>
+   |                          ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</li>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_end_around.phv:16:18
+   |
+16 | <ul><li><svg></li><text><?= $v ?></text></svg></ul>
+   |                  ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</div>` while the HTML element `<b>` opened after it inside SVG or MathML is still open, where browsers may close both, or an element around the SVG or MathML
+  --> err_svg_end_around.phv:17:39
+   |
+17 | <div><svg><foreignObject><div><b></div></b></div></foreignObject><text><?= $v ?></text></svg></div>
+   |                                       ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `<td>` inside `<svg>` or `<math>`, which browsers read by the HTML around the SVG or MathML (in a table it may close the cell, and the SVG or MathML with it; elsewhere it is ignored)
+  --> err_svg_end_around.phv:18:39
+   |
+18 | <table><tr><td><svg><foreignObject><td>x</td></foreignObject><text><?= $v ?></text></svg></td></tr></table>
+   |                                       ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `<svg>` inside `<select>`, which older browsers ignore there (reading what it holds as HTML)
+  --> err_svg_end_around.phv:19:40
+   |
+19 | <select name="s"><option>a</option><svg><text><?= $v ?></text></svg></select>
+   |                                        ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+10 errors found

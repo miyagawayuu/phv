@@ -78,8 +78,9 @@ pub use asyncio::running as async_running;
 pub use crypt::{hmac_sha256, server_key, store_namespace};
 pub use httpclient::{check_header_name, check_header_value, check_http_url, check_oauth_url, post_telemetry};
 pub use netdb::{
-    redis_publish, redis_subscribe, session_claim_oauth, session_insert, session_read, session_remove, session_sweep,
-    session_update, OAuthClaims, Pushed, RedisSubscriber, SessionLimits, SessionRow, SESSIONS_OF_1_1,
+    oauth_claim_ttl, redis_publish, redis_subscribe, session_claim_oauth, session_insert, session_read, session_remove,
+    session_store_evicts, session_sweep, session_update, OAuthClaims, Pushed, RedisSubscriber, SessionLimits,
+    SessionRow, OAUTH_CLAIMS_PER_SESSION, OAUTH_CLAIM_LIFETIME, SESSIONS_OF_1_1,
 };
 pub use sys::{constant_time_eq, sha256_hex};
 pub use web::{csrf_expected, csrf_matches, json_decode, mask_csrf, random_hex};
@@ -173,7 +174,9 @@ fn tag_name_at(b: &[u8], at: usize, name: &str) -> bool {
 /// `<plaintext>` and read its text as markup, where the template was checked
 /// as its text (the check a template gets for its own `<select>`, R19-26;
 /// found by the 1.2.1 audit). Such a start tag anywhere in the `Html` is
-/// refused (in a comment or a `<script>` too: simpler, and rare there).
+/// refused (in a comment or a `<script>` too: simpler, and rare there), and
+/// so is `<svg>` or `<math>`, which they ignore there too, reading what it
+/// holds as HTML (found by the 20th assessment).
 fn html_inside(html: &str, place: &str) -> Option<String> {
     let b = html.as_bytes();
     // `watched `: inside `<noscript>`, `<svg>` or `<math>` (see below).
@@ -184,11 +187,24 @@ fn html_inside(html: &str, place: &str) -> Option<String> {
     if place == "select" {
         let tag =
             html.match_indices('<').find_map(|(i, _)| IGNORED_IN_SELECT.iter().find(|t| tag_name_at(b, i + 1, t)));
-        return tag.map(|t| {
-            format!(
+        if let Some(t) = tag {
+            return Some(format!(
                 "`<{t}>` inside `<select>`: `Html` inserted into a `<select>` holds it, and older browsers ignore it \
                  there and read its text as markup, where the template that made the `Html` is checked as its text; \
                  close the `<select>` first, or insert a string (it is escaped) instead"
+            ));
+        }
+        // Older browsers ignore `<svg>` and `<math>` there too, and read what
+        // they hold as HTML, where the template checked it as SVG or MathML (a
+        // self-closed `<script/>` there is an HTML script; found by the 20th
+        // assessment).
+        let foreign =
+            html.match_indices('<').find_map(|(i, _)| ["svg", "math"].into_iter().find(|t| tag_name_at(b, i + 1, t)));
+        return foreign.map(|t| {
+            format!(
+                "`<{t}>` inside `<select>`: `Html` inserted into a `<select>` holds it, and older browsers ignore it \
+                 there and read what it holds as HTML, where the template that made the `Html` checked it as SVG or \
+                 MathML; insert it outside the `<select>`"
             )
         });
     }

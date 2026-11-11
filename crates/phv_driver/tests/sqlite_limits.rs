@@ -179,6 +179,47 @@ echo $db->first(sql"SELECT sum({call}) AS s FROM t")?->int("s") ?? 0;
     }
 }
 
+/// Found by the 20th audit: SQLite sleeps for a lock outside its program's
+/// steps, so the time limit did not stop the wait. A script set
+/// `PRAGMA busy_timeout` to up to 24 days and held its worker that long, and
+/// the default 5 seconds ran past a 1 second limit. The pragma is refused,
+/// and a write waiting for another connection's lock ends at the time limit.
+#[test]
+fn a_write_waiting_for_a_lock_stops_at_the_time_limit() {
+    let hold = r#"$a = Database::open("data/locked.db");
+$a->execute(sql"CREATE TABLE IF NOT EXISTS t (n INTEGER)");
+$b = Database::open("data/locked.db");
+$a->execute(sql"BEGIN IMMEDIATE");
+$a->execute(sql"INSERT INTO t VALUES (1)");
+"#;
+    for (name, pragma) in [
+        ("busy_set", "PRAGMA busy_timeout = 60000"),
+        ("busy_read", "PRAGMA busy_timeout"),
+        ("busy_table", "SELECT * FROM pragma_busy_timeout"),
+    ] {
+        let src = format!(
+            r#"{hold}try {{ $b->query(sql"{pragma}"); echo "ran"; }} catch (DatabaseError $e) {{ echo $e->getMessage(); }}"#
+        );
+        let (out, _) = run_site_for(name, &src, 1 << 30, std::time::Duration::from_secs(1));
+        assert!(out.contains("not authorized"), "{pragma}: {out}");
+    }
+    let src = format!("{hold}$b->execute(sql\"INSERT INTO t VALUES (2)\");\necho \"wrote\";");
+    let start = std::time::Instant::now();
+    let (out, _) = run_site_for("busy_wait", &src, 1 << 30, std::time::Duration::from_secs(1));
+    let took = start.elapsed();
+    assert!(out.contains("time limit was reached"), "{out}");
+    assert!(took < std::time::Duration::from_millis(1500), "took {took:?}");
+    // Without a time limit nearer than that, a write waits 5 seconds for the lock.
+    let src = format!(
+        "{hold}try {{ $b->execute(sql\"INSERT INTO t VALUES (2)\"); }} catch (DatabaseError $e) {{ echo $e->getMessage(); }}"
+    );
+    let start = std::time::Instant::now();
+    let (out, _) = run_site_for("busy_long", &src, 1 << 30, std::time::Duration::from_secs(30));
+    let took = start.elapsed();
+    assert!(out.contains("database is locked"), "{out}");
+    assert!(took >= std::time::Duration::from_secs(5) && took < std::time::Duration::from_secs(8), "took {took:?}");
+}
+
 /// Found by the 1.2.0 audit: PHV's own SQL functions (`replace()`, `trim()`,
 /// `instr()`, `LIKE`) copied their arguments and built their results without
 /// asking the memory limit, passing it by up to four values of the longest.

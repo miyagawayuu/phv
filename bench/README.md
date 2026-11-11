@@ -102,7 +102,9 @@ of a branch, say) and is accepted by `serve` too (`lsp.py` takes `--out <file>`)
 ## Comparing PHV with PHP 8.5
 
 Use a PHV release binary, Python 3.9 or later, and PHP 8.5 CLI with OPcache loaded.
-Pass `--php` if the PHP 8.5 executable is outside PATH. On Windows, pass the path to `phv.exe`.
+Pass `--php` if the PHP 8.5 executable is outside PATH. On Windows, pass the path to `phv.exe`. A name without a
+folder (`php`) is looked up only in the absolute folders of PATH, never in the current folder; a path (`./php`) is
+used as given.
 
 ```bash
 python3 bench/compare_php.py --phv /path/to/phv --php /path/to/php --output bench/results/php85.json

@@ -1,0 +1,16 @@
+<?phv
+// The `values` of an SVG animation element is a `;`-separated list whose every
+// value may become a link's URL (`attributeName="href"`). Escaping leaves `;`
+// alone, so a string anywhere in it could add a `javascript:` value of its
+// own, and so could a `safe_url()` value: only numbers go there (found by the
+// 20th assessment). In `srcset`, a value anywhere starts a URL (a `SafeUrl`,
+// which holds no whitespace, cannot start another candidate). Lines 1 to 3
+// are errors.
+$q = "x;javascript:alert(1)";
+$n = 3;
+?>
+<svg><a><set attributeName="href" values="/home;/search?q=<?= $q ?>" dur="1s"/></a></svg>
+<svg><a><animate attributeName="href" values="<?= safe_url("/a;javascript:alert(1)") ?>" dur="1s"/></a></svg>
+<img srcset="/img/a.png 1x, /img/<?= $q ?>.png 2x" alt="">
+<svg><rect><animate attributeName="width" values="0;<?= $n ?>;0" dur="1s"/></rect></svg>
+<img srcset="<?= safe_url("/img/a.png") ?> 1x, /img/<?= $n ?>.png 2x" alt="">

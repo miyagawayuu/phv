@@ -1,0 +1,11 @@
+<?phv
+// Older browsers ignore a `<svg>` (or `<math>`) inside a `<select>` and read
+// what it holds as HTML, where the template that made it checked it as SVG:
+// its self-closed `<script/>` is an HTML script there, and the escaped label
+// runs (found by the 20th assessment, in parse5). `Html` holding one stops
+// the page when it is inserted inside a `<select>`.
+$v = "document.title='mk1'";
+?>
+<select><option>a</option><?= render("views/select_options.phv.html", v: "b") ?></select>
+<select><option>a</option><?= render("views/svg_in_select.phv.html", label: $v) ?></select>
+not reached

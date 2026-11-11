@@ -442,21 +442,30 @@ fn wrapped_base64_counts_both_buffers_before_decoding() {
 
 #[test]
 fn a_conversion_releases_its_slot_on_success_and_error() {
+    use phv_vm::image_slots::{ImageSlots, ImageSlotsFor};
+    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
     let (src, width, height) = probe(png(&pattern(3, 3, 3))).unwrap();
     let mut pipe = Pipeline { src: Rc::new(src), ops: Vec::new(), width, height };
-    let mut vm = Vm::new(Arc::default(), Arc::from([]), false, phv_vm::Limits::default());
-    let slots = Arc::new(AtomicUsize::new(0));
-    vm.http.image_slots = Some(slots.clone());
+    let slots = Arc::new(ImageSlots::new(1));
+    let page = |client: &str| ImageSlotsFor::new(slots.clone(), client.into(), Arc::new(AtomicBool::new(false)));
+    // Every slot busy: the conversion waits, here until its time limit.
+    let limits = phv_vm::Limits { max_time: Some(std::time::Duration::from_millis(200)), ..Default::default() };
+    let mut vm = Vm::new(Arc::default(), Arc::from([]), false, limits);
+    vm.http.image_slots = Some(page("198.51.100.7"));
+    let held = page("203.0.113.9").take(|| Ok::<(), ()>(())).unwrap();
     let busy = render(&vm, "send()", &pipe, Format::Png, 85);
-    assert!(matches!(busy, Err(Fail::Vm(VmError::Fatal(message))) if message.contains("slots are busy")));
-    slots.store(1, Ordering::Relaxed);
+    assert!(matches!(busy, Err(Fail::Vm(VmError::Fatal(message))) if message.contains("maximum execution time")));
+    drop(held);
+    assert_eq!(slots.free(), 1);
+    let mut vm = Vm::new(Arc::default(), Arc::from([]), false, phv_vm::Limits::default());
+    vm.http.image_slots = Some(page("198.51.100.7"));
     assert!(render(&vm, "send()", &pipe, Format::Png, 85).is_ok());
-    assert_eq!(slots.load(Ordering::Relaxed), 1);
+    assert_eq!(slots.free(), 1);
     Rc::get_mut(&mut pipe.src).unwrap().bytes.clear();
     assert!(render(&vm, "send()", &pipe, Format::Png, 85).is_err());
-    assert_eq!(slots.load(Ordering::Relaxed), 1);
+    assert_eq!(slots.free(), 1);
 }
 
 #[test]
@@ -601,7 +610,7 @@ fn png_metadata_chunks_are_left_out_and_the_orientation_kept() {
     tagged = png_with(&tagged, b"zTXt", b"k\0\0\x78\x9c\x03\0\0\0\0\x01");
     // What the decoder reads is the PNG without them.
     let mut seen = Vec::new();
-    PngView::new(&tagged).read_to_end(&mut seen).unwrap();
+    View::png(&tagged).read_to_end(&mut seen).unwrap();
     assert_eq!(seen, plain);
     let (src, w, h) = probe(tagged).unwrap();
     assert_eq!((w, h), (4, 5));
@@ -610,7 +619,7 @@ fn png_metadata_chunks_are_left_out_and_the_orientation_kept() {
     let mut cut = png_with(&plain, b"iCCP", b"icc\0\0");
     cut.truncate(40);
     let mut seen = Vec::new();
-    PngView::new(&cut).read_to_end(&mut seen).unwrap();
+    View::png(&cut).read_to_end(&mut seen).unwrap();
     assert_eq!(seen, cut);
 }
 
@@ -642,4 +651,376 @@ fn encoding_reserves_what_the_encoders_take() {
     assert!(encode_need(&gray, Format::Webp) >= 3 * gray.data.len() as u64 * 49 / 10);
     let rgba = pattern(100, 100, 4);
     assert!(encode_need(&rgba, Format::Jpeg) >= 30_000 * 33 / 10);
+}
+
+// --- Lossless WebP prefix codes (the 20th audit's R23-1) ---------------------
+
+/// Bits written least significant first, as VP8L reads them.
+#[derive(Default)]
+struct BitWriter {
+    out: Vec<u8>,
+    acc: u64,
+    n: u32,
+}
+
+impl BitWriter {
+    fn put(&mut self, v: u32, bits: u32) {
+        self.acc |= (v as u64 & ((1 << bits) - 1)) << self.n;
+        self.n += bits;
+        while self.n >= 8 {
+            self.out.push(self.acc as u8);
+            self.acc >>= 8;
+            self.n -= 8;
+        }
+    }
+
+    /// A prefix code: its most significant bit first.
+    fn code(&mut self, (code, len): (u32, u32)) {
+        for i in (0..len).rev() {
+            self.put((code >> i) & 1, 1);
+        }
+    }
+
+    fn done(mut self) -> Vec<u8> {
+        if self.n > 0 {
+            self.out.push(self.acc as u8);
+        }
+        self.out
+    }
+}
+
+const CL_ORDER: [usize; 19] = [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+/// The codes of the canonical prefix code with `lengths`, by symbol.
+fn canonical_codes(lengths: &[u32]) -> Vec<(u32, u32)> {
+    let mut hist = [0u32; 16];
+    for &l in lengths {
+        hist[l as usize] += 1;
+    }
+    hist[0] = 0;
+    let (mut next, mut code) = ([0u32; 16], 0u32);
+    for l in 1..16 {
+        code = (code + hist[l - 1]) << 1;
+        next[l] = code;
+    }
+    lengths
+        .iter()
+        .map(|&l| {
+            if l == 0 {
+                return (0, 0);
+            }
+            let c = next[l as usize];
+            next[l as usize] += 1;
+            (c, l)
+        })
+        .collect()
+}
+
+/// A simple code of one symbol.
+fn simple1(w: &mut BitWriter, symbol: u32) {
+    w.put(1, 1);
+    w.put(0, 1);
+    if symbol < 2 {
+        w.put(0, 1);
+        w.put(symbol, 1);
+    } else {
+        w.put(1, 1);
+        w.put(symbol, 8);
+    }
+}
+
+/// A normal code of `lengths` (for its whole alphabet), each length written
+/// with a code-length code of 4 bits a symbol.
+fn normal(w: &mut BitWriter, lengths: &[u32]) {
+    w.put(0, 1);
+    w.put(19 - 4, 4);
+    for at in CL_ORDER {
+        w.put(if at < 16 { 4 } else { 0 }, 3);
+    }
+    w.put(0, 1);
+    for &l in lengths {
+        w.code((l, 4));
+    }
+}
+
+/// The code the PoC gave every code of every group: symbols 0 to 10 with
+/// lengths 1 to 10 and 10 (a table of 1,024 entries), its lengths written
+/// with a code-length code of 14 lengths.
+fn big_code(w: &mut BitWriter) {
+    let mut cl = [0u32; 19];
+    cl[1..7].fill(3);
+    cl[7..11].fill(4);
+    let cl_codes = canonical_codes(&cl);
+    w.put(0, 1);
+    w.put(14 - 4, 4);
+    for at in &CL_ORDER[..14] {
+        w.put(cl[*at], 3);
+    }
+    w.put(1, 1);
+    w.put(1, 3);
+    w.put(11 - 2, 4);
+    for l in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10] {
+        w.code(cl_codes[l]);
+    }
+}
+
+/// A green code of 2,328 symbols (an 11-bit color cache), 2,048 of them 15
+/// bits long: image-webp builds a tree of 4,096 nodes for it.
+fn long_green(w: &mut BitWriter) {
+    let mut cl = [0u32; 19];
+    cl[16] = 1;
+    cl[15] = 3;
+    cl[1] = 3;
+    cl[2] = 3;
+    cl[3] = 4;
+    cl[4] = 4;
+    let cl_codes = canonical_codes(&cl);
+    w.put(0, 1);
+    w.put(19 - 4, 4);
+    for at in CL_ORDER {
+        w.put(cl[at], 3);
+    }
+    let mut reads: Vec<(usize, Option<u32>)> = vec![(1, None), (2, None), (3, None), (4, None), (15, None)];
+    reads.extend(std::iter::repeat_n((16, Some(3)), 340));
+    reads.extend([(16, Some(1)), (16, Some(0))]);
+    w.put(1, 1);
+    w.put(4, 3);
+    w.put(reads.len() as u32 - 2, 10);
+    for (sym, extra) in reads {
+        w.code(cl_codes[sym]);
+        if let Some(e) = extra {
+            w.put(e, 2);
+        }
+    }
+}
+
+/// A simple WebP of the lossless bitstream `data`.
+fn webp_simple(data: &[u8]) -> Vec<u8> {
+    let mut body = b"WEBP".to_vec();
+    riff(&mut body, b"VP8L", data, None);
+    let mut out = b"RIFF".to_vec();
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// A lossless WebP of `w` × `h` whose entropy image names meta code
+/// `groups` - 1 everywhere, so that image-webp builds `groups` groups of five
+/// codes (the PoC's g65536 and, with `long`, l4096 and l43000).
+fn vp8l_groups(groups: u32, w: u32, h: u32, long: bool) -> Vec<u8> {
+    let mut b = BitWriter::default();
+    b.put(0x2F, 8);
+    b.put(w - 1, 14);
+    b.put(h - 1, 14);
+    b.put(0, 1);
+    b.put(0, 3);
+    b.put(0, 1);
+    if long {
+        b.put(1, 1);
+        b.put(11, 4);
+    } else {
+        b.put(0, 1);
+    }
+    b.put(1, 1);
+    b.put(0, 3);
+    // The entropy image: single symbols, so no bits for its pixels.
+    b.put(0, 1);
+    let meta = groups - 1;
+    for s in [meta & 0xFF, meta >> 8, 0, 0, 0] {
+        simple1(&mut b, s);
+    }
+    for _ in 0..groups {
+        for t in 0..5 {
+            if long && t == 0 {
+                long_green(&mut b);
+            } else {
+                big_code(&mut b);
+            }
+        }
+    }
+    for _ in 0..w * h * 4 {
+        b.put(0, 1);
+    }
+    let mut data = b.done();
+    data.extend_from_slice(&[0; 64]);
+    webp_simple(&data)
+}
+
+/// The lossless bitstream of a simple WebP.
+fn vp8l_of(webp: &[u8]) -> &[u8] {
+    assert_eq!(&webp[12..16], b"VP8L");
+    &webp[20..]
+}
+
+#[test]
+fn lossless_webp_prefix_codes_are_counted_before_image_webp_builds_them() {
+    // 16 groups: decoded as before, each of its 80 codes counted.
+    let small = vp8l_groups(16, 1, 1, false);
+    let need = vp8l::need(vp8l_of(&small), None, u64::MAX).unwrap();
+    assert!(need >= 80 * 4096, "{need}");
+    assert_eq!(read_back(&small).unwrap().0.data, vec![0, 0, 0]);
+    // The PoC's g65536: 1×1 pixel, 3.8 MB, and 1.3 GB of tables in image-webp.
+    let bomb = vp8l_groups(65_536, 1, 1, false);
+    let need = vp8l::need(vp8l_of(&bomb), None, u64::MAX).unwrap();
+    assert!(need >= 65_536 * 5 * 4096, "{need}");
+    // Under 128 MB: refused once the codes counted pass what is left.
+    let start = std::time::Instant::now();
+    assert_eq!(vp8l::need(vp8l_of(&bomb), None, 128 << 20), Err(vp8l::Stop::Memory));
+    let (src, _, _) = probe(bomb).unwrap();
+    assert_eq!(decode(&src, 128 << 20).unwrap_err(), OVER_MEMORY);
+    assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+    // Codes longer than the table: each green code's tree counted too (the
+    // PoC's l4096 took 345 MB).
+    let long = vp8l_groups(64, 1, 1, true);
+    let need = vp8l::need(vp8l_of(&long), None, u64::MAX).unwrap();
+    assert!(need >= 64 * (4 * 4096 + 4096 + 2 * 2048 * 16), "{need}");
+    // A bitstream cut short is refused where image-webp would stop.
+    let cut = &vp8l_of(&small)[..40];
+    assert!(matches!(vp8l::need(cut, None, u64::MAX), Err(vp8l::Stop::Damaged(_))));
+}
+
+/// The entropy image is decoded as image-webp decodes it: here its meta
+/// codes come from a literal, a backward reference and the color cache.
+#[test]
+fn the_entropy_image_is_read_with_its_references_and_color_cache() {
+    let mut b = BitWriter::default();
+    b.put(0x2F, 8);
+    b.put(16 - 1, 14);
+    b.put(1 - 1, 14);
+    b.put(0, 1);
+    b.put(0, 3);
+    b.put(0, 1);
+    // The main image: no color cache, meta codes in blocks of 4 pixels.
+    b.put(0, 1);
+    b.put(1, 1);
+    b.put(0, 3);
+    // Its entropy image, 4 × 1: a color cache of 2 entries.
+    b.put(1, 1);
+    b.put(1, 4);
+    // Green: literal 5, a length-1 reference and the two cache entries.
+    let mut green = vec![0u32; 282];
+    for s in [5, 256, 280, 281] {
+        green[s] = 2;
+    }
+    let codes = canonical_codes(&green);
+    normal(&mut b, &green);
+    for s in [0, 0, 0, 1] {
+        simple1(&mut b, s);
+    }
+    // Meta code 5 (as green): a literal, a copy of it (distance code 2 is the
+    // pixel to the left), the cache entry it went to, and a literal again.
+    let hashed = (0x1e35_a7bdu32.wrapping_mul(0x0000_0500) >> 31) as usize;
+    b.code(codes[5]);
+    b.code(codes[256]);
+    b.code(codes[280 + hashed]);
+    b.code(codes[5]);
+    // Six groups, each of one-symbol codes: the image is green 10 + its group.
+    for g in 0..6 {
+        for s in [10 + g, 0, 0, 0, 0] {
+            simple1(&mut b, s);
+        }
+    }
+    let mut data = b.done();
+    data.extend_from_slice(&[0; 8]);
+    let webp = webp_simple(&data);
+    let need = vp8l::need(vp8l_of(&webp), None, u64::MAX).unwrap();
+    // Six groups' vector, the cache, the code of four symbols and the entropy image.
+    assert!(need >= 8 * 280 + 8, "{need}");
+    let px = read_back(&webp).unwrap().0;
+    assert_eq!(px.data, [0, 15, 0].repeat(16));
+}
+
+#[test]
+fn webps_made_by_image_webp_are_read_as_before() {
+    for (w, h, ch) in [(1, 1, 3), (23, 17, 4), (300, 7, 3), (64, 64, 4)] {
+        let p = pattern(w, h, ch);
+        let webp = encode(&p, Format::Webp, 85).unwrap();
+        let need = vp8l::need(vp8l_of(&webp), None, u64::MAX).unwrap();
+        assert!(need < 1 << 20, "{need}");
+        assert_eq!(read_back(&webp).unwrap().0, p);
+    }
+}
+
+/// An ALPH chunk compressed losslessly, and an animation's first frame,
+/// are read the same way.
+#[test]
+fn lossless_alpha_and_frames_are_counted_too() {
+    // An ALPH chunk's bitstream has no header: the bomb's, without it.
+    let bomb = vp8l_groups(65_536, 1, 1, false);
+    let bits = vp8l_of(&bomb);
+    let mut headless = BitWriter::default();
+    // Its first 40 bits are the header; the rest is copied over, shifted.
+    for i in 40..bits.len() * 8 {
+        headless.put((bits[i / 8] >> (i % 8)) as u32 & 1, 1);
+    }
+    let mut alph = vec![1u8];
+    alph.extend_from_slice(&headless.done());
+    let still = webp_x(1, 1, 0x10, &[(b"ALPH", alph, None), (b"VP8 ", vp8_declaring(1, 1), None)]);
+    let (src, _, _) = probe(still).unwrap();
+    assert_eq!(src.lossless.len(), 1);
+    assert_eq!(decode(&src, 128 << 20).unwrap_err(), OVER_MEMORY);
+    // The first frame of an animation, lossless.
+    let mut frame = vec![0u8; 16];
+    riff(&mut frame, b"VP8L", bits, None);
+    let anim = webp_x(1, 1, 0x02, &[(b"ANIM", vec![0; 6], None), (b"ANMF", frame, None)]);
+    let (src, _, _) = probe(anim).unwrap();
+    assert_eq!(src.lossless.len(), 1);
+    assert_eq!(decode(&src, 128 << 20).unwrap_err(), OVER_MEMORY);
+}
+
+/// A lossy bitstream whose partitions are declared past its end: image-webp
+/// allocates a declared size (up to 16 MB) before it finds that out.
+#[test]
+fn lossy_partitions_declared_past_the_end_are_counted() {
+    let mut d = vp8_declaring(16, 16);
+    // A first partition of 4 bytes, then a table of 1 size: 16 MB.
+    d[..3].copy_from_slice(&[4 << 5, 0, 0]);
+    d.truncate(10);
+    d.extend_from_slice(&[0; 4]);
+    d.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+    assert_eq!(vp8_overshoot(&d), 0xFF_FFFF);
+    let mut body = b"WEBP".to_vec();
+    riff(&mut body, b"VP8 ", &d, None);
+    let mut webp = b"RIFF".to_vec();
+    webp.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    webp.extend_from_slice(&body);
+    let (src, _, _) = probe(webp).unwrap();
+    assert!(src.need >= 0xFF_FFFF, "{}", src.need);
+    // A first partition past the end: its size.
+    let mut first = vp8_declaring(16, 16);
+    first[0] = 0xE0;
+    first[1] = 0xFF;
+    first[2] = 0xFF;
+    assert_eq!(vp8_overshoot(&first), 0x7_FFFF);
+    // One that is there: nothing.
+    assert_eq!(vp8_overshoot(&vp8_declaring(16, 16)), 0);
+}
+
+/// Reads the WebPs of `PHV_WEBP_DIR` (made by libwebp, for instance) and
+/// checks that every one image-webp decodes is read here too.
+#[test]
+#[ignore]
+fn lossless_webps_of_a_folder_are_read_as_image_webp_reads_them() {
+    let dir = std::env::var("PHV_WEBP_DIR").expect("PHV_WEBP_DIR");
+    let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+    files.sort();
+    for f in files {
+        let bytes = std::fs::read(&f).unwrap();
+        let Ok((src, w, h)) = probe(bytes) else { continue };
+        let start = std::time::Instant::now();
+        let needs: Vec<_> =
+            src.lossless.iter().map(|(r, size)| vp8l::need(&src.bytes[r.clone()], *size, u64::MAX)).collect();
+        let took = start.elapsed();
+        let decoded = decode(&src, BIG);
+        eprintln!(
+            "{:<32} {w}×{h} {:?} in {:?}: {}",
+            f.file_name().unwrap().to_string_lossy(),
+            needs,
+            took,
+            if decoded.is_ok() { "decoded" } else { "not decoded" }
+        );
+        if decoded.is_ok() {
+            assert!(needs.iter().all(|n| n.is_ok()), "{f:?}");
+        }
+    }
 }

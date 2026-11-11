@@ -103,6 +103,8 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
+          python3 packaging/test_licenses.py
+          python3 bench/test_compare_php.py
           python3 packaging/licenses.py x86_64-unknown-linux-musl notices.txt
           grep -q "^  moxcms " notices.txt
       - name: Website samples match the compiler

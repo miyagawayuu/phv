@@ -182,43 +182,90 @@ fn session_conn(spec: &DatabaseSpec, ns: Option<&str>) -> Result<(SessionConn, I
     Ok((conn, until, t))
 }
 
-#[derive(Default)]
-pub struct OAuthClaims(std::collections::BTreeMap<String, i64>);
-const OAUTH_CLAIMS_PER_SHARD: usize = 512;
-// Leave time for callbacks already in progress and small clock differences
-// between servers. The callback still refuses states past their own expiry.
-const OAUTH_CLAIM_GRACE: i64 = 30;
+// ----- Claims of OAuth states (R22-25, redesigned after the 20th assessment) --
+//
+// `OAuth::callback()` records the state it finishes before it exchanges the
+// code, so that a state is used once even when a stale whole-session save
+// brings back the list of sign-ins in progress. A claim is a record of its
+// own, named by a digest of the site, the provider and the state (not of the
+// session: `regenerate()` moves a stale list to a new id, R23-9), and kept
+// until its own expiry, measured by the store's clock (R23-27). Nothing is
+// shared between sessions, so no visitor can use room another needs: one
+// session holds at most `OAUTH_CLAIMS_PER_SESSION` live claims, and only that
+// session is refused past it (found by the 20th assessment, R23-2: 64 shards
+// of 512 claims shared by every session let one visitor fill them all and
+// refuse every sign-in of the site for ten minutes). Expired claims are
+// removed (R23-26): Redis expires its keys, the SQL stores and the file
+// store remove them as they sweep sessions, the memory store with the
+// session or at its next claim.
 
-fn oauth_now(now: i64) -> i64 {
-    now.max(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
+/// How many live claims one session may hold: four times the sign-ins it may
+/// have started at once.
+pub const OAUTH_CLAIMS_PER_SESSION: usize = crate::oauth::PENDING_MAX * 4;
+
+/// How long a claim is kept past the state's own expiry: for callbacks
+/// already in progress, and clocks of servers a little apart.
+pub const OAUTH_CLAIM_GRACE: i64 = 30;
+
+/// The longest a claim is kept: a state lives `PENDING_TTL`, then the grace.
+pub const OAUTH_CLAIM_LIFETIME: i64 = crate::oauth::PENDING_TTL + OAUTH_CLAIM_GRACE;
+
+/// How long the claim of a state that expires at `expires` is kept, counted
+/// from `now` (both on the clock of the server that finishes the sign-in, so
+/// a store counts it from its own clock, whatever the server's), or None when
+/// the state has expired.
+pub fn oauth_claim_ttl(now: i64, expires: i64) -> Option<i64> {
+    let left = expires.checked_sub(now).filter(|&left| left > 0)?;
+    Some(left.min(crate::oauth::PENDING_TTL) + OAUTH_CLAIM_GRACE)
 }
 
+/// The live claims of one session (digests and Unix expiry times): the memory
+/// store keeps them with the session, the file store in a record of the
+/// session's own (`<session key>.s`).
+#[derive(Default, Clone, Debug)]
+pub struct OAuthClaims(Vec<(String, i64)>);
+
 impl OAuthClaims {
-    pub fn claim(&mut self, digest: &str, now: i64, expires: i64) -> bool {
-        let now = oauth_now(now);
-        self.0.retain(|_, expiry| *expiry > now.saturating_sub(OAUTH_CLAIM_GRACE));
-        if expires <= now || self.0.len() >= OAUTH_CLAIMS_PER_SHARD || self.0.contains_key(digest) {
+    /// Records `digest` for `ttl` seconds from `now`. False when the session
+    /// holds it already, or holds `OAUTH_CLAIMS_PER_SESSION` live claims;
+    /// expired claims are dropped first.
+    pub fn claim(&mut self, digest: &str, now: i64, ttl: i64) -> bool {
+        self.prune(now);
+        if ttl <= 0 || self.0.len() >= OAUTH_CLAIMS_PER_SESSION || self.0.iter().any(|(d, _)| d == digest) {
             return false;
         }
-        self.0.insert(digest.to_string(), expires);
+        self.0.push((digest.to_string(), now.saturating_add(ttl)));
         true
     }
 
+    /// Drops the claims that expired by `now`.
+    pub fn prune(&mut self, now: i64) {
+        self.0.retain(|&(_, expiry)| expiry > now);
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Reads a record `encode` wrote: lines of a digest (64 hex digits) and
+    /// an expiry, at most `OAUTH_CLAIMS_PER_SESSION` of them.
     pub fn decode(text: &str) -> Result<Self, &'static str> {
+        let invalid = "invalid OAuth claim record";
         let mut claims = Self::default();
         for line in text.lines() {
-            let invalid = "invalid OAuth claim record";
             let (key, expiry) = line.split_once(' ').ok_or(invalid)?;
             if key.len() != 64
                 || !key.bytes().all(|b| b.is_ascii_hexdigit())
-                || claims.0.len() >= OAUTH_CLAIMS_PER_SHARD
+                || claims.0.len() >= OAUTH_CLAIMS_PER_SESSION
+                || claims.0.iter().any(|(d, _)| d == key)
             {
                 return Err(invalid);
             }
-            let expiry = expiry.parse().map_err(|_| invalid)?;
-            if claims.0.insert(key.to_string(), expiry).is_some() {
-                return Err(invalid);
-            }
+            claims.0.push((key.to_string(), expiry.parse().map_err(|_| invalid)?));
         }
         Ok(claims)
     }
@@ -233,161 +280,216 @@ impl OAuthClaims {
     }
 }
 
+/// The claim of a state: kept for ARGV[2] seconds by the server's clock, and
+/// noted in the session's claims (a sorted set by expiry, which expires with
+/// its last claim). Refused when the session is gone, holds ARGV[3] live
+/// claims, or the state was claimed. KEYS: the claim, the session's claims,
+/// the session. 1 if claimed.
 static REDIS_OAUTH_CLAIM: LazyLock<LuaScript> = LazyLock::new(|| {
     LuaScript::new(
         r#"
-local now = math.max(tonumber(redis.call('TIME')[1]), tonumber(ARGV[2]))
-local expires = tonumber(ARGV[3])
-local grace = tonumber(ARGV[5])
-if expires <= now or redis.call('EXISTS', KEYS[2]) == 0 then return 0 end
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - grace)
-if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[4]) then return 0 end
-local added = redis.call('ZADD', KEYS[1], 'NX', expires, ARGV[1])
-if added == 1 then
-    local last = redis.call('ZRANGE', KEYS[1], -1, -1, 'WITHSCORES')
-    redis.call('EXPIREAT', KEYS[1], tonumber(last[2]) + grace)
-end
-return added
+local now = tonumber(redis.call('TIME')[1])
+local ttl, cap = tonumber(ARGV[2]), tonumber(ARGV[3])
+if ttl <= 0 or redis.call('EXISTS', KEYS[3]) == 0 then return 0 end
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
+if redis.call('ZCARD', KEYS[2]) >= cap then return 0 end
+if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ttl) then return 0 end
+redis.call('ZADD', KEYS[2], now + ttl, ARGV[1])
+local last = redis.call('ZRANGE', KEYS[2], -1, -1, 'WITHSCORES')
+redis.call('EXPIREAT', KEYS[2], tonumber(last[2]))
+return 1
 "#,
     )
 });
 
-/// Claims a state in one of 64 bounded shards for the site. The records live
-/// separately from session data, so a stale session save cannot undo a claim.
+/// The SQL stores' claims, of every site (the digests name the site): the
+/// digest, the session's key and the expiry by the database's clock.
+const OAUTH_CLAIMS_TABLE: &str = "phv_oauth_claims";
+const PG_OAUTH_CLAIMS_CREATE: &str = "CREATE TABLE IF NOT EXISTS phv_oauth_claims \
+    (id varchar(64) PRIMARY KEY, sid varchar(64) NOT NULL, expires bigint NOT NULL); \
+    CREATE INDEX IF NOT EXISTS phv_oauth_claims_sid ON phv_oauth_claims (sid, expires); \
+    CREATE INDEX IF NOT EXISTS phv_oauth_claims_expires ON phv_oauth_claims (expires)";
+const MY_OAUTH_CLAIMS_CREATE: &str = "CREATE TABLE IF NOT EXISTS phv_oauth_claims \
+    (id varchar(64) PRIMARY KEY, sid varchar(64) NOT NULL, expires bigint NOT NULL, \
+    INDEX phv_oauth_claims_sid (sid, expires), INDEX phv_oauth_claims_expires (expires))";
+/// The database's clock, in Unix seconds.
+const PG_NOW: &str = "floor(extract(epoch from clock_timestamp()))::bigint";
+const MY_NOW: &str = "UNIX_TIMESTAMP()";
+
+/// Claims the state of `digest` for the session stored under `session`, kept
+/// `ttl` seconds by the store's clock (`oauth_claim_ttl`). False when the
+/// session is gone, already holds `OAUTH_CLAIMS_PER_SESSION` live claims, or
+/// the state was claimed (by any session). The claims live apart from session
+/// data, so a stale session save cannot undo one.
 pub fn session_claim_oauth(
     spec: &DatabaseSpec,
     ns: Option<&str>,
     session: &str,
     digest: &str,
-    now: i64,
-    expires: i64,
+    ttl: i64,
 ) -> Result<bool, String> {
-    let shard = session.get(..2).and_then(|s| u8::from_str_radix(s, 16).ok()).ok_or("invalid session key")? % 64;
+    if ttl <= 0 || ttl > OAUTH_CLAIM_LIFETIME {
+        return Ok(false);
+    }
     let (mut conn, until, sessions) = session_conn(spec, ns)?;
+    let cap = OAUTH_CLAIMS_PER_SESSION as i64;
     if let SessionConn::Redis(c) = &mut conn {
-        let key = format!("{}oauth:{shard}", redis_sessions_prefix(ns));
+        let prefix = redis_sessions_prefix(ns);
+        let claim = format!("{prefix}oauth:c:{digest}");
+        let mine = format!("{prefix}oauth:s:{session}");
         let session = redis_session_key(session);
-        let now = now.to_string();
-        let expires = expires.to_string();
-        let cap = OAUTH_CLAIMS_PER_SHARD.to_string();
-        let grace = OAUTH_CLAIM_GRACE.to_string();
+        let (ttl, cap) = (ttl.to_string(), cap.to_string());
         let args = [
-            b"2".as_slice(),
-            key.as_bytes(),
+            b"3".as_slice(),
+            claim.as_bytes(),
+            mine.as_bytes(),
             session.as_bytes(),
             digest.as_bytes(),
-            now.as_bytes(),
-            expires.as_bytes(),
+            ttl.as_bytes(),
             cap.as_bytes(),
-            grace.as_bytes(),
         ];
         return match redis_script(c, &REDIS_OAUTH_CLAIM, &args, until)? {
             Reply::Int(n) => Ok(n == 1),
             _ => Err("the server sent an invalid reply".into()),
         };
     }
-
-    // A versioned update serializes competing claims without holding a SQL
-    // transaction across decoding. Each write also checks the session.
-    const TABLE: &str = "phv_oauth_states";
-    const CREATE: &str = "CREATE TABLE IF NOT EXISTS phv_oauth_states \
-        (id varchar(64) PRIMARY KEY, version bigint NOT NULL, data text NOT NULL)";
-    let key = crate::sha256_hex(format!("{sessions}:{shard}").as_bytes());
-    let made = format!("{}|{TABLE}", spec.url.as_deref().unwrap_or_default());
-    let create = !lock(&SESSION_TABLES).contains(&made);
-    if create {
+    let made = format!("{}|{OAUTH_CLAIMS_TABLE}", spec.url.as_deref().unwrap_or_default());
+    if !lock(&SESSION_TABLES).contains(&made) {
         match &mut conn {
-            SessionConn::Pg(c) => c.get().store_create(CREATE).map_err(|e| pg_message(&e))?,
+            SessionConn::Pg(c) => c.get().store_create(PG_OAUTH_CLAIMS_CREATE).map_err(|e| pg_message(&e))?,
             SessionConn::My(c) => {
                 use mysql::prelude::Queryable;
                 let w = c.get().watch();
-                c.get().conn.query_drop(CREATE).map_err(|e| w.msg(e))?;
+                c.get().conn.query_drop(MY_OAUTH_CLAIMS_CREATE).map_err(|e| w.msg(e))?;
             }
             SessionConn::Redis(_) => unreachable!(),
         }
         lock(&SESSION_TABLES).insert(made);
     }
-    for _ in 0..8 {
-        if Instant::now() >= until {
-            break;
-        }
-        let read = format!("SELECT version, data FROM {TABLE} WHERE id =");
-        let row: Option<(i64, String)> = match &mut conn {
-            SessionConn::Pg(c) => c
-                .get()
-                .query_kept(&format!("{read} $1"), &[&key])
-                .and_then(|rows| rows.first().map(|r| Ok((r.try_get(0)?, r.try_get(1)?))).transpose())
-                .map_err(|e| pg_message(&e))?,
-            SessionConn::My(c) => {
-                use mysql::prelude::Queryable;
-                let w = c.get().watch();
-                c.get().conn.exec_first(format!("{read} ?"), (&key,)).map_err(|e| w.msg(e))?
-            }
-            SessionConn::Redis(_) => unreachable!(),
-        };
-        let (version, mut claims) = match row {
-            Some((version, text)) => (Some(version), OAuthClaims::decode(&text)?),
-            None => (None, OAuthClaims::default()),
-        };
-        if !claims.claim(digest, now, expires) {
-            return Ok(false);
-        }
-        let data = claims.encode();
-        let written = match &mut conn {
-            SessionConn::Pg(c) => {
-                let conn = c.get();
-                match version {
-                    Some(version) => conn.execute_kept(
-                        &format!(
-                            "UPDATE {TABLE} SET version = version + 1, data = $1 \
-                        WHERE id = $2 AND version = $3 AND EXISTS (SELECT 1 FROM {sessions} WHERE id = $4)"
-                        ),
-                        &[&data, &key, &version, &session],
-                    ),
-                    None => conn.execute_kept(
-                        &format!(
-                            "INSERT INTO {TABLE} (id, version, data) SELECT $1, 1, $2 \
-                        WHERE EXISTS (SELECT 1 FROM {sessions} WHERE id = $3) ON CONFLICT (id) DO NOTHING"
-                        ),
-                        &[&key, &data, &session],
-                    ),
+    // One transaction: the session's row, locked, serializes its claims, so
+    // the count is exact; a state claimed meanwhile by another session is
+    // found by its key. Each statement reads what was committed before it
+    // (READ COMMITTED), so after the lock it counts the session's claims made
+    // by the transactions that held the lock before.
+    let hex = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    if !hex(session) || !hex(digest) {
+        return Ok(false);
+    }
+    let add = |now: &str| {
+        format!(
+            "INSERT INTO {OAUTH_CLAIMS_TABLE} (id, sid, expires) SELECT '{digest}', '{session}', {now} + {ttl} \
+             FROM {sessions} WHERE id = '{session}' AND (SELECT count(*) FROM {OAUTH_CLAIMS_TABLE} \
+             WHERE sid = '{session}' AND expires > {now}) < {cap}"
+        )
+    };
+    match &mut conn {
+        SessionConn::Pg(c) => {
+            // In one round trip (the values are hex digits and numbers).
+            use tokio_postgres::SimpleQueryMessage;
+            let conn = c.get();
+            let text = format!(
+                "{}; BEGIN ISOLATION LEVEL READ COMMITTED; SELECT 1 FROM {sessions} WHERE id = '{session}' FOR UPDATE; \
+                 {} ON CONFLICT (id) DO NOTHING; COMMIT",
+                conn.store_prelude().unwrap_or_else(|| "SELECT 1".into()),
+                add(PG_NOW)
+            );
+            match conn.client.run(None, conn.client.client().simple_query(&text)) {
+                Ok(messages) => {
+                    let done: Vec<u64> = messages
+                        .iter()
+                        .filter_map(|m| match m {
+                            SimpleQueryMessage::CommandComplete(n) => Some(*n),
+                            _ => None,
+                        })
+                        .collect();
+                    // SET, BEGIN, SELECT, INSERT, COMMIT.
+                    Ok(done.len() == 5 && done[3] == 1)
                 }
-                .map_err(|e| pg_message(&e))?
-                    > 0
+                Err(e) => {
+                    let _ = conn.client.batch_execute("ROLLBACK");
+                    Err(pg_message(&e))
+                }
+            }
+        }
+        SessionConn::My(c) => {
+            use mysql::prelude::Queryable;
+            let w = c.get().watch();
+            let conn = &mut c.get().conn;
+            let run = |conn: &mut mysql::Conn| -> Result<bool, mysql::Error> {
+                conn.query_drop("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")?;
+                conn.query_drop("START TRANSACTION")?;
+                conn.query_drop(format!("SELECT 1 FROM {sessions} WHERE id = '{session}' FOR UPDATE"))?;
+                match conn.query_drop(add(MY_NOW)) {
+                    Ok(()) => Ok(conn.affected_rows() == 1),
+                    Err(mysql::Error::MySqlError(e)) if e.code == 1062 => Ok(false),
+                    Err(e) => Err(e),
+                }
+            };
+            let claimed = run(conn);
+            let end = conn.query_drop(if matches!(claimed, Ok(true)) { "COMMIT" } else { "ROLLBACK" });
+            claimed.and_then(|claimed| end.map(|()| claimed)).map_err(|e| w.msg(e))
+        }
+        SessionConn::Redis(_) => unreachable!(),
+    }
+}
+
+/// Removes the claims of the SQL stores that expired (of every site), in
+/// bounded batches. Redis expires its claims itself.
+fn sweep_oauth_claims(conn: &mut SessionConn) -> Result<(), String> {
+    let batch = SHARED_SWEEP_BATCH;
+    for _ in 0..SHARED_SWEEP_PASSES {
+        let gone = match conn {
+            SessionConn::Redis(_) => return Ok(()),
+            SessionConn::Pg(c) => {
+                let sql = format!(
+                    "DELETE FROM {OAUTH_CLAIMS_TABLE} WHERE id IN \
+                     (SELECT id FROM {OAUTH_CLAIMS_TABLE} WHERE expires <= {PG_NOW} LIMIT $1)"
+                );
+                match c.get().execute_kept(&sql, &[&batch]) {
+                    Err(e) if pg_no_table(&e) => return Ok(()),
+                    r => r.map_err(|e| pg_message(&e))? as i64,
+                }
             }
             SessionConn::My(c) => {
                 use mysql::prelude::Queryable;
                 let w = c.get().watch();
                 let conn = &mut c.get().conn;
-                let result = match version {
-                    Some(version) => conn.exec_drop(
-                        format!(
-                            "UPDATE {TABLE} SET version = version + 1, data = ? \
-                        WHERE id = ? AND version = ? AND EXISTS (SELECT 1 FROM {sessions} WHERE id = ?)"
-                        ),
-                        (&data, &key, version, session),
-                    ),
-                    None => conn.exec_drop(
-                        format!(
-                            "INSERT INTO {TABLE} (id, version, data) SELECT ?, 1, ? \
-                        WHERE EXISTS (SELECT 1 FROM {sessions} WHERE id = ?)"
-                        ),
-                        (&key, &data, session),
-                    ),
-                };
-                match result {
-                    Ok(()) => conn.affected_rows() > 0,
-                    Err(mysql::Error::MySqlError(e)) if e.code == 1062 => false,
-                    Err(e) => return Err(w.msg(e)),
+                let sql = format!("DELETE FROM {OAUTH_CLAIMS_TABLE} WHERE expires <= {MY_NOW} LIMIT ?");
+                match conn.exec_drop(sql, (batch,)).map_err(|e| w.raw(e)) {
+                    Err(e) if my_no_table(&e) => return Ok(()),
+                    r => r.map_err(|e| my_message(&e))?,
                 }
+                conn.affected_rows() as i64
             }
-            SessionConn::Redis(_) => unreachable!(),
         };
-        if written {
-            return Ok(true);
+        if gone < batch {
+            break;
         }
     }
-    Ok(false)
+    Ok(())
+}
+
+/// What a Redis session store does when it runs out of memory
+/// (`maxmemory-policy`), when it is not `noeviction`: it may then remove
+/// sessions and the claims of finished sign-ins (RC32-01). None for another
+/// store, `noeviction`, or a server that does not allow `CONFIG GET`.
+pub fn session_store_evicts(spec: &DatabaseSpec) -> Option<String> {
+    if !matches!(kind_of(spec.url.as_deref()?), Kind::Redis) {
+        return None;
+    }
+    tls_init();
+    let until = Instant::now() + SESSION_WAIT;
+    let mut c = redis_conn(spec, PoolUse::Sessions, until).ok()?;
+    let reply = redis_run(&mut c, &[b"CONFIG", b"GET", b"maxmemory-policy"], until).ok()?;
+    eviction_policy(&reply)
+}
+
+/// The policy in the answer to `CONFIG GET maxmemory-policy`, unless it is `noeviction`.
+fn eviction_policy(reply: &Reply) -> Option<String> {
+    let Reply::Array(items) = reply else { return None };
+    let Some(Reply::Bulk(value)) = items.get(1) else { return None };
+    let policy = String::from_utf8_lossy(value).trim().to_ascii_lowercase();
+    (!policy.is_empty() && policy != "noeviction").then_some(policy)
 }
 
 /// Whether a statement failed because its table does not exist (the shared
@@ -883,6 +985,7 @@ pub fn session_sweep(spec: &DatabaseSpec, ns: Option<&str>, limits: &SessionLimi
     if t != SESSIONS_SHARED {
         sweep_shared_sessions(&mut conn, old, until)?;
     }
+    sweep_oauth_claims(&mut conn)?;
     // Deleting a tenth at a time until both limits hold (each pass is bounded).
     for _ in 0..20 {
         let (count, bytes): (i64, i64) = match &mut conn {
@@ -1012,4 +1115,223 @@ fn sweep_shared_sessions(conn: &mut SessionConn, old: i64, until: Instant) -> Re
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_holds_a_bounded_number_of_live_claims() {
+        let digest = |i: usize| crate::sha256_hex(format!("claim {i}").as_bytes());
+        let mut claims = OAuthClaims::default();
+        for i in 0..600 {
+            assert_eq!(claims.claim(&digest(i), 1000, 630), i < OAUTH_CLAIMS_PER_SESSION, "claim {i}");
+        }
+        // A claim is refused again, also past the cap.
+        assert!(!claims.claim(&digest(0), 1000, 630));
+        // Expired claims make room.
+        assert!(claims.claim(&digest(700), 1630, 630));
+        assert_eq!(claims.len(), 1);
+        let text = claims.encode();
+        assert_eq!(OAuthClaims::decode(&text).unwrap().encode(), text);
+        let long: String = (0..=OAUTH_CLAIMS_PER_SESSION).map(|i| format!("{} 1\n", digest(i))).collect();
+        assert!(OAuthClaims::decode(&long).is_err());
+        assert!(OAuthClaims::decode(&format!("{0} 1\n{0} 2\n", digest(1))).is_err());
+        assert!(OAuthClaims::decode("../x 1\n").is_err());
+        // Kept past the state's own expiry by the grace, never past a state's life.
+        assert_eq!(oauth_claim_ttl(100, 160), Some(60 + OAUTH_CLAIM_GRACE));
+        assert_eq!(oauth_claim_ttl(100, 100_000), Some(OAUTH_CLAIM_LIFETIME));
+        assert_eq!(oauth_claim_ttl(100, 100), None);
+        assert_eq!(oauth_claim_ttl(i64::MIN, i64::MAX), None);
+    }
+
+    #[test]
+    fn the_eviction_policy_is_read_from_the_answer() {
+        let answer = |p: &str| Reply::Array(vec![Reply::Bulk(b"maxmemory-policy".to_vec()), Reply::Bulk(p.into())]);
+        assert_eq!(eviction_policy(&answer("noeviction")), None);
+        assert_eq!(eviction_policy(&answer("allkeys-lru")).as_deref(), Some("allkeys-lru"));
+        assert_eq!(eviction_policy(&answer("volatile-ttl")).as_deref(), Some("volatile-ttl"));
+        assert_eq!(eviction_policy(&Reply::Array(Vec::new())), None);
+        assert_eq!(eviction_policy(&Reply::Nil), None);
+    }
+
+    /// The servers of the database tests, when set.
+    fn test_servers() -> Vec<(&'static str, DatabaseSpec)> {
+        ["PHV_TEST_REDIS_URL", "PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"]
+            .into_iter()
+            .filter_map(|var| {
+                let url = std::env::var(var).ok().filter(|u| !u.is_empty());
+                if url.is_none() {
+                    eprintln!("skipped: {var} is not set");
+                }
+                Some((var, DatabaseSpec { url: Some(url?), url_env: None, tls: None, pool_size: 4 }))
+            })
+            .collect()
+    }
+
+    /// A session key in the claim shard 0 of 1.3.1 (its first byte is 0, 64,
+    /// 128 or 192).
+    fn key_in_shard_0(i: usize) -> String {
+        format!("{:02x}{}", (i % 4) * 64, crate::random_hex(31))
+    }
+
+    fn limits() -> SessionLimits {
+        SessionLimits {
+            ttl: Duration::from_secs(600),
+            max_lifetime: Duration::from_secs(24 * 3600),
+            max_sessions: 50_000,
+            max_bytes: 256 << 20,
+        }
+    }
+
+    fn live_session(spec: &DatabaseSpec, ns: Option<&str>, key: &str) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let row = SessionRow { data: "{}".into(), created: now, last: now, returned: true };
+        assert!(session_insert(spec, ns, key, &row, &limits()).unwrap());
+    }
+
+    fn new_digest() -> String {
+        crate::sha256_hex(crate::random_hex(16).as_bytes())
+    }
+
+    /// No visitor uses room another needs (R23-2, found by the 20th
+    /// assessment: 512 claims filled a shard that every session of it shared,
+    /// and 64 sessions refused every sign-in of the site). 513 sessions of one
+    /// shard of 1.3.1 claim a state each, one session tries 600, and a fresh
+    /// session of that shard still claims; only the busy session is refused.
+    #[test]
+    fn database_claims_leave_room_for_every_other_session() {
+        let ns = crate::testing::namespace(0x51);
+        let ns = Some(ns.as_str());
+        for (var, spec) in test_servers() {
+            let ttl = OAUTH_CLAIM_LIFETIME;
+            for i in 0..513 {
+                let key = key_in_shard_0(i);
+                live_session(&spec, ns, &key);
+                assert!(session_claim_oauth(&spec, ns, &key, &new_digest(), ttl).unwrap(), "{var}: session {i}");
+            }
+            let busy = key_in_shard_0(0);
+            live_session(&spec, ns, &busy);
+            let used = new_digest();
+            let mut claimed = 0;
+            for i in 0..600 {
+                let digest = if i == 0 { used.clone() } else { new_digest() };
+                claimed += usize::from(session_claim_oauth(&spec, ns, &busy, &digest, ttl).unwrap());
+            }
+            assert_eq!(claimed, OAUTH_CLAIMS_PER_SESSION, "{var}");
+            let fresh = key_in_shard_0(1);
+            live_session(&spec, ns, &fresh);
+            assert!(session_claim_oauth(&spec, ns, &fresh, &new_digest(), ttl).unwrap(), "{var}: the shard was full");
+            // A state is used once, whichever session claims it again.
+            assert!(!session_claim_oauth(&spec, ns, &fresh, &used, ttl).unwrap(), "{var}");
+            // A session that is gone claims nothing; nor does an expired state.
+            assert!(!session_claim_oauth(&spec, ns, &key_in_shard_0(2), &new_digest(), ttl).unwrap(), "{var}");
+            assert!(!session_claim_oauth(&spec, ns, &fresh, &new_digest(), 0).unwrap(), "{var}");
+            // Claims of one session made at once are counted exactly.
+            let burst = key_in_shard_0(3);
+            live_session(&spec, ns, &burst);
+            let claimed: usize = std::thread::scope(|scope| {
+                let tries: Vec<_> = (0..40)
+                    .map(|_| scope.spawn(|| session_claim_oauth(&spec, ns, &burst, &new_digest(), ttl).unwrap()))
+                    .collect();
+                tries.into_iter().map(|t| usize::from(t.join().unwrap())).sum()
+            });
+            assert_eq!(claimed, OAUTH_CLAIMS_PER_SESSION, "{var}: claims at once");
+        }
+    }
+
+    /// How long the claim of `digest` has left by the store's clock (-2: none).
+    fn claim_left(conn: &mut SessionConn, ns: Option<&str>, digest: &str) -> i64 {
+        let until = Instant::now() + Duration::from_secs(5);
+        match conn {
+            SessionConn::Redis(c) => {
+                let k = format!("{}oauth:c:{digest}", redis_sessions_prefix(ns));
+                match redis_run(c, &[b"TTL", k.as_bytes()], until).unwrap() {
+                    Reply::Int(n) => n,
+                    _ => panic!("not a number"),
+                }
+            }
+            SessionConn::Pg(c) => {
+                let sql = format!("SELECT expires - {PG_NOW} FROM {OAUTH_CLAIMS_TABLE} WHERE id = $1");
+                let rows = c.get().query_kept(&sql, &[&digest]).unwrap();
+                rows.first().map_or(-2, |r| r.get::<_, i64>(0))
+            }
+            SessionConn::My(c) => {
+                use mysql::prelude::Queryable;
+                let sql = format!("SELECT expires - {MY_NOW} FROM {OAUTH_CLAIMS_TABLE} WHERE id = ?");
+                c.get().conn.exec_first::<i64, _, _>(sql, (digest,)).unwrap().unwrap_or(-2)
+            }
+        }
+    }
+
+    /// Claims are kept by the store's clock, for the time given, whatever the
+    /// clock of the server that claims (R23-27), and removed when they expire
+    /// (R23-26): Redis expires the keys, the SQL stores' sweep deletes rows.
+    #[test]
+    fn database_claims_expire_by_the_stores_clock_and_are_removed() {
+        let ns = crate::testing::namespace(0x52);
+        let ns = Some(ns.as_str());
+        for (var, spec) in test_servers() {
+            let key = key_in_shard_0(0);
+            live_session(&spec, ns, &key);
+            let (kept, short) = (new_digest(), new_digest());
+            assert!(session_claim_oauth(&spec, ns, &key, &kept, 600).unwrap(), "{var}");
+            assert!(session_claim_oauth(&spec, ns, &key, &short, 31).unwrap(), "{var}");
+            let until = Instant::now() + Duration::from_secs(5);
+            let (mut conn, _, _) = session_conn(&spec, ns).unwrap();
+            let l = claim_left(&mut conn, ns, &kept);
+            assert!((595..=600).contains(&l), "{var}: {l}");
+            let l = claim_left(&mut conn, ns, &short);
+            assert!((26..=31).contains(&l), "{var}: {l}");
+            // Expired, as the store's clock passes it.
+            match &mut conn {
+                SessionConn::Redis(c) => {
+                    let k = format!("{}oauth:c:{short}", redis_sessions_prefix(ns));
+                    redis_run(c, &[b"EXPIRE", k.as_bytes(), b"1"], until).unwrap();
+                    std::thread::sleep(Duration::from_millis(1500));
+                }
+                SessionConn::Pg(c) => {
+                    let sql = format!("UPDATE {OAUTH_CLAIMS_TABLE} SET expires = {PG_NOW} - 1 WHERE id = $1");
+                    c.get().execute_kept(&sql, &[&short]).unwrap();
+                }
+                SessionConn::My(c) => {
+                    use mysql::prelude::Queryable;
+                    let sql = format!("UPDATE {OAUTH_CLAIMS_TABLE} SET expires = {MY_NOW} - 1 WHERE id = ?");
+                    c.get().conn.exec_drop(sql, (&short,)).unwrap();
+                }
+            }
+            session_sweep(&spec, ns, &limits()).unwrap();
+            assert_eq!(claim_left(&mut conn, ns, &short), -2, "{var}: an expired claim was kept");
+            assert!(claim_left(&mut conn, ns, &kept) > 590, "{var}: a live claim was removed");
+            if let SessionConn::Redis(c) = &mut conn {
+                // The session's own count of claims expires with its last claim.
+                let k = format!("{}oauth:s:{key}", redis_sessions_prefix(ns));
+                let Reply::Int(n) = redis_run(c, &[b"TTL", k.as_bytes()], until).unwrap() else { panic!() };
+                assert!((595..=600).contains(&n), "{var}: {n}");
+            }
+        }
+    }
+
+    /// A Redis session store that may evict keys is told at startup (RC32-01).
+    #[test]
+    fn a_redis_store_that_evicts_keys_is_told() {
+        let Some((_, spec)) = test_servers().into_iter().find(|(v, _)| *v == "PHV_TEST_REDIS_URL") else { return };
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut c = redis_conn(&spec, PoolUse::Sessions, until).unwrap();
+        let was = match redis_run(&mut c, &[b"CONFIG", b"GET", b"maxmemory-policy"], until) {
+            Ok(Reply::Array(items)) => match items.get(1) {
+                Some(Reply::Bulk(v)) => v.clone(),
+                _ => panic!("no policy"),
+            },
+            _ => panic!("CONFIG GET failed"),
+        };
+        let mut told = Vec::new();
+        for policy in ["allkeys-lru", "noeviction"] {
+            redis_run(&mut c, &[b"CONFIG", b"SET", b"maxmemory-policy", policy.as_bytes()], until).unwrap();
+            told.push(session_store_evicts(&spec));
+        }
+        redis_run(&mut c, &[b"CONFIG", b"SET", b"maxmemory-policy", &was], until).unwrap();
+        assert_eq!(told, [Some("allkeys-lru".to_string()), None]);
+    }
 }

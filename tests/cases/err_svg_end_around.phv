@@ -1,0 +1,19 @@
+<?phv
+// Inside `<svg>` or `<math>`, browsers that find no element of an end tag's
+// name there act on it by the HTML around the SVG, which may close an element
+// opened before the `<svg>`, and the SVG with it: the `<script/>` after it,
+// read here as SVG (with the nonce), would be an HTML script running the
+// value (found by the 20th assessment, in Chrome and parse5). So would a
+// table part in HTML inside the SVG (in a table cell, a `<td>` closes the
+// cell), and a `<svg>` inside a `<select>` (older browsers ignore it). Every
+// line is an error.
+$v = "x";
+?>
+<a href="/"><svg viewBox="0 0 10 10"><path d="M0 0h10v10z"/></a><script/><text><?= $v ?></text></svg>
+<div class="icon"><svg viewBox="0 0 10 10"><path d="M0 0h10v10z"/></div><style/><text><?= $v ?></text></svg>
+<table><tr><td><svg><path/></td></tr></table><text><?= $v ?></text></svg>
+<template><svg></template><text><?= $v ?></text></svg>
+<ul><li><svg></li><text><?= $v ?></text></svg></ul>
+<div><svg><foreignObject><div><b></div></b></div></foreignObject><text><?= $v ?></text></svg></div>
+<table><tr><td><svg><foreignObject><td>x</td></foreignObject><text><?= $v ?></text></svg></td></tr></table>
+<select name="s"><option>a</option><svg><text><?= $v ?></text></svg></select>

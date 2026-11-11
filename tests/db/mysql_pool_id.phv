@@ -1,0 +1,8 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs under several time limits: the
+// id of the connection the script was given, to tell whether it was a pooled
+// one.
+import std.db.Database;
+
+$db = Database::connect("main");
+echo $db->first(sql"SELECT CONNECTION_ID() AS id")?->int("id") ?? 0;

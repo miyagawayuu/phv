@@ -59,5 +59,29 @@ $l = new Line();
 $l->t = "y";
 $lines->insert($l);
 echo "line key: ", $l->id ?? -1, ", row: ", $db->first(sql"SELECT t FROM phv_orm_log WHERE id = {$l->id}")?->string("t") ?? "", "\n";
+
+// An unsigned AUTO_INCREMENT key past the largest int is an error, not the
+// largest int, which is another row's key (20th audit).
+$db->execute(sql"DROP TABLE phv_orm_keys");
+$db->execute(sql"CREATE TABLE phv_orm_keys (id bigint unsigned PRIMARY KEY AUTO_INCREMENT, body text NOT NULL) AUTO_INCREMENT = 9223372036854775807");
+$db->execute(sql"INSERT INTO phv_orm_keys (body) VALUES ('victim')");
+$big = new Repo<Note>($db);
+$n = new Note();
+$n->body = "mk4";
+try {
+    $big->insert($n);
+    echo "insert(): key ", $n->id ?? -1, "\n";
+} catch (DatabaseError $e) {
+    echo "insert(): ", $e->getMessage(), ", entity key: ", $n->id ?? -1, "\n";
+}
+try {
+    $id = $db->lastInsertId();
+    echo "lastInsertId(): ", $id, "\n";
+} catch (DatabaseError $e) {
+    echo "lastInsertId(): ", $e->getMessage(), "\n";
+}
+foreach ($db->query(sql"SELECT CAST(id AS CHAR) AS id, body FROM phv_orm_keys ORDER BY id") as $r) {
+    echo "  row ", $r->string("id") ?? "", " ", $r->string("body") ?? "", "\n";
+}
 $db->execute(sql"DROP TABLE phv_orm_keys");
 $db->execute(sql"DROP TABLE phv_orm_log");

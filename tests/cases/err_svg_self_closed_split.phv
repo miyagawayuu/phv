@@ -1,0 +1,9 @@
+<?phv
+// `/` and `>` split by a statement still make a self-closing tag: `<svg/>`
+// opens nothing for browsers, so the `<script/>` after it is an HTML script
+// and the value in it is checked as code (found by the 20th assessment: the
+// tracker read an open SVG there, and the escaped string ran in Chrome).
+$v = "document.title='mk1'";
+$wide = true;
+?>
+<svg viewBox="0 0 10 10"/<?phv if ($wide) { } ?>><script/><?= $v ?></script>

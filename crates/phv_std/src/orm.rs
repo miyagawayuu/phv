@@ -56,22 +56,33 @@ pub(crate) fn rolled_back() {
     ROLLBACKS.with(|r| r.set(r.get().wrapping_add(1)));
 }
 
+/// The key of `table`'s writes: its name in lower case. SQLite reads table
+/// names without regard to case, and so does MySQL on Windows and macOS (or
+/// with `lower_case_table_names`), so `users` and `USERS` are one table
+/// (found by the 20th audit: two Repos of one table, named in different
+/// case, did not forget each other's writes). On PostgreSQL a quoted name in
+/// another case is another table, which then only forgets more than it must.
+fn table_key(table: &str) -> String {
+    table.to_ascii_lowercase()
+}
+
 /// What a Repo of `table` compares to know whether it must forget: both
 /// counts only grow, so their sum changes whenever either does.
 fn epoch(table: &str) -> i64 {
-    let writes = WRITES.with(|w| w.borrow().get(table).copied().unwrap_or(0));
+    let writes = WRITES.with(|w| w.borrow().get(&table_key(table)).copied().unwrap_or(0));
     ROLLBACKS.with(|r| r.get()).wrapping_add(writes)
 }
 
 /// Notes a Repo's write to `table`, and returns the epoch after it.
 fn wrote(table: &str) -> i64 {
+    let key = table_key(table);
     WRITES.with(|w| {
         let mut w = w.borrow_mut();
         let full = w.len() >= MAX_TABLES;
-        match w.get_mut(table) {
+        match w.get_mut(&key) {
             Some(n) => *n = n.wrapping_add(1),
             None if !full => {
-                w.insert(table.to_string(), 1);
+                w.insert(key, 1);
             }
             None => rolled_back(),
         }

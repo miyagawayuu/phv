@@ -68,6 +68,13 @@ impl Value {
         Value::Set(Rc::new(s))
     }
 
+    /// Whether it holds a reference (a string, a collection, an object or a
+    /// closure) rather than a scalar or `null`.
+    #[inline]
+    pub fn is_boxed(&self) -> bool {
+        !matches!(self, Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_))
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Null => "null",

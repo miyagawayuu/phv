@@ -65,13 +65,17 @@ struct Entry {
     bytes: usize,
     /// The visitor sent the session's cookie back at least once.
     returned: bool,
+    /// The OAuth states this session used up (see `OAuthStates for Store`).
+    claims: phv_std::OAuthClaims,
 }
+
+/// What one claim of the memory store is counted as in a session's `bytes`.
+const CLAIM_BYTES: usize = 128;
 
 struct Inner {
     map: HashMap<String, Entry>,
     bytes: usize,
     requests: u64,
-    oauth: HashMap<usize, phv_std::OAuthClaims>,
 }
 
 pub struct Store {
@@ -85,7 +89,9 @@ pub struct Store {
 
 /// Where sessions are kept when not in memory: files, or a database.
 trait Backend: Send + Sync {
-    fn claim_oauth(&self, id: &str, digest: &str, now: i64, expires: i64) -> std::io::Result<bool>;
+    /// Claims the OAuth state of `digest` for the session `id`, for `ttl`
+    /// seconds from `now` (see `phv_std::session_claim_oauth`).
+    fn claim_oauth(&self, id: &str, digest: &str, now: i64, ttl: i64) -> std::io::Result<bool>;
     /// The session and whether its visitor came back.
     fn read(&self, id: &str) -> Option<(Record, bool)>;
     /// Stores a session under a new id; false if the id is taken.
@@ -168,6 +174,16 @@ impl Stored {
     }
 }
 
+/// The startup warning for a Redis session store whose `maxmemory-policy`
+/// is `policy` (not `noeviction`).
+fn eviction_warning(policy: &str) -> String {
+    format!(
+        "warning: the Redis session store may evict keys when its memory is full (maxmemory-policy is {policy}): \
+         sessions, and the records that keep a finished OAuth sign-in from being used again, can be lost; \
+         set maxmemory-policy to noeviction"
+    )
+}
+
 /// Sessions in a database of `[databases]`: Redis keeps them under
 /// `phv:session:<hash>`, expires them itself (a session whose visitor has not
 /// come back after an hour) and keeps within `MAX_SESSIONS` and `MAX_BYTES` as
@@ -224,8 +240,9 @@ impl DbStore {
 }
 
 impl Backend for DbStore {
-    fn claim_oauth(&self, id: &str, digest: &str, now: i64, expires: i64) -> std::io::Result<bool> {
-        self.seen(phv_std::session_claim_oauth(&self.spec, self.ns(), &self.key(id), digest, now, expires))
+    /// Kept `ttl` seconds by the database's clock, whatever this server's says (R23-27).
+    fn claim_oauth(&self, id: &str, digest: &str, _now: i64, ttl: i64) -> std::io::Result<bool> {
+        self.seen(phv_std::session_claim_oauth(&self.spec, self.ns(), &self.key(id), digest, ttl))
             .map_err(std::io::Error::other)
     }
 
@@ -355,6 +372,24 @@ struct FileStore {
 /// How many locks the sessions of a file store are spread over.
 const LOCK_STRIPES: usize = 64;
 
+/// The directory of the file store's OAuth claims, in the session directory.
+const CLAIMS_DIR: &str = ".phv-oauth";
+
+/// A file of `CLAIMS_DIR`: a claim (`<digest>.c`) or a session's count of
+/// them (`<session key>.s`).
+fn is_claim_file(name: &str) -> bool {
+    name.strip_suffix(".c")
+        .or_else(|| name.strip_suffix(".s"))
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A claim shard of 1.3.1 (`.phv-oauth-<2 hex>.claims`), no longer used.
+fn is_old_claims_file(name: &str) -> bool {
+    name.strip_prefix(".phv-oauth-")
+        .and_then(|n| n.strip_suffix(".claims"))
+        .is_some_and(|n| n.len() == 2 && n.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// The lock of the session whose key (`session_key`), or whose file name,
 /// starts with `hash`: the first two hex digits of the key pick it.
 fn stripe_of(hash: &str) -> Option<usize> {
@@ -414,32 +449,40 @@ fn is_session_file(name: &str) -> bool {
 }
 
 impl Backend for FileStore {
-    fn claim_oauth(&self, id: &str, digest: &str, now: i64, expires: i64) -> std::io::Result<bool> {
-        let shard = stripe_of(&session_key(id)).expect("session hash");
-        let _held = self.lock_stripe(shard)?;
+    /// A claim is the empty file `<digest>.c` in `.phv-oauth/` (made under
+    /// the lock of the digest, so one process makes it), and the session's
+    /// live claims are counted in `<session key>.s` there (under the
+    /// session's lock). Both locks are held, the lower first. The sweep
+    /// removes both once older than any claim lives.
+    fn claim_oauth(&self, id: &str, digest: &str, now: i64, ttl: i64) -> std::io::Result<bool> {
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(false);
+        }
+        let key = session_key(id);
+        let mine = stripe_of(&key).expect("session hash");
+        let its = stripe_of(digest).expect("claim digest");
+        let _first = self.lock_stripe(mine.min(its))?;
+        let _second = if mine != its { Some(self.lock_stripe(mine.max(its))?) } else { None };
         let dir = self.open_dir()?;
         if !Self::exists(&dir, id, true) && !Self::exists(&dir, id, false) {
             return Ok(false);
         }
-        let name = format!(".phv-oauth-{shard:02x}.claims");
-        let path = OsStr::new(&name);
         let fail = |e: safefs::FsError| std::io::Error::other(format!("{e:?}"));
-        let mut claims = if dir.exists(path).map_err(fail)? {
-            let file = dir.open(path, false).map_err(fail)?;
-            let mut text = String::new();
-            file.take(64 * 1024 + 1).read_to_string(&mut text)?;
-            if text.len() > 64 * 1024 {
-                return Err(std::io::Error::other("invalid OAuth claim record"));
-            }
-            phv_std::OAuthClaims::decode(&text).map_err(std::io::Error::other)?
-        } else {
-            phv_std::OAuthClaims::default()
+        dir.make_dir(OsStr::new(CLAIMS_DIR)).map_err(fail)?;
+        let (claims_dir, _) = safefs::open_parent(&self.dir, &Path::new(CLAIMS_DIR).join("x")).map_err(fail)?;
+        let record = format!("{key}.s");
+        let mut claims = match Self::read_text(&claims_dir, OsStr::new(&record)) {
+            Ok(text) => phv_std::OAuthClaims::decode(&text).map_err(std::io::Error::other)?,
+            Err(safefs::FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => phv_std::OAuthClaims::default(),
+            Err(e) => return Err(fail(e)),
         };
-        if !claims.claim(digest, now, expires) {
+        let claim = format!("{digest}.c");
+        if !claims.claim(digest, now, ttl) || claims_dir.exists(OsStr::new(&claim)).map_err(fail)? {
             return Ok(false);
         }
-        let text = claims.encode();
-        Self::write_atomic(&dir, &name, &text, || {})?;
+        // The claim first: should the count fail after it, the state stays used.
+        claims_dir.open(OsStr::new(&claim), true).map_err(fail)?;
+        Self::write_atomic(&claims_dir, &record, &claims.encode(), || {})?;
         Ok(true)
     }
 
@@ -675,12 +718,18 @@ impl FileStore {
         self.written.store(0, Ordering::Relaxed);
         let Ok(rd) = std::fs::read_dir(&self.dir) else { return };
         let limit = SystemTime::now() - ttl.min(MAX_LIFETIME);
+        // Every claim of a file older than this has expired (R23-26).
+        let claims_limit = SystemTime::now() - Duration::from_secs(phv_std::OAUTH_CLAIM_LIFETIME as u64 + 1);
         let mut live: Vec<(bool, SystemTime, u64, PathBuf)> = Vec::new();
         let mut expired = Vec::new();
+        let mut claims = Vec::new();
         for e in rd.flatten() {
             let Ok(meta) = e.metadata() else { continue };
             let name = e.file_name().to_string_lossy().into_owned();
             let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+            if meta.is_file() && is_old_claims_file(&name) && modified < claims_limit {
+                claims.push((e.path(), Doomed::Before(claims_limit)));
+            }
             if !meta.is_file() || !is_session_file(&name) {
                 continue;
             }
@@ -692,6 +741,18 @@ impl FileStore {
             }
         }
         self.remove_doomed(expired);
+        let claims_dir = self.dir.join(CLAIMS_DIR);
+        let real_dir = std::fs::symlink_metadata(&claims_dir).is_ok_and(|m| m.is_dir());
+        if let Some(Ok(rd)) = real_dir.then(|| std::fs::read_dir(&claims_dir)) {
+            for e in rd.flatten() {
+                let Ok(meta) = e.metadata() else { continue };
+                let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+                if meta.is_file() && is_claim_file(&e.file_name().to_string_lossy()) && modified < claims_limit {
+                    claims.push((e.path(), Doomed::Before(claims_limit)));
+                }
+            }
+        }
+        self.remove_doomed(claims);
         let mut bytes: u64 = live.iter().map(|l| l.2).sum();
         if live.len() <= self.max_sessions && bytes <= self.max_bytes {
             return;
@@ -766,20 +827,30 @@ enum Doomed {
     Unchanged(SystemTime),
 }
 
+/// The claims of used OAuth states (R22-25; see `phv_std::session_claim_oauth`
+/// for the rules). The memory store keeps a session's claims with the
+/// session, counted in its size: they go when the session goes, since no
+/// request can bring back a session that is gone, and `regenerate()` takes
+/// them to the new id with the values (R23-9), all under the store's lock.
+/// So they are bounded by the store's limits, and no session uses room
+/// another needs (R23-2).
 impl phv_vm::OAuthStates for Store {
     fn claim(&self, session: &str, digest: &str, now: i64, expires: i64) -> bool {
-        if !valid_id(session) || expires <= now {
+        let Some(ttl) = phv_std::oauth_claim_ttl(now, expires) else { return false };
+        if !valid_id(session) {
             return false;
         }
         if let Some(backend) = &self.files {
-            return backend.claim_oauth(session, digest, now, expires).unwrap_or(false);
+            return backend.claim_oauth(session, digest, now, ttl).unwrap_or(false);
         }
         let mut inner = self.inner();
-        if !inner.map.get(session).is_some_and(|entry| self.alive(entry)) {
-            return false;
-        }
-        let shard = stripe_of(&session_key(session)).expect("session hash");
-        inner.oauth.entry(shard).or_default().claim(digest, now, expires)
+        let Some(entry) = inner.map.get_mut(session).filter(|entry| self.alive(entry)) else { return false };
+        let before = entry.claims.len();
+        let claimed = entry.claims.claim(digest, now, ttl);
+        let after = entry.claims.len();
+        entry.bytes = (entry.bytes + after * CLAIM_BYTES).saturating_sub(before * CLAIM_BYTES);
+        inner.bytes = (inner.bytes + after * CLAIM_BYTES).saturating_sub(before * CLAIM_BYTES);
+        claimed
     }
 }
 
@@ -798,7 +869,7 @@ impl Store {
             ttl,
             cookie: if secure { "__Host-PHVSESSID" } else { "PHVSESSID" },
             secure,
-            inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, requests: 0, oauth: HashMap::new() }),
+            inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, requests: 0 }),
             files,
         }
     }
@@ -812,6 +883,15 @@ impl Store {
         namespace: Option<String>,
     ) -> Store {
         let mut store = Store::new(ttl, secure, None);
+        // A Redis that evicts keys when full can drop sessions, and the
+        // claims that keep a used sign-in from being finished again (RC32-01).
+        // Told once at startup, without holding it up.
+        let check = spec.clone();
+        let _ = std::thread::Builder::new().name("phv-session-check".into()).spawn(move || {
+            if let Some(policy) = phv_std::session_store_evicts(&check) {
+                eprintln!("{}", eviction_warning(&policy));
+            }
+        });
         let limits = phv_std::SessionLimits {
             ttl,
             max_lifetime: MAX_LIFETIME,
@@ -964,6 +1044,7 @@ impl Store {
         };
         let mut created = Instant::now();
         let mut returned = false;
+        let mut claims = phv_std::OAuthClaims::default();
         if let Some(old) = &s.id {
             // Gone meanwhile (logged out, regenerated or expired by another
             // request): saving would bring it back for whoever holds the old id.
@@ -971,15 +1052,20 @@ impl Store {
             inner.bytes = inner.bytes.saturating_sub(e.bytes);
             created = e.created;
             returned = e.returned;
+            // The store's claims, never the request's: a stale save keeps them.
+            claims = e.claims;
+            if !claims.is_empty() {
+                claims.prune(now_secs() as i64);
+            }
         }
         let values = s.values.into_shared();
-        let bytes = size(&values);
+        let bytes = size(&values) + claims.len() * CLAIM_BYTES;
         if inner.map.len() >= MAX_SESSIONS || inner.bytes + bytes > MAX_BYTES {
             self.evict(&mut inner, bytes);
         }
         let issue_cookie = s.id.as_deref() != Some(new_id.as_str());
         inner.bytes += bytes;
-        inner.map.insert(new_id.clone(), Entry { values, created, last: Instant::now(), bytes, returned });
+        inner.map.insert(new_id.clone(), Entry { values, created, last: Instant::now(), bytes, returned, claims });
         issue_cookie.then(|| self.cookie_for(Some(&new_id)))
     }
 
@@ -2276,6 +2362,190 @@ mod tests {
         assert!(again.save(s).unwrap().contains("Max-Age=0"));
         assert!(again.load(Some(&header2)).id.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A new session of the store, with a value; its id.
+    fn claim_session(store: &Store) -> String {
+        let mut s = SessionData { changed: true, ..SessionData::default() };
+        s.values.insert("user".into(), "ann".into());
+        id_of(&store.save(s).unwrap())
+    }
+
+    /// Claims of other sessions never use room a session needs (R23-2,
+    /// found by the 20th assessment: every session of a claim shard shared
+    /// its 512 claims, so one visitor filled a shard with 512 sign-ins and 64
+    /// sessions refused every sign-in of the site). The memory store takes
+    /// 64 × 512 + 1 sessions with a claim each (every shard of 1.3.1 full,
+    /// and one more), the file store 513 sessions of one shard of 1.3.1; one
+    /// session then tries 600 claims, of which only its own
+    /// `OAUTH_CLAIMS_PER_SESSION` are taken, and a fresh session of that
+    /// shard still claims.
+    #[test]
+    fn claims_of_other_sessions_leave_room_for_a_new_one() {
+        use phv_vm::OAuthStates;
+
+        let dir = std::env::temp_dir().join(format!("phv-oauth-room-{}", phv_std::random_hex(8)));
+        let now = now_secs() as i64;
+        let digest = || phv_std::sha256_hex(phv_std::random_hex(16).as_bytes());
+        for (files, flood) in [(false, 64 * 512 + 1), (true, 513)] {
+            let store = Store::new(Duration::from_secs(600), false, files.then(|| dir.clone()));
+            // A session of the shard 0 of 1.3.1 for the file store (whose
+            // sessions can be written under a chosen id), any for the memory store.
+            let new_session = || -> String {
+                let Some(files) = &store.files else { return claim_session(&store) };
+                loop {
+                    let id = phv_std::random_hex(32);
+                    if stripe_of(&session_key(&id)) == Some(0) {
+                        let r = Record { created: now as u64, last: now as u64, values: Stored::Map(IndexMap::new()) };
+                        assert!(files.insert(&id, &r, true).unwrap());
+                        return id;
+                    }
+                }
+            };
+            for i in 0..flood {
+                assert!(store.claim(&new_session(), &digest(), now, now + 600), "files {files}: session {i}");
+            }
+            let busy = new_session();
+            let used = digest();
+            let claimed = (0..600)
+                .filter(|&i| store.claim(&busy, &if i == 0 { used.clone() } else { digest() }, now, now + 600))
+                .count();
+            assert_eq!(claimed, phv_std::OAUTH_CLAIMS_PER_SESSION, "files {files}");
+            assert!(!store.claim(&busy, &used, now, now + 600), "files {files}: a state was used twice");
+            let fresh = new_session();
+            assert!(store.claim(&fresh, &digest(), now, now + 600), "files {files}: a fresh session was refused");
+            if files {
+                // The file store's claims are the site's: another session cannot take one again.
+                assert!(!store.claim(&fresh, &used, now, now + 600));
+            }
+            // An expired state, and a session that is gone, claim nothing.
+            assert!(!store.claim(&fresh, &digest(), now, now));
+            assert!(!store.claim(&phv_std::random_hex(32), &digest(), now, now + 600), "files {files}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A state used by the callback stays used when a page that read the
+    /// session before the callback regenerates it and writes back the old
+    /// list of sign-ins under a new id (R23-9, found by the 20th assessment:
+    /// the claim named the old id, and the callback URL worked again). In
+    /// every store; the databases of `PHV_TEST_*_URL` when set.
+    #[test]
+    fn a_used_state_stays_used_when_a_stale_save_regenerates_the_session() {
+        use phv_vm::OAuthStates;
+
+        let _one_at_a_time = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("phv-oauth-regen-{}", phv_std::random_hex(8)));
+        let mut stores = vec![
+            ("memory", Store::new(Duration::from_secs(60), false, None)),
+            ("files", Store::new(Duration::from_secs(60), false, Some(dir.clone()))),
+        ];
+        for var in ["PHV_TEST_REDIS_URL", "PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL"] {
+            if let Some(url) = std::env::var(var).ok().filter(|u| !u.is_empty()) {
+                let spec = phv_vm::DatabaseSpec { url: Some(url), url_env: None, tls: None, pool_size: 2 };
+                let ns = Some(phv_std::testing::namespace(0x46));
+                stores.push((var, Store::with_database(Duration::from_secs(60), false, spec, Arc::default(), ns)));
+            }
+        }
+        let now = now_secs() as i64;
+        for (name, store) in &stores {
+            let id = claim_session(store);
+            let header = format!("PHVSESSID={id}");
+            // A slow page reads the session, the callback uses the state...
+            let mut stale = store.load(Some(&header));
+            let digest = phv_std::sha256_hex(phv_std::random_hex(16).as_bytes());
+            assert!(store.claim(&id, &digest, now, now + 600), "{name}");
+            // ...and the page regenerates the session and writes back what it read.
+            stale.regenerate = true;
+            stale.changed = true;
+            stale.values.insert("user".into(), "bob".into());
+            let moved = id_of(&store.save(stale).expect("regenerated"));
+            assert_ne!(moved, id);
+            assert!(!store.claim(&moved, &digest, now, now + 600), "{name}: the used state was claimed again");
+            let other = phv_std::sha256_hex(phv_std::random_hex(16).as_bytes());
+            assert!(store.claim(&moved, &other, now, now + 600), "{name}");
+            // A save of the session as a page read it keeps the claims too.
+            let mut later = store.load(Some(&format!("PHVSESSID={moved}")));
+            later.changed = true;
+            later.values.insert("seen".into(), "1".into());
+            store.save(later);
+            assert!(!store.claim(&moved, &other, now, now + 600), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Expired claims are removed (R23-26): the memory store's when the
+    /// session is saved or goes, the file store's by the sweep, with the
+    /// claim shards 1.3.1 left; live ones stay.
+    #[test]
+    fn expired_claims_are_removed() {
+        use phv_vm::OAuthStates;
+
+        let now = now_secs() as i64;
+        let digest = || phv_std::sha256_hex(phv_std::random_hex(16).as_bytes());
+        // Memory: a claim made 700 s ago has expired by the next save.
+        let store = Store::new(Duration::from_secs(600), false, None);
+        let id = claim_session(&store);
+        let base = store.inner().bytes;
+        assert!(store.claim(&id, &digest(), now - 700, now - 100));
+        assert_eq!(store.inner().bytes, base + CLAIM_BYTES);
+        // The next claim drops it.
+        assert!(store.claim(&id, &digest(), now, now + 600));
+        assert_eq!(store.inner().bytes, base + CLAIM_BYTES);
+        assert!(store.claim(&id, &digest(), now - 700, now - 100));
+        let mut s = store.load(Some(&format!("PHVSESSID={id}")));
+        s.changed = true;
+        s.values.insert("seen".into(), "1".into());
+        store.save(s);
+        let (kept, bytes) = {
+            let inner = store.inner();
+            (inner.map[&id].claims.len(), inner.map[&id].bytes)
+        };
+        assert_eq!(kept, 1);
+        assert_eq!(bytes, size(&store.inner().map[&id].values) + CLAIM_BYTES);
+        let mut s = store.load(Some(&format!("PHVSESSID={id}")));
+        s.destroyed = true;
+        store.save(s);
+        assert_eq!(store.inner().bytes, 0, "the claims went with the session");
+
+        // Files: claims and counts older than any claim lives go at the sweep.
+        let dir = std::env::temp_dir().join(format!("phv-oauth-sweep-{}", phv_std::random_hex(8)));
+        let mut store = Store::new(Duration::from_secs(600), false, Some(dir.clone()));
+        let (old, young) = (claim_session(&store), claim_session(&store));
+        let (old_claim, young_claim) = (digest(), digest());
+        assert!(store.claim(&old, &old_claim, now, now + 600));
+        assert!(store.claim(&young, &young_claim, now, now + 600));
+        std::fs::write(dir.join(".phv-oauth-2a.claims"), format!("{} 1\n", digest())).unwrap();
+        let long_ago = SystemTime::now() - Duration::from_secs(phv_std::OAUTH_CLAIM_LIFETIME as u64 + 60);
+        let claims = dir.join(CLAIMS_DIR);
+        for path in [
+            claims.join(format!("{old_claim}.c")),
+            claims.join(format!("{}.s", session_key(&old))),
+            dir.join(".phv-oauth-2a.claims"),
+        ] {
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(long_ago).unwrap();
+        }
+        let files = store.files.as_mut().unwrap();
+        files.file_store().unwrap().swept.store(0, Ordering::Relaxed);
+        files.sweep(Duration::from_secs(600));
+        let mut left: Vec<String> = std::fs::read_dir(&claims)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let mut want = vec![format!("{young_claim}.c"), format!("{}.s", session_key(&young))];
+        want.sort();
+        assert_eq!(left, want);
+        assert!(!dir.join(".phv-oauth-2a.claims").exists(), "a claim shard of 1.3.1 was kept");
+        assert!(!store.claim(&young, &young_claim, now, now + 600), "a live claim was removed");
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_eviction_warning_names_the_policy_and_the_fix() {
+        let w = eviction_warning("allkeys-lru");
+        assert!(w.starts_with("warning: ") && w.contains("allkeys-lru") && w.contains("noeviction"), "{w}");
     }
 
     #[test]

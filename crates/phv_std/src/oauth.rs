@@ -41,8 +41,8 @@ type R = Result<Value, VmError>;
 /// The session value that holds the sign-ins started and not yet finished.
 const PENDING_KEY: &str = "phv.oauth";
 /// Sign-ins a session may have started at once (several tabs), and for how long.
-const PENDING_MAX: usize = 4;
-const PENDING_TTL: i64 = 600;
+pub(crate) const PENDING_MAX: usize = 4;
+pub(crate) const PENDING_TTL: i64 = 600;
 /// Largest discovery document and token response.
 const MAX_DOC: usize = 256 << 10;
 /// Seconds of clock difference allowed with the provider.
@@ -473,11 +473,19 @@ fn finish(vm: &mut Vm, a: &[Value]) -> R {
     };
     let p = list.remove(i);
     save_pending(vm, &list)?;
+    // An answer with neither a code nor an error is not the provider's: the
+    // state is used up in this session, but nothing is claimed (no code was
+    // exchanged with it, and a page cannot make claims without one).
+    if query(vm, "code").is_none() && query(vm, "error").is_none() {
+        return Ok(error_map("invalid_request", "the provider sent no code"));
+    }
     // Whole-session saves can restore a stale pending list. Claims are kept
-    // separately and shared by all pages that use the same session store.
+    // separately and shared by all pages that use the same session store. The
+    // digest names the state, not the session: `regenerate()` moves a stale
+    // list to a new id, where the state must still be used (R23-9).
     let claimed = vm.http.session.id.as_deref().zip(vm.http.oauth_states.as_deref()).is_some_and(|(id, store)| {
         let site = vm.host.store_namespace.as_deref().unwrap_or("");
-        let digest = crate::sha256_hex(format!("phv-oauth:{site}:{id}:{name}:{}", p.state).as_bytes());
+        let digest = crate::sha256_hex(format!("phv-oauth:{site}:{name}:{}", p.state).as_bytes());
         store.claim(id, &digest, now(), p.started.saturating_add(PENDING_TTL))
     });
     if !claimed {

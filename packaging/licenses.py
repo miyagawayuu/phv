@@ -44,9 +44,25 @@ def licence_files(root: Path) -> list[Path]:
         dirs[:] = sorted(d for d in dirs if d.lower() not in SKIP_DIRS)
         for f in sorted(files):
             low = f.lower()
-            if low.startswith(PREFIXES) and not low.endswith(NOT_TEXT):
+            # A link could point anywhere: only the package's own files count.
+            if low.startswith(PREFIXES) and not low.endswith(NOT_TEXT) and not (Path(path) / f).is_symlink():
                 found.append(Path(path) / f)
     return found
+
+
+def inside(root: Path, relative: str) -> "Path | None":
+    """The file `relative` names in the package at `root`, or None when it is not a
+    file of the package: a link, or a path that leaves the package's folder
+    (`../..`, an absolute path), which a hand-made package's `license_file` could
+    name (20th assessment, R23-23)."""
+    path = root / relative
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if path.is_symlink() or not resolved.is_file() or not resolved.is_relative_to(root.resolve()):
+        return None
+    return path
 
 
 def crates(target: str) -> list[dict]:
@@ -88,8 +104,8 @@ def main() -> int:
         listed.append(f"  {name:<40} {licence}")
         files = licence_files(Path(p["manifest_path"]).parent)
         if p.get("license_file"):
-            extra = Path(p["manifest_path"]).parent / p["license_file"]
-            if extra.is_file() and extra not in files:
+            extra = inside(Path(p["manifest_path"]).parent, p["license_file"])
+            if extra is not None and extra not in files:
                 files.append(extra)
         root = Path(p["manifest_path"]).parent
         note = ""

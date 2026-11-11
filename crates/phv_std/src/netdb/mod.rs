@@ -48,8 +48,9 @@ pub use query_async::{start_query, start_redis};
 pub use ratelimit::{redis_command, redis_pipeline};
 pub(crate) use ratelimit::{redis_hit, redis_reset, redis_value};
 pub use sessions::{
-    session_claim_oauth, session_insert, session_read, session_remove, session_sweep, session_update, OAuthClaims,
-    SessionLimits, SessionRow, SESSIONS_OF_1_1,
+    oauth_claim_ttl, session_claim_oauth, session_insert, session_read, session_remove, session_store_evicts,
+    session_sweep, session_update, OAuthClaims, SessionLimits, SessionRow, OAUTH_CLAIMS_PER_SESSION,
+    OAUTH_CLAIM_LIFETIME, SESSIONS_OF_1_1,
 };
 
 #[cfg(test)]
@@ -65,7 +66,7 @@ use jobs_add::job_add;
 #[cfg(test)]
 use jobs_run::{BETWEEN_ADOPT_PAGES, REDIS_ADOPT_CALLS};
 #[cfg(test)]
-use my::{my_connect, my_statements};
+use my::{io_timeout_fits, my_connect, my_io_limits, my_statements};
 #[cfg(test)]
 use pg::{
     numeric_decode, numeric_encode, pg_connect, pg_text, refused_statement, statement_name, uuid_parse, PgConn, PgText,
@@ -171,6 +172,13 @@ mod tests {
             ("/*! mk1 */ PREPARE TRANSACTION 'x'", Kind::Postgres),
             ("/*!99999 mk1 */ PREPARE TRANSACTION 'x'", Kind::Postgres),
             ("/*! /* mk1 */ */ PREPARE TRANSACTION 'x'", Kind::Postgres),
+            // A vertical tab is a space to MySQL, MariaDB and PostgreSQL 16
+            // (found by the 20th audit), and so is a form feed.
+            ("XA\x0bPREPARE 'x'", Kind::MySql),
+            ("\x0bXA\x0b\x0bPREPARE\x0b'x'", Kind::MySql),
+            ("XA\x0cPREPARE 'x'", Kind::MySql),
+            ("PREPARE\x0bTRANSACTION 'x'", Kind::Postgres),
+            ("LOAD\x0bDATA\x0bLOCAL\x0bINFILE 'f' INTO TABLE t", Kind::MySql),
         ] {
             assert!(refused_statement(text, kind).is_some_and(|why| why.contains("is not allowed")), "{text}");
         }
@@ -226,6 +234,14 @@ mod tests {
             ("UPDATE t SET rollback = 1", Dialect::MySql, false, false),
             ("RELEASE SAVEPOINT s1", Dialect::Sqlite, false, false),
             ("", Dialect::Sqlite, false, false),
+            // A vertical tab is a space (found by the 20th audit).
+            ("ROLLBACK\x0b", Dialect::Postgres, true, true),
+            ("ROLLBACK\x0b", Dialect::MySql, true, true),
+            ("\x0bROLLBACK", Dialect::MySql, true, true),
+            ("COMMIT\x0bWORK", Dialect::MySql, false, true),
+            ("COMMIT\x0bWORK", Dialect::Postgres, false, true),
+            ("XA\x0bROLLBACK 'x'", Dialect::MySql, true, false),
+            ("ROLLBACK\x0bTO\x0bs1", Dialect::Postgres, true, false),
         ] {
             assert_eq!(may_roll_back(text, dialect), rolls_back, "{text} rolls back ({dialect:?})");
             assert_eq!(ends_transaction(text, dialect), ends, "{text} ends a transaction ({dialect:?})");
@@ -270,9 +286,33 @@ mod tests {
             ("DEALLOCATE ALL", PgText::Other),
             ("/* c */ SELECT 1", PgText::Other),
             ("", PgText::Other),
+            // A vertical tab is a space (found by the 20th audit).
+            ("ROLLBACK\x0b", PgText::End),
+            ("\x0bCOMMIT\x0bWORK", PgText::End),
+            ("BEGIN\x0b", PgText::Begin),
+            ("SELECT\x0b*\x0bINTO\x0bt2 FROM t", PgText::Other),
         ] {
             assert_eq!(pg_text(text), kind, "{text}");
         }
+    }
+
+    /// A MySQL connection serves a script whose time limit its socket timeout
+    /// covers, but not one whose limit is much shorter: a server that stops
+    /// answering would hold the page as long as the job that made the
+    /// connection could run (20th audit).
+    #[test]
+    fn a_mysql_connection_serves_time_limits_near_its_own() {
+        // The socket timeout of a connection made for, or needed by, a script of `secs`.
+        let io = |secs: u64| my_io_limits(None, Some(Duration::from_secs(secs))).0;
+        assert!(io_timeout_fits(io(30), io(30)));
+        assert!(io_timeout_fits(io(60), io(30)), "a somewhat longer limit");
+        assert!(!io_timeout_fits(io(1), io(30)), "a shorter limit");
+        assert!(!io_timeout_fits(io(3600), io(30)), "a job's hour");
+        assert!(io_timeout_fits(io(3600), io(3600)));
+        // No time limit: the 300 seconds of a command.
+        let none = my_io_limits(None, None).0;
+        assert!(io_timeout_fits(none, none));
+        assert!(!io_timeout_fits(none, io(30)));
     }
 
     /// The servers of the database tests (see crates/phv_driver/tests/databases.rs), when set.

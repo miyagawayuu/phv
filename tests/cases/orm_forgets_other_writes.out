@@ -3,3 +3,11 @@ entity: mk1, row: mk1
 a->update() after ROLLBACK TO: true
 entity: mk3, row: mk3
 a->update() with nothing changed: false
+a->update() after USERS was written: true
+entity: mk3, row: mk3
+INSERT OR ROLLBACK: UNIQUE constraint failed: users.id
+a->update() after INSERT OR ROLLBACK: true
+entity: mk4, row: mk4
+RAISE(ROLLBACK): no notes
+a->update() after RAISE(ROLLBACK): true
+entity: mk5, row: mk5

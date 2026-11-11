@@ -411,24 +411,39 @@ pub(crate) fn resolve(host: &str, port: u16, until: Instant) -> Result<Vec<Socke
     Ok(addrs.iter().map(|ip| SocketAddr::new(*ip, port)).collect())
 }
 
-/// Whether a connection to `ip:port` reaches the server listening on
+/// Whether a connection to `addr` reaches the server listening on
 /// `listen`: the address it is bound to; an address of this machine when it
 /// is bound to every one; or the unspecified address (`0.0.0.0`, `::`),
 /// which a connection takes as this machine (on Linux, through the loopback).
-pub fn reaches_listener(ip: IpAddr, port: u16, listen: SocketAddr) -> bool {
-    if port != listen.port() {
+/// A link-local IPv6 address is an address of this machine with its scope
+/// (the interface), which `addr` carries (`[fe80::1%eth0]`).
+pub fn reaches_listener(addr: SocketAddr, listen: SocketAddr) -> bool {
+    if addr.port() != listen.port() {
         return false;
     }
-    let ip = ip.to_canonical();
+    let ip = addr.ip().to_canonical();
     let bound = listen.ip().to_canonical();
     ip == bound
         || ip.is_unspecified()
-        || (bound.is_unspecified() && (ip.is_loopback() || is_address_of_this_machine(ip)))
+        || (bound.is_unspecified() && (ip.is_loopback() || is_address_of_this_machine(addr)))
 }
 
-/// Whether `ip` is an address of this machine: a socket can be bound to it.
-fn is_address_of_this_machine(ip: IpAddr) -> bool {
-    std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+/// Whether `addr`'s address is one of this machine: a socket can be bound to
+/// it. An IPv6 address is bound with its scope: Linux refuses a link-local
+/// address without one (20th assessment, R23-33: `[fe80::…%eth0]` on the
+/// server's port was not seen as the server, although it connects to it).
+/// Without the scope too, as before: Windows binds a link-local address
+/// without one, and a connection without one reaches it there.
+fn is_address_of_this_machine(addr: SocketAddr) -> bool {
+    let bind = |a: SocketAddr| std::net::UdpSocket::bind(a).is_ok();
+    match addr {
+        SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_none() => {
+            let ip = *v6.ip();
+            bind(SocketAddr::V6(std::net::SocketAddrV6::new(ip, 0, 0, v6.scope_id())))
+                || (v6.scope_id() != 0 && bind(SocketAddr::new(IpAddr::V6(ip), 0)))
+        }
+        other => bind(SocketAddr::new(other.ip().to_canonical(), 0)),
+    }
 }
 
 /// Connects to `host:port` before `until`, then starts TLS when `tls` is set.
@@ -453,7 +468,7 @@ pub(crate) fn dial_avoiding(
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     let addrs = resolve(bare, port, until)?;
     if let Some(own) = own {
-        if addrs.iter().any(|a| reaches_listener(a.ip(), a.port(), own)) {
+        if addrs.iter().any(|a| reaches_listener(*a, own)) {
             return Err("the address is this server's own: a page cannot call its own server, since it holds a \
                         worker while it waits for one"
                 .into());
@@ -504,6 +519,38 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    /// A link-local IPv6 address is this machine's with its scope (the
+    /// interface): Linux refuses to bind one without it, so `[fe80::…%eth0]`
+    /// on the port of a server bound to `[::]` was not seen as the server
+    /// (20th assessment, R23-33). Checked on this machine's link-local
+    /// addresses where Linux lists them; everywhere, an interface that does
+    /// not exist is not this machine.
+    #[test]
+    fn link_local_addresses_are_this_machine_with_their_scope() {
+        use std::net::{Ipv6Addr, SocketAddrV6};
+        let any: SocketAddr = "[::]:8080".parse().unwrap();
+        let scoped = |ip: Ipv6Addr, scope: u32, port: u16| SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope));
+        let fe80_1: Ipv6Addr = "fe80::1".parse().unwrap();
+        assert!(!reaches_listener(scoped(fe80_1, 0x7fff_fff0, 8080), any), "no such interface");
+        assert!(reaches_listener(scoped(Ipv6Addr::LOCALHOST, 0, 8080), any));
+        assert!(!reaches_listener(scoped(Ipv6Addr::LOCALHOST, 0, 8081), any));
+        let mut seen = 0;
+        for line in std::fs::read_to_string("/proc/net/if_inet6").unwrap_or_default().lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 6 || f[3] != "20" {
+                continue;
+            }
+            let Ok(bits) = u128::from_str_radix(f[0], 16) else { continue };
+            let Ok(index) = u32::from_str_radix(f[1], 16) else { continue };
+            let ip = Ipv6Addr::from(bits);
+            assert!(reaches_listener(scoped(ip, index, 8080), any), "{ip}%{index} ({})", f[5]);
+            // Bound to that very address, with its scope.
+            assert!(reaches_listener(scoped(ip, index, 8080), scoped(ip, index, 8080)));
+            seen += 1;
+        }
+        eprintln!("{seen} link-local addresses checked");
     }
 
     /// Waits until no work is counted in `pending`.

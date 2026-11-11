@@ -705,7 +705,15 @@ struct Session {
     /// The database file the connection has open (none for `:memory:`): the
     /// key of its statements' weights (`cost`).
     file: Option<cost::Database>,
+    /// When the current wait for a lock began, as nanoseconds after `EPOCH`
+    /// (see `wait_for_lock`).
+    waiting_since: AtomicU64,
 }
+
+/// The longest a statement waits for a lock another connection holds (a
+/// write while another connection writes), unless the script's time limit
+/// comes first; it then fails with "database is locked".
+const LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// The instant the sessions' deadlines count from.
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -721,6 +729,7 @@ impl Session {
             deadline: AtomicU64::new(0),
             changes_base: AtomicU64::new(0),
             file,
+            waiting_since: AtomicU64::new(0),
         });
         // SQLite runs one `LIKE` or `GLOB` as a single step, which the progress
         // handler cannot stop (a long text and pattern take minutes): these do.
@@ -752,7 +761,40 @@ impl Session {
             }
             sqlite_authorizer(ctx)
         }))?;
+        // Waits for another connection's lock end at the script's deadline
+        // (it replaces `harden`'s `busy_timeout`; see `wait_for_lock`).
+        let busy = session.clone();
+        c.busy_handler(Some(move |count: i32| busy.wait_for_lock(count)))?;
         Ok(session)
+    }
+
+    /// SQLite's busy handler: whether to try again for a lock another
+    /// connection holds, after sleeping a little (as SQLite's own handler
+    /// does, 1 ms at first and at most 100 ms at a time). It gives up after
+    /// `LOCK_WAIT` in all, and at the script's deadline. SQLite sleeps here
+    /// outside its program's steps, so the progress handler cannot stop the
+    /// wait (found by the 20th audit: with `PRAGMA busy_timeout`, which
+    /// scripts could set, a write waited up to 24 days past the time limit,
+    /// and the 5 seconds of `busy_timeout` ran past a shorter limit).
+    fn wait_for_lock(&self, count: i32) -> bool {
+        const DELAYS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+        let now = Instant::now();
+        let since = if count == 0 {
+            self.waiting_since.store(now.saturating_duration_since(*EPOCH).as_nanos() as u64, Ordering::SeqCst);
+            now
+        } else {
+            *EPOCH + Duration::from_nanos(self.waiting_since.load(Ordering::SeqCst))
+        };
+        let mut left = LOCK_WAIT.saturating_sub(now.saturating_duration_since(since));
+        if let Some(deadline) = self.deadline() {
+            left = left.min(deadline.saturating_duration_since(now));
+        }
+        let step = Duration::from_millis(DELAYS_MS[(count.max(0) as usize).min(DELAYS_MS.len() - 1)]);
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(step.min(left));
+        true
     }
 
     fn set_deadline(&self, deadline: Option<Instant>) {
@@ -1330,7 +1372,9 @@ static HEAP_LIMIT_SET: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// authorizer, `sqlite_authorizer`, is set after the caller's own pragmas).
 pub(crate) fn harden(c: &Connection) -> rusqlite::Result<()> {
     use rusqlite::limits::Limit;
-    c.busy_timeout(Duration::from_secs(5))?;
+    // How long a migration waits for a lock; a script's connection also stops
+    // waiting at its deadline (`Session::wait_for_lock` replaces this).
+    c.busy_timeout(LOCK_WAIT)?;
     // Defensive mode: no writes to the schema or the shadow tables of virtual
     // tables, which could corrupt the database file.
     c.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
@@ -1400,6 +1444,10 @@ pub(crate) fn sqlite_authorizer(ctx: rusqlite::hooks::AuthContext<'_>) -> rusqli
                     "schema_version",
                     "cell_size_check",
                     "trusted_schema",
+                    // It replaces the busy handler, which gives up at the time
+                    // limit, with a wait the time limit cannot stop (found by
+                    // the 20th audit; see `Session::wait_for_lock`).
+                    "busy_timeout",
                 ];
                 if blocked.contains(&name.as_str()) {
                     Authorization::Deny
@@ -1811,9 +1859,13 @@ fn transaction_step_of(vm: &mut Vm, a: &[Value], cmd: &str) -> R {
 /// Runs a script's statement (`query` or `execute`) on any database. A
 /// statement that may roll back writes or ends a transaction (`ROLLBACK`,
 /// `COMMIT` written as SQL) makes std.orm forget what it kept (found by the
-/// 19th audit: only `transaction()` did). On SQLite, inside `transaction()`: a statement is
-/// refused once SQLite ended the transaction (`Ended`), and SQLite is seen
-/// to have ended it when it is back in autocommit mode after a statement.
+/// 19th audit: only `transaction()` did). On SQLite, a statement after which
+/// the connection is back in autocommit mode ended the open transaction,
+/// perhaps by rolling it back (`INSERT OR ROLLBACK`, `RAISE(ROLLBACK)` in a
+/// trigger), whether `transaction()` or the script's own `BEGIN` opened it:
+/// std.orm forgets (found by the 20th audit: only a transaction of
+/// `transaction()` was looked at). Inside `transaction()`, a statement is
+/// refused once SQLite ended the transaction (`Ended`).
 fn statement(vm: &mut Vm, a: &[Value], run: fn(&mut Vm, &[Value]) -> R) -> R {
     // A `COMMIT` too: on PostgreSQL it rolls back a transaction that a failed
     // statement aborted, without an error.
@@ -1826,14 +1878,18 @@ fn statement(vm: &mut Vm, a: &[Value], run: fn(&mut Vm, &[Value]) -> R) -> R {
     if !is_sqlite(vm, &a[0]) {
         return run(vm, a);
     }
-    {
+    let was_open = {
         let db = db_of(vm, &a[0])?;
         if let Some(ended) = db.ended.get().filter(|_| db.depth.get() > 0) {
             return Err(vm.throw("DatabaseError", ended.refused()));
         }
-    }
+        !db.conn().is_autocommit()
+    };
     let r = run(vm, a);
     if let Ok(db) = db_of(vm, &a[0]) {
+        if was_open && db.conn().is_autocommit() && !rolls_back {
+            crate::orm::rolled_back();
+        }
         if db.depth.get() > 0 && db.ended.get().is_none() && db.conn().is_autocommit() {
             db.ended.set(Some(Ended::ByStatement));
             crate::orm::rolled_back();

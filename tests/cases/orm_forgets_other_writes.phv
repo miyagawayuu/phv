@@ -52,3 +52,41 @@ $n = new Note();
 $n->body = "x";
 $notes->insert($n);
 echo "a->update() with nothing changed: ", $a->update($u) ? "true" : "false", "\n";
+
+// Two Repos of one table named in different case (SQLite reads table names
+// without regard to case) forget each other's writes (20th audit).
+#[Table("USERS")]
+class Shouting {
+    public ?int $id = null;
+    public string $name = "";
+}
+$loud = new Repo<Shouting>($db);
+$s = $loud->find($u->id ?? 0) ?? new Shouting();
+$s->name = "loud";
+$loud->update($s);
+echo "a->update() after USERS was written: ", $a->update($u) ? "true" : "false", "\n";
+echo "entity: ", $u->name, ", row: ", $name(), "\n";
+
+// SQLite rolls back the script's own transaction for `INSERT OR ROLLBACK`
+// and `RAISE(ROLLBACK)`, outside transaction() (20th audit).
+$db->execute(sql"BEGIN");
+$u->name = "mk4";
+$a->update($u);
+try {
+    $db->execute(sql"INSERT OR ROLLBACK INTO users VALUES ({$u->id}, 'dup')");
+} catch (DatabaseError $e) {
+    echo "INSERT OR ROLLBACK: ", $e->getMessage(), "\n";
+}
+echo "a->update() after INSERT OR ROLLBACK: ", $a->update($u) ? "true" : "false", "\n";
+echo "entity: ", $u->name, ", row: ", $name(), "\n";
+$db->execute(sql"CREATE TRIGGER no_notes BEFORE INSERT ON notes BEGIN SELECT RAISE(ROLLBACK, 'no notes'); END");
+$db->execute(sql"BEGIN");
+$u->name = "mk5";
+$a->update($u);
+try {
+    $db->execute(sql"INSERT INTO notes (body) VALUES ('y')");
+} catch (DatabaseError $e) {
+    echo "RAISE(ROLLBACK): ", $e->getMessage(), "\n";
+}
+echo "a->update() after RAISE(ROLLBACK): ", $a->update($u) ? "true" : "false", "\n";
+echo "entity: ", $u->name, ", row: ", $name(), "\n";

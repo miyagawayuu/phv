@@ -272,8 +272,9 @@ pub struct HttpCtx {
     pub session: SessionData,
     /// Records a consumed OAuth state in the session store before token exchange.
     pub oauth_states: Option<std::sync::Arc<dyn OAuthStates>>,
-    /// Available image conversion slots, shared by the HTTP server's pages.
-    pub image_slots: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// The HTTP server's image conversion slots, as this page takes them
+    /// (`None` outside the server: `phv run`, jobs).
+    pub image_slots: Option<crate::image_slots::ImageSlotsFor>,
     /// Server secret for CSRF tokens (HMAC key).
     pub csrf_secret: Vec<u8>,
     /// The browser's CSRF cookie, if it sent a valid one.
@@ -1036,6 +1037,12 @@ pub struct Vm {
     prune_gen_regs: bool,
     compact_new_generators: bool,
     gen_register_plans: HashMap<usize, Option<crate::gen_registers::SavedRegisters>>,
+    /// Per function (by id): where `release_list` lists the registers a
+    /// return lets go of (0: not worked out yet, see `release_plan`).
+    release_at: Vec<u32>,
+    /// For each function worked out, its count and then its registers
+    /// (after a 0 at index 0).
+    release_list: Vec<u16>,
     /// The class of generators (`Generator` in the prelude), or `u32::MAX`.
     gen_class: u32,
 }
@@ -1383,6 +1390,8 @@ impl Vm {
             prune_gen_regs: std::env::var_os("PHV_VM_PRUNE_GEN_REGS").is_some_and(|v| v == "1"),
             compact_new_generators: std::env::var_os("PHV_VM_COMPACT_NEW_GENERATORS").is_some_and(|v| v == "1"),
             gen_register_plans: HashMap::new(),
+            release_at: Vec::new(),
+            release_list: vec![0],
             gen_class,
             coverage: None,
             profile: None,
@@ -2142,15 +2151,21 @@ impl Vm {
         let nregs = self.prog.funcs[func].num_regs as usize;
         let mut capacity = nregs;
         if self.prune_gen_regs && (8..=128).contains(&nregs) && self.debug.is_none() && self.profile.is_none() {
-            if !self.gen_register_plans.contains_key(&func) {
+            // The map entry is allowed for first (without room for it the
+            // generator itself does not fit, and creating it fails below).
+            if !self.gen_register_plans.contains_key(&func) && self.reserve(256).is_ok() {
                 let code = &self.prog.funcs[func].code;
                 let yields = code.iter().filter(|ins| matches!(ins, Instr::Yield { .. })).count();
-                // Analysis is optional when memory is tight. Allow for the
-                // mask list and the map entry before creating either one.
-                if self.reserve(yields.saturating_mul(64).saturating_add(256)).is_ok() {
-                    let plan = crate::gen_registers::SavedRegisters::analyze(&self.prog.funcs[func], n);
-                    self.gen_register_plans.insert(func, plan);
-                }
+                // Analysis is optional when memory is tight: without room
+                // for its mask list, the function is remembered as not
+                // pruned, so the analysis is not tried again at every
+                // generator it makes (audit 20).
+                let plan = if self.reserve(yields.saturating_mul(64).saturating_add(256)).is_ok() {
+                    crate::gen_registers::SavedRegisters::analyze(&self.prog.funcs[func], n)
+                } else {
+                    None
+                };
+                self.gen_register_plans.insert(func, plan);
             }
             if let Some(Some(plan)) = self.gen_register_plans.get(&func) {
                 capacity = plan.capacity;
@@ -2183,6 +2198,23 @@ impl Vm {
             self.budget = 1;
         }
         Ok(Value::Object(o))
+    }
+
+    /// Works out which registers of function `fid` a return lets go of (see
+    /// `boxed_registers`), once per function; where they are listed.
+    #[cold]
+    #[inline(never)]
+    fn release_plan(&mut self, fid: usize) -> usize {
+        let f = &self.prog.funcs[fid];
+        let regs = boxed_registers(&self.prog, f).unwrap_or_else(|| (0..f.num_regs).collect());
+        if self.release_at.len() <= fid {
+            self.release_at.resize(self.prog.funcs.len().max(fid + 1), 0);
+        }
+        let at = self.release_list.len();
+        self.release_list.push(regs.len() as u16);
+        self.release_list.extend(regs);
+        self.release_at[fid] = at as u32;
+        at
     }
 
     /// Recognizes the compiler's generator foreach followed by a pure
@@ -3093,6 +3125,32 @@ impl Vm {
                         self.guards.pop();
                     }
                     let fr = self.frames.pop().unwrap();
+                    // The callee's strings, collections, objects and closures
+                    // are let go: a copy left in a dead register (a parameter
+                    // holding the caller's list) kept the caller's value
+                    // shared, so its next change (`$xs[] = ...`, `.=`) copied
+                    // all of it, and a loop calling a helper and growing a
+                    // collection took quadratic time (audit 20). Scalars are
+                    // left: the next call overwrites them, and the type
+                    // checker guarantees registers are written before they
+                    // are read. Only the registers that may hold such a value
+                    // are looked at (none in `fib`, whose registers all hold
+                    // ints; writing every register made it 1.6 times as slow).
+                    // The outermost frame (the script's own) is left: its
+                    // values go when the VM is torn down, after the response
+                    // is sent.
+                    if !self.frames.is_empty() {
+                        let at = match self.release_at.get(fid) {
+                            Some(&at) if at != 0 => at as usize,
+                            _ => self.release_plan(fid),
+                        };
+                        for k in at + 1..=at + self.release_list[at] as usize {
+                            let r = base + self.release_list[k] as usize;
+                            if let Some(v) = self.regs.get_mut(r).filter(|v| v.is_boxed()) {
+                                *v = Value::Null;
+                            }
+                        }
+                    }
                     if fr.gen {
                         // A generator ended: the loop over it goes to its exit.
                         drop(v);
@@ -3104,13 +3162,6 @@ impl Vm {
                         }
                         continue 'frame;
                     }
-                    // The callee's registers are left as they are: the next
-                    // call overwrites them, and the type checker guarantees
-                    // registers are written before they are read. (Clearing
-                    // them here made `fib(30)` in the interpreter 1.6 times
-                    // as slow; the values that matter are emptied where they
-                    // are used: arguments are moved, `Concat` empties its
-                    // operands and a `foreach` its copy of the collection.)
                     if fr.stop {
                         return Ok(v);
                     }
@@ -4054,6 +4105,86 @@ fn short_repr(v: &Value) -> String {
     }
 }
 
+/// The registers of `f` that may hold a string, a collection, an object or
+/// a closure when it returns: its arguments and captures (but those its
+/// native signature makes numbers) and the registers an instruction may put
+/// such a value in. None when it has an instruction not known here
+/// (iterators, generators): all its registers are then looked at.
+fn boxed_registers(prog: &Program, f: &Function) -> Option<Vec<u16>> {
+    use Instr::*;
+    let n = f.num_regs as usize;
+    let mut boxed = vec![false; n];
+    let scalar = |k: Option<&ValKind>| matches!(k, Some(ValKind::Int | ValKind::Bool | ValKind::Float));
+    let sig = f.native.as_ref().filter(|s| s.params.len() == f.num_params as usize);
+    for (i, b) in boxed.iter_mut().enumerate().take(f.num_params as usize) {
+        *b = !scalar(sig.and_then(|s| s.params.get(i)));
+    }
+    let mut mark = |r: Reg| {
+        if let Some(b) = boxed.get_mut(r as usize) {
+            *b = true;
+        }
+    };
+    for ins in &f.code {
+        match ins {
+            Null(_) | Bool(..) | Int(..) | AddI(..) | SubI(..) | MulI(..) | ModI(..) | PowI(..) | NegI(..)
+            | IncI(..) | AddIImm(..) | SubIImm(..) | AddF(..) | SubF(..) | MulF(..) | DivF(..) | ModF(..)
+            | PowF(..) | NegF(..) | BitAnd(..) | BitOr(..) | BitXor(..) | Shl(..) | Shr(..) | BitNot(..) | Not(..)
+            | EqI(..) | LtI(..) | LeI(..) | Eq(..) | Ne(..) | Lt(..) | Le(..) | Cmp(..) | EqF(..) | NeF(..)
+            | LtF(..) | LeF(..) | CmpF(..) | IntToFloat(..) | FloatToInt(..) | InstanceOf(..) | IsType(..) => {}
+            Const(d, c) => {
+                if !matches!(
+                    prog.consts.get(*c as usize),
+                    Some(
+                        crate::bytecode::Const::Int(_)
+                            | crate::bytecode::Const::Bool(_)
+                            | crate::bytecode::Const::Float(_)
+                    )
+                ) {
+                    mark(*d);
+                }
+            }
+            Move(d, _)
+            | ToStr(d, _)
+            | Concat(d, ..)
+            | AppendStr(d, _)
+            | NewObject(d, _)
+            | GetProp(d, ..)
+            | NewList(d, ..)
+            | NewMap(d, ..)
+            | Range(d, ..)
+            | Index(d, ..)
+            | IndexOrNull(d, ..)
+            | EnumCase(d, ..)
+            | EnumCases(d, _)
+            | PopOutHtml(d) => mark(*d),
+            Call { dst, func, .. } => {
+                if !scalar(prog.funcs.get(*func as usize).and_then(|c| c.native.as_ref()).map(|s| &s.ret)) {
+                    mark(*dst);
+                }
+            }
+            CallVirtual { dst, .. }
+            | CallClosure { dst, .. }
+            | CallBuiltin { dst, .. }
+            | CallNamed { dst, .. }
+            | MakeClosure { dst, .. }
+            | EnumFrom { dst, .. } => mark(*dst),
+            TryBegin { exc, .. } => mark(*exc),
+            SetPath(p) | AppendPath { path: p, .. } => {
+                if let PathBase::Local(r) = p.base {
+                    mark(r);
+                }
+            }
+            SetProp(..) | Echo(_) | EchoAttr(_) | EchoHtml(_) | EchoNonce | PushOut | GuardOutput | EndGuard
+            | Cover(_) | Enter | Jump(_) | JumpIfFalse(..) | JumpIfTrue(..) | JumpIfNull(..) | JumpIfNotNull(..)
+            | JumpIfNotLtI(..) | JumpIfNotLeI(..) | JumpIfNotLtIImm(..) | JumpIfNotLeIImm(..) | JumpIfLtIImm(..)
+            | JumpIfLeIImm(..) | JumpIfEq(..) | JumpIfNotEq(..) | Ret(_) | RetNull | Throw(_) | MatchError(_)
+            | TryEnd(_) => {}
+            _ => return None,
+        }
+    }
+    Some((0..n).filter(|r| boxed[*r]).map(|r| r as u16).collect())
+}
+
 #[cfg(test)]
 mod string_ops_tests {
     use super::*;
@@ -4143,6 +4274,69 @@ mod compact_generator_tests {
         assert!(vm.gen_suspend(&gen, 1, 1, 32, 2, 1).is_ok());
         assert_eq!(gen.borrow().fields.len(), G_REGS + 32);
         assert_eq!(gen.borrow().fields.capacity(), capacity);
+    }
+
+    /// A return lets go of the registers that may hold a string, a
+    /// collection, an object or a closure: none of `fib`'s (an int argument,
+    /// ints computed and returned), the list a function makes, its unknown
+    /// arguments; all of them for a function with an iterator.
+    #[test]
+    fn returns_let_go_of_the_registers_that_may_hold_values() {
+        let int = Some(NativeSig { params: vec![ValKind::Int], ret: ValKind::Int });
+        let prog = Program {
+            funcs: vec![Function {
+                num_params: 1,
+                num_regs: 4,
+                native: int.clone(),
+                code: vec![
+                    Instr::SubIImm(1, 0, 1),
+                    Instr::Call { dst: 2, func: 0, args: 1, argc: 1 },
+                    Instr::AddI(3, 1, 2),
+                    Instr::Ret(3),
+                ],
+                ..Function::default()
+            }],
+            consts: vec![crate::bytecode::Const::EmptyList, crate::bytecode::Const::Int(1)],
+            ..Program::default()
+        };
+        assert_eq!(boxed_registers(&prog, &prog.funcs[0]), Some(vec![]));
+        let list = Function {
+            num_params: 1,
+            num_regs: 4,
+            code: vec![Instr::Const(1, 0), Instr::Const(2, 1), Instr::Move(3, 0), Instr::RetNull],
+            ..Function::default()
+        };
+        assert_eq!(boxed_registers(&prog, &list), Some(vec![0, 1, 3]));
+        let iterates =
+            Function { num_regs: 3, code: vec![Instr::IterInit(0, 1), Instr::RetNull], ..Function::default() };
+        assert_eq!(boxed_registers(&prog, &iterates), None);
+    }
+
+    /// `PHV_VM_PRUNE_GEN_REGS=1` with no room for a function's plan: the
+    /// function is remembered as not pruned, so the analysis is not run
+    /// again at every generator it makes (audit 20).
+    #[test]
+    fn a_plan_that_does_not_fit_is_not_tried_again() {
+        let mut prog = Program {
+            funcs: vec![
+                Function { num_regs: 1, ..Function::default() },
+                Function { num_regs: 32, ..Function::default() },
+            ],
+            ..Program::default()
+        };
+        prog.funcs[1].code = vec![Instr::Yield { key: NO_REG, val: 0, from: false, resume: 1 }, Instr::RetNull];
+        let mut vm = Vm::new(Arc::new(prog), Arc::from([]), false, Limits::default());
+        vm.compact_new_generators = false;
+        vm.prune_gen_regs = true;
+        vm.regs.resize(33, Value::Null);
+        vm.frames.push(Frame { func: 0, pc: 0, base: 0, ret: 0, stop: true, gen: false });
+        // Room for the map entry (256 bytes), not for the plan of one yield.
+        vm.limits.max_memory = Some(300);
+        assert!(vm.gen_start(1, 1, 1, 1).is_err(), "the generator does not fit either");
+        assert!(matches!(vm.gen_register_plans.get(&1), Some(None)));
+        vm.limits.max_memory = None;
+        assert!(vm.gen_start(1, 1, 1, 1).is_ok());
+        assert!(matches!(vm.gen_register_plans.get(&1), Some(None)));
     }
 
     #[test]

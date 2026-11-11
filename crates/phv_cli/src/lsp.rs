@@ -1220,6 +1220,8 @@ mod tests {
             );
         }
         bomb += "class K { use A40; }\n";
+        // On disk too: a document the server cannot read is not checked.
+        std::fs::write(p.dir.join("bomb.phv"), &bomb).unwrap();
         let bomb_uri = path_to_uri(&p.dir.join("bomb.phv"));
         let uri = path_to_uri(&p.dir.join("page.phv"));
         let open = |uri: &str, text: &str| {
@@ -1246,6 +1248,58 @@ mod tests {
         assert!(took < Duration::from_secs(10), "took {took:?}");
         let hover = got.iter().find(|m| m["id"] == 1).unwrap();
         assert!(hover["result"]["contents"]["value"].as_str().unwrap_or_default().contains("string"), "{hover}");
+        let checked = got
+            .iter()
+            .find(|m| m["method"] == "textDocument/publishDiagnostics" && m["params"]["uri"] == bomb_uri)
+            .unwrap_or_else(|| panic!("not checked: {got:?}"));
+        assert_eq!(checked["params"]["diagnostics"], json!([]), "{checked}");
+    }
+
+    /// A file whose class gives each of a trait's 40,000 methods an alias
+    /// (2.4 MB) is checked in a moment: with it open, a hover in another file
+    /// is answered within the deadline. Each alias looked through every
+    /// method, and the server answered nothing for 12 s (audit 20).
+    #[test]
+    fn answers_with_many_trait_aliases_open() {
+        let p = Project::new("aliases");
+        let n = 40_000;
+        let methods: String = (0..n).map(|i| format!("public function m{i}(): int {{ return 1; }} ")).collect();
+        let rules: String = (0..n).map(|i| format!("m{i} as a{i}; ")).collect();
+        let big = format!("<?phv\ntrait T {{ {methods}}}\nfinal class C {{ use T {{ {rules}}} }}\n");
+        // On disk too, as a file of a cloned repository would be.
+        std::fs::write(p.dir.join("big.phv"), &big).unwrap();
+        let big_uri = path_to_uri(&p.dir.join("big.phv"));
+        let uri = path_to_uri(&p.dir.join("page.phv"));
+        let open = |uri: &str, text: &str| {
+            notification(
+                "textDocument/didOpen",
+                json!({ "textDocument": { "uri": uri, "languageId": "phv", "version": 0, "text": text } }),
+            )
+        };
+        let msgs = vec![
+            open(&big_uri, &big),
+            open(&uri, "<?phv\n$name = \"x\";\necho $name;\n"),
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "textDocument/hover",
+                "params": { "textDocument": { "uri": uri }, "position": { "line": 2, "character": 6 } },
+            }),
+        ];
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let got = serve_batch(msgs);
+            let _ = tx.send((got, start.elapsed()));
+        });
+        let (got, took) = rx.recv_timeout(Duration::from_secs(60)).expect("no answer in 60 s");
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+        let hover = got.iter().find(|m| m["id"] == 1).unwrap();
+        assert!(hover["result"]["contents"]["value"].as_str().unwrap_or_default().contains("string"), "{hover}");
+        // The large file was checked, and has no errors.
+        let checked = got
+            .iter()
+            .find(|m| m["method"] == "textDocument/publishDiagnostics" && m["params"]["uri"] == big_uri)
+            .unwrap_or_else(|| panic!("not checked: {got:?}"));
+        assert_eq!(checked["params"]["diagnostics"], json!([]), "{checked}");
     }
 
     #[test]

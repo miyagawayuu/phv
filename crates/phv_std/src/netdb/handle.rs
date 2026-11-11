@@ -319,7 +319,16 @@ pub fn last_insert_id(vm: &mut Vm, a: &[Value]) -> R {
             Err(vm
                 .throw("DatabaseError", "PostgreSQL has no last insert id; use `INSERT ... RETURNING id` with first()"))
         }
-        Link::My(c) => Ok(Value::Int(c.get().conn.last_insert_id().try_into().unwrap_or(i64::MAX))),
+        // An unsigned AUTO_INCREMENT key may be past the largest int: it is an
+        // error, not the largest int, which may be another row's key (found
+        // by the 20th audit: std.orm then updated that row).
+        Link::My(c) => {
+            let id = c.get().conn.last_insert_id();
+            match i64::try_from(id) {
+                Ok(id) => Ok(Value::Int(id)),
+                Err(_) => Err(vm.throw("DatabaseError", format!("the last insert id {id} is too large for int"))),
+            }
+        }
         Link::Redis(_) => unreachable!("Redis handle used as a database"),
     }
 }

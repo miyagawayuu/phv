@@ -96,7 +96,8 @@ JIT ありで `runs` 回(既定で 5 回)、JIT なし(`PHV_JIT=0`)で `runs` �
 ## PHV と PHP 8.5 の比較
 
 PHV のリリースバイナリ、Python 3.9 以降、OPcache を読み込んだ PHP 8.5 CLI を使います。
-PHP 8.5 に PATH が通っていない場合は `--php` で実行ファイルを指定します。
+PHP 8.5 に PATH が通っていない場合は `--php` で実行ファイルを指定します。フォルダーを含まない名前(`php`)は
+PATH の絶対パスのフォルダーだけから探し、カレントフォルダーからは探しません。パス(`.\php.exe`)はそのまま使います。
 
 ```powershell
 python bench/compare_php.py --phv .\target\release\phv.exe --php php --output bench/results/php85.json

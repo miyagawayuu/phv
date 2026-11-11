@@ -392,6 +392,10 @@ struct Checked {
     kinds: Vec<Option<Vec<K>>>,
     /// Whether it uses strings or lists, and so needs a register window.
     strings: bool,
+    /// By instruction: the registers it makes a number or a boolean whose
+    /// window slot may still hold a string, list, map or object (see
+    /// `stale_slots`). Native code empties those slots after it.
+    stale: Vec<Vec<Reg>>,
 }
 
 /// The largest function the JIT compiles, in registers and instructions.
@@ -475,7 +479,129 @@ fn well_formed(prog: &Program, f: &Function, ok: &[bool]) -> Option<Checked> {
             }
         }
     }
-    Some(Checked { kinds, strings })
+    let stale = if strings { stale_slots(prog, sig, ok, f, &kinds) } else { vec![Vec::new(); n] };
+    Some(Checked { kinds, strings, stale })
+}
+
+/// The registers each instruction makes a machine number or boolean (in a
+/// machine register, not the window) while their window slot may still hold
+/// a string, list, map or object from earlier. The interpreter's write drops
+/// the old value; native code only defines its machine register, so the
+/// stale copy stayed in the slot and kept the value shared: the next change
+/// (`$o->xs[] = ...`, an element write) copied all of it, and a loop doing
+/// that took quadratic time (audit 20). Found by a forward analysis of
+/// whether each slot may hold such a value (`kinds` gives what each
+/// instruction leaves), so registers that only ever hold numbers cost
+/// nothing. A constant does not count: the unit's cache shares it anyway, so
+/// letting it go gains nothing (a string constant kept in a register before a
+/// loop would otherwise be let go at every pass).
+fn stale_slots(prog: &Program, sig: &NativeSig, ok: &[bool], f: &Function, kinds: &[Option<Vec<K>>]) -> Vec<Vec<Reg>> {
+    let (n, regs) = (f.code.len(), f.num_regs as usize);
+    let words = regs.div_ceil(64);
+    let scalar = |k: K| matches!(k, K::Int | K::Bool | K::Float);
+    // The kinds after instruction `i` and where control goes next.
+    let after = |i: usize, st: &[K]| -> Option<(Vec<K>, Flow)> {
+        let mut st = st.to_vec();
+        let flow = step(prog, sig, ok, &f.code[i], &mut st, &mut true)?;
+        Some((st, flow))
+    };
+    // Whether the slot may hold a boxed value, before each instruction (a bit per register).
+    let mut held: Vec<Option<Vec<u64>>> = vec![None; n];
+    let mut entry = vec![0u64; words];
+    for (r, p) in sig.params.iter().enumerate() {
+        if p.boxed() {
+            entry[r / 64] |= 1 << (r % 64);
+        }
+    }
+    held[0] = Some(entry);
+    let mut work = vec![0usize];
+    while let Some(i) = work.pop() {
+        let (Some(before), Some(mut out)) = (&kinds[i], held[i].clone()) else { continue };
+        let Some((st, flow)) = after(i, before) else { continue };
+        let next = matches!(flow, Flow::Next);
+        let written = writes(&f.code[i]);
+        for (r, k) in st.iter().enumerate() {
+            if k.boxed() {
+                // A new value (a register it writes, or one whose kind it
+                // changed): a constant, or one that may be shared.
+                if written.contains(&Some(r as Reg)) || *k != before[r] {
+                    if matches!(f.code[i], Instr::Const(..)) {
+                        out[r / 64] &= !(1 << (r % 64));
+                    } else {
+                        out[r / 64] |= 1 << (r % 64);
+                    }
+                }
+            } else if next && scalar(*k) {
+                // Emptied after the instruction (see below), or already empty.
+                out[r / 64] &= !(1 << (r % 64));
+            }
+        }
+        let targets = match flow {
+            Flow::Next => [Some(i + 1), None],
+            Flow::Jump(t) => [Some(t as usize), None],
+            Flow::Branch(t) => [Some(i + 1), Some(t as usize)],
+            Flow::Stop => [None, None],
+        };
+        for t in targets.into_iter().flatten().filter(|t| *t < n) {
+            match &mut held[t] {
+                None => {
+                    held[t] = Some(out.clone());
+                    work.push(t);
+                }
+                Some(old) => {
+                    let mut changed = false;
+                    for (o, w) in old.iter_mut().zip(&out) {
+                        if *o | w != *o {
+                            *o |= w;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        work.push(t);
+                    }
+                }
+            }
+        }
+    }
+    let mut stale = vec![Vec::new(); n];
+    for i in 0..n {
+        let (Some(st), Some(before)) = (&kinds[i], &held[i]) else { continue };
+        let Some((st, Flow::Next)) = after(i, st) else { continue };
+        for (r, k) in st.iter().enumerate() {
+            if scalar(*k) && before[r / 64] >> (r % 64) & 1 != 0 {
+                stale[i].push(r as Reg);
+            }
+        }
+    }
+    stale
+}
+
+/// The registers an instruction puts a new string, list, map or object in,
+/// as far as `stale_slots` needs them (others are seen by their kind).
+fn writes(ins: &Instr) -> [Option<Reg>; 2] {
+    use Instr::*;
+    match *ins {
+        Const(d, _)
+        | Move(d, _)
+        | ToStr(d, _)
+        | Concat(d, ..)
+        | AppendStr(d, _)
+        | Index(d, ..)
+        | IndexOrNull(d, ..)
+        | GetProp(d, ..)
+        | NewList(d, ..)
+        | NewMap(d, ..)
+        | Range(d, ..)
+        | NewObject(d, _)
+        | IterInit(d, _) => [Some(d), None],
+        Call { dst, .. } | CallVirtual { dst, .. } | CallBuiltin { dst, .. } => [Some(dst), None],
+        IterNext { key, val, .. } => [Some(key), Some(val)],
+        SetPath(ref p) | AppendPath { path: ref p, .. } => match p.base {
+            PathBase::Local(r) => [Some(r), None],
+            PathBase::Prop(..) => [None, None],
+        },
+        _ => [None, None],
+    }
 }
 
 /// `PHV_JIT_EXPLAIN=1`: says which instruction keeps a function out of the
@@ -2274,6 +2400,16 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.call(H::Put, &[rv, tag, zero]);
     }
 
+    /// Ends instruction `i`, which goes on to `next`: a slot that held a
+    /// string, list, map or object of a register it made a number lets the
+    /// value go (see `stale_slots`), as the interpreter's write does.
+    fn after(&mut self, i: usize, next: u32) {
+        for &r in &self.checked.stale[i] {
+            self.moved_out(r);
+        }
+        self.jump(next);
+    }
+
     /// Fails with the error a helper left in `ctx.error`, if any.
     fn check_ctx(&mut self) {
         let e = self.b.ins().load(I64, self.mf, self.ctx, CTX_ERROR);
@@ -2976,7 +3112,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                     // the call is direct.
                     if let [only] = targets[..] {
                         self.emit_call(only, dst, args, argc, st);
-                        self.jump(next);
+                        self.after(i, next);
                         continue;
                     }
                     let t = self.call_regs(H::VTarget, &[args as i64, slot as i64]).unwrap();
@@ -3274,7 +3410,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                 _ => unreachable!("unsupported instruction reached the JIT"),
             }
             // `well_formed` checked that the last instruction returns.
-            self.jump(next);
+            self.after(i, next);
         }
         for (through, blk) in std::mem::take(&mut self.back_edges) {
             self.b.switch_to_block(through);
@@ -3323,6 +3459,25 @@ mod tests {
             ..Default::default()
         };
         assert!(accepts(&prog));
+    }
+
+    /// A register made a number where it held a list read from a parameter
+    /// lets the list go after the instruction (and only there); one that held
+    /// a constant string does not (audit 20).
+    #[test]
+    fn numbers_written_over_values_empty_their_slots() {
+        let list = ValKind::List(phv_vm::bytecode::Scalar::Int);
+        let f = func(
+            vec![list, I],
+            I,
+            5,
+            vec![Move(2, 0), Index(2, 2, 1), Const(3, 0), Int(3, 1), AddI(4, 2, 3), Int(2, 0), Ret(4)],
+        );
+        let prog = Program { funcs: vec![f], consts: vec![C::Str("a".into())], ..Default::default() };
+        let checked = well_formed(&prog, &prog.funcs[0], &[true]).expect("compiled");
+        let stale: Vec<(usize, Vec<Reg>)> =
+            checked.stale.iter().enumerate().filter(|(_, s)| !s.is_empty()).map(|(i, s)| (i, s.clone())).collect();
+        assert_eq!(stale, vec![(1, vec![2])]);
     }
 
     #[test]

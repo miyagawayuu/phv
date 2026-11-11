@@ -128,8 +128,9 @@ pub fn start_query(vm: &mut Vm, a: &[Value]) -> R {
             let text = render_sql(text, Dialect::MySql);
             check_statement(vm, &text, Kind::MySql)?;
             let params = my_params(params);
+            let limits = (vm.memory_limit(), vm.time_limit());
             crate::asyncio::start(vm, until, pool, move || {
-                let r = my_detached(&spec, &url, &text, params, execute, until, budget);
+                let r = my_detached(&spec, &url, &text, params, execute, until, budget, limits);
                 crate::asyncio::Outcome::Db(r.map_err(|e| format!("{fail}{e}")))
             })
         }
@@ -376,6 +377,9 @@ fn pg_detached(
     Ok(r)
 }
 
+/// Runs a statement in the background on a MySQL connection of its own;
+/// `limits` are the memory and time limits of the script that started it.
+#[allow(clippy::too_many_arguments)]
 fn my_detached(
     spec: &DatabaseSpec,
     url: &str,
@@ -384,12 +388,18 @@ fn my_detached(
     execute: bool,
     until: Instant,
     budget: usize,
+    limits: (Option<usize>, Option<Duration>),
 ) -> Result<Detached, String> {
     use mysql::prelude::Queryable;
     let left = until.saturating_duration_since(Instant::now());
-    let fits = super::my::my_fits(Some(budget * 2), Some(left));
+    // Made with the script's own limits, as `Database::connect` makes its
+    // connections, so that the script's pages can use it afterwards (found
+    // by the 20th audit: made with the time and memory left, it never fit a
+    // page, which closed it). The script's limits cover this statement's.
+    let (memory, time_limit) = limits;
+    let fits = super::my::my_fits(memory, time_limit);
     let mut c = pooled_fitting(&MY_POOLS, spec, url, PoolUse::Scripts, until, fits, |t| {
-        my_connect(url, spec, t, Some(budget * 2), Some(left))
+        my_connect(url, spec, t, memory, time_limit)
     })
     .map_err(|e| detached_error(spec, url, PoolUse::Scripts, e))?;
     let error = |c: &mut Pooled<MyConn>, e: mysql::Error| -> String {

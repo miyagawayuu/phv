@@ -1,0 +1,10 @@
+<?phv
+// HTML inside a `<foreignObject>` is read by browsers in the insertion mode of
+// the HTML around the SVG: in a table cell, a `<td>` closes the cell and the
+// SVG with it, and the page after it, checked as SVG, is HTML (found by the
+// 20th assessment: the `<script/>` after it ran the value in Chrome). `Html`
+// holding a table part stops the page when it is inserted inside SVG or MathML.
+$v = "document.title='mk1'";
+?>
+<table><tr><td><svg viewBox="0 0 10 10"><foreignObject width="10" height="10"><?= render("views/table_cell.phv.html", label: "icon") ?></foreignObject><script/><text><?= $v ?></text></svg></td></tr></table>
+not reached

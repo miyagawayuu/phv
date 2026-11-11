@@ -1,0 +1,3 @@
+<table><tr><td><svg viewBox="0 0 10 10"><foreignObject width="10" height="10">
+--- runtime error ---
+Fatal error: `Html` inserted inside `<svg>` or `<math>` holds `<td>` inside `<svg>` or `<math>`, which browsers read by the HTML around the SVG or MathML (in a table it may close the cell, and the SVG or MathML with it; elsewhere it is ignored): browsers would build the SVG or MathML around it in another way than the page after it was checked; close every element it opens there and no other, write HTML elements only inside a `<foreignObject>` (or `<desc>`, `<title>`, a MathML text element) it opens, or insert it outside the SVG or MathML

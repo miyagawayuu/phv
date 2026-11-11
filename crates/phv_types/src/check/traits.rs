@@ -54,13 +54,48 @@ pub(super) struct TraitMembers<'a> {
 }
 
 impl TraitMembers<'_> {
-    fn has_method(&self, name: &str) -> bool {
-        self.methods.iter().chain(&self.required).any(|m| m.name == name)
-    }
-
     /// How many members it holds (what a copy of it costs).
     fn size(&self) -> usize {
         self.methods.len() + self.required.len() + self.props.len() + self.consts.len()
+    }
+}
+
+/// The methods of the traits a `use` names, by name, for its rules: a rule
+/// finds what it names at once, however many rules and methods there are.
+/// (A scan of the trait's methods per rule made `N` aliases take O(N²):
+/// 40,000 took 13 s to check, and 17 levels of traits that each alias every
+/// method of the one below took 43 s.)
+struct UsedIndex<'u> {
+    /// Where each trait is in `used`.
+    at: HashMap<ClassId, usize>,
+    /// The methods (false) and abstract methods (true) of `used[i]` named
+    /// `n`, by `(i, n)`, as positions in its `methods` and `required`.
+    members: HashMap<(usize, &'u str), Vec<(usize, bool)>>,
+    /// The first two traits of `used` (in order) with a method of the name.
+    owners: HashMap<&'u str, (usize, Option<usize>)>,
+}
+
+impl<'u> UsedIndex<'u> {
+    fn new(used: &'u [(ClassId, Span, TraitMembers<'_>)]) -> UsedIndex<'u> {
+        let mut index = UsedIndex { at: HashMap::new(), members: HashMap::new(), owners: HashMap::new() };
+        for (i, (t, _, m)) in used.iter().enumerate() {
+            index.at.insert(*t, i);
+            let methods = m.methods.iter().enumerate().map(|(j, x)| (j, false, x));
+            let required = m.required.iter().enumerate().map(|(j, x)| (j, true, x));
+            for (j, abs, x) in methods.chain(required) {
+                index.members.entry((i, x.name.as_str())).or_default().push((j, abs));
+                let owners = index.owners.entry(x.name.as_str()).or_insert((i, None));
+                if owners.0 != i && owners.1.is_none() {
+                    owners.1 = Some(i);
+                }
+            }
+        }
+        index
+    }
+
+    /// Whether `used[i]` has a method (or an abstract one) named `name`.
+    fn has_method(&self, i: usize, name: &str) -> bool {
+        self.members.contains_key(&(i, name))
     }
 }
 
@@ -96,22 +131,41 @@ impl<'a> Checker<'a> {
     /// one already reported (the same member checked for another class) is
     /// dropped.
     pub(super) fn note_trait(&mut self, mark: usize, t: ClassId, user: ClassId) {
-        let note = used_by(&self.class_names[t as usize], &self.class_names[user as usize]);
-        let mut i = mark;
-        while i < self.diags.len() {
-            let d = &self.diags[i];
-            let seen = self.diags[..mark]
-                .iter()
-                .any(|e| e.severity == d.severity && e.message == d.message && e.span == d.span);
-            if seen {
-                self.diags.remove(i);
+        if mark >= self.diags.len() {
+            return;
+        }
+        let note = (t != user).then(|| used_by(&self.class_names[t as usize], &self.class_names[user as usize]));
+        self.drop_repeated(mark, note);
+    }
+
+    /// Drops the diagnostics from `mark` on that say what one before `mark`
+    /// says at the same place, and adds `note` to the others (unless they
+    /// name a trait already: the innermost one is named). Linear in the
+    /// diagnostics looked at: a scan of the earlier ones for each made a
+    /// trait whose 40,000 rules each gave an error take 10 s to check
+    /// (audit 20). The earlier ones are indexed as calls reach them, and
+    /// again only when a call looks at a shorter prefix (a call drops only
+    /// diagnostics from its `mark` on, so the index of a prefix no longer
+    /// than that stays right).
+    fn drop_repeated(&mut self, mark: usize, note: Option<String>) {
+        if self.seen_len > mark {
+            self.seen_diags.clear();
+            self.seen_len = 0;
+        }
+        for d in &self.diags[self.seen_len..mark] {
+            self.seen_diags.insert((d.is_error(), d.message.clone(), d.span));
+        }
+        self.seen_len = mark;
+        for mut d in self.diags.split_off(mark) {
+            if self.seen_diags.contains(&(d.is_error(), d.message.clone(), d.span)) {
                 continue;
             }
-            // The innermost trait is named (one used by another is noted once).
-            if t != user && !self.diags[i].notes.iter().any(|n| n.starts_with("in trait `")) {
-                self.diags[i].notes.push(note.clone());
+            if let Some(note) = &note {
+                if !d.notes.iter().any(|n| n.starts_with("in trait `")) {
+                    d.notes.push(note.clone());
+                }
             }
-            i += 1;
+            self.diags.push(d);
         }
     }
 
@@ -213,17 +267,24 @@ impl<'a> Checker<'a> {
         let mut excluded: HashSet<(ClassId, String)> = HashSet::new();
         let mut vis_change: HashMap<(ClassId, String), Visibility> = HashMap::new();
         let mut aliases: Vec<(TraitMethod<'a>, bool, ClassId, Span)> = Vec::new();
+        // Each rule counts as a member copied (an alias makes one), so that
+        // rules repeated along nested traits stop at the limit.
+        let rules: usize = uses.iter().map(|u| u.rules.len()).sum();
+        if rules > 0 && self.over_inherit_limit_at(rules, uses[0].span) {
+            return TraitMembers::default();
+        }
+        let index = UsedIndex::new(&used);
         for u in uses {
             for rule in &u.rules {
                 match rule {
                     ast::TraitRule::Insteadof { from, method, excluded: others, .. } => {
-                        let Some(keep) = self.rule_trait(&used, from) else { continue };
-                        if !used[keep].2.has_method(&method.0) {
+                        let Some(keep) = self.rule_trait(&index, from) else { continue };
+                        if !index.has_method(keep, &method.0) {
                             self.error(format!("trait `{}` has no method `{}`", from.0, method.0), method.1);
                             continue;
                         }
                         for o in others {
-                            let Some(drop) = self.rule_trait(&used, o) else { continue };
+                            let Some(drop) = self.rule_trait(&index, o) else { continue };
                             if drop == keep {
                                 self.error(
                                     format!(
@@ -234,7 +295,7 @@ impl<'a> Checker<'a> {
                                 );
                                 continue;
                             }
-                            if !used[drop].2.has_method(&method.0) {
+                            if !index.has_method(drop, &method.0) {
                                 self.error(format!("trait `{}` has no method `{}`", o.0, method.0), o.1);
                                 continue;
                             }
@@ -244,50 +305,37 @@ impl<'a> Checker<'a> {
                     ast::TraitRule::As { from, method, vis, alias, span } => {
                         let at = match from {
                             Some(f) => {
-                                let Some(i) = self.rule_trait(&used, f) else { continue };
-                                if !used[i].2.has_method(&method.0) {
+                                let Some(i) = self.rule_trait(&index, f) else { continue };
+                                if !index.has_method(i, &method.0) {
                                     self.error(format!("trait `{}` has no method `{}`", f.0, method.0), method.1);
                                     continue;
                                 }
                                 i
                             }
-                            None => {
-                                let hits: Vec<usize> =
-                                    (0..used.len()).filter(|i| used[*i].2.has_method(&method.0)).collect();
-                                match hits.as_slice() {
-                                    [] => {
-                                        self.error(format!("no trait used here has a method `{}`", method.0), method.1);
-                                        continue;
-                                    }
-                                    [i] => *i,
-                                    [a, b, ..] => {
-                                        let (a, b) = (
-                                            self.class_names[used[*a].0 as usize].clone(),
-                                            self.class_names[used[*b].0 as usize].clone(),
-                                        );
-                                        self.error(
-                                            format!("`{}` is a method of both `{a}` and `{b}`", method.0),
-                                            method.1,
-                                        )
-                                        .add_note(format!("name the trait: `{a}::{} as ...;`", method.0));
-                                        continue;
-                                    }
+                            None => match index.owners.get(method.0.as_str()).copied() {
+                                None => {
+                                    self.error(format!("no trait used here has a method `{}`", method.0), method.1);
+                                    continue;
                                 }
-                            }
+                                Some((i, None)) => i,
+                                Some((a, Some(b))) => {
+                                    let (a, b) = (
+                                        self.class_names[used[a].0 as usize].clone(),
+                                        self.class_names[used[b].0 as usize].clone(),
+                                    );
+                                    self.error(format!("`{}` is a method of both `{a}` and `{b}`", method.0), method.1)
+                                        .add_note(format!("name the trait: `{a}::{} as ...;`", method.0));
+                                    continue;
+                                }
+                            },
                         };
                         let t = used[at].0;
                         match alias {
                             Some((a, _)) => {
-                                let found: Vec<(TraitMethod<'a>, bool)> = used[at]
-                                    .2
-                                    .methods
-                                    .iter()
-                                    .map(|m| (m, false))
-                                    .chain(used[at].2.required.iter().map(|m| (m, true)))
-                                    .filter(|(m, _)| m.name == method.0)
-                                    .map(|(m, abs)| (m.clone(), abs))
-                                    .collect();
-                                for (mut m, abs) in found {
+                                let given = &used[at].2;
+                                let found = index.members.get(&(at, method.0.as_str())).map_or(&[][..], |v| &v[..]);
+                                for &(j, abs) in found {
+                                    let mut m = if abs { given.required[j].clone() } else { given.methods[j].clone() };
                                     m.name = a.clone();
                                     m.vis = vis.unwrap_or(m.vis);
                                     aliases.push((m, abs, t, *span));
@@ -304,6 +352,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        drop(index);
         // Every method with the trait it came through and where that is named.
         let mut methods: Vec<(TraitMethod<'a>, ClassId, Span)> = Vec::new();
         let mut out = TraitMembers::default();
@@ -383,9 +432,9 @@ impl<'a> Checker<'a> {
     }
 
     /// The index in `used` of the trait a rule names (`A` in `A::m`).
-    fn rule_trait(&mut self, used: &[(ClassId, Span, TraitMembers<'a>)], name: &(String, Span)) -> Option<usize> {
+    fn rule_trait(&mut self, index: &UsedIndex<'_>, name: &(String, Span)) -> Option<usize> {
         let t = self.class_ref(&name.0, name.1);
-        let found = t.and_then(|t| used.iter().position(|(u, ..)| *u == t));
+        let found = t.and_then(|t| index.at.get(&t).copied());
         if found.is_none() {
             self.error(format!("trait `{}` is not used here", name.0), name.1)
                 .add_note("a rule can name only the traits of this class's `use`");
@@ -627,12 +676,12 @@ impl<'a> Checker<'a> {
     /// abstract method of the class (so a concrete class reports it missing).
     pub(super) fn add_trait_requirements(&mut self, cid: ClassId, required: &[TraitMethod<'a>]) {
         let ci = cid as usize;
-        let mut done: Vec<(&FunctionDecl, &str)> = Vec::new();
+        // Each (declaration, name) once, found at once whatever their number.
+        let mut done: HashSet<(*const FunctionDecl, &str)> = HashSet::new();
         for r in required {
-            if done.iter().any(|(d, n)| std::ptr::eq(*d, r.decl) && *n == r.name) {
+            if !done.insert((r.decl as *const FunctionDecl, &r.name)) {
                 continue;
             }
-            done.push((r.decl, &r.name));
             let m = r.decl;
             let tname = self.class_names[r.origin as usize].clone();
             let fid = self.in_trait(r.origin, &r.subst, m.is_static, cid, |this| {
@@ -693,14 +742,8 @@ impl<'a> Checker<'a> {
                         ));
                     }
                     // Reported once, also when several classes use the trait.
-                    let mut i = mark;
-                    while i < self.diags.len() {
-                        let d = &self.diags[i];
-                        if self.diags[..mark].iter().any(|e| e.message == d.message && e.span == d.span) {
-                            self.diags.remove(i);
-                        } else {
-                            i += 1;
-                        }
+                    if mark < self.diags.len() {
+                        self.drop_repeated(mark, None);
                     }
                 }
                 None => {

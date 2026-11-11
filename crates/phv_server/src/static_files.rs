@@ -218,14 +218,36 @@ pub fn mark_gzip(h: &mut HeaderMap) {
     h.remove("accept-ranges");
 }
 
-/// Adds `Accept-Encoding` to `Vary`.
+/// Adds `name` (`Accept-Encoding`, `Origin`, `Accept-Language`) to `Vary`,
+/// keeping every name of every `Vary` field the response has: a page may send
+/// several (`response()->header()` appends), and one replaced by the server's
+/// lost the page's `Vary: Cookie` (20th assessment, R23-15). The fields become
+/// one, each name once; `*` (varies with everything) stays alone.
 pub fn vary(h: &mut HeaderMap, name: &'static str) {
-    let current = h.get("vary").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    if current.split(',').any(|v| v.trim().eq_ignore_ascii_case(name)) {
+    let fields: Option<Vec<String>> = h.get_all("vary").iter().map(|v| v.to_str().ok().map(str::to_string)).collect();
+    // A field that is not text (obs-text) cannot be merged: the fields are
+    // kept as they are, and the name is added as one more.
+    let Some(fields) = fields else {
+        h.append("vary", HeaderValue::from_static(name));
         return;
+    };
+    let mut names: Vec<String> = Vec::new();
+    for text in &fields {
+        for n in text.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            if !names.iter().any(|m| m.eq_ignore_ascii_case(n)) {
+                names.push(n.to_string());
+            }
+        }
     }
-    let value = if current.is_empty() { name.to_string() } else { format!("{current}, {name}") };
-    if let Ok(v) = HeaderValue::from_str(&value) {
+    let merged = if names.iter().any(|n| n == "*") {
+        "*".to_string()
+    } else {
+        if !names.iter().any(|m| m.eq_ignore_ascii_case(name)) {
+            names.push(name.to_string());
+        }
+        names.join(", ")
+    };
+    if let Ok(v) = HeaderValue::from_str(&merged) {
         h.insert("vary", v);
     }
 }
@@ -254,6 +276,41 @@ mod tests {
         assert_eq!(r("bytes=0-1,5-6"), None);
         assert_eq!(r("items=0-1"), None);
         assert_eq!(r("bytes=x-1"), None);
+    }
+
+    /// Every `Vary` field a page sent is kept when the server adds a name
+    /// (20th assessment, R23-15: only the first was, so `Vary: Cookie` sent
+    /// after `Vary: Origin` was lost).
+    #[test]
+    fn vary_keeps_every_field() {
+        let all = |h: &HeaderMap| h.get_all("vary").iter().map(|v| v.to_str().unwrap().to_string()).collect::<Vec<_>>();
+        let mut h = HeaderMap::new();
+        h.append("vary", HeaderValue::from_static("Origin"));
+        h.append("vary", HeaderValue::from_static("Cookie"));
+        vary(&mut h, "Accept-Encoding");
+        assert_eq!(all(&h), ["Origin, Cookie, Accept-Encoding"]);
+        vary(&mut h, "Accept-Encoding");
+        vary(&mut h, "origin");
+        assert_eq!(all(&h), ["Origin, Cookie, Accept-Encoding"]);
+        let mut h = HeaderMap::new();
+        h.append("vary", HeaderValue::from_static("Cookie, X-A"));
+        h.append("vary", HeaderValue::from_static("x-a ,  , Accept-Language"));
+        vary(&mut h, "Accept-Encoding");
+        assert_eq!(all(&h), ["Cookie, X-A, Accept-Language, Accept-Encoding"]);
+        let mut h = HeaderMap::new();
+        vary(&mut h, "Accept-Encoding");
+        assert_eq!(all(&h), ["Accept-Encoding"]);
+        let mut h = HeaderMap::new();
+        h.append("vary", HeaderValue::from_static("Cookie"));
+        h.append("vary", HeaderValue::from_static("*"));
+        vary(&mut h, "Accept-Encoding");
+        assert_eq!(all(&h), ["*"]);
+        // A field that is not text is left as it is, with the name added.
+        let mut h = HeaderMap::new();
+        h.append("vary", HeaderValue::from_bytes(b"X-\xe9").unwrap());
+        vary(&mut h, "Accept-Encoding");
+        assert_eq!(h.get_all("vary").iter().count(), 2);
+        assert_eq!(h.get_all("vary").iter().nth(1).unwrap(), "Accept-Encoding");
     }
 
     #[test]

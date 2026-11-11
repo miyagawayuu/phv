@@ -124,14 +124,57 @@ fn client_of(ip: IpAddr) -> IpAddr {
 }
 
 /// The admin connection's stream: it marks the connection as having asked
-/// once the end of a request head (`\r\n\r\n`) is read, so a probe whose head
-/// was read and is being parsed is not taken for a silent connection (bytes not
-/// read yet are seen by `Open::silent`'s peek).
+/// once the end of a request head (an empty line after a request line) is
+/// read, so a probe whose head was read and is being parsed is not taken for a
+/// silent connection (bytes not read yet are seen by `Open::silent`'s peek).
+///
+/// Empty lines before the request line do not count: HTTP parsers skip them,
+/// so a connection that sends only `\r\n\r\n` has asked nothing, and taking it
+/// for one that had let 64 of them from 16 addresses keep every probe out
+/// (20th assessment, R23-14).
 struct Marked {
     inner: Arc<tokio::net::TcpStream>,
     asked: Arc<AtomicBool>,
-    /// How many bytes of `\r\n\r\n` the bytes read so far end with.
-    matched: usize,
+    head: HeadEnd,
+}
+
+/// Finds the end of a request head in the bytes read so far: an empty line
+/// (`\r\n` or `\n`, as HTTP/1.1 parsers accept) after a line that holds a byte
+/// other than CR or LF. Leading empty lines are not a head.
+#[derive(Clone, Copy)]
+struct HeadEnd {
+    /// A byte other than CR or LF was read: the request line has begun.
+    started: bool,
+    /// The current line holds nothing but CR so far.
+    line_empty: bool,
+}
+
+impl HeadEnd {
+    fn new() -> Self {
+        HeadEnd { started: false, line_empty: true }
+    }
+
+    /// Reads `bytes`; true when a head ended in them.
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        let mut ended = false;
+        for &b in bytes {
+            match b {
+                b'\n' => {
+                    if self.started && self.line_empty {
+                        ended = true;
+                        self.started = false;
+                    }
+                    self.line_empty = true;
+                }
+                b'\r' => {}
+                _ => {
+                    self.started = true;
+                    self.line_empty = false;
+                }
+            }
+        }
+        ended
+    }
 }
 
 impl tokio::io::AsyncRead for Marked {
@@ -148,24 +191,9 @@ impl tokio::io::AsyncRead for Marked {
                 Err(e) => return Poll::Ready(Err(e)),
             }
         };
-        let read = &buf.initialize_unfilled()[..n];
-        const END: &[u8] = b"\r\n\r\n";
-        let mut m = self.matched;
-        let mut asked = false;
-        for &b in read {
-            m = if b == END[m] {
-                m + 1
-            } else if b == b'\r' {
-                1
-            } else {
-                0
-            };
-            if m == END.len() {
-                asked = true;
-                m = 0;
-            }
-        }
-        self.matched = m;
+        let mut head = self.head;
+        let asked = head.feed(&buf.initialize_unfilled()[..n]);
+        self.head = head;
         if asked {
             self.asked.store(true, Ordering::SeqCst);
         }
@@ -246,7 +274,7 @@ pub(crate) async fn serve(state: Arc<State>, listener: TcpListener, token: Optio
                     .header_read_timeout(ADMIN_HEADER_TIMEOUT)
                     .keep_alive(false)
                     .max_buf_size(16 * 1024);
-                let stream = Marked { inner: stream, asked: marked, matched: 0 };
+                let stream = Marked { inner: stream, asked: marked, head: HeadEnd::new() };
                 let conn = b.serve_connection(TokioIo::new(stream), service);
                 let _ = tokio::time::timeout(Duration::from_secs(30), conn).await;
             });
@@ -314,6 +342,26 @@ async fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Empty lines before a request line are not a request (HTTP parsers skip
+    /// them): a connection sending only `\r\n\r\n` stays silent (20th
+    /// assessment, R23-14). A head ends at an empty line after its first line,
+    /// in one read or split over several, with CRLF or bare LF lines.
+    #[test]
+    fn empty_lines_before_a_request_are_not_a_request() {
+        let ends = |parts: &[&[u8]]| {
+            let mut h = HeadEnd::new();
+            parts.iter().any(|p| h.feed(p))
+        };
+        assert!(!ends(&[b"\r\n\r\n"]));
+        assert!(!ends(&[b"\r\n\r\n\r\n\r\n\n\n\r\r\n"]));
+        assert!(!ends(&[b"\r\n", b"\r\n", b"\r\n\r\n"]));
+        assert!(!ends(&[b"GET /health HTTP/1.1\r\nHost: x\r\n"]));
+        assert!(ends(&[b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n"]));
+        assert!(ends(&[b"\r\n\r\nGET /health HTTP/1.1\r\n\r\n"]));
+        assert!(ends(&[b"GET /health HTTP/1.1\r", b"\n", b"\r", b"\n"]));
+        assert!(ends(&[b"GET /health HTTP/1.1\n\n"]));
+    }
 
     /// A request that waits on a connection is seen through its second
     /// handle before the connection's task reads it, so the connection is not

@@ -15,14 +15,26 @@ Windows x64 のリリースビルドで、オブジェクトを扱うページ�
 
 ### 更新
 
-画像変換は16ワーカーで6枠です。v1.3.0 以前から更新して共有セッションを使う場合は、v1.3.1 で追加された OAuth の使用済み state 記録を全プロセスが使うよう、一斉に切り替えてください。共有ファイルセッションを使う v1.2 の全プロセスは、新版の起動前に停止してください。[v1.3.1 の移行手順](https://github.com/miyagawayuu/phv/releases/tag/v1.3.1)
+- **セッションと OAuth**。共有ストアの使用済み state の記録を、v1.3.1 の 64 区画から state ごとの記録に変えました(1 セッションの有効な記録は 16 件まで)。v1.3.1 の記録(`phv_oauth_states` の表、`.phv-oauth-XX.claims`、`…:oauth:<n>`)は読まないので、サイトの全プロセスを一斉に切り替えてください。表は切り替えの 11 分後に削除できます。Redis の `maxmemory-policy` が `noeviction` 以外なら起動時に警告します。共有ファイルセッションを使う v1.2 の全プロセスは、新版の起動前に停止してください。
+- **SQLite**。`PRAGMA busy_timeout` は拒否します。ロックを待つ書き込みは、5 秒かスクリプトの時間の上限の早いほうで諦めます。同梱の SQLite は 3.54.1 です。
+- **テンプレート**。`<svg>`・`<math>` の中で、その外で開いた要素を閉じる終了タグ、表と文書の部品(`<td>`、`<table>` など)、`<select>` の中の `<svg>`・`<math>`、`/` と `>` の間の文はエラーです。`imagesrcset` は `srcset` と同じく URL のリストとして検査し、アニメーションの `values` には数値だけを入れられます。
+- **応答のヘッダー**。Cookie か Authorization の付いたリクエストへの応答は、ページが `Cache-Control` を設定しない限り、ストリーミングしないページも `private, no-store` になります。ページの `Vary` はすべて残ります。
+- **画像**。変換は空きの枠を到着順に待ちます(16 ワーカーで 6 枠、1 つのアドレスはその半分まで)。復号と符号化のメモリをすべて数えるので、これまで上限をすり抜けていた一部の画像はメモリのエラーになります。
+- **そのほか**。トレイトの `as` の規則はメンバーの上限に数えます。MySQL の `lastInsertId()` が `int` に収まらないときは `DatabaseError` です。オブジェクトの生成と例外の送出は 4〜7% 遅くなりました(戻るコンストラクターがレジスターを手放すため)。
 
 ### セキュリティと検証
 
-- VS Code 拡張は、既定の PATH 検索で、ドットで始まる名前を含むワークスペースの子ディレクトリも除外します。
-- Web サイトのデプロイは `main` 限定の GitHub Environment を使います。GitHub リリースのドラフト作成には既存タグが必要です。
-- Redis 7、PostgreSQL 17、MySQL 8.4 の共有ストア試験では、異常停止からの再起動後と、複製済みの待機系への切り替え後に、使用済み記録が保持され、PHV のストア API が重複登録を拒否しました。使用済み記録を失う可能性がある復旧では、コールバックを再開する前に対象サイトのセッションを無効化してください。[仕様](https://github.com/miyagawayuu/phv/blob/v1.3.2/docs/spec.ja.md)
-- 候補 `49b3a84` の CI と配布ビルドが通過し、Windows 実機と Linux ARM64 エミュレーションで、既定・JIT 無効・切り戻し・試験設定の出力が一致しました。[CI](https://github.com/miyagawayuu/phv/actions/runs/42825612305) · [配布ビルド](https://github.com/miyagawayuu/phv/actions/runs/42825618324)
+v1.3.1 と v1.3.2 の候補を含む実装全体を、10 人のレビュアーが攻撃を再現して診断しました(第 20 回、[security-audit.ja.md §31](https://github.com/miyagawayuu/phv/blob/v1.3.2/docs/security-audit.ja.md))。指摘は 35 件(Critical 2、High 2、Medium 5、Low 11、Info 15)で、すべて修正または文書化し、修正で加わったコードも別のレビュアーが攻撃しました。リリース済みの版に影響するもの:
+
+- **画像**(Critical、1.3.0 と 1.3.1): 可逆 WebP の 1×1 のファイルが、宣言した符号の表で 128 MB の上限の下 1.3〜4.5 GB を使い、メモリを絞ったサーバーを異常終了させました。復号の前に `std.image` が表を数えます。JPEG の係数(Medium)と GIF のメタデータ(Low)も数えます。
+- **サインイン**(High、1.3.1): 1 人の訪問者が使用済みの記録の区画を埋め、サイト全体のサインインを約 10 分止められました。
+- **SQLite**(High、1.3.1 以前): `PRAGMA busy_timeout` で、時間の上限を超えてワーカーを持ち続けられました。
+- **テンプレート**(Medium、1.3.0 と 1.3.1): `<svg>`・`<math>` の中の終了タグと表の部品が SVG を終わらせ、訪問者の値がページのノンス付きのスクリプトとして実行されました。
+- **画像変換の枠**(Medium、1.3.1): 1 つのクライアントがすべての枠を持ち、ほかの訪問者の変換を失敗させられました。
+- **言語**(Medium と Low、1.3.0 と 1.3.1): トレイトの別名と、ヘルパーに渡したコレクションの追記が二乗の時間になりました。
+- ほかに Low として、SQL の垂直タブによる `XA PREPARE` の拒否のすり抜け、管理用ポートの空行の接続、`Vary` の消失などを修正しました。
+- JIT は約 35,000、ジェネレーターは約 24,200 のランダムなプログラム、サーバーは 60 万件の混在リクエストで、1.3.2 の高速化が誤った結果を生まないことを確かめました。Windows と Linux ですべてのテストが通ります。
+- VS Code 拡張は、既定の PATH 検索で、ドットで始まる名前を含むワークスペースの子ディレクトリも除外します。Web サイトのデプロイは `main` 限定の GitHub Environment を使い、GitHub リリースのドラフト作成には既存タグが必要です。
 
 ## English
 
@@ -39,14 +51,26 @@ On Windows x64 release builds, at 600 requests per second, the median request p9
 
 ### Upgrading
 
-Image conversion uses six slots with 16 workers. When upgrading from v1.3.0 or earlier with a shared session store, switch all processes together so that they share the consumed OAuth state records introduced in v1.3.1. Stop all v1.2 processes that use a shared file session directory before starting the new version. [v1.3.1 migration instructions](https://github.com/miyagawayuu/phv/releases/tag/v1.3.1)
+- **Sessions and OAuth.** The used-state records of shared stores are now one record per state, not v1.3.1's 64 shards (at most 16 live records per session). v1.3.1's records (the `phv_oauth_states` table, `.phv-oauth-XX.claims`, `…:oauth:<n>`) are not read, so switch every process of a site at once; the table can be dropped 11 minutes after the switch. A Redis store whose `maxmemory-policy` is not `noeviction` is warned about at startup. Stop all v1.2 processes that use a shared file session directory before starting the new version.
+- **SQLite.** `PRAGMA busy_timeout` is refused. A write waiting for a lock gives up after 5 seconds or at the script's time limit, whichever is first. The bundled SQLite is 3.54.1.
+- **Templates.** Inside `<svg>` and `<math>`, an end tag that closes an element opened outside them, table and document parts (`<td>`, `<table>`…), `<svg>` and `<math>` inside `<select>`, and a statement between `/` and `>` are errors. `imagesrcset` is checked as a list of URLs like `srcset`, and animation `values` take numbers only.
+- **Response headers.** A response to a request with a cookie or an `Authorization` header is `private, no-store` unless the page sets `Cache-Control`, also when it is not streamed. Every `Vary` field a page sets is kept.
+- **Images.** A conversion waits for a free slot in arrival order (six slots with 16 workers, at most half for one address). Decoding and encoding memory is counted in full, so a few images that slipped past the limit before end with the memory error.
+- **Other.** Trait `as` rules count toward the member limit. A MySQL `lastInsertId()` that does not fit in `int` raises `DatabaseError`. Creating objects and throwing exceptions are 4–7% slower (a returning constructor lets go of its registers).
 
 ### Security and verification
 
-- The VS Code extension excludes dot-prefixed workspace subdirectories from its default executable search on PATH.
-- The website deploys through a GitHub Environment restricted to `main`. Draft GitHub releases require an existing tag.
-- In tests with Redis 7, PostgreSQL 17, and MySQL 8.4, consumed-state records survived restart after an unclean stop and failover to a replica confirmed to have the records. PHV's store API rejected duplicate claims after recovery. If recovery may have lost consumed-state records, invalidate the affected site's sessions before resuming callbacks. [Specification](https://github.com/miyagawayuu/phv/blob/v1.3.2/docs/spec.md)
-- CI and distribution builds passed for candidate `49b3a84`. Output matched on native Windows and emulated Linux ARM64 in the default, interpreter, rollback, and experimental configurations. [CI](https://github.com/miyagawayuu/phv/actions/runs/42825612305) · [Distribution build](https://github.com/miyagawayuu/phv/actions/runs/42825618324)
+The whole implementation, including v1.3.1 and the v1.3.2 candidate, was assessed by ten reviewers who reproduced every attack (the twentieth assessment, [security-audit.md §31](https://github.com/miyagawayuu/phv/blob/v1.3.2/docs/security-audit.md)): 35 findings (2 Critical, 2 High, 5 Medium, 11 Low, 15 Info), all fixed or documented, and the code the fixes added was attacked by a further reviewer. Those that affect released versions:
+
+- **Images** (Critical, 1.3.0 and 1.3.1): a 1×1 lossless WebP made the decoder build its declared code tables, 1.3–4.5 GB under a 128 MB limit, and aborted a server with capped memory. `std.image` now counts the tables before decoding. JPEG coefficients (Medium) and GIF metadata (Low) are counted too.
+- **Sign-in** (High, 1.3.1): one visitor could fill the used-state shards and block sign-in for the whole site for about 10 minutes.
+- **SQLite** (High, 1.3.1 and earlier): `PRAGMA busy_timeout` let a script hold its worker past its time limit.
+- **Templates** (Medium, 1.3.0 and 1.3.1): end tags and table parts inside `<svg>` or `<math>` could end the SVG, so a visitor's value ran as a script with the page's nonce.
+- **Image conversion slots** (Medium, 1.3.1): one client could hold every slot and make other visitors' conversions fail.
+- **The language** (Medium and Low, 1.3.0 and 1.3.1): trait aliases, and appending to a collection passed to a helper, took quadratic time.
+- Low findings fixed besides: a vertical tab getting past the `XA PREPARE` refusal, empty-line connections on the admin port, lost `Vary` fields, and others.
+- About 35,000 random programs for the JIT, 24,200 for generators and 600,000 mixed requests to a running server showed no wrong result from 1.3.2's speed work. All tests pass on Windows and Linux.
+- The VS Code extension excludes dot-prefixed workspace subdirectories from its default executable search on PATH. The website deploys through a GitHub Environment restricted to `main`, and draft GitHub releases require an existing tag.
 
 ## インストール / Installing
 

@@ -434,7 +434,10 @@ pass.
   Set `PHV_VM_COMPACT_NEW_GENERATORS=1` to retain only arguments and captures until the first resume.
   With this experimental setting, allocation of the full register window is checked against the memory limit at
   first resume. `PHV_VM_PRUNE_GEN_REGS=1` separately enables experimental register pruning for eligible suspended
-  frames, keeping the registers required by resumption, closing, and exception handling.
+  frames, keeping the registers required by resumption, closing, and exception handling. Under this setting a waiting
+  generator does not keep the variables it no longer reads (unlike the rule above): their values are let go while it
+  waits, so they no longer count against the memory limit. When there is no room for a function's pruning plan, its
+  generators keep their whole frame.
 - Generators and the loops over them run in the interpreter (§17).
 - `yield` is a reserved word from 1.3; a method can still be named `yield`. A project's own class named `Generator`
   hides the built-in one in the files that declare or import it.
@@ -736,8 +739,8 @@ properties.
 - Each class holds a copy of what it takes from traits: those copies count against the members all classes inherit
   together, and the methods copied may have 32 MB of source in all (§17). A trait reached along several paths (two
   traits that use a third, level after level) is flattened once or twice per class, not once per path, and every
-  trait flattened counts against that limit, also one without members, so checking traits takes time in proportion
-  to their `use` lists.
+  trait flattened counts against that limit, also one without members, as does each rule of a `use` each time it is
+  applied (an alias is one more copy), so checking traits takes time in proportion to their `use` lists and rules.
 
 ### Annotations
 
@@ -909,18 +912,26 @@ HTML escaping protects only element content and **quoted** attribute values. `<?
 are a compile error. Locations are determined according to the browser's parsing rules (WHATWG), including
 the content of `<textarea>`, `<title>`, and similar elements, `<!--` inside `<script>`, comments such as `<!-->` and `--!>`, the inside of `<svg>`
 and `<math>` (where any markup, such as a tag, comment or CDATA section, in a `<script>` or `<style>` is an error; a self-closed `<svg/>`
-opens nothing, and `</math>` does not close an `<svg>`), markup inside `<noscript>` (checked as markup), a `<` written just
+opens nothing, also with a statement between `/` and `>`, and `</math>` does not close an `<svg>`), markup inside `<noscript>` (checked as markup), a `<` written just
 before a value or block (a value there would name a tag: an error),
 and text such as `</scripts>` that looks like an end tag but is not one. Inside `<svg>` and `<math>`, the elements are followed
 as browsers build them, and what browsers would read in another way is an error: `</svg>` (or `</math>`) while an HTML element
 opened inside a `<foreignObject>`, `<desc>`, `<title>` or MathML text element (`<mi>`, `<mtext>`...) is still open (browsers
 ignore it and read on as SVG: close the element first); an HTML element such as `<p>`, `<div>`, `<b>` or `<font>` (or `</p>`,
 `</br>`) right inside SVG or MathML, where browsers end the SVG before it; an element other than `<svg>` inside MathML
-`<annotation-xml>`; an end tag inside SVG that would close an HTML element around it; and a `>` inside a CDATA section
-(`<![CDATA[ ... ]]>`, read to `]]>` there) that is not the end of `]]>`. A `<title>`, `<style>`, `<xmp>`, `<iframe>`,
+`<annotation-xml>`; an end tag inside SVG or MathML that closes no element opened inside it (browsers then act on it by
+the HTML around the SVG: `<a><svg></a>`, `<div><svg></div>`, `<li><svg></li>`, `<td><svg></td>` and
+`<template><svg></template>` close the SVG; only `</svg>`, `</math>`, the end tags of raw-text elements such as `</script>`
+and, in HTML inside the SVG, `</p>` and `</br>` are fine there), and in HTML inside SVG or MathML the end tag of an
+element other than the innermost open one (`<foreignObject><div><b></div>`); the start tags `<table>`, `<caption>`,
+`<col>`, `<colgroup>`, `<tbody>`, `<thead>`, `<tfoot>`, `<tr>`, `<td>`, `<th>`, `<frame>`, `<frameset>`, `<head>`, `<body>`
+and `<html>` anywhere inside SVG or MathML, a `<foreignObject>` included (browsers read them by the insertion mode of the
+HTML around the SVG: in a table cell a `<td>` closes the cell and the SVG with it, elsewhere it is ignored); a `<svg>` or
+`<math>` inside an open `<select>` (older browsers ignore it there and read what it holds as HTML); and a `>` inside a
+CDATA section (`<![CDATA[ ... ]]>`, read to `]]>` there) that is not the end of `]]>`. A `<title>`, `<style>`, `<xmp>`, `<iframe>`,
 `<noembed>`, `<noframes>` or `<plaintext>` inside an open `<select>` is an error: older browsers ignore it there and read its
 text as markup. `Html` inserted inside an open `<select>` (`<select><?= render(...) ?></select>`) that holds the start tag of
-one of these elements stops the script with a runtime error (the template that made it was checked on its own), and a
+one of these elements, or of `<svg>` or `<math>`, stops the script with a runtime error (the template that made it was checked on its own), and a
 template may not end inside a `<select>`. A `<template>` inside an open `<select>` is an error too: older browsers ignore
 a `</select>` inside it, so the `<select>` stays open after it. Inside `<noscript>`, `<svg>` and `<math>`, the end tag of an
 element whose text a browser may read as raw text (`</textarea>`, `</noscript>`, `</xmp>`...) inside a comment or an attribute value
@@ -936,10 +947,10 @@ while it is checked on its own. So `<!--</<?= $v ?>-->` and `title="</nos<?phv f
 | Element content, quoted attribute value | `<p><?= $s ?></p>`, `title="<?= $s ?>"` | Escaped and output. `Html` is output as it is, except that in an attribute value its `"`, `'`, `<` and `>` are written as `&quot;`, `&#039;`, `&lt;` and `&gt;` (the value is the same), so no `Html` can end the attribute, or a `<noscript>` or `<title>` that a browser reads around it as raw text |
 | Comment | `<!-- <?= $s ?> -->` | As element content, but a value may not come right after `<!--`, `<!---` or a `-` (`<!-- a-<?= $s ?>`), and the text right after a value may not start with `>`, `!>`, `->` or `-!>` (`<!-- <?= $s ?>> -->`), also with a statement between (`<?= $s ?>!<?phv f(); ?>>`): a value ending with `--` would end the comment there. A loop's body may follow its own end or a `continue`, what follows a loop may follow a `break`, and a `finally` block may follow a value before a jump in its `try` block, so the same holds there: `<!-- <?phv foreach ($xs as $x) { ?>> <?= $x ?><?phv } ?> -->` is an error. `Html` that holds `-->` or `--!>` (in a bogus comment such as `<!x ...>`, `>`), that starts with `>`, `!>`, `->` or `-!>` (it may come right after a value), or that holds `</noscript` (inside `<noscript>`, `<svg>` or `<math>`, the end tag of any raw-text element such as `</title`) stops the script with a runtime error. A `-` at the end of a comment's text is read with the text after a statement (`-<?phv f(); ?>->` ends the comment) |
 | Text of `<textarea>`, `<title>`, `<xmp>`, `<iframe>`, `<noembed>`, `<noframes>` | `<textarea><?= $s ?></textarea>` | As element content. `Html` that holds the element's end tag (`</textarea`) or `</noscript` stops the script with a runtime error: it would end the element (or a `<noscript>` around it, read as raw text with scripting on) there |
-| Element content or a comment inside `<svg>` or `<math>` | `<svg><?= render("bar.phv.html") ?></svg>` | As element content. Browsers read markup there as foreign content, while a template was checked as HTML: `Html` that holds a CDATA section, the end tag of a raw-text element it did not open, or a raw-text element (`<title>`, `<style>`, `<textarea>`...) whose text holds `<` or does not end, stops the script with a runtime error (an SVG `<title>Bar 3</title>` or `<style>.a{fill:red}</style>` is fine). So does `Html` that would change the SVG or MathML around it, read as browsers read it where it lands (the page after it was checked as if it changed nothing): one that leaves an element open (`<foreignObject>`, `<desc>`, `<mi>`, `<g>`...), holds an end tag of an element it did not open (`</svg>`, `</g>`), or holds an HTML element such as `<p>` or `<img>` right inside SVG or MathML (one inside a `<foreignObject>` it opens is fine), or any element right inside `<annotation-xml>` |
+| Element content or a comment inside `<svg>` or `<math>` | `<svg><?= render("bar.phv.html") ?></svg>` | As element content. Browsers read markup there as foreign content, while a template was checked as HTML: `Html` that holds a CDATA section, the end tag of a raw-text element it did not open, or a raw-text element (`<title>`, `<style>`, `<textarea>`...) whose text holds `<` or does not end, stops the script with a runtime error (an SVG `<title>Bar 3</title>` or `<style>.a{fill:red}</style>` is fine). So does `Html` that would change the SVG or MathML around it, read as browsers read it where it lands (the page after it was checked as if it changed nothing): one that leaves an element open (`<foreignObject>`, `<desc>`, `<mi>`, `<g>`...), holds an end tag of an element it did not open (`</svg>`, `</g>`), or holds an HTML element such as `<p>` or `<img>` right inside SVG or MathML (one inside a `<foreignObject>` it opens is fine), any element right inside `<annotation-xml>`, or a table part such as `<td>` (or `<table>`, `<tr>`, `<body>`...) anywhere |
 | Unquoted attribute value | `href=<?= $u ?>` | Error (add quotes) |
 | Inside a tag (between attributes) | `<div <?= $attrs ?>>` | Error |
-| Start of a URL attribute | `href="<?= $u ?>"`, `src="<?= $u ?>"` | Only `SafeUrl` (`safe_url($u)`) and numbers. If the preceding text contains `/` `?` `#` `:`, it is not the start (`href="/post?id=<?= $id ?>"` is allowed). `href="j<?= ?>"` still counts as the start. After a `&` at the start (`href="&<?= ?>"`, `&#106;`) only numbers are allowed, `SafeUrl` included: the value would continue a character reference (`&` and `#x6a;avascript:` make `javascript:`). and so does the text after an inserted value (`safe_url("")` is empty): `href="<?= safe_url($a) ?><?= $b ?>"` is an error; check the whole URL with `safe_url($a . $b)`. `<base href="<?= safe_url($u) ?>">` is accepted like any URL attribute and relies on the default CSP's `base-uri 'self'` (§14), and `<meta charset="<?= $c ?>">` is text: the response's `charset=utf-8` header wins over it |
+| Start of a URL attribute | `href="<?= $u ?>"`, `src="<?= $u ?>"` | Only `SafeUrl` (`safe_url($u)`) and numbers. If the preceding text contains `/` `?` `#` `:`, it is not the start (`href="/post?id=<?= $id ?>"` is allowed). `href="j<?= ?>"` still counts as the start. After a `&` at the start (`href="&<?= ?>"`, `&#106;`) only numbers are allowed, `SafeUrl` included: the value would continue a character reference (`&` and `#x6a;avascript:` make `javascript:`). and so does the text after an inserted value (`safe_url("")` is empty): `href="<?= safe_url($a) ?><?= $b ?>"` is an error; check the whole URL with `safe_url($a . $b)`. `<base href="<?= safe_url($u) ?>">` is accepted like any URL attribute and relies on the default CSP's `base-uri 'self'` (§14), and `<meta charset="<?= $c ?>">` is text: the response's `charset=utf-8` header wins over it. In a list of URLs a value anywhere is a URL start, as it may hold the separator and start an item of its own: in `srcset` and `imagesrcset` it takes a `SafeUrl` or a number (`srcset="/img/<?= $name ?>.png 2x"` with a string is an error; a `SafeUrl` holds no whitespace, without which no candidate starts), and in the `values` of an SVG animation element (`<animate>`, `<set>`...), whose every `;`-separated value `attributeName="href"` makes a link's URL, only numbers (a string or a `SafeUrl` may hold `;`) |
 | `javascript:` / `data:` URL | `href="javascript:go(<?= $v ?>)"` | Error (numbers are allowed) |
 | Inside `<script>` | `var x = <?= $v ?>;` | Only `SafeJs` (`json_html($v)`) and numbers, where an expression goes. Inside a JavaScript string, template literal, comment or regular expression (`` `<?= $v ?>` ``, `"<?= $v ?>"`), only numbers: a JSON value's quotes would end the string, and `${...}` in a template literal runs. Write `const s = <?= json_html($v) ?>;` |
 | `<style>`, `style="..."` | | Error (numbers are allowed) |
@@ -1024,8 +1035,13 @@ phv serve examples/site --port 8080
   quarter of `workers`, at least 2; see "Streaming responses").
 - Headers sent by default: `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`,
   `Referrer-Policy: strict-origin-when-cross-origin`, and Content-Security-Policy (see "Content-Security-Policy" below).
-  HSTS if `secure_cookies = true` (always over HTTPS). `Cache-Control: private, no-store` on responses that use sessions or cookies, or
-  that carry a CSRF token (`csrf_field()`, `csrf_token()`).
+  HSTS if `secure_cookies = true` (always over HTTPS). `Cache-Control: private, no-store` (unless the page set
+  `Cache-Control`) on pages' responses that use the session, set a cookie or carry a CSRF token (`csrf_field()`,
+  `csrf_token()`), and on every page's response to a request that carries a `Cookie` or `Authorization` header,
+  whole or streamed: `request()` hands a page every cookie, so what it shows from one is not known to the server.
+  `Vary` names the request headers a response depends on: the server adds `Accept-Encoding` (compressible text),
+  `Origin` (`[cors]`) and `Accept-Language` (std.i18n) to the `Vary` fields the page set, as one field that keeps
+  every name the page gave.
   Version information such as `Server` / `X-Powered-By` is not sent. Scripts cannot set transport headers such as `Content-Length`.
 - A page runs for any request method (it reads it from `request()->method`) but `TRACE` and `CONNECT`, which get
   `405 Method Not Allowed` without running a page. Static files answer only `GET` and `HEAD` (others get 405).
@@ -1225,7 +1241,10 @@ these are not served on the site's port):
 - The admin port answers `GET` and `HEAD`, one request per connection, at most 64 connections at once and 4 from one
   client address (an IPv6 address by its /64); a client must send its request within 1 second. A new connection past
   either limit closes the oldest one that has sent nothing yet (or is closed itself when every connection is answering
-  a request), so connections that send nothing cannot keep a probe of `/health` or `/ready` waiting.
+  a request), so connections that send nothing cannot keep a probe of `/health` or `/ready` waiting. Empty lines
+  before a request line count as nothing sent (HTTP skips them): a connection that sends only `
+` is closed like
+  a silent one.
 - Metrics (all start with `phv_`): `requests_total{kind, code}` (`kind`: `page`, `static`, `ws`, `sse`, `other`; `code`:
   `2xx`...), `request_duration_seconds{route}` (a histogram per page, labelled with its file: `/posts/[id]`, never the
   path asked for; at most 1,000 routes, the rest as `other`; static files as `static`), `worker_wait_seconds`,
@@ -1358,7 +1377,10 @@ session()->destroy();                 // log out
   that keep a site within the limits below are under `phv:sessions:<namespace>:`. PostgreSQL and MySQL keep a site's
   sessions in a table of its own, `phv_sessions_<namespace>`, created when first needed; every 30 seconds (sooner
   after 1,000 new sessions) a server removes expired sessions and keeps the table within the limits below. If the
-  database cannot be reached, the request goes on without its session and a warning is logged.
+  database cannot be reached, the request goes on without its session and a warning is logged. Run Redis with
+  `maxmemory-policy noeviction`: under any other policy a full Redis removes keys, sessions and the records of used
+  sign-ins (see std.oauth) among them. A server warns when it starts if Redis answers `CONFIG GET maxmemory-policy`
+  with another policy.
 - Sites that share a database keep their sessions apart by the site's namespace: `[security] store_namespace`, or
   else `[project] name` (rate limits and jobs are kept under it too). Two copies of a site with the same name, such as
   staging and production, must set different `store_namespace` values (a server using a shared store without it
@@ -1520,13 +1542,21 @@ $thumb = Image::fromBase64($dataUrl)->fit(64)->toDataUrl();         // SafeUrl, 
   them, `ValueError`, before anything is decoded: a small file that declares a huge size (an image bomb) is refused
   by its header.
 - Reading a header takes little memory whatever the file declares. Of its metadata only the EXIF orientation is read,
-  in place; an ICC profile, XMP, text chunks and the like are never decoded (not when the pixels are, either). A WebP
+  in place; an ICC profile, XMP, text chunks and the like are never decoded (not when the pixels are, either: a PNG's
+  are left out of what its decoder reads, and so are a GIF's XMP and ICC extensions). A WebP
   whose image data declares a size other than its canvas (or an animation frame's) is refused by its header, as the
   decoder would decode it at that size first. Whether a JPEG is progressive is what its decoder finds in it.
 - The memory decoding takes counts toward the memory limit before decoding starts: 3 bytes a pixel (4 with
   transparency), what the decoder works with (a progressive JPEG keeps its coefficients: 2 bytes a pixel for each of
   its components, 6 for a color photo and 8 for CMYK; a lossy WebP with transparency 7 bytes a pixel, an animated
-  WebP up to 15), and each step's result (resizing keeps only a few rows of its work). Writing it counts what the
+  WebP up to 15; a sequential JPEG whose first scan lacks a component keeps its coefficients as a progressive one
+  does; a JPEG's rows, about a megabyte for the widest), and each step's result (resizing keeps only a few rows of its
+  work). A lossless WebP may name up to 65,536 groups of prefix codes, whatever its size, and its decoder builds a table
+  for each code of each: before it is decoded, std.image reads its codes itself (those of its alpha and of an
+  animation's first frame too) and counts their tables, so a small file whose codes would take more than is left ends
+  with the memory error at once (real images: a few hundred kilobytes at most; reading them takes under a
+  millisecond). So does a lossy WebP whose data declares a part longer than the file (its decoder allocates the size
+  declared, up to 16 MB, first). Writing it counts what the
   encoder works with, measured on noise (what compresses least): about 4 times the pixels for PNG and WebP, 2.5 times
   for JPEG. A decoder with a memory limit of its own (PNG, GIF) gets what is left beyond all this, so a GIF frame
   larger than its screen counts too. Past the limit the script ends with the usual memory error. Making a thumbnail
@@ -1542,9 +1572,15 @@ $thumb = Image::fromBase64($dataUrl)->fit(64)->toDataUrl();         // SafeUrl, 
   quality 100, of noise: the slowest case). So a script can pass its time limit by about 3 seconds at the caps (4 on
   a busy machine). Resizing, cropping and turning check the time limit every 16 rows. A typical upload, a 4000×3000
   JPEG made 800 pixels wide, takes 0.3 to 0.5 seconds.
-- HTTP pages share six concurrent conversion slots per server when `workers = 16`. For other worker counts, the
-  number of slots is `max(1, workers / 4)` with integer division. When all slots are busy, writing an image throws
-  `RuntimeException` before pixel decoding begins.
+- HTTP pages share the server's image conversion slots: six when `workers = 16`, otherwise `max(1, workers / 4)`
+  (integer division). A conversion (`send()`, `saveTo()`, `toBase64()`, `toDataUrl()`) holds a slot while it decodes,
+  works and encodes. When none is free it waits for one, in the order the conversions asked, for as long as the page's
+  time limit allows (past it, the usual time-limit error). One client address (as the rate limit counts them: an IPv6
+  /64 is one) holds at most half of the slots at once (at least one), so a client that keeps every slot it may have
+  busy delays the conversions of others by one conversion at most, and never makes them fail. A conversion whose
+  client has gone (its connection closed) while it waits takes no slot and throws `RuntimeException`. `phv run` and
+  background jobs (`std.jobs`) convert without slots: jobs are not counted, so a server's pages and jobs together may
+  convert more images at once than it has slots (at most `[jobs] workers` more).
 - A decoder that fails on a damaged file in a way its authors did not foresee (a panic) is a `ValueError`; it never
   ends the page's worker or the server, and nothing of it is printed to the error output.
 
@@ -1643,6 +1679,10 @@ before it is committed, as MySQL does.
   every 100 steps of its program, every MB it allocates and after each row, and `LIKE`, `GLOB`, `instr()`,
   `replace()` and `trim(X, Y)` look at it on every call. These functions count what they allocate toward the memory
   limit. A text or blob is at most 16 MB (SQLite raises "string or blob too big").
+- A statement that needs a lock another connection holds (a write while another connection of the file, the same
+  script's too, is in a write transaction) waits for it up to 5 seconds, and never past the script's time limit:
+  then it raises `DatabaseError` ("database is locked"), or at the time limit stops with the time limit's error.
+  `PRAGMA busy_timeout` is refused, also to read it (it would replace that wait with one the time limit cannot stop).
 - Some single steps read a whole value without looking at the deadline: turning a text into a number (`b * 2`,
   `CAST`, `NOT b`), `length()`, `substr()`, `NOCASE`, comparing or copying it. Before a statement first runs, its
   program is weighed: each such step counts by how long it may take, up to 2 for two operands that are turned into
@@ -1713,7 +1753,11 @@ The methods are the same as for SQLite (`query`, `first`, `execute`, `transactio
   settings are cleared (PostgreSQL: cursors, `SET`s, roles, `LISTEN`, advisory locks, temporary tables and prepared
   statements; MySQL `COM_RESET_CONNECTION`, the active role and the database of the URL). Connecting to the same name
   twice in one script gives the same connection. When every connection is in use, `connect()` waits up to the
-  script's time limit (30 seconds at most) and then raises `DatabaseError`.
+  script's time limit (30 seconds at most) and then raises `DatabaseError`. A MySQL connection's socket gives up on a
+  server that stops answering 10 seconds after the time limit of the script that made it (300 seconds without
+  one); the driver cannot change that later, so a script is given a pooled MySQL connection only when that time is
+  at least its own and at most twice its own (an idle connection that does not fit is closed and another made), and
+  takes packets as large as it does. `queryAsync()` and `executeAsync()` make theirs with the script's limits too.
 - On the server, the reset and return (also of a SQLite or Redis connection) happen after the page's response has
   been handed over, so the visitor does not wait for them; the page's worker is held until they are done (the
   `workers` limit counts such pages), and the response time in the access log ends when the response is handed over.
@@ -1739,7 +1783,11 @@ The methods are the same as for SQLite (`query`, `first`, `execute`, `transactio
   connection does not end it). The other `XA` statements are allowed. Comments before and between the words do not
   hide them: on MySQL a versioned comment (`/*!80000 … */`) is read both with and without its words, for each version
   it names (a server older than the version skips them), and a statement that starts with versioned comments of more
-  than 16 versions is refused; on PostgreSQL `/*! … */` is an ordinary comment.
+  than 16 versions is refused; on PostgreSQL `/*! … */` is an ordinary comment. Words are separated as the servers
+  separate them: by a space, tab, line feed, carriage return, form feed or vertical tab (`XA\vPREPARE` is refused),
+  and the same reading finds `COMMIT` and `ROLLBACK` written as SQL (`transaction()`, std.orm).
+- `lastInsertId()` on MySQL raises `DatabaseError` when the id is too large for `int` (an unsigned `BIGINT` key past
+  9223372036854775807), rather than giving another value, which could be another row's key.
 - Value types: PostgreSQL `bool` → `bool`; integer types → `int`; `real`/`double precision` → `float`;
   `numeric`, `json`/`jsonb`, `uuid`, dates and times (`YYYY-MM-DD HH:MM:SS[.ffffff]`, `timestamptz` in UTC),
   `bytea` (`\x...` hex) and text types → `string`. Other types (arrays, `interval`, ...) raise `DatabaseError`:
@@ -1846,8 +1894,9 @@ statements, refused statements, results within the memory left to the script).
   SQLite and PostgreSQL, `lastInsertId()` on MySQL, which gives back integer keys only: a `string` key must then be
   given, else `ValueError`). On MySQL that key must be the table's `AUTO_INCREMENT` column (looked up once per Repo
   in `information_schema`): `lastInsertId()` is the value of whichever column is `AUTO_INCREMENT`, or 0, so a key
-  that a default or a trigger makes raises `ValueError` before the row is added; a `lastInsertId()` of 0 raises
-  `DatabaseError`. One property is the key (no composite keys).
+  that a default or a trigger makes raises `ValueError` before the row is added; a `lastInsertId()` of 0, or one too
+  large for `int`, raises `DatabaseError` (the row was added; the entity's key stays null). One property is the key
+  (no composite keys).
 - `new Repo<User>($db)` is checked when the program is checked (a compile error says why a class is not an entity):
   `User` is a plain, non-generic class whose properties are all public, whose constructor, if it has one, only
   promotes its parameters (rows become objects without calling it, as `json_decode_as` builds them), and whose readonly
@@ -1882,9 +1931,11 @@ statements, refused statements, results within the memory left to the script).
   differ: a column another request changed meanwhile is not written back with an old value, and nothing is sent when
   nothing changed (`update()` returns false). An entity the Repo did not read (another Repo's, or one made with `new`
   with its key set) has every column written. After a `transaction()` is rolled back or fails to commit, after
-  `ROLLBACK` (also `ROLLBACK TO SAVEPOINT`) or `COMMIT` written as SQL, and after a deadlock on MySQL, every Repo
-  forgets what it kept, since the rows may no longer hold it; a Repo also forgets when another Repo of the request
-  wrote to its table. Writes made with SQL of one's own (`$db->execute()`) are not seen: an entity whose row such a
+  `ROLLBACK` (also `ROLLBACK TO SAVEPOINT`) or `COMMIT` written as SQL, after a deadlock on MySQL, and on SQLite
+  after any statement that ended the open transaction (`INSERT OR ROLLBACK`, `RAISE(ROLLBACK)` in a trigger, also
+  in a transaction the script began with its own `BEGIN`), every Repo forgets what it kept, since the rows may no
+  longer hold it; a Repo also forgets when another Repo of the request wrote to its table (table names compared
+  without regard to case, as SQLite, and MySQL on Windows and macOS, compare them). Writes made with SQL of one's own (`$db->execute()`) are not seen: an entity whose row such a
   statement changed should be read again (or written by a Repo that did not read it). `update()` finds the row by the
   key, which it never changes. A Repo shares nothing with other requests.
 
@@ -2122,11 +2173,12 @@ when the body is not JSON).
   of an `[http]` or `[websockets]` service, or the `issuer`, `authorize_url` or `token_url` of an `[oauth]` provider,
   has the server's port and a host that is an address the server listens on (the loopback, `localhost`, or any
   address of the machine when it listens on every one) or the unspecified address (`0.0.0.0`, `::`, which a
-  connection takes as this machine). Addresses known only when a page connects (a name that resolves to the server
-  later, or the endpoints of an OpenID Connect discovery document) are checked then: a page's connection to the
-  server's own address is refused with `NetworkError`. Call the code directly instead, or serve the API from another
-  address. A reverse proxy in front of the server is on another port, so it is not caught, and calling the site
-  through it has the same problem.
+  connection takes as this machine). A link-local IPv6 address is taken with its scope (`[fe80::1%eth0]`): it is this
+  machine's when it is the address of that interface. Addresses known only when a page connects (a name that resolves
+  to the server later, or the endpoints of an OpenID Connect discovery document) are checked then: a page's
+  connection to the server's own address is refused with `NetworkError`. Call the code directly instead, or serve the
+  API from another address. A reverse proxy in front of the server is on another port, so it is not caught, and
+  calling the site through it has the same problem.
 - Connections are kept open between requests to the same host (at most 8 per host and 256 in all, closed after 30
   idle seconds): one is kept only when its response ended where its framing said (`Content-Length`, or a chunked body
   with nothing after it) and the server did not ask to close it, and it is used again only if nothing arrived on it
@@ -2192,13 +2244,26 @@ response()->redirect("/");
   random `state`, an OpenID Connect `nonce` and the PKCE verifier in the visitor's session, for 10 minutes and one use;
   a session may have 4 sign-ins started at once (tabs). Extra parameters such as `["prompt" => "select_account"]` can be
   given, but not those of the flow itself.
-- Before exchanging the code, `callback()` records the state atomically in the session store, separately from the
-  session values. Servers sharing that store see the same claims. The store keeps up to 512 claims in each of 64
-  shards, retains live claims when full, and refuses new claims with `invalid_state`. A store failure also refuses
-  the callback. SQL session stores create `phv_oauth_states` when first used. Use Redis with `noeviction`. The
-  one-use guarantee requires acknowledged claims to survive recovery. If an unplanned shutdown, failover or
+- Before exchanging the code, `callback()` records the state as used, atomically, in the session store and
+  separately from the session values, so a stale save of the session cannot bring it back. Servers sharing that
+  store see the same records. A record names the site, the provider and the state, not the session: a state stays
+  used when a page that read the session earlier calls `session()->regenerate()` and writes the old list of
+  sign-ins under a new id. An answer with neither a `code` nor an `error` uses up the state in the session without
+  a record. Each record is kept until 30 seconds after the state's 10 minutes, counted by the database's clock in
+  Redis, PostgreSQL and MySQL (keep the clocks of a site's servers within 30 seconds of each other), and is then
+  removed: Redis expires its keys (`phv:sessions:<namespace>:oauth:c:<digest>`, and the session's count
+  `…:oauth:s:<hash>`); PostgreSQL and MySQL keep the records in the table `phv_oauth_claims`, created when first
+  used, and delete expired rows as they sweep sessions; a file store keeps them in `.phv-oauth/` in its directory
+  (an empty `<digest>.c` per state and a `<hash>.s` per session) and its sweep removes them; the memory store keeps
+  them with the session, counted in its size, and drops them with it. A session holds at most 16 live records (four
+  times the sign-ins it can start at once): past that, its own callbacks are refused with `invalid_state` until its
+  records expire, and no other session is affected (in 1.3.1 every session of one of 64 shards shared 512 records,
+  so one visitor could fill them and refuse every sign-in of the site). A store failure also refuses the callback.
+  The one-use guarantee requires acknowledged claims to survive recovery. If an unplanned shutdown, failover or
   backup restore can lose acknowledged claims, invalidate the affected site's sessions before resuming callbacks
   and ask users to start sign-in again. Switch all processes that share a session store together when upgrading to this version.
+  The records of 1.3.1 (`phv_oauth_states`, `.phv-oauth-<xx>.claims`, `…:oauth:<n>`) are not read: the files are
+  removed by the sweep and the Redis keys expire, and the table can be dropped 11 minutes after the upgrade.
   When upgrading from 1.2 with file sessions, stop every 1.2 process before starting the new version because the
   session lock files differ. Concurrent session saves can still lose a sign-in started in another tab; start it again.
 - `callback()` accepts only a `state` this session started for this provider, so a sign-in cannot be finished in
@@ -3242,6 +3307,10 @@ It then runs the type checker and shows the places that need manual work, such a
 3. Compilation to register-based bytecode (type-specialized instructions such as `AddI`, `LtI`, and `JumpIfNotLtIImm`)
 4. Execution
    - **Interpreter**: written entirely in safe Rust. Strings, lists, and maps use reference counting + copy-on-write.
+     A call that returns lets go of the strings, collections, objects and closures its registers held, and native
+     code lets go of the one a register held when it writes a number there, so a value passed to a function or read
+     for one element is not left shared: the caller's next `$xs[] = ...` or `.=` changes it in place. (The script's
+     own variables are let go when its VM is torn down, after the response is sent.)
      A generator (§8) is an object that holds its frame while it waits: the registers, where it resumes and its open
      `try` blocks. A loop that asks for its next value puts the frame back on top of the call stack, above the loop's,
      and `yield` takes it off again.
@@ -3325,6 +3394,7 @@ It then runs the type checker and shows the places that need manual work, such a
 | Memory | 128 MB (`[security] memory_limit_mb`) | Fatal error |
 | SQLite databases a script has open at once | 64 | `DatabaseError` |
 | SQLite text or blob | 16 MB | `DatabaseError` (string or blob too big) |
+| SQLite statement waiting for another connection's lock | 5 s, and the time limit | `DatabaseError` (database is locked); at the time limit, its fatal error |
 | SQLite statement: weight of its steps that read a whole value (see SQLite above); steps | 128; 43,008 | `DatabaseError` |
 | SQLite connections kept idle per process: per file; in all; memory held together; a kept statement's program | 64; 256; 64 MB; 1 MB | Closed instead of kept; run but not kept |
 | Call depth | 10,000 (callbacks of builtins inside each other: 200, each only while 512 KB of the thread's stack is left) | Fatal error |
@@ -3476,6 +3546,9 @@ Planned, in this order. Each release is audited before it is published, as befor
   pages, and a pool of page threads; generators (`yield`) and traits, which only add to the language; and in the
   standard library, translations (`std.i18n`), images (`std.image`) and an ORM (`std.orm`). Reusing VMs between
   pages and caching type-checked modules were measured and left out ([improvement-plan.md](improvement-plan.md)).
+- **1.3.1 and 1.3.2** (done): faster pages and generators (the JIT reusing property reads in loops and writing list
+  elements in place, `yield from` forwarding), the OAuth used-state records shared by a site's servers, and image
+  conversion slots, assessed in §31 of the audit.
 
 Some features are left out on purpose, because they work against the design principles (§1): `eval`, variable
 variables, static properties and global variables, references (`&$x`), truthiness, `===`, `@`, `goto`, magic

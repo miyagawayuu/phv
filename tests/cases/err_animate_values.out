@@ -1,0 +1,22 @@
+error: only numbers can be inserted into the `values` of an SVG animation element
+  --> err_animate_values.phv:12:63
+   |
+12 | <svg><a><set attributeName="href" values="/home;/search?q=<?= $q ?>" dur="1s"/></a></svg>
+   |                                                               ^^
+   = note: each `;`-separated value may become a link's URL (`attributeName="href"`), and a string or `safe_url()` value could hold `;` and add a `javascript:` value of its own; write the values in the template
+
+error: only numbers can be inserted into the `values` of an SVG animation element
+  --> err_animate_values.phv:13:51
+   |
+13 | <svg><a><animate attributeName="href" values="<?= safe_url("/a;javascript:alert(1)") ?>" dur="1s"/></a></svg>
+   |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: each `;`-separated value may become a link's URL (`attributeName="href"`), and a string or `safe_url()` value could hold `;` and add a `javascript:` value of its own; write the values in the template
+
+error: a URL attribute cannot start with an unchecked value
+  --> err_animate_values.phv:14:38
+   |
+14 | <img srcset="/img/a.png 1x, /img/<?= $q ?>.png 2x" alt="">
+   |                                      ^^
+   = note: use `safe_url($url)`, which only allows http(s), mailto, tel and relative URLs (blocks `javascript:`); `escape()` does not make a URL safe
+
+3 errors found

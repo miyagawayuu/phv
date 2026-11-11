@@ -275,6 +275,84 @@ fn silent_connections_do_not_keep_health_waiting() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A TCP connection to `to` from the loopback address `from` (bound first),
+/// or `None` when this system cannot bind it (macOS has only 127.0.0.1).
+fn connect_from(from: std::net::Ipv4Addr, to: SocketAddr) -> Option<TcpStream> {
+    let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).ok()?;
+    s.bind(&SocketAddr::from((from, 0)).into()).ok()?;
+    s.connect_timeout(&to.into(), Duration::from_secs(5)).ok()?;
+    Some(s.into())
+}
+
+/// Empty lines are not a request: connections that send only `\r\n\r\n`
+/// stay silent, so they cannot keep a probe from another address out. Found
+/// by the 20th assessment (R23-14): 64 such connections from 16 addresses (4
+/// each, within the per-address limit) got 70 of 74 probes closed.
+#[test]
+fn connections_sending_only_empty_lines_do_not_keep_probes_out() {
+    let _one = one_at_a_time();
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+    if std::net::TcpListener::bind("127.0.0.17:0").is_err() {
+        eprintln!("skipped: this system cannot use 127.0.0.2");
+        return;
+    }
+    let dir = site("crlf");
+    let port = free_port();
+    write(&dir, "phv.toml", &format!("[admin]\nlisten = \"127.0.0.1:{port}\"\n"));
+    write(&dir, "public/index.phv", HOME);
+    start(&dir);
+    let admin = admin_at(port);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let made = Arc::new(AtomicUsize::new(0));
+    let holders: Vec<_> = (0..64u8)
+        .map(|i| {
+            let (stop, made) = (stop.clone(), made.clone());
+            let from = Ipv4Addr::new(127, 0, 0, 2 + i / 4);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    if let Some(mut s) = connect_from(from, admin) {
+                        made.fetch_add(1, Ordering::SeqCst);
+                        let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                        let _ = s.write_all(b"\r\n\r\n");
+                        let _ = s.read(&mut [0u8; 1]);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(1000));
+    let (mut worst, mut closed) = (Duration::ZERO, 0);
+    for _ in 0..20 {
+        let start = Instant::now();
+        let mut s = connect_from(Ipv4Addr::LOCALHOST, admin).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        s.write_all(b"GET /health HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").unwrap();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
+        if buf.starts_with(b"HTTP/1.1 200 ") && buf.ends_with(b"ok\n") {
+            worst = worst.max(start.elapsed());
+        } else {
+            closed += 1;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    stop.store(true, Ordering::SeqCst);
+    for h in holders {
+        h.join().unwrap();
+    }
+    assert!(made.load(Ordering::SeqCst) >= 64, "the flood made {} connections", made.load(Ordering::SeqCst));
+    assert_eq!(closed, 0, "probes from another address were closed");
+    // 0.1 s on an idle machine; a loaded CI runner gets more.
+    let limit = if std::env::var_os("CI").is_some() { Duration::from_millis(500) } else { Duration::from_millis(100) };
+    assert!(worst < limit, "the slowest /health took {worst:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn health_turns_503_when_the_server_stops() {
     let _one = one_at_a_time();

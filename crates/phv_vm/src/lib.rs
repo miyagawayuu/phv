@@ -5,6 +5,7 @@ pub mod bytecode;
 mod cycles;
 mod gen_registers;
 pub mod i18n;
+pub mod image_slots;
 pub mod jit;
 mod stack;
 pub mod value;

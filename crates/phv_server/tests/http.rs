@@ -350,6 +350,67 @@ fn a_locale_chosen_from_accept_language_varies_by_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A page's own `Vary` fields are all kept when compression or i18n add
+/// theirs (20th assessment, R23-15: `Vary: Origin` then `Vary: Cookie` gave
+/// `vary: Origin, Accept-Encoding`, so a shared cache could serve one
+/// visitor's variant to another).
+#[test]
+fn a_pages_own_vary_fields_are_all_kept() {
+    let dir = std::env::temp_dir().join(format!("phv-http-vary-all-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(&dir, "phv.toml", "[i18n]\ndefault = \"en\"\nlocales = [\"en\", \"ja\"]\n");
+    write(&dir, "lang/en.toml", "hello = \"Hello\"\n");
+    write(&dir, "lang/ja.toml", "hello = \"Konnichiwa\"\n");
+    write(
+        &dir,
+        "public/index.phv",
+        "<?phv\nimport std.http.response;\nimport std.i18n.t;\nresponse()->header(\"Vary\", \"Cookie\");\n\
+         response()->header(\"Vary\", \"X-A, cookie\");\necho t(\"hello\"), str_repeat(\"x\", 2000);\n",
+    );
+    let addr = start(&dir);
+    let r = request(
+        addr,
+        "GET / HTTP/1.1\r\nHost: test\r\nAccept-Language: ja\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("content-encoding"), Some("gzip"));
+    let fields: Vec<&str> =
+        r.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("vary")).map(|(_, v)| v.as_str()).collect();
+    assert_eq!(fields, ["Cookie, X-A, Accept-Language, Accept-Encoding"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A page answered whole (no `flush()`) to a request that carries a cookie or
+/// credentials is `Cache-Control: private, no-store`, as the same page
+/// streamed is: what it reads from them cannot be told apart from what it
+/// does not (20th assessment, R23-20). A `Cache-Control` the page set is kept.
+#[test]
+fn a_buffered_page_asked_with_a_cookie_is_private() {
+    let dir = std::env::temp_dir().join(format!("phv-http-private-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write(
+        &dir,
+        "public/hello.phv",
+        "<?phv\nimport std.http.request;\necho \"hello \" . (request()->cookie(\"name\") ?? \"guest\");\n",
+    );
+    write(
+        &dir,
+        "public/cached.phv",
+        "<?phv\nimport std.http.response;\nresponse()->header(\"Cache-Control\", \"public, max-age=60\");\necho \"same for all\";\n",
+    );
+    let addr = start(&dir);
+    let r = get(addr, "/hello", "name=mk1");
+    assert_eq!(r.body, "hello mk1");
+    assert_eq!(r.header("cache-control"), Some("private, no-store"));
+    let r = request(addr, "GET /hello HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer x\r\nConnection: close\r\n\r\n");
+    assert_eq!(r.header("cache-control"), Some("private, no-store"));
+    let r = request(addr, "GET /hello HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    assert_eq!(r.body, "hello guest");
+    assert_eq!(r.header("cache-control"), None, "no cookie, nothing personal");
+    assert_eq!(get(addr, "/cached", "name=mk1").header("cache-control"), Some("public, max-age=60"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The bytes of `response()->file()` or an image's `send()` are output: a
 /// later Content-Type cannot retype them as HTML or JavaScript (R22-30, the
 /// file's `<b>mk1</b>` was served as `text/html`).

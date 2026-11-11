@@ -16,13 +16,19 @@
 //!   reservation (and a small fixed one while the header is read); so does
 //!   the encoders' working memory.
 //! - No decoder is asked for metadata: an allocation it would size from what
-//!   the file declares (image-webp's EXIF chunk, png's ICC profile) is never
-//!   made. The EXIF orientation is read in place from the file's bytes, a PNG
-//!   is decoded without its ICC, text and EXIF chunks (`PngView`), and a WebP
-//!   whose bitstream declares a size other than its canvas or frame is refused
+//!   the file declares (image-webp's EXIF chunk, png's ICC profile, gif's XMP
+//!   and ICC) is never made. The EXIF orientation is read in place from the
+//!   file's bytes, a PNG is decoded without its ICC, text and EXIF chunks and
+//!   a GIF without its XMP and ICC extensions (`View`), and a WebP whose
+//!   bitstream declares a size other than its canvas or frame is refused
 //!   before image-webp decodes it at that size (`webp_layout`).
+//! - A lossless WebP's prefix codes, which image-webp builds without a limit
+//!   (up to 65,536 groups of them whatever the canvas), are read and counted
+//!   by std.image first (`vp8l`).
 //! - JPEGs are read with zune-jpeg directly, so its own header parse says
-//!   whether one is progressive, and its own count of scans is capped.
+//!   whether one is progressive, and whether its first scan holds every
+//!   component (if not, every coefficient is kept), and its own count of
+//!   scans is capped.
 //! - Decoders and encoders run inside `catch_unwind`: a panic in one of them is
 //!   a `ValueError`, not the end of the page (or of `phv run`), and is not
 //!   printed (`guarded`).
@@ -46,15 +52,17 @@ use image::codecs::png::{CompressionType, FilterType, PngDecoder, PngEncoder};
 use image::codecs::webp::{WebPDecoder, WebPEncoder};
 use image::metadata::Orientation;
 use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, ImageError, Limits};
+use phv_vm::image_slots::NoSlot;
 use phv_vm::{BuiltinFn, Value, Vm, VmError};
 use std::cell::Cell;
 use std::io::{BufRead, Cursor, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
+
+mod vp8l;
 
 /// The widest and tallest image read or made.
 pub(crate) const MAX_SIDE: u32 = 16_384;
@@ -69,6 +77,11 @@ const HEADER_ALLOC: u64 = 1 << 20;
 /// 83 for 12 megapixels (an encoder writes about 10), and at least 10, at most
 /// 100 (zune-jpeg's own cap).
 const MAX_SCAN_PIXELS: u64 = 1_000_000_000;
+/// Bytes zune-jpeg keeps for each column of each component, besides the
+/// pixels: a row of blocks of coefficients, its upsampled and converted rows
+/// (`measure_webp_code_groups` in the driver's image tests: 0.9 MB for a JPEG
+/// 16,383 pixels wide; twice that is counted).
+const JPEG_ROW_BYTES: u64 = 32;
 /// The most steps (resizes, crops, turns) an image is made with.
 const MAX_STEPS: usize = 64;
 /// Rows between two checks of the limits while pixels are worked on.
@@ -130,6 +143,9 @@ struct Source {
     /// A JPEG's output color space and the most scans it may have (zune-jpeg
     /// counts them as it decodes).
     jpeg: Option<(ColorSpace, usize)>,
+    /// A WebP's lossless bitstreams, whose codes are counted before it is
+    /// decoded (`WebpLayout::lossless`).
+    lossless: Vec<Lossless>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,17 +237,16 @@ fn limits(max_alloc: u64) -> Limits {
 
 /// The decoder of a PNG, GIF or WebP (JPEGs are read with zune-jpeg itself).
 fn decoder<'a>(bytes: &'a [u8], format: Format, limits: Limits) -> Result<Box<dyn ImageDecoder + 'a>, ImageError> {
-    let r = Cursor::new(bytes);
     Ok(match format {
-        Format::Png => Box::new(PngDecoder::with_limits(PngView::new(bytes), limits)?),
+        Format::Png => Box::new(PngDecoder::with_limits(View::png(bytes), limits)?),
         Format::Jpeg => unreachable!("JPEGs are read with zune-jpeg"),
         Format::Gif => {
-            let mut d = GifDecoder::new(r)?;
+            let mut d = GifDecoder::new(View::gif(bytes))?;
             d.set_limits(limits)?;
             Box::new(d)
         }
         Format::Webp => {
-            let mut d = WebPDecoder::new(r)?;
+            let mut d = WebPDecoder::new(Cursor::new(bytes))?;
             d.set_limits(limits)?;
             Box::new(d)
         }
@@ -348,26 +363,47 @@ struct JpegHead {
     h: u32,
     components: u64,
     progressive: bool,
+    /// Whether its first scan holds every component: if not, zune-jpeg keeps
+    /// every coefficient of a sequential JPEG until the last scan, as for a
+    /// progressive one (the 20th audit's R23-7).
+    first_scan_whole: bool,
     out: ColorSpace,
     orientation: Orientation,
 }
 
+/// The number of components of the scan whose header (an SOS segment, which
+/// zune-jpeg checks is 6 + 2 × that number long) ends at `end`, if one does.
+fn scan_components(b: &[u8], end: usize) -> Option<u64> {
+    (1..=4u64).find(|&n| {
+        let len = 6 + 2 * n as usize;
+        end.checked_sub(len + 2).and_then(|at| b.get(at..at + 5)) == Some(&[0xFF, 0xDA, 0, len as u8, n as u8][..])
+    })
+}
+
 /// Reads a JPEG's header with zune-jpeg itself, so that whether it is
-/// progressive is what the decoder will find (it skips stray bytes between
-/// segments, which a walk of our own read as the end of the header).
+/// progressive, and what its first scan holds, is what the decoder will find
+/// (it skips stray bytes between segments, which a walk of our own read as
+/// the end of the header). It reads up to the end of the first scan's header,
+/// so the bytes before where it stopped are that header.
 fn jpeg_head(b: &[u8]) -> Result<JpegHead, String> {
     // The sides are checked against the caps by the caller, with its message.
-    let mut d = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(b), jpeg_options(u16::MAX as u32, 100));
+    let mut at = Cursor::new(b);
+    let mut d = zune_jpeg::JpegDecoder::new_with_options(&mut at, jpeg_options(u16::MAX as u32, 100));
     d.decode_headers().map_err(|e| damaged(Format::Jpeg, e.to_string()))?;
     let info = d.info().ok_or_else(|| damaged(Format::Jpeg, "no header".into()))?;
     let input = d.input_colorspace().unwrap_or(ColorSpace::YCbCr);
     // A broken EXIF block is no reason to refuse the image.
     let orientation = d.exif().and_then(|e| Orientation::from_exif_chunk(e)).unwrap_or(Orientation::NoTransforms);
+    drop(d);
+    let components = info.components as u64;
+    // Not found: counted as a scan without every component.
+    let first_scan_whole = scan_components(b, at.position() as usize) == Some(components);
     Ok(JpegHead {
         w: info.width as u32,
         h: info.height as u32,
-        components: info.components as u64,
+        components,
         progressive: info.sof.is_progressive(),
+        first_scan_whole,
         out: jpeg_out(input),
         orientation,
     })
@@ -424,42 +460,116 @@ fn webp_frame(name: &[u8; 4], data: &[u8], want: (u32, u32)) -> Result<(), Strin
     }
 }
 
-/// What std.image reads of a WebP file itself, walking its chunks as
-/// image-webp does: where its EXIF chunk is (image-webp would allocate the
-/// size the chunk declares, up to 4 GB, before reading it) and the bytes
-/// decoding takes besides the decoded image. Every bitstream (VP8, VP8L, and
-/// the first chunk of each animation frame) must declare the size of its
-/// canvas or frame.
-fn webp_layout(b: &[u8], canvas: (u32, u32)) -> Result<(Option<Range<usize>>, u64), String> {
+/// The most image-webp allocates for the partitions of the lossy bitstream
+/// `d` before it finds the bitstream ends before them: it allocates the size
+/// each declares (the first in the frame's header, up to 512 KB; the others in
+/// a table after it, of 1, 3 or 7 sizes, up to 16 MB each), then reads it.
+/// The partitions that are there are copies of the file, counted with it.
+fn vp8_overshoot(d: &[u8]) -> u64 {
+    let Some(tag) = d.get(..3) else { return 0 };
+    let first = (u32::from_le_bytes([tag[0], tag[1], tag[2], 0]) >> 5) as usize;
+    let table = 10 + first;
+    if table > d.len() {
+        return first as u64;
+    }
+    // How many partitions there are is in the arithmetic-coded header:
+    // every count is tried.
+    let mut most = 0;
+    for n in [2usize, 4, 8] {
+        let Some(sizes) = d.get(table..table + 3 * (n - 1)) else { continue };
+        let mut at = table + 3 * (n - 1);
+        for s in sizes.as_chunks::<3>().0 {
+            let size = u32::from_le_bytes([s[0], s[1], s[2], 0]) as usize;
+            if at + size > d.len() {
+                most = most.max(size);
+                break;
+            }
+            at += size;
+        }
+    }
+    most as u64
+}
+
+/// A lossless bitstream of a WebP: where it is, and its size when it has no
+/// header of its own (an ALPH chunk's).
+type Lossless = (Range<usize>, Option<(u32, u32)>);
+
+/// What std.image reads of a WebP file itself (`webp_layout`).
+struct WebpLayout {
+    /// Where its EXIF chunk is (image-webp would allocate the size the chunk
+    /// declares, up to 4 GB, before reading it).
+    exif: Option<Range<usize>>,
+    /// The bytes decoding takes besides the decoded image and the codes of
+    /// its lossless bitstreams.
+    extra: u64,
+    /// The lossless bitstreams image-webp may decode: a VP8L chunk (with its
+    /// own header), or the data of an ALPH chunk that is compressed losslessly
+    /// (of the size given). Their codes are counted when the image is decoded
+    /// (`vp8l::need`).
+    lossless: Vec<Lossless>,
+}
+
+/// Walks the chunks of a WebP file as image-webp does: every bitstream (VP8,
+/// VP8L, and the first chunk of each animation frame) must declare the size
+/// of its canvas or frame. Of each kind of chunk image-webp decodes the first
+/// one; of an animation, its first frame only.
+fn webp_layout(b: &[u8], canvas: (u32, u32)) -> Result<WebpLayout, String> {
     let px = canvas.0 as u64 * canvas.1 as u64;
     let data = |start: usize, len: usize| &b[start.min(b.len())..start.saturating_add(len).min(b.len())];
-    let Some((first, start, len)) = riff_chunk(b, 12) else { return Ok((None, px * 4)) };
+    let range = |start: usize, len: usize| start.min(b.len())..start.saturating_add(len).min(b.len());
+    let mut layout = WebpLayout { exif: None, extra: px * 4, lossless: Vec::new() };
+    let Some((first, start, len)) = riff_chunk(b, 12) else { return Ok(layout) };
     match &first {
         // Its canvas is its bitstream's size. A lossy frame is decoded into
         // planes (1.5 bytes a pixel, in whole macroblocks) from a copy of its
         // partitions; a lossless one without alpha as RGBA first.
-        b"VP8 " => return Ok((None, px * 2 + b.len() as u64)),
+        b"VP8 " => {
+            layout.extra = px * 2 + b.len() as u64 + vp8_overshoot(data(start, len));
+            return Ok(layout);
+        }
         b"VP8X" => {}
-        _ => return Ok((None, px * 4)),
+        b"VP8L" => {
+            layout.lossless.push((range(start, len), None));
+            return Ok(layout);
+        }
+        _ => return Ok(layout),
     }
     let flags = data(start, len).first().copied().unwrap_or(0);
     let (alpha, animated) = (flags & 0x10 != 0, flags & 0x02 != 0);
     let riff = b.get(4..8).map_or(0, |s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize);
     let mut at = riff_next(start, len);
     let end = at.saturating_add(riff.saturating_sub(12));
-    let (mut exif, mut lossless, mut first_frame) = (None, false, None);
+    let (mut exif, mut lossless, mut first_frame, mut overshoot) = (None, false, None, 0);
+    // The data of an ALPH chunk at `r`, when it is compressed losslessly.
+    let alph_lossless = |r: Range<usize>| (b.get(r.start).is_some_and(|h| h & 3 == 1)).then(|| r.start + 1..r.end);
     while at < end {
         let Some((name, start, len)) = riff_chunk(b, at) else { break };
         let d = data(start, len);
         match &name {
             b"EXIF" if exif.is_none() && start.saturating_add(len) <= b.len() => exif = Some(start..start + len),
+            // Every VP8L and every lossless ALPH is counted, whatever the
+            // flags say and however many there are: `vp8l::need` takes the
+            // largest, so a bitstream image-webp does not decode costs nothing
+            // more, and one it does decode cannot be left out (found by the
+            // re-attack of the 20th assessment's fixes).
             b"VP8 " | b"VP8L" => {
                 lossless |= &name == b"VP8L";
                 webp_frame(&name, d, canvas)?;
+                if &name == b"VP8 " {
+                    overshoot = overshoot.max(vp8_overshoot(d));
+                } else {
+                    layout.lossless.push((range(start, len), None));
+                }
+            }
+            b"ALPH" => {
+                if let Some(r) = alph_lossless(range(start, len)) {
+                    layout.lossless.push((r, Some(canvas)));
+                }
             }
             b"ANMF" if d.len() >= 16 => {
                 let u24 = |i: usize| u32::from_le_bytes([d[i], d[i + 1], d[i + 2], 0]);
                 let frame = (u24(6) + 1, u24(9) + 1);
+                let sub_range = |s: usize, l: usize| start + s.min(d.len())..start + s.saturating_add(l).min(d.len());
                 // The frame's bitstream; after an ALPH chunk, the next chunk
                 // is decoded as VP8 whatever its name.
                 let mut kind = None;
@@ -467,10 +577,40 @@ fn webp_layout(b: &[u8], canvas: (u32, u32)) -> Result<(Option<Range<usize>>, u6
                     kind = Some(sub);
                     if &sub == b"ALPH" {
                         if let Some((_, s, l)) = riff_chunk(d, riff_next(s, l)) {
-                            webp_frame(b"VP8 ", &d[s.min(d.len())..s.saturating_add(l).min(d.len())], frame)?;
+                            let v = &b[sub_range(s, l)];
+                            webp_frame(b"VP8 ", v, frame)?;
+                            overshoot = overshoot.max(vp8_overshoot(v));
                         }
                     } else {
-                        webp_frame(&sub, &d[s.min(d.len())..s.saturating_add(l).min(d.len())], frame)?;
+                        let v = &b[sub_range(s, l)];
+                        webp_frame(&sub, v, frame)?;
+                        if &sub == b"VP8 " {
+                            overshoot = overshoot.max(vp8_overshoot(v));
+                        }
+                    }
+                }
+                // image-webp copies the first two sub-chunks of the first ANMF
+                // into its chunk map whether or not the file is an animation,
+                // each as long as it declares (read past the frame's end), and
+                // may decode the VP8L or a lossless ALPH among them as the image
+                // or its alpha (the re-attack of the 20th assessment's fixes: a
+                // VP8L in an ANMF of a file that is not an animation was decoded
+                // uncounted). The sub-chunks of every frame are counted.
+                let mut pos = 16;
+                for _ in 0..2 {
+                    let Some((sub, s, l)) = riff_chunk(d, pos) else { break };
+                    let r = range(start + s, l);
+                    if &sub == b"VP8L" {
+                        layout.lossless.push((r, None));
+                    } else if &sub == b"ALPH" {
+                        if let Some(r) = alph_lossless(r) {
+                            layout.lossless.push((r.clone(), Some(frame)));
+                            layout.lossless.push((r, Some(canvas)));
+                        }
+                    }
+                    pos = riff_next(s, l);
+                    if pos.saturating_add(8) > d.len() {
+                        break;
                     }
                 }
                 if first_frame.is_none() {
@@ -481,6 +621,7 @@ fn webp_layout(b: &[u8], canvas: (u32, u32)) -> Result<(Option<Range<usize>>, u6
         }
         at = riff_next(start, len);
     }
+    layout.exif = exif;
     let extra = if animated {
         // A canvas of RGBA, and the first frame: lossless as RGBA; lossy as
         // planes and RGB, or with alpha (decoded as RGBA, then one byte a
@@ -498,7 +639,8 @@ fn webp_layout(b: &[u8], canvas: (u32, u32)) -> Result<(Option<Range<usize>>, u6
     } else {
         px * 2 + if alpha { px * 5 } else { 0 } + b.len() as u64
     };
-    Ok((exif, extra))
+    layout.extra = extra + overshoot;
+    Ok(layout)
 }
 
 /// The EXIF block of a PNG (its first `eXIf` chunk before the image data), read
@@ -517,51 +659,101 @@ fn png_exif(b: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// A PNG as the decoder sees it: without its ICC profile (which the png crate
-/// inflates as soon as it reads the header, up to its whole memory limit),
-/// its text and its EXIF block, none of which std.image uses (the orientation
-/// is read in place, `png_exif`). Whole chunks are left out, so what is left
-/// is a PNG; a chunk cut short or too long for the file ends the walk, and
-/// the rest is passed on as it is. Nothing is copied or allocated.
-struct PngView<'a> {
+/// A file as its decoder sees it: without the blocks std.image does not use
+/// and a decoder would keep, whole blocks at a time, so what is left is a
+/// file of the same format. A block cut short or too long for the file ends
+/// the walk, and the rest is passed on as it is. Nothing is copied or
+/// allocated.
+///
+/// - A PNG without its ICC profile (which the png crate inflates as soon as
+///   it reads the header, up to its whole memory limit), its text and its
+///   EXIF block (the orientation is read in place, `png_exif`).
+/// - A GIF without its XMP and ICC application extensions, which the gif
+///   crate collects while it reads the header, up to 50 MB of its own.
+struct View<'a> {
     b: &'a [u8],
     /// Where the next byte comes from.
     at: usize,
-    /// Up to where the bytes from `at` are passed on before the next chunk.
+    /// Up to where the bytes from `at` are passed on before the next block.
     until: usize,
     /// Bytes passed on so far.
     pos: u64,
+    /// The block at an offset: where it ends and whether it is left out; or
+    /// `None` when the rest is passed on as it is.
+    block: BlockFn,
 }
 
-impl<'a> PngView<'a> {
-    fn new(b: &'a [u8]) -> PngView<'a> {
+/// Finds the block of a file at an offset: where it ends and whether it is
+/// left out; `None` when the rest is passed on as it is.
+type BlockFn = fn(&[u8], usize) -> Option<(usize, bool)>;
+
+/// A PNG chunk.
+fn png_block(b: &[u8], at: usize) -> Option<(usize, bool)> {
+    let head = b.get(at..at + 8)?;
+    let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
+    let end = (len <= i32::MAX as u32).then(|| at + 12 + len as usize).filter(|&end| end <= b.len())?;
+    Some((end, matches!(&head[4..8], b"iCCP" | b"tEXt" | b"zTXt" | b"iTXt" | b"eXIf")))
+}
+
+/// Where the data sub-blocks of a GIF starting at `i` end (after the empty one).
+fn gif_sub_blocks(b: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        let n = *b.get(i)? as usize;
+        i += 1 + n;
+        if n == 0 {
+            return (i <= b.len()).then_some(i);
+        }
+    }
+}
+
+/// A GIF block: an extension, or an image (its descriptor, color table and data).
+fn gif_block(b: &[u8], at: usize) -> Option<(usize, bool)> {
+    match *b.get(at)? {
+        0x21 => {
+            let end = gif_sub_blocks(b, at + 2)?;
+            // An application extension: its first sub-block is its name.
+            let app = b.get(at + 1..at + 3) == Some(&[0xFF, 11][..]);
+            Some((end, app && matches!(b.get(at + 3..at + 14), Some(b"XMP DataXMP" | b"ICCRGBG1012"))))
+        }
+        0x2C => {
+            let flags = *b.get(at + 9)?;
+            let table = if flags & 0x80 != 0 { 3 << ((flags & 7) + 1) } else { 0 };
+            Some((gif_sub_blocks(b, at + 11 + table)?, false))
+        }
+        _ => None,
+    }
+}
+
+impl<'a> View<'a> {
+    fn png(b: &'a [u8]) -> View<'a> {
         // The signature, then chunk by chunk.
-        PngView { b, at: 0, until: b.len().min(8), pos: 0 }
+        View { b, at: 0, until: b.len().min(8), pos: 0, block: png_block }
     }
 
-    /// At the end of a chunk passed on: skips the chunks left out, and finds
+    fn gif(b: &'a [u8]) -> View<'a> {
+        // The header, the screen and its color table, then block by block.
+        let flags = b.get(10).copied().unwrap_or(0);
+        let table = if flags & 0x80 != 0 { 3 << ((flags & 7) + 1) } else { 0 };
+        View { b, at: 0, until: b.len().min(13 + table), pos: 0, block: gif_block }
+    }
+
+    /// At the end of a block passed on: skips the blocks left out, and finds
     /// the end of the next one.
-    fn next_chunk(&mut self) {
+    fn next_block(&mut self) {
         while self.at == self.until && self.at < self.b.len() {
-            let Some(head) = self.b.get(self.at..self.at + 8) else {
-                self.until = self.b.len();
-                return;
-            };
-            let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
-            let end = (len <= i32::MAX as u32).then(|| self.at + 12 + len as usize).filter(|&end| end <= self.b.len());
-            match end {
-                Some(end) if matches!(&head[4..8], b"iCCP" | b"tEXt" | b"zTXt" | b"iTXt" | b"eXIf") => {
+            match (self.block)(self.b, self.at) {
+                Some((end, true)) => {
                     self.at = end;
                     self.until = end;
                 }
-                Some(end) => self.until = end,
+                Some((end, false)) => self.until = end,
                 None => self.until = self.b.len(),
             }
         }
     }
 }
 
-impl Read for PngView<'_> {
+impl Read for View<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = {
             let src = self.fill_buf()?;
@@ -574,9 +766,9 @@ impl Read for PngView<'_> {
     }
 }
 
-impl BufRead for PngView<'_> {
+impl BufRead for View<'_> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-        self.next_chunk();
+        self.next_block();
         Ok(&self.b[self.at..self.until])
     }
 
@@ -587,13 +779,13 @@ impl BufRead for PngView<'_> {
     }
 }
 
-impl Seek for PngView<'_> {
-    /// The png decoder only reads forward: telling where it is is all it may ask.
+impl Seek for View<'_> {
+    /// The decoders only read forward: telling where they are is all they may ask.
     fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
         match to {
             SeekFrom::Current(0) => Ok(self.pos),
             SeekFrom::Start(p) if p == self.pos => Ok(self.pos),
-            _ => Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "a PNG is read forward")),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "an image is read forward")),
         }
     }
 }
@@ -613,6 +805,7 @@ fn probe(bytes: Vec<u8>) -> Result<(Source, u32, u32), String> {
     let not_image = || "not a PNG, JPEG, GIF or WebP image".to_string();
     let format = Format::sniff(&bytes).ok_or_else(not_image)?;
     let too_large = |w: u32, h: u32| format!("the image is {w}×{h} pixels: {}", caps_text());
+    let mut lossless = Vec::new();
     let (w, h, mut need, orientation, jpeg, eight) = if format == Format::Jpeg {
         let head = jpeg_head(&bytes)?;
         let (w, h) = (head.w, head.h);
@@ -636,10 +829,12 @@ fn probe(bytes: Vec<u8>) -> Result<(Source, u32, u32), String> {
         }
         let eight = px * head.out.num_components() as u64;
         // The pixels, the copies zune-jpeg makes of the metadata segments,
-        // and for a progressive JPEG every coefficient of every component as
-        // 16-bit numbers, in whole blocks.
-        let mut need = eight + bytes.len() as u64;
-        if head.progressive {
+        // its rows of coefficients and of upsampled and converted samples
+        // (about a megabyte for the widest), and for a progressive JPEG, or a
+        // sequential one whose first scan lacks a component, every
+        // coefficient of every component as 16-bit numbers, in whole blocks.
+        let mut need = eight + bytes.len() as u64 + (w as u64 + 32) * head.components * JPEG_ROW_BYTES;
+        if head.progressive || !head.first_scan_whole {
             let padded = (w as u64 + 16) * (h as u64 + 16);
             need += padded * head.components * 2 + px / 4;
         }
@@ -661,9 +856,10 @@ fn probe(bytes: Vec<u8>) -> Result<(Source, u32, u32), String> {
         let exif = match format {
             Format::Png => png_exif(&bytes),
             Format::Webp => {
-                let (exif, extra) = webp_layout(&bytes, (w, h))?;
-                need += extra;
-                exif.map(|r| &bytes[r])
+                let layout = webp_layout(&bytes, (w, h))?;
+                need += layout.extra;
+                lossless = layout.lossless;
+                layout.exif.map(|r| &bytes[r])
             }
             // An animation's first frame is drawn on a canvas of its own (a
             // frame larger than the screen is refused by the decoder's limit).
@@ -681,7 +877,7 @@ fn probe(bytes: Vec<u8>) -> Result<(Source, u32, u32), String> {
         need += eight;
     }
     let (w, h) = if turns_sides(orientation) { (h, w) } else { (w, h) };
-    Ok((Source { bytes, format, orientation, need, jpeg }, w, h))
+    Ok((Source { bytes, format, orientation, need, jpeg, lossless }, w, h))
 }
 
 /// The channels of the 8-bit pixels made from a decoder's color type.
@@ -723,6 +919,25 @@ fn decode(src: &Source, max_alloc: u64) -> Result<Pixels, String> {
             let failed = |e: ImageError| match e {
                 ImageError::Limits(_) => OVER_MEMORY.to_string(),
                 e => decode_error(src.format, e),
+            };
+            let max_alloc = match src.format {
+                // The prefix codes of a lossless WebP, which image-webp builds
+                // without a limit, read and counted first: within what is left.
+                Format::Webp => {
+                    let mut most = 0;
+                    for (r, size) in &src.lossless {
+                        match vp8l::need(&src.bytes[r.clone()], *size, max_alloc) {
+                            Ok(n) => most = most.max(n),
+                            Err(vp8l::Stop::Memory) => return Err(OVER_MEMORY.to_string()),
+                            Err(vp8l::Stop::Damaged(why)) => return Err(damaged(Format::Webp, why.to_string())),
+                        }
+                    }
+                    max_alloc.saturating_sub(most)
+                }
+                // gif reserves a frame larger than its screen as RGBA, and
+                // then decodes it into a buffer of a byte a pixel besides.
+                Format::Gif => max_alloc / 5 * 4,
+                _ => max_alloc,
             };
             let d = decoder(&src.bytes, src.format, limits(max_alloc)).map_err(failed)?;
             let img = DynamicImage::from_decoder(d).map_err(failed)?;
@@ -1258,26 +1473,18 @@ fn apply(p: Pixels, op: Op, tick: &mut Tick) -> Result<Pixels, VmError> {
     })
 }
 
-/// Returns a server slot even when conversion unwinds.
-struct ImageSlot<'a>(&'a AtomicUsize);
-
-impl Drop for ImageSlot<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 /// Decodes the source of `pipe`, runs its steps and encodes the result, within
 /// the script's limits.
 fn render(vm: &Vm, what: &str, pipe: &Pipeline, format: Format, quality: u8) -> Result<Vec<u8>, Fail> {
     vm.check_limits()?;
-    let _slot = if let Some(slots) = &vm.http.image_slots {
-        slots
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1))
-            .map_err(|_| vm.throw("RuntimeException", "all image conversion slots are busy"))?;
-        Some(ImageSlot(slots))
-    } else {
-        None
+    // Under the server, a slot: waited for in turn, within the page's time
+    // limit (a slot held is given back when this returns or unwinds).
+    let _slot = match &vm.http.image_slots {
+        Some(slots) => Some(slots.take(|| vm.check_limits()).map_err(|e| match e {
+            NoSlot::Stopped(e) => e,
+            NoSlot::Gone => vm.throw("RuntimeException", "the client has gone: the image was not converted"),
+        })?),
+        None => None,
     };
     let need = pipe.src.need;
     vm.reserve(need.min(usize::MAX as u64) as usize)?;

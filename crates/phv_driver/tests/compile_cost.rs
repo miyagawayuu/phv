@@ -280,6 +280,89 @@ fn diamonds_of_traits_check_at_once() {
     assert!(peak < 400 << 20, "held {} MB", peak >> 20);
 }
 
+/// A `use` with one alias per method of the trait (`m0 as a0; ...`): each
+/// rule looked through the trait's methods, so `N` aliases took O(N²) (40,000
+/// took 13 s to check, and the language server answered nothing meanwhile),
+/// and 17 levels of traits that each alias every method of the one below
+/// (7 MB) took 43 s (audit 20). Rules now find a method by its name, and
+/// count against the limit of members copied.
+#[test]
+fn many_trait_aliases_check_at_once() {
+    // (`T::m as a;` is one token more: 60,000 of them pass the token limit.)
+    for (name, from, n) in [("aliases", "", 60_000), ("aliases_named", "T::", 40_000)] {
+        let methods: String = (0..n).map(|i| format!("public function m{i}(): int {{ return {i}; }}\n")).collect();
+        let rules: String = (0..n).map(|i| format!("{from}m{i} as a{i};\n")).collect();
+        let src = format!(
+            "<?phv\ntrait T {{\n{methods}}}\nfinal class C {{ use T {{\n{rules}}} }}\necho (new C())->a{}();\n",
+            n - 1
+        );
+        let (out, _, took) = compile_src(name, src);
+        assert_eq!(out, format!("{}", n - 1), "{name}");
+        // About 20 s in a debug build before (13 s for 40,000 in release).
+        assert!(took < Duration::from_secs(8), "{name} took {took:?}");
+    }
+    // Each level aliases every method of the one below: 2^17 methods at the top.
+    let mut names = vec!["m0".to_string()];
+    let mut src = String::from("<?phv\ntrait T0 { public function m0(): int { return 1; } }\n");
+    for i in 1..=17 {
+        let mut rules = String::new();
+        let mut next = Vec::new();
+        for m in &names {
+            rules += &format!("T{}::{m} as {m}a{i}; ", i - 1);
+            next.push(m.clone());
+            next.push(format!("{m}a{i}"));
+        }
+        src += &format!("trait T{i} {{ use T{} {{ {rules}}} }}\n", i - 1);
+        names = next;
+    }
+    src += "final class C { use T17; }\necho (new C())->m0();\n";
+    let (out, peak, took) = compile_src("aliases_doubling", src);
+    assert!(out.contains("inherit more than 200000 members in total"), "{}", &out[..out.len().min(500)]);
+    assert!(took < Duration::from_secs(8), "took {took:?}");
+    assert!(peak < 1 << 30, "held {} MB", peak >> 20);
+}
+
+/// Errors found in traits are reported once, also when the trait is checked
+/// again for each class that uses it: each one was looked for among all the
+/// diagnostics before it, so two traits whose 20,000 rules each name a
+/// missing method took 10 s to check, and a trait of 20,000 wrong methods
+/// used by two classes 3 s (audit 20).
+#[test]
+fn many_errors_in_traits_are_reported_at_once() {
+    let n = 20_000;
+    let mut src = String::from("<?phv\ntrait T { public function m(): int { return 1; } }\n");
+    for k in 0..2 {
+        let rules: String = (0..n).map(|i| format!("x{i} as y{k}_{i}; ")).collect();
+        src += &format!("trait U{k} {{ use T {{ {rules}}} }}\n");
+    }
+    src += "final class C { use U0; use U1; }\n";
+    let (out, _, took) = compile_src("rule_errors", src);
+    assert!(out.contains("no trait used here has a method `x0`"), "{}", &out[..out.len().min(500)]);
+    assert!(
+        out.ends_with(
+            "40000 errors found
+"
+        ),
+        "{}",
+        &out[out.len().saturating_sub(300)..]
+    );
+    assert!(took < Duration::from_secs(5), "took {took:?}");
+    let methods: String = (0..n).map(|i| format!("public function m{i}(): int {{ return \"s\"; }}\n")).collect();
+    let src = format!("<?phv\ntrait T {{\n{methods}}}\nfinal class C {{ use T; }}\nfinal class D {{ use T; }}\n");
+    let (out, _, took) = compile_src("method_errors", src);
+    assert!(out.contains("in trait `T`, used by `C`"), "{}", &out[..out.len().min(500)]);
+    assert!(!out.contains("used by `D`"), "reported once: {}", &out[..out.len().min(500)]);
+    assert!(
+        out.ends_with(
+            "20000 errors found
+"
+        ),
+        "{}",
+        &out[out.len().saturating_sub(300)..]
+    );
+    assert!(took < Duration::from_secs(5), "took {took:?}");
+}
+
 /// The type arguments a class gives its ancestors double with each level of
 /// `class C<T> extends B<fn(T): T>` (25 lines took 7 GB): they are measured
 /// before they are built.

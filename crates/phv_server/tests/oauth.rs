@@ -282,6 +282,11 @@ fn start_with(iss_supported: bool, file_sessions: bool) -> (SocketAddr, Arc<Mute
     write(&dir, "public/cbflush.phv", CALLBACK_AFTER_FLUSH);
     write(&dir, "public/loginp.phv", "<?phv\nimport std.oauth.OAuth;\nOAuth::provider(\"plain\")->redirect();\n");
     write(&dir, "public/cbp.phv", CALLBACK_PLAIN);
+    write(
+        &dir,
+        "public/regen.phv",
+        "<?phv\nimport std.http.session;\nsession()->regenerate();\nsession()->set(\"user\", \"u\");\necho \"ok\";\n",
+    );
     let opts = ServeOptions {
         root: dir.clone(),
         host: "127.0.0.1".into(),
@@ -623,5 +628,58 @@ fn a_state_written_back_by_another_request_is_not_used_twice() {
     let (_, _, body) = get(addr, &cb, Some(&cookie));
     assert!(body.starts_with("error invalid_state"), "{body}");
     assert_eq!(p.lock().unwrap().token_requests, 1, "the code was not exchanged again");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A used state written back under a new session id, by a page that read the
+/// session before the callback and then called `session()->regenerate()`,
+/// does not finish a second time: the claim names the state, not the
+/// session. Found by the 20th assessment (R23-9): the callback URL worked
+/// again with the new cookie, and the code was exchanged twice.
+#[test]
+fn a_used_state_moved_to_a_new_id_by_regenerate_is_not_used_twice() {
+    let (addr, p, dir) = start_with(false, true);
+    let (cookie, params) = login(addr, &p, None);
+    let state = params["state"].clone();
+    // What the other page read.
+    let before = pending_text(&dir);
+    let cb = format!("/cb?code=code-{state}&state={state}");
+    let (_, _, body) = get(addr, &cb, Some(&cookie));
+    assert!(body.starts_with("ok sub=user-1"), "{body}");
+    // The page regenerates the session and writes back the list it read.
+    let (_, headers, _) = get(addr, "/regen", Some(&cookie));
+    let moved = headers
+        .iter()
+        .filter(|(n, _)| n == "set-cookie")
+        .find_map(|(_, v)| v.split(';').next().filter(|c| c.starts_with("PHVSESSID=") && c.len() > 20))
+        .expect("a new session cookie")
+        .to_string();
+    assert_ne!(moved, cookie);
+    let list: Vec<serde_json::Value> = serde_json::from_str(&before).unwrap();
+    set_pending(&dir, &list.iter().map(|v| v.to_string()).collect::<Vec<_>>());
+    assert!(pending_text(&dir).contains(&state), "the used state is back, under the new id");
+    let (_, _, body) = get(addr, &cb, Some(&moved));
+    assert!(body.starts_with("error invalid_state"), "{body}");
+    assert_eq!(p.lock().unwrap().token_requests, 1, "the code was not exchanged again");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A callback that carries neither a code nor an error uses up the state in
+/// the session but claims nothing in the store (a claim costs the store; a
+/// page can make none without a code).
+#[test]
+fn a_callback_without_a_code_or_an_error_claims_nothing() {
+    let (addr, p, dir) = start_with(false, true);
+    let (cookie, params) = login(addr, &p, None);
+    let state = params["state"].clone();
+    let (_, _, body) = get(addr, &format!("/cb?state={state}"), Some(&cookie));
+    assert!(body.starts_with("error invalid_request"), "{body}");
+    let claims = dir.join("sessions").join(".phv-oauth");
+    let made = std::fs::read_dir(&claims).map_or(0, |d| d.count());
+    assert_eq!(made, 0, "a claim was made");
+    // The state is used up in the session.
+    let (_, _, body) = get(addr, &format!("/cb?code=code-{state}&state={state}"), Some(&cookie));
+    assert!(body.starts_with("error invalid_state"), "{body}");
+    assert_eq!(p.lock().unwrap().token_requests, 0);
     let _ = std::fs::remove_dir_all(&dir);
 }

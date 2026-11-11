@@ -1,0 +1,5 @@
+<select><option>a</option><option value="b">b</option>
+</select>
+<select><option>a</option>
+--- runtime error ---
+Fatal error: `<svg>` inside `<select>`: `Html` inserted into a `<select>` holds it, and older browsers ignore it there and read what it holds as HTML, where the template that made the `Html` checked it as SVG or MathML; insert it outside the `<select>`

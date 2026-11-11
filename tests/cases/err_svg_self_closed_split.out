@@ -1,0 +1,8 @@
+error: only `json_html()` values and numbers can be inserted into `<script>`
+ --> err_svg_self_closed_split.phv:9:63
+  |
+9 | <svg viewBox="0 0 10 10"/<?phv if ($wide) { } ?>><script/><?= $v ?></script>
+  |                                                               ^^
+  = note: use `json_html($value)`, which produces a JavaScript value that is safe inside a script; `escape()` does not make code safe
+
+1 error found

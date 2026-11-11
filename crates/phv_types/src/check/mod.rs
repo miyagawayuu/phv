@@ -274,6 +274,11 @@ pub(crate) struct Checker<'a> {
     /// Bytes of trait methods copied into classes so far (see `traits::MAX_TRAIT_CODE`).
     trait_code: usize,
     reported_trait_code: bool,
+    /// The diagnostics `diags[..seen_len]` by severity, message and place:
+    /// one found again in a trait used by another class is dropped at once
+    /// (see `drop_repeated`), however many there are.
+    seen_diags: HashSet<(bool, String, Span)>,
+    seen_len: usize,
     /// What each trait gives (with what its type parameters stand for) while
     /// the traits of one class or trait are flattened: a trait reached along
     /// many paths is flattened at most twice (see `traits::flatten_trait`).
@@ -426,6 +431,8 @@ impl<'a> Checker<'a> {
             func_trait: HashMap::new(),
             trait_code: 0,
             reported_trait_code: false,
+            seen_diags: HashSet::new(),
+            seen_len: 0,
             trait_memo: HashMap::new(),
         }
     }
@@ -2131,17 +2138,19 @@ impl<'a> Checker<'a> {
     /// Counts `n` more inherited members; true (after reporting it once) when
     /// that goes over `MAX_INHERITED_MEMBERS`, and the members are then not copied.
     fn over_inherit_limit(&mut self, n: usize, decl: &ClassDecl) -> bool {
-        self.inherited_members += n;
+        self.over_inherit_limit_at(n, decl.name_span)
+    }
+
+    /// `over_inherit_limit`, reported at `span`.
+    fn over_inherit_limit_at(&mut self, n: usize, span: Span) -> bool {
+        self.inherited_members = self.inherited_members.saturating_add(n);
         if self.inherited_members <= MAX_INHERITED_MEMBERS {
             return false;
         }
         if !self.reported_hierarchy {
             self.reported_hierarchy = true;
-            self.error(
-                format!("the classes inherit more than {MAX_INHERITED_MEMBERS} members in total"),
-                decl.name_span,
-            )
-            .add_note("split the program into smaller class hierarchies");
+            self.error(format!("the classes inherit more than {MAX_INHERITED_MEMBERS} members in total"), span)
+                .add_note("split the program into smaller class hierarchies");
         }
         true
     }

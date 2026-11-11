@@ -1448,3 +1448,57 @@ echo $p->twice(3), " ", $q->twice(2), " ", $p->total(), " ", $q->total(), "\n";
     assert_ne!(entry(&ca), entry(&cb), "a property of another kind: another unit");
     assert_eq!(entry(&ca), entry(&cc), "the same layout: one unit");
 }
+
+/// Native code that made a register a number where it had held a list (the
+/// copy of a property read for one element, a conditional's result) left
+/// the list in its window slot: the list stayed shared, so every
+/// `$a->xs[] = ...` and every element write copied all of it (audit 20: 9.5 s
+/// natively against 0.007 s interpreted at 40,000 passes). The slot now lets
+/// the value go, as the interpreter's write does.
+#[test]
+fn numbers_written_over_lists_let_them_go() {
+    let src = r#"<?phv
+class A {
+    public list<int> $xs = [];
+    public function __construct() { $this->xs = [1]; }
+}
+function push(A $a, int $n): int {
+    for ($i = 0; $i < $n; $i++) {
+        $a->xs[] = $a->xs[$i % count($a->xs)] % 100;
+    }
+    return count($a->xs);
+}
+function pick(list<int> $xs, list<int> $ys, int $n): int {
+    $t = 0;
+    for ($i = 0; $i < $n; $i++) {
+        $zs = $i >= 0 ? $xs : $ys;
+        $t = ($t + $zs[$i]) % 1000;
+        $zs = $ys;
+        $xs[$i] = $t;
+    }
+    return $t;
+}
+$n = 40000;
+echo push(new A(), $n), " ", pick(range(0, $n), [1], $n);
+"#;
+    let dir = std::env::temp_dir().join(format!("phv-jit-test-{}-stale", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("main.phv");
+    std::fs::write(&entry, src).unwrap();
+    let mut took = Vec::new();
+    for jit in [false, true] {
+        let mut c = compile(&dir, &entry).unwrap_or_else(|e| panic!("{}", e.render(false)));
+        if jit {
+            c.enable_jit_all();
+            assert_compiled(&c, &["push", "pick"]);
+        }
+        let start = std::time::Instant::now();
+        let outcome = run(&c, RunOptions { html: false, limits: Limits::default(), http: None, host: None });
+        took.push(start.elapsed());
+        assert!(outcome.error.is_none(), "{:?}", outcome.error.map(|e| e.render()));
+        assert_eq!(outcome.output, "40001 0", "jit: {jit}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    // Copying the list at every pass copies 800 million elements in each function.
+    assert!(took[1] < took[0] * 10 + Duration::from_millis(500), "interpreted {:?}, native {:?}", took[0], took[1]);
+}

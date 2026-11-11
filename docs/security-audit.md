@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates nineteen audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, §24 an assessment of the whole implementation before 1.1.0, §25 an assessment of the whole implementation before 1.1.1, §26 an assessment of the whole implementation before 1.2.0, §27 an assessment of the whole implementation of the 1.2.0 release candidate, §28 an assessment of the whole implementation before 1.2.1, and §29 an assessment of the whole implementation before 1.3.0.
+This report consolidates twenty-one audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, §24 an assessment of the whole implementation before 1.1.0, §25 an assessment of the whole implementation before 1.1.1, §26 an assessment of the whole implementation before 1.2.0, §27 an assessment of the whole implementation of the 1.2.0 release candidate, §28 an assessment of the whole implementation before 1.2.1, §29 an assessment of the whole implementation before 1.3.0, §30 an independent review of the 1.3.2 candidate, and §31 an assessment of the whole implementation before 1.3.2.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§25: 2026-11-06, §26–§27: 2026-11-07, §28: 2026-11-08, §29: 2026-11-09)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§25: 2026-11-06, §26–§27: 2026-11-07, §28: 2026-11-08, §29: 2026-11-09, §30: 2026-11-10, §31: 2026-11-11)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -2208,3 +2208,165 @@ The test did not count token exchanges through OAuth callbacks or cover failover
 
 New attack reproduction and production deployment verification remain outstanding. The full-audit gate in the
 [release procedure](releasing.md) remains open.
+
+## 31. Twentieth Assessment: the Whole Implementation (before 1.3.2)
+
+Date: 2026-11-11. Scope: everything at 6bc5a8c, the 1.3.2 candidate: 1.3.1 (released without such an assessment:
+the OAuth used-state records kept in the shared session stores, image conversion slots, changes to the page pool) and
+1.3.2 (the JIT reusing checked property reads in loops and updating unshared list elements in place, `yield from`
+forwarding and the exception-handler buffer reused across suspension, two experimental generator settings, string
+appends borrowing their source, `Html` sharing its text with plain strings, and §30's workflow fixes), none of which
+had been attacked. Every earlier fix was attacked again.
+
+Ten reviewers each took one area: the web server; the standard library, its clients and `std.orm`; the JIT and the
+VM's data operations; generators and the VM's exception handling; templates and the tracker; the tools, CI and the
+supply chain; background jobs and the stores; sign-in and tokens; the running system as a whole; and `std.image` and
+`std.i18n`. They attacked a release build locally as in §29, with fake identity providers and the three databases in
+Docker, Chrome 157 and parse5 for templates. Each finding was confirmed with a PoC; four reviewers found R23-2
+independently. The JIT was compared with the interpreter on about 35,000 random programs (three ways each), the
+generators on about 24,200 programs under up to ten configurations (the off switches, the experimental settings,
+and 1.3.0), the image decoders fuzzed with about 3.96 million inputs, and the running server checked over 600,000
+mixed requests with every body compared: none of 1.3.2's own changes gave a wrong result, a crash or a leak between
+requests. Six groups then fixed every finding, each with regression tests, and a further reviewer attacked the code
+the fixes added.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| Critical | 2 | Fixed (one in the first fix of the other, found before the release) |
+| High | 2 | Fixed |
+| Medium | 5 | Fixed |
+| Low | 11 | Fixed |
+| Info | 15 | Fixed or documented |
+
+### Critical
+
+| # | Finding | Fix |
+|---|---|---|
+| R23-1 | A lossless WebP (VP8L) may declare up to 65,536 prefix-code groups through its 16-bit meta codes, five Huffman tables each, none depending on the canvas and none counted by image-webp or by `std.image`: a 1×1 file of 3.8 MB committed 1,315 MB under a 128 MB limit, one of 7.6 MB (inside the 8 MB upload body) 4.5 GB and 7.6 seconds past a 1-second limit, and one upload aborted a server whose memory was capped at 3 GB; also in 1.3.0 | Before image-webp decodes, `std.image` reads the lossless bitstream itself (`imaging/vp8l.rs`: the transforms, the entropy image with its backward references and color cache, every code's lengths) and counts exactly the tables and trees image-webp will build, for the main image, a lossless alpha channel and the first animation frame; past the memory left it stops with the memory error. The 7.6 MB file now ends at 13 MB in 0.06 seconds |
+| R23-34 | Found by the re-attack of the fixes: R23-1's fix counted the bitstreams of an ANMF frame only in an animation, but image-webp copies the first frame's sub-chunks into its chunk map for any extended file and decodes a VP8L or lossless ALPH found there before the top-level VP8: a file that is not an animation, with a VP8 chunk and an ANMF holding the R23-1 bitstream, used 1,264 MB (the 8 MB one 4,475 MB) under a 128 MB limit with the first fix | Every VP8L and every lossless ALPH in the file is counted, top level and the first two sub-chunks of every frame, each as long as it declares, whatever the flags say; the largest bounds the decode. The three files now end with the memory error at 1–6 MB |
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R23-2 | The used-state records of R22-25 (1.3.1) lived in 64 shards per site, 512 records each, shared by every session of a shard, and a full shard refused new claims; a claim was made before the code was looked at. One anonymous visitor filled a shard with about 512 pairs of `/login` and `/callback?state=…` without a code, and 64 sessions blocked sign-in for the whole site for about 10.5 minutes, repeatably (memory store 9.8 seconds, Redis 76–91, PostgreSQL, the file store; MySQL by the same code); 1.3.0 was not affected | Each state is a record of its own, keyed by a digest of the site, provider and state and expiring by the store's clock (Redis `SET NX` with an expiry, a SQL table swept with the sessions, a file per state, the memory store's session entry); one session holds at most 16 live claims, and only that session is refused past them; a callback with neither a code nor an error claims nothing. After the same fills, every other visitor signed in, in every store |
+| R23-3 | `PRAGMA busy_timeout` was allowed, and SQLite waits for a lock outside the steps the progress handler sees: a script held its worker for as long as it set (up to 24.8 days); two requests on a server with two workers were never answered and every other page got 503. The default 5-second wait also outran short time limits; also in 1.3.0 | The pragma is refused; a busy handler waits with back-off and gives up after 5 seconds or at the script's deadline, whichever is first. The PoC now fails at once, and a write blocked under a 1-second limit ends in 1.1 seconds |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R23-4 | Each `as` rule of a `use` scanned every member of the used traits: 40,000 aliases (2.4 MB) took 13 seconds in `phv check`, 17 nested alias levels (7 MB) 44 seconds, and the language server stopped answering for the whole workspace; the deduplication of trait diagnostics was quadratic as well; also in 1.3.0 | An index per `use` makes each rule a lookup, rules count toward the member limit, and diagnostics are deduplicated through an index: 60,000 aliases check in 0.5 seconds, the 17 levels hit the member limit at once, and the language server answers in 0.24 seconds |
+| R23-5 | An end tag inside `<svg>` or `<math>` that closes an HTML element opened before it (`</a>`, `</div>`, `</td>`, `</select>`…) was not refused: browsers leave the SVG while the tracker read on as SVG, so a following self-closed `<script/>` got the page's nonce and a visitor's value ran in Chrome 157; `<svg>` inside `<select>` did the same with older parsers; also in 1.3.0 | Inside SVG and MathML an end tag must close something opened inside them (or be one no browser acts on there); `<svg>` and `<math>` are refused while a `<select>` is open, also in inserted `Html` |
+| R23-6 | HTML inside an integration point was read as if always "in body", so table parts (`<td>`, `<tr>`, `<table>`…) inside `<foreignObject>`, `<desc>` or `<mi>` popped the SVG in a table, or were ignored by browsers but pushed by the tracker: a way around R22-8 for inserted `Html`, and in the page | The start tags of table and document parts are refused inside SVG and MathML, in the page and in inserted `Html`; the reviewer's fuzzers flag 0 templates, against 169 |
+| R23-7 | A sequential JPEG whose first scan lacks components keeps every coefficient in the decoder, unreserved: 162 bytes at 8000×5000 used 369 MB (449 MB as CMYK) under a 128 MB limit; also in 1.3.0 | The decoder's own header parse is read up to the first scan, and the coefficients are reserved when it does not hold every component: 6 MB, the memory error before decoding |
+| R23-8 | The image conversion slots of 1.3.1 threw at once when none was free and had no share per client: one client keeping as many conversions as slots running (each a 146 KB upload, held about 4 seconds, also after the client left) made 259 of 260 conversions of other visitors fail, where 1.3.0 answered all; ordinary bursts lost a few | A conversion waits for a slot in arrival order within the page's limits; one client address holds at most half of the slots; a waiting conversion whose client has gone takes none. Under the same attack, 160 of 160 conversions of another visitor succeeded |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R23-9 | The used-state digest held the session id, so a page calling `session()->regenerate()` with a stale pending list made a used callback URL work again (two code exchanges) | The digest is of the site, provider and state only |
+| R23-10 | A vertical tab is whitespace to MySQL, MariaDB and PostgreSQL but not to PHV's reading of SQL words: `XA\vPREPARE` and `PREPARE\vTRANSACTION` got past R22-15 (a prepared transaction outlived its script and held its rows), and `ROLLBACK\v` past R22-4 and R22-13 (a lost update) | One definition of SQL whitespace, vertical tab included, wherever words are read |
+| R23-11 | std.orm forgot other Repos' writes per exact table name, while SQLite (and MySQL on Windows and macOS) ignore case | Table names are compared without case |
+| R23-12 | `lastInsertId()` saturated at the largest `int`, so an unsigned AUTO_INCREMENT key past it gave the entity another row's key | A value that does not fit raises `DatabaseError` |
+| R23-13 | A SQLite statement that rolled back outside `transaction()` (`INSERT OR ROLLBACK`, `RAISE(ROLLBACK)` in a trigger) was not seen by std.orm | Any statement that leaves a transaction it found open makes the Repos forget |
+| R23-14 | On the admin port a connection that sent only empty lines counted as having sent a request, so 64 of them from 16 addresses made the server close every new connection, probes from other addresses included (70 of 74 closed): a way around R22-21 | A request head counts only after a byte other than CR or LF; under the same attack 74 of 74 probes were answered |
+| R23-15 | Adding the server's own `Vary` name kept only the first `Vary` field, so a page's own (`Vary: Cookie`) could be dropped when compression, CORS or i18n added theirs | Every field is merged, without duplicates |
+| R23-16 | A statement between `/` and `>` (`<svg …/<?phv … ?>>`) hid a self-closed `<svg/>` from the tracker | The slash is part of the tracker's state across pieces |
+| R23-17 | The GIF decoder kept XMP and ICC application blocks outside the reservation (up to about 8 MB through an upload) | GIFs are read through a view that drops those blocks |
+| R23-18 | The interpreter kept a returned call's registers, so a list, map or string passed to a helper stayed shared and the caller's next append copied it: a loop calling a helper and growing a collection took quadratic time (n = 40,000: 6–22 seconds; a 70-byte request held a worker for 15.8 seconds); also in 1.3.0 | A returning call lets go of the registers that may hold such values (worked out once per function); the same request takes 0.04 seconds |
+| R23-19 | Native code left a value in a register's slot when it wrote a number there, so a stale temporary kept a list shared and the next write copied it (a compiled loop 4.5–10 seconds against 0.04 interpreted), defeating 1.3.2's in-place element writes; also in 1.3.0 | The JIT empties a slot that may hold such a value when it writes a number over it; the loop takes 0.04 seconds |
+
+### Info
+
+| # | Finding | Fix |
+|---|---|---|
+| R23-20 | A buffered page answering a request with a cookie got no `Cache-Control`, where the same page streamed got `private, no-store` | Both get `private, no-store` unless the page sets `Cache-Control`, as the specification said |
+| R23-21 | The MySQL pool's fit (8094110) accepted any longer socket timeout, so a page could take a connection a job made with a one-hour limit | A connection serves limits from its own down to half of it |
+| R23-22 | Connections `queryAsync()` made with the time left never fitted a page afterwards | They are made with the script's full limits |
+| R23-23 | `packaging/licenses.py` read a crate's `license_file` outside the crate's folder | It resolves the path, requires it inside the crate and skips links |
+| R23-24 | `bench/compare_php.py` could run `php` from the current folder on Windows | A bare name is looked up in the absolute folders of `PATH` only |
+| R23-25 | libsqlite3-sys 0.39.1 (SQLite 3.54.1) and rusqlite 0.41.1 were out | SQLite 3.54.1 is taken (its opcode list is unchanged); rusqlite 0.41.1, whose one change PHV does not reach, waits for the next update under the two-week rule |
+| R23-26 | Expired used-state records were never removed | Every store removes them |
+| R23-27 | A server whose clock ran ahead could prune other servers' claims early | Expiry is counted by the store's clock; the specification asks that a site's servers agree within 30 seconds |
+| R23-28 | Nothing warned when a Redis session store may evict keys, which voids the one-use guarantee (RC32-01) | A warning at startup names the eviction policy |
+| R23-29 | A value inserted into a list attribute (`srcset`, animation `values`) could start an item of its own | Every insertion into such a list is checked as an item's start; animation values take numbers |
+| R23-30 | Under `PHV_VM_PRUNE_GEN_REGS=1` a waiting generator drops variables it no longer reads, where the specification said it keeps its variables | Documented next to the setting |
+| R23-31 | Under that setting, a plan that did not fit in memory was worked out again at every generator creation | The failure is remembered |
+| R23-32 | Smaller overshoots of `std.image`: a GIF frame larger than its screen, a VP8 partition declared past the file, very wide JPEGs | Counted |
+| R23-33 | On Linux the self-call check lost the scope of a link-local IPv6 address | The address is compared with its scope |
+| R23-35 | Found by the re-attack: `imagesrcset` (`<link rel=preload as=image>`), `attributionsrc` and `archive` fetch URLs but were not URL attributes to the tracker, so a visitor's string could start them (nothing runs there) | They are URL attributes, and `imagesrcset` a list of URLs like `srcset` |
+
+### Residual Risks
+
+- In Redis, the SQL stores and the file store, the number of used-state records is bounded by the callback rate over
+  about 10.5 minutes (each record costs two page requests); the memory store's by its session limits.
+- Jobs and `phv run` take no image conversion slot.
+- A page answering a request that carries any cookie is `private, no-store` unless it sets `Cache-Control` itself.
+- The decoders and encoders of `std.image` still cannot be interrupted (§29).
+- HTTP/2 frame-level attacks were not run (no client), nor Firefox and Safari for templates.
+- §29's residual risks remain, and those §30 lists (RC32-01's recovery case).
+
+### Verification
+
+The PoCs were run again against the fixed release build (before → after):
+- a 1×1 lossless WebP with 65,536 code groups, and one of 7.6 MB: 1,315 MB, and 2,064 MB in 12.9 seconds, under a
+  128 MB limit → the memory error at 13 MB within 0.14 seconds; the same bitstreams in an ANMF frame of a file that is
+  not an animation (R23-34): 1,264 and 4,475 MB with the first fix → the memory error at 1–6 MB;
+- the used-state fills (R23-2): after 32,748 claims, 20 of 20 real sign-ins refused (memory store, Redis) → after
+  32,864 and 33,318 claims, 20 of 20 reached the provider; one session's 520 sign-ins, a victim in its shard refused
+  in every store → both victims reached the provider in every store; the regenerate replay (R23-9): two exchanges →
+  `invalid_state`, one exchange;
+- `PRAGMA busy_timeout` under a 2-second limit: 22.5 seconds → refused in 0.13 seconds; with two workers, two
+  requests never answered and `/ok` 503 → 500 in 0.03 seconds and `/ok` 200 in 7 ms;
+- 40,000 trait aliases: 13 seconds in `phv check` → 0.35 seconds; the language server's hover 11.6 → 0.24 seconds;
+- the template breakouts (R23-5, R23-6, R23-16) in Chrome 157: the visitor's script ran in six pages → refused at check
+  or at run time; the reviewer's fuzzers 169 flagged templates → 0;
+- a JPEG whose first scan lacks components: 374 MB → 6 MB; a GIF with XMP blocks: 195 → 101 MB;
+- image slots held by one client: 259 of 260 conversions of another visitor failed → 160 of 160 succeeded;
+- `XA\vPREPARE`: the prepared transaction outlived the script → refused; `ROLLBACK\v`: a lost update → `DatabaseError`;
+- the admin port flooded with empty lines from 16 addresses: 70 of 74 probes closed → 74 of 74 answered;
+- a helper growing a collection, n = 40,000: 5.8 seconds (interpreter) and 4.5–10 seconds (native) → 0.03–0.12.
+
+A further reviewer then attacked the code the fixes added: the bitstream reader (about 1.7 million inputs, in process
+with overflow checks, against image-webp 0.2.4 measured by a counting allocator: no panic, overflow or hang, never a
+bitstream decoded that the reader refused, never more than 64 KB past its count), the used-state records (two servers
+sharing each of the file, Redis, PostgreSQL and MySQL stores, twelve trials each of twelve concurrent callbacks with a
+regenerating stale page: every code exchanged once), the template rules (52,000 generated templates and about 180
+written by hand against parse5 and Chrome 157: none ran a value), and the registers let go on return (44,745 programs
+and the test cases, interpreter and JIT, against the unfixed binary: no difference). It found R23-34 and R23-35, fixed
+and checked against its files.
+
+All tests pass on Windows and on Linux (Docker), against PostgreSQL 17, MySQL 8.4 and Redis 7, with clippy
+(`-D warnings`) and rustfmt. The benchmarks of `bench/`, run back to back with the binary of 6bc5a8c
+(`bench/results/6bc5a8c-loaded.json`, `audit20-loaded.json`): the server's pages 0.98–1.01 in requests per second,
+the editor's rows 0.74–1.00, and the micro-benchmarks 0.93–1.07, where creating objects and throwing exceptions are
+4–7% slower (a returning constructor lets go of its registers) and the rest within noise.
+
+### Regression tests
+
+Regression tests are named after what they check, in each crate's tests and in `tests/cases` and `tests/db`
+(`err_svg_end_around`, `err_html_table_part_in_svg`, `err_html_svg_in_select`, `err_svg_self_closed_split`,
+`err_animate_values`, `orm_forgets_other_writes`, `mysql_orm_keys`). Some of the others:
+- `image.rs`: `a_lossless_webp_with_many_code_groups_stays_within_the_limit` (also in an ANMF frame of a file that is
+  not an animation), `a_sequential_jpeg_whose_first_scan_lacks_components_counts_its_coefficients`;
+  `phv_std`: `lossless_webp_prefix_codes_are_counted_before_image_webp_builds_them`,
+  `gif_metadata_extensions_are_not_collected`; `phv_server`: `one_address_cannot_take_every_image_conversion_slot`;
+- `oauth.rs` and `session.rs`: `database_claims_leave_room_for_every_other_session`,
+  `claims_of_other_sessions_leave_room_for_a_new_one`,
+  `a_used_state_stays_used_when_a_stale_save_regenerates_the_session`,
+  `database_claims_expire_by_the_stores_clock_and_are_removed`, `a_redis_store_that_evicts_keys_is_told`;
+- `sqlite_limits.rs`: `a_write_waiting_for_a_lock_stops_at_the_time_limit`; `netdb`:
+  `prepared_transactions_are_refused` and `statements_that_end_or_roll_back_a_transaction_are_told_apart` (with
+  vertical tabs); `databases.rs`: `a_connection_made_for_a_much_longer_time_limit_is_not_used_for_a_short_one`;
+- `compile_cost.rs`: `many_trait_aliases_check_at_once`, `many_errors_in_traits_are_reported_at_once`; `lsp.rs`:
+  `answers_with_many_trait_aliases_open`; `linear.rs`: `growing_a_value_passed_to_a_helper_takes_linear_time`;
+  `jit.rs`: `numbers_written_over_lists_let_them_go`;
+- `htmlctx.rs`: `end_tags_inside_foreign_content_close_only_what_it_opened`,
+  `table_parts_inside_foreign_content_are_refused`, `every_url_of_a_list_is_checked`;
+- `admin.rs`: `connections_sending_only_empty_lines_do_not_keep_probes_out`; `http.rs`:
+  `a_pages_own_vary_fields_are_all_kept`, `a_buffered_page_asked_with_a_cookie_is_private`;
+  `packaging/test_licenses.py`, `bench/test_compare_php.py`.

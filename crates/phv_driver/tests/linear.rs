@@ -151,3 +151,57 @@ try {
          {\"a\":\"xy3\"}{\"a\":\"xy\"}\nundefined map key \"missing\"\n"
     );
 }
+
+/// A loop that passes a list, a string or a map to a helper and then grows
+/// it: the interpreter kept the helper's parameter after it returned, so the
+/// caller's value stayed shared and each append copied all of it (audit 20:
+/// 40,000 passes took 12 to 22 s, and a 70-byte request held a worker for
+/// 16 s). A returned call now lets its strings, collections and objects go.
+#[test]
+fn growing_a_value_passed_to_a_helper_takes_linear_time() {
+    let src = r#"<?phv
+function first(list<int> $xs): int {
+    return $xs[0];
+}
+function size(string $s): int {
+    $t = $s;
+    return strlen($t);
+}
+function has(map<string, int> $m, string $k): bool {
+    return $m->has($k);
+}
+function kept(list<int> $xs): list<int> {
+    return $xs;
+}
+$n = 40000;
+$xs = [1];
+$t = 0;
+for ($i = 0; $i < $n; $i++) {
+    $t += first($xs);
+    $xs[] = $i;
+}
+$s = "";
+for ($i = 0; $i < $n; $i++) {
+    $t += size($s);
+    $s .= "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+}
+map<string, int> $m = [];
+for ($i = 0; $i < $n; $i++) {
+    if (!has($m, "k" . $i)) {
+        $m["k" . $i] = $i;
+    }
+}
+$ys = [0];
+for ($i = 0; $i < $n; $i++) {
+    $ys = kept($ys);
+    $ys[] = $i;
+}
+echo count($xs), " ", strlen($s), " ", count($m), " ", count($ys), " ", $t;
+"#;
+    let start = Instant::now();
+    let limits = Limits { max_time: Some(Duration::from_secs(60)), ..Limits::default() };
+    let (out, _) = run_src("helper", src, limits);
+    assert_eq!(out, "40001 2560000 40000 40001 51198760000");
+    // Copying at every pass copies more than 50 GB in all.
+    assert!(start.elapsed() < Duration::from_secs(10), "took {:?}", start.elapsed());
+}

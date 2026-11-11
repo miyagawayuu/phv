@@ -120,7 +120,11 @@ export class Database {
         return new Future(fn(): int => __async_int($id));
     }
 
-    /** The id of the last inserted row (SQLite, MySQL; with PostgreSQL use `RETURNING id`). */
+    /**
+     * The id of the last inserted row (SQLite, MySQL; with PostgreSQL use
+     * `RETURNING id`). `DatabaseError` when it is too large for `int` (an
+     * unsigned MySQL key past 9223372036854775807).
+     */
     public function lastInsertId(): int {
         return __db_last_id($this->handle);
     }

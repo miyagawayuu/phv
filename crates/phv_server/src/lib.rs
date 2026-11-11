@@ -119,7 +119,9 @@ struct State {
     time_limit: Duration,
     config: Config,
     sessions: Arc<session::Store>,
-    image_slots: Arc<std::sync::atomic::AtomicUsize>,
+    /// Image conversions running at once (`std.image`): waited for in turn,
+    /// at most half of them for one client address.
+    image_slots: Arc<phv_vm::image_slots::ImageSlots>,
     /// Key for CSRF tokens: derived from `[security] secret_env`, or new on
     /// every start (open forms then need a reload).
     csrf_secret: Vec<u8>,
@@ -238,7 +240,7 @@ impl State {
             csrf_old: None,
             secret: None,
             workers: Arc::new(tokio::sync::Semaphore::new(config.workers)),
-            image_slots: Arc::new(std::sync::atomic::AtomicUsize::new(image_slots)),
+            image_slots: Arc::new(phv_vm::image_slots::ImageSlots::new(image_slots)),
             pages: pool::Pool::new(),
             body_budget: Arc::new(tokio::sync::Semaphore::new(config.workers.max(1) * (MAX_BODY / 1024))),
             buffered: Arc::new(AtomicUsize::new(0)),
@@ -579,7 +581,13 @@ fn url_host_port(url: &str) -> Option<(String, u16)> {
         _ => (authority, default),
     };
     let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
-    (!host.is_empty()).then(|| (host.to_string(), port))
+    // The zone of a link-local IPv6 address is written `%25<zone>` in a URL
+    // (RFC 6874): `[fe80::1%25eth0]` is `fe80::1%eth0` (R23-33).
+    let host = match host.split_once('%') {
+        Some((ip, zone)) if zone.len() > 2 && zone.starts_with("25") => format!("{ip}%{}", &zone[2..]),
+        _ => host.to_string(),
+    };
+    (!host.is_empty()).then_some((host, port))
 }
 
 /// Whether `host` (a name or an address) reaches the server listening on
@@ -587,7 +595,8 @@ fn url_host_port(url: &str) -> Option<(String, u16)> {
 fn is_this_server(host: &str, addr: SocketAddr) -> bool {
     use std::net::ToSocketAddrs;
     let Ok(resolved) = (host, addr.port()).to_socket_addrs() else { return false };
-    resolved.into_iter().any(|a| phv_std::reaches_listener(a.ip(), a.port(), addr))
+    // With the scope a link-local IPv6 address resolved to (R23-33).
+    resolved.into_iter().any(|a| phv_std::reaches_listener(a, addr))
 }
 
 fn serve_with(
@@ -2550,6 +2559,12 @@ impl State {
         }
 
         let had_session = session.id.is_some();
+        // The image conversion slots, as this request's client takes them.
+        let image_slots = {
+            let client = ip.parse::<std::net::IpAddr>().map_or_else(|_| ip.clone(), phv_std::ratelimit::client_key);
+            let gone = parts.extensions.get::<ClientGone>().map_or_else(Default::default, |g| g.0.clone());
+            phv_vm::image_slots::ImageSlotsFor::new(self.image_slots.clone(), client, gone)
+        };
         let mut ctx = HttpCtx {
             ws,
             can_publish: true,
@@ -2562,7 +2577,7 @@ impl State {
             session,
             oauth_states: (!self.config.host.oauth.is_empty())
                 .then(|| self.sessions.clone() as Arc<dyn phv_vm::OAuthStates>),
-            image_slots: Some(self.image_slots.clone()),
+            image_slots: Some(image_slots.clone()),
             csrf_secret: self.csrf_secret.clone(),
             csrf_cookie,
             remote_ip: ip,
@@ -2593,7 +2608,7 @@ impl State {
         drop(body);
         // What the error page of this request gets: the request line and headers, nothing sent in it.
         let error_ctx = || HttpCtx {
-            image_slots: Some(self.image_slots.clone()),
+            image_slots: Some(image_slots.clone()),
             method: parts.method.as_str().to_string(),
             path: percent_encoding::percent_decode_str(parts.uri.path()).decode_utf8_lossy().into_owned(),
             headers: parts
@@ -2811,11 +2826,13 @@ impl State {
         }
         // Personalized responses must not be stored by shared caches: those that use the
         // session or cookies, or carry a CSRF token (it is tied to the visitor's cookie).
-        // A streamed page (flush()) may still make itself personal after its head
-        // is sent (a CSRF token needs the visitor's cookie): its head is personal
-        // when the request carries a cookie or credentials (found by the 1.2 audit).
+        // A page may answer with what a cookie or credentials say without the server
+        // seeing it (`request()` hands it every cookie and header), so a response to a
+        // request that carries a cookie or credentials is personal too, whole or
+        // streamed (found by the 1.2 audit for streamed heads, which a page may still
+        // make personal after flush(); by the 20th assessment, R23-20, for whole ones).
         let credentials =
-            keep && http.headers.iter().any(|(k, v)| (k == "cookie" || k == "authorization") && !v.trim().is_empty());
+            http.headers.iter().any(|(k, v)| (k == "cookie" || k == "authorization") && !v.trim().is_empty());
         let personal = touched_session || sets_cookie || http.personalized || credentials;
         // What the page does after flush() knows whether its head was personal.
         http.personalized = personal;
@@ -2924,6 +2941,22 @@ async fn read_body(
     Ok((Bytes::from(data), held))
 }
 
+/// Set when a request is dropped before its page answered it (its client's
+/// connection closed): an image conversion of the page then takes no slot.
+#[derive(Clone, Default)]
+struct ClientGone(Arc<std::sync::atomic::AtomicBool>);
+
+/// Sets its flag when dropped, unless disarmed.
+struct GoneOnDrop(Option<Arc<std::sync::atomic::AtomicBool>>);
+
+impl Drop for GoneOnDrop {
+    fn drop(&mut self) {
+        if let Some(gone) = &self.0 {
+            gone.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 async fn run_script(
     state: &Arc<State>,
     script: PathBuf,
@@ -2932,7 +2965,10 @@ async fn run_script(
     req: Request<Incoming>,
     kind: Page,
 ) -> Resp {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
+    let gone = ClientGone::default();
+    parts.extensions.insert(gone.clone());
+    let mut gone_on_drop = GoneOnDrop(Some(gone.0));
     // Memory is bounded by the scripts running at once, the bodies they read and
     // the output waiting to be sent; past a limit, new requests are turned away for now.
     // Over HTTP/2 a connection has several requests at once: none of their
@@ -3002,6 +3038,8 @@ async fn run_script(
     let done = tokio::select! {
         biased;
         Ok(mut head) = &mut head_rx => {
+            // The page goes on streaming: its client is followed by the stream.
+            gone_on_drop.0 = None;
             head.extensions_mut().insert(served);
             return head;
         }
@@ -3307,7 +3345,8 @@ mod tests {
             config.workers = workers;
             let state = State::new(root.clone(), false, Duration::from_secs(5), config);
             let expected = if workers == 16 { 6 } else { (workers / 4).max(1) };
-            assert_eq!(state.image_slots.load(Ordering::Relaxed), expected, "{workers} workers");
+            assert_eq!(state.image_slots.total(), expected, "{workers} workers");
+            assert_eq!(state.image_slots.per_client(), (expected / 2).max(1), "{workers} workers");
         }
     }
 
@@ -3320,6 +3359,10 @@ mod tests {
         assert_eq!(url_host_port("ws://[::1]:9000/socket?x=1"), Some(("::1".into(), 9000)));
         assert_eq!(url_host_port("wss://game.example.com/"), Some(("game.example.com".into(), 443)));
         assert_eq!(url_host_port("ftp://a/"), None);
+        // A zone is `%25<zone>` in a URL (RFC 6874).
+        assert_eq!(url_host_port("http://[fe80::1%25eth0]:8080/"), Some(("fe80::1%eth0".into(), 8080)));
+        assert_eq!(url_host_port("http://[fe80::1%2522]:8080/"), Some(("fe80::1%22".into(), 8080)));
+        assert_eq!(url_host_port("http://[fe80::1%22]:8080/"), Some(("fe80::1%22".into(), 8080)));
         let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         assert!(is_this_server("127.0.0.1", loopback));
         assert!(is_this_server("localhost", loopback));
@@ -3346,7 +3389,7 @@ mod tests {
             assert!(is_this_server("::ffff:0.0.0.0", listen), "{listen}");
         }
         let other_port: SocketAddr = "127.0.0.1:8081".parse().unwrap();
-        assert!(!phv_std::reaches_listener("0.0.0.0".parse().unwrap(), 8080, other_port));
+        assert!(!phv_std::reaches_listener("0.0.0.0:8080".parse().unwrap(), other_port));
     }
 
     #[test]

@@ -12,6 +12,13 @@ error: `</math>` while the HTML element `<b>` opened inside SVG or MathML is sti
    |                       ^
    = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
 
+error: `</desc>` while the HTML element `<p>` opened after it inside SVG or MathML is still open, where browsers may close both, or an element around the SVG or MathML
+  --> err_svg_end_ignored.phv:11:22
+   |
+11 | <svg><desc><p>a</desc></svg></p>
+   |                      ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
 error: `</svg>` while the HTML element `<p>` opened inside SVG or MathML is still open, where browsers ignore it
   --> err_svg_end_ignored.phv:11:28
    |
@@ -47,4 +54,4 @@ error: `</div>` inside SVG or MathML that an HTML element `<div>` around it is o
    |                                    ^
    = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
 
-7 errors found
+8 errors found

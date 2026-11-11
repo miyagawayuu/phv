@@ -175,7 +175,7 @@ pub(super) fn my_connect(
 /// little after the time limit (statements are stopped at the deadline with
 /// KILL QUERY before that); no packet (one row, mostly) is larger than half
 /// the script's memory.
-fn my_io_limits(memory: Option<usize>, time_limit: Option<Duration>) -> (Duration, usize) {
+pub(super) fn my_io_limits(memory: Option<usize>, time_limit: Option<Duration>) -> (Duration, usize) {
     let io_timeout = time_limit.map_or(Duration::from_secs(300), |t| t + Duration::from_secs(10));
     (io_timeout, memory.unwrap_or(128 << 20) / 2)
 }
@@ -185,12 +185,22 @@ fn my_io_limits(memory: Option<usize>, time_limit: Option<Duration>) -> (Duratio
 /// (found while checking the fixes of the 19th assessment: a connection made
 /// by a script with a 2-second limit, taken by one with 60 seconds, gave up
 /// on a 14-second statement after 12 seconds with "the time limit was
-/// reached"). A connection made for a longer limit serves a shorter one: its
-/// statements are stopped at the deadline by KILL QUERY, and the socket's
-/// timeout only bounds the wait for a server that stops answering.
+/// reached"). A connection made for a somewhat longer limit serves a shorter
+/// one: its statements are stopped at the deadline by KILL QUERY, and the
+/// socket's timeout only bounds the wait for a server that stops answering,
+/// where KILL QUERY cannot get through either. That wait is bounded above
+/// too, at twice the script's own (found by the 20th audit: a page could
+/// take a connection a job with a one-hour limit made, and wait an hour past
+/// its 30 seconds for a server that stopped answering).
 pub(super) fn my_fits(memory: Option<usize>, time_limit: Option<Duration>) -> impl Fn(&MyConn) -> bool {
     let (io_timeout, packet) = my_io_limits(memory, time_limit);
-    move |c: &MyConn| c.io_timeout >= io_timeout && c.packet >= packet
+    move |c: &MyConn| io_timeout_fits(c.io_timeout, io_timeout) && c.packet >= packet
+}
+
+/// Whether a connection's socket timeout `have` serves a script that needs
+/// `need` (see `my_fits`): at least as long, and at most twice as long.
+pub(super) fn io_timeout_fits(have: Duration, need: Duration) -> bool {
+    have >= need && have <= need.saturating_mul(2)
 }
 
 pub(super) fn my_message(e: &mysql::Error) -> String {

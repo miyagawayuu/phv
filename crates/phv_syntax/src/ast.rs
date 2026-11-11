@@ -147,6 +147,11 @@ pub enum EchoContext {
     Handler,
     /// A URL attribute that starts with `javascript:`, `vbscript:` or `data:`.
     ScriptUrl,
+    /// The `values` of an SVG animation element (`<animate>`, `<set>`...), a
+    /// `;`-separated list whose every item may become a link's URL
+    /// (`attributeName="href"`): a string or `SafeUrl` could hold `;` and
+    /// add a `javascript:` item of its own, so only numbers go there.
+    UrlListNumber,
     /// `<iframe srcdoc="...">`: its value is parsed as an HTML document.
     Srcdoc,
     /// The URL of a `<script>` (`src`, or `href` in SVG): the tag gets the CSP

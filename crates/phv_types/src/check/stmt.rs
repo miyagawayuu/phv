@@ -115,7 +115,11 @@ impl Checker<'_> {
                     let h = html_inside(h, *ctx);
                     if matches!(
                         ctx,
-                        EchoContext::Attr | EchoContext::Url | EchoContext::UrlReference | EchoContext::MetaContent
+                        EchoContext::Attr
+                            | EchoContext::Url
+                            | EchoContext::UrlReference
+                            | EchoContext::UrlListNumber
+                            | EchoContext::MetaContent
                     ) {
                         out.push(HStmt::EchoAttr(h));
                     } else {

@@ -198,7 +198,7 @@ class Database
 - `public function execute(Sql $query): int` — Runs INSERT / UPDATE / DELETE / DDL and returns the number of changed rows.
 - `public function queryAsync(Sql $query): Future<list<Row>>` — `query()` in the background, on a connection of its own (so outside a transaction of this connection). Wait for the rows with `await()`. With SQLite the statement runs right away.
 - `public function executeAsync(Sql $query): Future<int>` — `execute()` in the background, like `queryAsync()`.
-- `public function lastInsertId(): int` — The id of the last inserted row (SQLite, MySQL; with PostgreSQL use `RETURNING id`).
+- `public function lastInsertId(): int` — The id of the last inserted row (SQLite, MySQL; with PostgreSQL use `RETURNING id`). `DatabaseError` when it is too large for `int` (an unsigned MySQL key past 9223372036854775807).
 - `public function transaction(fn(): void $work): void` — Runs `$work` in a transaction; rolls back if it throws.
 - `public function close(): void`
 

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import platform
 import shutil
 import statistics
@@ -23,6 +24,33 @@ echo json_encode([
 """
 
 
+def program(name):
+    """The executable `name` names: a path with a folder (`./phv`,
+    `target/release/phv.exe`) as given; a bare name only in the folders of PATH
+    that are absolute. Never the current folder, which Windows searches first for
+    a bare name, and so does `shutil.which`: a `php.bat` there ran
+    (20th assessment, R23-24)."""
+    seps = [os.sep] + ([os.altsep] if os.altsep else [])
+    if any(s in name for s in seps):
+        found = shutil.which(str(Path(name).resolve()))
+        return str(Path(found).resolve()) if found else None
+    # Looked up here: `shutil.which(name, path=folder)` on Windows tries the
+    # current folder first, even with a folder given.
+    suffixes = [""]
+    if os.name == "nt":
+        exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+        if not any(name.lower().endswith(e.lower()) for e in exts):
+            suffixes = exts
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if not folder or not os.path.isabs(folder):
+            continue
+        for suffix in suffixes:
+            candidate = os.path.join(folder, name + suffix)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return str(Path(candidate).resolve())
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phv", required=True, help="path to a PHV release binary")
@@ -32,10 +60,9 @@ def main():
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")
-    phv, php = shutil.which(args.phv), shutil.which(args.php)
+    phv, php = program(args.phv), program(args.php)
     if not phv or not php:
-        parser.error("--phv and --php must identify executable CLI binaries")
-    phv, php = str(Path(phv).resolve()), str(Path(php).resolve())
+        parser.error("--phv and --php must identify executable CLI binaries (a path, or a name found in PATH)")
 
     source = ROOT / "bench/runtime.phv"
     # Keep the workloads and measurement boundaries identical across the two languages.

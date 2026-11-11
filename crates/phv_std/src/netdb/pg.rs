@@ -127,13 +127,27 @@ pub(super) enum PgText {
     Other,
 }
 
+/// Whether `c` separates words of SQL: the space characters of the lexers of
+/// PostgreSQL (16 and later), MySQL and MariaDB, `[ \t\n\r\f\v]` (found by
+/// the 20th audit: Rust's ASCII whitespace leaves out the vertical tab, so
+/// `XA\vPREPARE` was read as one word, and `ROLLBACK\v` as no `ROLLBACK`).
+/// SQLite refuses a vertical tab, which costs nothing here.
+fn is_sql_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0C' | '\x0B')
+}
+
+/// The words of `text`, split at SQL spaces (`is_sql_space`).
+fn sql_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(is_sql_space).filter(|w| !w.is_empty())
+}
+
 pub(super) fn pg_text(text: &str) -> PgText {
-    let words: Vec<String> =
-        text.trim().trim_end_matches(';').split_ascii_whitespace().take(3).map(|w| w.to_ascii_uppercase()).collect();
+    let text = text.trim_matches(is_sql_space);
+    let words: Vec<String> = sql_words(text.trim_end_matches(';')).take(3).map(|w| w.to_ascii_uppercase()).collect();
     let word = |i: usize| words.get(i).map_or("", String::as_str);
     match word(0) {
         // `SELECT ... INTO` creates a table.
-        "SELECT" | "WITH" if text.split_ascii_whitespace().any(|w| w.eq_ignore_ascii_case("INTO")) => PgText::Other,
+        "SELECT" | "WITH" if sql_words(text).any(|w| w.eq_ignore_ascii_case("INTO")) => PgText::Other,
         "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "WITH" | "VALUES" => PgText::Plain,
         "BEGIN" | "START" => PgText::Begin,
         "COMMIT" | "ROLLBACK" | "END" | "ABORT"
@@ -623,7 +637,7 @@ fn leading_words(text: &str, n: usize, comments: Comments, skipped: &mut Vec<u64
             while i < b.len() && b[i] != b'\n' {
                 i += 1;
             }
-        } else if b[i].is_ascii_whitespace() || b[i] == b';' || b[i] == b'(' {
+        } else if is_sql_space(b[i] as char) || b[i] == b';' || b[i] == b'(' {
             end_word(&mut word, &mut words);
             i += 1;
         } else {
@@ -702,7 +716,7 @@ fn all_readings(text: &str, n: usize, dialect: Dialect) -> Vec<Vec<String>> {
 /// (the common case, decided without reading comments); true when it starts
 /// with one of them, or with anything else than a letter (a comment).
 fn first_word_may_be(text: &str, words: &[&str]) -> bool {
-    let t = text.trim_start();
+    let t = text.trim_start_matches(is_sql_space);
     let len = t.bytes().take_while(|b| b.is_ascii_alphabetic()).count();
     len == 0 || words.iter().any(|w| t[..len].eq_ignore_ascii_case(w))
 }

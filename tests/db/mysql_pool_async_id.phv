@@ -1,0 +1,11 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs: the id of a connection
+// queryAsync() made. The script's own connection goes back to the pool
+// first (close()), then the background one (it sleeps), so the next script
+// is offered that one first.
+import std.db.Database;
+
+$db = Database::connect("main");
+$f = $db->queryAsync(sql"SELECT CONNECTION_ID() AS id, SLEEP(0.5) AS s");
+$db->close();
+echo $f->await()[0]->int("id") ?? 0;

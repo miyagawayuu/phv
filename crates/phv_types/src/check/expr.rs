@@ -422,6 +422,11 @@ impl<'a> Checker<'a> {
                 "values cannot be inserted into a `javascript:` (or `data:`) URL",
                 "put the value in a `data-*` attribute and read it from a script",
             ),
+            UrlListNumber if numeric => return,
+            UrlListNumber => (
+                "only numbers can be inserted into the `values` of an SVG animation element",
+                "each `;`-separated value may become a link's URL (`attributeName=\"href\"`), and a string or `safe_url()` value could hold `;` and add a `javascript:` value of its own; write the values in the template",
+            ),
             Srcdoc => (
                 "values cannot be inserted into `srcdoc`",
                 "its value is parsed as a separate HTML document, where escaping does not apply; serve the content as its own page and use `src`",
