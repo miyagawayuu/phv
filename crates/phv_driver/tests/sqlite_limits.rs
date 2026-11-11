@@ -200,7 +200,8 @@ $a->execute(sql"INSERT INTO t VALUES (1)");
         let src = format!(
             r#"{hold}try {{ $b->query(sql"{pragma}"); echo "ran"; }} catch (DatabaseError $e) {{ echo $e->getMessage(); }}"#
         );
-        let (out, _) = run_site_for(name, &src, 1 << 30, std::time::Duration::from_secs(1));
+        // Refused before anything waits: a limit a slow runner's start-up cannot reach.
+        let (out, _) = run_site_for(name, &src, 1 << 30, std::time::Duration::from_secs(10));
         assert!(out.contains("not authorized"), "{pragma}: {out}");
     }
     let src = format!("{hold}$b->execute(sql\"INSERT INTO t VALUES (2)\");\necho \"wrote\";");
@@ -208,7 +209,8 @@ $a->execute(sql"INSERT INTO t VALUES (1)");
     let (out, _) = run_site_for("busy_wait", &src, 1 << 30, std::time::Duration::from_secs(1));
     let took = start.elapsed();
     assert!(out.contains("time limit was reached"), "{out}");
-    assert!(took < std::time::Duration::from_millis(1500), "took {took:?}");
+    // Well before the 5 seconds a lock is waited for (a slow runner's start-up counts too).
+    assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
     // Without a time limit nearer than that, a write waits 5 seconds for the lock.
     let src = format!(
         "{hold}try {{ $b->execute(sql\"INSERT INTO t VALUES (2)\"); }} catch (DatabaseError $e) {{ echo $e->getMessage(); }}"

@@ -154,6 +154,11 @@ fn get_from(addr: SocketAddr, from: [u8; 4], path: &str) -> (u16, String, Durati
 /// (the 20th audit's R23-8: in 1.3.1 every conversion past the slots threw).
 #[test]
 fn one_address_cannot_take_every_image_conversion_slot() {
+    // A second client address on the loopback (macOS has only 127.0.0.1 unless configured).
+    if std::net::TcpListener::bind("127.0.0.2:0").is_err() {
+        eprintln!("skipped: this system cannot use 127.0.0.2");
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("phv-image-slots-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     // 8 workers: 2 slots, 1 for each address.
