@@ -2300,11 +2300,11 @@ impl Vm {
             if relay.is_some() {
                 // The normal restore would overwrite anything a call by
                 // the consumer left in the register window.
-                self.regs[base..base + nregs].fill(Value::Null);
+                self.regs[base..base + nregs].iter_mut().for_each(Value::clear);
             } else if ob.fields.len() == G_REGS + nregs {
                 let window = &mut self.regs[base..base + nregs];
                 for (r, v) in window.iter_mut().zip(ob.fields.drain(G_REGS..)) {
-                    *r = v;
+                    r.put(v);
                 }
             } else {
                 let Value::Int(at) = ob.fields[G_AT] else { unreachable!("generator suspension point") };
@@ -2326,9 +2326,9 @@ impl Vm {
                     }
                     let window = &mut self.regs[base..base + nregs];
                     for (r, v) in window.iter_mut().zip(ob.fields.drain(G_REGS..)) {
-                        *r = v;
+                        r.put(v);
                     }
-                    window[saved..].fill(Value::Null);
+                    window[saved..].iter_mut().for_each(Value::clear);
                 } else {
                     let mask = self.gen_register_plans[&(func as usize)]
                         .as_ref()
@@ -2338,20 +2338,20 @@ impl Vm {
                     let mut start = 0;
                     let mut saved = ob.fields.drain(G_REGS..);
                     for range in crate::gen_registers::ranges(mask) {
-                        window[start..range.start].fill(Value::Null);
+                        window[start..range.start].iter_mut().for_each(Value::clear);
                         start = range.end;
                         for r in &mut window[range] {
-                            *r = saved.next().expect("saved register");
+                            r.put(saved.next().expect("saved register"));
                         }
                     }
-                    window[start..].fill(Value::Null);
+                    window[start..].iter_mut().for_each(Value::clear);
                 }
             }
-            ob.fields[G_STATE] = Value::Int(G_RUNNING);
+            ob.fields[G_STATE].put(Value::Int(G_RUNNING));
             let fi = self.frames.len();
             self.gen_restore_handlers(fi, &ob.fields[G_HANDLERS]);
             if !self.reuse_gen_handlers && relay.is_none() {
-                ob.fields[G_HANDLERS] = Value::Null;
+                ob.fields[G_HANDLERS].clear();
             }
             drop(ob);
             if let Some((child, child_pc, trace_pc)) = relay {
@@ -2417,9 +2417,9 @@ impl Vm {
             let (key_reg, val_reg) = relay.forwarding.expect("saved relay registers");
             {
                 let mut ob = relay.gen.borrow_mut();
-                ob.fields[G_REGS + key_reg as usize] = key.clone();
-                ob.fields[G_REGS + val_reg as usize] = val.clone();
-                ob.fields[G_STATE] = Value::Int(G_FORWARD_WAITING);
+                ob.fields[G_REGS + key_reg as usize].put(key.clone());
+                ob.fields[G_REGS + val_reg as usize].put(val.clone());
+                ob.fields[G_STATE].put(Value::Int(G_FORWARD_WAITING));
             }
             while self.handlers.last().is_some_and(|h| h.frame == relay.frame) {
                 self.handlers.pop();
@@ -2472,17 +2472,17 @@ impl Vm {
         if let Some(mask) = plan.and_then(|plan| plan.at(at as usize)) {
             let mut start = 0;
             for range in crate::gen_registers::ranges(mask) {
-                window[start..range.start].fill(Value::Null);
+                window[start..range.start].iter_mut().for_each(Value::clear);
                 start = range.end;
                 ob.fields.extend(window[range].iter_mut().map(std::mem::take));
             }
-            window[start..].fill(Value::Null);
+            window[start..].iter_mut().for_each(Value::clear);
         } else {
             ob.fields.extend(window.iter_mut().map(std::mem::take));
         }
-        ob.fields[G_PC] = Value::Int(resume as i64);
-        ob.fields[G_AT] = Value::Int(at);
-        ob.fields[G_STATE] = Value::Int(G_WAITING);
+        ob.fields[G_PC].put(Value::Int(resume as i64));
+        ob.fields[G_AT].put(Value::Int(at));
+        ob.fields[G_STATE].put(Value::Int(G_WAITING));
         Ok(())
     }
 
@@ -2490,7 +2490,7 @@ impl Vm {
     /// targets and exception registers, in the order they were installed.
     fn gen_save_handlers(&mut self, fi: usize, saved: &mut Value) -> Result<(), VmError> {
         if !self.handlers.last().is_some_and(|h| h.frame == fi) {
-            *saved = Value::Null;
+            saved.clear();
             return Ok(());
         }
         let count = self.handlers.iter().rev().take_while(|h| h.frame == fi).count();
@@ -3913,7 +3913,7 @@ impl Vm {
                                 ref v => bad("generator key", v),
                             };
                             if *key == NO_REG {
-                                ob.fields[G_KEY] = Value::Int(next.saturating_add(1));
+                                ob.fields[G_KEY].put(Value::Int(next.saturating_add(1)));
                                 Value::Int(next)
                             } else {
                                 let k = std::mem::take(&mut reg!(*key));
@@ -3941,9 +3941,9 @@ impl Vm {
                         let link = if link.parent_forwarding { self.gen_forward_value(link, &k, &v) } else { link };
                         let consumer = self.frames.last().unwrap().base;
                         if link.key != NO_REG {
-                            self.regs[consumer + link.key as usize] = k;
+                            self.regs[consumer + link.key as usize].put(k);
                         }
-                        self.regs[consumer + link.val as usize] = v;
+                        self.regs[consumer + link.val as usize].put(v);
                         continue 'frame;
                     }
                     Instr::PopOutHtml(d) => {

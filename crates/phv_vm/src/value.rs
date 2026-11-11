@@ -68,6 +68,30 @@ impl Value {
         Value::Set(Rc::new(s))
     }
 
+    /// Writes `v` here. Where the value replaced is most often a number or
+    /// `null` (a register, a generator's state), this skips the call a drop
+    /// of a `Value` is; only a string, collection, object or closure is
+    /// dropped.
+    #[inline(always)]
+    pub fn put(&mut self, v: Value) {
+        let old = std::mem::replace(self, v);
+        if old.is_boxed() {
+            drop(old);
+        } else {
+            std::mem::forget(old);
+        }
+    }
+
+    /// Empties it (see `put`).
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        if self.is_boxed() {
+            *self = Value::Null;
+        } else {
+            self.put(Value::Null);
+        }
+    }
+
     /// Whether it holds a reference (a string, a collection, an object or a
     /// closure) rather than a scalar or `null`.
     #[inline]
