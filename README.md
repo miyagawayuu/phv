@@ -215,26 +215,26 @@ and generators, with and without JIT.
 
 | Benchmark | PHV (JIT) | PHV (interpreter) | CPython 3.13 |
 |---|---:|---:|---:|
-| `fib(30)` (recursive calls) | 7.2 ms | 84 ms | 99 ms |
-| 10 million loop iterations | 14 ms | 286 ms | 348 ms |
-| Concatenating 1 million characters | 22 ms | 31 ms | 66 ms |
-| Mandelbrot 300×300 (floats) | 4.2 ms | 234 ms | 198 ms |
-| Building 1 million strings from numbers | 304 ms | 337 ms | 351 ms |
-| map / filter / sum over 1 million elements | 184 ms | 180 ms | 88 ms |
-| 200,000 map updates | 42 ms | 46 ms | 34 ms |
-| Sieve of Eratosthenes up to 1 million (`list<bool>`) | 89 ms | 155 ms | 107 ms |
-| Building and summing a list of 1 million floats | 34 ms | 75 ms | 76 ms |
-| Appending to a property with `.=` 200,000 times | 12 ms | 11 ms | 333 ms |
-| 1 million string comparisons (`==`) | 21 ms | 46 ms | 40 ms |
-| Escaping 200,000 strings for HTML | 89 ms | 86 ms | 93 ms |
-| Creating 1 million objects | 178 ms | 183 ms | 110 ms |
-| Throwing and catching 100,000 exceptions | 40 ms | 42 ms | 14 ms |
-| Sorting 200,000 elements with `sortBy` | 318 ms | 306 ms | 269 ms |
+| `fib(30)` (recursive calls) | 6.7 ms | 82 ms | 92 ms |
+| 10 million loop iterations | 12 ms | 284 ms | 342 ms |
+| Concatenating 1 million characters | 15 ms | 19 ms | 65 ms |
+| Mandelbrot 300×300 (floats) | 4.1 ms | 228 ms | 189 ms |
+| Building 1 million strings from numbers | 250 ms | 280 ms | 343 ms |
+| map / filter / sum over 1 million elements | 132 ms | 132 ms | 84 ms |
+| 200,000 map updates | 27 ms | 33 ms | 33 ms |
+| Sieve of Eratosthenes up to 1 million (`list<bool>`) | 57 ms | 145 ms | 103 ms |
+| Building and summing a list of 1 million floats | 20 ms | 66 ms | 74 ms |
+| Appending to a property with `.=` 200,000 times | 8.2 ms | 8.4 ms | 327 ms |
+| 1 million string comparisons (`==`) | 18 ms | 45 ms | 39 ms |
+| Escaping 200,000 strings for HTML | 43 ms | 43 ms | 88 ms |
+| Creating 1 million objects | 90 ms | 129 ms | 98 ms |
+| Throwing and catching 100,000 exceptions | 23 ms | 23 ms | 13 ms |
+| Sorting 200,000 elements with `sortBy` | 195 ms | 194 ms | 260 ms |
 
 The JIT compiles functions and methods whose values are all `int`, `bool`, `float` or `string`, nullable ones,
 lists and maps of them, or objects. Lists, maps and objects are handled by the interpreter's own code, so the gain
-is in the loops and arithmetic around them: creating objects and reading their properties take about as long as in
-the interpreter. Code that relies on closures runs in the interpreter and, as the table shows, can be slower than
+is mostly in the loops and arithmetic around them: creating an object or reading a property is still a call into
+that code. Code that relies on closures runs in the interpreter and, as the table shows, can be slower than
 CPython (`PHV_JIT_EXPLAIN=1` shows why a function is not compiled); so are exceptions, which note where they were
 thrown (to be improved). Set `PHV_JIT=0` to turn the JIT off.
 

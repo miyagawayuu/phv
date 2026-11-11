@@ -434,7 +434,13 @@ pub unsafe extern "C" fn phv_jit_const(ctx: *mut JitCtx, d: i64, c: i64) {
 /// See `rt`.
 pub unsafe extern "C" fn phv_jit_move(ctx: *mut JitCtx, d: i64, s: i64) {
     let w = rt(ctx).top();
-    let v = w[s as usize].clone();
+    // The kinds native code moves, without the call a general clone is.
+    let v = match &w[s as usize] {
+        Value::Object(o) => Value::Object(Rc::clone(o)),
+        Value::Str(s) => Value::Str(Rc::clone(s)),
+        Value::List(l) => Value::List(Rc::clone(l)),
+        v => v.clone(),
+    };
     store(&mut w[d as usize], v);
 }
 

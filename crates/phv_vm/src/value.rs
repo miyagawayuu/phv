@@ -180,7 +180,11 @@ fn drop_last(this: &mut Value) {
                 Value::Object(o) => {
                     if Rc::strong_count(o) == 1 {
                         if let Ok(mut ob) = o.try_borrow_mut() {
-                            out.extend(ob.fields.drain(..).filter(holds_values));
+                            // Most objects hold numbers and strings only:
+                            // nothing to move, and no worklist to grow.
+                            if ob.fields.iter().any(holds_values) {
+                                out.extend(ob.fields.drain(..).filter(holds_values));
+                            }
                         }
                     }
                 }

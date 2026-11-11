@@ -396,6 +396,12 @@ struct Checked {
     /// window slot may still hold a string, list, map or object (see
     /// `stale_slots`). Native code empties those slots after it.
     stale: Vec<Vec<Reg>>,
+    /// By instruction: the registers of `stale` whose slot it fills (`true`:
+    /// with a value that may be shared; `false`: with a constant, which does
+    /// not count). Native code keeps, per such register, whether its slot
+    /// holds a value to let go, and empties a stale slot only when it does:
+    /// in a loop the slot is stale at the first pass and empty afterwards.
+    fills: Vec<Vec<(Reg, bool)>>,
 }
 
 /// The largest function the JIT compiles, in registers and instructions.
@@ -479,8 +485,9 @@ fn well_formed(prog: &Program, f: &Function, ok: &[bool]) -> Option<Checked> {
             }
         }
     }
-    let stale = if strings { stale_slots(prog, sig, ok, f, &kinds) } else { vec![Vec::new(); n] };
-    Some(Checked { kinds, strings, stale })
+    let (stale, fills) =
+        if strings { stale_slots(prog, sig, ok, f, &kinds) } else { (vec![Vec::new(); n], vec![Vec::new(); n]) };
+    Some(Checked { kinds, strings, stale, fills })
 }
 
 /// The registers each instruction makes a machine number or boolean (in a
@@ -495,7 +502,17 @@ fn well_formed(prog: &Program, f: &Function, ok: &[bool]) -> Option<Checked> {
 /// nothing. A constant does not count: the unit's cache shares it anyway, so
 /// letting it go gains nothing (a string constant kept in a register before a
 /// loop would otherwise be let go at every pass).
-fn stale_slots(prog: &Program, sig: &NativeSig, ok: &[bool], f: &Function, kinds: &[Option<Vec<K>>]) -> Vec<Vec<Reg>> {
+///
+/// Also returns, by instruction, the slots of those registers it fills
+/// (`Checked::fills`), by the rule the analysis itself uses.
+#[allow(clippy::type_complexity)]
+fn stale_slots(
+    prog: &Program,
+    sig: &NativeSig,
+    ok: &[bool],
+    f: &Function,
+    kinds: &[Option<Vec<K>>],
+) -> (Vec<Vec<Reg>>, Vec<Vec<(Reg, bool)>>) {
     let (n, regs) = (f.code.len(), f.num_regs as usize);
     let words = regs.div_ceil(64);
     let scalar = |k: K| matches!(k, K::Int | K::Bool | K::Float);
@@ -564,16 +581,30 @@ fn stale_slots(prog: &Program, sig: &NativeSig, ok: &[bool], f: &Function, kinds
         }
     }
     let mut stale = vec![Vec::new(); n];
+    let mut any = vec![false; regs];
     for i in 0..n {
         let (Some(st), Some(before)) = (&kinds[i], &held[i]) else { continue };
         let Some((st, Flow::Next)) = after(i, st) else { continue };
         for (r, k) in st.iter().enumerate() {
             if scalar(*k) && before[r / 64] >> (r % 64) & 1 != 0 {
                 stale[i].push(r as Reg);
+                any[r] = true;
             }
         }
     }
-    stale
+    // What the analysis above counts as filling a slot, for those registers.
+    let mut fills = vec![Vec::new(); n];
+    for i in 0..n {
+        let Some(before) = &kinds[i] else { continue };
+        let Some((st, _)) = after(i, before) else { continue };
+        let written = writes(&f.code[i]);
+        for (r, k) in st.iter().enumerate() {
+            if any[r] && k.boxed() && (written.contains(&Some(r as Reg)) || *k != before[r]) {
+                fills[i].push((r as Reg, !matches!(f.code[i], Instr::Const(..))));
+            }
+        }
+    }
+    (stale, fills)
 }
 
 /// The registers an instruction puts a new string, list, map or object in,
@@ -2225,6 +2256,9 @@ struct Translator<'a, 'b> {
     fvars: Vec<Variable>,
     /// Per register: 1 when it holds `null` (a nullable scalar), else 0.
     nvars: Vec<Variable>,
+    /// Per register some instruction leaves stale (`Checked::stale`): 1 while
+    /// its window slot may hold a value to let go (see `Checked::fills`).
+    held: HashMap<Reg, Variable>,
     blocks: Vec<Block>,
     /// Branches back to an instruction (a loop's test at its end): the block
     /// each goes through, which counts the budget, and the target's block.
@@ -2258,6 +2292,7 @@ impl<'a, 'b> Translator<'a, 'b> {
             ivars: Vec::new(),
             fvars: Vec::new(),
             nvars: Vec::new(),
+            held: HashMap::new(),
             blocks: Vec::new(),
             back_edges: Vec::new(),
             ctx: Value::from_u32(0),
@@ -2405,7 +2440,19 @@ impl<'a, 'b> Translator<'a, 'b> {
     /// value go (see `stale_slots`), as the interpreter's write does.
     fn after(&mut self, i: usize, next: u32) {
         for &r in &self.checked.stale[i] {
+            // Only when the slot holds a value: in a loop it does at the
+            // first pass, and a call per pass cost as much as the rest of
+            // a method call.
+            let var = self.held[&r];
+            let held = self.b.use_var(var);
+            let (put, cont) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(held, put, &[], cont, &[]);
+            self.b.switch_to_block(put);
             self.moved_out(r);
+            self.b.ins().jump(cont, &[]);
+            self.b.switch_to_block(cont);
+            let zero = self.iconst(0);
+            self.b.def_var(var, zero);
         }
         self.jump(next);
     }
@@ -2695,6 +2742,15 @@ impl<'a, 'b> Translator<'a, 'b> {
             self.b.def_var(self.fvars[r], f);
             self.b.def_var(self.nvars[r], zero);
         }
+        // Whether the slot of a register that goes stale holds a value: at
+        // first only an argument's does (the window comes empty).
+        for r in self.checked.stale.iter().flatten().copied().collect::<std::collections::BTreeSet<Reg>>() {
+            let var = self.b.declare_var(I64);
+            let boxed = self.sig.params.get(r as usize).is_some_and(|p| p.boxed());
+            let v = self.iconst(boxed as i64);
+            self.b.def_var(var, v);
+            self.held.insert(r, var);
+        }
         // depth check, register window and budget
         let d = self.b.ins().load(I64, self.mf, self.ctx, CTX_DEPTH);
         let d = self.b.ins().iadd_imm_s(d, 1);
@@ -2735,6 +2791,10 @@ impl<'a, 'b> Translator<'a, 'b> {
             };
             let k = |r: Reg| st[r as usize];
             let next = (i + 1) as u32;
+            for &(r, shared) in &self.checked.fills[i] {
+                let v = self.iconst(shared as i64);
+                self.b.def_var(self.held[&r], v);
+            }
             match *ins {
                 Instr::Int(d, v) => {
                     let c = self.iconst(v);
@@ -3478,6 +3538,11 @@ mod tests {
         let stale: Vec<(usize, Vec<Reg>)> =
             checked.stale.iter().enumerate().filter(|(_, s)| !s.is_empty()).map(|(i, s)| (i, s.clone())).collect();
         assert_eq!(stale, vec![(1, vec![2])]);
+        // Native code empties the slot only while it holds a value: the
+        // `Move` fills it (the only register that goes stale).
+        let fills: Vec<(usize, Vec<(Reg, bool)>)> =
+            checked.fills.iter().enumerate().filter(|(_, s)| !s.is_empty()).map(|(i, s)| (i, s.clone())).collect();
+        assert_eq!(fills, vec![(0, vec![(2, true)])]);
     }
 
     #[test]
