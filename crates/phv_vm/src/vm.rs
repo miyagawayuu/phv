@@ -3125,17 +3125,20 @@ impl Vm {
                         self.guards.pop();
                     }
                     let fr = self.frames.pop().unwrap();
-                    // The callee's strings, collections, objects and closures
-                    // are let go: a copy left in a dead register (a parameter
-                    // holding the caller's list) kept the caller's value
-                    // shared, so its next change (`$xs[] = ...`, `.=`) copied
-                    // all of it, and a loop calling a helper and growing a
-                    // collection took quadratic time (audit 20). Scalars are
-                    // left: the next call overwrites them, and the type
-                    // checker guarantees registers are written before they
-                    // are read. Only the registers that may hold such a value
-                    // are looked at (none in `fib`, whose registers all hold
-                    // ints; writing every register made it 1.6 times as slow).
+                    // The callee's strings, collections and closures are let
+                    // go: a copy left in a dead register (a parameter holding
+                    // the caller's list) kept the caller's value shared, so
+                    // its next change (`$xs[] = ...`, `.=`) copied all of it,
+                    // and a loop calling a helper and growing a collection
+                    // took quadratic time (audit 20). Scalars and objects are
+                    // left (an object is shared by reference: a dead copy
+                    // never makes a change copy it): the next call overwrites
+                    // them, and the type checker guarantees registers are
+                    // written before they are read. Only the registers that
+                    // may hold such a value are looked at (`boxed_registers`:
+                    // none in `fib`, whose registers all hold ints, or in a
+                    // constructor that stores ints; writing every register
+                    // made `fib` 1.6 times as slow).
                     // The outermost frame (the script's own) is left: its
                     // values go when the VM is torn down, after the response
                     // is sent.
@@ -4114,10 +4117,15 @@ fn boxed_registers(prog: &Program, f: &Function) -> Option<Vec<u16>> {
     use Instr::*;
     let n = f.num_regs as usize;
     let mut boxed = vec![false; n];
-    let scalar = |k: Option<&ValKind>| matches!(k, Some(ValKind::Int | ValKind::Bool | ValKind::Float));
+    // Scalars and objects are left: an object is shared by reference, so a
+    // dead copy of it never makes a change copy it (`$this` of a
+    // constructor, the object `new` made).
+    let kept = |k: Option<&ValKind>| {
+        matches!(k, Some(ValKind::Int | ValKind::Bool | ValKind::Float | ValKind::Object(_) | ValKind::OptObject(_)))
+    };
     let sig = f.native.as_ref().filter(|s| s.params.len() == f.num_params as usize);
     for (i, b) in boxed.iter_mut().enumerate().take(f.num_params as usize) {
-        *b = !scalar(sig.and_then(|s| s.params.get(i)));
+        *b = !kept(sig.and_then(|s| s.params.get(i)));
     }
     let mut mark = |r: Reg| {
         if let Some(b) = boxed.get_mut(r as usize) {
@@ -4130,7 +4138,8 @@ fn boxed_registers(prog: &Program, f: &Function) -> Option<Vec<u16>> {
             | IncI(..) | AddIImm(..) | SubIImm(..) | AddF(..) | SubF(..) | MulF(..) | DivF(..) | ModF(..)
             | PowF(..) | NegF(..) | BitAnd(..) | BitOr(..) | BitXor(..) | Shl(..) | Shr(..) | BitNot(..) | Not(..)
             | EqI(..) | LtI(..) | LeI(..) | Eq(..) | Ne(..) | Lt(..) | Le(..) | Cmp(..) | EqF(..) | NeF(..)
-            | LtF(..) | LeF(..) | CmpF(..) | IntToFloat(..) | FloatToInt(..) | InstanceOf(..) | IsType(..) => {}
+            | LtF(..) | LeF(..) | CmpF(..) | IntToFloat(..) | FloatToInt(..) | InstanceOf(..) | IsType(..)
+            | NewObject(..) => {}
             Const(d, c) => {
                 if !matches!(
                     prog.consts.get(*c as usize),
@@ -4147,7 +4156,6 @@ fn boxed_registers(prog: &Program, f: &Function) -> Option<Vec<u16>> {
             | ToStr(d, _)
             | Concat(d, ..)
             | AppendStr(d, _)
-            | NewObject(d, _)
             | GetProp(d, ..)
             | NewList(d, ..)
             | NewMap(d, ..)
@@ -4158,7 +4166,7 @@ fn boxed_registers(prog: &Program, f: &Function) -> Option<Vec<u16>> {
             | EnumCases(d, _)
             | PopOutHtml(d) => mark(*d),
             Call { dst, func, .. } => {
-                if !scalar(prog.funcs.get(*func as usize).and_then(|c| c.native.as_ref()).map(|s| &s.ret)) {
+                if !kept(prog.funcs.get(*func as usize).and_then(|c| c.native.as_ref()).map(|s| &s.ret)) {
                     mark(*dst);
                 }
             }
@@ -4277,9 +4285,10 @@ mod compact_generator_tests {
     }
 
     /// A return lets go of the registers that may hold a string, a
-    /// collection, an object or a closure: none of `fib`'s (an int argument,
-    /// ints computed and returned), the list a function makes, its unknown
-    /// arguments; all of them for a function with an iterator.
+    /// collection or a closure: none of `fib`'s (an int argument, ints
+    /// computed and returned) or of a constructor's objects, the list a
+    /// function makes, its unknown arguments; all of them for a function
+    /// with an iterator.
     #[test]
     fn returns_let_go_of_the_registers_that_may_hold_values() {
         let int = Some(NativeSig { params: vec![ValKind::Int], ret: ValKind::Int });
@@ -4310,6 +4319,20 @@ mod compact_generator_tests {
         let iterates =
             Function { num_regs: 3, code: vec![Instr::IterInit(0, 1), Instr::RetNull], ..Function::default() };
         assert_eq!(boxed_registers(&prog, &iterates), None);
+        // Objects are shared by reference, so a dead copy is left (a
+        // constructor's `$this`, an object `new` made); a string parameter
+        // and an object's property read are let go.
+        let ctor = Function {
+            num_params: 3,
+            num_regs: 5,
+            native: Some(NativeSig {
+                params: vec![ValKind::Object(0), ValKind::OptObject(1), ValKind::Str],
+                ret: ValKind::Void,
+            }),
+            code: vec![Instr::NewObject(3, 1), Instr::SetProp(0, 0, 1), Instr::GetProp(4, 0, 0), Instr::RetNull],
+            ..Function::default()
+        };
+        assert_eq!(boxed_registers(&prog, &ctor), Some(vec![2, 4]));
     }
 
     /// `PHV_VM_PRUNE_GEN_REGS=1` with no room for a function's plan: the
