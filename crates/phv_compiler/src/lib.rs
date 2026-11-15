@@ -269,8 +269,30 @@ struct FnC<'a> {
     code: Vec<Instr>,
     offsets: Vec<u32>,
     reg_of: Vec<Reg>,
+    /// Per local: declared `string` (its register never holds anything but
+    /// a plain string once it is assigned).
+    str_local: Vec<bool>,
     num_locals: u16,
     next: u16,
+    /// Temporaries that hold a string, a collection, an object or a closure
+    /// their instruction only read: emptied when they are given back (see
+    /// `release`).
+    owed: Vec<Reg>,
+    /// Temporaries given back while they held a value (`release`): each is
+    /// emptied before the next instruction, unless that instruction writes
+    /// the register anyway (see `emit`).
+    pending: Vec<Reg>,
+    /// Compare-and-jumps on temporaries that still held a value, with those
+    /// temporaries: they are emptied where the jump goes too (see `patch`).
+    at_jump: Vec<(usize, Vec<Reg>)>,
+    /// The start of the loop whose condition is being compiled at its end:
+    /// where its jumps will go (they are emitted before they are pointed).
+    back_to: Option<u32>,
+    /// Temporaries left for a loop's next pass to write, by a jump of the
+    /// condition at its end: owed again once the loop is left.
+    kept_back: Vec<Reg>,
+    /// The furthest position a jump was pointed to.
+    joined: u32,
     max: u16,
     loops: Vec<LoopCtx>,
     tries: Vec<TryCtx>,
@@ -308,8 +330,15 @@ impl<'a> FnC<'a> {
             code: Vec::new(),
             offsets: Vec::new(),
             reg_of,
+            str_local: f.locals.iter().map(|l| l.ty == Type::Str).collect(),
             num_locals: next,
             next,
+            owed: Vec::new(),
+            pending: Vec::new(),
+            at_jump: Vec::new(),
+            back_to: None,
+            kept_back: Vec::new(),
+            joined: 0,
             max: next,
             loops: Vec::new(),
             tries: Vec::new(),
@@ -393,6 +422,13 @@ impl<'a> FnC<'a> {
     /// Past `MAX_CODE` instructions the function is reported as too large;
     /// the code is not kept growing meanwhile (and is discarded).
     fn emit(&mut self, i: Instr) -> usize {
+        if !self.pending.is_empty() {
+            self.settle(Some(&i));
+        }
+        self.push(i)
+    }
+
+    fn push(&mut self, i: Instr) -> usize {
         if self.code.len() >= MAX_CODE {
             self.too_long = true;
             self.too_big = true;
@@ -403,7 +439,95 @@ impl<'a> FnC<'a> {
         self.code.len() - 1
     }
 
+    /// Deals with the temporaries given back with a value still in them
+    /// (`release`), before instruction `next` (or, with none, the start of
+    /// a loop). Each is emptied there, unless it need not be:
+    /// - `next` writes the register without reading it, and without running
+    ///   anything first: the value goes then;
+    /// - `next` only computes or reads (it runs no other code and changes no
+    ///   string or collection in place, so that a copy left meanwhile costs
+    ///   nothing): the register waits for the instruction after it, where
+    ///   it may be written;
+    /// - `next` jumps back to code that writes the register before anything
+    ///   else could notice (the loop's next pass reads the element again);
+    /// - `next` is a `return`.
+    fn settle(&mut self, next: Option<&Instr>) {
+        use Instr::*;
+        let pending = std::mem::take(&mut self.pending);
+        if matches!(next, Some(Ret(_) | RetNull)) {
+            return;
+        }
+        // Where a jump back goes (`back_to`: not pointed yet).
+        let back = |t: u32, len: usize| if t == 0 { self.back_to } else { Some(t).filter(|t| (*t as usize) < len) };
+        let (target, conditional) = match next {
+            Some(Jump(t)) => (back(*t, self.code.len()), false),
+            Some(
+                JumpIfFalse(_, t)
+                | JumpIfTrue(_, t)
+                | JumpIfNotLtI(_, _, t)
+                | JumpIfNotLeI(_, _, t)
+                | JumpIfNotLtIImm(_, _, t)
+                | JumpIfNotLeIImm(_, _, t)
+                | JumpIfLtIImm(_, _, t)
+                | JumpIfLeIImm(_, _, t),
+            ) => (back(*t, self.code.len()), true),
+            _ => (None, false),
+        };
+        // (An exception could take the copy to a handler: nothing waits there.)
+        let waits = self.tries.is_empty() && next.is_some_and(reads_only);
+        let plain = self.tries.is_empty();
+        for r in pending {
+            if next.is_some_and(|i| overwrites(i, r, plain)) {
+                continue;
+            }
+            // (Never past an instruction that writes the register.)
+            if next.is_some_and(|i| reads_only(i) && dest(i) == Some(r)) {
+                self.push(Null(r));
+                continue;
+            }
+            match target {
+                Some(t) if plain && self.overwritten_from(t, r) => {
+                    // Gone on the way back; still owed where the loop ends.
+                    if conditional {
+                        self.pending.push(r);
+                        if self.back_to.is_some() {
+                            self.kept_back.push(r);
+                        }
+                    }
+                }
+                _ if waits => self.pending.push(r),
+                _ => {
+                    self.push(Null(r));
+                }
+            }
+        }
+    }
+
+    /// Whether the code from `at` writes register `r` before it does
+    /// anything but compute and read (see `settle`).
+    fn overwritten_from(&self, at: u32, r: Reg) -> bool {
+        for i in self.code.iter().skip(at as usize).take(16) {
+            if overwrites(i, r, true) || reads_only(i) && dest(i) == Some(r) {
+                return true;
+            }
+            if !reads_only(i) {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// The position of the next instruction, as a place to jump to.
     fn here(&self) -> u32 {
+        self.code.len() as u32
+    }
+
+    /// The position of the next instruction, as the start of a loop: the
+    /// temporaries still to be emptied are, before it (not at every pass).
+    fn loop_start(&mut self) -> u32 {
+        if !self.pending.is_empty() {
+            self.settle(None);
+        }
         self.code.len() as u32
     }
 
@@ -441,6 +565,48 @@ impl<'a> FnC<'a> {
         r < self.num_locals
     }
 
+    /// Whether the value of `e`, read into a temporary, must not stay there
+    /// once it is used: a string, a collection, an object or a closure that
+    /// is not a constant. Left in the register until something else is
+    /// written there, the copy keeps the value shared (and what an object
+    /// holds, alive and shared): the next change of it (`$xs[] = ...`, `.=`)
+    /// copies all of it, and whether a later instruction happens to use the
+    /// register decided whether a loop took linear or quadratic time
+    /// (audits 20 and 21). A constant is shared with the program anyway.
+    fn owes(&self, e: &HExpr) -> bool {
+        !matches!(e.kind, HExprKind::Local(_) | HExprKind::Const(_)) && reference(&e.ty)
+    }
+
+    /// Notes that temporary `r` holds the value of `e` after the
+    /// instruction that reads it (see `owes`, `release`).
+    fn keeps(&mut self, e: &HExpr, r: Reg) {
+        if !self.is_local(r) && self.owes(e) && !self.owed.contains(&r) {
+            self.owed.push(r);
+        }
+    }
+
+    /// Gives the temporaries from `mark` back, emptying those that still
+    /// hold a value (`keeps`): no temporary keeps a reference past the
+    /// expression or statement it was made for. Instructions that move
+    /// their operands out (calls, joins, list and map literals) and values
+    /// read into the register their result goes to leave nothing to empty,
+    /// and neither does a register the next instruction writes (`settle`).
+    fn release(&mut self, mark: Reg) {
+        if self.owed.iter().any(|r| *r >= mark) {
+            // (Nothing runs after a `return` or a `throw` no jump goes past.)
+            let ended = matches!(self.code.last(), Some(Instr::Ret(_) | Instr::RetNull | Instr::Throw(_)))
+                && self.joined < self.code.len() as u32
+                && self.pending.is_empty();
+            let mut owed: Vec<Reg> = self.owed.iter().copied().filter(|r| *r >= mark).collect();
+            self.owed.retain(|r| *r < mark);
+            owed.sort_unstable();
+            if !ended {
+                self.pending.extend(owed);
+            }
+        }
+        self.next = mark;
+    }
+
     fn reg(&self, id: u32) -> Reg {
         self.reg_of[id as usize]
     }
@@ -448,6 +614,19 @@ impl<'a> FnC<'a> {
     fn patch(&mut self, at: usize, target: u32) {
         if self.too_long {
             return;
+        }
+        self.joined = self.joined.max(target);
+        // What a compare-and-jump left in its temporaries is emptied where
+        // it goes as well (the jumps of a condition go forward, to here).
+        if let Some(k) = self.at_jump.iter().position(|(j, _)| *j == at) {
+            let (_, regs) = self.at_jump.swap_remove(k);
+            if target as usize == self.code.len() {
+                for r in regs {
+                    if !self.pending.contains(&r) {
+                        self.pending.push(r);
+                    }
+                }
+            }
         }
         match &mut self.code[at] {
             Instr::Jump(t)
@@ -495,12 +674,24 @@ impl<'a> FnC<'a> {
 
     /// Returns a register holding `e`: the local itself for variables,
     /// otherwise a fresh temporary.
+    /// For `$s = $s . a . b;` (and `$s = "{$s}...";`) on the local `id`,
+    /// declared `string`: what is appended to it (`a`, `b`). A string that
+    /// is safe HTML is not joined this way.
+    fn self_append<'e>(&self, id: u32, value: &'e HExpr) -> Option<&'e [HExpr]> {
+        let HExprKind::Concat(items, false) = &value.kind else { return None };
+        let (first, rest) = items.split_first()?;
+        let own = matches!(first.kind, HExprKind::Local(l) if l == id) && first.ty == Type::Str;
+        let plain = self.str_local.get(id as usize).copied().unwrap_or(false) && value.ty == Type::Str;
+        (own && plain && !rest.is_empty()).then_some(rest)
+    }
+
     fn operand(&mut self, e: &HExpr) -> Reg {
         if let HExprKind::Local(id) = e.kind {
             return self.reg(id);
         }
         let t = self.alloc();
         self.expr_into(e, t);
+        self.keeps(e, t);
         t
     }
 
@@ -550,8 +741,9 @@ impl<'a> FnC<'a> {
         self.off = e.span.start;
         if t != dst {
             self.emit(Instr::Move(dst, t));
+            self.keeps(e, t);
         }
-        self.next = mark;
+        self.release(mark);
     }
 
     fn expr_raw(&mut self, e: &HExpr, dst: Reg) {
@@ -592,8 +784,23 @@ impl<'a> FnC<'a> {
                 self.emit(float_cmp(*k, dst, x, y));
             }
             HExprKind::Binary(k, a, b, swap) => {
-                let ra = self.operand(a);
-                let rb = self.operand(b);
+                // A string, collection or object to be compared must not
+                // stay in a temporary (see `owes`): one is read into `dst`
+                // when that is a temporary, where the result replaces it at
+                // no cost; another is emptied after the comparison.
+                let in_dst = !self.is_local(dst);
+                let ra = if in_dst && self.owes(a) {
+                    self.expr_into(a, dst);
+                    dst
+                } else {
+                    self.operand(a)
+                };
+                let rb = if in_dst && ra != dst && self.owes(b) {
+                    self.expr_into(b, dst);
+                    dst
+                } else {
+                    self.operand(b)
+                };
                 let (x, y) = if *swap { (rb, ra) } else { (ra, rb) };
                 self.off = off;
                 self.emit(bin_instr(*k, dst, x, y));
@@ -630,7 +837,13 @@ impl<'a> FnC<'a> {
                 self.emit(Instr::Concat(dst, start, items.len() as u16, *html));
             }
             HExprKind::IntToFloat(x) | HExprKind::FloatToInt(x) | HExprKind::ToStr(x) => {
-                let r = self.operand(x);
+                // (`(string) escape($s)`: read where the string goes.)
+                let r = if !self.is_local(dst) && self.owes(x) {
+                    self.expr_into(x, dst);
+                    dst
+                } else {
+                    self.operand(x)
+                };
                 self.off = off;
                 self.emit(match e.kind {
                     HExprKind::IntToFloat(_) => Instr::IntToFloat(dst, r),
@@ -662,17 +875,49 @@ impl<'a> FnC<'a> {
                 self.emit(Instr::Range(dst, ra, rb, *incl));
             }
             HExprKind::Index(b, k) | HExprKind::IndexOrNull(b, k) => {
-                let rb = self.operand(b);
+                // A container that is not a variable (`$o->xs` of `$o->xs[0]`,
+                // the row of `$grid[$i][$j]`) must not stay in a temporary
+                // once the element is read: left there it kept the property
+                // or the row shared until the register was used again, so the
+                // next change of it (`$o->xs[] = ...`) copied all of it, and a
+                // loop reading an element and then growing the collection
+                // took quadratic time (audit 21). It is read into `dst` when
+                // that is a temporary (the element then replaces it, at no
+                // cost), and emptied after the read otherwise (`owes`).
+                let temporary = !matches!(b.kind, HExprKind::Local(_));
+                // (A number read into a variable goes through a temporary
+                // the same way, then to the variable: native code reads
+                // `GetProp(t, ..); Index(t, t, k)` without copying the
+                // collection at all.)
+                let number = matches!(e.ty, Type::Int | Type::Float | Type::Bool);
+                let to = if temporary && number && self.is_local(dst) { self.alloc() } else { dst };
+                let rb = if temporary && !self.is_local(to) {
+                    self.expr_into(b, to);
+                    to
+                } else {
+                    self.operand(b)
+                };
                 let rk = self.operand(k);
                 self.off = off;
                 if matches!(e.kind, HExprKind::Index(..)) {
-                    self.emit(Instr::Index(dst, rb, rk));
+                    self.emit(Instr::Index(to, rb, rk));
                 } else {
-                    self.emit(Instr::IndexOrNull(dst, rb, rk));
+                    self.emit(Instr::IndexOrNull(to, rb, rk));
+                }
+                if to != dst {
+                    self.emit(Instr::Move(dst, to));
                 }
             }
             HExprKind::Prop(o, slot) => {
-                let ro = self.operand(o);
+                // An object that is not a variable (`view($rows)->title`,
+                // `$a->b->c`) is read into `dst` when that is a temporary:
+                // the property then replaces it (see `owes`).
+                let ro = if !self.is_local(dst) && self.owes(o) {
+                    self.expr_into(o, dst);
+                    dst
+                } else {
+                    self.operand(o)
+                };
                 self.off = off;
                 let slot = self.prop_slot(*slot);
                 self.emit(Instr::GetProp(dst, ro, slot));
@@ -682,6 +927,9 @@ impl<'a> FnC<'a> {
                 self.expr_into(obj, t);
                 let j = self.emit(Instr::JumpIfNull(t, 0));
                 self.expr_into(body, dst);
+                // The object is kept in a hidden variable: let go once the
+                // member is read (see `owes`).
+                self.emit(Instr::Null(t));
                 let j_end = self.emit(Instr::Jump(0));
                 let null_at = self.here();
                 self.patch(j, null_at);
@@ -751,6 +999,17 @@ impl<'a> FnC<'a> {
                 let start = self.args(caps);
                 self.off = off;
                 self.emit(Instr::MakeClosure { dst, func: *fid, caps: start, n: caps.len() as u16 });
+                // The closure holds its own copies. The ones staged for it
+                // are let go: left in their temporaries they kept a captured
+                // list, map or string shared after the closure was gone, so
+                // the next change of the variable copied all of it (audit
+                // 21: `$xs[] = $i; f(fn() => count($xs));` in a loop took
+                // quadratic time). Numbers share nothing.
+                for (i, c) in caps.iter().enumerate() {
+                    if !matches!(c.ty, Type::Int | Type::Float | Type::Bool | Type::Null) {
+                        self.emit(Instr::Null(start + i as u16));
+                    }
+                }
             }
             HExprKind::Match { subject, arms, default } => {
                 let s = subject.as_ref().map(|s| {
@@ -758,6 +1017,11 @@ impl<'a> FnC<'a> {
                     self.expr_into(s, t);
                     (t, s.ty.clone())
                 });
+                // The subject is let go where the comparisons end (`owes`).
+                let subject_owed = match (&s, subject) {
+                    (Some((t, _)), Some(e)) if self.owes(e) => Some(*t),
+                    _ => None,
+                };
                 let mut arm_jumps: Vec<Vec<usize>> = Vec::new();
                 for (conds, _) in arms {
                     let mut jumps = Vec::new();
@@ -770,6 +1034,14 @@ impl<'a> FnC<'a> {
                                     let t = self.alloc();
                                     self.emit(Instr::EqF(t, *sr, rc));
                                     jumps.push(self.emit(Instr::JumpIfTrue(t, 0)));
+                                } else if self.owes(c) {
+                                    // Compared first, so that the value can
+                                    // be let go before the jump.
+                                    let t = self.alloc();
+                                    self.emit(Instr::Eq(t, *sr, rc));
+                                    self.owed.retain(|r| *r != rc);
+                                    self.emit(Instr::Null(rc));
+                                    jumps.push(self.emit(Instr::JumpIfTrue(t, 0)));
                                 } else {
                                     // `EqI` and `Eq` agree on ints.
                                     jumps.push(self.emit(Instr::JumpIfEq(*sr, rc, 0)));
@@ -780,13 +1052,16 @@ impl<'a> FnC<'a> {
                                 jumps.push(self.emit(Instr::JumpIfTrue(rc, 0)));
                             }
                         }
-                        self.next = mark;
+                        self.release(mark);
                     }
                     arm_jumps.push(jumps);
                 }
                 let mut ends = Vec::new();
                 match default {
                     Some(d) => {
+                        if let Some(t) = subject_owed {
+                            self.emit(Instr::Null(t));
+                        }
                         self.expr_into(d, dst);
                         ends.push(self.emit(Instr::Jump(0)));
                     }
@@ -806,6 +1081,9 @@ impl<'a> FnC<'a> {
                 for ((_, body), jumps) in arms.iter().zip(arm_jumps) {
                     let at = self.here();
                     self.patch_all(jumps, at);
+                    if let Some(t) = subject_owed {
+                        self.emit(Instr::Null(t));
+                    }
                     self.expr_into(body, dst);
                     ends.push(self.emit(Instr::Jump(0)));
                 }
@@ -874,18 +1152,30 @@ impl<'a> FnC<'a> {
                 let i = if *k == BinKind::LtI { Instr::JumpIfNotLtI(x, y, 0) } else { Instr::JumpIfNotLeI(x, y, 0) };
                 vec![self.emit(i)]
             }
-            HExprKind::Binary(k @ (BinKind::EqI | BinKind::Eq | BinKind::Ne), a, b, swap) if !float_pair(*k, a, b) => {
+            // A string, collection or object that is not a variable, left
+            // in a temporary by the compare-and-jump, is emptied on both
+            // ways out: after it (`release`) and where it goes (`patch`).
+            // At the end of a loop, whose jumps go back, it is compared the
+            // general way below, which leaves nothing.
+            HExprKind::Binary(k @ (BinKind::EqI | BinKind::Eq | BinKind::Ne), a, b, swap)
+                if !float_pair(*k, a, b) && (self.back_to.is_none() || !self.owes(a) && !self.owes(b)) =>
+            {
                 let (x, y) = self.eq_operands(a, b, *swap);
                 self.off = e.span.start;
                 let i = if *k == BinKind::Ne { Instr::JumpIfEq(x, y, 0) } else { Instr::JumpIfNotEq(x, y, 0) };
-                vec![self.emit(i)]
+                let j = self.emit(i);
+                let left: Vec<Reg> = self.owed.iter().copied().filter(|r| *r >= mark).collect();
+                if !left.is_empty() {
+                    self.at_jump.push((j, left));
+                }
+                vec![j]
             }
             _ => {
                 let r = self.operand(e);
                 vec![self.emit(Instr::JumpIfFalse(r, 0))]
             }
         };
-        self.next = mark;
+        self.release(mark);
         out
     }
 
@@ -923,7 +1213,13 @@ impl<'a> FnC<'a> {
                 let i = if *k == BinKind::LtI { Instr::JumpIfNotLeI(y, x, 0) } else { Instr::JumpIfNotLtI(y, x, 0) };
                 vec![self.emit(i)]
             }
-            HExprKind::Binary(k @ (BinKind::EqI | BinKind::Eq | BinKind::Ne), a, b, swap) if !float_pair(*k, a, b) => {
+            // (A comparison of a string, collection or object that is not
+            // a variable goes the general way below, which leaves nothing in
+            // a temporary: the jump here may go back, where nothing can be
+            // emptied any more.)
+            HExprKind::Binary(k @ (BinKind::EqI | BinKind::Eq | BinKind::Ne), a, b, swap)
+                if !float_pair(*k, a, b) && !self.owes(a) && !self.owes(b) =>
+            {
                 let (x, y) = self.eq_operands(a, b, *swap);
                 self.off = e.span.start;
                 let i = if *k == BinKind::Ne { Instr::JumpIfNotEq(x, y, 0) } else { Instr::JumpIfEq(x, y, 0) };
@@ -934,7 +1230,7 @@ impl<'a> FnC<'a> {
                 vec![self.emit(Instr::JumpIfTrue(r, 0))]
             }
         };
-        self.next = mark;
+        self.release(mark);
         out
     }
 
@@ -955,7 +1251,7 @@ impl<'a> FnC<'a> {
         for s in stmts {
             let mark = self.next;
             self.stmt(s);
-            self.next = mark;
+            self.release(mark);
         }
     }
 
@@ -1046,6 +1342,7 @@ impl<'a> FnC<'a> {
             HStmt::Expr(e) => {
                 let t = self.alloc();
                 self.expr_into(e, t);
+                self.keeps(e, t);
             }
             HStmt::Echo(e) => {
                 let r = self.operand(e);
@@ -1072,6 +1369,41 @@ impl<'a> FnC<'a> {
             HStmt::Assign(p, value) => {
                 if let (HPlaceBase::Local(id), true) = (&p.base, p.path.is_empty()) {
                     let r = self.reg(*id);
+                    if let Some(rest) = self.self_append(*id, value) {
+                        // `$s = $s . $x;` and `$s = "{$s}...";` append in
+                        // place, as `$s .= $x;` does: a loop of them took
+                        // quadratic time (audit 21: 200,000 passes, 48 s).
+                        // What is appended is worked out first, from `$s`
+                        // as it was, so the result is the same: also when
+                        // it reads `$s`, or throws (nothing is appended).
+                        if let [one] = rest {
+                            let src = self.operand(one);
+                            self.off = value.span.start;
+                            self.emit(Instr::AppendStr(r, src));
+                            return;
+                        }
+                        // Several: they are staged, then `$s` itself is
+                        // moved in front of them and the join adds them to
+                        // it where it is (`op_concat`), in a buffer grown
+                        // once. Joining them into a temporary first kept
+                        // what is appended twice (audit 21: a string of 60
+                        // MB built from two of 30 MB no longer fitted in
+                        // 128 MB). When `$s` is staged too (`$s . $a . $s`)
+                        // it is not the only holder, and the join builds a
+                        // new string as before.
+                        let start = self.alloc_n(rest.len() + 1);
+                        if self.too_big {
+                            return;
+                        }
+                        for (i, a) in rest.iter().enumerate() {
+                            self.expr_into(a, start + 1 + i as u16);
+                        }
+                        self.emit(Instr::Move(start, r));
+                        self.emit(Instr::Null(r));
+                        self.off = value.span.start;
+                        self.emit(Instr::Concat(r, start, rest.len() as u16 + 1, false));
+                        return;
+                    }
                     self.expr_into(value, r);
                     return;
                 }
@@ -1128,6 +1460,10 @@ impl<'a> FnC<'a> {
                 self.store(&base, keys, create, push, cur);
                 let end = self.here();
                 self.patch(j, end);
+                // The value read, or the one stored.
+                if reference(&rhs.ty) && !self.owed.contains(&cur) {
+                    self.owed.push(cur);
+                }
             }
             HStmt::Append(id, rhs) => {
                 let r = self.operand(rhs);
@@ -1150,7 +1486,7 @@ impl<'a> FnC<'a> {
                 }
             }
             HStmt::Loop { cond, body, step, do_while } => {
-                let top = self.here();
+                let top = self.loop_start();
                 self.loops.push(LoopCtx::new(self.tries.len(), None));
                 if *do_while {
                     self.block(body);
@@ -1167,15 +1503,22 @@ impl<'a> FnC<'a> {
                     // when it holds (one jump a pass instead of two).
                     self.loops.pop();
                     let exits = cond.as_ref().map(|c| self.cond_false(c)).unwrap_or_default();
-                    let top = self.here();
+                    let top = self.loop_start();
                     self.loops.push(LoopCtx::new(self.tries.len(), None));
                     self.block(body);
                     let cont = self.here();
                     self.block(step);
                     match cond {
                         Some(c) => {
+                            self.back_to = Some(top);
                             let back = self.cond_true(c);
+                            self.back_to = None;
                             self.patch_all(back, top);
+                            for r in std::mem::take(&mut self.kept_back) {
+                                if !self.pending.contains(&r) {
+                                    self.pending.push(r);
+                                }
+                            }
                         }
                         None => {
                             self.emit(Instr::Jump(top));
@@ -1197,7 +1540,7 @@ impl<'a> FnC<'a> {
                 } else {
                     self.emit(Instr::JumpIfNotLtI(v, end_reg, 0))
                 };
-                let top = self.here();
+                let top = self.loop_start();
                 self.loops.push(LoopCtx::new(self.tries.len(), None));
                 self.block(body);
                 let cont = self.here();
@@ -1227,7 +1570,7 @@ impl<'a> FnC<'a> {
                 let fin = FinallyCtx { why, val: fval, entries: Vec::new(), exits: Vec::new() };
                 let begin = self.emit(Instr::TryBegin { catch: 0, exc: fval });
                 self.tries.push(TryCtx { active: 1, finally: Some(fin) });
-                let top = self.here();
+                let top = self.loop_start();
                 let key = key.map(|k| self.reg(k)).unwrap_or(NO_REG);
                 let val = self.reg(*val);
                 let next = self.emit(Instr::GenNext { it, key, val, end: 0 });
@@ -1270,7 +1613,7 @@ impl<'a> FnC<'a> {
                 self.expr_into(subject, it);
                 self.off = subject.span.start;
                 self.emit(Instr::IterInit(it, it));
-                let top = self.here();
+                let top = self.loop_start();
                 let key = key.map(|k| self.reg(k)).unwrap_or(NO_REG);
                 let val = self.reg(*val);
                 let next = self.emit(Instr::IterNext { it, key, val, end: 0 });
@@ -1614,6 +1957,140 @@ fn float_cmp(k: BinKind, d: Reg, a: Reg, b: Reg) -> Instr {
         BinKind::Lt => Instr::LtF(d, a, b),
         BinKind::Le => Instr::LeF(d, a, b),
         _ => Instr::CmpF(d, a, b),
+    }
+}
+
+/// Whether instruction `i` writes register `r` without reading it, and
+/// without running anything first (see `Compiler::settle`). One that may
+/// fail instead (an element read, arithmetic) counts only where no handler
+/// could go on (`plain`).
+fn overwrites(i: &Instr, r: Reg, plain: bool) -> bool {
+    use Instr::*;
+    match i {
+        Int(d, _) | Bool(d, _) | Null(d) | Const(d, _) | NewObject(d, _) | EnumCase(d, ..) => *d == r,
+        Move(d, a) | ToStr(d, a) | GetProp(d, a, _) => *d == r && *a != r,
+        Concat(d, start, n, _) | NewList(d, start, n) => *d == r && !(*start..*start + *n).contains(&r),
+        IncI(..) => false,
+        _ => plain && reads_only(i) && dest(i) == Some(r),
+    }
+}
+
+/// The register an instruction that only computes or reads (`reads_only`)
+/// writes.
+fn dest(i: &Instr) -> Option<Reg> {
+    use Instr::*;
+    match i {
+        Int(d, ..)
+        | Bool(d, ..)
+        | Null(d)
+        | Const(d, ..)
+        | Move(d, ..)
+        | IncI(d, ..)
+        | AddI(d, ..)
+        | SubI(d, ..)
+        | MulI(d, ..)
+        | ModI(d, ..)
+        | NegI(d, ..)
+        | AddIImm(d, ..)
+        | SubIImm(d, ..)
+        | AddF(d, ..)
+        | SubF(d, ..)
+        | MulF(d, ..)
+        | DivF(d, ..)
+        | NegF(d, ..)
+        | BitAnd(d, ..)
+        | BitOr(d, ..)
+        | BitXor(d, ..)
+        | BitNot(d, ..)
+        | Not(d, ..)
+        | EqI(d, ..)
+        | LtI(d, ..)
+        | LeI(d, ..)
+        | EqF(d, ..)
+        | NeF(d, ..)
+        | LtF(d, ..)
+        | LeF(d, ..)
+        | IntToFloat(d, ..)
+        | FloatToInt(d, ..)
+        | Eq(d, ..)
+        | Ne(d, ..)
+        | Lt(d, ..)
+        | Le(d, ..)
+        | Cmp(d, ..)
+        | CmpF(d, ..)
+        | ToStr(d, ..)
+        | Concat(d, ..)
+        | InstanceOf(d, ..)
+        | IsType(d, ..)
+        | GetProp(d, ..)
+        | Index(d, ..)
+        | IndexOrNull(d, ..) => Some(*d),
+        _ => None,
+    }
+}
+
+/// Whether instruction `i` only computes or reads: it runs no other code,
+/// changes no string or collection in place and does not jump (see
+/// `Compiler::settle`).
+fn reads_only(i: &Instr) -> bool {
+    use Instr::*;
+    matches!(
+        i,
+        Int(..)
+            | Bool(..)
+            | Null(_)
+            | Const(..)
+            | Move(..)
+            | IncI(..)
+            | AddI(..)
+            | SubI(..)
+            | MulI(..)
+            | ModI(..)
+            | NegI(..)
+            | AddIImm(..)
+            | SubIImm(..)
+            | AddF(..)
+            | SubF(..)
+            | MulF(..)
+            | DivF(..)
+            | NegF(..)
+            | BitAnd(..)
+            | BitOr(..)
+            | BitXor(..)
+            | BitNot(..)
+            | Not(..)
+            | EqI(..)
+            | LtI(..)
+            | LeI(..)
+            | EqF(..)
+            | NeF(..)
+            | LtF(..)
+            | LeF(..)
+            | IntToFloat(..)
+            | FloatToInt(..)
+            | Eq(..)
+            | Ne(..)
+            | Lt(..)
+            | Le(..)
+            | Cmp(..)
+            | CmpF(..)
+            | ToStr(..)
+            | Concat(..)
+            | InstanceOf(..)
+            | IsType(..)
+            | GetProp(..)
+            | Index(..)
+            | IndexOrNull(..)
+    )
+}
+
+/// Whether a value of type `t` is, or may be, a string, a collection, an
+/// object or a closure (not a number, a boolean or `null`).
+fn reference(t: &Type) -> bool {
+    match t {
+        Type::Int | Type::Float | Type::Bool | Type::Null | Type::Void | Type::Never => false,
+        Type::Union(members) => members.iter().any(reference),
+        _ => true,
     }
 }
 

@@ -301,7 +301,12 @@ fn orm() {
 /// commits implicitly, `BEGIN` written as SQL and a deadlock; the depth of
 /// `transaction()` stays right after an inner `COMMIT` fails, and std.orm
 /// forgets what it kept. On MySQL, `insert()` takes `lastInsertId()` as the
-/// key only from an AUTO_INCREMENT key column (found by the 19th audit).
+/// key only from an AUTO_INCREMENT key column (found by the 19th audit). On
+/// MySQL the end of a transaction is also seen when the statement's words do
+/// not say it (`ROLLBACK` through `EXECUTE` or `CALL`, a statement that
+/// commits implicitly in the outermost `transaction()`), a statement kept to
+/// run later may hold no XA statement, and an XA transaction a script leaves
+/// on its connection is rolled back (found by the 21st assessment).
 #[test]
 fn transactions_the_database_ended_are_not_reported_as_committed() {
     sweep_once();
@@ -318,6 +323,9 @@ fn transactions_the_database_ended_are_not_reported_as_committed() {
         check(&host, "mysql_tx_ended");
         check(&host, "mysql_tx_ended_after");
         check(&host, "mysql_orm_keys");
+        // Ended by a statement whose own words do not say so (21st assessment).
+        check(&host, "mysql_tx_indirect");
+        check(&host, "mysql_tx_indirect_after");
     }
 }
 

@@ -1,0 +1,17 @@
+<?phv
+// Browsers with scripting on read a `<noscript>` as raw text, up to its end
+// tag wherever it is written: in a tag name, between attributes, in an
+// attribute name or before a value too, where the checker reads no end tag.
+// `<noscript><svg><a</noscript>` left an SVG open for the checker and none for
+// browsers, so the `<script/>` after it, read as SVG (with the nonce), was an
+// HTML script running the value (found by the 21st assessment, in Chrome).
+// Inside SVG or MathML the same holds for the end tag of every raw-text
+// element. Every line is an error.
+$v = "x";
+?>
+<noscript><svg><a</noscript><script/><?= $v ?></script></a<></svg></noscript>
+<noscript><svg><a </noscript><script/><?= $v ?></script></a></svg></noscript>
+<noscript><svg><a x</noscript><script/><?= $v ?></script></a></svg></noscript>
+<noscript><svg><a x=</noscript><script/><?= $v ?></script></a></svg></noscript>
+<noscript><svg><a<?phv if ($v != "") { } ?></noscript><script/><?= $v ?></script></a<></svg></noscript>
+<svg><a </textarea><text><?= $v ?></text></a></svg>

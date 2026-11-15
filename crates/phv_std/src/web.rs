@@ -138,6 +138,13 @@ impl Json<'_> {
             self.i += 1;
         }
         let text = std::str::from_utf8(&self.s[start..self.i]).unwrap_or("");
+        // As RFC 8259 writes numbers: no leading zeros (`012`), digits on both
+        // sides of the point and after the exponent. Other parsers refuse the
+        // rest, or read `012` as 10: a document must mean the same to all
+        // (found by the 21st assessment: `012` was read as 12).
+        if !is_json_number(text.as_bytes()) {
+            return self.err("invalid number");
+        }
         if !float {
             if let Ok(i) = text.parse::<i64>() {
                 return Ok(Value::Int(i));
@@ -216,6 +223,34 @@ impl Json<'_> {
     }
 }
 
+/// Whether `t` is a number as JSON writes it (RFC 8259, section 6):
+/// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
+fn is_json_number(t: &[u8]) -> bool {
+    let digits = |t: &[u8]| t.iter().take_while(|b| b.is_ascii_digit()).count();
+    let t = t.strip_prefix(b"-").unwrap_or(t);
+    let int = digits(t);
+    if int == 0 || (int > 1 && t[0] == b'0') {
+        return false;
+    }
+    let mut t = &t[int..];
+    if let Some(frac) = t.strip_prefix(b".") {
+        let n = digits(frac);
+        if n == 0 {
+            return false;
+        }
+        t = &frac[n..];
+    }
+    if let Some(exp) = t.strip_prefix(b"e").or_else(|| t.strip_prefix(b"E")) {
+        let exp = exp.strip_prefix(b"+").or_else(|| exp.strip_prefix(b"-")).unwrap_or(exp);
+        let n = digits(exp);
+        if n == 0 {
+            return false;
+        }
+        t = &exp[n..];
+    }
+    t.is_empty()
+}
+
 pub fn json_decode(text: &str) -> Result<Value, String> {
     let mut p = Json { s: text.as_bytes(), i: 0, vm: None, values: 0, stopped: None };
     let v = p.value(0)?;
@@ -277,7 +312,7 @@ fn set_cookie(vm: &mut Vm, a: &[Value]) -> R {
     let (secure, http_only, same_site) =
         (matches!(a[4], Value::Bool(true)), matches!(a[5], Value::Bool(true)), s(&a[6]));
     if !is_token(name) {
-        return Err(vm.throw("ValueError", format!("invalid cookie name \"{name}\"")));
+        return Err(vm.throw("ValueError", format!("invalid cookie name \"{}\"", crate::httpclient::brief(name))));
     }
     if path.bytes().any(|b| b < 0x20 || b == b';' || b == 0x7f) {
         return Err(vm.throw("ValueError", "invalid cookie path"));
@@ -456,8 +491,17 @@ pub fn lookup(name: &str) -> Option<BuiltinFn> {
             unsent(vm, "the session")?;
             vm.http.session.regenerate = true;
             vm.http.session.changed = true;
-            // Tokens issued before login stop working after it.
-            vm.http.new_csrf_cookie = Some(random_hex(32));
+            // Tokens issued before login stop working after it: the browser
+            // gets a new CSRF cookie. One already made in this response (by
+            // `csrf_token()` for a visitor who had none, or by an earlier
+            // `regenerate()`) is new as well, was never sent before, and is
+            // kept, so that a token this response has handed out for it still
+            // matches (found by the 21st assessment: it never verified). A
+            // token made in this response for the cookie the request came
+            // with cannot be kept valid: that cookie is the one to replace.
+            if vm.http.new_csrf_cookie.is_none() {
+                vm.http.new_csrf_cookie = Some(random_hex(32));
+            }
             Ok(Value::Null)
         },
         "__sess_destroy" => |vm, _| {
@@ -523,6 +567,82 @@ mod tests {
         assert!(json_decode("{\"a\":1} x").is_err());
         assert!(json_decode(&"[".repeat(1000)).is_err());
         assert!(matches!(json_decode("12345678901234567890").unwrap(), Value::Float(_)));
+    }
+
+    /// Numbers are read as RFC 8259 writes them (21st assessment: `012`
+    /// was read as 12, which other parsers refuse or read as 10).
+    #[test]
+    fn numbers_with_leading_zeros_are_refused() {
+        for bad in [
+            "012",
+            "-012",
+            "00",
+            "01.5",
+            "[1, 02]",
+            "{\"exp\": 0123}",
+            "1.",
+            "-",
+            "1.e5",
+            "1e",
+            "1e+",
+            "-.5",
+            "1.5.2",
+            "1e5e5",
+            "+1",
+            "0x10",
+            "1-2",
+        ] {
+            assert!(json_decode(bad).is_err(), "{bad}");
+        }
+        for (good, int) in [
+            ("0", true),
+            ("-0", true),
+            ("10", true),
+            ("0.5", false),
+            ("-0.0", false),
+            ("1e5", false),
+            ("1E-2", false),
+            ("0e0", false),
+            ("120", true),
+            ("1.050", false),
+        ] {
+            let v = json_decode(good).unwrap_or_else(|e| panic!("{good}: {e}"));
+            assert_eq!(matches!(v, Value::Int(_)), int, "{good}");
+        }
+        assert!(matches!(json_decode("[0, 100, -7]").unwrap(), Value::List(ref l) if l.len() == 3));
+    }
+
+    /// `regenerate()` gives the browser a new CSRF cookie, so tokens from
+    /// before sign-in stop working; a cookie this response has already made
+    /// is kept, so the token handed out for it still matches (21st
+    /// assessment: it never verified).
+    #[test]
+    fn a_token_made_for_a_new_cookie_survives_regenerate() {
+        let regenerate = lookup("__sess_regenerate").unwrap();
+        let expected = |vm: &Vm, cookie: &str| csrf_expected(&vm.http.csrf_secret, cookie);
+        // A visitor without a CSRF cookie: the token's cookie is made in this response.
+        let mut vm = Vm::new(std::sync::Arc::default(), std::sync::Arc::from([]), false, phv_vm::Limits::default());
+        vm.http.csrf_secret = b"secret".to_vec();
+        let token = csrf_token(&mut vm).ok().unwrap();
+        let made = vm.http.new_csrf_cookie.clone().unwrap();
+        regenerate(&mut vm, &[]).ok().unwrap();
+        assert_eq!(vm.http.new_csrf_cookie.as_deref(), Some(made.as_str()), "the cookie of this response is kept");
+        assert!(csrf_matches(&expected(&vm, &made), &token));
+        // A visitor who came with one: it is replaced, and a token for it no longer matches.
+        let mut vm = Vm::new(std::sync::Arc::default(), std::sync::Arc::from([]), false, phv_vm::Limits::default());
+        vm.http.csrf_secret = b"secret".to_vec();
+        vm.http.csrf_cookie = Some("old-cookie".into());
+        let before = csrf_token(&mut vm).ok().unwrap();
+        assert!(vm.http.new_csrf_cookie.is_none());
+        regenerate(&mut vm, &[]).ok().unwrap();
+        let new = vm.http.new_csrf_cookie.clone().unwrap();
+        assert_ne!(new, "old-cookie");
+        assert!(!csrf_matches(&expected(&vm, &new), &before), "a token from before is of the old cookie");
+        // A token made after it is of the new cookie; a second regenerate() keeps that cookie.
+        let after = csrf_token(&mut vm).ok().unwrap();
+        regenerate(&mut vm, &[]).ok().unwrap();
+        assert_eq!(vm.http.new_csrf_cookie.as_deref(), Some(new.as_str()));
+        assert!(csrf_matches(&expected(&vm, &new), &after));
     }
 
     /// The hex table gives what formatting each byte gave.

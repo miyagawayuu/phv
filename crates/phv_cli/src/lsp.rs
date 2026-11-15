@@ -140,11 +140,22 @@ fn send(out: &mut impl Write, msg: &Value) {
     let _ = out.flush();
 }
 
+/// The longest URI of a document, in bytes, and the most folders above it.
+/// The project of a document is looked for in each folder above it and every
+/// folder is checked for links, so a URI of 30,000 folders (a message may be
+/// 64 MB) took half a minute each time (21st assessment). Windows paths end at
+/// 32,767 characters; percent-encoding can triple them.
+const MAX_URI: usize = 100_000;
+const MAX_URI_DEPTH: usize = 256;
+
 /// The local file a `file:///...` URI names. Anything that could reach another
 /// machine or a device is refused: `file://host/share`, UNC paths smuggled in
 /// after decoding (`file:///%5C%5Chost%5Cshare`), `\\?\` and `\\.\` paths, and
 /// device names such as `CON` or a named pipe.
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    if uri.len() > MAX_URI {
+        return None;
+    }
     let rest = uri.strip_prefix("file://")?;
     if !rest.starts_with('/') {
         return None;
@@ -168,6 +179,9 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
         decoded
     };
     let path = PathBuf::from(path);
+    if path.components().count() > MAX_URI_DEPTH {
+        return None;
+    }
     let names_ok = path.components().all(|c| match c {
         std::path::Component::Normal(n) => n.to_str().is_some_and(phv_std::safefs::valid_name),
         std::path::Component::ParentDir => false,
@@ -397,8 +411,12 @@ fn canonical_doc(p: &Path) -> Option<PathBuf> {
 
 struct Server {
     open: HashMap<PathBuf, String>,
-    /// The canonical path of each open document, found when it was opened.
-    canonical: HashMap<PathBuf, PathBuf>,
+    /// The canonical path of each open document, found when it was opened
+    /// and again when it is saved; `None` for one that is not on disk (or is
+    /// behind a link to another machine), so that it is not looked for again
+    /// by every request: 300 such documents delayed an answer by 50 seconds
+    /// (21st assessment).
+    canonical: HashMap<PathBuf, Option<PathBuf>>,
     /// Files we published diagnostics for, per entry document.
     reported: HashMap<PathBuf, HashSet<String>>,
     /// Open documents larger than sources may be: kept without their text, so
@@ -452,11 +470,19 @@ impl Server {
         self.analyses.get_mut().clear();
     }
 
+    /// The canonical path of `p`: as remembered for an open document.
+    fn canonical_of(&self, p: &Path) -> Option<PathBuf> {
+        match self.canonical.get(p) {
+            Some(c) => c.clone(),
+            None => canonical_doc(p),
+        }
+    }
+
     fn overlay(&self) -> HashMap<PathBuf, String> {
         self.open
             .iter()
             .filter_map(|(p, t)| {
-                let c = self.canonical.get(p).cloned().or_else(|| canonical_doc(p))?;
+                let c = self.canonical_of(p)?;
                 Some((c, t.clone()))
             })
             .collect()
@@ -516,7 +542,7 @@ impl Server {
     /// Analyzes `path` as if its text were `text`.
     fn analyze_text(&self, path: &Path, text: String) -> Analysis {
         let mut overlay = self.overlay();
-        if let Some(c) = canonical_doc(path) {
+        if let Some(c) = self.canonical_of(path) {
             overlay.insert(c, text);
         }
         analyze_for_editor(&find_root(path), path, overlay)
@@ -788,9 +814,7 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                         doc_path(params).filter(|p| server.open.contains_key(p) || server.open.len() < MAX_OPEN)
                     {
                         let text = params["textDocument"]["text"].as_str().unwrap_or("");
-                        if let Some(c) = canonical_doc(&p) {
-                            server.canonical.insert(p.clone(), c);
-                        }
+                        server.canonical.insert(p.clone(), canonical_doc(&p));
                         let text = server.admit(&p, text);
                         server.open.insert(p.clone(), text);
                         server.changed();
@@ -890,6 +914,11 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                 "textDocument/didSave" => {
                     // Only documents the editor opened are checked.
                     if let Some(p) = doc_path(params).filter(|p| server.open.contains_key(p)) {
+                        // A new document is on disk from its first save on.
+                        if server.canonical.get(&p).is_some_and(Option::is_none) {
+                            server.canonical.insert(p.clone(), canonical_doc(&p));
+                            server.changed();
+                        }
                         schedule(&mut due, p, Instant::now(), false);
                     }
                     None
@@ -941,7 +970,18 @@ fn serve(inbox: &Inbox, out: &mut impl Write) -> Option<i32> {
                         }
                     }
                 }
-                "textDocument/formatting" => Some(doc_path(params).map_or(Value::Null, |p| server.formatting(&p))),
+                "textDocument/formatting" => {
+                    match doc_path(params).map_or(Ok(Value::Null), |p| server.formatting(&p)) {
+                        Ok(edits) => Some(edits),
+                        Err(message) => {
+                            send(
+                                out,
+                                &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32803, "message": message } }),
+                            );
+                            None
+                        }
+                    }
+                }
                 "textDocument/signatureHelp" => Some(match doc_path(params) {
                     Some(p) => {
                         let (line, character) = position();
@@ -1479,6 +1519,104 @@ mod tests {
         }
     }
 
+    /// 21st assessment: the project of a document is looked for in every
+    /// folder above it, so a document 30,000 folders deep (a URI may be as
+    /// long as a message) took half a minute per request.
+    #[test]
+    fn refuses_long_and_deep_uris() {
+        let root = if cfg!(windows) { "file:///C:/" } else { "file:///" };
+        let deep = |n: usize| format!("{root}{}x.phv", "a/".repeat(n));
+        assert!(uri_to_path(&deep(200)).is_some());
+        assert!(uri_to_path(&deep(MAX_URI_DEPTH)).is_none());
+        assert!(uri_to_path(&deep(30_000)).is_none());
+        assert!(uri_to_path(&format!("{root}{}.phv", "a".repeat(MAX_URI))).is_none());
+    }
+
+    /// A document that is not on disk was looked for again by every request
+    /// (300 of them delayed an answer by 50 seconds). It is looked for when
+    /// it is opened and when it is saved.
+    #[test]
+    fn documents_not_on_disk_are_looked_for_once() {
+        let p = Project::new("missing");
+        let uri = path_to_uri(&p.dir.join("page.phv"));
+        let open = |uri: &str| {
+            notification(
+                "textDocument/didOpen",
+                json!({ "textDocument": { "uri": uri, "languageId": "phv", "version": 0, "text": "<?phv\necho 1;\n" } }),
+            )
+        };
+        let mut msgs: Vec<Value> = (0..300).map(|i| open(&path_to_uri(&p.dir.join(format!("gone{i}.phv"))))).collect();
+        msgs.push(open(&uri));
+        msgs.push(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "textDocument/hover",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": 1, "character": 1 } },
+        }));
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let got = serve_batch(msgs);
+            let _ = tx.send((got, start.elapsed()));
+        });
+        let (got, took) = rx.recv_timeout(Duration::from_secs(300)).expect("no answer in 300 s");
+        assert!(got.iter().any(|m| m["id"] == 1), "{got:?}");
+        assert!(took < Duration::from_secs(60), "took {took:?}");
+
+        // What was found when a document was opened is what requests use.
+        let new = p.dir.join("new.phv");
+        let mut server = Server::new();
+        server.canonical.insert(new.clone(), canonical_doc(&new));
+        server.open.insert(new.clone(), "<?phv\necho 1;\n".into());
+        std::fs::write(&new, "<?phv\necho 1;\n").unwrap();
+        assert_eq!(server.canonical_of(&new), None);
+        assert!(server.overlay().is_empty());
+        // (A save looks again: see `textDocument/didSave`.)
+        server.canonical.insert(new.clone(), canonical_doc(&new));
+        assert_eq!(server.overlay().len(), 1);
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    /// The formatter refuses a document nested deeper than the parser allows
+    /// (formatting 1,622 bytes of nested brackets took 12 seconds and answered
+    /// with a 2.5 MB edit; 136 KB of open brackets took 4 GB): the request is
+    /// answered with an error, and one that does not lex with no edit.
+    #[test]
+    fn formatting_refusals_are_errors() {
+        let p = Project::new("refusals");
+        let uri = path_to_uri(&p.dir.join("page.phv"));
+        let ask = |text: String| {
+            let msgs = vec![
+                notification(
+                    "textDocument/didOpen",
+                    json!({ "textDocument": { "uri": uri, "languageId": "phv", "version": 0, "text": text } }),
+                ),
+                json!({
+                    "jsonrpc": "2.0", "id": 7, "method": "textDocument/formatting",
+                    "params": { "textDocument": { "uri": uri }, "options": { "tabSize": 4, "insertSpaces": true } },
+                }),
+            ];
+            // On a stack like the one `phv` runs on: the document is also parsed.
+            let server = std::thread::Builder::new().stack_size(64 << 20).spawn(move || serve_batch(msgs));
+            server.unwrap().join().unwrap().into_iter().find(|m| m["id"] == 7).unwrap()
+        };
+        let start = Instant::now();
+        for text in [
+            format!("<?phv\n$b = {}1{};\n", "[".repeat(800), "]".repeat(800)),
+            format!("<?phv\n{}", "$a = [\n".repeat(20_000)),
+        ] {
+            let answer = ask(text);
+            assert_eq!(answer["error"]["code"], -32803, "{answer}");
+            let message = answer["error"]["message"].as_str().unwrap();
+            assert!(message.contains("nested too deeply"), "{message}");
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "took {:?}", start.elapsed());
+        assert_eq!(ask("<?phv\n$s = \"open".into())["result"], json!([]));
+        assert_eq!(
+            ask("<?phv\nif (true) {\necho 1;\n}\n".into())["result"][0]["newText"],
+            "<?phv\nif (true) {\n    echo 1;\n}\n"
+        );
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
     /// The text each edit of a rename would replace, by file name, sorted.
     fn edits(result: &Value) -> Vec<(String, String)> {
         let mut out = Vec::new();
@@ -1543,7 +1681,7 @@ mod tests {
     fn formats_helps_with_signatures_and_lists_symbols() {
         let p = Project::new("tools");
         let (server, path, _, _) = p.open("page.phv", "<?phv\nfunction f(int $a): int {\nreturn $a;   \n}|\n");
-        let edits = server.formatting(&path);
+        let edits = server.formatting(&path).unwrap();
         assert_eq!(edits[0]["newText"], "<?phv\nfunction f(int $a): int {\n    return $a;\n}\n", "{edits}");
         let (server, path, line, character) = p.open(
             "page.phv",
@@ -1621,6 +1759,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p.dir);
     }
 
+    /// 21st assessment: workspace symbols, references and rename walked what
+    /// they took for the project to its end. A document with no `phv.toml`
+    /// above it has its own folder for a project, which may be a drive
+    /// (`C:\x.phv`: 40 seconds per request). Little of such a folder is read,
+    /// nothing of a drive's root, and a rename that could not look at every
+    /// file is refused.
+    #[test]
+    fn project_walks_are_bounded() {
+        let dir = std::env::temp_dir().join(format!("phv-lsp-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lib = "export function shared(): int { return 1; }\n";
+        // 400 folders beside the document, each with a file, and one chain 12 folders deep.
+        for i in 0..400 {
+            std::fs::create_dir_all(dir.join(format!("d{i:03}"))).unwrap();
+            std::fs::write(
+                dir.join(format!("d{i:03}/f.phv")),
+                format!("export function f{i}(): int {{ return {i}; }}\n"),
+            )
+            .unwrap();
+        }
+        let deep = dir.join("a/b/c/d/e/f/g/h/i/j/k/l");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("deep.phv"), "export function deep(): int { return 1; }\n").unwrap();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/m.phv"), lib).unwrap();
+        let page = "<?phv\nimport lib.m.shared;\necho sha|red();\n";
+        std::fs::write(dir.join("page.phv"), page.replace('|', "")).unwrap();
+        let open = || {
+            let cursor = page.find('|').unwrap();
+            let mut server = Server::new();
+            server.open.insert(dir.join("page.phv"), page.replace('|', ""));
+            let character = page[..cursor].rsplit('\n').next().unwrap().len() as u64;
+            (server, dir.join("page.phv"), 2, character)
+        };
+        let names = |server: &Server| -> Vec<String> {
+            let found = server.workspace_symbols("");
+            found.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect()
+        };
+
+        // Without a phv.toml: 200 folders at most, 4 deep, and no rename.
+        let limit = features::project_walk(&dir);
+        assert_eq!((limit.folders, limit.depth), (200, 4));
+        let (server, path, line, character) = open();
+        let start = Instant::now();
+        let found = names(&server);
+        assert!(found.len() < 200 && !found.contains(&"deep".to_string()), "{} symbols", found.len());
+        let e = server.rename(&path, line, character, "other").unwrap_err();
+        assert_eq!(e, "the project is too large to find every use; nothing was renamed");
+        assert!(server.references(&path, line, character, true).as_array().is_some());
+        assert!(start.elapsed() < Duration::from_secs(60), "took {:?}", start.elapsed());
+
+        // The root of a drive (or `/`) is never walked.
+        let root = dir.ancestors().last().unwrap();
+        let limit = features::project_walk(root);
+        assert_eq!((limit.folders, limit.depth), (0, 0));
+        let want = |p: &Path| p.to_string_lossy().ends_with(".phv");
+        let start = Instant::now();
+        let (files, complete) = crate::tools::collect_within(&[root.to_path_buf()], &want, &limit);
+        assert!(files.is_empty() && !complete);
+        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+
+        // In a project (a phv.toml), a few folders are all looked at, and the rename is made.
+        for i in 150..400 {
+            std::fs::remove_dir_all(dir.join(format!("d{i:03}"))).unwrap();
+        }
+        std::fs::write(dir.join("phv.toml"), "[project]\nname = \"t\"\n").unwrap();
+        let (server, path, line, character) = open();
+        let found = names(&server);
+        assert!(found.contains(&"deep".to_string()) && found.contains(&"f149".to_string()), "{} symbols", found.len());
+        let renamed = edits(&server.rename(&path, line, character, "other").unwrap());
+        assert_eq!(renamed.len(), 3, "{renamed:?}");
+        // Past the 300 files that are looked at, it is refused as well.
+        for i in 150..400 {
+            std::fs::create_dir_all(dir.join(format!("d{i:03}"))).unwrap();
+            std::fs::write(dir.join(format!("d{i:03}/f.phv")), "export function g(): int { return 1; }\n").unwrap();
+        }
+        let (server, path, line, character) = open();
+        assert!(server.rename(&path, line, character, "other").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An open document over 8 MB is kept without its text, and nothing edits
     /// from that empty text (the 1.0.0 audit: formatting added a blank line).
     #[test]
@@ -1632,7 +1851,7 @@ mod tests {
         assert!(text.is_empty());
         server.open.insert(big.clone(), text);
         let all = json!({ "start": { "line": 0, "character": 0 }, "end": { "line": 99, "character": 0 } });
-        assert_eq!(server.formatting(&big), Value::Null);
+        assert_eq!(server.formatting(&big), Ok(Value::Null));
         assert_eq!(server.code_actions(&big, &all), json!([]));
         assert_eq!(server.document_symbols(&big), Value::Null);
         // A rename anywhere would miss its uses there.

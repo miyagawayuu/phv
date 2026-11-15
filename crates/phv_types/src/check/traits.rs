@@ -238,6 +238,7 @@ impl<'a> Checker<'a> {
     ) -> TraitMembers<'a> {
         // Each trait used directly, where it is named, and what it gives.
         let mut used: Vec<(ClassId, Span, TraitMembers<'a>)> = Vec::new();
+        let mut used_ids: HashSet<ClassId> = HashSet::new();
         for u in uses {
             for r in &u.traits {
                 let Some(t) = self.class_ref(&r.name, r.span) else {
@@ -252,7 +253,10 @@ impl<'a> Checker<'a> {
                     }
                     continue;
                 }
-                if used.iter().any(|(u, ..)| *u == t) {
+                // Looked up in a set: a scan of `used` for each trait named
+                // made 160,000 traits in one `use` take a minute (21st assessment).
+                // (Empty traits meet the member limit: each flatten counts one.)
+                if !used_ids.insert(t) {
                     self.error(format!("trait `{}` is used more than once", r.name), r.span);
                     continue;
                 }

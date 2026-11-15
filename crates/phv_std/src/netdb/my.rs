@@ -34,6 +34,227 @@ pub(super) struct MyConn {
     /// made it (`my_io_limits`); the driver cannot change them later.
     io_timeout: Duration,
     packet: usize,
+    /// What the server last said of the session's transaction (see `TxTrack`).
+    tx: TxTrack,
+    /// The id of the XA transaction the script started on this connection
+    /// with `XA START` (as it wrote it), until the session is reset: it is
+    /// rolled back when the script is done with the connection (`end_xa`).
+    xa: Option<String>,
+}
+
+/// The state of a session's transaction as the server reports it with each
+/// reply (`session_track_transaction_info = STATE`): eight characters, the
+/// first `T` in a transaction begun explicitly, `I` in one begun implicitly
+/// (`autocommit = 0`), `_` in none; the next six say what the transaction has
+/// done so far (reads and writes of transactional and other tables, an unsafe
+/// statement, a result sent), and are only ever added to while it lasts.
+///
+/// So a statement after which the first character is `_`, or has changed, or
+/// one of the six is gone, ended the transaction that was open before it,
+/// whatever its text: `ROLLBACK` or `COMMIT` run through `EXECUTE` or `CALL`,
+/// a statement that commits implicitly (found by the 21st assessment: only
+/// the statement's own words were read, so `PREPARE s FROM 'ROLLBACK'` and a
+/// procedure whose body is `ROLLBACK` ended the transaction of
+/// `transaction()` unseen, and std.orm kept what it had written).
+///
+/// A procedure that ends the transaction and begins another that does the
+/// same kinds of things leaves the same state. The server is therefore asked
+/// for the transaction's characteristics too (`CHARACTERISTICS`): it reports
+/// them whenever a transaction begins or ends, and not otherwise, so a report
+/// of them after a statement run in an open transaction says that transaction
+/// is over, whatever state the statement left (found by the re-attack of the
+/// 21st assessment: `ROLLBACK; START TRANSACTION; UPDATE …` in a procedure
+/// lost the work before it unseen).
+#[derive(Default)]
+struct TxTrack {
+    /// Whether the server reports the state (it took the setting).
+    on: bool,
+    /// The state last reported (`________` before any).
+    state: [u8; 8],
+    /// Set when a statement ended the transaction it found open, until
+    /// `MyConn::take_tx_ended` reads it.
+    ended: bool,
+}
+
+/// Asks the server to report the transaction's state (see `TxTrack`).
+const TRACK_TX: &str = "SET SESSION session_track_transaction_info = 'CHARACTERISTICS'";
+
+/// Whether the transaction of state `old` is over in state `new` (see `TxTrack`).
+pub(super) fn tx_over(old: &[u8; 8], new: &[u8; 8]) -> bool {
+    old[0] != b'_' && (new[0] != old[0] || (1..7).any(|i| old[i] != b'_' && new[i] == b'_'))
+}
+
+impl MyConn {
+    /// Reads the transaction state of the last reply, if it carries one, and
+    /// notes whether the open transaction ended (`TxTrack`). Called after
+    /// every statement run on a script's connection.
+    pub(super) fn note_tx(&mut self) {
+        use mysql::session_state_change::SessionStateChange;
+        if !self.tx.on {
+            return;
+        }
+        let mut new = None;
+        let mut boundary = false;
+        if let Ok(changes) = self.conn.session_state_changes() {
+            for info in &changes {
+                match info.decode() {
+                    Ok(SessionStateChange::TransactionState(state)) => {
+                        if let Ok(b) = <[u8; 8]>::try_from(state.as_bytes()) {
+                            new = Some(b);
+                        }
+                    }
+                    // Reported when a transaction began or ended.
+                    Ok(SessionStateChange::TransactionCharacteristics(_)) => boundary = true,
+                    _ => {}
+                }
+            }
+        }
+        // (A result set ends with a reply of its own, which carries nothing: no reply is read twice.)
+        if boundary && self.tx.state[0] != b'_' {
+            self.tx.ended = true;
+        }
+        if let Some(new) = new {
+            if tx_over(&self.tx.state, &new) {
+                self.tx.ended = true;
+            }
+            self.tx.state = new;
+        }
+    }
+
+    /// Whether a statement since the last call ended the transaction it found
+    /// open (see `TxTrack`).
+    pub(super) fn take_tx_ended(&mut self) -> bool {
+        std::mem::take(&mut self.tx.ended)
+    }
+
+    /// After a statement of PHV's own that ends or begins a transaction
+    /// (`transaction()`'s `COMMIT`, `ROLLBACK`): the state is read, and the
+    /// end it shows is not the script's doing.
+    pub(super) fn note_own_tx(&mut self) {
+        self.note_tx();
+        self.tx.ended = false;
+    }
+
+    /// The transaction state last reported (for tests).
+    #[cfg(test)]
+    pub(super) fn tx_state(&self) -> String {
+        String::from_utf8_lossy(&self.tx.state).into_owned()
+    }
+
+    /// Notes the XA transaction a script's statement starts (`XA START 'id'`,
+    /// `XA BEGIN 'id'`), to end it when the script is done (`end_xa`). An id
+    /// PHV cannot give back as it is (anything but quoted strings and
+    /// numbers, such as `JOIN` or `RESUME` after it) is not kept. Once the
+    /// script has ended it itself (`XA COMMIT`, `XA ROLLBACK`), there is
+    /// nothing to end: a later transaction of that id is someone else's.
+    pub(super) fn note_xa(&mut self, text: &str) {
+        if let Some(id) = super::pg::xa_start_id(text) {
+            self.xa = Some(id).filter(|id| id.len() <= 1024 && xa_id_only(id));
+        } else if super::pg::xa_ends(text) {
+            self.xa = None;
+        }
+    }
+
+    /// Ends the XA transaction the script started and left on the session:
+    /// rolled back whatever its state (active, idle, or prepared by a
+    /// procedure made outside PHV, which `refused_statement` cannot see). A
+    /// prepared one would otherwise stay on the server, with its locks, after
+    /// the connection is reset or closed (21st assessment).
+    fn end_xa(&mut self) {
+        use mysql::prelude::Queryable;
+        let Some(id) = self.xa.take() else { return };
+        // Active: `XA END` first (an error in the other states); then idle or
+        // prepared: `XA ROLLBACK`. Errors are the answer when there is none.
+        let _ = self.conn.query_drop(format!("XA END {id}"));
+        let _ = self.conn.query_drop(format!("XA ROLLBACK {id}"));
+    }
+}
+
+/// Whether `id` is the id of an XA transaction and nothing more: quoted
+/// strings (with `X` or `B` before them), hexadecimal literals and numbers,
+/// separated by commas (`'gtrid'[, 'bqual'[, formatID]]`), so that
+/// `XA ROLLBACK <id>` is one statement that names it.
+pub(super) fn xa_id_only(id: &str) -> bool {
+    let b = id.as_bytes();
+    let space = |i: &mut usize| {
+        while *i < b.len() && matches!(b[*i], b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) {
+            *i += 1;
+        }
+    };
+    let mut i = 0;
+    let mut parts = 0;
+    loop {
+        space(&mut i);
+        let start = i;
+        while i < b.len() && b[i].is_ascii_alphanumeric() {
+            i += 1;
+        }
+        if i < b.len() && (b[i] == b'\'' || b[i] == b'"') {
+            let quote = b[i];
+            if !matches!(&id[start..i], "" | "x" | "X" | "b" | "B") {
+                return false;
+            }
+            i += 1;
+            loop {
+                match b.get(i) {
+                    // A backslash may or may not escape (`NO_BACKSLASH_ESCAPES`).
+                    None | Some(b'\\') => return false,
+                    Some(&c) if c == quote => {
+                        i += 1;
+                        if b.get(i) != Some(&quote) {
+                            break;
+                        }
+                        i += 1;
+                    }
+                    Some(_) => i += 1,
+                }
+            }
+        } else if i == start || !(b[start].is_ascii_digit()) {
+            // Not a number or a `0x…` literal: a word (`JOIN`, `RESUME`).
+            return false;
+        }
+        parts += 1;
+        space(&mut i);
+        match b.get(i) {
+            None => return parts <= 3,
+            Some(b',') => i += 1,
+            Some(_) => return false,
+        }
+    }
+}
+
+/// Rolls back, from a second connection, the XA transaction `id` that a
+/// connection being closed may have left prepared (a prepared transaction
+/// outlives its connection). Tried a few times: the server lets go of it
+/// only once the first connection is closed. An error is the answer when
+/// there was none.
+fn end_xa_aside(opts: Arc<mysql::Opts>, id: String) {
+    let send = move || {
+        use mysql::prelude::Queryable;
+        let side = mysql::OptsBuilder::from_opts((*opts).clone())
+            .tcp_connect_timeout(Some(Duration::from_secs(5)))
+            .read_timeout(Some(Duration::from_secs(5)))
+            .write_timeout(Some(Duration::from_secs(5)));
+        let Ok(mut side) = mysql::Conn::new(side) else { return };
+        for _ in 0..5 {
+            if side.query_drop(format!("XA ROLLBACK {id}")).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    // Without a thread the transaction stays until someone ends it by name.
+    let _ = crate::workers::spawn(send);
+}
+
+impl Drop for MyConn {
+    /// A connection closed with the script's XA transaction still on it
+    /// (after a network error, or a reset that failed).
+    fn drop(&mut self) {
+        if let Some(id) = self.xa.take() {
+            end_xa_aside(self.opts.clone(), id);
+        }
+    }
 }
 
 impl MyConn {
@@ -84,10 +305,18 @@ impl Driver for MyConn {
         if killed || self.failed.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
+        // The script's XA transaction first: the reset does not end a
+        // prepared one, which would stay on the server with its locks.
+        self.end_xa();
         // Rolls back an open transaction and clears session variables and temporary tables.
         if self.conn.reset().is_err() {
             return false;
         }
+        // The reset clears the setting that makes the server report the
+        // transaction's state: it is set again with the statements below.
+        self.tx.state = *b"________";
+        self.tx.ended = false;
+        let track = if self.tx.on { TRACK_TX } else { "DO 0" };
         // COM_RESET_CONNECTION keeps the active role and the current database:
         // both are put back with one query of two statements (one round trip
         // instead of two), whose replies are checked in order. The command
@@ -95,14 +324,15 @@ impl Driver for MyConn {
         // functions that write a command and read a packet to itself.
         match self.opts.get_db_name() {
             Some(db) => {
-                my_statements(&mut self.conn, &format!("SET ROLE DEFAULT; USE `{}`", db.replace('`', "``"))).is_ok()
+                my_statements(&mut self.conn, &format!("{track}; SET ROLE DEFAULT; USE `{}`", db.replace('`', "``")))
+                    .is_ok()
             }
             // Without a database in the URL there is none to go back to: a script that
             // chose one leaves a connection that is not reused.
             None => matches!(
-                my_statements(&mut self.conn, "SET ROLE DEFAULT; SELECT DATABASE()").as_deref(),
-                Ok([row]) if row.get::<Option<String>, _>(0) == Some(None)
-            ),
+            my_statements(&mut self.conn, &format!("{track}; SET ROLE DEFAULT; SELECT DATABASE()")).as_deref(),
+                            Ok([row]) if row.get::<Option<String>, _>(0) == Some(None)
+                        ),
         }
     }
 
@@ -150,14 +380,29 @@ pub(super) fn my_connect(
         .tcp_connect_timeout(Some(timeout))
         .read_timeout(Some(io_timeout))
         .write_timeout(Some(io_timeout))
-        .max_allowed_packet(Some(packet));
+        .max_allowed_packet(Some(packet))
+        // The server then reports the session's transaction state with its
+        // replies (`TxTrack`).
+        .additional_capabilities(mysql::consts::CapabilityFlags::CLIENT_SESSION_TRACK);
     let opts = Arc::new(mysql::Opts::from(builder.clone()));
     // The driver looks the host up itself, with no deadline of its own, and
     // waits for a server's greeting as long as for any answer.
-    let conn =
-        crate::netio::with_deadline_in(&MY_CONNECTING, Instant::now() + timeout, move || mysql::Conn::new(builder))?
-            .map_err(|e| my_message(&e))?;
+    let made = crate::netio::with_deadline_in(&MY_CONNECTING, Instant::now() + timeout, move || {
+        use mysql::prelude::Queryable;
+        let mut conn = mysql::Conn::new(builder)?;
+        // A server that does not know the setting (MySQL before 5.7, MariaDB
+        // before 10.2) is used as before, by the statements' words alone.
+        let tracked = match conn.query_drop(TRACK_TX) {
+            Ok(()) => true,
+            Err(mysql::Error::MySqlError(_)) => false,
+            Err(e) => return Err(e),
+        };
+        Ok((conn, tracked))
+    })?;
+    let (conn, tracked) = made.map_err(|e| my_message(&e))?;
     Ok(MyConn {
+        tx: TxTrack { on: tracked, state: *b"________", ended: false },
+        xa: None,
         conn,
         timeout_ms: None,
         opts,
@@ -438,6 +683,7 @@ pub(super) fn my_run<T>(
     my_limit_time(vm, c)?;
     let kill = my_kill_at(vm, c);
     let r = run(&mut c.get().conn);
+    c.get().note_tx();
     if kill.disarm() {
         c.broken = true;
     }
@@ -524,6 +770,7 @@ pub(super) fn my_query(vm: &mut Vm, c: &mut Pooled<MyConn>, q: &Value) -> R {
         }
         Ok(())
     })();
+    c.get().note_tx();
     if kill.disarm() {
         c.broken = true;
     }
@@ -554,6 +801,10 @@ pub(super) fn my_execute(vm: &mut Vm, c: &mut Pooled<MyConn>, q: &Value) -> R {
     let unsupported = matches!(&r, Err(mysql::Error::MySqlError(m)) if m.code == 1295);
     if unsupported && params.is_empty() && !text.contains(';') {
         r = c.get().conn.query_drop(&text);
+    }
+    c.get().note_tx();
+    if r.is_ok() {
+        c.get().note_xa(&text);
     }
     if kill.disarm() {
         c.broken = true;

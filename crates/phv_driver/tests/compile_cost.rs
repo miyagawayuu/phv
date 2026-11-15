@@ -548,3 +548,174 @@ fn long_chains_and_deep_types_are_limited() {
         assert_eq!(out, "1", "{name}");
     }
 }
+
+/// The traits of one `use` were looked for among those before them, one by
+/// one: a class using 160,000 empty traits (4 MB) took a minute (21st
+/// assessment; R23-4 had indexed the rules of a `use`, not its traits).
+/// Empty traits still meet the member limit (each one flattened counts).
+#[test]
+fn many_traits_used_by_one_class_check_at_once() {
+    let traits = |n: usize| -> String { (0..n).map(|i| format!("trait T{i} {{ }}\n")).collect() };
+    let names = |n: usize| (0..n).map(|i| format!("T{i}")).collect::<Vec<_>>().join(", ");
+    let n = 150_000;
+    let src = format!("<?phv\n{}final class C {{ use {}; }}\n$c = new C();\necho \"ok\";\n", traits(n), names(n));
+    let (out, _, took) = compile_src("traits_used", src);
+    assert_eq!(out, "ok");
+    // About 50 s in a release build before.
+    assert!(took < Duration::from_secs(30), "took {took:?}");
+    let n = 70_000;
+    // 210,000 traits used in all.
+    let classes: String = (0..3).map(|i| format!("final class C{i} {{ use {}; }}\n", names(n))).collect();
+    let (out, _, took) = compile_src("traits_used_limit", format!("<?phv\n{}{classes}echo \"ok\";\n", traits(n)));
+    assert!(out.contains("inherit more than 200000 members in total"), "{}", &out[..out.len().min(300)]);
+    assert!(took < Duration::from_secs(30), "took {took:?}");
+    let (out, _, _) = compile_src("trait_twice", "<?phv\ntrait T { }\nclass C { use T, T; }\n".into());
+    assert!(out.contains("trait `T` is used more than once"), "{out}");
+}
+
+/// Each property was looked for in the list of the constructor's promoted
+/// parameters and in the list of its assignments: 65,000 promoted parameters
+/// took 10 s (21st assessment).
+#[test]
+fn constructors_of_many_properties_check_at_once() {
+    let n = 60_000;
+    let params = (0..n).map(|i| format!("public int $p{i} = 0")).collect::<Vec<_>>().join(", ");
+    let src = format!("<?phv\nclass A {{ public function __construct({params}) {{}} }}\necho \"ok\";\n");
+    let (out, _, took) = compile_src("promoted", src);
+    assert_eq!(out, "ok");
+    assert!(took < Duration::from_secs(30), "took {took:?}");
+    let props: String = (0..n).map(|i| format!("public int $p{i};\n")).collect();
+    let body = "$this->q = 1;\n".repeat(100_000);
+    let src = format!("<?phv\nclass A {{\npublic int $q = 0;\n{props}public function __construct() {{\n{body}}} }}\n");
+    let (out, _, took) = compile_src("assigned", src);
+    // The first few are named, the rest counted.
+    assert!(
+        out.contains("the constructor of `A` does not initialize $p0, $p1, $p2, $p3, $p4 and 59995 more properties\n"),
+        "{}",
+        &out[..out.len().min(300)]
+    );
+    assert!(took < Duration::from_secs(30), "took {took:?}");
+}
+
+/// Each call holds the default value of every argument it leaves out: 20,000
+/// calls `f();` of a function with 40,000 defaulted parameters (750 KB)
+/// needed 190 GB (21st assessment). They are counted, for all calls together.
+#[test]
+fn defaults_of_arguments_left_out_are_counted() {
+    let params = |n: usize| (0..n).map(|i| format!("int $p{i} = 0")).collect::<Vec<_>>().join(", ");
+    let decls = [
+        ("function f({}): int { return 1; }\n", "f();\n"),
+        ("class A { public function __construct({}) {} }\n", "new A();\n"),
+        ("class A { public function m({}): int { return 1; } }\n$a = new A();\n", "$a->m();\n"),
+        ("class A { public static function m({}): int { return 1; } }\n", "A::m();\n"),
+    ];
+    for (i, (decl, call)) in decls.iter().enumerate() {
+        let src = format!("<?phv\n{}{}echo 1;\n", decl.replacen("{}", &params(5_000), 1), call.repeat(2_000));
+        let (out, peak, took) = compile_src(&format!("defaults{i}"), src);
+        assert!(
+            out.contains("the calls of this program leave out more than 1000000 arguments in total"),
+            "{decl}: {}",
+            &out[..out.len().min(300)]
+        );
+        // 200 of the 2,000 calls are checked: 10 GB before.
+        assert!(peak < 700 << 20, "{decl}: held {} MB", peak >> 20);
+        assert!(took < Duration::from_secs(60), "{decl}: took {took:?}");
+    }
+    // Under the limit nothing changes.
+    let src = format!(
+        "<?phv\nfunction f({}): int {{ return $p7 + 1; }}\n{}echo f(), f(p7: 4);\n",
+        params(200),
+        "f();\n".repeat(2_000)
+    );
+    let (out, _, _) = compile_src("defaults_ok", src);
+    assert_eq!(out, "15");
+}
+
+/// Every diagnostic was kept, with the names of types and members in full:
+/// 20,000 errors naming a class with a 1 MB name took 70 GB, and 5,000
+/// classes that implement nothing of a 40,000-method interface 3 GB and 80 s
+/// (21st assessment). The first 1,000 errors and 1,000 warnings are kept
+/// whole and of the rest the first 120 bytes, a message is cut at 2,000
+/// bytes, a list of missing members names five, and a name has at most 255
+/// bytes.
+#[test]
+fn diagnostics_are_bounded() {
+    let name = "A".repeat(255);
+    let src = format!("<?phv\nclass {name} {{ }}\n$a = new {name}();\n{}", "$a + 1;\n".repeat(50_000));
+    let (out, peak, took) = compile_src("many_errors", src);
+    assert!(out.contains(&format!("cannot apply `+` to `{name}` and `int`")), "{}", &out[..out.len().min(300)]);
+    assert!(out.ends_with("50000 errors found\n"), "{}", &out[out.len().saturating_sub(300)..]);
+    assert!(peak < 300 << 20, "held {} MB", peak >> 20);
+    assert!(took < Duration::from_secs(60), "took {took:?}");
+    let (out, _, _) = compile_src("long_name", format!("<?phv\nclass {name}A {{ }}\n"));
+    assert!(out.contains("this name is too long (more than 255 bytes)"), "{}", &out[..out.len().min(300)]);
+
+    // A message that names a large type is cut.
+    let classes: String = (0..200).map(|i| format!("class {}{i} {{ }}\n", "K".repeat(200))).collect();
+    let union = (0..200).map(|i| format!("{}{i}", "K".repeat(200))).collect::<Vec<_>>().join("|");
+    let src = format!("<?phv\n{classes}function f({union} $u): int {{\n{}return 1; }}\n", "$u + 1;\n".repeat(2_000));
+    let (out, peak, _) = compile_src("long_types", src);
+    assert!(out.contains("KKKK..."), "{}", &out[..out.len().min(300)]);
+    assert!(out.ends_with("2000 errors found\n"), "{}", &out[out.len().saturating_sub(300)..]);
+    assert!(peak < 300 << 20, "held {} MB", peak >> 20);
+
+    let methods: String = (0..3_000).map(|i| format!("public function m{i}(): int;\n")).collect();
+    let classes: String = (0..1_500).map(|i| format!("class C{i} implements I {{ }}\n")).collect();
+    let (out, peak, took) = compile_src("missing", format!("<?phv\ninterface I {{\n{methods}}}\n{classes}"));
+    assert!(
+        out.contains("class `C0` does not implement I::m0, I::m1, I::m10, I::m100, I::m1000 and 2995 more methods\n"),
+        "{}",
+        &out[..out.len().min(300)]
+    );
+    // (One for each class, and one for the script, which has no code.)
+    assert!(out.ends_with("1501 errors found\n"), "{}", &out[out.len().saturating_sub(300)..]);
+    assert!(peak < 300 << 20, "held {} MB", peak >> 20);
+    assert!(took < Duration::from_secs(120), "took {took:?}");
+
+    // Warnings are counted apart from errors, and a program with only warnings still runs.
+    let unused: String = (0..3_000).map(|i| format!("$u{i} = {i};\n")).collect();
+    let src = format!("<?phv\nfunction f(): int {{\n{unused}return 7; }}\necho f();\n");
+    let (out, _, _) = compile_src("many_warnings", src);
+    assert_eq!(out, "7");
+}
+
+/// A union type inferred from values could have 10,000 members where a
+/// written one has 256, and telling whether one union fits another tried each
+/// member of one against each of the other: two unions of 4,990 classes cost
+/// 1.7 s per use, 169 s for a 203 KB file (21st assessment). An inferred
+/// union is as wide as a written one may be, and a member that is in the other
+/// union as it is, is found by its place.
+#[test]
+fn unions_are_no_wider_than_written_ones_and_fit_at_once() {
+    let classes = |n: usize| -> String { (0..n).map(|i| format!("class K{i} {{ }}\n")).collect() };
+    let list = |n: usize| (0..n).map(|i| format!("new K{i}()")).collect::<Vec<_>>().join(", ");
+    let wide = "the values here have more than 256 different types";
+    // 9,990 unrelated classes in one list took 9 s.
+    let (out, _, took) = compile_src("list", format!("<?phv\n{}$l = [{}];\necho 1;\n", classes(9_990), list(9_990)));
+    assert!(out.contains(wide), "{}", &out[..out.len().min(300)]);
+    assert!(took < Duration::from_secs(30), "took {took:?}");
+    let (out, _, _) = compile_src("list_257", format!("<?phv\n{}$l = [{}];\necho 1;\n", classes(257), list(257)));
+    assert!(out.contains(wide), "{}", &out[..out.len().min(300)]);
+    // As many as a written union may have, and `null` with them.
+    let src = format!("<?phv\n{}$l = [{}, null];\necho count($l);\n", classes(256), list(256));
+    let (out, _, _) = compile_src("list_256", src);
+    assert_eq!(out, "257");
+    // Classes with a common ancestor are one type, however many.
+    let subs: String = (0..2_000).map(|i| format!("class S{i} extends B {{ }}\n")).collect();
+    let items = (0..2_000).map(|i| format!("new S{i}()")).collect::<Vec<_>>().join(", ");
+    let src = format!("<?phv\nclass B {{ }}\n{subs}$l = [{items}];\necho count($l);\n");
+    let (out, _, _) = compile_src("list_subs", src);
+    assert_eq!(out, "2000");
+
+    // Written unions of 250 members that differ in one: 24 KB took 7 s.
+    let u = (0..250).map(|i| format!("K{i}")).collect::<Vec<_>>().join("|");
+    let v = (1..250).map(|i| format!("K{i}")).collect::<Vec<_>>().join("|") + "|Z";
+    let uses = "$l = [$x, $y, $x, $y, $x, $y, $x, $y];\n$z = $c ? $x : $y;\n".repeat(300);
+    let src = format!(
+        "<?phv\nclass Z {{ }}\n{}function f({u} $x, {v} $y, bool $c): int {{\n{uses}return 1; }}\necho 1;\n",
+        classes(250)
+    );
+    let (out, _, took) = compile_src("written", src);
+    assert_eq!(out, "1");
+    assert!(took < Duration::from_secs(30), "took {took:?}");
+}

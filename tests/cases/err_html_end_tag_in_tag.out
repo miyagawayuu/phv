@@ -1,0 +1,43 @@
+error: `</noscript` (or, inside `<noscript>`, `<svg>` or `<math>`, the end tag of another raw-text element such as `</textarea>`) in a comment, an attribute value or raw text
+  --> err_html_end_tag_in_tag.phv:12:18
+   |
+12 | <noscript><svg><a</noscript><script/><?= $v ?></script></a<></svg></noscript>
+   |                  ^
+   = note: where a browser reads that element's text as raw text (any template or function may be written inside a `<noscript>`), the end tag ends it there and what follows becomes markup; remove it, or write `&lt;/` in an attribute
+
+error: `</noscript` (or, inside `<noscript>`, `<svg>` or `<math>`, the end tag of another raw-text element such as `</textarea>`) in a comment, an attribute value or raw text
+  --> err_html_end_tag_in_tag.phv:13:19
+   |
+13 | <noscript><svg><a </noscript><script/><?= $v ?></script></a></svg></noscript>
+   |                   ^
+   = note: where a browser reads that element's text as raw text (any template or function may be written inside a `<noscript>`), the end tag ends it there and what follows becomes markup; remove it, or write `&lt;/` in an attribute
+
+error: `</noscript` (or, inside `<noscript>`, `<svg>` or `<math>`, the end tag of another raw-text element such as `</textarea>`) in a comment, an attribute value or raw text
+  --> err_html_end_tag_in_tag.phv:14:20
+   |
+14 | <noscript><svg><a x</noscript><script/><?= $v ?></script></a></svg></noscript>
+   |                    ^
+   = note: where a browser reads that element's text as raw text (any template or function may be written inside a `<noscript>`), the end tag ends it there and what follows becomes markup; remove it, or write `&lt;/` in an attribute
+
+error: `</noscript` (or, inside `<noscript>`, `<svg>` or `<math>`, the end tag of another raw-text element such as `</textarea>`) in a comment, an attribute value or raw text
+  --> err_html_end_tag_in_tag.phv:15:21
+   |
+15 | <noscript><svg><a x=</noscript><script/><?= $v ?></script></a></svg></noscript>
+   |                     ^
+   = note: where a browser reads that element's text as raw text (any template or function may be written inside a `<noscript>`), the end tag ends it there and what follows becomes markup; remove it, or write `&lt;/` in an attribute
+
+error: `</noscript` (or, inside `<noscript>`, `<svg>` or `<math>`, the end tag of another raw-text element such as `</textarea>`) in a comment, an attribute value or raw text
+  --> err_html_end_tag_in_tag.phv:16:44
+   |
+16 | <noscript><svg><a<?phv if ($v != "") { } ?></noscript><script/><?= $v ?></script></a<></svg></noscript>
+   |                                            ^
+   = note: where a browser reads that element's text as raw text (any template or function may be written inside a `<noscript>`), the end tag ends it there and what follows becomes markup; remove it, or write `&lt;/` in an attribute
+
+error: `</noscript` (or, inside `<noscript>`, `<svg>` or `<math>`, the end tag of another raw-text element such as `</textarea>`) in a comment, an attribute value or raw text
+  --> err_html_end_tag_in_tag.phv:17:9
+   |
+17 | <svg><a </textarea><text><?= $v ?></text></a></svg>
+   |         ^
+   = note: where a browser reads that element's text as raw text (any template or function may be written inside a `<noscript>`), the end tag ends it there and what follows becomes markup; remove it, or write `&lt;/` in an attribute
+
+6 errors found

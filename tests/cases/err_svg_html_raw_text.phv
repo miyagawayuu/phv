@@ -1,0 +1,18 @@
+<?phv
+// A raw-text element of HTML inside SVG or MathML (a `<textarea>` in a
+// `<foreignObject>`, a `<title>` in a `<desc>`, an `<xmp>` in a `<mi>`...) is
+// one for browsers: its text is read raw up to its end tag. Read as markup,
+// `<svg><a </textarea>` in it left an SVG open for the checker and none for
+// browsers, so the `<script/>` after it, read as SVG (with the nonce), was an
+// HTML script running the value (found by the 21st assessment, in Chrome and
+// parse5). Its text is raw text here too, so the value is in a `<script>`:
+// every line is an error.
+$v = "x";
+?>
+<svg><foreignObject><textarea><svg><a </textarea><script/><?= $v ?></script></a></svg></textarea></foreignObject></svg>
+<svg><foreignObject><textarea><svg><a</textarea><script/><?= $v ?></script></a<></svg></textarea></foreignObject></svg>
+<svg><desc><title><svg><a x=</title><script/><?= $v ?></script></a></svg></title></desc></svg>
+<svg><title><xmp><svg><a </xmp><script/><?= $v ?></script></a></svg></xmp></title></svg>
+<math><mi><noembed><svg><a </noembed><script/><?= $v ?></script></a></svg></noembed></mi></math>
+<math><mtext><b><iframe><svg><a </iframe><script/><?= $v ?></script></a></svg></iframe></b></mtext></math>
+<svg><foreignObject><textarea><svg><a </textarea><style/><?= $v ?></style></a></svg></textarea></foreignObject></svg>

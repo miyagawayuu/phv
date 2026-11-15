@@ -1,0 +1,18 @@
+<?phv
+// Run after mysql_tx_indirect.phv, which ended with an XA transaction of its
+// own on its connection: it was rolled back when that script was done, so
+// its change is gone and the row is free (21st assessment).
+import std.db.Database;
+
+$db = Database::connect("main");
+$db->execute(sql"SET SESSION innodb_lock_wait_timeout = 2");
+echo "name: ", $db->first(sql"SELECT name FROM phv_txi_users WHERE id = 1")?->string("name") ?? "?", "\n";
+try {
+    echo "rows changed: ", $db->execute(sql"UPDATE phv_txi_users SET name = 'after' WHERE id = 1"), "\n";
+} catch (DatabaseError $e) {
+    echo "error: ", $e->getMessage(), "\n";
+}
+$db->execute(sql"DROP TABLE phv_txi_users");
+$db->execute(sql"DROP TABLE IF EXISTS phv_txi_extra");
+$db->execute(sql"DROP PROCEDURE phv_txi_rb");
+$db->execute(sql"DROP PROCEDURE phv_txi_wr");

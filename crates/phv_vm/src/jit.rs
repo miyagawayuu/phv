@@ -192,6 +192,9 @@ pub struct JitRt {
     used: usize,
     /// The string a native function returned.
     ret: Value,
+    /// Bytes the helpers went over since the clock was last read for them
+    /// (see `long_op`).
+    work: usize,
     /// The VM's constant cache, lent for the call.
     pub(crate) consts: Vec<Option<Value>>,
     pub(crate) prog: Option<Arc<Program>>,
@@ -434,6 +437,12 @@ pub unsafe extern "C" fn phv_jit_const(ctx: *mut JitCtx, d: i64, c: i64) {
 /// See `rt`.
 pub unsafe extern "C" fn phv_jit_move(ctx: *mut JitCtx, d: i64, s: i64) {
     let w = rt(ctx).top();
+    // The source is not used again (`JIT_SLOT_TAKE`): moved, not copied.
+    if s & JIT_SLOT_TAKE != 0 {
+        let v = std::mem::take(&mut w[(s & !JIT_SLOT_TAKE) as usize]);
+        store(&mut w[d as usize], v);
+        return;
+    }
     // The kinds native code moves, without the call a general clone is.
     let v = match &w[s as usize] {
         Value::Object(o) => Value::Object(Rc::clone(o)),
@@ -476,32 +485,80 @@ pub unsafe extern "C" fn phv_jit_concat(ctx: *mut JitCtx, d: i64, start: i64, n:
     let w = rt(ctx).top();
     match op_concat(w, mem, d as u16, start as u16, n as u16, false) {
         Ok(()) => {
-            long_op(ctx, str_len(&w[d as usize]));
-            0
+            let late = long_join(ctx, str_len(&w[d as usize]));
+            if late {
+                JIT_ERR_TIME
+            } else {
+                0
+            }
         }
         Err(_) => JIT_ERR_MEMORY,
     }
 }
 
 /// As `Vm::long_op`: after a long string operation, the next loop step or
-/// call checks the limits.
+/// call checks the limits, and the clock is read here: past the deadline,
+/// the time limit's error is left in `ctx.error`, which native code looks at
+/// after every call it made returns (and the VM when native code returns).
+/// The way back out of a recursion has no loop step and no call (audit 21).
 ///
 /// # Safety
 /// See `rt`.
-unsafe fn long_op(ctx: *mut JitCtx, bytes: usize) {
-    if bytes >= LONG_OP {
+///
+/// Returns whether the deadline has passed: a helper that returns an error
+/// code returns the time limit's then, which stops native code at once
+/// (straight-line joins and appends).
+///
+/// Every operation adds up as joins do (`long_join`): native code has no
+/// other sum of what it compared (the interpreter's `equal` has its own).
+/// 3,000 comparisons of 60 KB on each of 9,900 returns ran 30 seconds under
+/// a 1-second limit (audit 21); counting only those of 4 KB or more still
+/// let 3,000 comparisons of 4,000 bytes per return run 1.9 seconds under
+/// 0.3 (the second re-attack of its fixes).
+unsafe fn long_op(ctx: *mut JitCtx, bytes: usize) -> bool {
+    long_join(ctx, bytes)
+}
+
+/// As `Vm::long_join`: the bytes of shorter joins add up.
+///
+/// # Safety
+/// See `rt`.
+unsafe fn long_join(ctx: *mut JitCtx, bytes: usize) -> bool {
+    let rt = rt(ctx);
+    rt.work = rt.work.wrapping_add(bytes);
+    rt.work >= LONG_OP && long_done(ctx, bytes >= LONG_OP)
+}
+
+/// The rare part of `long_op` and `long_join`.
+///
+/// # Safety
+/// See `rt`.
+#[cold]
+unsafe fn long_done(ctx: *mut JitCtx, long: bool) -> bool {
+    rt(ctx).work = 0;
+    if long {
         (*ctx).budget = 1;
     }
+    let late = (*(*ctx).limits).deadline.is_some_and(|d| Instant::now() > d);
+    if late && (*ctx).error == 0 {
+        (*ctx).error = JIT_ERR_TIME;
+    }
+    late
 }
 
 /// After hashing a map key of `bytes`: a long one is timed at once (one
-/// loop step may look it up many times), as in the interpreter.
+/// loop step may look it up many times), as in the interpreter, and shorter
+/// ones add up (`long_join`).
 ///
 /// # Safety
 /// See `rt`.
 unsafe fn long_key(ctx: *mut JitCtx, bytes: usize) {
-    if bytes >= LONG_OP && (*(*ctx).limits).deadline.is_some_and(|d| Instant::now() > d) && (*ctx).error == 0 {
-        (*ctx).error = JIT_ERR_TIME;
+    if bytes >= LONG_OP {
+        if (*(*ctx).limits).deadline.is_some_and(|d| Instant::now() > d) && (*ctx).error == 0 {
+            (*ctx).error = JIT_ERR_TIME;
+        }
+    } else {
+        long_join(ctx, bytes);
     }
 }
 
@@ -514,8 +571,11 @@ pub unsafe extern "C" fn phv_jit_append(ctx: *mut JitCtx, d: i64, s: i64) -> i64
     let w = rt(ctx).top();
     match op_append(w, mem, d as u16, s as u16) {
         Ok(work) => {
-            long_op(ctx, work);
-            0
+            if long_op(ctx, work) {
+                JIT_ERR_TIME
+            } else {
+                0
+            }
         }
         Err(_) => JIT_ERR_MEMORY,
     }
@@ -549,13 +609,33 @@ pub unsafe extern "C" fn phv_jit_strlen(ctx: *mut JitCtx, r: i64, chars: i64) ->
 /// # Safety
 /// See `rt`.
 pub unsafe extern "C" fn phv_jit_str_cmp(ctx: *mut JitCtx, a: i64, b: i64) -> i64 {
+    let (take_a, take_b) = (a & JIT_SLOT_TAKE != 0, b & JIT_SLOT_TAKE != 0);
+    let (a, b) = (a & !JIT_SLOT_TAKE, b & !JIT_SLOT_TAKE);
     let w = rt(ctx).top();
     let r = match (&w[a as usize], &w[b as usize]) {
         (Value::Str(x), Value::Str(y)) => x.as_str().cmp(y.as_str()) as i64,
         (x, y) => compare(x, y) as i64,
     };
     long_op(ctx, str_len(&w[a as usize]));
+    taken(ctx, a, take_a, b, take_b);
     r
+}
+
+/// Empties the slots a comparison was asked to (`JIT_SLOT_TAKE`).
+///
+/// # Safety
+/// See `rt`.
+#[inline(always)]
+unsafe fn taken(ctx: *mut JitCtx, a: i64, take_a: bool, b: i64, take_b: bool) {
+    if take_a || take_b {
+        let w = rt(ctx).top();
+        if take_a {
+            drop(std::mem::take(&mut w[a as usize]));
+        }
+        if take_b {
+            drop(std::mem::take(&mut w[b as usize]));
+        }
+    }
 }
 
 /// `%` on floats, exactly as the interpreter computes it.
@@ -580,6 +660,16 @@ pub const JIT_ELEM_STR: i64 = 2;
 pub const JIT_ELEM_LIST: i64 = 3;
 pub const JIT_ELEM_MAP: i64 = 4;
 pub const JIT_ELEM_OBJ: i64 = 5;
+/// Added to the `JIT_ELEM_*` of `phv_jit_index` and `phv_jit_get`: the
+/// container's slot is emptied once the element is read. Native code asks
+/// for it when the container was read into a temporary only for this
+/// element (`$o->xs[0]`): left in the slot, the copy kept the property
+/// shared, and the next change of it copied all of it (audit 21). Emptying
+/// it here costs no call of its own.
+pub const JIT_ELEM_TAKE: i64 = 1 << 8;
+/// Added to a slot number of `phv_jit_str_eq` and `phv_jit_str_cmp`: that
+/// slot is emptied once the strings are compared (see `JIT_ELEM_TAKE`).
+pub const JIT_SLOT_TAKE: i64 = 1 << 32;
 
 /// `NewList`: the `n` slots from `start` (moved out) as a list in slot `d`.
 ///
@@ -596,6 +686,7 @@ pub unsafe extern "C" fn phv_jit_new_list(ctx: *mut JitCtx, d: i64, start: i64, 
 /// # Safety
 /// See `rt`.
 pub unsafe extern "C" fn phv_jit_index(ctx: *mut JitCtx, d: i64, l: i64, i: i64, kind: i64) -> i64 {
+    let (take, kind) = (kind & JIT_ELEM_TAKE != 0, kind & !JIT_ELEM_TAKE);
     let w = rt(ctx).top();
     let Value::List(list) = &w[l as usize] else {
         wrong_value(ctx);
@@ -609,19 +700,24 @@ pub unsafe extern "C" fn phv_jit_index(ctx: *mut JitCtx, d: i64, l: i64, i: i64,
             return 0;
         }
     };
-    match (kind, item) {
-        (JIT_ELEM_INT, Value::Int(n)) => *n,
-        (JIT_ELEM_INT, Value::Bool(b)) => *b as i64,
-        (JIT_ELEM_FLOAT, Value::Float(f)) => f.to_bits() as i64,
-        (JIT_ELEM_STR, Value::Str(s)) => {
-            w[d as usize] = Value::Str(s.clone());
-            0
-        }
+    let (bits, string) = match (kind, item) {
+        (JIT_ELEM_INT, Value::Int(n)) => (*n, None),
+        (JIT_ELEM_INT, Value::Bool(b)) => (*b as i64, None),
+        (JIT_ELEM_FLOAT, Value::Float(f)) => (f.to_bits() as i64, None),
+        (JIT_ELEM_STR, Value::Str(s)) => (0, Some(Value::Str(s.clone()))),
         _ => {
             wrong_value(ctx);
-            0
+            return 0;
         }
+    };
+    // The list first (its slot may be the one the string goes to).
+    if take {
+        drop(std::mem::take(&mut w[l as usize]));
     }
+    if let Some(s) = string {
+        w[d as usize] = s;
+    }
+    bits
 }
 
 /// The length of the list or map in slot `l`.
@@ -825,6 +921,7 @@ pub unsafe extern "C" fn phv_jit_unbox(ctx: *mut JitCtx, r: i64, kind: i64) -> i
 /// # Safety
 /// See `rt`.
 pub unsafe extern "C" fn phv_jit_get(ctx: *mut JitCtx, d: i64, c: i64, k: i64, kind: i64, or_null: i64) -> i64 {
+    let (take, kind) = (kind & JIT_ELEM_TAKE != 0, kind & !JIT_ELEM_TAKE);
     let w = rt(ctx).top();
     let found = match (&w[c as usize], &w[k as usize]) {
         (Value::List(l), Value::Int(i)) => match usize::try_from(*i).ok().and_then(|x| l.get(x)) {
@@ -841,6 +938,10 @@ pub unsafe extern "C" fn phv_jit_get(ctx: *mut JitCtx, d: i64, c: i64, k: i64, k
         }
     };
     long_key(ctx, str_len(&w[k as usize]));
+    // The container first (its slot may be the one the element goes to).
+    if take && (found.is_ok() || or_null != 0) {
+        drop(std::mem::take(&mut w[c as usize]));
+    }
     match found {
         Ok(v) => deliver(ctx, d, kind, v, false),
         Err(_) if or_null != 0 => deliver(ctx, d, kind, Value::Null, true),
@@ -904,7 +1005,9 @@ pub unsafe extern "C" fn phv_jit_append_key(ctx: *mut JitCtx, r: i64, k: i64, cu
     let cur = std::mem::take(&mut w[cur as usize]);
     let src = w[val as usize].clone();
     match path_append(&mut w[r as usize], &key, &[], cur, &src, mem) {
-        Ok(work) => long_op(ctx, work),
+        Ok(work) => {
+            long_op(ctx, work);
+        }
         Err(PathError::Memory(_)) => (*ctx).error = JIT_ERR_MEMORY,
         Err(PathError::Throw(class, msg)) => throw(ctx, class, msg),
     }
@@ -915,6 +1018,8 @@ pub unsafe extern "C" fn phv_jit_append_key(ctx: *mut JitCtx, r: i64, k: i64, cu
 /// # Safety
 /// See `rt`.
 pub unsafe extern "C" fn phv_jit_str_eq(ctx: *mut JitCtx, a: i64, b: i64) -> i64 {
+    let (take_a, take_b) = (a & JIT_SLOT_TAKE != 0, b & JIT_SLOT_TAKE != 0);
+    let (a, b) = (a & !JIT_SLOT_TAKE, b & !JIT_SLOT_TAKE);
     let w = rt(ctx).top();
     let r = match (&w[a as usize], &w[b as usize]) {
         (Value::Str(x), Value::Str(y)) => Rc::ptr_eq(x, y) || x == y,
@@ -923,6 +1028,7 @@ pub unsafe extern "C" fn phv_jit_str_eq(ctx: *mut JitCtx, a: i64, b: i64) -> i64
         (x, y) => crate::value::flat_equal(x, y).unwrap_or(false),
     };
     long_op(ctx, str_len(&w[a as usize]));
+    taken(ctx, a, take_a, b, take_b);
     r as i64
 }
 
@@ -1016,6 +1122,7 @@ pub unsafe extern "C" fn phv_jit_get_prop(
     kind: i64,
     nullable: i64,
 ) -> i64 {
+    let (take, kind) = (kind & JIT_ELEM_TAKE != 0, kind & !JIT_ELEM_TAKE);
     let v = match &rt(ctx).top()[o as usize] {
         Value::Object(ob) => match ob.try_borrow() {
             Ok(ob) => ob.fields.get(slot as usize).cloned(),
@@ -1023,6 +1130,10 @@ pub unsafe extern "C" fn phv_jit_get_prop(
         },
         _ => None,
     };
+    // The object was read only for this property (`JIT_ELEM_TAKE`).
+    if take {
+        drop(std::mem::take(&mut rt(ctx).top()[o as usize]));
+    }
     match v {
         Some(v) => deliver(ctx, d, kind, v, nullable != 0),
         None => {
@@ -1038,6 +1149,22 @@ pub unsafe extern "C" fn phv_jit_get_prop(
 /// # Safety
 /// See `rt`. The checked bytecode supplies the object register and slot.
 pub unsafe extern "C" fn phv_jit_get_prop_scalar(ctx: *mut JitCtx, o: i64, slot: i64, kind: i64) -> i64 {
+    if kind & JIT_ELEM_TAKE != 0 {
+        // The object was read only for this property: its slot is emptied.
+        let object = std::mem::take(&mut rt(ctx).top()[o as usize]);
+        if let Value::Object(object) = &object {
+            if let Ok(object) = object.try_borrow() {
+                match (kind & !JIT_ELEM_TAKE, object.fields.get(slot as usize)) {
+                    (JIT_ELEM_INT, Some(Value::Int(n))) => return *n,
+                    (JIT_ELEM_INT, Some(Value::Bool(b))) => return i64::from(*b),
+                    (JIT_ELEM_FLOAT, Some(Value::Float(f))) => return f.to_bits() as i64,
+                    _ => {}
+                }
+            }
+        }
+        wrong_value(ctx);
+        return 0;
+    }
     if let Value::Object(object) = &rt(ctx).top()[o as usize] {
         if let Ok(object) = object.try_borrow() {
             match (kind, object.fields.get(slot as usize)) {
@@ -1052,13 +1179,129 @@ pub unsafe extern "C" fn phv_jit_get_prop_scalar(ctx: *mut JitCtx, o: i64, slot:
     0
 }
 
+// Reads through a property, for `$o->xs[$i]`, `$o->m[$k]` and `$o->s == $t`
+// when native code needs the property's list, map or string for nothing
+// else: the element is read where it is, so no copy of the collection is
+// made (in a slot it would keep the property shared until the slot was
+// written again, and the next change of the property would copy all of it:
+// audit 21), and nothing has to be let go afterwards. `os` is the object's
+// slot, with the property's number above it (`JIT_PROP_SHIFT`).
+
+/// Where the property's number starts in the `os` argument of the reads
+/// through a property.
+pub const JIT_PROP_SHIFT: i64 = 16;
+
+/// `Index` of the list in a property at `i` (see `phv_jit_index`).
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_prop_index(ctx: *mut JitCtx, d: i64, os: i64, i: i64, kind: i64) -> i64 {
+    let (o, slot) = ((os & ((1 << JIT_PROP_SHIFT) - 1)) as usize, (os >> JIT_PROP_SHIFT) as usize);
+    let string = {
+        let object = match &rt(ctx).top()[o] {
+            Value::Object(object) => object.try_borrow().ok(),
+            _ => None,
+        };
+        let Some(Value::List(list)) = object.as_ref().and_then(|ob| ob.fields.get(slot)) else {
+            wrong_value(ctx);
+            return 0;
+        };
+        match (kind, usize::try_from(i).ok().and_then(|x| list.get(x))) {
+            (JIT_ELEM_INT, Some(Value::Int(n))) => return *n,
+            (JIT_ELEM_INT, Some(Value::Bool(b))) => return *b as i64,
+            (JIT_ELEM_FLOAT, Some(Value::Float(f))) => return f.to_bits() as i64,
+            (JIT_ELEM_STR, Some(Value::Str(s))) => Value::Str(s.clone()),
+            (_, None) => {
+                let msg = format!("list index {i} is out of range (length {})", list.len());
+                throw(ctx, "IndexError", msg);
+                return 0;
+            }
+            _ => {
+                wrong_value(ctx);
+                return 0;
+            }
+        }
+    };
+    rt(ctx).top()[d as usize] = string;
+    0
+}
+
+/// `Index` (or `IndexOrNull`) of the list or map in a property at the key
+/// in slot `k` (see `phv_jit_get`).
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_prop_get(ctx: *mut JitCtx, d: i64, os: i64, k: i64, kind: i64, or_null: i64) -> i64 {
+    let (o, slot) = ((os & ((1 << JIT_PROP_SHIFT) - 1)) as usize, (os >> JIT_PROP_SHIFT) as usize);
+    let found = {
+        let w = rt(ctx).top();
+        let object = match &w[o] {
+            Value::Object(object) => object.try_borrow().ok(),
+            _ => None,
+        };
+        match (object.as_ref().and_then(|ob| ob.fields.get(slot)), &w[k as usize]) {
+            (Some(Value::List(l)), Value::Int(i)) => match usize::try_from(*i).ok().and_then(|x| l.get(x)) {
+                Some(v) => Ok(v.clone()),
+                None => Err(("IndexError", format!("list index {i} is out of range (length {})", l.len()))),
+            },
+            (Some(Value::Map(m)), key) => match m.get(&key.to_key()) {
+                Some(v) => Ok(v.clone()),
+                None => Err(("KeyError", format!("undefined map key {}", key_repr(key)))),
+            },
+            _ => {
+                wrong_value(ctx);
+                return 0;
+            }
+        }
+    };
+    long_key(ctx, str_len(&rt(ctx).top()[k as usize]));
+    match found {
+        Ok(v) => deliver(ctx, d, kind, v, false),
+        Err(_) if or_null != 0 => deliver(ctx, d, kind, Value::Null, true),
+        Err((class, msg)) => {
+            throw(ctx, class, msg);
+            0
+        }
+    }
+}
+
+/// `==` of the string in a property and the one in slot `b`, as 0 or 1 (see
+/// `phv_jit_str_eq`).
+///
+/// # Safety
+/// See `rt`.
+pub unsafe extern "C" fn phv_jit_prop_str_eq(ctx: *mut JitCtx, os: i64, b: i64) -> i64 {
+    let (o, slot) = ((os & ((1 << JIT_PROP_SHIFT) - 1)) as usize, (os >> JIT_PROP_SHIFT) as usize);
+    let (equal, bytes) = {
+        let w = rt(ctx).top();
+        let object = match &w[o] {
+            Value::Object(object) => object.try_borrow().ok(),
+            _ => None,
+        };
+        match (object.as_ref().and_then(|ob| ob.fields.get(slot)), &w[b as usize]) {
+            (Some(Value::Str(x)), Value::Str(y)) => (Rc::ptr_eq(x, y) || x == y, x.len()),
+            _ => {
+                wrong_value(ctx);
+                return 0;
+            }
+        }
+    };
+    long_op(ctx, bytes);
+    equal as i64
+}
+
 /// `SetProp`: the value in slot `v` into property `slot` of the object in slot `o`.
 ///
 /// # Safety
 /// See `rt`.
 pub unsafe extern "C" fn phv_jit_set_prop(ctx: *mut JitCtx, o: i64, slot: i64, v: i64) {
     let w = rt(ctx).top();
-    let val = w[v as usize].clone();
+    // (With `JIT_SLOT_TAKE` the value is not used again: moved, not copied.)
+    let val = if v & JIT_SLOT_TAKE != 0 {
+        std::mem::take(&mut w[(v & !JIT_SLOT_TAKE) as usize])
+    } else {
+        w[v as usize].clone()
+    };
     let done = match &w[o as usize] {
         Value::Object(ob) => match ob.try_borrow_mut() {
             Ok(mut ob) => match ob.fields.get_mut(slot as usize) {
@@ -1198,7 +1441,9 @@ pub unsafe extern "C" fn phv_jit_append_prop(ctx: *mut JitCtx, o: i64, slot: i64
         path_append(field, &[], &[], cur, &src, mem)
     };
     match r {
-        Ok(work) => long_op(ctx, work),
+        Ok(work) => {
+            long_op(ctx, work);
+        }
         Err(PathError::Memory(_)) => (*ctx).error = JIT_ERR_MEMORY,
         Err(PathError::Throw(class, msg)) => throw(ctx, class, msg),
     }
@@ -1236,7 +1481,12 @@ pub unsafe extern "C" fn phv_jit_vtarget(ctx: *mut JitCtx, o: i64, slot: i64) ->
 /// # Safety
 /// See `with_vm`.
 pub unsafe extern "C" fn phv_jit_echo(ctx: *mut JitCtx, r: i64, attr: i64) -> i64 {
-    let v = rt(ctx).top()[r as usize].clone();
+    // (With `JIT_SLOT_TAKE` the value is not used again: moved, not copied.)
+    let v = if r & JIT_SLOT_TAKE != 0 {
+        std::mem::take(&mut rt(ctx).top()[(r & !JIT_SLOT_TAKE) as usize])
+    } else {
+        rt(ctx).top()[r as usize].clone()
+    };
     // The frame's index as the interpreter would have it, for the guards
     // of the HTML around the call (and those the function set itself).
     let fi = frame_index(ctx);

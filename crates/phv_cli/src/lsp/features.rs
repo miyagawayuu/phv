@@ -10,6 +10,19 @@ use phv_types::index::EditorIndex;
 /// so that the files importing a module are seen too), and searched for
 /// workspace symbols.
 const MAX_PROJECT_FILES: usize = 300;
+
+/// How far the files of a project are looked for below its root: a project
+/// is the folder of a `phv.toml`. A document with none above it is taken with
+/// the folder it is in, which can be anything (a home folder, a download
+/// folder, a drive): little of that is read, and nothing of a drive's root.
+pub(super) fn project_walk(root: &Path) -> crate::tools::WalkLimit {
+    let (folders, depth) = match root.join("phv.toml").is_file() {
+        true => (5_000, 32),
+        false if root.parent().is_none() => (0, 0),
+        false => (200, 4),
+    };
+    crate::tools::WalkLimit { files: MAX_PROJECT_FILES, folders, depth }
+}
 /// Longest query answer of workspace symbols.
 const MAX_SYMBOLS: usize = 500;
 
@@ -169,8 +182,9 @@ struct Target {
 }
 
 impl Server {
-    /// The documents the editor has open and the `.phv` files of the project.
-    fn project_entries(&self, path: &Path) -> Vec<PathBuf> {
+    /// The documents the editor has open and the `.phv` files of the project,
+    /// and whether these are all of them (see `project_walk`).
+    fn project_entries(&self, path: &Path) -> (Vec<PathBuf>, bool) {
         let root = find_root(path);
         let mut entries = vec![path.to_path_buf()];
         for p in self.open.keys() {
@@ -182,15 +196,18 @@ impl Server {
             let s = p.to_string_lossy();
             s.ends_with(".phv") && !s.ends_with(".phv.html")
         };
-        for p in crate::tools::collect_max(std::slice::from_ref(&root), &want, MAX_PROJECT_FILES) {
+        let (found, mut complete) =
+            crate::tools::collect_within(std::slice::from_ref(&root), &want, &project_walk(&root));
+        for p in found {
             if entries.len() >= MAX_PROJECT_FILES {
+                complete = false;
                 break;
             }
             if !entries.iter().any(|e| normalize(e) == normalize(&p)) {
                 entries.push(p);
             }
         }
-        entries
+        (entries, complete)
     }
 
     /// The text of an open document, or of the file on disk (a regular file of
@@ -219,9 +236,10 @@ impl Server {
     fn places(&self, path: &Path, target: &Target) -> (Vec<(Place, String)>, bool) {
         let mut out: Vec<(Place, String)> = Vec::new();
         let mut seen: HashSet<Place> = HashSet::new();
-        let entries = if target.is_variable { vec![path.to_path_buf()] } else { self.project_entries(path) };
+        // A rename is refused when some files of the project were not looked at.
+        let (entries, mut complete) =
+            if target.is_variable { (vec![path.to_path_buf()], true) } else { self.project_entries(path) };
         let deadline = std::time::Instant::now() + SEARCH_BUDGET;
-        let mut complete = true;
         for entry in entries {
             if std::time::Instant::now() > deadline {
                 complete = false;
@@ -325,7 +343,7 @@ impl Server {
         let mut files: HashMap<PathBuf, SourceFile> = HashMap::new();
         let (places, complete) = self.places(path, target);
         if !complete {
-            return Err("the project is too large to find every use in time; nothing was renamed".into());
+            return Err("the project is too large to find every use; nothing was renamed".into());
         }
         for (p, span_text) in places {
             let Some((s, e)) = name_in(&span_text, &target.name) else { continue };
@@ -351,21 +369,27 @@ impl Server {
         }
     }
 
-    pub(super) fn formatting(&self, path: &Path) -> Value {
-        let Some(text) = self.open.get(path).filter(|_| !self.too_large.contains(path)) else { return Value::Null };
+    /// The edit that formats `path`; an error for a document the formatter
+    /// refuses (nested too deeply, too large once formatted).
+    pub(super) fn formatting(&self, path: &Path) -> Result<Value, String> {
+        use phv_syntax::format::FormatError;
+        let Some(text) = self.open.get(path).filter(|_| !self.too_large.contains(path)) else {
+            return Ok(Value::Null);
+        };
         if path.to_string_lossy().ends_with(".phv.html") {
-            return Value::Null;
+            return Ok(Value::Null);
         }
         // `[fmt] width` of the project, as `phv fmt` uses.
         let width =
             phv_driver::load_config(&find_root(path)).map(|c| c.fmt.width).unwrap_or(phv_syntax::format::DEFAULT_WIDTH);
-        match phv_syntax::format::format_source_width(text, width) {
-            Ok(formatted) if formatted != *text => json!([{
+        match phv_syntax::format::format_checked(text, width) {
+            Ok(formatted) if formatted != *text => Ok(json!([{
                 "range": { "start": text_position(text, 0), "end": text_position(text, text.len()) },
                 "newText": formatted,
-            }]),
+            }])),
+            Err(FormatError::Refused(e)) => Err(format!("not formatted: {e}")),
             // Unchanged, or code that does not parse: nothing to do.
-            _ => json!([]),
+            _ => Ok(json!([])),
         }
     }
 
@@ -423,7 +447,13 @@ impl Server {
         }
         let want = |p: &Path| p.to_string_lossy().ends_with(".phv");
         let mut out = Vec::new();
-        for file in crate::tools::collect_max(&roots, &want, MAX_PROJECT_FILES) {
+        let mut files = Vec::new();
+        for root in &roots {
+            let left = MAX_PROJECT_FILES - files.len();
+            let limit = crate::tools::WalkLimit { files: left, ..project_walk(root) };
+            files.extend(crate::tools::collect_within(std::slice::from_ref(root), &want, &limit).0);
+        }
+        for file in files {
             let Some(text) = self.text_of(&file) else { continue };
             let template = file.to_string_lossy().ends_with(".phv.html");
             let (module, _) = phv_syntax::parser::parse_module(&text, 0, template);

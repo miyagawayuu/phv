@@ -1,0 +1,102 @@
+<?phv
+// Elements read out of properties, rows and call results, and strings or
+// collections of properties compared: the copy read for it is let go at
+// once (audit 21); the output must be what 1.3.2 prints.
+class Box {
+    public list<int> $xs = [];
+    public list<string> $names = [];
+    public map<string, int> $byName = [];
+    public map<int, string> $labels = [];
+    public list<list<int>> $rows = [];
+    public string $text = "abc";
+    public ?string $note = null;
+    public ?Box $next = null;
+
+    public function __construct() {
+        $this->xs = [10, 20, 30];
+        $this->names = ["a", "b"];
+        $this->byName = ["k" => 1, "l" => 2];
+        $this->labels = [1 => "one", 2 => "two"];
+        $this->rows = [[1, 2], [3]];
+    }
+    public function first(): int {
+        return $this->xs[0];
+    }
+    public function grow(): int {
+        $this->xs[] = count($this->xs);
+        return count($this->xs);
+    }
+}
+function make(): list<int> {
+    return [7, 8, 9];
+}
+function boom(): int {
+    throw new RuntimeException("boom");
+}
+function elements(Box $b, int $i): string {
+    $x = $b->xs[$i];
+    $y = $b->xs[0] + $b->xs[$i] * 2;
+    $name = $b->names[$i % 2];
+    $label = $b->labels[$i + 1] ?? "none";
+    $n = $b->byName["k"] + ($b->byName["zz"] ?? 5) + ($b->byName[$name] ?? 7);
+    $row = $b->rows[0][$i % 2] + $b->rows[1][0] + make()[$i % 3];
+    return $x . " " . $y . " " . $name . " " . $label . " " . $n . " " . $row;
+}
+function compares(Box $b, string $s): string {
+    $out = "";
+    if ($b->text == $s) { $out .= "eq "; }
+    if ($s != $b->text) { $out .= "ne "; }
+    if ($b->text == $b->text && $b->names == $b->names) { $out .= "same "; }
+    if ($b->note == null) { $out .= "null "; }
+    if ($b->note == "n" || $b->note != $s) { $out .= "note "; }
+    $lt = $b->text < $s;
+    $le = $s <= $b->text;
+    $c = $b->text <=> $s;
+    $eq = $b->xs == [10, 20, 30];
+    $t = ($b->text == "abc" ? 1 : 0) + ($b->names[0] == "a" ? 2 : 0) + ($b->byName == ["k" => 1] ? 4 : 0);
+    return $out . ($lt ? "lt" : "ge") . " " . ($le ? "le" : "gt") . " " . $c . " " . ($eq ? "T" : "F") . " " . $t;
+}
+function changes(Box $b): string {
+    // The element is read before the property changes, and the change is seen after.
+    $x = $b->xs[0] + $b->grow() + $b->xs[count($b->xs) - 1];
+    $b->xs[0] = $b->xs[1];
+    $b->xs[] = $b->xs[0];
+    $b->names[0] .= $b->names[1];
+    $b->names[] = $b->names[0];
+    $b->rows[0][] = $b->rows[1][0];
+    $b->text .= $b->text == "abc" ? "!" : "?";
+    $b->byName["m"] = $b->byName["k"] + ($b->byName["m"] ?? 40);
+    $copy = $b->xs;
+    $copy[0] = $b->xs[2];
+    return $x . " " . json_encode($b->xs) . json_encode($copy) . json_encode($b->names) . json_encode($b->rows) . $b->text . json_encode($b->byName);
+}
+function errors(Box $b): string {
+    $out = "";
+    $x = 5;
+    try { $x = $b->xs[99]; } catch (IndexError $e) { $out .= $x . ":" . $e->getMessage() . "; "; }
+    try { $x = $b->byName["none"]; } catch (KeyError $e) { $out .= $x . ":" . $e->getMessage() . "; "; }
+    try { $x = $b->rows[1][5] + 1; } catch (IndexError $e) { $out .= $x . ":" . $e->getMessage() . "; "; }
+    try { $x = $b->xs[boom()]; } catch (RuntimeException $e) { $out .= $x . ":" . $e->getMessage() . "; "; }
+    try { $x = $b->rows[7][0]; } catch (IndexError $e) { $out .= $x . ":" . $e->getMessage() . "; "; }
+    $s = "kept";
+    try { $s = $b->names[-1]; } catch (IndexError $e) { $out .= $s . ":" . $e->getMessage(); }
+    return $out;
+}
+$b = new Box();
+$b->next = new Box();
+for ($i = 0; $i < 3; $i++) {
+    echo elements($b, $i), "\n";
+}
+echo compares($b, "abc"), "\n", compares($b, "abd"), "\n";
+$b->note = "n";
+echo compares($b, "ab"), "\n";
+echo changes($b), "\n", changes($b), "\n";
+echo errors($b), "\n";
+$next = $b->next;
+echo $b->first(), " ", $next == null ? 0 : $next->xs[1] + ($next->next == null ? 1 : 2), " ", $b->xs[0] . $b->names[0] . $b->text, "\n";
+$total = 0;
+foreach ($b->rows as $i => $row) {
+    $total += $b->rows[$i][0] + $row[0];
+    $b->rows[$i][] = $total;
+}
+echo $total, json_encode($b->rows), "\n";

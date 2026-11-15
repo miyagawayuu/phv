@@ -93,6 +93,10 @@ impl std::hash::Hasher for PtrHasher {
     }
 }
 
+/// What `Vm::long_done` unwinds with when the time limit has passed;
+/// `Vm::outermost` takes it.
+struct TimeUp;
+
 pub enum VmError {
     /// A PHV exception; can be caught with `try`/`catch`.
     Exception(Box<Exc>),
@@ -980,6 +984,11 @@ pub struct Vm {
     pub(crate) budget: u32,
     /// Bytes echoed since the limits were last checked for output.
     echoed: usize,
+    /// Bytes instructions went over since the clock was last read for them
+    /// (see `long_op`).
+    work: usize,
+    /// A run is inside `outermost`, which takes what `long_done` unwinds with.
+    catching: bool,
     /// Bytes compared by `equal` since the limits were last checked: kept
     /// across calls, so a builtin comparing many values is timed as a whole
     /// (found by the 1.1 audit: `contains()` ran 18 s past a 1 s limit).
@@ -1113,6 +1122,47 @@ pub(crate) fn op_to_str(regs: &mut [Value], d: Reg, a: Reg) {
     regs[d as usize] = v;
 }
 
+/// `Concat` whose first register holds a plain string of its own: the others
+/// are appended to it, in a buffer grown once for all of them (twice the
+/// old one at least, so a loop of `$s = $s . $a . $b` takes linear time, and
+/// never a copy of what is appended besides the result: a 60 MB string
+/// built from two of 30 MB stays within 128 MB, as when it was built anew).
+/// `size` is the length of the result.
+#[inline(never)]
+fn concat_onto(regs: &mut [Value], mem: MemLimit, d: Reg, start: Reg, n: u16, size: usize) -> Result<(), usize> {
+    let (head, rest) = regs[start as usize..start as usize + n as usize].split_at_mut(1);
+    let s = match &mut head[0] {
+        Value::Str(first) => Rc::get_mut(first).expect("phv vm: a string of its own"),
+        v => bad("string", v),
+    };
+    let (len, cap) = (s.len(), s.capacity());
+    if size > cap {
+        // The buffer moves: the old one and the new one exist together.
+        // Twice the old one when that fits in the memory left, else just
+        // what is needed, which is what building the string anew took.
+        let grown = size.max(cap.saturating_mul(2));
+        if grown <= 1 << 12 || mem.reserve(grown).is_ok() {
+            s.reserve(size - len);
+        } else {
+            mem.reserve(size)?;
+            s.reserve_exact(size - len);
+        }
+    }
+    for p in rest {
+        p.append_to(s);
+        if matches!(p, Value::Str(_) | Value::Html(_)) {
+            *p = Value::Null;
+        }
+    }
+    let big = s.len() > 1 << 20;
+    let joined = std::mem::take(&mut regs[start as usize]);
+    regs[d as usize] = joined;
+    if big {
+        mem.check()?;
+    }
+    Ok(())
+}
+
 /// `Concat`: joins `n` registers from `start`. The error is the memory limit.
 pub(crate) fn op_concat(
     regs: &mut [Value],
@@ -1129,6 +1179,15 @@ pub(crate) fn op_concat(
             Value::Str(s) | Value::Html(s) => s.len(),
             _ => 24,
         };
+    }
+    // A plain string nothing else holds, first: the rest is added to it
+    // where it is (`$s = $s . $a . $b`, whose `$s` the compiler moves here).
+    if !html && n > 1 {
+        if let Value::Str(first) = &regs[start as usize] {
+            if Rc::strong_count(first) == 1 && Rc::weak_count(first) == 0 {
+                return concat_onto(regs, mem, d, start, n, size);
+            }
+        }
     }
     // Escaping can make a string up to 6 times longer (`"` -> `&quot;`).
     let need = if html { size.saturating_mul(6) } else { size };
@@ -1367,6 +1426,8 @@ impl Vm {
             deadline: limits.max_time.map(|d| Instant::now() + d),
             budget: BUDGET,
             echoed: 0,
+            work: 0,
+            catching: false,
             equal_since: Cell::new(0),
             rng: seed,
             native_depth: 0,
@@ -1434,13 +1495,41 @@ impl Vm {
 
     /// Calls a PHV function from Rust (also used by builtins such as `map`).
     pub fn call_function(&mut self, func: u32, args: &[Value]) -> Result<Value, VmError> {
+        if self.native_depth == 0 {
+            return self.outermost(|vm| vm.call_inner(func, &[], args));
+        }
         self.call_inner(func, &[], args)
+    }
+
+    /// A call that enters the VM with nothing running (a script, a page, a
+    /// job, a callback the host makes): where a run that a long instruction
+    /// ended past the deadline arrives (see `long_done`), and becomes the
+    /// time limit's error. As after any fatal error, the frames, handlers
+    /// and guards of the run are dropped; nothing of the script runs again.
+    #[inline(never)]
+    fn outermost(&mut self, f: impl FnOnce(&mut Vm) -> Result<Value, VmError>) -> Result<Value, VmError> {
+        let frames = self.frames.len();
+        self.catching = true;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.catching = false;
+        match r {
+            Ok(r) => r,
+            Err(payload) if payload.is::<TimeUp>() => {
+                self.native_depth = 0;
+                if self.frames.len() > frames {
+                    self.unwind_to(frames);
+                }
+                Err(self.time_error())
+            }
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// Calls a closure value from Rust.
     pub fn call_value(&mut self, callee: &Value, args: &[Value]) -> Result<Value, VmError> {
         match callee {
             // `callee` is not in the VM, so its captures need no copy of the closure.
+            Value::Closure(c) if self.native_depth == 0 => self.outermost(|vm| vm.call_inner(c.func, &c.caps, args)),
             Value::Closure(c) => self.call_inner(c.func, &c.caps, args),
             v => bad("closure", v),
         }
@@ -2102,8 +2191,71 @@ impl Vm {
     #[inline]
     fn long_op(&mut self, bytes: usize) {
         if bytes >= LONG_OP {
+            self.long_done();
+        }
+    }
+
+    /// `long_op` for a join (`Concat`), whose shorter ones add up: `LONG_OP`
+    /// bytes joined since the clock was last read for them count as one
+    /// long instruction (audit 21: a function of 3,000 joins of 62 KB each,
+    /// 9,900 calls deep, ran 50 seconds under a 2-second limit on its way
+    /// back). Only joins: the same sum in `long_op` cost 10 to 20% on loops
+    /// that compare or append short strings.
+    #[inline]
+    fn long_join(&mut self, bytes: usize) {
+        let work = self.work.wrapping_add(bytes);
+        self.work = work;
+        if work >= LONG_OP {
+            self.join_done(bytes);
+        }
+    }
+
+    /// The rare part of `long_op`. It reads the clock itself: straight-line
+    /// code has neither a loop step nor a call (the way back out of a
+    /// recursion, a generator's body, a script's own statements), and each
+    /// instruction of it may go over a value as large as memory allows
+    /// (audit 21: `return f($n - 1) . $s;` 9,900 deep ran 27 seconds under a
+    /// 2-second limit; 8,000 statements joining 8 to 32 MB each ran 15
+    /// seconds under 1). Past the deadline the run is left at once, by
+    /// unwinding to where Rust entered the VM (`outermost`), which makes
+    /// the time limit's error of it: no instruction and no return has a check for this (one
+    /// in either cost 5% on unrelated benchmarks), no `catch` or `finally`
+    /// of the script runs, as for every fatal error. Not while native code
+    /// is running a helper of the VM (there is no unwinding through native
+    /// frames): its next loop step or call does the check.
+    #[cold]
+    #[inline(never)]
+    fn long_done(&mut self) {
+        self.budget = 1;
+        self.past_deadline();
+    }
+
+    /// The rare part of `long_join`. One long join makes the next loop step
+    /// or call do the whole check, as `long_done`; short ones that added up
+    /// only read the clock (a loop of them would do the whole check every
+    /// few passes).
+    #[cold]
+    #[inline(never)]
+    fn join_done(&mut self, bytes: usize) {
+        self.work = 0;
+        if bytes >= LONG_OP {
             self.budget = 1;
         }
+        self.past_deadline();
+    }
+
+    /// Leaves the run when the deadline has passed (see `long_done`).
+    fn past_deadline(&mut self) {
+        let caught = self.catching && self.jit_stack_limit == 0;
+        if caught && self.deadline.is_some_and(|d| Instant::now() > d) {
+            std::panic::resume_unwind(Box::new(TimeUp));
+        }
+    }
+
+    /// The fatal error of the time limit.
+    fn time_error(&self) -> VmError {
+        let secs = self.limits.max_time.map(|t| t.as_secs_f64()).unwrap_or(0.0);
+        VmError::Fatal(format!("maximum execution time of {secs} seconds exceeded"))
     }
 
     /// After output of `bytes`: the limits are checked once `LONG_OP` bytes
@@ -3125,20 +3277,17 @@ impl Vm {
                         self.guards.pop();
                     }
                     let fr = self.frames.pop().unwrap();
-                    // The callee's strings, collections and closures are let
-                    // go: a copy left in a dead register (a parameter holding
-                    // the caller's list) kept the caller's value shared, so
-                    // its next change (`$xs[] = ...`, `.=`) copied all of it,
-                    // and a loop calling a helper and growing a collection
-                    // took quadratic time (audit 20). Scalars and objects are
-                    // left (an object is shared by reference: a dead copy
-                    // never makes a change copy it): the next call overwrites
-                    // them, and the type checker guarantees registers are
-                    // written before they are read. Only the registers that
-                    // may hold such a value are looked at (`boxed_registers`:
-                    // none in `fib`, whose registers all hold ints, or in a
-                    // constructor that stores ints; writing every register
-                    // made `fib` 1.6 times as slow).
+                    // The callee's strings, collections, objects and closures
+                    // are let go: a copy left in a dead register (a parameter
+                    // holding the caller's list) kept the caller's value
+                    // shared, so its next change (`$xs[] = ...`, `.=`) copied
+                    // all of it, and a loop calling a helper and growing a
+                    // collection took quadratic time (audit 20). Scalars are
+                    // left: the next call overwrites them, and the type
+                    // checker guarantees registers are written before they
+                    // are read. Only the registers that may hold such a value
+                    // are looked at (none in `fib`, whose registers all hold
+                    // ints; writing every register made it 1.6 times as slow).
                     // The outermost frame (the script's own) is left: its
                     // values go when the VM is torn down, after the response
                     // is sent.
@@ -3338,7 +3487,7 @@ impl Vm {
                     Instr::Concat(d, start, n, html) => {
                         let mem = self.mem();
                         tri!(op_concat(&mut self.regs[base..], mem, *d, *start, *n, *html).map_err(memory_error));
-                        self.long_op(str_len(&reg!(*d)));
+                        self.long_join(str_len(&reg!(*d)));
                     }
                     Instr::AppendStr(d, s) => {
                         let mem = self.mem();
@@ -4117,15 +4266,10 @@ fn boxed_registers(prog: &Program, f: &Function) -> Option<Vec<u16>> {
     use Instr::*;
     let n = f.num_regs as usize;
     let mut boxed = vec![false; n];
-    // Scalars and objects are left: an object is shared by reference, so a
-    // dead copy of it never makes a change copy it (`$this` of a
-    // constructor, the object `new` made).
-    let kept = |k: Option<&ValKind>| {
-        matches!(k, Some(ValKind::Int | ValKind::Bool | ValKind::Float | ValKind::Object(_) | ValKind::OptObject(_)))
-    };
+    let scalar = |k: Option<&ValKind>| matches!(k, Some(ValKind::Int | ValKind::Bool | ValKind::Float));
     let sig = f.native.as_ref().filter(|s| s.params.len() == f.num_params as usize);
     for (i, b) in boxed.iter_mut().enumerate().take(f.num_params as usize) {
-        *b = !kept(sig.and_then(|s| s.params.get(i)));
+        *b = !scalar(sig.and_then(|s| s.params.get(i)));
     }
     let mut mark = |r: Reg| {
         if let Some(b) = boxed.get_mut(r as usize) {
@@ -4138,8 +4282,7 @@ fn boxed_registers(prog: &Program, f: &Function) -> Option<Vec<u16>> {
             | IncI(..) | AddIImm(..) | SubIImm(..) | AddF(..) | SubF(..) | MulF(..) | DivF(..) | ModF(..)
             | PowF(..) | NegF(..) | BitAnd(..) | BitOr(..) | BitXor(..) | Shl(..) | Shr(..) | BitNot(..) | Not(..)
             | EqI(..) | LtI(..) | LeI(..) | Eq(..) | Ne(..) | Lt(..) | Le(..) | Cmp(..) | EqF(..) | NeF(..)
-            | LtF(..) | LeF(..) | CmpF(..) | IntToFloat(..) | FloatToInt(..) | InstanceOf(..) | IsType(..)
-            | NewObject(..) => {}
+            | LtF(..) | LeF(..) | CmpF(..) | IntToFloat(..) | FloatToInt(..) | InstanceOf(..) | IsType(..) => {}
             Const(d, c) => {
                 if !matches!(
                     prog.consts.get(*c as usize),
@@ -4156,6 +4299,7 @@ fn boxed_registers(prog: &Program, f: &Function) -> Option<Vec<u16>> {
             | ToStr(d, _)
             | Concat(d, ..)
             | AppendStr(d, _)
+            | NewObject(d, _)
             | GetProp(d, ..)
             | NewList(d, ..)
             | NewMap(d, ..)
@@ -4166,7 +4310,7 @@ fn boxed_registers(prog: &Program, f: &Function) -> Option<Vec<u16>> {
             | EnumCases(d, _)
             | PopOutHtml(d) => mark(*d),
             Call { dst, func, .. } => {
-                if !kept(prog.funcs.get(*func as usize).and_then(|c| c.native.as_ref()).map(|s| &s.ret)) {
+                if !scalar(prog.funcs.get(*func as usize).and_then(|c| c.native.as_ref()).map(|s| &s.ret)) {
                     mark(*dst);
                 }
             }
@@ -4285,10 +4429,9 @@ mod compact_generator_tests {
     }
 
     /// A return lets go of the registers that may hold a string, a
-    /// collection or a closure: none of `fib`'s (an int argument, ints
-    /// computed and returned) or of a constructor's objects, the list a
-    /// function makes, its unknown arguments; all of them for a function
-    /// with an iterator.
+    /// collection, an object or a closure: none of `fib`'s (an int argument,
+    /// ints computed and returned), the list a function makes, its unknown
+    /// arguments; all of them for a function with an iterator.
     #[test]
     fn returns_let_go_of_the_registers_that_may_hold_values() {
         let int = Some(NativeSig { params: vec![ValKind::Int], ret: ValKind::Int });
@@ -4319,9 +4462,9 @@ mod compact_generator_tests {
         let iterates =
             Function { num_regs: 3, code: vec![Instr::IterInit(0, 1), Instr::RetNull], ..Function::default() };
         assert_eq!(boxed_registers(&prog, &iterates), None);
-        // Objects are shared by reference, so a dead copy is left (a
-        // constructor's `$this`, an object `new` made); a string parameter
-        // and an object's property read are let go.
+        // Objects are let go too: a dead copy of an object keeps what its
+        // fields hold shared (`new Box($xs)` kept the caller's list at two
+        // references, so its next append copied it: audit 21) and alive.
         let ctor = Function {
             num_params: 3,
             num_regs: 5,
@@ -4332,7 +4475,7 @@ mod compact_generator_tests {
             code: vec![Instr::NewObject(3, 1), Instr::SetProp(0, 0, 1), Instr::GetProp(4, 0, 0), Instr::RetNull],
             ..Function::default()
         };
-        assert_eq!(boxed_registers(&prog, &ctor), Some(vec![2, 4]));
+        assert_eq!(boxed_registers(&prog, &ctor), Some(vec![0, 1, 2, 3, 4]));
     }
 
     /// `PHV_VM_PRUNE_GEN_REGS=1` with no room for a function's plan: the

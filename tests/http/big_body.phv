@@ -1,0 +1,10 @@
+import std.net.HttpClient;
+
+// Run by crates/phv_driver/tests/http.rs: the service answers with a body of
+// 4 MB that is not UTF-8, in one chunk.
+try {
+    $r = HttpClient::connect("api")->get("/big");
+    echo "body: ", strlen($r->body), " bytes\n";
+} catch (NetworkError $e) {
+    echo "NetworkError: ", $e->getMessage(), "\n";
+}

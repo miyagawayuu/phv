@@ -402,6 +402,8 @@ struct Checked {
     /// holds a value to let go, and empties a stale slot only when it does:
     /// in a loop the slot is stale at the first pass and empty afterwards.
     fills: Vec<Vec<(Reg, bool)>>,
+    /// By instruction: some jump or branch goes to it.
+    jump_target: Vec<bool>,
 }
 
 /// The largest function the JIT compiles, in registers and instructions.
@@ -477,17 +479,22 @@ fn well_formed(prog: &Program, f: &Function, ok: &[bool]) -> Option<Checked> {
             }
         }
     }
+    let mut jump_target = vec![false; n];
     for (i, st) in kinds.iter().enumerate() {
         if let Some(st) = st {
-            if step(prog, sig, ok, &f.code[i], &mut st.clone(), &mut strings).is_none() {
-                explain(f, i, st);
-                return None;
+            match step(prog, sig, ok, &f.code[i], &mut st.clone(), &mut strings) {
+                None => {
+                    explain(f, i, st);
+                    return None;
+                }
+                Some(Flow::Jump(t) | Flow::Branch(t)) => jump_target[t as usize] = true,
+                Some(_) => {}
             }
         }
     }
     let (stale, fills) =
         if strings { stale_slots(prog, sig, ok, f, &kinds) } else { (vec![Vec::new(); n], vec![Vec::new(); n]) };
-    Some(Checked { kinds, strings, stale, fills })
+    Some(Checked { kinds, strings, stale, fills, jump_target })
 }
 
 /// The registers each instruction makes a machine number or boolean (in a
@@ -515,7 +522,11 @@ fn stale_slots(
 ) -> (Vec<Vec<Reg>>, Vec<Vec<(Reg, bool)>>) {
     let (n, regs) = (f.code.len(), f.num_regs as usize);
     let words = regs.div_ceil(64);
-    let scalar = |k: K| matches!(k, K::Int | K::Bool | K::Float);
+    // The kinds native code keeps in a machine register: a number or a
+    // boolean, a nullable one, and `null`. A nullable number counts too
+    // (audit 21: the slot of a register reused for `$m[$k] ?? 1` or a
+    // `?int` property kept the list read into it before).
+    let scalar = |k: K| matches!(k, K::Int | K::Bool | K::Float | K::Null) || matches!(k, K::Opt(e) if e != E::Str);
     // The kinds after instruction `i` and where control goes next.
     let after = |i: usize, st: &[K]| -> Option<(Vec<K>, Flow)> {
         let mut st = st.to_vec();
@@ -526,7 +537,8 @@ fn stale_slots(
     let mut held: Vec<Option<Vec<u64>>> = vec![None; n];
     let mut entry = vec![0u64; words];
     for (r, p) in sig.params.iter().enumerate() {
-        if p.boxed() {
+        // (A nullable number comes in the window, but is no value to let go.)
+        if K::of(*p).is_some_and(K::boxed) {
             entry[r / 64] |= 1 << (r % 64);
         }
     }
@@ -605,6 +617,163 @@ fn stale_slots(
         }
     }
     (stale, fills)
+}
+
+/// Property reads native code does not make on their own: a `GetProp` of
+/// a list, map or string whose value is used once, a few instructions on,
+/// by an `Index`/`IndexOrNull` that puts the element in the same register
+/// (`$o->xs[$i]`, as the compiler writes it) or by an `==`/`!=` with another
+/// string (`$o->s == "x"`). The use then reads through the property (see
+/// `phv_jit_prop_index`): no copy of the collection is made, so none can
+/// stay behind in a slot (audit 21) and none has to be let go. Returned by
+/// the `GetProp`'s position: where the use is. The instructions between
+/// (the key's, the other string's) only compute numbers or copy values:
+/// they read neither the register nor change the object's, cannot change
+/// the property, and no jump enters after the `GetProp`.
+fn through_property(prog: &Program, f: &Function, checked: &Checked) -> HashMap<usize, usize> {
+    use Instr::*;
+    let mut found = HashMap::new();
+    for (i, ins) in f.code.iter().enumerate() {
+        let (GetProp(d, o, slot), Some(st)) = (ins, &checked.kinds[i]) else { continue };
+        let (d, o) = (*d, *o);
+        let Some(fk) = st.get(o as usize).and_then(|k| field_kind(prog, *k, *slot)) else { continue };
+        if d == o || !matches!(fk, K::List(_) | K::Map(..) | K::Str) {
+            continue;
+        }
+        for j in i + 1..f.code.len().min(i + 12) {
+            let Some(st) = &checked.kinds[j] else { break };
+            if checked.jump_target[j] {
+                break;
+            }
+            match f.code[j] {
+                Index(x, c, key) | IndexOrNull(x, c, key) => {
+                    if x == d && c == d && key != d && fk != K::Str {
+                        found.insert(i, j);
+                    }
+                    break;
+                }
+                Eq(x, a, b) | Ne(x, a, b) => {
+                    let other = if a == d { b } else { a };
+                    if x == d && (a == d) != (b == d) && fk == K::Str && st[other as usize] == K::Str {
+                        found.insert(i, j);
+                    }
+                    break;
+                }
+                // `if ($o->s == "x")`: the jump does not write the register,
+                // so nothing may read it afterwards, either way.
+                JumpIfEq(a, b, t) | JumpIfNotEq(a, b, t) => {
+                    let other = if a == d { b } else { a };
+                    if (a == d) != (b == d)
+                        && fk == K::Str
+                        && st[other as usize] == K::Str
+                        && unread_from(f, j + 1, d, 2)
+                        && unread_from(f, t as usize, d, 2)
+                    {
+                        found.insert(i, j);
+                    }
+                    break;
+                }
+                _ => {}
+            }
+            // What an instruction in between writes, and what it reads.
+            let Some((writes, reads)) = computes(&f.code[j]) else { break };
+            if writes == d || writes == o || reads.contains(&d) {
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// Whether, from instruction `at`, register `d` is written (or the function
+/// returns) before anything reads it, on every way the code can go; `false`
+/// when that cannot be told within a few instructions and `branches` jumps.
+fn unread_from(f: &Function, at: usize, d: Reg, branches: u32) -> bool {
+    use Instr::*;
+    let mut at = at;
+    for _ in 0..24 {
+        let Some(ins) = f.code.get(at) else { return false };
+        let branch =
+            |regs: [Reg; 2], t: u32| !regs.contains(&d) && branches > 0 && unread_from(f, t as usize, d, branches - 1);
+        match *ins {
+            RetNull => return true,
+            Ret(r) => return r != d,
+            Null(x) | Int(x, _) | Bool(x, _) | Const(x, _) if x == d => return true,
+            Jump(t) => {
+                at = t as usize;
+                continue;
+            }
+            JumpIfFalse(r, t) | JumpIfTrue(r, t) => {
+                if !branch([r, r], t) {
+                    return false;
+                }
+            }
+            JumpIfNotLtI(a, b, t) | JumpIfNotLeI(a, b, t) => {
+                if !branch([a, b], t) {
+                    return false;
+                }
+            }
+            JumpIfNotLtIImm(a, _, t) | JumpIfNotLeIImm(a, _, t) | JumpIfLtIImm(a, _, t) | JumpIfLeIImm(a, _, t) => {
+                if !branch([a, a], t) {
+                    return false;
+                }
+            }
+            GetProp(x, o, _) => {
+                if o == d {
+                    return false;
+                }
+                if x == d {
+                    return true;
+                }
+            }
+            Index(x, c, k) | IndexOrNull(x, c, k) => {
+                if c == d || k == d {
+                    return false;
+                }
+                if x == d {
+                    return true;
+                }
+            }
+            Null(_) => {}
+            _ => match computes(ins) {
+                Some((writes, reads)) => {
+                    if reads.contains(&d) {
+                        return false;
+                    }
+                    if writes == d {
+                        return true;
+                    }
+                }
+                None => return false,
+            },
+        }
+        at += 1;
+    }
+    false
+}
+
+/// For an instruction that only computes a number or copies a value: the
+/// register it writes and those it reads. None for any other.
+fn computes(ins: &Instr) -> Option<(Reg, [Reg; 2])> {
+    use Instr::*;
+    Some(match *ins {
+        Int(x, _) | Bool(x, _) | Const(x, _) => (x, [x, x]),
+        Move(x, a) | AddIImm(x, a, _) | SubIImm(x, a, _) | NegI(x, a) | BitNot(x, a) => (x, [a, a]),
+        IncI(x, _) => (x, [x, x]),
+        AddI(x, a, b)
+        | SubI(x, a, b)
+        | MulI(x, a, b)
+        | ModI(x, a, b)
+        | BitAnd(x, a, b)
+        | BitOr(x, a, b)
+        | BitXor(x, a, b)
+        | Shl(x, a, b)
+        | Shr(x, a, b)
+        | EqI(x, a, b)
+        | LtI(x, a, b)
+        | LeI(x, a, b) => (x, [a, b]),
+        _ => return None,
+    })
 }
 
 /// The registers an instruction puts a new string, list, map or object in,
@@ -1225,11 +1394,14 @@ enum H {
     EchoNonce,
     SetPropScalar,
     GetPropScalar,
+    PropIndex,
+    PropGet,
+    PropStrEq,
 }
 
 /// Name, address, number of i64 arguments after `ctx` (None: `(f64, f64) -> f64`)
 /// and whether it returns an i64, in the order of `H`.
-fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 45] {
+fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 48] {
     [
         ("phv_jit_tick", phv_jit_tick as *const u8, Some(0), true),
         ("phv_jit_enter", phv_jit_enter as *const u8, Some(3), true),
@@ -1276,6 +1448,9 @@ fn helpers() -> [(&'static str, *const u8, Option<usize>, bool); 45] {
         ("phv_jit_echo_nonce", phv_jit_echo_nonce as *const u8, Some(0), true),
         ("phv_jit_set_prop_scalar", phv_jit_set_prop_scalar as *const u8, Some(4), false),
         ("phv_jit_get_prop_scalar", phv_jit_get_prop_scalar as *const u8, Some(3), true),
+        ("phv_jit_prop_index", phv_jit_prop_index as *const u8, Some(4), true),
+        ("phv_jit_prop_get", phv_jit_prop_get as *const u8, Some(5), true),
+        ("phv_jit_prop_str_eq", phv_jit_prop_str_eq as *const u8, Some(2), true),
     ]
 }
 
@@ -2259,6 +2434,17 @@ struct Translator<'a, 'b> {
     /// Per register some instruction leaves stale (`Checked::stale`): 1 while
     /// its window slot may hold a value to let go (see `Checked::fills`).
     held: HashMap<Reg, Variable>,
+    /// The `Null`s at these instructions find their slots already emptied
+    /// by the instruction before them (see `emptied_after`): they have
+    /// nothing to store.
+    skip_null: std::collections::HashSet<usize>,
+    /// Reads made through a property (`through_property`): by the position
+    /// of the `GetProp` that is not made, and by the position of the read,
+    /// the object's slot and the property's number as the helpers take them.
+    unread: std::collections::HashSet<usize>,
+    through: HashMap<usize, i64>,
+    /// By the position of such a read: the register of the `GetProp`.
+    through_reg: HashMap<usize, Reg>,
     blocks: Vec<Block>,
     /// Branches back to an instruction (a loop's test at its end): the block
     /// each goes through, which counts the budget, and the target's block.
@@ -2293,6 +2479,10 @@ impl<'a, 'b> Translator<'a, 'b> {
             fvars: Vec::new(),
             nvars: Vec::new(),
             held: HashMap::new(),
+            skip_null: std::collections::HashSet::new(),
+            unread: std::collections::HashSet::new(),
+            through: HashMap::new(),
+            through_reg: HashMap::new(),
             blocks: Vec::new(),
             back_edges: Vec::new(),
             ctx: Value::from_u32(0),
@@ -2487,16 +2677,69 @@ impl<'a, 'b> Translator<'a, 'b> {
         self.b.use_var(bits)
     }
 
+    /// Whether the read at instruction `at` of an element of the container
+    /// in slot `c`, into register `d`, is the last use of that copy of the
+    /// container: the compiler read it into the element's own register
+    /// (`GetProp(d, ..); Index(d, d, k)`), or empties it right after
+    /// (`Index(d, c, k); Null(c)`, which no jump may enter between). The
+    /// helper then empties the slot itself (`JIT_ELEM_TAKE`), which costs
+    /// no call: left there, the copy would keep the property shared.
+    fn takes(&self, at: usize, d: Reg, c: Reg) -> bool {
+        d == c || self.emptied_after(at, c).is_some()
+    }
+
+    /// Where the compiler empties temporary `r` after instruction `at`,
+    /// which is then the last use of the value: a `Null` that follows it,
+    /// with only other `Null`s and instructions that compute numbers
+    /// without touching the register between (no jump may enter there).
+    /// The helper of `at` then takes the value out of the slot itself, and
+    /// that `Null` stores nothing (`taken`): no call of its own.
+    fn emptied_after(&self, at: usize, r: Reg) -> Option<usize> {
+        for j in at + 1..self.func.code.len().min(at + 12) {
+            if self.checked.jump_target[j] || self.checked.kinds[j].is_none() {
+                break;
+            }
+            match self.func.code[j] {
+                Instr::Null(x) if x == r => return Some(j),
+                Instr::Null(_) => {}
+                ref ins => match computes(ins) {
+                    Some((writes, reads)) if writes != r && !reads.contains(&r) => {}
+                    _ => break,
+                },
+            }
+        }
+        None
+    }
+
+    /// After a read that emptied slot `c` (see `takes`): the slot holds
+    /// nothing to let go (unless the element itself went there), and the
+    /// `Null` that follows has nothing to store.
+    fn taken(&mut self, at: usize, d: Reg, c: Reg, in_slot: bool) {
+        if d != c {
+            let j = self.emptied_after(at, c).expect("a temporary emptied after its last use");
+            self.skip_null.insert(j);
+        } else if in_slot {
+            return;
+        }
+        if let Some(&var) = self.held.get(&c) {
+            let zero = self.iconst(0);
+            self.b.def_var(var, zero);
+        }
+    }
+
     /// Element `i` (a machine value) of the list in slot `l`, into register
-    /// `d` (a machine register, or slot `d` for a string).
-    fn element(&mut self, d: Reg, l: Reg, i: Value, e: E) {
+    /// `d` (a machine register, or slot `d` for a string); with `take`, the
+    /// list's slot is emptied.
+    fn element(&mut self, d: Reg, l: Reg, i: Value, e: E, take: bool, through: Option<i64>) {
         let code = match e {
             E::Float => JIT_ELEM_FLOAT,
             E::Str => JIT_ELEM_STR,
             _ => JIT_ELEM_INT,
         };
-        let (dv, lv, cv) = (self.iconst(d as i64), self.iconst(l as i64), self.iconst(code));
-        let r = self.call(H::Index, &[dv, lv, i, cv]).unwrap();
+        let code = if take { code | JIT_ELEM_TAKE } else { code };
+        let (dv, lv, cv) = (self.iconst(d as i64), self.iconst(through.unwrap_or(l as i64)), self.iconst(code));
+        let helper = if through.is_some() { H::PropIndex } else { H::Index };
+        let r = self.call(helper, &[dv, lv, i, cv]).unwrap();
         self.check_ctx();
         match e {
             E::Float => {
@@ -2614,9 +2857,14 @@ impl<'a, 'b> Translator<'a, 'b> {
     }
 
     /// `a == b` (of kinds `ka` and `kb`, checked by `eq_mode`) as 0 or 1.
-    fn eq_flag(&mut self, a: Reg, b: Reg, ka: K, kb: K) -> Value {
+    /// `a == b` as 0 or 1. With `take` (two strings only), the slot of that
+    /// register is emptied once they are compared (`JIT_SLOT_TAKE`).
+    fn eq_flag(&mut self, a: Reg, b: Reg, ka: K, kb: K, take: Option<Reg>) -> Value {
         match eq_mode(ka, kb) {
-            Some(EqMode::Plain) if ka == K::Str => self.call_regs(H::StrEq, &[a as i64, b as i64]).unwrap(),
+            Some(EqMode::Plain) if ka == K::Str => {
+                let slot = |r: Reg| if take == Some(r) { r as i64 | JIT_SLOT_TAKE } else { r as i64 };
+                self.call_regs(H::StrEq, &[slot(a), slot(b)]).unwrap()
+            }
             Some(EqMode::Plain) => {
                 let (x, y) = (self.get(a), self.get(b));
                 let c = self.b.ins().icmp(IntCC::Equal, x, y);
@@ -2708,6 +2956,14 @@ impl<'a, 'b> Translator<'a, 'b> {
         let entry = self.b.create_block();
         self.b.append_block_params_for_function_params(entry);
         self.blocks = (0..code.len()).map(|_| self.b.create_block()).collect();
+        if self.checked.strings {
+            for (at, read) in through_property(self.prog, self.func, self.checked) {
+                let Instr::GetProp(d, o, slot) = code[at] else { unreachable!("a property read") };
+                self.unread.insert(at);
+                self.through_reg.insert(read, d);
+                self.through.insert(read, o as i64 | (slot as i64) << JIT_PROP_SHIFT);
+            }
+        }
         let nregs = self.func.num_regs.max(1) as usize;
         self.ivars = (0..nregs).map(|_| self.b.declare_var(I64)).collect();
         self.fvars = (0..nregs).map(|_| self.b.declare_var(F64)).collect();
@@ -2746,7 +3002,7 @@ impl<'a, 'b> Translator<'a, 'b> {
         // first only an argument's does (the window comes empty).
         for r in self.checked.stale.iter().flatten().copied().collect::<std::collections::BTreeSet<Reg>>() {
             let var = self.b.declare_var(I64);
-            let boxed = self.sig.params.get(r as usize).is_some_and(|p| p.boxed());
+            let boxed = self.sig.params.get(r as usize).is_some_and(|p| K::of(*p).is_some_and(K::boxed));
             let v = self.iconst(boxed as i64);
             self.b.def_var(var, v);
             self.held.insert(r, var);
@@ -2790,10 +3046,13 @@ impl<'a, 'b> Translator<'a, 'b> {
                 continue;
             };
             let k = |r: Reg| st[r as usize];
-            let next = (i + 1) as u32;
-            for &(r, shared) in &self.checked.fills[i] {
-                let v = self.iconst(shared as i64);
-                self.b.def_var(self.held[&r], v);
+            // (`i` names a register in some instructions below.)
+            let (at, next) = (i, (i + 1) as u32);
+            if !self.unread.contains(&at) {
+                for &(r, shared) in &self.checked.fills[i] {
+                    let v = self.iconst(shared as i64);
+                    self.b.def_var(self.held[&r], v);
+                }
             }
             match *ins {
                 Instr::Int(d, v) => {
@@ -2823,7 +3082,13 @@ impl<'a, 'b> Translator<'a, 'b> {
                 },
                 Instr::Move(d, s) => match k(s) {
                     ks if ks.boxed() => {
-                        self.call_regs(H::Move, &[d as i64, s as i64]);
+                        // (Moved, when the source is emptied right after.)
+                        let take = d != s && self.emptied_after(at, s).is_some();
+                        let from = if take { s as i64 | JIT_SLOT_TAKE } else { s as i64 };
+                        self.call_regs(H::Move, &[d as i64, from]);
+                        if take {
+                            self.taken(at, d, s, false);
+                        }
                         if ks.class().is_some() {
                             let n = self.getn(s);
                             self.b.def_var(self.nvars[d as usize], n);
@@ -2853,9 +3118,18 @@ impl<'a, 'b> Translator<'a, 'b> {
                     let z = self.iconst(0);
                     self.b.def_var(self.ivars[d as usize], z);
                     self.setn(d, 1);
-                    // A nullable string is read from the window.
+                    // A nullable string is read from the window (where the
+                    // read just before may have left the `null` already).
                     if self.checked.strings {
-                        self.spill(d, K::Null);
+                        if !self.skip_null.contains(&at) {
+                            self.spill(d, K::Null);
+                        }
+                        // Which empties the slot: nothing is left to let go
+                        // after this instruction (see `after`).
+                        if let Some(&var) = self.held.get(&d) {
+                            let zero = self.iconst(0);
+                            self.b.def_var(var, zero);
+                        }
                     }
                 }
                 Instr::JumpIfNull(r, t) | Instr::JumpIfNotNull(r, t) => {
@@ -2866,12 +3140,31 @@ impl<'a, 'b> Translator<'a, 'b> {
                     continue;
                 }
                 Instr::Eq(d, a, b) | Instr::Ne(d, a, b) => {
-                    let eq = self.eq_flag(a, b, k(a), k(b));
+                    // A string read into the result's own register for this
+                    // comparison (`$o->s == "x"`) is let go by the helper.
+                    let plain = k(a) == K::Str && eq_mode(k(a), k(b)) == Some(EqMode::Plain);
+                    let through = self.through.get(&at).copied();
+                    let take = (through.is_none() && plain && (d == a || d == b)).then_some(d);
+                    let eq = match through {
+                        // The string of a property, compared where it is.
+                        Some(os) => self.call_regs(H::PropStrEq, &[os, if a == d { b } else { a } as i64]).unwrap(),
+                        None => self.eq_flag(a, b, k(a), k(b), take),
+                    };
                     let r = if matches!(ins, Instr::Ne(..)) { self.b.ins().bxor_imm_s(eq, 1) } else { eq };
                     self.set(d, r);
+                    if take.is_some() {
+                        self.taken(at, d, d, false);
+                    }
                 }
                 Instr::JumpIfEq(a, b, t) | Instr::JumpIfNotEq(a, b, t) => {
-                    let eq = self.eq_flag(a, b, k(a), k(b));
+                    let eq = match self.through.get(&at).copied() {
+                        // The string of a property, compared where it is.
+                        Some(os) => {
+                            let other = if self.through_reg[&at] == a { b } else { a };
+                            self.call_regs(H::PropStrEq, &[os, other as i64]).unwrap()
+                        }
+                        None => self.eq_flag(a, b, k(a), k(b), None),
+                    };
                     let (yes, no) = if matches!(ins, Instr::JumpIfEq(..)) { (t, next) } else { (next, t) };
                     let (yes, no) = (self.edge(i, yes), self.edge(i, no));
                     self.b.ins().brif(eq, yes, &[], no, &[]);
@@ -2952,8 +3245,11 @@ impl<'a, 'b> Translator<'a, 'b> {
                     self.set(d, r);
                 }
                 Instr::Lt(d, a, b) | Instr::Le(d, a, b) | Instr::Cmp(d, a, b) if k(a).strip() == K::Str => {
-                    // Compare the strings (-1, 0 or 1), then that with 0.
-                    let c = self.call_regs(H::StrCmp, &[a as i64, b as i64]).unwrap();
+                    // Compare the strings (-1, 0 or 1), then that with 0. One
+                    // read into the result's own register is let go.
+                    let take = d == a || d == b;
+                    let slot = |r: Reg| if take && r == d { r as i64 | JIT_SLOT_TAKE } else { r as i64 };
+                    let c = self.call_regs(H::StrCmp, &[slot(a), slot(b)]).unwrap();
                     let r = match ins {
                         Instr::Cmp(..) => c,
                         _ => {
@@ -2966,6 +3262,9 @@ impl<'a, 'b> Translator<'a, 'b> {
                         }
                     };
                     self.set(d, r);
+                    if take {
+                        self.taken(at, d, d, false);
+                    }
                 }
                 Instr::EqI(d, a, b)
                 | Instr::LtI(d, a, b)
@@ -3238,7 +3537,12 @@ impl<'a, 'b> Translator<'a, 'b> {
                 Instr::Index(d, l, i) if matches!(k(l), K::List(_)) => {
                     let K::List(e) = k(l) else { unreachable!("checked") };
                     let iv = self.get(i);
-                    self.element(d, l, iv, e);
+                    let through = self.through.get(&at).copied();
+                    let take = through.is_none() && self.takes(at, d, l);
+                    self.element(d, l, iv, e, take, through);
+                    if take {
+                        self.taken(at, d, l, e == E::Str);
+                    }
                 }
                 Instr::Index(d, c, key) | Instr::IndexOrNull(d, c, key) => {
                     let or_null = matches!(ins, Instr::IndexOrNull(..));
@@ -3248,9 +3552,18 @@ impl<'a, 'b> Translator<'a, 'b> {
                         _ => unreachable!("checked"),
                     };
                     self.spill(key, k(key));
-                    let args = [d as i64, c as i64, key as i64, e.code(), or_null as i64];
-                    let v = self.call_regs(H::Get, &args).unwrap();
+                    let through = self.through.get(&at).copied();
+                    let take = through.is_none() && self.takes(at, d, c);
+                    let code = if take { e.code() | JIT_ELEM_TAKE } else { e.code() };
+                    let v = match through {
+                        Some(os) => self.call_regs(H::PropGet, &[d as i64, os, key as i64, code, or_null as i64]),
+                        None => self.call_regs(H::Get, &[d as i64, c as i64, key as i64, code, or_null as i64]),
+                    }
+                    .unwrap();
                     self.check_ctx();
+                    if take {
+                        self.taken(at, d, c, e == E::Str);
+                    }
                     match e {
                         E::Float => {
                             let f = self.b.ins().bitcast(F64, MemFlagsData::new(), v);
@@ -3263,6 +3576,13 @@ impl<'a, 'b> Translator<'a, 'b> {
                         let null = self.b.ins().load(I64, self.mf, self.ctx, CTX_DETAIL);
                         let null = if e == E::Empty { self.iconst(1) } else { null };
                         self.b.def_var(self.nvars[d as usize], null);
+                        // Nothing is found in an empty list or map, and the
+                        // helper writes nothing: the slot gets the `null` a
+                        // nullable string or object is read from (it may be
+                        // the container's own slot, `$o->xs[0] ?? null`).
+                        if e == E::Empty && self.checked.strings {
+                            self.spill(d, K::Null);
+                        }
                     }
                 }
                 Instr::NewMap(d, start, n) => {
@@ -3388,7 +3708,7 @@ impl<'a, 'b> Translator<'a, 'b> {
                         self.set(key, idx);
                     }
                     if e != E::Empty {
-                        self.element(val, it, idx, e);
+                        self.element(val, it, idx, e, false, None);
                     }
                     let n = self.b.ins().iadd_imm_s(idx, 1);
                     self.set(it + 1, n);
@@ -3398,11 +3718,18 @@ impl<'a, 'b> Translator<'a, 'b> {
                     self.check_ctx();
                     self.setn(d, 0);
                 }
+                // Read where it is used (see `through_property`).
+                Instr::GetProp(..) if self.unread.contains(&at) => {}
                 Instr::GetProp(d, o, slot) => {
                     let fk = field_kind(self.prog, k(o), slot).expect("checked");
                     let (code, nullable) = fk.elem().expect("checked");
+                    // An object read only for this property (`f()->p`): the
+                    // helper empties its slot (see `takes`).
+                    let cached = cached_props.get(&i).copied();
+                    let take = cached.is_none() && self.takes(at, d, o);
+                    let code = if take { code | JIT_ELEM_TAKE } else { code };
                     let v = if matches!(fk, K::Int | K::Bool | K::Float) {
-                        self.read_scalar_prop(o, slot, code, cached_props.get(&i).copied())
+                        self.read_scalar_prop(o, slot, code, cached)
                     } else {
                         let value = self
                             .call_regs(H::GetProp, &[d as i64, o as i64, slot as i64, code, nullable as i64])
@@ -3410,6 +3737,9 @@ impl<'a, 'b> Translator<'a, 'b> {
                         self.check_ctx();
                         value
                     };
+                    if take {
+                        self.taken(at, d, o, fk.boxed());
+                    }
                     match fk {
                         K::Float | K::Opt(E::Float) => {
                             let f = self.b.ins().bitcast(F64, MemFlagsData::new(), v);
@@ -3441,14 +3771,25 @@ impl<'a, 'b> Translator<'a, 'b> {
                 }
                 Instr::SetProp(o, slot, v) => {
                     self.spill(v, k(v));
-                    self.call_regs(H::SetProp, &[o as i64, slot as i64, v as i64]);
+                    // (Moved, when the value's temporary is emptied right after.)
+                    let take = k(v).boxed() && o != v && self.emptied_after(at, v).is_some();
+                    let from = if take { v as i64 | JIT_SLOT_TAKE } else { v as i64 };
+                    self.call_regs(H::SetProp, &[o as i64, slot as i64, from]);
                     self.check_ctx();
+                    if take {
+                        self.taken(at, o, v, false);
+                    }
                 }
                 Instr::Echo(r) | Instr::EchoAttr(r) => {
                     self.spill(r, k(r));
+                    let take = k(r).boxed() && self.emptied_after(at, r).is_some();
+                    let from = if take { r as i64 | JIT_SLOT_TAKE } else { r as i64 };
                     let attr = matches!(ins, Instr::EchoAttr(_)) as i64;
-                    let e = self.call_regs(H::Echo, &[r as i64, attr]).unwrap();
+                    let e = self.call_regs(H::Echo, &[from, attr]).unwrap();
                     self.check(e);
+                    if take {
+                        self.taken(at, NO_REG, r, false);
+                    }
                 }
                 Instr::EchoHtml(c) => {
                     let e = self.call_regs(H::EchoHtml, &[c as i64]).unwrap();
@@ -3543,6 +3884,30 @@ mod tests {
         let fills: Vec<(usize, Vec<(Reg, bool)>)> =
             checked.fills.iter().enumerate().filter(|(_, s)| !s.is_empty()).map(|(i, s)| (i, s.clone())).collect();
         assert_eq!(fills, vec![(0, vec![(2, true)])]);
+    }
+
+    /// The same for a register made a nullable number or `null` (an element
+    /// that may be missing, `null` itself): kept in a machine register too,
+    /// so its slot lets the list go (audit 21). A nullable number that came
+    /// as an argument is no value to let go.
+    #[test]
+    fn nullable_numbers_written_over_values_empty_their_slots() {
+        let list = ValKind::List(phv_vm::bytecode::Scalar::Int);
+        let opt = ValKind::Opt(phv_vm::bytecode::Scalar::Int);
+        let f = func(
+            vec![list, I, opt],
+            I,
+            6,
+            vec![Move(3, 0), IndexOrNull(3, 3, 1), Move(4, 0), Null(4), Move(5, 0), Move(5, 2), Int(4, 1), Ret(4)],
+        );
+        let prog = Program { funcs: vec![f], ..Default::default() };
+        let checked = well_formed(&prog, &prog.funcs[0], &[true]).expect("compiled");
+        let stale: Vec<(usize, Vec<Reg>)> =
+            checked.stale.iter().enumerate().filter(|(_, s)| !s.is_empty()).map(|(i, s)| (i, s.clone())).collect();
+        assert_eq!(stale, vec![(1, vec![3]), (3, vec![4]), (5, vec![5])]);
+        let fills: Vec<(usize, Vec<(Reg, bool)>)> =
+            checked.fills.iter().enumerate().filter(|(_, s)| !s.is_empty()).map(|(i, s)| (i, s.clone())).collect();
+        assert_eq!(fills, vec![(0, vec![(3, true)]), (2, vec![(4, true)]), (4, vec![(5, true)])]);
     }
 
     #[test]
@@ -3775,6 +4140,52 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(canonical(&a, 0).key, one(C::Float(1.0)));
+    }
+
+    /// `$o->xs[$i]` and `$o->s == "x"` as the compiler writes them are read
+    /// through the property (no copy of the list or string is made); not
+    /// when the element goes elsewhere, when something between could change
+    /// the property or reads the register, or when a jump enters between.
+    #[test]
+    fn elements_and_strings_of_properties_are_read_in_place() {
+        let list = ValKind::List(Scalar::Int);
+        let o = ValKind::Object(0);
+        let found = |params: Vec<ValKind>, ret: ValKind, regs: u16, code: Vec<Instr>| {
+            let prog = Program {
+                funcs: vec![func(params, ret, regs, code)],
+                classes: vec![class("P", &[("xs", list), ("s", S)], vec![0], vec![])],
+                consts: vec![C::Str("x".into())],
+                ..Default::default()
+            };
+            let checked = well_formed(&prog, &prog.funcs[0], &[true]).expect("compiled");
+            let mut found: Vec<(usize, usize)> =
+                through_property(&prog, &prog.funcs[0], &checked).into_iter().collect();
+            found.sort_unstable();
+            found
+        };
+        // `$o->xs[$i % 3]`, then `$o->s == "x"`.
+        let code = vec![
+            GetProp(2, 0, 0),
+            Int(4, 3),
+            ModI(3, 1, 4),
+            Index(2, 2, 3),
+            GetProp(3, 0, 1),
+            Const(4, 0),
+            Eq(3, 3, 4),
+            Ret(2),
+        ];
+        assert_eq!(found(vec![o, I], I, 5, code), vec![(0, 3), (4, 6)]);
+        // The element goes to another register: the list is copied.
+        assert_eq!(found(vec![o, I], I, 4, vec![GetProp(2, 0, 0), Index(3, 2, 1), Null(2), Ret(3)]), vec![]);
+        // A property is written between (it may be the one read).
+        let code = vec![GetProp(2, 0, 0), SetProp(0, 1, 3), Index(2, 2, 1), Ret(2)];
+        assert_eq!(found(vec![o, I, o, S], I, 4, code), vec![]);
+        // The list is read between.
+        let code = vec![GetProp(2, 0, 0), Move(3, 2), Index(2, 2, 1), Ret(2)];
+        assert_eq!(found(vec![o, I], I, 4, code), vec![]);
+        // A jump enters between the read of the property and the element's.
+        let code = vec![JumpIfLeIImm(1, 0, 2), GetProp(2, 0, 0), Index(2, 2, 1), Ret(2)];
+        assert_eq!(found(vec![o, I, list], I, 3, code), vec![]);
     }
 
     fn class(name: &str, fields: &[(&str, ValKind)], supers: Vec<u32>, vtable: Vec<u32>) -> Class {

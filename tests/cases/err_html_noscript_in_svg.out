@@ -1,0 +1,57 @@
+error: `<noscript>` inside `<svg>` or `<math>`: browsers with scripting on read a `<noscript>` as raw text up to the first `</noscript>` (any template may be written inside one), which would end it, and the SVG or MathML with it, here
+  --> err_html_noscript_in_svg.phv:14:25
+   |
+14 | <noscript><svg><noscript></noscript><script/><?= $v ?></script></svg></noscript>
+   |                         ^
+   = note: a template must be read the same way by every browser, with scripting on and off; write it without this
+
+error: `</noscript>` inside `<svg>` or `<math>`: browsers with scripting on read a `<noscript>` as raw text up to the first `</noscript>` (any template may be written inside one), which would end it, and the SVG or MathML with it, here
+  --> err_html_noscript_in_svg.phv:14:36
+   |
+14 | <noscript><svg><noscript></noscript><script/><?= $v ?></script></svg></noscript>
+   |                                    ^
+   = note: a template must be read the same way by every browser, with scripting on and off; write it without this
+
+error: `<noscript>` inside `<svg>` or `<math>`: browsers with scripting on read a `<noscript>` as raw text up to the first `</noscript>` (any template may be written inside one), which would end it, and the SVG or MathML with it, here
+  --> err_html_noscript_in_svg.phv:15:30
+   |
+15 | <noscript><math><mi><noscript></noscript></mi><script/><?= $v ?></script></math></noscript>
+   |                              ^
+   = note: a template must be read the same way by every browser, with scripting on and off; write it without this
+
+error: `</noscript>` inside `<svg>` or `<math>`: browsers with scripting on read a `<noscript>` as raw text up to the first `</noscript>` (any template may be written inside one), which would end it, and the SVG or MathML with it, here
+  --> err_html_noscript_in_svg.phv:15:41
+   |
+15 | <noscript><math><mi><noscript></noscript></mi><script/><?= $v ?></script></math></noscript>
+   |                                         ^
+   = note: a template must be read the same way by every browser, with scripting on and off; write it without this
+
+error: `<noscript>` inside `<svg>` or `<math>`: browsers with scripting on read a `<noscript>` as raw text up to the first `</noscript>` (any template may be written inside one), which would end it, and the SVG or MathML with it, here
+  --> err_html_noscript_in_svg.phv:16:30
+   |
+16 | <svg><foreignObject><noscript><p>no script</p></noscript></foreignObject><text><?= $v ?></text></svg>
+   |                              ^
+   = note: a template must be read the same way by every browser, with scripting on and off; write it without this
+
+error: `</noscript>` inside `<svg>` or `<math>`: browsers with scripting on read a `<noscript>` as raw text up to the first `</noscript>` (any template may be written inside one), which would end it, and the SVG or MathML with it, here
+  --> err_html_noscript_in_svg.phv:16:57
+   |
+16 | <svg><foreignObject><noscript><p>no script</p></noscript></foreignObject><text><?= $v ?></text></svg>
+   |                                                         ^
+   = note: a template must be read the same way by every browser, with scripting on and off; write it without this
+
+error: `<noscript>` inside `<svg>` or `<math>`: browsers with scripting on read a `<noscript>` as raw text up to the first `</noscript>` (any template may be written inside one), which would end it, and the SVG or MathML with it, here
+  --> err_html_noscript_in_svg.phv:17:24
+   |
+17 | <svg><desc><b><noscript></noscript></b></desc></svg>
+   |                        ^
+   = note: a template must be read the same way by every browser, with scripting on and off; write it without this
+
+error: `</noscript>` inside `<svg>` or `<math>`: browsers with scripting on read a `<noscript>` as raw text up to the first `</noscript>` (any template may be written inside one), which would end it, and the SVG or MathML with it, here
+  --> err_html_noscript_in_svg.phv:17:35
+   |
+17 | <svg><desc><b><noscript></noscript></b></desc></svg>
+   |                                   ^
+   = note: a template must be read the same way by every browser, with scripting on and off; write it without this
+
+8 errors found

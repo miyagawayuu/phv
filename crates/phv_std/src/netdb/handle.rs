@@ -89,7 +89,10 @@ fn open(vm: &mut Vm, name: &str, want_redis: bool) -> R {
         return push(vm, name, link);
     }
     let Some(spec) = vm.host.databases.get(name).cloned() else {
-        return Err(vm.throw("DatabaseError", format!("no database named \"{name}\" in [databases] of phv.toml")));
+        return Err(vm.throw(
+            "DatabaseError",
+            format!("no database named \"{}\" in [databases] of phv.toml", crate::httpclient::brief(name)),
+        ));
     };
     let Some(url) = spec.url.clone() else {
         let var = spec.url_env.as_deref().unwrap_or("?");
@@ -151,7 +154,11 @@ pub fn query(vm: &mut Vm, a: &[Value]) -> R {
     let mut link = link.borrow_mut();
     match &mut *link {
         Link::Pg(c) => guarded(vm, c, &a[1], Dialect::Postgres, |vm, c| pg_query(vm, c, &a[1])),
-        Link::My(c) => guarded(vm, c, &a[1], Dialect::MySql, |vm, c| my_query(vm, c, &a[1])),
+        Link::My(c) => {
+            let r = guarded(vm, c, &a[1], Dialect::MySql, |vm, c| my_query(vm, c, &a[1]));
+            my_transaction_ended(c);
+            r
+        }
         Link::Redis(_) => unreachable!("Redis handle used as a database"),
     }
 }
@@ -161,8 +168,30 @@ pub fn execute(vm: &mut Vm, a: &[Value]) -> R {
     let mut link = link.borrow_mut();
     match &mut *link {
         Link::Pg(c) => guarded(vm, c, &a[1], Dialect::Postgres, |vm, c| pg_execute(vm, c, &a[1])),
-        Link::My(c) => guarded(vm, c, &a[1], Dialect::MySql, |vm, c| my_execute(vm, c, &a[1])),
+        Link::My(c) => {
+            let r = guarded(vm, c, &a[1], Dialect::MySql, |vm, c| my_execute(vm, c, &a[1]));
+            my_transaction_ended(c);
+            r
+        }
         Link::Redis(_) => unreachable!("Redis handle used as a database"),
+    }
+}
+
+/// After a script's statement on MySQL: when the server says the transaction
+/// that was open before it is over (`MyConn::note_tx`), whatever the
+/// statement's text (`ROLLBACK` through `EXECUTE` or `CALL`, a statement that
+/// commits implicitly), std.orm forgets what it kept, as after a rollback
+/// written as SQL, and the open `transaction()` calls have ended: their
+/// later statements are refused and their `COMMIT` raises (found by the 21st
+/// assessment: `transaction()` returned as if it had committed). Outside
+/// `transaction()` too, for a transaction the script began itself (as on
+/// SQLite since the 20th).
+fn my_transaction_ended(c: &mut Pooled<MyConn>) {
+    if c.conn().is_some_and(MyConn::take_tx_ended) {
+        crate::orm::rolled_back();
+        if c.depth > 0 && c.ended.is_none() {
+            c.ended = Some(Ended::ByStatement);
+        }
     }
 }
 
@@ -286,6 +315,8 @@ impl TxConn for Pooled<MyConn> {
     fn run(&mut self, vm: &Vm, sql: &str) -> Result<(), VmError> {
         use mysql::prelude::Queryable;
         let r = self.get().conn.query_drop(sql);
+        // The state after `transaction()`'s own statement: its end is not the script's.
+        self.get().note_own_tx();
         r.map_err(|e| my_error(vm, self, e))
     }
 

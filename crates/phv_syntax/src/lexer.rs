@@ -26,6 +26,11 @@ pub fn lex(src: &str, file: u32, base: u32, mode: Mode) -> (Vec<Token>, Vec<Diag
 /// file of the repository has a few thousand.
 pub const MAX_TOKENS: usize = 1_000_000;
 
+/// The longest name (of a variable, function, class, member...), in bytes.
+/// Messages and the compiled program repeat names: a class with a 1 MB name
+/// made 20,000 error messages take 70 GB (21st assessment).
+pub const MAX_NAME: usize = 255;
+
 /// The error of a file with more than `MAX_TOKENS` tokens.
 pub fn too_many_tokens(span: Span) -> Diagnostic {
     Diagnostic::error(format!("this file is too large: more than {MAX_TOKENS} tokens"), span)
@@ -272,6 +277,9 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         while self.pos < self.bytes.len() && is_ident_char(self.peek(0)) {
             self.pos += 1;
+        }
+        if self.pos - start > MAX_NAME {
+            self.error(format!("this name is too long (more than {MAX_NAME} bytes)"), start, self.pos);
         }
         &self.src[start..self.pos]
     }
@@ -734,6 +742,27 @@ mod tests {
         let (_, diags) = lex(&junk, 0, 0, Mode::Code);
         assert!(diags.len() <= MAX_ERRORS + 1, "{}", diags.len());
         assert!(diags.last().unwrap().message.contains("too many errors"));
+    }
+
+    /// 21st assessment: names had no length limit, and every message (and
+    /// note) that named a class with a 1 MB name held a copy of it.
+    #[test]
+    fn long_names_are_refused() {
+        for (n, ok) in [(MAX_NAME, true), (MAX_NAME + 1, false), (1 << 20, false)] {
+            let name = "a".repeat(n);
+            for src in [
+                format!("class {name} {{}}"),
+                format!("${name} = 1;"),
+                format!("$a->{name}();"),
+                format!("echo \"{{${name}}} ${name}\";"),
+            ] {
+                let (_, diags) = lex(&src, 0, 0, Mode::Code);
+                assert_eq!(diags.is_empty(), ok, "{n}: {:?}", diags.first().map(|d| &d.message));
+                if let Some(d) = diags.first() {
+                    assert_eq!(d.message, format!("this name is too long (more than {MAX_NAME} bytes)"));
+                }
+            }
+        }
     }
 
     /// Found by the 1.0.0 audit: a file of 8 MB of list items took about

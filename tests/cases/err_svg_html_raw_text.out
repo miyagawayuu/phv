@@ -1,0 +1,57 @@
+error: `</a>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_html_raw_text.phv:12:80
+   |
+12 | <svg><foreignObject><textarea><svg><a </textarea><script/><?= $v ?></script></a></svg></textarea></foreignObject></svg>
+   |                                                                                ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</a<>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_html_raw_text.phv:13:80
+   |
+13 | <svg><foreignObject><textarea><svg><a</textarea><script/><?= $v ?></script></a<></svg></textarea></foreignObject></svg>
+   |                                                                                ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</a>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_html_raw_text.phv:14:67
+   |
+14 | <svg><desc><title><svg><a x=</title><script/><?= $v ?></script></a></svg></title></desc></svg>
+   |                                                                   ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</a>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_html_raw_text.phv:15:62
+   |
+15 | <svg><title><xmp><svg><a </xmp><script/><?= $v ?></script></a></svg></xmp></title></svg>
+   |                                                              ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</a>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_html_raw_text.phv:16:68
+   |
+16 | <math><mi><noembed><svg><a </noembed><script/><?= $v ?></script></a></svg></noembed></mi></math>
+   |                                                                    ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</a>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_html_raw_text.phv:17:72
+   |
+17 | <math><mtext><b><iframe><svg><a </iframe><script/><?= $v ?></script></a></svg></iframe></b></mtext></math>
+   |                                                                        ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</svg>` while the HTML element `<b>` opened inside SVG or MathML is still open, where browsers ignore it
+  --> err_svg_html_raw_text.phv:17:78
+   |
+17 | <math><mtext><b><iframe><svg><a </iframe><script/><?= $v ?></script></a></svg></iframe></b></mtext></math>
+   |                                                                              ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `</a>` inside SVG or MathML that closes no element opened inside it, where browsers may close an HTML element around the SVG or MathML, and the SVG or MathML with it
+  --> err_svg_html_raw_text.phv:18:78
+   |
+18 | <svg><foreignObject><textarea><svg><a </textarea><style/><?= $v ?></style></a></svg></textarea></foreignObject></svg>
+   |                                                                              ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+8 errors found

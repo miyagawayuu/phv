@@ -107,6 +107,36 @@ class LicenceFiles(unittest.TestCase):
         self.assertIn("own licence", text)
         self.assertNotIn("mk1", text)
 
+    def test_linked_folders_in_the_crate_are_not_walked(self):
+        """A folder of the crate that is a link to one outside it (a symbolic link, or a junction on Windows,
+        which `os.walk` enters): a licence-named file in it is not the crate's."""
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "LICENSE-secret").write_text("mk1 licence-named file outside the crate\n", encoding="utf-8")
+        made = 0
+        for how in ("symlink", "junction"):
+            p = crate(self.base, f"walked{how}")
+            folder = Path(p["manifest_path"]).parent
+            (folder / "COPYING").write_text("own licence\n", encoding="utf-8")
+            try:
+                if how == "symlink":
+                    os.symlink(outside, folder / "sub", target_is_directory=True)
+                elif os.name == "nt":
+                    subprocess.run(["cmd", "/c", "mklink", "/J", str(folder / "sub"), str(outside)],
+                                   check=True, capture_output=True)
+                else:
+                    continue
+            except (OSError, NotImplementedError, subprocess.CalledProcessError):
+                continue
+            made += 1
+            self.assertEqual(run([p], self.out), 0)
+            text = self.out.read_text(encoding="utf-8")
+            self.assertIn("own licence", text)
+            self.assertNotIn("mk1", text)
+            self.assertNotIn("sub/", text)
+        if made == 0:
+            self.skipTest("no links can be made here")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -110,6 +110,11 @@ const TEMPLATE: Flags = 1 << 19;
 /// an `<svg>` in it; in body it is ignored. Inside SVG or MathML, where that
 /// mode is not known here, it is refused (found by the 20th assessment).
 const NEEDS_MODE: Flags = 1 << 20;
+/// `<frameset>`: where browsers take it (a page with nothing before it but
+/// its head), they ignore every tag after it but `<frame>`, `<frameset>` and
+/// `<noframes>`, also the start tag of a raw-text element such as `<textarea>`,
+/// whose text they then read as markup. Refused everywhere (the 21st assessment).
+const FRAMESET: Flags = 1 << 21;
 /// `<svg>` or `<math>`.
 const FOREIGN_ROOT: Flags = SVG_ROOT | MATH_ROOT;
 
@@ -226,7 +231,7 @@ const ELEMENTS: &[Element] = &[
     Element { name: "tr", flags: NEEDS_MODE },
     Element { name: "td", flags: NEEDS_MODE },
     Element { name: "th", flags: NEEDS_MODE },
-    Element { name: "frameset", flags: NEEDS_MODE },
+    Element { name: "frameset", flags: NEEDS_MODE | FRAMESET },
     Element { name: "html", flags: NEEDS_MODE },
 ];
 
@@ -570,6 +575,11 @@ enum When {
     /// After the match: `-`s, then `>` (`<!-->`, `<!--->` in a script).
     DashesThenGt,
     InForeign,
+    /// The raw-text element is one whose text browsers read as markup in SVG
+    /// and MathML (`RAW_IN_FOREIGN`: `<script>`, `<style>`), not an HTML one
+    /// such as `<textarea>` in a `<foreignObject>`, whose text is raw there
+    /// too (the 21st assessment).
+    MarkupInForeign,
     /// The raw-text element is `<script>`.
     Script,
     NotScript,
@@ -806,7 +816,7 @@ const RULES: &[(Ctx, &[Rule])] = &[
             // tags and bogus comments).
             Rule {
                 on: On::Is('<'),
-                when: &[When::InForeign, When::Next(MarkupStart)],
+                when: &[When::InForeign, When::MarkupInForeign, When::Next(MarkupStart)],
                 then: Then::ForeignMarkup,
                 read: One,
             },
@@ -957,6 +967,9 @@ enum Wrong {
     /// A start tag inside SVG or MathML that acts by the insertion mode
     /// around it (`NEEDS_MODE`; the 20th assessment).
     NeedsMode,
+    /// `<mglyph>` or `<malignmark>` in HTML inside SVG or MathML (the 21st
+    /// assessment).
+    Mglyph,
     /// An end tag in HTML inside SVG or MathML of an element open below the
     /// innermost one (the 20th assessment).
     EndOrder,
@@ -1001,6 +1014,18 @@ const START_RULES: &[OpenRule] = &[
     // In a text integration point, `<mglyph>` and `<malignmark>` stay MathML.
     OpenRule::new(&[Top::TextPoint], TagIs::Has(MGLYPH), Closed::Yes, Wrong::None, Stack::Nothing),
     OpenRule::new(&[Top::TextPoint], TagIs::Has(MGLYPH), Closed::No, Wrong::None, Stack::PushSameNs),
+    // Elsewhere in HTML inside SVG or MathML they are HTML elements, but only
+    // if the browser's current element is the one read here: browsers close
+    // HTML elements on their own (a `<p>` at the next `<p>`, an `<a>` at the
+    // next `<a>`, `<li>`, `<option>`...), which is not followed here, so after
+    // `<mi><p><p></p>` a `<p>` is still open here and none for browsers, whose
+    // `<mglyph>` is then MathML, and an `<svg>` in it no SVG (found by the
+    // 21st assessment: a `<p>` there returned browsers to the `<mi>`, where a
+    // self-closed `<script/>` read here as SVG was an HTML script, with the
+    // nonce). These two are the only start tags read differently right inside
+    // a text integration point and inside an HTML element in it. Refused, and
+    // read on as HTML.
+    OpenRule::new(&[Top::Html, Top::HtmlPoint], TagIs::Has(MGLYPH), Closed::Any, Wrong::Mglyph, Stack::Continue),
     // `<annotation-xml>` holds HTML or MathML depending on its `encoding`, which is
     // not followed here; `<svg>` is SVG either way (R19-8). Read on as HTML.
     OpenRule::new(&[Top::AnnotationXml], TagIs::Lacks(SVG_ROOT), Closed::Any, Wrong::AnnotationXml, Stack::Continue),
@@ -1675,6 +1700,10 @@ pub enum InlineCode {
     /// `<foreignObject>` is still open (an error: what follows would be read
     /// as SVG where this tracker reads HTML). The message says which.
     ForeignStructure(String),
+    /// Markup that browsers read one way with scripting on and another with
+    /// it off, or not as written at all (`<noscript>` inside SVG or MathML,
+    /// `<frameset>`). The message says which.
+    ParsedTwoWays(String),
     /// `>` inside a CDATA section in SVG or MathML that is not the end of
     /// `]]>` (an error: where it is a bogus comment, it ends there).
     CdataEnd,
@@ -2002,6 +2031,21 @@ impl HtmlTracker {
         }
     }
 
+    /// Where an end tag written in the template is not one for this tracker:
+    /// in a comment (or CDATA section), an attribute value, between the
+    /// attributes of a tag, in an attribute name and in a tag name (found by
+    /// the 21st assessment: `<noscript><svg><a</noscript>` and `<a </noscript>`
+    /// were a tag name and an attribute here, the end of the `<noscript>` for
+    /// browsers with scripting on).
+    fn end_tag_hidden_here(&self) -> bool {
+        self.in_comment_or_value() || self.in_tag() || self.pending.is_some()
+    }
+
+    /// In element text, where an end tag is read as one.
+    fn in_text(&self) -> bool {
+        matches!(self.state, State::Text) && self.pending.is_none()
+    }
+
     /// In a comment (or CDATA section) or an attribute value.
     fn in_comment_or_value(&self) -> bool {
         matches!(
@@ -2141,16 +2185,52 @@ impl HtmlTracker {
         //    A self-closing start tag read as foreign content (not in an
         //    integration point) opens nothing (WHATWG 13.2.6.5): `<svg><script/>`
         //    opens no script text either (found by the 1.2.1 audit).
-        let foreign_self_closed = !closing
-            && self_closing
-            && matches!(self.open.last().map_or(Top::None, Open::top), Top::Foreign | Top::AnnotationXml);
+        let around = self.open.last().map_or(Top::None, Open::top);
+        let foreign_self_closed = !closing && self_closing && matches!(around, Top::Foreign | Top::AnnotationXml);
+        // Whether a start tag here opens an HTML element: outside SVG and
+        // MathML, in an integration point (`<foreignObject>`, `<desc>`, the SVG
+        // `<title>`, `<mi>`...) and in an HTML element inside one.
+        let html_element = matches!(around, Top::None | Top::Html | Top::HtmlPoint | Top::TextPoint);
         if closing {
             self.open_end(&tag, flags);
         } else {
             self.open_start(&tag, flags, self_closing);
         }
-        // 3. `<noscript>` depth, outside foreign content. Browsers ignore `/>` on
-        //    HTML elements: `<noscript/>` opens one.
+        // 3. `<noscript>`. Browsers with scripting on read one as raw text up to
+        //    the first `</noscript`, and any template or function may be written
+        //    inside one: read as markup here, what it holds must leave this
+        //    tracker where it was at its start tag when that end tag comes. So
+        //    its tags may not be written inside SVG or MathML, where the end tag
+        //    closes an SVG `<noscript>` here (or one in a `<foreignObject>`) and
+        //    the SVG stays open, while for browsers it ends a `<noscript>` around
+        //    the SVG, and with it the SVG (found by the re-attack of the 21st
+        //    assessment's fixes: in `<noscript><svg><noscript></noscript>`, the
+        //    `<script/>` after it was an HTML script with the nonce).
+        if is(NOSCRIPT) && around != Top::None {
+            let slash = if closing { "/" } else { "" };
+            self.found.push((
+                self.here,
+                InlineCode::ParsedTwoWays(format!(
+                    "`<{slash}noscript>` inside `<svg>` or `<math>`: browsers with scripting on read a \
+                     `<noscript>` as raw text up to the first `</noscript>` (any template may be written inside \
+                     one), which would end it, and the SVG or MathML with it, here"
+                )),
+            ));
+        }
+        // `<frameset>`: browsers that take it ignore the tags after it.
+        if is(FRAMESET) && !closing && around == Top::None {
+            self.found.push((
+                self.here,
+                InlineCode::ParsedTwoWays(
+                    "`<frameset>`: browsers ignore every tag after it but `<frame>`, `<frameset>` and \
+                     `<noframes>`, also the start tag of a `<textarea>`, `<title>` or `<script>`, whose text \
+                     they then read as markup where it is checked as text"
+                        .to_string(),
+                ),
+            ));
+        }
+        //    The `<noscript>` depth, outside foreign content. Browsers ignore `/>`
+        //    on HTML elements: `<noscript/>` opens one.
         if !self.in_foreign() && is(NOSCRIPT) {
             if closing {
                 self.noscript = self.noscript.saturating_sub(1);
@@ -2177,10 +2257,14 @@ impl HtmlTracker {
                 )),
             ));
         }
-        // 5. A raw-text element's start tag opens its text (`RAW` in HTML content,
-        //    `RAW_IN_FOREIGN` inside SVG or MathML, unless self-closed there);
-        //    anything else returns to text.
-        let raw = flags & if self.in_foreign() { RAW_IN_FOREIGN } else { RAW } != 0 && !foreign_self_closed;
+        // 5. A raw-text element's start tag opens its text: `RAW` for an HTML
+        //    element, also one inside SVG or MathML (a `<textarea>` in a
+        //    `<foreignObject>` is one for browsers: found by the 21st assessment,
+        //    its text was read as markup here, and `<svg><a </textarea>` in it
+        //    left an SVG open here, none for browsers, whose `<script/>` after it
+        //    was a script); `RAW_IN_FOREIGN` for an SVG or MathML element, unless
+        //    self-closed. Anything else returns to text.
+        let raw = flags & if html_element { RAW } else { RAW_IN_FOREIGN } != 0 && !foreign_self_closed;
         self.state =
             if !closing && raw { State::Raw { tag, flags, escape: 0, js: Js::default() } } else { State::Text };
     }
@@ -2213,6 +2297,10 @@ impl HtmlTracker {
             Wrong::NeedsMode => format!(
                 "`<{tag}>` inside `<svg>` or `<math>`, which browsers read by the HTML around the SVG or MathML \
                  (in a table it may close the cell, and the SVG or MathML with it; elsewhere it is ignored)"
+            ),
+            Wrong::Mglyph => format!(
+                "`<{tag}>` in HTML inside `<svg>` or `<math>`, which browsers read as MathML where they have \
+                 closed the HTML elements before it on their own (a `<p>` at the next `<p>`...)"
             ),
             Wrong::EndOrder => format!(
                 "`</{tag}>` while the HTML element `<{}>` opened after it inside SVG or MathML is still open, \
@@ -2361,8 +2449,8 @@ impl HtmlTracker {
         if self.tail.is_empty() {
             return;
         }
-        let in_comment_or_value = self.in_comment_or_value();
-        let in_text = matches!(self.state, State::Text);
+        let in_comment_or_value = self.end_tag_hidden_here();
+        let in_text = self.in_text();
         let head: String = text.chars().take(16).collect();
         let joined = format!("{}{head}", self.tail).to_ascii_lowercase();
         let split = self.tail.len();
@@ -2462,9 +2550,9 @@ impl HtmlTracker {
 
     /// Whether `when` holds for a match of `len` characters at `i`.
     fn holds(&self, when: When, chars: &[char], i: usize, len: usize) -> bool {
-        let (escape, script) = match &self.state {
-            State::Raw { flags, escape, .. } => (*escape, *flags & SCRIPT != 0),
-            _ => (0, false),
+        let (escape, script, markup_in_foreign) = match &self.state {
+            State::Raw { flags, escape, .. } => (*escape, *flags & SCRIPT != 0, *flags & RAW_IN_FOREIGN != 0),
+            _ => (0, false, false),
         };
         match when {
             When::AtEnd => i + len == chars.len(),
@@ -2473,6 +2561,7 @@ impl HtmlTracker {
             When::SpacesThenEq => chars.get(spaces_end(chars, i)) == Some(&'='),
             When::DashesThenGt => chars.get(dashes_end(chars, i + len)) == Some(&'>'),
             When::InForeign => self.in_foreign(),
+            When::MarkupInForeign => markup_in_foreign,
             When::Script => script,
             When::NotScript => !script,
             When::Escape(n) => escape == n,
@@ -2669,15 +2758,15 @@ impl HtmlTracker {
         while i < chars.len() {
             self.here = offsets[i];
             let ctx = self.ctx();
-            // An end tag hidden from this tracker (`hides`), in any context but a tag name.
-            if ctx != Ctx::TagName && chars[i] == '<' && chars.get(i + 1) == Some(&'/') {
+            // An end tag hidden from this tracker (`hides`), in any context.
+            if chars[i] == '<' && chars.get(i + 1) == Some(&'/') {
                 let name: String = chars[i + 2..]
                     .iter()
                     .take_while(|c| c.is_ascii_alphabetic())
                     .map(|c| c.to_ascii_lowercase())
                     .collect();
-                let in_text = matches!(self.state, State::Text);
-                if is_delim(chars.get(i + 2 + name.len())) && self.hides(self.in_comment_or_value(), in_text, &name) {
+                let in_text = self.in_text();
+                if is_delim(chars.get(i + 2 + name.len())) && self.hides(self.end_tag_hidden_here(), in_text, &name) {
                     self.found.push((offsets[i], InlineCode::HiddenEndTag));
                 }
             }
@@ -2788,7 +2877,7 @@ fn inserted_problem(html: &str, start: &[(&str, Ns)]) -> Option<String> {
     t.feed(html);
     for (_, found) in t.take_inline_code() {
         let what = match found {
-            InlineCode::ForeignStructure(msg) => msg,
+            InlineCode::ForeignStructure(msg) | InlineCode::ParsedTwoWays(msg) => msg,
             InlineCode::ForeignCdata => "markup in a `<script>` or `<style>` of SVG or MathML".to_string(),
             InlineCode::CdataEnd => "`>` inside a CDATA section".to_string(),
             InlineCode::HiddenEndTag => "the end tag of a raw-text element in a comment or attribute".to_string(),
@@ -2876,6 +2965,180 @@ mod tests {
         assert!(found("<svg><script>if (a < b) {}</script></svg>").is_empty());
     }
 
+    /// Found by the 21st assessment: a raw-text element of HTML inside SVG or
+    /// MathML (in a `<foreignObject>`, `<desc>`, the SVG `<title>`, `<mi>`...)
+    /// is one for browsers, so its text is read raw here too. Read as markup,
+    /// `<svg><a </textarea>` in a `<textarea>` left an SVG open here and none
+    /// for browsers, for whom the `<script/>` after it was a script with the
+    /// nonce, and the value in it code.
+    #[test]
+    fn raw_text_elements_of_html_inside_foreign_content_are_raw() {
+        for point in ["<svg><foreignObject>", "<svg><desc>", "<svg><title>", "<svg><foreignObject><div>"]
+            .into_iter()
+            .chain(["<math><mi>", "<math><mo>", "<math><mn>", "<math><ms>", "<math><mtext>", "<math><mi><b>"])
+        {
+            for tag in ["textarea", "title", "xmp", "iframe", "noembed", "noframes"] {
+                assert_eq!(ctx(&format!("{point}<{tag}>")), EchoContext::RawText(tag), "{point} {tag}");
+                // Markup in its text is text, and its end tag ends it.
+                let html = format!("{point}<{tag}><svg><a </{tag}>");
+                assert!(found(&html).is_empty(), "{html}");
+                assert_eq!(ctx(&html), ctx(point), "{html}");
+                // So a `<script/>` after it is an HTML script.
+                assert_eq!(ctx(&format!("{html}<script/>")), EchoContext::Script, "{html}");
+                assert_eq!(ctx(&format!("{point}<{tag}><svg><a</{tag}><script/>")), EchoContext::Script);
+                assert_eq!(ctx(&format!("{point}<{tag}><svg><a x=</{tag}><style/>")), EchoContext::Style);
+            }
+            assert_eq!(ctx(&format!("{point}<plaintext><svg>")), EchoContext::Text, "{point}");
+            assert_eq!(ctx(&format!("{point}<script>")), EchoContext::Script, "{point}");
+            assert_eq!(ctx(&format!("{point}<style>")), EchoContext::Style, "{point}");
+        }
+        // Right inside SVG or MathML they are SVG or MathML elements, whose text is markup.
+        for html in ["<svg><textarea>", "<math><title>", "<svg><g><xmp>", "<math><mi><mglyph><textarea>"] {
+            assert!(matches!(ctx(html), EchoContext::ForeignText(_)), "{html}");
+        }
+        assert_eq!(ctx("<svg><title>"), EchoContext::ForeignText("foreign html"));
+        // The page is read to its end as browsers read it.
+        let mut t = HtmlTracker::default();
+        t.feed("<svg><foreignObject><textarea><svg><a </textarea></foreignObject></svg>");
+        assert!(t.take_inline_code().is_empty());
+        assert!(t.at_top_level());
+    }
+
+    /// Found by the 21st assessment: the end tag of a `<noscript>` (raw text
+    /// for browsers with scripting on) was not watched in a tag name, between
+    /// attributes, in an attribute name or before a value, so
+    /// `<noscript><svg><a</noscript>` left an SVG open here and none for
+    /// browsers. Inside SVG or MathML the same holds for every raw-text element.
+    #[test]
+    fn end_tags_hidden_in_tags_are_refused() {
+        for html in [
+            "<noscript><svg><a</noscript>",
+            "<noscript><svg><a </noscript>",
+            "<noscript><svg><a x</noscript>",
+            "<noscript><svg><a x=</noscript>",
+            "<noscript><a</NoScript >",
+            "<p><a</noscript>",
+            "<svg><foreignObject><noscript><svg><a</noscript>",
+            "<svg><a</textarea>",
+            "<svg><a </title>",
+            "<math><mi><a x=</xmp>",
+        ] {
+            assert!(found(html).contains(&InlineCode::HiddenEndTag), "{html}");
+        }
+        // Split between pieces of literal text.
+        for pieces in [&["<noscript><svg><a</", "noscript>"][..], &["<noscript><svg><a <", "/noscript>"]] {
+            let mut t = HtmlTracker::default();
+            let mut found = Vec::new();
+            for p in pieces {
+                t.feed(p);
+                found.extend(t.take_inline_code());
+            }
+            assert!(found.iter().any(|(_, c)| *c == InlineCode::HiddenEndTag), "{pieces:?}");
+        }
+        // Other end tags there, and these in text, are fine.
+        assert!(found("<p><a</b></a<>").is_empty());
+        assert!(found("<a</textarea>").is_empty());
+        assert!(found("<noscript><p></p></noscript><svg><title>x</title></svg>").is_empty());
+    }
+
+    /// Found by the re-attack of the 21st assessment's fixes: browsers with
+    /// scripting on read a `<noscript>` as raw text up to the first
+    /// `</noscript`, wherever it is. Inside SVG or MathML that end tag closed an
+    /// SVG `<noscript>` here and left the SVG open, none for browsers, for whom
+    /// the `<script/>` after it was an HTML script with the nonce.
+    #[test]
+    fn noscript_inside_foreign_content_is_refused() {
+        let refused = |html: &str| {
+            found(html).iter().any(|c| matches!(c, InlineCode::ParsedTwoWays(m) if m.contains("noscript>` inside")))
+        };
+        for html in [
+            "<noscript><svg><noscript></noscript>",
+            "<svg><noscript>",
+            "<svg><g></noscript>",
+            "<noscript><math><mi></NoScript >",
+            "<svg><foreignObject><noscript>",
+            "<svg><foreignObject><noscript><p></p></noscript>",
+            "<math><mtext><b><noscript/>",
+            "<svg><desc></noscript>",
+        ] {
+            assert!(refused(html), "{html}");
+        }
+        // In inserted `Html` too: the page may be inside a `<noscript>`.
+        for place in ["foreign svg", "foreign math", "foreign html", "foreign mathtext"] {
+            assert!(foreign_insert_problem("<noscript>a</noscript>", place).is_some(), "{place}");
+        }
+        // Outside SVG and MathML it is read as markup, as before; SVG may be
+        // written inside it, closed before its end tag.
+        for html in [
+            "<noscript><p>Enable JavaScript.</p><img src=\"/pixel.gif\" alt=\"\"></noscript>",
+            "<head><noscript><link rel=\"stylesheet\" href=\"/nojs.css\"><style>.js{display:none}</style></noscript></head>",
+            "<noscript><svg viewBox=\"0 0 1 1\"><path d=\"M0 0\"/></svg> off</noscript>",
+            "<noscript><noscript>a</noscript></noscript>",
+            "<table><tr><td><noscript>a</noscript></td></tr></table>",
+        ] {
+            assert!(found(html).is_empty(), "{html}");
+            let mut t = HtmlTracker::default();
+            t.feed(html);
+            assert!(t.at_top_level(), "{html}");
+        }
+        // After the first `</noscript`, where browsers with scripting on are
+        // outside it, this tracker is where it was before the `<noscript>`.
+        assert_eq!(ctx("<noscript><svg><title>a</title></svg></noscript>"), EchoContext::Text);
+        assert_eq!(ctx("<noscript><svg></svg></noscript><script/>"), EchoContext::Script);
+    }
+
+    /// Found by the 21st assessment: browsers that take a `<frameset>` ignore
+    /// the start tag of a `<textarea>` after it and read its text as markup,
+    /// so the `<frame src>` in it took a value checked as the textarea's text.
+    #[test]
+    fn frameset_is_refused() {
+        let refused = |html: &str| {
+            found(html).iter().any(|c| matches!(c, InlineCode::ParsedTwoWays(m) if m.contains("frameset")))
+        };
+        assert!(refused("<frameset><textarea><frame src=\""));
+        assert!(refused("<html><head></head><FRAMESET cols=\"50%,50%\">"));
+        assert!(!refused("<p>frameset</p></frameset><frame-set>"));
+    }
+
+    /// Found by the 21st assessment: browsers close HTML elements on their
+    /// own (a `<p>` at the next `<p>`), which is not followed here, so after
+    /// `<mi><p><p></p>` a `<p>` was open here and none for browsers, for whom
+    /// `<mglyph>` was then MathML and the `<svg>` in it no SVG; a `<p>` in its
+    /// `<foreignObject>` returned them to the `<mi>`, where the `<script/>`
+    /// read here as SVG was an HTML script.
+    #[test]
+    fn mglyph_in_html_inside_foreign_content_is_refused() {
+        let refused = |html: &str| {
+            found(html)
+                .iter()
+                .any(|c| matches!(c, InlineCode::ForeignStructure(m) if m.contains("which browsers read as MathML")))
+        };
+        for html in [
+            "<math><mi><p><p></p><mglyph>",
+            "<math><mi><a href=\"/\"><a href=\"/x\">x</a><mglyph>",
+            "<math><mtext><li><li></li><malignmark>",
+            "<math><mi><p><MGLYPH/>",
+            "<svg><foreignObject><mglyph>",
+            "<svg><desc><b><malignmark>",
+            "<math><mi><svg><title><mglyph>",
+        ] {
+            assert!(refused(html), "{html}");
+        }
+        // In a MathML text element and right inside MathML or SVG they are read as browsers read them.
+        for html in [
+            "<math><mi><mglyph></mglyph></mi></math>",
+            "<math><mtext><malignmark/>x</mtext></math>",
+            "<math><mglyph/></math>",
+            "<svg><mglyph></mglyph></svg>",
+            "<p><mglyph></mglyph></p>",
+        ] {
+            assert!(found(html).is_empty(), "{html}");
+        }
+        let problem = foreign_insert_problem("<mglyph><svg></svg></mglyph>", "foreign html");
+        assert!(problem.is_some_and(|m| m.contains("which browsers read as MathML")));
+        assert!(foreign_insert_problem("<mglyph></mglyph>", "foreign mathtext").is_none());
+    }
+
     /// Found by the 1.0.0 audit: `<svg/>` opens nothing, and `</math>` does
     /// not close an `<svg>` (browsers ignore it), so raw-text elements stay
     /// the same for the tracker and the browser.
@@ -2890,13 +3153,13 @@ mod tests {
     }
 
     /// Found by the 1.0.0 audit: where a browser reads an element's text as raw
-    /// text (`<noscript>` with scripting on, `<xmp>` in `<foreignObject>`), its
+    /// text (`<noscript>` with scripting on, also in a `<foreignObject>`), its
     /// end tag in a comment or attribute value ends it.
     #[test]
     fn end_tags_hidden_in_comments_and_attributes_are_refused() {
         for html in [
             "<noscript><!--</noscript><meta http-equiv=\"refresh\">-->",
-            "<svg><foreignObject><xmp><!--</xmp><a href=\"",
+            "<svg><foreignObject><noscript><!--</noscript><a href=\"",
             "<svg><a title=\"</textarea >\">",
             "<math><!x </title>",
             // Inside `<noscript>`, its end tag in raw text too (found again by the audit).
@@ -2924,7 +3187,8 @@ mod tests {
             &["<noscript><!--</nos", "cript>"],
             &["<noscript><!--</", "no", "script>"],
             &["<noscript><!--<", "/", "noscript>"],
-            &["<svg><foreignObject><xmp><!--</", "x", "mp>"],
+            &["<svg><foreignObject><noscript><!--</", "no", "script>"],
+            &["<svg><!--</", "x", "mp>"],
         ] {
             let mut t = HtmlTracker::default();
             let mut found = Vec::new();

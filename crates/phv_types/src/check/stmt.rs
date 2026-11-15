@@ -477,7 +477,12 @@ impl Checker<'_> {
 
     /// `[$a, $b] = $list;`, `[$first, ...$rest] = $list;` and
     /// `["id" => $id] = $map;` (nested patterns too): the value is kept in a
-    /// hidden variable, and each target is assigned its element.
+    /// hidden variable, and each target is assigned its element. The hidden
+    /// variable is emptied afterwards: it would otherwise share the list or
+    /// map with the variable it came from until the function returns, so that
+    /// every later write to that variable copied it (found by the 21st
+    /// assessment: a loop that destructured a list and then changed it took
+    /// quadratic time), and it would keep a call's result alive as long.
     fn destructure(&mut self, pattern: &Expr, value: &Expr, out: &mut Vec<HStmt>) {
         let h = self.expr(value, None);
         let is_list = matches!(pattern.kind, ExprKind::List(_));
@@ -506,6 +511,12 @@ impl Checker<'_> {
         let name = format!("%d{}", self.cx().locals.len());
         // After an error, the targets get `Type::Error` instead of more errors.
         let ty = if ok { h.ty.clone() } else { Type::Error };
+        let empty = match &ty {
+            Type::List(_) => Some(HExprKind::List(Vec::new())),
+            Type::Map(..) => Some(HExprKind::Map(Vec::new())),
+            _ => None,
+        }
+        .map(|kind| HExpr { kind, ty: ty.clone(), span: pattern.span });
         let id = self.cx().declare(&name, ty, pattern.span);
         self.cx().flow.mark(id);
         out.push(HStmt::Assign(HPlace { base: HPlaceBase::Local(id), path: Vec::new() }, h));
@@ -546,6 +557,9 @@ impl Checker<'_> {
         for (target, kind) in items {
             let value = Expr { kind, span: target.span };
             self.assign(target, AssignOp::Set, &value, out);
+        }
+        if let Some(empty) = empty {
+            out.push(HStmt::Assign(HPlace { base: HPlaceBase::Local(id), path: Vec::new() }, empty));
         }
     }
 

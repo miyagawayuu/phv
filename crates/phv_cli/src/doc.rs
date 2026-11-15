@@ -307,45 +307,175 @@ pub fn collect_modules(paths: &[PathBuf], std: bool) -> Vec<DocModule> {
 
 // ----- Markdown -------------------------------------------------------------
 
-/// A module header's lines, with indented ones (examples) as code blocks.
-fn md_text(text: &str, out: &mut String) {
-    let mut in_code = false;
-    for line in text.lines() {
-        let code = line.starts_with("  ");
-        if code != in_code {
-            if code && !out.ends_with("\n\n") {
-                out.push('\n');
-            }
-            out.push_str(if code { "```phv\n" } else { "```\n\n" });
-            in_code = code;
-        }
-        if code {
-            out.push_str(line.trim_start_matches(' '));
-        } else {
-            out.push_str(&md_escape(line));
-        }
-        out.push('\n');
-    }
-    if in_code {
-        out.push_str("```\n");
+/// A fence for `code`: longer than any run of backticks in it, so that
+/// nothing in the code ends the block.
+fn fence(code: &str) -> String {
+    "`".repeat(longest_backticks(code).max(2) + 1)
+}
+
+fn longest_backticks(s: &str) -> usize {
+    s.split(|c| c != '`').map(str::len).max().unwrap_or(0)
+}
+
+/// `code` as a code span, delimited by more backticks than it has in a row.
+fn code_span(code: &str) -> String {
+    let code = code.replace('\n', " ");
+    match longest_backticks(&code) {
+        0 => format!("`{code}`"),
+        n => format!("{f} {code} {f}", f = "`".repeat(n + 1)),
     }
 }
 
-/// Prose for Markdown: `<` and `&` outside code spans are written as entities,
-/// so a comment cannot add HTML (or lose `<name>` to it) where it is rendered.
-fn md_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for (i, part) in text.split('`').enumerate() {
-        if i > 0 {
-            out.push('`');
+/// A module header's lines, with indented ones (examples) as code blocks.
+fn md_text(text: &str, out: &mut String) {
+    let lines: Vec<&str> = text.lines().collect();
+    let is_code = |l: &str| l.starts_with("  ");
+    let mut i = 0;
+    while i < lines.len() {
+        let mut j = i;
+        while j < lines.len() && is_code(lines[j]) == is_code(lines[i]) {
+            j += 1;
         }
-        if i % 2 == 1 {
-            out.push_str(part);
+        if is_code(lines[i]) {
+            let code: Vec<&str> = lines[i..j].iter().map(|l| l.trim_start_matches(' ')).collect();
+            let code = code.join("\n");
+            let fence = fence(&code);
+            if !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            out.push_str(&format!("{fence}phv\n{code}\n{fence}\n"));
+            if j < lines.len() {
+                out.push('\n');
+            }
         } else {
-            out.push_str(&part.replace('&', "&amp;").replace('<', "&lt;"));
+            out.push_str(&md_escape(&lines[i..j].join("\n")));
+            out.push('\n');
         }
+        i = j;
+    }
+}
+
+/// How far a code span is looked for past its opening backticks.
+const MAX_CODE_SPAN: usize = 4096;
+
+/// Prose for Markdown, so that a comment adds no HTML and no link where it is
+/// rendered, whichever renderer reads it, and keeps its `code` spans (and
+/// the `<name>` in them).
+///
+/// Outside code spans nothing is left that could make a tag, a link, an
+/// image, a link definition, a table or a code span: `<` and `&` are written
+/// as entities, `[`, `]`, `|`, backticks and a backslash before punctuation
+/// get a backslash, and what would make a bare URL or address a link
+/// (`://`, `www.`, `@`) is written with an entity. So the only backticks left
+/// are those of the code spans kept.
+///
+/// A run of backticks opens a code span if a run of the same length closes
+/// it (as in Markdown), on its line or over lines that each start with a
+/// letter. A span is kept as it is unless its text could do harm if a
+/// renderer did not take it for code (`<`, brackets, a URL): such a span is
+/// kept only on one line, with no `|` in it (a table would cut it) and with no
+/// span over several lines before it; otherwise it is written as prose,
+/// backticks included.
+///
+/// 21st assessment: every second piece between backticks was taken for code,
+/// and then, pairing runs as Markdown does, a renderer still paired them
+/// otherwise (a bare URL took the opening backtick with it), so a comment's
+/// `[x](javascript:...)` inside what was taken for code became a link.
+fn md_escape(text: &str) -> String {
+    let b = text.as_bytes();
+    let line_start = |i: usize| text[..i].rfind('\n').map_or(0, |n| n + 1);
+    // Whether the line starting at `i` can only be more text of a paragraph.
+    let plain = |i: usize| text[i..].chars().next().is_some_and(|c| c.is_alphabetic());
+    let run = |i: usize| b[i..].iter().take_while(|c| **c == b'`').count();
+    // The end of the code span that the `n` backticks at `i` open, if one closes it.
+    let close = |i: usize, n: usize| -> Option<usize> {
+        let mut j = i + n;
+        let mut may_cross = plain(line_start(i));
+        while j < b.len() && j - i <= MAX_CODE_SPAN {
+            match b[j] {
+                b'`' => {
+                    let m = run(j);
+                    if m == n {
+                        return Some(j + n);
+                    }
+                    j += m;
+                }
+                b'\n' => {
+                    may_cross = may_cross && plain(j + 1);
+                    if !may_cross {
+                        return None;
+                    }
+                    j += 1;
+                }
+                _ => j += 1,
+            }
+        }
+        None
+    };
+    // Text that would be a tag, a link or a URL if it were not taken for code.
+    let risky = |code: &str| {
+        let lower = code.to_ascii_lowercase();
+        code.contains(['<', '[', ']', '@']) || lower.contains("://") || lower.contains("www.")
+    };
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut crossed = false;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'`' {
+            i = md_prose_char(text, i, &mut out);
+            continue;
+        }
+        let n = run(i);
+        let Some(end) = close(i, n) else {
+            out.push_str(&"\\`".repeat(n));
+            i += n;
+            continue;
+        };
+        let code = &text[i + n..end - n];
+        let one_line = !code.contains('\n');
+        if !risky(code) || (one_line && !crossed && !code.contains('|')) {
+            out.push_str(&text[i..end]);
+            crossed |= !one_line;
+        } else {
+            let mut j = i;
+            while j < end {
+                j = md_prose_char(text, j, &mut out);
+            }
+        }
+        i = end;
     }
     out
+}
+
+/// Writes the character of `text` at `i` as Markdown prose (see `md_escape`); returns where the next one is.
+fn md_prose_char(text: &str, i: usize, out: &mut String) -> usize {
+    let b = text.as_bytes();
+    match b[i] {
+        b'`' => out.push_str("\\`"),
+        b'<' => out.push_str("&lt;"),
+        b'&' => out.push_str("&amp;"),
+        b'[' => out.push_str("\\["),
+        b']' => out.push_str("\\]"),
+        b'|' => out.push_str("\\|"),
+        b'@' => out.push_str("&#64;"),
+        // Before a letter, a digit or a space a backslash is one already.
+        b'\\' if b.get(i + 1).is_none_or(|c| c.is_ascii_punctuation() || *c == b'\n') => out.push_str("\\\\"),
+        b':' if text[i..].starts_with("://") => out.push_str("&#58;"),
+        // `~~~` at the start of a line (also in a list or a quote) opens a code
+        // block, to the end of the page if nothing closes it.
+        b'~' if text[i..].starts_with("~~~") && !text[..i].ends_with('~') => out.push_str("\\~"),
+        b'w' | b'W' if text[i..].get(..4).is_some_and(|w| w.eq_ignore_ascii_case("www.")) => {
+            out.push_str(&text[i..i + 3]);
+            out.push_str("&#46;");
+            return i + 4;
+        }
+        _ => {
+            let c = text[i..].chars().next().unwrap();
+            out.push(c);
+            return i + c.len_utf8();
+        }
+    }
+    i + 1
 }
 
 fn anchor(s: &str) -> String {
@@ -355,16 +485,17 @@ fn anchor(s: &str) -> String {
 pub fn markdown(modules: &[DocModule], title: &str) -> String {
     let mut out = format!("# {title}\n\n");
     for m in modules {
-        out.push_str(&format!("- [{}](#{})\n", m.name, anchor(&m.name)));
+        out.push_str(&format!("- [{}](#{})\n", md_escape(&m.name), anchor(&m.name)));
     }
     for m in modules {
-        out.push_str(&format!("\n## {}\n\n", m.name));
+        out.push_str(&format!("\n## {}\n\n", md_escape(&m.name)));
         if !m.header.is_empty() {
             md_text(&m.header, &mut out);
             out.push('\n');
         }
         for item in &m.items {
-            out.push_str(&format!("### {} {}\n\n```phv\n{}\n```\n\n", item.kind, item.name, item.signature));
+            let fence = fence(&item.signature);
+            out.push_str(&format!("### {} {}\n\n{fence}phv\n{}\n{fence}\n\n", item.kind, item.name, item.signature));
             if !item.doc.is_empty() {
                 out.push_str(&md_escape(&item.doc));
                 out.push_str("\n\n");
@@ -372,7 +503,7 @@ pub fn markdown(modules: &[DocModule], title: &str) -> String {
             for member in &item.members {
                 let doc = md_escape(&member.doc.split_whitespace().collect::<Vec<_>>().join(" "));
                 let sep = if doc.is_empty() { "" } else { " — " };
-                out.push_str(&format!("- `{}`{sep}{doc}\n", member.signature));
+                out.push_str(&format!("- {}{sep}{doc}\n", code_span(&member.signature)));
             }
             if !item.members.is_empty() {
                 out.push('\n');
@@ -513,6 +644,147 @@ mod tests {
         let page = html(&[document("lib.greet", SRC)], "API <x>");
         assert!(page.contains("<title>API &lt;x&gt;</title>"));
         assert!(page.contains("Twice if <code>loud</code>."));
+    }
+
+    /// 21st assessment: every second piece between backticks was taken for
+    /// code where Markdown pairs runs of the same length (after ``` `` ` ``` a
+    /// comment's HTML was written as it was), links were never escaped, and a
+    /// renderer may pair backticks in its own way (a bare URL took the opening
+    /// one with it). Prose is written so that nothing in it is markup, and a
+    /// code span whose text could do harm is kept only where nothing can cut it.
+    #[test]
+    fn markdown_prose_makes_no_markup() {
+        // Unpaired backticks are escaped; what follows is prose.
+        assert_eq!(
+            md_escape("Adds. `` ` <img src=x onerror=mk1> and [a link](javascript:mk1) <b>"),
+            "Adds. \\`\\` \\` &lt;img src=x onerror=mk1> and \\[a link\\](javascript:mk1) &lt;b>"
+        );
+        // The re-attack's comment: the URL is no link, so it cannot take the backtick with it.
+        assert_eq!(
+            md_escape("`` <http://mk1>:`and</p>#{[a](javascript:mk1)<](mk1)\\`"),
+            "\\`\\` &lt;http&#58;//mk1>:`and</p>#{[a](javascript:mk1)<](mk1)\\`"
+        );
+        // Code spans stay as they are, with their `<name>` and brackets, also with longer runs.
+        for kept in [
+            "a `<T>` b",
+            "a ``x ` <y>`` b",
+            "`list<int>` or `$m[\"k\"]`",
+            "\\d \\w and `a\\`",
+            "over `two\nlines` here",
+        ] {
+            assert_eq!(md_escape(kept), kept);
+        }
+        // One whose text could be markup is not kept over lines, after a span over lines, or with a `|`.
+        assert_eq!(md_escape("the `[i18n]\nlocales` setting"), "the \\`\\[i18n\\]\nlocales\\` setting");
+        assert_eq!(md_escape("see `a\nb` and `<T>`"), "see `a\nb` and \\`&lt;T>\\`");
+        assert_eq!(md_escape("x `a | <img>` y"), "x \\`a \\| &lt;img>\\` y");
+        // A span does not go on over a line that could start a block.
+        assert_eq!(md_escape("a ` b\n# <img> ` c"), "a \\` b\n# &lt;img> \\` c");
+        assert_eq!(md_escape("a ` b\n\n<img> ` c"), "a \\` b\n\n&lt;img> \\` c");
+        // Links, images, definitions, autolinks, bare URLs, addresses, tables, entities and escapes.
+        assert_eq!(
+            md_escape("![x](y) [a][b] [c]: d <http://e> \\<f> &amp; \\"),
+            "!\\[x\\](y) \\[a\\]\\[b\\] \\[c\\]: d &lt;http&#58;//e> \\\\&lt;f> &amp;amp; \\\\"
+        );
+        assert_eq!(md_escape("https://a.b/`c WWW.d.e x@y.z a|b"), "https&#58;//a.b/\\`c WWW&#46;d.e x&#64;y.z a\\|b");
+        // A fence of tildes (struck text stays).
+        assert_eq!(md_escape("a\n ~~~ <img>\n> ~~~~x ~~b~~"), "a\n \\~~~ &lt;img>\n> \\~~~~x ~~b~~");
+        // Code blocks and code spans of signatures get fences that their text cannot end.
+        let src = "<?phv\n// Module.\n//\n//   ```\n//   <img src=x onerror=mk1>\n\n/** Doc. */\nexport function f(string $s = \"\n```\n<img src=y onerror=mk1>\"): void {}\n\nexport class C {\n    public function g(string $t = \"`<b>\"): void {}\n}\n";
+        let md = markdown(&[document("lib.<i>m", src)], "API");
+        assert!(md.contains("````phv\n```\n<img src=x onerror=mk1>\n````\n"), "{md}");
+        assert!(md.contains("\n````phv\nfunction f(string $s = \""), "{md}");
+        assert!(md.contains("- `` public function g(string $t = \"`<b>\"): void ``\n"), "{md}");
+        assert!(md.contains("- [lib.&lt;i>m](#libim)\n") && md.contains("\n## lib.&lt;i>m\n"), "{md}");
+    }
+
+    /// Whatever a comment holds, the only backticks left unescaped in its
+    /// prose are those of code spans on one line (or over plain lines), and no
+    /// `<`, `[`, `]`, `|`, `@`, `://` or `www.` is outside them.
+    #[test]
+    fn markdown_prose_of_generated_comments_makes_no_markup() {
+        let pieces = [
+            "`",
+            "``",
+            "```",
+            "<",
+            ">",
+            "[",
+            "]",
+            "(",
+            ")",
+            "|",
+            "\\",
+            "&",
+            "@",
+            ":",
+            "//",
+            "http://mk1",
+            "www.mk1.x",
+            "javascript:mk1",
+            "<img src=x onerror=mk1>",
+            "</p>",
+            "<!--",
+            "mk1",
+            " ",
+            "\n",
+            "\n\n",
+            "# ",
+            "- ",
+            "a",
+            "!",
+            "&lt;",
+            "&#96;",
+            "*",
+            "_",
+            "~~",
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            let n = 1 + next() % 14;
+            let text: String = (0..n).map(|_| pieces[(next() % pieces.len() as u64) as usize]).collect();
+            let out = md_escape(&text);
+            // Take the kept code spans out (each ends at the next run of its length), then look at the rest.
+            let b = out.as_bytes();
+            let (mut prose, mut i) = (String::new(), 0);
+            while i < b.len() {
+                if b[i] == b'\\' && i + 1 < b.len() {
+                    // An escaped character is text.
+                    prose.push('x');
+                    i += 1 + out[i + 1..].chars().next().unwrap().len_utf8();
+                } else if b[i] == b'`' {
+                    let n = b[i..].iter().take_while(|c| **c == b'`').count();
+                    let mut j = i + n;
+                    let end = loop {
+                        assert!(j < b.len(), "an unpaired backtick in {out:?} (from {text:?})");
+                        let m = b[j..].iter().take_while(|c| **c == b'`').count();
+                        if m == n {
+                            break j + n;
+                        }
+                        j += m.max(1);
+                    };
+                    let code = &out[i + n..end - n];
+                    let lower = code.to_ascii_lowercase();
+                    let risky = code.contains(['<', '[', ']', '@']) || lower.contains("://") || lower.contains("www.");
+                    assert!(!risky || !code.contains(['\n', '|']), "{out:?} (from {text:?})");
+                    prose.push('x');
+                    i = end;
+                } else {
+                    let c = out[i..].chars().next().unwrap();
+                    prose.push(c);
+                    i += c.len_utf8();
+                }
+            }
+            let lower = prose.to_ascii_lowercase();
+            let markup = prose.contains(['<', '@', '[', ']', '|']) || lower.contains("://") || lower.contains("www.");
+            assert!(!markup, "{out:?} (from {text:?})");
+        }
     }
 
     /// docs/stdlib.md is `phv doc --std --format md --title "PHV standard library"`;

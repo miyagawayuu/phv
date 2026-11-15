@@ -2,10 +2,10 @@
 
 English | [日本語](security-audit.ja.md)
 
-This report consolidates twenty-one audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
-§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, §24 an assessment of the whole implementation before 1.1.0, §25 an assessment of the whole implementation before 1.1.1, §26 an assessment of the whole implementation before 1.2.0, §27 an assessment of the whole implementation of the 1.2.0 release candidate, §28 an assessment of the whole implementation before 1.2.1, §29 an assessment of the whole implementation before 1.3.0, §30 an independent review of the 1.3.2 candidate, and §31 an assessment of the whole implementation before 1.3.2.
+This report consolidates twenty-two audits. §1–§6 cover the first audit (and the resolution of its residual risks), §7 covers the second vulnerability assessment,
+§8 covers the parts excluded from the second assessment (`phv lsp`, `phv migrate`, bytecode cache), §9 covers what was added up to v0.4.0, §10 the follow-up on the residual risks, §11 what was added for v0.5.0, §12 the follow-up on its residual risks, §13 what was added for v0.5.2, §14 what was added for v0.6.0, §15 what was added for v0.7.0, §16 the follow-up on compressing proxies (v0.7.1), §17 what was added for v0.8.0, §18 what was added for v0.9.0, §19 and §20 the follow-up on two outside reviews of v0.9.0 (v0.9.1), §21 an assessment of the whole implementation before the work on 1.0, §22 an assessment of the whole implementation before 1.0.0, §23 an assessment of the whole implementation after the processing work, §24 an assessment of the whole implementation before 1.1.0, §25 an assessment of the whole implementation before 1.1.1, §26 an assessment of the whole implementation before 1.2.0, §27 an assessment of the whole implementation of the 1.2.0 release candidate, §28 an assessment of the whole implementation before 1.2.1, §29 an assessment of the whole implementation before 1.3.0, §30 an independent review of the 1.3.2 candidate, §31 an assessment of the whole implementation before 1.3.2, and §32 an assessment of the whole implementation before 1.3.3.
 
-Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§25: 2026-11-06, §26–§27: 2026-11-07, §28: 2026-11-08, §29: 2026-11-09, §30: 2026-11-10, §31: 2026-11-11)
+Date: 2026-11-02 (§9–§13: 2026-11-03, §14–§19: 2026-11-04, §20–§22: 2026-11-05, §23–§25: 2026-11-06, §26–§27: 2026-11-07, §28: 2026-11-08, §29: 2026-11-09, §30: 2026-11-10, §31: 2026-11-11, §32: 2026-11-15)
 Scope: All crates of the PHV implementation (parser, type checker, compiler, VM, JIT, standard library, web server, CLI tools)
 
 ## 1. Method
@@ -2370,3 +2370,183 @@ Regression tests are named after what they check, in each crate's tests and in `
 - `admin.rs`: `connections_sending_only_empty_lines_do_not_keep_probes_out`; `http.rs`:
   `a_pages_own_vary_fields_are_all_kept`, `a_buffered_page_asked_with_a_cookie_is_private`;
   `packaging/test_licenses.py`, `bench/test_compare_php.py`.
+
+## 32. Twenty-first Assessment: the Whole Implementation (before 1.3.3)
+
+Date: 2026-11-11 to 2026-11-15. Scope: everything at 3763a7d, the 1.3.3 candidate: 1.3.2 as released, and the four
+performance commits after it (objects left in a returning call's registers, a cheaper drop of a value and register
+windows of native code reused between calls, a stale slot emptied only when a flag says it holds a value, generator
+state written without a drop call), none of which had been attacked. Every earlier fix was attacked again.
+
+Ten reviewers each took one area, as in §31: the web server; the standard library, its clients and `std.orm`; the JIT
+and the VM's data operations; generators and exceptions; templates and the tracker; the tools, CI and the supply
+chain; jobs and the stores; sign-in and tokens; the running system as a whole; `std.image` and `std.i18n`. They
+attacked a release build locally, with fake identity providers, PostgreSQL 17, MySQL 8.4 and Redis 7 in Docker, and
+Chrome 157 and parse5 for templates; each finding was confirmed with a PoC and run against the released 1.3.2 too.
+Four reviewers found R24-4 independently. The JIT and the VM were compared with each other and with 1.3.2 on about
+37,000 random programs, generators on about 28,300 programs under up to ten configurations, the image decoders
+fuzzed with about 3.2 million inputs, templates with about 16,800 generated pages against parse5, and the running
+server checked over about 2.2 million mixed requests with every body compared: no request saw another's data and
+none of the new code gave a wrong result or a crash. Groups then fixed every finding with regression tests. Two
+rounds of re-attack of the code the fixes added followed (three reviewers, then one reviewer and the lead); they
+found R24-3, R24-9, R24-19, R24-22 to R24-24, R24-28, R24-29, R24-32, R24-36 and R24-37, which were fixed and checked
+in turn.
+
+### Summary of Results
+
+| Severity | Count | Fix |
+|---|---:|---|
+| Critical | 0 | — |
+| High | 3 | Fixed (one found by the re-attack) |
+| Medium | 12 | Fixed (one a regression of the candidate, one made by a first fix and found by the re-attack) |
+| Low | 22 | Fixed or narrowed (see the residual risks) |
+| Info | 9 | Fixed or documented |
+
+### High
+
+| # | Finding | Fix |
+|---|---|---|
+| R24-1 | A raw-text or RCDATA element of HTML inside an SVG or MathML integration point (`<textarea>`, `<title>`, `<xmp>`, `<iframe>`, `<noembed>` in a `<foreignObject>`, `<desc>`, SVG `<title>` or `<mi>`…`<mtext>`) was not raw text to the tracker, which chose by whether it was in foreign content: in `<svg><foreignObject><textarea><svg><a </textarea>`, an SVG stayed open for the tracker and none for a browser, whose next self-closed `<script/>` got the page's nonce and ran a visitor's escaped value (Chrome 157); also in 1.3.2 | The raw-text decision is made by the namespace of the element just opened; an end tag hidden in a tag name, between attributes or in an attribute name is watched; the same in inserted `Html` |
+| R24-2 | `<mglyph>` or `<malignmark>` after `<mi><p><p></p>` is MathML for a browser (which closed the `<p>`) and HTML for the tracker (which never closes elements implicitly): the `<svg>` under it opened real SVG whose `<script/>` ran a visitor's value; also in 1.3.2 | `<mglyph>` and `<malignmark>` are refused in HTML inside SVG or MathML, where the tracker cannot know the browser's current element; they stay valid directly in a text integration point and in MathML |
+| R24-3 | Found by the re-attack: `<noscript>` is raw text to browsers with scripting on, markup to the tracker: in `<noscript><svg><noscript></noscript><script/>…`, the first `</noscript>` ended the outer one and the SVG for a browser, and the `<script/>` was an HTML script with the nonce (Chrome 157, parse5); also in 1.3.2 | `<noscript>` and `</noscript>` are refused inside SVG and MathML, in every template and in inserted `Html`; with end tags already watched in comments, values, raw text and tags, the first `</noscript` always finds the tracker where it was before the `<noscript>`. Values in a `<noscript>` are escaped as anywhere, so none can carry `</noscript` (checked in Chrome) |
+
+### Medium
+
+| # | Finding | Fix |
+|---|---|---|
+| R24-4 | The candidate's 40b9d91 left objects in a returning call's registers; an object left there kept the list, map or string it held shared, so a helper that wrapped the caller's list in an object (`new Box($xs)`) made the caller's next append copy all of it: R23-18 again (40,000 passes 5–16 seconds against 0.04; one 30-byte request held a worker for 18 seconds and `n=80000` reached the time limit). Not in 1.3.2 | The change was reverted: a returning call lets go of objects again, as in 1.3.2. The loops take 0.02 seconds |
+| R24-5 | The time limit was looked at on loop steps and calls only; the way back out of a recursion runs neither, and each return may be followed by an instruction over a value as large as memory allows: `return back($s, $n - 1) . $s;` 9,900 deep ran 27 seconds under a 2-second limit, and 395 under 20 with 1 GB of memory (one worker held, 27 later requests answered 503); also in 1.3.2 | An instruction that goes over 64 KB reads the clock, and joins add up; past the deadline the interpreter leaves the run where it is (it unwinds to where Rust entered the VM: no `catch` or `finally` of the script runs, and never through native frames), and native code returns the time limit's error. The same requests end after 2.0 seconds. A join whose first operand is its own is also appended in place, so that recursion now takes 0.1 seconds |
+| R24-6 | With `rate_limit_store`, every key of `rate_limit()` was a Redis hash kept for its window (up to a day) and nothing bounded their number: a visitor of a page that limits by a name the visitor types added a key per request (20,507 in 100 seconds) until Redis was full, when sessions, jobs and every limit failed; also in 1.3.2 | A site keeps at most 100,000 keys, in three sorted sets under `phv:ratelimits:<namespace>:` (by expiry, not limited by first hit, limited); see R24-9 for which key gives way |
+| R24-7 | The shared rate limit numbered its window by each server's clock and started the count again when the stored number was another: two servers 20 seconds apart allowed 193 of 193 hits of a limit of 3 a minute; also in 1.3.2 | The window is numbered, and the time to wait told, by the Redis server's clock (`TIME` in the script) |
+| R24-8 | `file_append()` opened the file for writing and moved to its end once, so two scripts, jobs or processes appending at once wrote over each other: 2,180 of 4,000 log lines whole, 684 cut; also in 1.3.2 | The file is opened for appending (`O_APPEND`, `FILE_APPEND_DATA`), every other check as before: 4,000 of 4,000 lines |
+| R24-9 | Found by the re-attack, in R24-6's first fix: at the bound a new key took the place of the newest limited key when every key was limited, so a visitor who filled a site with 100,000 limited keys (500,000 requests in 100 seconds) could reach the limit on a key, send one hit with a fresh key and have the limit back: 205 guesses in 247 requests against 5 a day | A limited key is never given up in Redis before its window ends; a new key takes the place of the key that has gone longest without reaching its limit, and while every key is limited new keys are counted in the server process (bounded, refusing none) until there is room. The process's own table gives up limited keys only when fewer than a tenth are not limited, those whose window ends soonest first (this replaces R21-1's newest-first rule): about 90,000 keys taken to their limit per limit lifted. The same attack: 5 guesses in 247 requests |
+| R24-10 | Found by the re-attack: on Windows the file functions opened by path under a held directory, so an empty subdirectory given a junction's reparse point in place sent reads, writes and appends to the junction's target (36,592 bytes appended outside, a file read 3,038 times and overwritten); needs a local process that can write in the permitted directory; also in 1.3.2 | Every entry is opened, created, listed, moved and deleted relative to its directory's handle (`NtCreateFile` with a root directory, the entry itself and not what it links to); a directory that became a link refuses. Linux and macOS already worked relative to the directory's descriptor |
+| R24-11 | `phv fmt` indented every line by each bracket still open and lexed the whole text again for each level it broke: 700 KB of `$a = [` lines took 5.5 GB in a second (4 GB in the language server), 1,600 nested brackets a minute, a 71 KB program that compiles became a 22 MB file that could not be read again; also in 1.3.2 | The lines are lexed once; a file with more than 500 brackets and blocks open at once, whose formatted text would pass 8 MB, or that needs too much work, is refused and left as it is (an error answer in the language server). No file of the repository formats differently |
+| R24-12 | Each call held a copy of the default value of every argument it left out, counted nowhere: 20,000 calls of a function with 40,000 defaulted parameters (750 KB) passed 3 GB in 5 seconds in `phv check` and the language server; also in 1.3.2 | The arguments left out are counted for all calls of a program (1,000,000); past that the program is refused |
+| R24-13 | Every diagnostic was kept with the names of types and members in full, and names had no length limit: 20,000 errors naming a class with a 1 MB name passed 3 GB in a second; also in 1.3.2 | A name has at most 255 bytes; a message is cut at 2,000 bytes; after 1,000 errors and 1,000 warnings only the start of a message is kept; lists of missing members name five and count the rest |
+| R24-14 | A union type inferred from values could have 10,000 members (a written one has 256), and one union was fitted to another member by member: a 203 KB file took 169 seconds, and the language server answered nothing meanwhile; also in 1.3.2 | An inferred union is as wide as a written one may be (an error past 256 members), and members are found by their place |
+| R24-15 | A way around R23-4: the traits of one `use` were looked for among those before them one by one: a class using 160,000 empty traits took a minute; also in 1.3.2 | A set of the traits used |
+
+### Low
+
+| # | Finding | Fix |
+|---|---|---|
+| R24-16 | For the same reason as R24-4, an object graph built by a returned call stayed alive in its dead register: a script that loaded a report twice ran out of its 128 MB where 1.3.2 did not. Not in 1.3.2 | As R24-4 |
+| R24-17 | Reading an element of a property (`$x = $o->xs[0]`) or comparing a string property left the copy in a temporary register, so the next `$o->xs[] = …` copied all of it (40,000 passes 4–12 seconds in both engines); also in 1.3.2 | Covered by R24-19's rule; native code reads the element or compares the string through the property without copying it (two to three times as fast as before) |
+| R24-18 | Around R23-19: native code left a list in the slot of a register it reused for a nullable number (`$m[$k] ?? 1`, a `?int` property), so every later element write copied the list (30 seconds natively against 0.02 interpreted); also in 1.3.2 | Every kind native code keeps in a machine register, nullable numbers and `null` included, empties its slot's stale value |
+| R24-19 | Found by the re-attack: a value read into a temporary register and used once stayed there until an instruction happened to reuse the register: the object a call returned as the receiver of a property read (`view($rows)->title`), the operand of `??`, `?:`, `match`, `?->`, `instanceof`, a comparison, `echo`, `foreach`, `(string)`; the object held the caller's list, which the next append copied (40,000 passes 4–13 seconds); also in 1.3.2 | The compiler lets no temporary keep a string, collection, object or closure past the expression or statement it was made for: the value is read into its result's register, moved out by the instruction that uses it, or emptied when the temporary is given back; native code takes it out of its slot in the same call. 0.01 seconds |
+| R24-20 | Destructuring kept its value in a hidden variable, so the list stayed shared and every later write copied it (80,000 passes 37 seconds); also in 1.3.2 | The hidden variable is emptied once the targets are assigned: 0.01 seconds |
+| R24-21 | `$s = $s . $x;` and `$s = "{$s}…";` built a new string every pass (200,000 passes 48 seconds, `.=` 0.04), and a closure's captured value stayed in the register it was staged in (14 seconds); also in 1.3.2 | Both forms on a `string` variable append in place; staged captures are let go once the closure has its own: 14 ms and 9 ms |
+| R24-22 | Found by the re-attack, in R24-21's first fix: `$s = $s . $a . $b` joined what it appends into a temporary first, so a 60 MB string built from two of 30 MB no longer fitted in 128 MB. Not in 1.3.2 | The items are staged, `$s` is moved in front of them and the join adds them to it in a buffer grown once: the same peak memory as 1.3.2 |
+| R24-23 | Found by the re-attack, around R24-5's first fix: the deadline was acted on only when the frame of a long instruction returned, never in a generator's frame or the script's own, and never for operations under 64 KB: 8,000 top-level statements joining 8–32 MB ran 15 seconds under 1, and 3,000 joins of 62 KB on each of 9,900 returns 50 seconds under 2 without any error; also in 1.3.2 | The final form of R24-5: the run is left at the long instruction itself, and shorter joins add up. The three programs end after 1.0–2.2 seconds in both engines |
+| R24-24 | Found by the second re-attack: native code added only operations of 4 KB or more to that sum, so 3,000 comparisons of 4,000-byte strings on each of 9,900 returns ran 1.9 seconds under a 0.3-second limit and gave their result; also in 1.3.2 | Every operation of native code adds up, and short map keys too: 0.6 seconds, with the time limit's error |
+| R24-25 | On MySQL only a statement's own words were read: `ROLLBACK` through `PREPARE … FROM`/`EXECUTE` or a procedure ended the transaction of `transaction()`, which returned as if it had committed while std.orm kept what it had written (a lost update), and a procedure whose body is `XA PREPARE` prepared a transaction that outlived the script with its locks; also in 1.3.2 | The server reports the transaction's state and characteristics with each reply (`session_track_transaction_info`), so its end is seen whatever the text, also a procedure that ends one transaction and begins another; statements that keep another to run later may hold no `XA`; a script's own XA transaction is rolled back when it is done with the connection; `LOAD XML LOCAL` is refused |
+| R24-26 | `Mail` checked its 10 MB cap on the finished message, after four copies of each text (110 MB of text took 841 MB under 128), and did not count addresses (a 50 MB reply-to took 317 MB, and an error echoed a 40 MB recipient); also in 1.3.2 | The size is worked out before anything is built and what is built is reserved; addresses over 254 bytes and subjects over 998 are refused; messages show at most 64 characters of a value |
+| R24-27 | `HttpClient` read 16 MB whatever memory was left and held a chunk twice and its text at up to three times the size (84 MB under a 16 MB limit); background requests without a length took 523 MB under 128; also in 1.3.2 | A body is at most a third of the memory left (a background one a fortieth), at most 16 MB; a body of unknown size takes its allowance once instead of doubling; the text is made and bounded where the body is |
+| R24-28 | Found by the re-attack, in R24-29's first fix: with a time limit of a second every wait for a store that hangs was "cut by the caller's deadline", so the store was never marked as failed and 20 of 20 requests waited out their limit | Three such waits in a row with no answer between them, a second or more in all, mark the store as failed |
+| R24-29 | A request that reached its own time limit while `rate_limit()` waited for Redis counted as a failure of the store, which is then not asked for 5 seconds: requests timed to end there made another visitor's `rate_limit()` refuse 159 of 187 times; also in 1.3.2 | A wait that its caller's deadline cut short does not mark the store as failed (with R24-28) |
+| R24-30 | On MySQL a job's payload was read inside the transaction that chose it, through a connection that takes 8 MB: a 9 MB row put there by another writer of the database stayed first in line and no job of the site ran any more; a Redis job whose name was over the reply's 32 MB did the same (found by the re-attack); also in 1.3.2 | MySQL leases a job before it reads it; in every store a payload over 1 MB or a name over 64 bytes is given up as failed with an error that says so, and the next job runs |
+| R24-31 | On Windows, `Database::open()` of a SQLite file other requests were writing to failed at random (a journal being deleted could not be opened, or had no link left): 54 of 12,000 opens; also in 1.3.2 | A journal being deleted counts as missing; one with a second hard link is still refused: 0 of 13,000 |
+| R24-32 | Found by the re-attack: a name that was a hard link to a file elsewhere when opened, and removed right after, left the count at one: 3–199 of 80,000 appends landed in the other file; also in 1.3.2 | On Windows the file's links are read with their directories in one answer and must be the one name here; on Unix the name is looked at again after the open (narrower, see the residual risks) |
+| R24-33 | A constructor's promoted parameters and assignments were searched as lists: 65,000 promoted parameters took 10 seconds; also in 1.3.2 | Sets: 0.1 seconds |
+| R24-34 | `phv doc --format md` took every second piece between backticks for code, where Markdown pairs runs of equal length, and never escaped links: a comment's `<img onerror=…>` and `[x](javascript:…)` reached the rendered page; pairing as Markdown does was not enough either (the re-attack: a bare URL's autolink took a backtick); also in 1.3.2 | Prose is written so that nothing in it is markup whatever a renderer pairs (entities for `<` and `&`, escaped brackets, pipes, backticks and tildes, bare URLs broken with an entity); a risky code span is kept only on one line. 30,000 generated comments rendered by marked in four dialects make no tag or link |
+| R24-35 | The language server looked for a project's files until it had found 300, however many folders that took, and a document with no `phv.toml` above it has its own folder for a project: with `C:\x.phv` open each workspace-symbol request read the whole drive (40 seconds), and a rename in a project of more than 300 files changed only the first 300; also in 1.3.2 | The walk reads at most 5,000 folders 32 deep below a `phv.toml`, 200 folders 4 deep below a document without one, nothing at a drive's root; a rename that could not look at every file is refused |
+| R24-36 | A discovery document's endpoints written `localhost.`, `[::ffff:127.0.0.1]`, `[::1%1]`, `0.0.0.0`, the old IPv4 forms (`127.1`) or a name resolving to loopback were not taken as this machine for a remote issuer (the loopback listener received the code and the client secret with `tls = false`); also in 1.3.2 | Zones and older IPv4 forms are read, issuer and endpoint by the same notion of "this machine", and an endpoint a remote issuer named is refused when its name leads to this machine at request time |
+| R24-37 | Found by the re-attack: after a `<frameset>` browsers ignore the start tag of a `<textarea>`, `<title>` or `<script>` and read its text as markup, which the tracker checked as text (parse5); also in 1.3.2 | `<frameset>` is refused |
+
+### Info
+
+| # | Finding | Fix |
+|---|---|---|
+| R24-38 | `Content_Length`, `Content.Length`, `Transfer_Encoding` and `Proxy_Authorization` passed the check of headers PHV sets; `LOAD XML LOCAL INFILE` was not refused; the specification said names with `~` are refused (only an alias of a file's name is) | `_`, `.` and runs of them count as `-` for those names; `LOAD XML LOCAL` is refused; the specification says what the code does |
+| R24-39 | A `csrf_token()` made before `session()->regenerate()` in the same response never verified | A CSRF cookie the response itself made is kept, so its token stays valid; for a visitor who came with one the order is documented (the old cookie must go). 120 orders in every store: no token from before a sign-in works after it |
+| R24-40 | `json_decode` and the token parsers read `012` as 12 | Numbers are read as RFC 8259 writes them |
+| R24-41 | The language server took URIs as long as a message and looked for a document not on disk again on every request, in every folder above it (half a minute per request for one 30,000 folders deep) | A URI has at most 100,000 bytes and 256 folders; what was found when a document was opened is kept |
+| R24-42 | `bench/lsp.py` started a bare `git`, which Windows looks for in the current folder first | Looked for in the absolute folders of `PATH` |
+| R24-43 | `packaging/licenses.py` walked into a junction inside a crate | Linked folders are not walked; each file must be inside the crate |
+| R24-44 | 29 crates in `Cargo.lock` (the lock 1.3.2 shipped) were less than 14 days old | None is yanked, all checksums equal the index, and the release is tagged once all are 14 days old |
+| R24-45 | Nine WebP inputs out of 2 million make a decoder panic | Every decoder and encoder runs inside `catch_unwind` (R22-33): each became a catchable `ValueError` in `phv run` and `phv serve`, the server went on |
+| R24-46 | A generator that yields its own growing list copies it at every step (the consumer's variable keeps the last value) | As in PHP's copy-on-write; written down |
+
+### Residual Risks
+
+- Code without loops or calls whose instructions each go over less than 64 KB and are not joins, comparisons or map
+  keys is stopped only at its next loop step or call: 3,000 copies of 60 KB per return of a 9,900-deep recursion
+  ran 55 seconds, and 3,000 `<` of 60 KB strings 26 seconds, under a 2-second limit. The bound is statements per
+  function × the call depth (10,000) × 64 KB. Closing it costs about 5% on a benchmark row.
+- SQLite opens its database file by path (checked before and after); the file session store renames and lists its
+  configured directory by path.
+- On Unix, a hard link made to an outside file between the open and the second look still lets one append through;
+  it needs a process that may link the file.
+- While every rate-limit key of a site is at its limit, new keys are counted per server process; a count kept there
+  restarts in Redis once there is room (at most twice the limit in that window). A limit in the process's own table
+  is lost early only after about 90,000 later limits.
+- A procedure made outside PHV that prepares an XA transaction the script did not start can still outlive it; an XA
+  started through `executeAsync()` is not tracked.
+- Decoders cannot be interrupted: one upload under the default limits held a worker about 1.5 seconds on the
+  assessment's machine (§29).
+- During a rolling upgrade, 1.3.2 servers number rate-limit windows by their own clocks.
+- §31's residual risks remain. HTTP/2 over TLS, Firefox and Safari were not run.
+
+### Verification
+
+The PoCs were run again against the fixed release build (before → after):
+- the template breakouts (R24-1 to R24-3, R24-37) in Chrome 157: the visitor's script ran → refused at check or at
+  run time; generated pages compared with parse5 with scripting on and off: 242 dangerous of 1,000 → 0 of 30,600;
+- `new Box($xs)` in a helper, 40,000 passes: 5–16 seconds → 0.02; the report loaded twice: out of memory → fits;
+- the way back out of a recursion under a 2-second limit: 27 and 50 seconds → 2.0–2.2; 8,000 top-level joins under
+  1: 15 seconds → 1.1; short native comparisons under 0.3: 1.9 seconds with a result → 0.6 with the error;
+- shared rate limits: unbounded keys → 100,000; 193 of 193 hits allowed across clocks → 3 per window; the eviction
+  attack: 205 guesses in 247 → 5; a hung store with a 1-second limit: 20 of 20 waited → 3;
+- `file_append()` from 16 clients: 2,180 of 4,000 lines whole → 4,000; the junction race on Windows: 36,592 bytes
+  written outside → none in three runs of each operation;
+- the formatter, checker and language server shapes: up to 5.5 GB or 382 seconds → refused or under 3 seconds;
+- MySQL's indirect `ROLLBACK` and `XA PREPARE`: a lost update and a prepared transaction outliving the script →
+  `transaction()` throws, the procedure is refused; `Mail` and `HttpClient`: 841 and 84 MB → 120 and 8 MB;
+- the time limit reached in straight-line code at the top level, in a generator, in `map` and `sortBy` callbacks,
+  in a constructor, below a native frame, JIT on and off: each ended with the uncatchable error after 2.1 seconds
+  with no `finally` run; 192 such pages mixed with 768 normal ones on the same server workers, JIT on and off:
+  every slow page the error page within 1.03 seconds, every normal body as expected.
+
+The differential fuzzers of the JIT, the VM and generators ran about 7,700 more programs four ways against the
+final build without a difference. All tests passed on Windows against PostgreSQL 17, MySQL 8.4 and Redis 7 after
+the fixes of the first re-attack, and again after the last ones (three tests of local TLS and connections fail on
+the assessment's machine also at 3763a7d: its security software inspects local traffic), with clippy
+(`-D warnings`) and rustfmt; CI runs them on Linux, Windows and macOS. The benchmarks of `bench/` against 1.3.2
+(`bench/results/v1.3.3-windows-x64.json` against `7fdda41.json`): every row 0.77–0.97 of 1.3.2's but the
+interpreter's Mandelbrot (1.03); against the candidate 3763a7d every row is within the noise of two builds of the
+same source except `escape()` 200k, about 6% slower in both modes (its own path did not change; not found).
+
+### Regression tests
+
+Regression tests are named after what they check, in each crate's tests and in `tests/cases` and `tests/db`
+(`err_svg_html_raw_text`, `err_html_end_tag_in_tag`, `err_svg_html_mglyph`, `err_html_noscript_in_svg`,
+`err_html_frameset`, `element_of_property`, `self_concat`, `mysql_tx_indirect`). Some of the others:
+- `linear.rs`: `growing_a_value_a_helper_put_in_an_object_takes_linear_time`, `what_a_returned_call_built_is_freed`,
+  `growing_a_property_after_reading_an_element_of_it_takes_linear_time`,
+  `growing_a_value_after_using_a_temporary_that_held_it_takes_linear_time`,
+  `changing_a_value_after_destructuring_it_takes_linear_time`; `jit.rs`:
+  `nullable_numbers_written_over_lists_let_them_go`; `unwind_time_limit.rs`:
+  `the_way_back_out_of_a_recursion_stops_at_the_time_limit`, `straight_line_code_stops_at_the_time_limit`,
+  `short_comparisons_on_the_way_back_add_up_in_native_code`; `self_concat.rs`:
+  `joining_several_strings_to_a_string_needs_no_more_memory_than_before`;
+- `htmlctx.rs`: `raw_text_elements_of_html_inside_foreign_content_are_raw`, `end_tags_hidden_in_tags_are_refused`,
+  `mglyph_in_html_inside_foreign_content_is_refused`, `noscript_inside_foreign_content_is_refused`,
+  `frameset_is_refused`;
+- `netdb::ratelimit`: `the_shared_store_keeps_within_its_bound_and_keeps_limited_keys`,
+  `hits_share_the_window_of_the_stores_clock`, `a_store_that_hangs_is_found_out_by_callers_with_little_time`;
+  `ratelimit`: `a_limit_reached_in_a_full_table_is_not_given_up_for_new_keys`; `netdb::jobs_run`:
+  `a_job_too_large_to_read_is_given_up_and_the_queue_goes_on`,
+  `a_redis_job_with_a_name_or_id_too_long_to_read_does_not_stop_the_queue`;
+- `safefs`: `appends_made_at_once_are_whole`, `a_directory_turned_into_a_junction_does_not_lead_outside`,
+  `a_directory_swapped_for_a_symlink_does_not_lead_outside`, `a_hard_link_removed_after_the_open_is_still_refused`;
+  `sqlite_open_race.rs`: `opening_a_database_others_write_to_does_not_fail`,
+  `a_hard_linked_journal_or_database_is_still_refused`;
+- `phv_std`: `the_mysql_transaction_state_tells_when_a_transaction_ended`,
+  `endpoints_on_this_machine_are_seen_in_every_spelling`, `a_message_past_the_cap_is_refused_before_it_is_built`,
+  `numbers_with_leading_zeros_are_refused`, `a_token_made_for_a_new_cookie_survives_regenerate`; `http.rs`:
+  `a_response_body_is_bounded_by_the_memory_left`;
+- `format.rs`: `deep_nesting_is_refused`, `output_larger_than_a_source_file_is_refused`; `compile_cost.rs`:
+  `defaults_of_arguments_left_out_are_counted`, `diagnostics_are_bounded`,
+  `unions_are_no_wider_than_written_ones_and_fit_at_once`, `many_traits_used_by_one_class_check_at_once`; `doc.rs`:
+  `markdown_prose_makes_no_markup`; `lsp.rs`: `refuses_long_and_deep_uris`, `project_walks_are_bounded`.

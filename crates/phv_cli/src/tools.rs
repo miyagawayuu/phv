@@ -8,52 +8,77 @@ use std::time::{Duration, Instant};
 
 const SKIP_DIRS: &[&str] = &["target", "vendor", ".git", ".jj", "node_modules"];
 
-/// Files under `paths` accepted by `want` (directories are walked).
-pub fn collect(paths: &[PathBuf], want: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
-    collect_max(paths, want, usize::MAX)
+/// How far a walk goes: the files it finds, the folders it reads and how deep
+/// below the paths given.
+pub struct WalkLimit {
+    pub files: usize,
+    pub folders: usize,
+    pub depth: usize,
 }
 
-/// `collect`, stopping once `max` files are found (a huge tree is not walked to the end).
-pub fn collect_max(paths: &[PathBuf], want: &dyn Fn(&Path) -> bool, max: usize) -> Vec<PathBuf> {
-    fn walk(dir: &Path, want: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>, max: usize) {
-        if out.len() >= max {
-            return;
-        }
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        // Links (symlinks, junctions) are not followed: a loop would never end,
-        // and `phv fmt` must not rewrite files outside the tree it was given.
-        let mut entries: Vec<(PathBuf, std::fs::FileType)> =
-            rd.filter_map(|e| e.ok().and_then(|e| Some((e.path(), e.file_type().ok()?)))).collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (p, ty) in entries {
-            if ty.is_symlink() {
-                continue;
-            }
-            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            if out.len() >= max {
+/// Files under `paths` accepted by `want` (directories are walked to the end:
+/// the paths are the ones a command was given).
+pub fn collect(paths: &[PathBuf], want: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
+    collect_within(paths, want, &WalkLimit { files: usize::MAX, folders: usize::MAX, depth: usize::MAX }).0
+}
+
+/// `collect` within `limit`, and whether the walk came to its end (false:
+/// there may be more files). The language server walks what it takes for a
+/// project, which may be a drive: finding few files it read every folder
+/// (40 seconds for a document in `C:\`; 21st assessment).
+pub fn collect_within(paths: &[PathBuf], want: &dyn Fn(&Path) -> bool, limit: &WalkLimit) -> (Vec<PathBuf>, bool) {
+    struct Walk<'a> {
+        want: &'a dyn Fn(&Path) -> bool,
+        limit: &'a WalkLimit,
+        out: Vec<PathBuf>,
+        folders: usize,
+        complete: bool,
+    }
+    impl Walk<'_> {
+        fn walk(&mut self, dir: &Path, depth: usize) {
+            if self.out.len() >= self.limit.files || self.folders >= self.limit.folders || depth > self.limit.depth {
+                self.complete = false;
                 return;
             }
-            if ty.is_dir() {
-                if !SKIP_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
-                    walk(&p, want, out, max);
+            self.folders += 1;
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            // Links (symlinks, junctions) are not followed: a loop would never end,
+            // and `phv fmt` must not rewrite files outside the tree it was given.
+            let mut entries: Vec<(PathBuf, std::fs::FileType)> =
+                rd.filter_map(|e| e.ok().and_then(|e| Some((e.path(), e.file_type().ok()?)))).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (p, ty) in entries {
+                if ty.is_symlink() {
+                    continue;
                 }
-            } else if want(&p) {
-                out.push(p);
+                let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                if ty.is_dir() {
+                    if !SKIP_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
+                        self.walk(&p, depth + 1);
+                    }
+                } else if (self.want)(&p) {
+                    if self.out.len() >= self.limit.files {
+                        self.complete = false;
+                        return;
+                    }
+                    self.out.push(p);
+                }
             }
         }
     }
-    let mut out = Vec::new();
+    let mut w = Walk { want, limit, out: Vec::new(), folders: 0, complete: true };
     for p in paths {
-        if out.len() >= max {
-            break;
-        }
         if p.is_file() {
-            out.push(p.clone());
+            if w.out.len() >= limit.files {
+                w.complete = false;
+                break;
+            }
+            w.out.push(p.clone());
         } else {
-            walk(p, want, &mut out, max);
+            w.walk(p, 0);
         }
     }
-    out
+    (w.out, w.complete)
 }
 
 fn name_of(p: &Path) -> String {

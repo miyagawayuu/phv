@@ -1,0 +1,8 @@
+error: `<frameset>`: browsers ignore every tag after it but `<frame>`, `<frameset>` and `<noframes>`, also the start tag of a `<textarea>`, `<title>` or `<script>`, whose text they then read as markup where it is checked as text
+  --> err_html_frameset.phv:12:25
+   |
+12 | <frameset cols="50%,50%"><textarea><frame src="<?= $v ?>"></textarea></frameset>
+   |                         ^
+   = note: a template must be read the same way by every browser, with scripting on and off; write it without this
+
+1 error found

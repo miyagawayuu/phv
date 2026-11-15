@@ -179,7 +179,13 @@ impl<'a> Checker<'a> {
             (Type::Void, _) | (_, Type::Void) => false,
             (_, Type::Any) => true,
             (Type::Union(ms), _) => ms.iter().all(|m| self.assignable_inner(m, to, false)),
-            (_, Type::Union(ts)) => ts.iter().any(|t| self.assignable_inner(from, t, coerce)),
+            // The members of a union are sorted: one that is among them as it
+            // is, is found without trying each (two unions of 5,000 classes
+            // took 1.7 s per use; 21st assessment).
+            (_, Type::Union(ts)) => {
+                (!from.is_open() && ts.binary_search(from).is_ok())
+                    || ts.iter().any(|t| self.assignable_inner(from, t, coerce))
+            }
             (Type::Int, Type::Float) => coerce,
             // A checked URL is still HTML (not the other way round). A
             // `json_html()` value is not: its quotes would end an attribute.
@@ -220,7 +226,15 @@ impl<'a> Checker<'a> {
                 super::note_too_large();
                 return Type::Error;
             }
-            Type::union(vec![a.clone(), b.clone()])
+            let u = Type::union(vec![a.clone(), b.clone()]);
+            // An inferred union is no wider than a written one may be (`null` aside).
+            if let Type::Union(ms) = &u {
+                if ms.len() - usize::from(ms.binary_search(&Type::Null).is_ok()) > super::MAX_UNION {
+                    super::note_too_wide();
+                    return Type::Error;
+                }
+            }
+            u
         };
         match (a, b) {
             (Type::Never, t) | (t, Type::Never) => t.clone(),
@@ -743,6 +757,16 @@ impl<'a> Checker<'a> {
     pub(crate) fn check_type_size(&mut self, h: &mut HExpr) {
         use super::{LARGE_TYPE, MAX_TYPE_SIZE, MAX_TYPE_TOTAL};
         let n = super::type_size(&h.ty, MAX_TYPE_SIZE);
+        if super::take_too_wide() {
+            super::take_too_large();
+            let msg = format!("the values here have more than {} different types", super::MAX_UNION);
+            self.error(msg, h.span).add_note(
+                "an inferred union type can have as many members as a written one; give the values a common \
+                 class or interface",
+            );
+            h.ty = Type::Error;
+            return;
+        }
         if super::take_too_large() || n > MAX_TYPE_SIZE {
             let msg = format!("the type of this expression is too large (more than {MAX_TYPE_SIZE} type nodes)");
             self.error(msg, h.span).add_note(
@@ -1594,6 +1618,7 @@ impl<'a> Checker<'a> {
             }
         }
         let mut out = Vec::new();
+        let mut filled = 0;
         if let Some(r) = rest {
             rest_parts.sort_by_key(|(i, ..)| *i);
             let ty = subst(&params[r].ty, &b);
@@ -1603,7 +1628,10 @@ impl<'a> Checker<'a> {
             match slot {
                 Some(h) => out.push(h),
                 None => match &params[j].default {
-                    Some(d) => out.push(hconst(d.clone(), subst(&params[j].ty, &b), span)),
+                    Some(d) => {
+                        filled += 1;
+                        out.push(hconst(d.clone(), subst(&params[j].ty, &b), span))
+                    }
                     None => {
                         let msg = format!("missing argument `${}` for `{fname}`", params[j].name);
                         self.error(msg, span);
@@ -1611,6 +1639,20 @@ impl<'a> Checker<'a> {
                     }
                 },
             }
+        }
+        // Each call holds the defaults of the arguments it leaves out: 20,000
+        // calls of a function with 40,000 defaulted parameters needed 190 GB
+        // (21st assessment). They are counted, and past the limit the rest
+        // of the program is not checked.
+        self.default_args += filled;
+        if self.default_args > super::MAX_DEFAULT_ARGS && !self.reported_type_nodes {
+            self.reported_type_nodes = true;
+            let msg =
+                format!("the calls of this program leave out more than {} arguments in total", super::MAX_DEFAULT_ARGS);
+            self.error(msg, span).add_note(
+                "each call holds the default values of the arguments it leaves out; give the functions called \
+                 most often fewer parameters with defaults",
+            );
         }
         (out, b)
     }

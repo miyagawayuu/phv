@@ -38,8 +38,40 @@ fn text(v: &Value) -> String {
 pub fn send(vm: &mut Vm, a: &[Value]) -> R {
     let via = text(&a[0]);
     let Some(spec) = vm.host.mail.get(&via).cloned() else {
-        return Err(vm.throw("PermissionError", format!("phv.toml has no [mail.{via}]")));
+        return Err(vm.throw("PermissionError", format!("phv.toml has no [mail.{}]", crate::httpclient::brief(&via))));
     };
+    // Before anything is copied or encoded: the message is built from several
+    // copies of its texts (found by the 21st assessment: the size was checked
+    // on the finished message, so a text of 110 MB took 841 MB under a 128 MB
+    // limit before it was refused).
+    let len = |v: &Value| match v {
+        Value::Str(s) | Value::Html(s) => s.len(),
+        _ => 0,
+    };
+    let (subject_len, text_len, html_len) = (len(&a[2]), len(&a[3]), len(&a[4]));
+    if !fits(subject_len, text_len, html_len) {
+        return Err(vm.throw("ValueError", format!("mail: {TOO_LARGE}")));
+    }
+    // The addresses too, before any is copied, and never shown whole (found
+    // by the re-attack of the 21st assessment: a 50 MB reply-to took 317 MB
+    // under a 128 MB limit, and a 40 MB recipient came back as a 41 MB
+    // exception message).
+    let recipients = match &a[1] {
+        Value::List(l) => l.as_slice(),
+        _ => &[],
+    };
+    if recipients.len() > MAX_RECIPIENTS {
+        return Err(vm.throw("ValueError", format!("mail: a message needs 1 to {MAX_RECIPIENTS} recipients")));
+    }
+    if recipients.iter().chain([&a[5]]).any(|v| len(v) > MAX_ADDRESS) {
+        return Err(vm.throw("ValueError", format!("mail: {LONG_ADDRESS}")));
+    }
+    if subject_len > MAX_SUBJECT {
+        return Err(vm.throw("ValueError", format!("mail: {LONG_SUBJECT}")));
+    }
+    // The copies made on the way: the texts, their base64, its lines, the
+    // parts, the message, and the message as it is sent.
+    vm.reserve((subject_len + text_len + html_len).saturating_mul(8).saturating_add(64 << 10))?;
     let to: Vec<String> = match &a[1] {
         Value::List(l) => l.iter().map(text).collect(),
         _ => Vec::new(),
@@ -90,6 +122,28 @@ fn no_breaks(what: &str, v: &str) -> Result<(), String> {
     Ok(())
 }
 
+const TOO_LARGE: &str = "the message is larger than 10 MB";
+
+/// The longest address (RFC 5321: 254 bytes).
+const MAX_ADDRESS: usize = 254;
+const LONG_ADDRESS: &str = "an address is longer than 254 bytes";
+
+/// The longest subject: a header line's 998 characters (RFC 5322).
+const MAX_SUBJECT: usize = 998;
+const LONG_SUBJECT: &str = "the subject is longer than 998 bytes";
+
+/// The bytes of `n` bytes of text as base64 on lines of 76 characters.
+fn encoded_len(n: usize) -> usize {
+    let b64 = n.div_ceil(3).saturating_mul(4);
+    b64.saturating_add(b64 / 76 * 2)
+}
+
+/// Whether a message with a subject and texts of these lengths can be within
+/// `MAX_MESSAGE` once encoded: checked before it is built.
+fn fits(subject: usize, text: usize, html: usize) -> bool {
+    encoded_len(subject).saturating_add(encoded_len(text)).saturating_add(encoded_len(html)) <= MAX_MESSAGE
+}
+
 /// `=?UTF-8?B?...?=` words for text that is not plain ASCII, split so no line grows long.
 fn header_text(s: &str) -> String {
     if s.bytes().all(|b| (0x20..0x7f).contains(&b)) {
@@ -123,13 +177,23 @@ fn base64_lines(s: &str) -> String {
 /// The message as sent after `DATA` (headers, then a text part, or text and
 /// HTML alternatives), lines ending in CRLF.
 pub fn build(from: &str, m: &Message) -> Result<String, String> {
+    if !fits(m.subject.len(), m.text.len(), m.html.len()) {
+        return Err(TOO_LARGE.into());
+    }
     if m.to.is_empty() || m.to.len() > MAX_RECIPIENTS {
         return Err(format!("a message needs 1 to {MAX_RECIPIENTS} recipients"));
+    }
+    // Before any is looked at or shown: a message names an address, never a text of any length.
+    if m.to.iter().any(|t| t.len() > MAX_ADDRESS) || m.reply_to.len() > MAX_ADDRESS {
+        return Err(LONG_ADDRESS.into());
+    }
+    if m.subject.len() > MAX_SUBJECT {
+        return Err(LONG_SUBJECT.into());
     }
     for t in m.to {
         no_breaks("an address", t)?;
         if address_of(t).is_none_or(|a| a != t) {
-            return Err(format!("`{t}` is not an email address"));
+            return Err(format!("`{}` is not an email address", crate::httpclient::brief(t)));
         }
     }
     no_breaks("the subject", m.subject)?;
@@ -137,7 +201,7 @@ pub fn build(from: &str, m: &Message) -> Result<String, String> {
         no_breaks("the reply-to address", m.reply_to)?;
         // A bare address: a display name from a form could list more addresses.
         if address_of(m.reply_to).is_none_or(|a| a != m.reply_to) {
-            return Err(format!("`{}` is not an email address", m.reply_to));
+            return Err(format!("`{}` is not an email address", crate::httpclient::brief(m.reply_to)));
         }
     }
     let from_addr = address_of(from).ok_or("[mail] from is not an email address")?;
@@ -168,7 +232,7 @@ pub fn build(from: &str, m: &Message) -> Result<String, String> {
         ));
     }
     if h.len() > MAX_MESSAGE {
-        return Err("the message is larger than 10 MB".into());
+        return Err(TOO_LARGE.into());
     }
     Ok(h)
 }
@@ -327,6 +391,48 @@ mod tests {
         assert!(build("app@example.com", &Message { reply_to: list, ..m }).is_err());
         let html = build("app@example.com", &Message { html: "<b>x</b>", ..m }).unwrap();
         assert!(html.contains("multipart/alternative") && html.contains("text/html"));
+    }
+
+    /// A message past the cap is refused by the lengths of its texts, before
+    /// any of it is encoded (21st assessment: the finished message was
+    /// measured, after four copies of each text had been made).
+    #[test]
+    fn a_message_past_the_cap_is_refused_before_it_is_built() {
+        let to = vec!["ann@example.com".to_string()];
+        let big = "a".repeat(64 << 20);
+        let m = Message { to: &to, subject: "s", text: &big, html: "", reply_to: "" };
+        let before = phv_vm::alloc::thread_allocated();
+        let start = std::time::Instant::now();
+        assert_eq!(build("app@example.com", &m).unwrap_err(), TOO_LARGE);
+        assert_eq!(build("app@example.com", &Message { text: "t", html: &big, ..m }).unwrap_err(), TOO_LARGE);
+        assert_eq!(
+            build("app@example.com", &Message { text: "t", subject: &big[..999], ..m }).unwrap_err(),
+            LONG_SUBJECT
+        );
+        assert!(build("app@example.com", &Message { text: "t", subject: &big[..998], ..m }).is_ok());
+        assert!(phv_vm::alloc::thread_allocated() - before < 1 << 20, "nothing was built");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        // What fits is what the encoded message can hold.
+        assert!(fits(0, 7 << 20, 0) && !fits(0, 8 << 20, 0));
+        assert!(fits(100, 3 << 20, 4 << 20) && !fits(100, 4 << 20, 4 << 20));
+        let m = Message { text: &big[..7 << 20], ..m };
+        assert!(build("app@example.com", &m).is_ok_and(|d| d.len() <= MAX_MESSAGE));
+        assert_eq!(encoded_len(57), 78);
+        // Addresses are measured too, and a message never shows one whole
+        // (re-attack of the 21st assessment).
+        let long = format!("{}@example.com", "a".repeat(40 << 20));
+        let many = vec![long.clone()];
+        let m = Message { to: &many, subject: "s", text: "t", html: "", reply_to: "" };
+        let before = phv_vm::alloc::thread_allocated();
+        assert_eq!(build("app@example.com", &m).unwrap_err(), LONG_ADDRESS);
+        assert_eq!(build("app@example.com", &Message { to: &to, reply_to: &long, ..m }).unwrap_err(), LONG_ADDRESS);
+        assert!(phv_vm::alloc::thread_allocated() - before < 1 << 20, "nothing was copied");
+        let odd = vec![format!("{} b@example.com", "a".repeat(200))];
+        let said = build("app@example.com", &Message { to: &odd, ..m }).unwrap_err();
+        assert!(said.ends_with("is not an email address") && said.len() < 120, "{said}");
+        let fine = vec![format!("{}@example.com", "a".repeat(242))];
+        assert!(build("app@example.com", &Message { to: &fine, ..m }).is_ok());
+        assert_eq!(encoded_len(58), 82);
     }
 
     #[test]

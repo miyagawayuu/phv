@@ -2,15 +2,24 @@
 //! `rate_limit()` and the server's per-client limit. Each (key, window) pair
 //! counts hits in a fixed window. The table is bounded; when it is full, a
 //! tenth of it is freed: expired windows go first, then windows that are not
-//! at their limit (oldest first), and only then limited ones, newest first.
-//! So a limited window is lost only when nothing in the table has expired
-//! and fewer than a tenth of its windows are not limited or limited and
-//! newer. A flood of new keys, limited or not, cannot lift a limit that was
-//! set before it began, since its own windows are the newest (found by the
-//! 18th audit: the oldest limited windows went first, so a flood of limited
-//! windows lifted the oldest limits). What is not guaranteed: a limit set
-//! while the table is already full of someone's limited windows is lost once
-//! a tenth of the table's worth of newer ones arrive.
+//! at their limit (oldest first), and only then limited ones, those whose
+//! window ends soonest first. No key is ever refused for lack of room.
+//!
+//! So a limited window is lost only when nothing in the table has expired,
+//! fewer than a tenth of its windows are not limited, and about nine tenths
+//! of the table (90,000 windows) are limited windows that end after it:
+//! lifting one limit takes that many keys taken to their limit after it,
+//! each time. Which limited windows go first is a choice between two
+//! attackers, since a table of limited windows only has to give one up:
+//! the oldest first (before 1.2.1) let a flood lift a limit set before it,
+//! at the price of a table's worth of keys; the newest first (1.2.1 to
+//! 1.3.2, the 18th audit) kept every limit set before a flood, and gave up
+//! a limit just reached in a full table for the next key, a tenth of the
+//! table's worth of keys for each limit lifted (found by the re-attack of
+//! the 21st assessment's fixes, which had copied the rule to the shared
+//! store: there it cost one request). The window that ends soonest is the
+//! one whose loss lifts the least; among windows of one length it is the
+//! oldest, and a flood through a short window gives up its own.
 //!
 //! The table is split by key into `SHARDS` maps, each under a lock of its
 //! own, so requests with different keys do not wait for one another. The
@@ -91,8 +100,8 @@ impl Table {
 
     /// Makes room for more keys, in amortized O(1): each pass frees a tenth.
     /// Expired windows go first, then the oldest windows that are not at
-    /// their limit, then the newest limited ones, chosen over every shard
-    /// together (see the module doc).
+    /// their limit, then the limited ones that end soonest, chosen over
+    /// every shard together (see the module doc).
     fn make_room(&self) {
         let mut shards: Vec<MutexGuard<'_, Map>> = (0..SHARDS).map(|i| self.lock(i)).collect();
         for t in shards.iter_mut() {
@@ -101,11 +110,19 @@ impl Table {
         let len: usize = shards.iter().map(|t| t.len()).sum();
         let target = MAX_KEYS * 9 / 10;
         if len > target {
-            let mut order: Vec<(bool, Instant, TableKey)> =
-                shards.iter().flat_map(|t| t.iter().map(|(k, w)| (w.hits >= w.max, w.start, k.clone()))).collect();
-            // Not-limited before limited; the not-limited oldest first, the
-            // limited newest first (a flood's own windows are the newest).
-            order.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| if a.0 { b.1.cmp(&a.1) } else { a.1.cmp(&b.1) }));
+            // Not-limited before limited; the not-limited by their start
+            // (oldest first), the limited by their end (soonest first).
+            let mut order: Vec<(bool, Instant, TableKey)> = shards
+                .iter()
+                .flat_map(|t| {
+                    t.iter().map(|(k, w)| {
+                        let limited = w.hits >= w.max;
+                        let at = if limited { w.start.checked_add(w.length).unwrap_or(w.start) } else { w.start };
+                        (limited, at, k.clone())
+                    })
+                })
+                .collect();
+            order.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
             for (_, _, k) in order.into_iter().take(len - target) {
                 shards[self.shard_of(&k.0)].remove(&k);
             }
@@ -275,19 +292,25 @@ pub fn client_key(ip: std::net::IpAddr) -> String {
     }
 }
 
+/// For the tests (also those of the shared store, which counts here when a
+/// site is full): the table is one per process, so a test that floods it, or
+/// whose windows must stay, takes this and starts with an empty table. (A
+/// flood of limited windows left behind would otherwise fill the next test's
+/// table: see the module doc.)
+#[cfg(test)]
+pub(crate) fn serial_for_tests() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    clear();
+    guard
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The table is one per process: a test that floods it, or whose windows
-    /// must stay, takes this and starts with an empty table. (A flood of
-    /// limited windows left behind would otherwise make the next test's
-    /// limit the newest, and a flood there would evict it: see the module doc.)
     fn serial() -> MutexGuard<'static, ()> {
-        static SERIAL: Mutex<()> = Mutex::new(());
-        let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        clear();
-        guard
+        serial_for_tests()
     }
 
     #[test]
@@ -353,30 +376,72 @@ mod tests {
         assert!(exact_len() <= MAX_KEYS);
     }
 
-    /// A flood of limited windows (one hit each with `max = 1`) does not lift
-    /// an older limit either: among limited windows the newest go first, and
-    /// the flood's own windows are the newest (found by the 18th audit: the
-    /// oldest limited windows went first, so the flood lifted the oldest
-    /// limit in the table).
+    /// A limit reached while the table is full of limited windows is not
+    /// given up for the keys that come next: among limited windows those
+    /// that end soonest go first, and it ends last (found by the re-attack
+    /// of the 21st assessment's fixes: the newest limited windows went
+    /// first, so a visitor who had filled the table reached a limit, sent
+    /// new keys, and had the limit back for a tenth of the table's worth of
+    /// keys each time). It takes about nine tenths of the table in limited
+    /// windows that end after it to lift it.
     #[test]
-    fn a_flood_of_limited_windows_does_not_lift_an_older_limit() {
+    fn a_limit_reached_in_a_full_table_is_not_given_up_for_new_keys() {
+        let _serial = serial();
+        let day = Duration::from_secs(86_400);
+        let key = |i: usize| format!("test:full-table-{i}");
+        for i in 0..MAX_KEYS - 1 {
+            assert!(hit(&key(i), 1, day));
+        }
+        let target = "test:full-table-target";
+        assert!(hit(target, 1, day));
+        assert!(!hit(target, 1, day), "the target is limited");
+        assert_eq!(exact_len(), MAX_KEYS);
+        // New keys, each taken to its limit: none is refused, and the table
+        // gives up its oldest limits, a tenth at a time.
+        let fresh = |i: usize| format!("test:full-table-fresh-{i}");
+        for i in 0..MAX_KEYS / 2 {
+            assert!(hit(&fresh(i), 1, day), "a new key was refused");
+            assert!(!hit(&fresh(i), 1, day));
+        }
+        assert!(exact_len() <= MAX_KEYS);
+        assert!(!hit(target, 1, day), "a limit reached in a full table was lifted by new keys");
+        assert_eq!(retry_after(&key(0), day), 0, "the limits that end soonest go first");
+        assert!(retry_after(&fresh(MAX_KEYS / 2 - 1), day) > 0);
+        // A flood through a short window gives up its own windows, not the
+        // day-long limits that end after them.
+        let minute = Duration::from_secs(60);
+        for i in 0..MAX_KEYS / 2 {
+            assert!(hit(&format!("test:full-table-short-{i}"), 1, minute));
+        }
+        assert!(!hit(target, 1, day), "a flood through a short window lifted a longer limit");
+        // What the bound means: the limit is lost once about nine tenths of
+        // the table are limited windows that end after it.
+        for i in MAX_KEYS / 2..MAX_KEYS + MAX_KEYS / 5 {
+            assert!(hit(&fresh(i), 1, day));
+        }
+        assert_eq!(retry_after(target, day), 0, "the bound of the table");
+    }
+
+    /// A limit set before a flood of limited windows outlasts the first
+    /// tenth of the table the flood pushes out (the windows that are not at
+    /// their limit, then its own that end first), not the whole flood: see
+    /// the module doc for the choice.
+    #[test]
+    fn a_flood_of_limited_windows_first_gives_up_what_is_not_limited() {
         let _serial = serial();
         let day = Duration::from_secs(86_400);
         assert!(hit("test:limited-flood-victim", 1, day));
         assert!(!hit("test:limited-flood-victim", 1, day), "the victim is limited");
-        // The victim's window is the oldest; make that clear.
-        std::thread::sleep(Duration::from_millis(5));
-        let key = |i: usize| format!("test:limited-flood-{i}");
-        for i in 0..MAX_KEYS + 2000 {
-            assert!(hit(&key(i), 1, day));
+        for i in 0..MAX_KEYS / 2 {
+            hit(&format!("test:limited-flood-open-{i}"), 5, day);
+        }
+        // The table is full after half a table of limited windows: the
+        // not-limited half makes room for as many more.
+        for i in 0..MAX_KEYS - 1000 {
+            assert!(hit(&format!("test:limited-flood-{i}"), 1, day));
         }
         assert!(exact_len() <= MAX_KEYS);
-        assert!(!hit("test:limited-flood-victim", 1, day), "still limited after a flood of limited windows");
-        // What went was the newest of the flood, never its first window; at
-        // least the 2,000 over the bound are gone.
-        assert!(!hit(&key(0), 1, day), "the flood's oldest window is kept");
-        let gone = (0..MAX_KEYS + 2000).filter(|i| retry_after(&key(*i), day) == 0).count();
-        assert!(gone >= 2000, "{gone} of the flood's windows are gone");
+        assert!(!hit("test:limited-flood-victim", 1, day), "limited windows went while others were not limited");
     }
 
     /// The bound and the eviction are those of the whole table, not of a

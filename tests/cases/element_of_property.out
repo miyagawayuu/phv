@@ -1,0 +1,11 @@
+10 30 a one 13 11
+20 50 b two 13 13
+30 70 a none 13 13
+eq same null note ge le 0 T 3
+ne same null note lt gt -1 T 3
+ne same note ge le 1 T 3
+17 [20,20,30,3,20][30,20,30,3,20]["ab","b","ab"][[1,2,3],[3]]abc!{"k":1,"l":2,"m":41}
+31 [20,20,30,3,20,5,20][30,20,30,3,20,5,20]["abb","b","ab","abb"][[1,2,3,3],[3]]abc!?{"k":1,"l":2,"m":42}
+5:list index 99 is out of range (length 7); 5:undefined map key "none"; 5:list index 5 is out of range (length 1); 5:boom; 5:list index 7 is out of range (length 2); kept:list index -1 is out of range (length 4)
+20 21 20abbabc!?
+8[[1,2,3,3,2],[3,8]]

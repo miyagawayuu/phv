@@ -941,6 +941,19 @@ on, `<foreignObject>`), that end tag would end it and turn what follows into mar
 template and function, inside a `<noscript>` or not, in comments, attribute values and raw text (`<script>`, `<textarea>`...): any
 template or function may be written inside a `<noscript>` (`<noscript><?= render(...) ?></noscript>`, a layout's body, a call),
 while it is checked on its own. So `<!--</<?= $v ?>-->` and `title="</nos<?phv f(); ?>"` are errors in every template.
+Such an end tag is watched in the same way in a tag name, between the attributes of a tag and in an attribute name
+(`<noscript><a</noscript>`). For the same reason `<noscript>` and `</noscript>` are errors inside `<svg>` and `<math>`
+(a `<foreignObject>` included), in every template, and `Html` that holds them stops the script when it is inserted
+there: browsers with scripting on read a `<noscript>` as raw text up to the first `</noscript>`, which would end a
+`<noscript>` around the SVG, and the SVG with it, where the template is checked as still inside the SVG. An SVG
+written inside a `<noscript>` and closed before its end tag is fine, and values inserted inside a `<noscript>` (in
+text, attribute values and comments) are escaped as everywhere, so none can hold `</noscript`. A `<textarea>`,
+`<title>`, `<xmp>`, `<iframe>`, `<noembed>`, `<noframes>` or `<plaintext>` in HTML inside SVG or MathML (in a
+`<foreignObject>`, `<desc>`, the SVG `<title>`, `<mi>`...) is checked as browsers read it there: its text is raw text
+up to its end tag. `<mglyph>` and `<malignmark>` are errors in HTML inside SVG or MathML (browsers read them as MathML
+where they have closed the HTML elements before them on their own); right inside a MathML text element (`<mi>`,
+`<mtext>`...) they are fine. `<frameset>` is an error: browsers that take it ignore every tag after it but `<frame>`,
+`<frameset>` and `<noframes>`, also the start tag of a `<textarea>`, whose text they then read as markup.
 
 | Location | Example | Treatment |
 |---|---|---|
@@ -1358,6 +1371,10 @@ session()->destroy();                 // log out
 - Values are stored on the server. The cookie holds only a 256-bit random ID
   (`PHVSESSID`, `HttpOnly`, `SameSite=Lax`, and `Secure` with `[security] secure_cookies = true`).
 - IDs that the server did not issue are rejected. The values in one session can total at most 64 KB.
+- `regenerate()` also gives the browser a new CSRF cookie, so that tokens made before the sign-in stop working. Call
+  it before `csrf_token()` or `csrf_field()` in the same response: a token the response made earlier for the cookie
+  the visitor came with stops working like every token from before (the form it is in would be refused). A
+  token made in the same response for a visitor who had no CSRF cookie yet stays valid: its cookie is new already.
 - A session is removed after `[security] session_ttl` seconds without access. Even with continued access, it is removed after 24 hours.
 - By default, sessions are stored in memory and are lost when the server restarts. If you set a directory in the project,
   as in `[security] session_store = "sessions/"`, each session is stored in its own file. Sessions then survive restarts and can be shared by
@@ -1664,9 +1681,14 @@ work caught the error (PostgreSQL ends a transaction at its first error, and its
 error; an inner `transaction()` around the statement lets the rest go on); on MySQL, after a deadlock (error 1213),
 or a lock wait timeout (1205) with `innodb_rollback_on_timeout` on; on SQLite, after an error that rolls the whole
 transaction back (`INSERT OR ROLLBACK`); and everywhere after `COMMIT` or `ROLLBACK` written as SQL inside it (on
-MySQL also `BEGIN`, which commits the open transaction). On MySQL a statement that commits implicitly (`CREATE
-TABLE`, ...) inside an inner `transaction()` is found when that one ends; in the outermost one it is not: what ran
-before it is committed, as MySQL does.
+MySQL also `BEGIN`, which commits the open transaction). On MySQL the server reports the state of the
+transaction with each reply, and when one begins or ends, so its end is seen whatever the statement's text: `ROLLBACK`
+or `COMMIT` run through `PREPARE … FROM` and `EXECUTE` or by a procedure (`CALL`), also one that begins another
+transaction right after, and a statement that commits implicitly (`CREATE TABLE`, ...), in the outermost
+`transaction()` too (what ran before it is committed, as MySQL does, and `transaction()` throws). A procedure with a
+transaction of its own (`START TRANSACTION … COMMIT`) called inside `transaction()` ends it the same way. On a server
+that does not report this (MySQL before 5.7, MariaDB before 10.2) only the statement's own words are read, and an
+implicit commit is found only inside an inner `transaction()`, when that one ends.
 
 - **SQL can be written only as `sql"..."` literals (type `Sql`).** Values embedded with `{$x}` are always passed
   as placeholders, so SQL injection cannot occur. A `string` cannot be passed to `query()`.
@@ -1694,7 +1716,8 @@ before it is committed, as MySQL does.
 - SQL errors raise `DatabaseError`.
 - A connection to a database file is kept for the next script that opens the same file (up to 30 seconds idle;
   `:memory:` databases are never kept), so pages that open the database on every request do not reopen the file.
-  Each open checks the path as before: no link on the way, the journal files missing or plain files, and the
+  Each open checks the path as before: no link on the way, the journal files missing or plain files (one that
+  another connection is deleting at that moment counts as missing), and the
   database a plain file with one link that is the very file the kept connection has open (otherwise a new connection
   is opened). The new script gets its own time limit, and `lastInsertId()`, `changes()` and `total_changes()` start
   from zero. A kept connection also keeps its prepared statements (the 32 texts run last), so a script that runs the
@@ -1777,10 +1800,16 @@ The methods are the same as for SQLite (`query`, `first`, `execute`, `transactio
   larger than the memory left to the script is refused while it is read (the connection is then closed, not reused), so
   a large result or a misbehaving server cannot grow the process past the memory limit. PostgreSQL notifications
   (`LISTEN`) are dropped as they arrive; scripts cannot read them.
-- Each call runs a single statement (MySQL multi-statements are off), and `LOAD DATA LOCAL INFILE` is refused. So
+- Each call runs a single statement (MySQL multi-statements are off), and `LOAD DATA LOCAL INFILE` and `LOAD XML
+  LOCAL INFILE` are refused. So
   are `XA PREPARE` (MySQL) and `PREPARE TRANSACTION` (PostgreSQL): a transaction prepared for a two-phase commit
   would keep its locks after the script, also across restarts, until someone ends it by name (the reset of a pooled
-  connection does not end it). The other `XA` statements are allowed. Comments before and between the words do not
+  connection does not end it). The other `XA` statements are allowed. On MySQL a statement that keeps another to run
+  later (`CREATE` or `ALTER` of a procedure, function, trigger or event, `PREPARE … FROM`, MariaDB's `EXECUTE
+  IMMEDIATE`) is refused when its text holds the word `XA` anywhere, and the XA transaction a script started with
+  `XA START` is rolled back when the script is done with its connection, whatever state it is in. What remains: a
+  procedure made outside PHV that prepares a transaction the script did not start with an `XA START` of its own
+  (or whose id PHV could not read: after a comment, or followed by `JOIN` or `RESUME`); that one stays. Comments before and between the words do not
   hide them: on MySQL a versioned comment (`/*!80000 … */`) is read both with and without its words, for each version
   it names (a server older than the version skips them), and a statement that starts with versioned comments of more
   than 16 versions is refused; on PostgreSQL `/*! … */` is an ordinary comment. Words are separated as the servers
@@ -1931,8 +1960,9 @@ statements, refused statements, results within the memory left to the script).
   differ: a column another request changed meanwhile is not written back with an old value, and nothing is sent when
   nothing changed (`update()` returns false). An entity the Repo did not read (another Repo's, or one made with `new`
   with its key set) has every column written. After a `transaction()` is rolled back or fails to commit, after
-  `ROLLBACK` (also `ROLLBACK TO SAVEPOINT`) or `COMMIT` written as SQL, after a deadlock on MySQL, and on SQLite
-  after any statement that ended the open transaction (`INSERT OR ROLLBACK`, `RAISE(ROLLBACK)` in a trigger, also
+  `ROLLBACK` (also `ROLLBACK TO SAVEPOINT`) or `COMMIT` written as SQL, after a deadlock on MySQL, and on SQLite and MySQL
+  after any statement that ended the open transaction (SQLite: `INSERT OR ROLLBACK`, `RAISE(ROLLBACK)` in a trigger;
+  MySQL: `ROLLBACK` through `EXECUTE` or `CALL`, a statement that commits implicitly; also
   in a transaction the script began with its own `BEGIN`), every Repo forgets what it kept, since the rows may no
   longer hold it; a Repo also forgets when another Repo of the request wrote to its table (table names compared
   without regard to case, as SQLite, and MySQL on Windows and macOS, compare them). Writes made with SQL of one's own (`$db->execute()`) are not seen: an entity whose row such a
@@ -2157,9 +2187,10 @@ when the body is not JSON).
   `%252e`, or followed by `;` as in `..;`), encoded slashes, `%` not followed by two hex digits, and `?` or `#` (give
   the query as `$query`). Characters outside ASCII are percent-encoded.
 - Header names and values are checked (no line breaks). `Host`, `Content-Length`, `Transfer-Encoding`,
-  `Connection` and the other headers that frame the message are set by PHV. Scripts can replace the `headers` of
-  `phv.toml`, but not those of `headers_env` (also not under another spelling: `_` counts as `-`, as CGI servers read
-  both the same way). A query parameter of the base URL cannot be given again in `$query`, also not under a name
+  `Connection` and the other headers that frame the message are set by PHV, and cannot be given under another
+  spelling either: `_` and `.` count as `-`, and several of them in a row as one, as CGI servers and gateways may
+  read them the same way (`Content_Length`, `Content.Length`, `Content__Length`). Scripts can replace
+  the `headers` of `phv.toml`, but not those of `headers_env` (nor under such a spelling). A query parameter of the base URL cannot be given again in `$query`, also not under a name
   the server may read as the same: PHP reads `.`, a space and a `[` without a `]` after it as `_`, drops leading
   spaces and what follows a NUL, and reads `name[...]` as `name`; ASP.NET ignores case; a name is also compared
   once more percent-decoded. With `account_id` in the base URL, `account.id`, `account id`, `account_id[]` and
@@ -2193,7 +2224,9 @@ when the body is not JSON).
   whatever the server sends: the name lookup, every read and every write stop at that deadline, and at most 10
   interim (`1xx`) responses are skipped. The addresses a host name was looked up to are kept for 30 seconds (a
   failed lookup is not kept), and requests for the same name at the same time share one lookup. Request and response
-  bodies are at most 16 MB. The body is read as UTF-8 text.
+  bodies are at most 16 MB, and a response at most a third of the memory left to the script, both as the bytes
+  read and as the text they become (text of bytes that are not UTF-8 is up to three times as long); a larger one
+  raises `NetworkError`. The body is read as UTF-8 text.
 - Connection failures and network errors raise `NetworkError`, naming the service but never its URL, host or headers
   (errors are described in fixed words, such as "the server's TLS certificate is not valid"). An
   unset `url_env` or `headers_env` variable is reported when a request is sent, so `phv check` works without the
@@ -2294,7 +2327,9 @@ response()->redirect("/");
   Endpoints need TLS unless they are on this machine or `tls = false`; the redirect URI needs TLS unless it is on this
   machine. The endpoints a discovery document names must use `https://` when the issuer does, and may be on this
   machine only when the issuer is (so a remote provider cannot have the code and the secret sent in plain text to a
-  port here). The client secret comes from the environment (scripts cannot read the variable) and is never shown; an
+  port here). "On this machine" is read widely there: `localhost` also with a trailing dot, loopback and unspecified
+  addresses in any form (`[::ffff:127.0.0.1]`, `[::1%1]`, `127.1`, `2130706433`, `0.0.0.0`), and, when a request is
+  sent to an endpoint a remote issuer named, a name that has such an address at that time. The client secret comes from the environment (scripts cannot read the variable) and is never shown; an
   unset variable is reported when a sign-in starts.
 - Failures of the provider or the visitor throw `OAuthError` (`$e->error` is the OAuth error code, and texts from the
   provider are cut to printable ASCII); a provider that cannot be reached throws `NetworkError`; mistakes in phv.toml or
@@ -2349,7 +2384,8 @@ Mail::to($email)
   never sent without TLS to another machine.
 - An address is a plain `name@domain` (no display name, no line breaks), and the subject cannot contain line breaks
   (`ValueError`), so a value from a form cannot add headers or recipients. A message has 1 to 50 recipients and at most
-  10 MB. The text part is always sent; `html()` adds an HTML alternative.
+  10 MB as it is sent (base64: about 7 MB of subject, text and HTML together), checked before it is built; an
+  address is at most 254 bytes and the subject 998. An error message about an address shows at most its first 64 characters. The text part is always sent; `html()` adds an HTML alternative.
 - Sending waits for the server, at most the script's time limit or 30 seconds, and throws `NetworkError` if it fails.
 
 ### Regular expressions (std.regex)
@@ -2635,7 +2671,10 @@ $data = json_decode($j->payload);
 - A job that does not compile stops `phv serve`, `phv jobs run` and `phv build`. When the server stops, running jobs
   get what is left of `shutdown_timeout`; one that does not finish runs again elsewhere when its lease runs out.
 - The payload is stored as it is: encrypt (`encrypt()`) what must stay secret. A page that adds jobs for visitors
-  should be rate limited (`rate_limit()`), so a visitor cannot fill the queue.
+  should be rate limited (`rate_limit()`), so a visitor cannot fill the queue. A job found in a shared store with a
+  payload over 1 MB or a name over 64 bytes (`enqueue()` adds 64 KB at most, under the name of a job script:
+  something else wrote it) is not run: when its turn comes it is given up as failed, with an error that says so, and
+  the jobs after it run. An entry of a Redis store whose id is over 64 bytes is removed.
 
 ### Asynchronous I/O (std.async)
 
@@ -2664,8 +2703,9 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
 - The work stops at the script's time limit (without one: 30 seconds for HTTP and Redis, 300 for SQL), and so does
   waiting for it. A script can have 16 operations running at once, and on one database at most half its `pool_size`
   (at least 1); starting more throws `RuntimeException`.
-- The work's result may take a sixteenth of the memory left to the script when it starts (and at most 16 MB for an
-  HTTP response); a larger result is an error. It is counted against the script's limit when it is awaited.
+- The work's result may take a sixteenth of the memory left to the script when it starts; an HTTP response a
+  fortieth, as bytes and as text (16 of them may run at once, each holding both for a moment), and at most 16 MB; a
+  larger result is an error. It is counted against the script's limit when it is awaited.
 - `queryAsync` / `executeAsync` on a database server use a connection of their own from the pool, so they run
   outside the script's transaction; give `pool_size` room for them. With SQLite the statement runs right away.
 - Work that was started and never awaited is still waited for when the script ends (until its time limit at most):
@@ -2687,7 +2727,7 @@ $all = await_all([$api->getAsync("/a"), $api->getAsync("/b")]);   // list<HttpRe
 | `totp_secret()`, `totp_code($secret, ?$time)`, `totp_verify($secret, $code): ?int` | Two-factor codes of authenticator apps (TOTP, RFC 6238: HMAC-SHA1, 6 digits, 30 seconds). The secret is 160 random bits as Base32. `totp_verify` accepts one step of clock drift either way, compares in constant time, and returns the time step it matched (or `null`): store it and refuse a step that is not newer, so a code cannot be used twice. Store it in the database with one statement that only succeeds for a newer step (`UPDATE ... SET step = {$step} WHERE id = {$id} AND step < {$step}`, then check the affected rows): with the session, two requests sending the same code at the same time could both pass |
 | `qr_svg($text): Html` | A QR code as an `<svg>` element (for example of an `otpauth://` URI). The markup holds only the modules, not the text, so it is safe to output |
 | `base64_encode`, `base64_decode: ?string`, `urlencode`, `rawurlencode`, `urldecode`, `http_build_query` | |
-| `json_decode($s): any` | Depth up to 128 |
+| `json_decode($s): any` | Depth up to 128. Numbers are read as RFC 8259 writes them: `012`, `1.` and `-.5` are invalid JSON (`ValueError`), as everywhere JSON is read (`request()->json()`, `json_decode_as()`, tokens) |
 | `encrypt($text, $key)`, `decrypt($box, $key): ?string` | ChaCha20-Poly1305, with a key derived for each message (HKDF-SHA256 with a random salt) and a random nonce; the result is base64url text. `decrypt` returns `null` if the text was changed or the key is not the one it was encrypted with |
 | `sign_token($data, $key)`, `sign_token($data, $key, $seconds)`, `verify_token($token, $key): ?string` | Data with an HMAC-SHA256 signature, valid for `$seconds` when given (links in e-mails, such as password resets). The data can be read (it is only base64url): encrypt what must stay secret. `verify_token` returns the data, or `null` if the token was changed, signed with another key, or has expired |
 | `jwt_encode($claims, $key)`, `jwt_decode($token, $key): ?map<string, any>` | JSON Web Tokens with HS256 only (RS256, ES256, EdDSA and key sets: see std.jwt): a token that names another algorithm (`none` included) is refused. `exp` and `nbf` are checked; as in std.jwt, a token with `crit` in its header, or with an `iat` (a number) more than a minute ahead, is refused. The key is used as it is (as other JWT libraries expect), so do not also use it with `hash_hmac()`: an HMAC of a visitor's text would be a valid signature |
@@ -2781,13 +2821,27 @@ rate_limit_reset("login:" . ip_group(request()->ip));
   and returns `false` if it has. Counters are shared within the server process and are lost on restart.
 - To share the counters between server processes (or machines), name a Redis database from `[databases]` in
   `[security] rate_limit_store`. `rate_limit()`, `rate_limit_reset()` and `requests_per_minute` then count on that
-  server, in keys starting with `phv:ratelimit:` that expire with their window. If the server cannot be reached,
+  server, in keys starting with `phv:ratelimit:` that expire with their window. The windows are told apart by the
+  Redis server's clock, so the clocks of the server processes do not matter (while processes of 1.3.2 or earlier
+  count on the same server, their clocks must still agree with it). The server holds at most 100,000 keys of a site
+  (of a namespace, see "Sessions"; the bookkeeping is under `phv:ratelimits:<namespace>:`): when a new key finds them
+  all in use, the key that has gone longest without reaching its limit is discarded. A key at its limit is never
+  discarded there before its window ends: while every key of the site is at its limit, a new key is counted in the
+  server process that got the request instead (each process counts for itself, under the rule of the next item),
+  and on the Redis server again once it has room. If the server cannot be reached,
   `rate_limit()` returns `false` (a limit that cannot be counted refuses), `rate_limit_reset()` throws
   `DatabaseError`, and `requests_per_minute` counts in the process; each failure is logged. After such a failure the
   server is not asked again for 5 seconds: meanwhile every call fails the same way at once, without waiting for it.
+  A call that fails because its own script reached its time limit while waiting (with less than a second left) does
+  not count as such a failure, unless three such calls in a row, a second or more from the first to the last, got
+  no answer: a server that hangs is then treated as one that cannot be reached, also by scripts whose time limit is
+  a second.
 - The same key is counted separately for each window length (you can apply both 5 per minute and 50 per day).
-  `rate_limit_reset($key)` forgets the windows of that key, of every length, and of no other key. When there are more than 100,000 keys,
-  keys that have not reached their limit are discarded first, so using a large number of keys does not release keys that are currently limited.
+  `rate_limit_reset($key)` forgets the windows of that key, of every length, and of no other key. The process holds at most 100,000 keys and refuses none:
+  when a new key finds them all in use, a tenth is discarded, keys that have not reached their limit first (the oldest
+  first), so a flood of keys does not release keys that are currently limited. Only when fewer than a tenth have not
+  reached their limit are limited keys discarded, those whose window ends soonest first: a limit can be lost before
+  its window ends only after about 90,000 other keys have been taken to their limit with windows that end after it.
 - `requests_per_minute` counts IPv6 addresses grouped by /64. Do the same in keys: `ip_group($ip)` returns the /64 of
   an IPv6 address (and an IPv4 address as it is), as in `rate_limit("login:" . ip_group(request()->ip), 5, 60)`, since one
   visitor can use any address of their network.
@@ -2799,7 +2853,7 @@ rate_limit_reset("login:" . ip_group(request()->ip));
 
 | Function | Description |
 |---|---|
-| `file_append($path, $text)` | Adds to the end of a file, creating it if needed (`write`) |
+| `file_append($path, $text)` | Adds to the end of a file, creating it if needed (`write`). Scripts, jobs and server processes that append to one file at the same time each add their text whole, in some order |
 | `filesize($path)`, `filemtime($path)`, `is_dir($path)` | Size in bytes, time of the last change (Unix time), whether it is a directory (`read`) |
 | `scandir($dir): list<string>` | Names of the files and directories in `$dir`, sorted; links are left out (`read`) |
 | `mkdir($dir)` | Creates the directory and any missing parents inside the permitted one; an existing directory is fine (`write`) |
@@ -2816,8 +2870,9 @@ write = ["data/", "storage/"]  # file_put_contents / unlink / mkdir / rename / s
 env = ["APP_*"]             # environment variables readable with getenv (a trailing * is a prefix match)
 ```
 
-- Paths are relative to the project. `..`, absolute paths and names with `~` (Windows short names such as `GIT~1`)
-  are not allowed.
+- Paths are relative to the project. `..` and absolute paths are not allowed, nor a name that is another name of
+  the file than its own (a Windows short name such as `GIT~1`): the name must be the one the file has (in any case).
+  A file whose own name holds `~` (`notes~1.txt`) is used by that name.
 - Symbolic links and junctions under a permitted directory are not followed (a path through a link raises `PermissionError`).
   Paths are opened one level at a time from the permitted directory, rejecting links, so a directory cannot be swapped
   between the check and the use.
@@ -3162,6 +3217,8 @@ $body = render(
 `phv fmt` never joins lines, and never changes a line that holds a comment, a multi-line string, inline HTML or
 `<?phv` / `?>` tags, so formatting cannot change what a program does; formatting a formatted file changes nothing.
 A file with more than one hard link is reported and left as it is (writing it would change the other name too).
+So is a file with more than 500 brackets and blocks open at once (closed or not), one whose formatted text would be
+larger than a source file may be (8 MB), and one with a line that would have to be broken too many times.
 
 ### Testing
 
@@ -3311,6 +3368,15 @@ It then runs the type checker and shows the places that need manual work, such a
      code lets go of the one a register held when it writes a number there, so a value passed to a function or read
      for one element is not left shared: the caller's next `$xs[] = ...` or `.=` changes it in place. (The script's
      own variables are let go when its VM is torn down, after the response is sent.)
+     `$s = $s . $x;` and `$s = "{$s}...";` on a `string` variable append in place as `$s .= $x;` does (what is
+     appended is worked out first, from `$s` as it was), and the values staged for a closure's captures are let go
+     once the closure has its own.
+     The time limit is looked at on loop steps and calls, and by an instruction in between that goes over 64 KB of
+     a value (a join, a comparison, a copy; shorter joins and `==` comparisons add up to that): past the limit the
+     script stops there, so also in code without loops or calls (the way back out of a deep recursion, a
+     generator's body, a script's own statements). Code without loops or calls whose instructions each go over
+     less than 64 KB and are neither (thousands of statements that copy, append to or order strings of some tens
+     of KB, on every return of a deep recursion) is stopped only at its next loop step or call.
      A generator (§8) is an object that holds its frame while it waits: the registers, where it resumes and its open
      `try` blocks. A loop that asks for its next value puts the frame back on top of the call stack, above the loop's,
      and `yield` takes it off again.
@@ -3418,6 +3484,7 @@ It then runs the type checker and shows the places that need manual work, such a
 | Spans waiting to be exported | 8,192 and 16 MB; a span's name or text attribute 1,024 bytes | dropped (`phv_telemetry_dropped_spans_total`); longer texts are cut |
 | Source file (module, template, script) | 8 MB | Compile error (`phv lsp`: a larger open document is not checked or formatted, and renames are refused while it is open) |
 | Tokens of one source file (the code inside its strings included) | 1,000,000 | Compile error (the file is not parsed) |
+| A name (of a variable, function, class, member...) | 255 bytes | Compile error |
 | All the files of one program (a page or script with what it imports and renders, std included) | 2,000,000 tokens, 32 MB of source, 2,000 files | Compile error (the program is not checked; between requests `phv lsp` keeps the analyses of open documents up to 250,000 tokens and 16 MB of source in all, the least recently used dropped first, each for at most 2 seconds) |
 | Members inherited by all classes together | 200,000 | Compile error (each class holds a copy of what it inherits and of what it takes from traits) |
 | Source of the trait methods copied into classes, all classes together | 32 MB | Compile error (each copy is checked and compiled) |
@@ -3430,7 +3497,12 @@ It then runs the type checker and shows the places that need manual work, such a
 | A string built by a constant expression | 1 MiB (16 MiB for all of a program's, with the string default values of the properties of every class, inherited ones included) | Compile error |
 | Type aliases resolved inside each other | 64 | Compile error |
 | Type parameters of a function, class or type alias | 4 | Compile error |
-| Members of a union type written in the source | 256 | Compile error |
+| Members of a union type, written in the source or inferred from values (`null` not counted in an inferred one) | 256 | Compile error (give the values a common class or interface) |
+| Arguments left out by all the calls of a program together (each is filled with its default value) | 1,000,000 | Compile error (the rest of the program is not checked) |
+| Errors, and warnings, reported with their whole message and notes | 1,000 of each, a message of at most 2,000 bytes | the later ones keep the first 120 bytes of their message; a list of missing methods or properties names 5 and counts the rest |
+| Brackets and blocks open at once in a file that `phv fmt` formats; the formatted file | 500; 8 MB | Not formatted: the file is left as it is (`phv lsp` answers the formatting request with an error) |
+| The URI of a document (`phv lsp`) | 100,000 bytes, 256 folders | The document is not opened |
+| Files `phv lsp` looks at for references, rename and workspace symbols | 300 files, in 5,000 folders at most 32 deep below the project's `phv.toml`; for a document with no `phv.toml` above it, 200 folders at most 4 deep below its own folder, and none when that is the root of a drive | The other files are not searched; a rename that could not look at every file is refused |
 | Size of the type an alias stands for | 10,000 type nodes (2,000,000 for all uses together) | Compile error |
 | Size of the type of an expression, inferred from the types of others (a generic call, a closure, a list) | 10,000 type nodes (2,000,000 for all expressions together whose types have 100 nodes or more) | Compile error |
 | A bytecode cache entry (`.phv-cache/`) | 256 MB | not written (the program is compiled at each run) |
@@ -3549,6 +3621,11 @@ Planned, in this order. Each release is audited before it is published, as befor
 - **1.3.1 and 1.3.2** (done): faster pages and generators (the JIT reusing property reads in loops and writing list
   elements in place, `yield from` forwarding), the OAuth used-state records shared by a site's servers, and image
   conversion slots, assessed in §31 of the audit.
+- **1.3.3** (done): a faster interpreter and JIT (cheaper drops of values, native code reading a property's
+  elements in place, generators that suspend and resume faster), and the fixes of the audit's §32: the template
+  check, the time limit on the way back out of a recursion and in straight-line code, shared rate limits, appends,
+  Windows file access relative to directory handles, MySQL transactions, and limits in `phv fmt`, the type
+  checker and the language server.
 
 Some features are left out on purpose, because they work against the design principles (§1): `eval`, variable
 variables, static properties and global variables, references (`&$x`), truthiness, `===`, `@`, `goto`, magic

@@ -94,9 +94,9 @@ export function translator(): Translator {
 }
 
 /**
- * The request's locale: the one `set_locale()` chose, or the best of `[i18n]
- * locales` for the request's `Accept-Language` (the default locale outside a
- * request).
+ * The request's locale: the one `set_locale()` chose, or the best of the
+ * `[i18n] locales` for the request's `Accept-Language` (the default locale
+ * outside a request).
  */
 export function locale(): string {
     return __i18n_locale();

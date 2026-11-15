@@ -1,0 +1,13 @@
+<?phv
+// Browsers that take a `<frameset>` (a page with nothing before it but its
+// head) ignore every tag after it but `<frame>`, `<frameset>` and
+// `<noframes>`: also the start tag of a `<textarea>`, whose text they then
+// read as markup, where the checker reads text. The `<frame>` in it would take
+// the value as its URL (found by the 21st assessment, with parse5).
+// `<frameset>` is an error.
+$v = "x";
+?>
+<!doctype html>
+<html><head><title>t</title></head>
+<frameset cols="50%,50%"><textarea><frame src="<?= $v ?>"></textarea></frameset>
+</html>

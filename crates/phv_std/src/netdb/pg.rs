@@ -668,7 +668,70 @@ pub(super) fn refused_statement(text: &str, kind: Kind) -> Option<String> {
     // statement (found by the 19th audit: `/*!99999 x */ XA PREPARE 'x'` was
     // read as `X XA PREPARE`, which a server older than 9.99.99 runs as
     // `XA PREPARE`).
-    readings.iter().find_map(|words| refused_words(words, kind))
+    if let Some(why) = readings.iter().find_map(|words| refused_words(words, kind)) {
+        return Some(why);
+    }
+    // MySQL: a statement that keeps another to run later, when what it keeps
+    // holds the word `XA` anywhere (in a comment or a string too: every way
+    // of reading it counts). Found by the 21st assessment: `CREATE PROCEDURE
+    // p() XA PREPARE 'x'` was accepted, and `CALL p()` then prepared the
+    // transaction, which outlived the script with its locks.
+    if kind == Kind::MySql && readings.iter().any(|words| keeps_a_statement(words, text)) && has_word(text, "XA") {
+        return Some(
+            "an XA statement is not allowed in a procedure, function, trigger or event, nor in a statement \
+             prepared with PREPARE or EXECUTE IMMEDIATE: a transaction prepared there would keep its locks after \
+             the script until XA ROLLBACK or XA COMMIT ends it"
+                .into(),
+        );
+    }
+    None
+}
+
+/// Whether `text` holds `word` (given in upper case) as a whole word, in any
+/// case: between characters that cannot be part of a name. Comments and
+/// strings are read like the rest.
+fn has_word(text: &str, word: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()))
+        .any(|w| w.eq_ignore_ascii_case(word))
+}
+
+/// Whether a MySQL statement that starts with `words` (one reading of
+/// `text`) keeps another statement to run later: `CREATE` or `ALTER` of a
+/// procedure, function, trigger or event, `PREPARE … FROM`, and MariaDB's
+/// `EXECUTE IMMEDIATE`.
+fn keeps_a_statement(words: &[String], text: &str) -> bool {
+    let word = |i: usize| words.get(i).map_or("", String::as_str);
+    match word(0) {
+        "CREATE" | "ALTER" => ["PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"].iter().any(|w| has_word(text, w)),
+        "PREPARE" => true,
+        "EXECUTE" => word(1) == "IMMEDIATE",
+        _ => false,
+    }
+}
+
+/// Whether the MySQL statement `text` ends an XA transaction for good
+/// (`XA COMMIT`, `XA ROLLBACK`), read as `xa_start_id` reads.
+pub(super) fn xa_ends(text: &str) -> bool {
+    let mut words = sql_words(text.trim_matches(|c| is_sql_space(c) || c == ';'));
+    let (first, second) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+    first.eq_ignore_ascii_case("XA")
+        && (second.eq_ignore_ascii_case("COMMIT") || second.eq_ignore_ascii_case("ROLLBACK"))
+}
+
+/// The id of the XA transaction that the MySQL statement `text` starts
+/// (`XA START 'id'`, `XA BEGIN 'id'`): what follows the two words, as
+/// written. None for any other statement, and when a comment stands before
+/// or between the words.
+pub(super) fn xa_start_id(text: &str) -> Option<String> {
+    let t = text.trim_matches(|c| is_sql_space(c) || c == ';');
+    let mut words = sql_words(t);
+    let (first, second) = (words.next()?, words.next()?);
+    let starts = first.eq_ignore_ascii_case("XA")
+        && (second.eq_ignore_ascii_case("START") || second.eq_ignore_ascii_case("BEGIN"));
+    // What follows the second word (a part of `t`).
+    let at = second.as_ptr() as usize - t.as_ptr() as usize + second.len();
+    let id = t[at..].trim_matches(is_sql_space);
+    (starts && !id.is_empty()).then(|| id.to_string())
 }
 
 /// Distinct versions of versioned comments a MySQL statement may start with
@@ -765,8 +828,9 @@ fn refused_words(words: &[String], kind: Kind) -> Option<String> {
              until XA ROLLBACK or XA COMMIT ends it"
                 .into(),
         ),
-        Kind::MySql if two == ("LOAD", "DATA") && words.iter().any(|w| w == "LOCAL") => {
-            Some("LOAD DATA LOCAL INFILE is not allowed: it would send the server a file of this host".into())
+        // `LOAD XML` reads a file of the client the same way (21st assessment).
+        Kind::MySql if matches!(two, ("LOAD", "DATA" | "XML")) && words.iter().any(|w| w == "LOCAL") => {
+            Some(format!("LOAD {} LOCAL INFILE is not allowed: it would send the server a file of this host", two.1))
         }
         Kind::Postgres if two == ("PREPARE", "TRANSACTION") => Some(
             "PREPARE TRANSACTION is not allowed: a prepared transaction would keep its locks after the script \

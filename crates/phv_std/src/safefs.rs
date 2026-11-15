@@ -115,7 +115,7 @@ impl DirGuard {
     /// Opens `name` for reading, or for writing (created if missing, emptied if present).
     pub fn open(&self, name: &OsStr, write: bool) -> Result<File, FsError> {
         let f = imp::open_file(self, name, write)?;
-        check_plain(&f)?;
+        self.check_own(&f, name)?;
         if write {
             f.set_len(0)?;
         }
@@ -128,13 +128,46 @@ impl DirGuard {
     }
 
     /// Fails if `name` exists and is not a plain file (a link, a hard link, a directory).
+    ///
+    /// A file that is being deleted is missing: SQLite removes its journal
+    /// when a transaction ends, while other requests look at it here. On
+    /// Windows such a file stays in the directory until its last handle is
+    /// closed (this check's own, in another request) and cannot be opened
+    /// meanwhile: the name is then looked at again, a few milliseconds at
+    /// most (audit 21: 54 of 12,000 `Database::open()` of a file other
+    /// requests were writing to failed with "permission denied" or "several
+    /// hard links"). A file whose access is really denied is still refused.
     pub fn check_plain_or_missing(&self, name: &OsStr) -> Result<(), FsError> {
+        let mut looks = 0;
+        loop {
+            match self.plain_or_missing(name) {
+                Err(FsError::Io(e)) if looks < 3 && imp::may_be_deleting(&e) => {
+                    looks += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(looks));
+                }
+                r => return r,
+            }
+        }
+    }
+
+    fn plain_or_missing(&self, name: &OsStr) -> Result<(), FsError> {
         if !self.exists(name)? {
             return Ok(());
         }
         match imp::open_file(self, name, false) {
-            Ok(f) => check_plain(&f),
-            // Deleted meanwhile (SQLite removes its journal when a transaction ends).
+            Ok(f) => {
+                let meta = f.metadata()?;
+                if !meta.is_file() {
+                    return Err(FsError::NotFile);
+                }
+                // The count is read once. No link at all: deleted after it
+                // was opened (a hard link of something has two or more).
+                match imp::link_count(&f, &meta)? {
+                    0 | 1 => Ok(()),
+                    _ => Err(FsError::HardLink),
+                }
+            }
+            // Deleted meanwhile.
             Err(FsError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
@@ -154,13 +187,34 @@ impl DirGuard {
         imp::remove(self, name)
     }
 
-    /// Opens `name` for appending (created if missing).
+    /// Opens `name` for appending (created if missing). The operating system
+    /// puts every write at the end of the file as it is at that moment
+    /// (`O_APPEND`, `FILE_APPEND_DATA`), so scripts, job runners and server
+    /// processes appending to one file at once each add their text whole
+    /// (found by the 21st assessment: the file was opened for writing and
+    /// positioned at its end once, so two writers wrote at the same offset
+    /// and one's lines were lost or cut). Checked as any file opened for
+    /// writing is.
     pub fn open_append(&self, name: &OsStr) -> Result<File, FsError> {
-        use std::io::Seek;
-        let mut f = imp::open_file(self, name, true)?;
-        check_plain(&f)?;
-        f.seek(io::SeekFrom::End(0))?;
+        let f = imp::open_append(self, name)?;
+        self.check_own(&f, name)?;
         Ok(f)
+    }
+
+    /// `f`, opened as `name` here, is a regular file whose one link is that
+    /// name. The count alone does not say so: a name that was a hard link to
+    /// a file elsewhere when it was opened, and was removed right after,
+    /// leaves the file with one link, the one elsewhere (found by the 21st
+    /// assessment: a process allowed to write in the directory and to link
+    /// the other file made a few of 20,000 appends land in it). On Windows
+    /// the system gives the file's links with their directories in one
+    /// answer; on Unix the name is looked at again, which leaves a much
+    /// narrower race to a process that can link the file (with the kernel's
+    /// `protected_hardlinks`, the default, only its owner or one who may
+    /// write it anyway).
+    fn check_own(&self, f: &File, name: &OsStr) -> Result<(), FsError> {
+        check_plain(f)?;
+        imp::sole_link(self, f, name)
     }
 
     /// Creates the directory `name` here; an existing directory is fine.
@@ -185,7 +239,7 @@ impl DirGuard {
 
     /// Moves the plain file `name` to `to_name` in `to` (replacing a plain file there).
     pub fn rename_to(&self, name: &OsStr, to: &DirGuard, to_name: &OsStr) -> Result<(), FsError> {
-        check_plain(&imp::open_file(self, name, false)?)?;
+        self.check_own(&imp::open_file(self, name, false)?, name)?;
         to.check_plain_or_missing(to_name)?;
         imp::rename(self, name, to, to_name)
     }
@@ -482,7 +536,15 @@ mod imp {
     }
 
     pub fn open_file(g: &DirGuard, name: &OsStr, write: bool) -> Result<File, FsError> {
-        let access = if write { libc::O_WRONLY | libc::O_CREAT } else { libc::O_RDONLY };
+        open_with(g, name, if write { libc::O_WRONLY | libc::O_CREAT } else { libc::O_RDONLY })
+    }
+
+    /// `open_file` for writing, with every write put at the end of the file.
+    pub fn open_append(g: &DirGuard, name: &OsStr) -> Result<File, FsError> {
+        open_with(g, name, libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND)
+    }
+
+    fn open_with(g: &DirGuard, name: &OsStr, access: libc::c_int) -> Result<File, FsError> {
         // O_NONBLOCK: opening a FIFO must not hang (it is then refused as not a file).
         let flags = access | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_NONBLOCK;
         openat(g.dir.as_raw_fd(), name, flags).map_err(|e| match e.raw_os_error() {
@@ -539,6 +601,32 @@ mod imp {
 
     pub fn link_count(_: &File, meta: &std::fs::Metadata) -> Result<u64, FsError> {
         Ok(meta.nlink())
+    }
+
+    /// See `DirGuard::check_own`: the name still names the opened file, and
+    /// the file has that one link. A file deleted or replaced since it was
+    /// opened (no link left) is fine, as before: it is nobody else's.
+    pub fn sole_link(g: &DirGuard, f: &File, name: &OsStr) -> Result<(), FsError> {
+        let c = cstr(name)?;
+        let opened = f.metadata()?;
+        // SAFETY: `st` is plain data filled by fstatat; the result is checked.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::fstatat(g.dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+        #[allow(clippy::unnecessary_cast)] // the types differ between platforms
+        let same = r == 0 && st.st_dev as u64 == opened.dev() && st.st_ino as u64 == opened.ino();
+        if same && st.st_nlink == 1 {
+            return Ok(());
+        }
+        // Not under its name any more: deleted or replaced, unless it still has a link somewhere.
+        if !same && f.metadata()?.nlink() == 0 {
+            return Ok(());
+        }
+        Err(FsError::HardLink)
+    }
+
+    /// See the Windows one: here a deleted file's name is gone at once.
+    pub fn may_be_deleting(_: &io::Error) -> bool {
+        false
     }
 
     pub fn make_dir(g: &DirGuard, name: &OsStr) -> Result<(), FsError> {
@@ -610,11 +698,14 @@ mod imp {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::{Path, PathBuf};
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Storage::FileSystem::{
-        FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-        GetLongPathNameW, BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO,
+        FileBasicInfo, FileDispositionInfo, FileDispositionInfoEx, FileFullDirectoryInfo, FileFullDirectoryRestartInfo,
+        GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetLongPathNameW,
+        SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_DISPOSITION_INFO,
+        FILE_DISPOSITION_INFO_EX, FILE_FULL_DIR_INFO, FILE_RENAME_INFO,
     };
 
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -625,8 +716,168 @@ mod imp {
     const ATTR_DIRECTORY: u32 = 0x10;
     const ATTR_REPARSE_POINT: u32 = 0x400;
 
-    /// Opens a directory and holds it: without FILE_SHARE_DELETE nobody can
-    /// rename, delete or replace it while the handle is open.
+    // What `NtCreateFile` takes (ntdll): the access wanted, what to do when
+    // the name exists or not, and how to open it.
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    /// What `OpenOptions::append` asks for: every write right but FILE_WRITE_DATA.
+    const APPEND_ONLY: u32 = 0x0012_0116 & !0x2;
+    const FILE_OPEN: u32 = 1;
+    const FILE_CREATE: u32 = 2;
+    const FILE_OPEN_IF: u32 = 3;
+    const FILE_DIRECTORY_FILE: u32 = 0x1;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
+    const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x4000;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+    const STATUS_FILE_IS_A_DIRECTORY: i32 = 0xC000_00BAu32 as i32;
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *const u16,
+    }
+
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: HANDLE,
+        object_name: *const UnicodeString,
+        attributes: u32,
+        security_descriptor: *const std::ffi::c_void,
+        security_quality_of_service: *const std::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: isize,
+        information: usize,
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtCreateFile(
+            handle: *mut HANDLE,
+            access: u32,
+            attributes: *const ObjectAttributes,
+            status: *mut IoStatusBlock,
+            allocation_size: *const i64,
+            file_attributes: u32,
+            share: u32,
+            disposition: u32,
+            options: u32,
+            ea: *const std::ffi::c_void,
+            ea_length: u32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+        fn NtQueryInformationFile(
+            handle: HANDLE,
+            status: *mut IoStatusBlock,
+            information: *mut std::ffi::c_void,
+            length: u32,
+            class: u32,
+        ) -> i32;
+        fn NtSetInformationFile(
+            handle: HANDLE,
+            status: *mut IoStatusBlock,
+            information: *const std::ffi::c_void,
+            length: u32,
+            class: u32,
+        ) -> i32;
+    }
+
+    /// Why `open_at` failed: the error as the Win32 calls give it, and
+    /// whether the name is a directory where a file was asked for.
+    struct OpenAtError {
+        error: io::Error,
+        is_directory: bool,
+    }
+
+    /// An error of `open_at` as the callers report it. The system refuses to
+    /// open anything relative to a directory that has become a link since its
+    /// handle was opened (ERROR_CANT_RESOLVE_FILENAME): that is a link on the
+    /// way, like any other.
+    fn link_or_io(e: io::Error) -> FsError {
+        if e.raw_os_error() == Some(1921) {
+            FsError::Link
+        } else {
+            FsError::Io(e)
+        }
+    }
+
+    /// Opens the entry `name` of the open directory `dir`, relative to its
+    /// handle: the system looks the one name up in that very directory, so
+    /// nothing that happens to the directory's path meanwhile (found by the
+    /// 21st assessment: an empty subdirectory given a junction's reparse
+    /// point in place, while its handle was held, sent a file opened by path
+    /// to the junction's target; `mk1` lines were appended outside the
+    /// permitted directory) can lead the open elsewhere. The entry itself is
+    /// opened, never what it links to (`FILE_OPEN_REPARSE_POINT`); the callers
+    /// refuse a link. `name` is one component (`valid_name`).
+    fn open_at(
+        dir: &File,
+        name: &OsStr,
+        access: u32,
+        share: u32,
+        disposition: u32,
+        options: u32,
+    ) -> Result<File, OpenAtError> {
+        let fail = |error: io::Error| OpenAtError { error, is_directory: false };
+        let wide: Vec<u16> = name.encode_wide().collect();
+        let bytes = u16::try_from(wide.len() * 2).map_err(|_| fail(io::ErrorKind::InvalidInput.into()))?;
+        if wide.is_empty() || wide.iter().any(|c| *c == b'\\' as u16 || *c == b'/' as u16 || *c == 0) {
+            return Err(fail(io::ErrorKind::InvalidInput.into()));
+        }
+        let object_name = UnicodeString { length: bytes, maximum_length: bytes, buffer: wide.as_ptr() };
+        let attributes = ObjectAttributes {
+            length: std::mem::size_of::<ObjectAttributes>() as u32,
+            root_directory: dir.as_raw_handle() as HANDLE,
+            object_name: &object_name,
+            attributes: OBJ_CASE_INSENSITIVE,
+            security_descriptor: std::ptr::null(),
+            security_quality_of_service: std::ptr::null(),
+        };
+        let mut handle: HANDLE = std::ptr::null_mut();
+        let mut io_status = IoStatusBlock { status: 0, information: 0 };
+        // SAFETY: every pointer is to a live value of the type the call takes;
+        // `wide` outlives the call; the handle is owned by the `File` below.
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                // As `CreateFileW` adds them: to wait for its I/O, and to read what it is.
+                access | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+                &attributes,
+                &mut io_status,
+                std::ptr::null(),
+                0x80, // FILE_ATTRIBUTE_NORMAL, for a file it creates
+                share,
+                disposition,
+                options | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            // SAFETY: a plain conversion of the status.
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(OpenAtError {
+                error: io::Error::from_raw_os_error(code as i32),
+                is_directory: status == STATUS_FILE_IS_A_DIRECTORY,
+            });
+        }
+        // SAFETY: a handle the call just opened, owned by nothing else.
+        Ok(unsafe { File::from_raw_handle(handle as _) })
+    }
+
+    /// Opens a directory by its path and holds it: without FILE_SHARE_DELETE
+    /// nobody can rename, delete or replace it while the handle is open. Only
+    /// for the permitted directory itself (`open_base`): what is below it is
+    /// opened relative to its parent's handle (`open_at`).
     fn open_dir(path: &Path, follow: bool) -> Result<File, FsError> {
         let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
         if !follow {
@@ -689,8 +940,31 @@ mod imp {
         Ok((f, path))
     }
 
-    pub fn open_subdir(_dir: &File, path: &Path, name: &OsStr) -> Result<File, FsError> {
-        let f = open_dir(&path.join(name), false)?;
+    /// The subdirectory `name` of the open directory `dir`, held like it
+    /// (see `open_dir`), opened relative to `dir`'s handle.
+    pub fn open_subdir(dir: &File, _path: &Path, name: &OsStr) -> Result<File, FsError> {
+        let f = open_at(
+            dir,
+            name,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            FILE_OPEN_FOR_BACKUP_INTENT,
+        )
+        .map_err(|e| {
+            if e.error.kind() == io::ErrorKind::NotFound {
+                FsError::NoDir
+            } else {
+                link_or_io(e.error)
+            }
+        })?;
+        let attrs = f.metadata()?.file_attributes();
+        if attrs & ATTR_REPARSE_POINT != 0 {
+            return Err(FsError::Link);
+        }
+        if attrs & ATTR_DIRECTORY == 0 {
+            return Err(FsError::NoDir);
+        }
         check_real_name(&f, name)?;
         Ok(f)
     }
@@ -741,12 +1015,12 @@ mod imp {
             .open(path)?)
     }
 
+    const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
     /// Opens an entry only to read its attributes and real name.
     fn open_entry(g: &DirGuard, name: &OsStr) -> io::Result<File> {
-        OpenOptions::new()
-            .access_mode(0x80) // FILE_READ_ATTRIBUTES
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(g.path.join(name))
+        open_at(&g.dir, name, FILE_READ_ATTRIBUTES, SHARE_ALL, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT)
+            .map_err(|e| e.error)
     }
 
     pub fn check_not_shared(_: &File) -> Result<(), FsError> {
@@ -754,19 +1028,28 @@ mod imp {
     }
 
     pub fn open_file(g: &DirGuard, name: &OsStr, write: bool) -> Result<File, FsError> {
-        let mut o = OpenOptions::new();
         if write {
-            o.write(true).create(true);
+            open_with(g, name, GENERIC_WRITE, FILE_OPEN_IF)
         } else {
-            o.read(true);
+            open_with(g, name, GENERIC_READ, FILE_OPEN)
         }
+    }
+
+    /// `open_file` for writing, with every write put at the end of the file
+    /// (the handle may append and nothing else: `FILE_APPEND_DATA`).
+    pub fn open_append(g: &DirGuard, name: &OsStr) -> Result<File, FsError> {
+        open_with(g, name, APPEND_ONLY, FILE_OPEN_IF)
+    }
+
+    /// Opens the file `name` of the guard's directory, relative to the
+    /// directory's handle (`open_at`), never by its path.
+    fn open_with(g: &DirGuard, name: &OsStr, access: u32, disposition: u32) -> Result<File, FsError> {
         // The link itself is opened, never its target, and then refused.
-        o.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        let f = o.open(g.path.join(name)).map_err(|e| {
-            if e.raw_os_error() == Some(5) && g.path.join(name).is_dir() {
+        let f = open_at(&g.dir, name, access, SHARE_ALL, disposition, FILE_NON_DIRECTORY_FILE).map_err(|e| {
+            if e.is_directory {
                 FsError::NotFile
             } else {
-                FsError::Io(e)
+                link_or_io(e.error)
             }
         })?;
         if f.metadata()?.file_attributes() & ATTR_REPARSE_POINT != 0 {
@@ -780,7 +1063,7 @@ mod imp {
         let f = match open_entry(g, name) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(FsError::Io(e)),
+            Err(e) => return Err(link_or_io(e)),
         };
         if f.metadata()?.file_attributes() & ATTR_REPARSE_POINT != 0 {
             return Err(FsError::Link);
@@ -796,7 +1079,7 @@ mod imp {
         let f = match open_entry(g, name) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(FsError::Io(e)),
+            Err(e) => return Err(link_or_io(e)),
         };
         let attrs = f.metadata()?.file_attributes();
         if attrs & ATTR_REPARSE_POINT != 0 {
@@ -822,39 +1105,161 @@ mod imp {
         Ok(Some(super::FileId(u64::from(info.dwVolumeSerialNumber), index)))
     }
 
-    pub fn remove(g: &DirGuard, name: &OsStr) -> Result<(), FsError> {
-        // The directory is pinned, so the name still means the checked entry.
-        let f = open_entry(g, name)?;
+    /// Opens the file `name` to delete or move it: the entry itself, by the
+    /// directory's handle, under its own name.
+    fn open_to_move(g: &DirGuard, name: &OsStr) -> Result<File, FsError> {
+        let f = open_at(&g.dir, name, DELETE | FILE_READ_ATTRIBUTES, SHARE_ALL, FILE_OPEN, FILE_NON_DIRECTORY_FILE)
+            .map_err(|e| link_or_io(e.error))?;
         check_real_name(&f, name)?;
-        drop(f);
-        Ok(std::fs::remove_file(g.path.join(name))?)
+        Ok(f)
     }
 
-    /// The directories on the way are held open without FILE_SHARE_DELETE, so
-    /// the path still names the checked directory.
+    /// Deletes the very entry that was opened and checked, through its handle
+    /// (as `std::fs::remove_file` does it: at once, also when others have the
+    /// file open; on a file system without that, when the last handle closes).
+    pub fn remove(g: &DirGuard, name: &OsStr) -> Result<(), FsError> {
+        let f = open_to_move(g, name)?;
+        let h = f.as_raw_handle() as HANDLE;
+        // FILE_DISPOSITION_FLAG_DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE
+        let ex = FILE_DISPOSITION_INFO_EX { Flags: 0x1 | 0x2 | 0x10 };
+        let size = std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32;
+        // SAFETY: `ex` and `plain` are plain data of the size given; the handle is open.
+        if unsafe { SetFileInformationByHandle(h, FileDispositionInfoEx, (&raw const ex).cast(), size) } != 0 {
+            return Ok(());
+        }
+        let plain = FILE_DISPOSITION_INFO { DeleteFile: true };
+        let size = std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32;
+        if unsafe { SetFileInformationByHandle(h, FileDispositionInfo, (&raw const plain).cast(), size) } == 0 {
+            return Err(FsError::Io(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Creates the directory `name` in the guard's directory, by its handle.
     pub fn make_dir(g: &DirGuard, name: &OsStr) -> Result<(), FsError> {
-        Ok(std::fs::create_dir(g.path.join(name))?)
+        open_at(&g.dir, name, GENERIC_READ, SHARE_ALL, FILE_CREATE, FILE_DIRECTORY_FILE)
+            .map(drop)
+            .map_err(|e| link_or_io(e.error))
     }
 
+    /// The names of the files and directories of the open directory, read
+    /// through its own handle, never by its path; links are left out.
     pub fn entries(g: &DirGuard) -> Result<Vec<String>, FsError> {
+        let h = g.dir.as_raw_handle() as HANDLE;
         let mut names = Vec::new();
-        for e in std::fs::read_dir(&g.path)?.flatten() {
-            let Ok(meta) = e.metadata() else { continue };
-            if meta.file_attributes() & ATTR_REPARSE_POINT != 0 {
-                continue;
+        // Aligned for the entries, which start with a 32-bit offset and hold 64-bit times.
+        let mut buf = vec![0u64; 8192];
+        let bytes = (buf.len() * 8) as u32;
+        let name_at = std::mem::offset_of!(FILE_FULL_DIR_INFO, FileName);
+        let mut class = FileFullDirectoryRestartInfo;
+        loop {
+            // SAFETY: the buffer is `bytes` long and aligned; the handle is open.
+            if unsafe { GetFileInformationByHandleEx(h, class, buf.as_mut_ptr().cast(), bytes) } == 0 {
+                let e = io::Error::last_os_error();
+                // ERROR_NO_MORE_FILES; an empty directory answers ERROR_FILE_NOT_FOUND to the first call.
+                return match e.raw_os_error() {
+                    Some(18) | Some(2) => Ok(names),
+                    _ => Err(FsError::Io(e)),
+                };
             }
-            if let (true, Some(n)) = (meta.is_file() || meta.is_dir(), e.file_name().to_str()) {
-                names.push(n.to_string());
+            class = FileFullDirectoryInfo;
+            let base = buf.as_ptr().cast::<u8>();
+            let mut at = 0usize;
+            loop {
+                // SAFETY: the system filled the buffer with entries, each
+                // starting at an offset it gave, inside the buffer.
+                let entry = unsafe { &*base.add(at).cast::<FILE_FULL_DIR_INFO>() };
+                let len = (entry.FileNameLength as usize / 2).min((bytes as usize - at - name_at) / 2);
+                let wide = unsafe { std::slice::from_raw_parts(base.add(at + name_at).cast::<u16>(), len) };
+                if entry.FileAttributes & ATTR_REPARSE_POINT == 0 {
+                    if let Ok(name) = String::from_utf16(wide) {
+                        if name != "." && name != ".." {
+                            names.push(name);
+                        }
+                    }
+                }
+                let next = entry.NextEntryOffset as usize;
+                if next == 0 || at + next + name_at > bytes as usize {
+                    break;
+                }
+                at += next;
             }
         }
-        Ok(names)
     }
 
+    /// Moves the very entry that was opened and checked, through its handle,
+    /// to the name `to_name` of the directory `to` holds open (given by its
+    /// handle, not its path), replacing a file of that name.
     pub fn rename(from: &DirGuard, name: &OsStr, to: &DirGuard, to_name: &OsStr) -> Result<(), FsError> {
-        let f = open_entry(from, name)?;
-        check_real_name(&f, name)?;
-        drop(f);
-        Ok(std::fs::rename(from.path.join(name), to.path.join(to_name))?)
+        let f = open_to_move(from, name)?;
+        let wide: Vec<u16> = to_name.encode_wide().collect();
+        let name_at = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let size = name_at + wide.len() * 2 + 2;
+        let mut buf = vec![0u64; size.div_ceil(8) + 1];
+        let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let mut io_status = IoStatusBlock { status: 0, information: 0 };
+        // The system's own call, not `SetFileInformationByHandle`, which reads
+        // the name as a path and takes no directory handle.
+        // SAFETY: the buffer is aligned and large enough for the structure
+        // and the name after it; both handles are open. 10: FileRenameInformation.
+        let status = unsafe {
+            (*info).Anonymous.ReplaceIfExists = true;
+            (*info).RootDirectory = to.dir.as_raw_handle() as HANDLE;
+            (*info).FileNameLength = (wide.len() * 2) as u32;
+            std::ptr::copy_nonoverlapping(
+                wide.as_ptr(),
+                buf.as_mut_ptr().cast::<u8>().add(name_at).cast::<u16>(),
+                wide.len(),
+            );
+            NtSetInformationFile(f.as_raw_handle() as HANDLE, &mut io_status, info.cast(), size as u32, 10)
+        };
+        if status < 0 {
+            // SAFETY: a plain conversion of the status.
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(FsError::Io(io::Error::from_raw_os_error(code as i32)));
+        }
+        Ok(())
+    }
+
+    /// See `DirGuard::check_own`: the system lists the file's links, each
+    /// with the directory it is in, in one answer (`FileHardLinkInformation`):
+    /// there must be one, `name` in the guard's directory. A file system
+    /// without hard links (FAT, exFAT) does not answer; there the count
+    /// `check_plain` read is all there is.
+    pub fn sole_link(g: &DirGuard, f: &File, name: &OsStr) -> Result<(), FsError> {
+        // FILE_LINKS_INFORMATION: BytesNeeded, EntriesReturned, then entries of
+        // NextEntryOffset, ParentFileId (at 8), FileNameLength (at 16, in
+        // characters) and the name (at 20).
+        let mut buf = vec![0u64; 512];
+        let mut io_status = IoStatusBlock { status: 0, information: 0 };
+        // SAFETY: the buffer is as long as said and aligned; the handle is open. 46: FileHardLinkInformation.
+        let status = unsafe {
+            NtQueryInformationFile(f.as_raw_handle() as HANDLE, &mut io_status, buf.as_mut_ptr().cast(), 4096, 46)
+        };
+        // STATUS_BUFFER_OVERFLOW: more links than fit, so more than one.
+        if status == 0x8000_0005u32 as i32 {
+            return Err(FsError::HardLink);
+        }
+        if status < 0 {
+            return Ok(());
+        }
+        let entries = (buf[0] >> 32) as u32;
+        let parent = buf[2] as i64;
+        let len = (buf[3] as u32 as usize).min(255);
+        // SAFETY: the name starts 28 bytes into the buffer and is `len` characters, within it.
+        let wide = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>().add(28).cast::<u16>(), len) };
+        // SAFETY: `info` is plain data filled by the call; the handle is open.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(g.dir.as_raw_handle(), &mut info) } == 0 {
+            return Err(FsError::Io(io::Error::last_os_error()));
+        }
+        let dir = ((u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)) as i64;
+        let own = String::from_utf16_lossy(wide).to_lowercase() == name.to_string_lossy().to_lowercase();
+        if entries == 1 && parent == dir && own {
+            Ok(())
+        } else {
+            Err(FsError::HardLink)
+        }
     }
 
     pub fn link_count(f: &File, _: &std::fs::Metadata) -> Result<u64, FsError> {
@@ -864,6 +1269,14 @@ mod imp {
             return Err(FsError::Io(io::Error::last_os_error()));
         }
         Ok(info.nNumberOfLinks as u64)
+    }
+
+    /// Whether opening a file failed the way it does while the file is being
+    /// deleted (deleted with a handle still open on it): ERROR_ACCESS_DENIED.
+    /// A file whose access is denied for another reason fails the same way,
+    /// so the caller looks again and takes the answer it then gets.
+    pub fn may_be_deleting(e: &io::Error) -> bool {
+        e.raw_os_error() == Some(5)
     }
 
     pub fn stamp(f: &File) -> io::Result<super::Stamp> {
@@ -1400,6 +1813,222 @@ mod tests {
     /// time then put back, has another stamp: the change time (also on
     /// Windows, where it was left out) sees the rewrite. The loader's memo
     /// took the two for the same file and served the old page.
+    /// Gives the existing empty directory `dir` a junction's reparse point
+    /// to `target`, in place (what `mklink /J` does after making the
+    /// directory): a handle held on the directory does not prevent it.
+    #[cfg(windows)]
+    fn make_junction_in_place(dir: &Path, target: &Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn DeviceIoControl(
+                device: *mut std::ffi::c_void,
+                code: u32,
+                input: *const std::ffi::c_void,
+                input_len: u32,
+                output: *mut std::ffi::c_void,
+                output_len: u32,
+                returned: *mut u32,
+                overlapped: *mut std::ffi::c_void,
+            ) -> i32;
+        }
+        // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+        let Ok(h) = std::fs::OpenOptions::new().write(true).custom_flags(0x0200_0000 | 0x0020_0000).open(dir) else {
+            return false;
+        };
+        let target = target.to_string_lossy().trim_start_matches(r"\\?\").to_string();
+        let wide = |t: &str| std::ffi::OsStr::new(t).encode_wide().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        let (substitute, print) = (wide(&format!(r"\??\{target}")), wide(&target));
+        let mut paths = substitute.clone();
+        paths.extend([0, 0]);
+        paths.extend(&print);
+        paths.extend([0, 0]);
+        // IO_REPARSE_TAG_MOUNT_POINT and its data: the lengths and offsets of the two names.
+        let mut buf = 0xA000_0003u32.to_le_bytes().to_vec();
+        for n in [paths.len() + 8, 0, 0, substitute.len(), substitute.len() + 2, print.len()] {
+            buf.extend((n as u16).to_le_bytes());
+        }
+        buf.extend(&paths);
+        let mut returned = 0u32;
+        // SAFETY: the buffer is as long as said; the handle is open. FSCTL_SET_REPARSE_POINT.
+        let done = unsafe {
+            DeviceIoControl(
+                h.as_raw_handle().cast(),
+                0x900A4,
+                buf.as_ptr().cast(),
+                buf.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        done != 0
+    }
+
+    /// A directory that becomes a junction while a guard holds it (an empty
+    /// directory can be given a reparse point in place) does not lead any
+    /// file function to the junction's target: every entry is opened,
+    /// created, listed, moved and deleted through the directory's handle
+    /// (21st assessment: files were opened by path, and `mk1` lines were
+    /// appended to, and a file read and overwritten, outside the permitted
+    /// directory).
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_turned_into_a_junction_does_not_lead_outside() {
+        let d = tmp("junction-in-place");
+        let (base, outside) = (d.join("data"), d.join("outside").canonicalize().unwrap());
+        std::fs::write(outside.join("r.txt"), "secret2").unwrap();
+        std::fs::write(outside.join("moved.txt"), "keep").unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        std::fs::write(base.join("other/mine.txt"), "mine").unwrap();
+        // The guard is on the real, empty directory; then it becomes a junction.
+        let (g, name) = open_parent(&base, Path::new("sub/r.txt")).unwrap();
+        let (other, mine) = open_parent(&base, Path::new("other/mine.txt")).unwrap();
+        if !make_junction_in_place(&base.join("sub"), &outside) {
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        assert_eq!(
+            std::fs::read(base.join("sub/r.txt")).unwrap(),
+            b"secret2",
+            "by its path, the junction leads outside"
+        );
+        let names = |v: &[&str]| v.iter().map(|n| OsString::from(*n)).collect::<Vec<_>>();
+        let unknown = names(&["new.txt", "newdir", "moved.txt"]);
+        // Nothing of the target is seen through the guard, and nothing is made in it.
+        assert!(matches!(g.exists(&name), Err(FsError::Link)), "the outside file is not seen");
+        assert!(matches!(g.open(&name, false), Err(FsError::Link)), "read");
+        assert!(matches!(g.plain_file_id(&name), Err(FsError::Link)));
+        assert!(g.entries().is_ok_and(|e| e.is_empty()), "the outside names are not listed");
+        assert!(g.remove(&name).is_err(), "delete");
+        let _ = g.open(&name, true).map(|mut f| f.write_all(b"mk1w"));
+        let _ = g.open_append(&name).map(|mut f| f.write_all(b"mk1"));
+        let _ = g.open(&unknown[0], true).map(|mut f| f.write_all(b"mk1"));
+        let _ = g.make_dir(&unknown[1]);
+        assert!(other.rename_to(&mine, &g, &unknown[2]).is_err(), "a move into it");
+        assert!(g.rename_to(&name, &other, &unknown[2]).is_err(), "a move out of it");
+        assert_eq!(std::fs::read(outside.join("r.txt")).unwrap(), b"secret2");
+        assert_eq!(std::fs::read(outside.join("moved.txt")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(base.join("other/mine.txt")).unwrap(), b"mine");
+        let mut left: Vec<_> = std::fs::read_dir(&outside).unwrap().flatten().map(|e| e.file_name()).collect();
+        left.sort();
+        assert_eq!(left, names(&["moved.txt", "r.txt", "secret.txt"]), "nothing was added outside");
+        drop((g, other));
+        // A guard asked for afterwards refuses the junction.
+        assert!(matches!(open_parent(&base, Path::new("sub/r.txt")), Err(FsError::Link)));
+        let _ = std::fs::remove_dir(base.join("sub"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// On Unix every entry is reached from its directory's descriptor: a
+    /// directory swapped for a link to another one while a guard holds it
+    /// leads nothing there (the guard stays on the directory it opened), and
+    /// a guard asked for afterwards refuses the link (checked for the 21st
+    /// assessment, which found the Windows side opening by path).
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_for_a_symlink_does_not_lead_outside() {
+        let d = tmp("swapped");
+        let (base, outside) = (d.join("data"), d.join("outside"));
+        std::fs::write(outside.join("r.txt"), "secret2").unwrap();
+        let (g, name) = open_parent(&base, Path::new("sub/r.txt")).unwrap();
+        std::fs::rename(base.join("sub"), base.join("was-sub")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("sub")).unwrap();
+        assert_eq!(std::fs::read(base.join("sub/r.txt")).unwrap(), b"secret2", "by its path, the link leads outside");
+        assert!(!g.exists(&name).unwrap());
+        assert!(g.open(&name, false).is_err());
+        assert!(g.entries().unwrap().is_empty());
+        g.open(&name, true).unwrap().write_all(b"mk1w").unwrap();
+        g.open_append(&name).unwrap().write_all(b"mk1").unwrap();
+        g.make_dir(OsStr::new("newdir")).unwrap();
+        assert_eq!(std::fs::read(outside.join("r.txt")).unwrap(), b"secret2");
+        assert_eq!(std::fs::read(base.join("was-sub/r.txt")).unwrap(), b"mk1wmk1");
+        let mut left: Vec<_> = std::fs::read_dir(&outside).unwrap().flatten().map(|e| e.file_name()).collect();
+        left.sort();
+        assert_eq!(left, [OsString::from("r.txt"), OsString::from("secret.txt")], "nothing was added outside");
+        drop(g);
+        assert!(matches!(open_parent(&base, Path::new("sub/r.txt")), Err(FsError::Link)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The file functions on an ordinary directory, all through its handle:
+    /// make, list, move (also over a file, and to another directory), delete.
+    #[test]
+    fn entries_are_made_listed_moved_and_deleted() {
+        let d = tmp("entries");
+        let base = d.join("data");
+        let (g, a) = open_parent(&base, Path::new("sub/a.txt")).unwrap();
+        let (top, b) = open_parent(&base, Path::new("b.txt")).unwrap();
+        let os = |n: &str| OsString::from(n);
+        assert!(g.entries().unwrap().is_empty());
+        g.open(&a, true).unwrap().write_all(b"one").unwrap();
+        g.make_dir(&os("inner")).unwrap();
+        g.make_dir(&os("inner")).unwrap();
+        assert!(g.make_dir(&a).is_err(), "a file of that name");
+        assert_eq!(g.entries().unwrap(), ["a.txt", "inner"]);
+        // Many entries: more than one buffer of names.
+        for i in 0..600 {
+            g.open(&os(&format!("file-with-a-rather-long-name-{i:04}.txt")), true).unwrap();
+        }
+        assert_eq!(g.entries().unwrap().len(), 602);
+        for i in 0..600 {
+            g.remove(&os(&format!("file-with-a-rather-long-name-{i:04}.txt"))).unwrap();
+        }
+        // A move to another directory, then over an existing file.
+        top.open(&b, true).unwrap().write_all(b"old").unwrap();
+        g.rename_to(&a, &top, &os("c.txt")).unwrap();
+        assert_eq!(std::fs::read(base.join("c.txt")).unwrap(), b"one");
+        top.rename_to(&os("c.txt"), &top, &b).unwrap();
+        assert_eq!(std::fs::read(base.join("b.txt")).unwrap(), b"one");
+        assert_eq!(top.entries().unwrap(), ["b.txt", "sub"]);
+        assert_eq!(g.entries().unwrap(), ["inner"]);
+        assert!(g.remove(&a).is_err(), "it is gone");
+        assert!(top.remove(&os("sub")).is_err(), "a directory is not deleted as a file");
+        top.remove(&b).unwrap();
+        assert!(!top.exists(&b).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A name that was a hard link to a file elsewhere when it was opened,
+    /// and is removed right after, leaves that file with one link: the count
+    /// alone would let the write through (21st assessment). The opened file
+    /// must have its one link here, under the name it was opened by.
+    #[test]
+    fn a_hard_link_removed_after_the_open_is_still_refused() {
+        let d = tmp("hard-then-gone");
+        let base = d.join("data");
+        if std::fs::hard_link(d.join("outside/secret.txt"), base.join("hard.txt")).is_err() {
+            return;
+        }
+        let (g, name) = open_parent(&base, Path::new("hard.txt")).unwrap();
+        let f = imp::open_append(&g, &name).unwrap();
+        assert!(matches!(g.check_own(&f, &name), Err(FsError::HardLink)), "two links");
+        // The link in the permitted directory goes: one link is left, the one outside.
+        std::fs::remove_file(base.join("hard.txt")).unwrap();
+        assert!(check_plain(&f).is_ok(), "the count alone lets it through");
+        assert!(matches!(g.check_own(&f, &name), Err(FsError::HardLink)));
+        // Another file takes the name: still not the one that was opened.
+        std::fs::write(base.join("hard.txt"), "new").unwrap();
+        assert!(matches!(g.check_own(&f, &name), Err(FsError::HardLink)));
+        drop(f);
+        // A plain file is its own, also under another case of its name on Windows.
+        let f = imp::open_append(&g, &name).unwrap();
+        assert!(g.check_own(&f, &name).is_ok());
+        drop(f);
+        g.open_append(&name).unwrap().write_all(b"+more").unwrap();
+        assert_eq!(std::fs::read(base.join("hard.txt")).unwrap(), b"new+more");
+        // A link made to it elsewhere afterwards is seen.
+        if std::fs::hard_link(base.join("hard.txt"), d.join("outside/copy.txt")).is_ok() {
+            assert!(matches!(g.open_append(&name), Err(FsError::HardLink)));
+            assert!(matches!(g.open(&name, false), Err(FsError::HardLink)));
+        }
+        assert_eq!(std::fs::read_to_string(d.join("outside/secret.txt")).unwrap(), "secret");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn a_rewrite_with_the_old_write_time_changes_the_stamp() {
         let d = tmp("stamp");
@@ -1419,6 +2048,64 @@ mod tests {
         assert_eq!(after.len(), before.len());
         assert_eq!(after.modified(), before.modified());
         assert_ne!(after, before, "the same stamp after a rewrite");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Writers appending to one file at once each add their text whole: the
+    /// operating system puts each write at the end (found by the 21st
+    /// assessment: 16 clients of a page that logs a line lost 1,820 of 4,000
+    /// lines and cut 684, the file being positioned at its end once). An
+    /// append is checked as any other write: a hard link, a link and a
+    /// directory are refused, and nothing already in the file is replaced.
+    #[test]
+    fn appends_made_at_once_are_whole() {
+        let d = tmp("append");
+        let base = d.join("data");
+        let (g, name) = open_parent(&base, Path::new("sub/log.txt")).unwrap();
+        g.open(&name, true).unwrap().write_all(b"first\n").unwrap();
+        // A handle opened before others wrote still appends after them.
+        let mut early = g.open_append(&name).unwrap();
+        g.open_append(&name).unwrap().write_all(b"second\n").unwrap();
+        early.write_all(b"third\n").unwrap();
+        drop(early);
+        assert_eq!(std::fs::read_to_string(base.join("sub/log.txt")).unwrap(), "first\nsecond\nthird\n");
+        let (threads, each) = (16, 250);
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let base = &base;
+                scope.spawn(move || {
+                    for i in 0..each {
+                        let (g, name) = open_parent(base, Path::new("sub/log.txt")).unwrap();
+                        let line = format!("writer {t} line {i} {}\n", "x".repeat(i % 40));
+                        g.open_append(&name).unwrap().write_all(line.as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+        let text = std::fs::read_to_string(base.join("sub/log.txt")).unwrap();
+        let lines: std::collections::HashSet<&str> = text.lines().collect();
+        assert_eq!(text.lines().count(), 3 + threads * each, "a line was lost or cut");
+        for t in 0..threads {
+            for i in 0..each {
+                let line = format!("writer {t} line {i} {}", "x".repeat(i % 40));
+                assert!(lines.contains(line.as_str()), "{line:?} is missing");
+            }
+        }
+        // The checks of a write hold for an append.
+        let (g, sub) = open_parent(&base, Path::new("sub")).unwrap();
+        assert!(matches!(g.open_append(&sub), Err(FsError::NotFile)));
+        if std::fs::hard_link(d.join("outside/secret.txt"), base.join("hard.txt")).is_ok() {
+            let (g, name) = open_parent(&base, Path::new("hard.txt")).unwrap();
+            assert!(matches!(g.open_append(&name), Err(FsError::HardLink)));
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(d.join("outside/secret.txt"), base.join("link.txt")).unwrap();
+            let (g, name) = open_parent(&base, Path::new("link.txt")).unwrap();
+            assert!(matches!(g.open_append(&name), Err(FsError::Link)));
+        }
+        assert!(matches!(open_parent(&base, Path::new("../outside/secret.txt")), Err(FsError::BadName)));
+        assert_eq!(std::fs::read_to_string(d.join("outside/secret.txt")).unwrap(), "secret");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

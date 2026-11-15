@@ -405,6 +405,12 @@ impl Parser {
                 self.diags.push(d);
                 return;
             }
+            InlineCode::ParsedTwoWays(msg) => {
+                let mut d = Diagnostic::error(msg, span);
+                d.add_note("a template must be read the same way by every browser, with scripting on and off; write it without this");
+                self.diags.push(d);
+                return;
+            }
             InlineCode::CdataEnd => {
                 let mut d = Diagnostic::error("`>` inside a CDATA section that is not the end of `]]>`", span);
                 d.add_note("where a browser reads the section as a bogus comment (inside HTML in SVG), it ends at the first `>` and what follows becomes markup; write `&gt;` or move the text out of the section");
@@ -649,6 +655,7 @@ impl Parser {
                         | crate::htmlctx::InlineCode::HiddenEndTag
                         | crate::htmlctx::InlineCode::CommentEnd
                         | crate::htmlctx::InlineCode::ForeignStructure(_)
+                        | crate::htmlctx::InlineCode::ParsedTwoWays(_)
                         | crate::htmlctx::InlineCode::CdataEnd
                         | crate::htmlctx::InlineCode::RawTextInSelect(_)
                         | crate::htmlctx::InlineCode::TemplateInSelect => 1,

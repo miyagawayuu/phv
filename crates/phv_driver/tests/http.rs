@@ -419,6 +419,46 @@ fn requests_stop_at_the_time_limit() {
     }
 }
 
+/// A response body is read only up to a quarter of the memory left to the
+/// script (and 16 MB): it is held as bytes and, when it is not UTF-8, as text
+/// up to three times as large (21st assessment: 16 MB were read whatever
+/// was left, and a 16 MB chunk held 84 MB under a 16 MB limit).
+#[test]
+fn a_response_body_is_bounded_by_the_memory_left() {
+    const BODY: usize = 4 << 20;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                if read_request(&mut s).is_none() {
+                    return;
+                }
+                let head =
+                    format!("HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n{BODY:x}\r\n");
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(&vec![0xffu8; BODY]);
+                let _ = s.write_all(b"\r\n0\r\n\r\n");
+            });
+        }
+    });
+    let run_with = |max_memory: usize| {
+        let path = root().join("big_body.phv");
+        let c = compile_with_overlay(&root(), &path, HashMap::new()).unwrap_or_else(|e| panic!("{}", e.render(false)));
+        let limits =
+            Limits { max_time: Some(Duration::from_secs(30)), max_memory: Some(max_memory), ..Limits::default() };
+        let outcome = run(&c, RunOptions { html: false, limits, http: None, host: Some(host(&url, None)) });
+        format!("{}{}", outcome.output, outcome.error.map(|e| e.render()).unwrap_or_default())
+    };
+    // 8 MB: at most 2 MB of body, refused at the chunk's size.
+    let out = run_with(8 << 20);
+    assert!(out.starts_with("NetworkError: ") && out.contains("the response is larger than"), "{out}");
+    assert!(!out.contains("larger than 16 MB"), "{out}");
+    // 64 MB: the 4 MB fit, and become 12 MB of text.
+    assert_eq!(run_with(64 << 20), format!("body: {} bytes\n", BODY * 3));
+}
+
 /// A chunk size near the largest integer is an error, not a crash.
 #[test]
 fn huge_chunk_sizes_are_errors() {

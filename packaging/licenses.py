@@ -38,15 +38,31 @@ SAME_PROJECT = {
 }
 
 
+def is_link(path: Path) -> bool:
+    """A symbolic link or, on Windows, a junction."""
+    return path.is_symlink() or (hasattr(os.path, "isjunction") and os.path.isjunction(path))
+
+
 def licence_files(root: Path) -> list[Path]:
     found = []
+    real_root = root.resolve()
     for path, dirs, files in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if d.lower() not in SKIP_DIRS)
+        # A link could point anywhere: only the package's own folders and files
+        # count. `os.walk` does not enter symbolic links, but it entered a
+        # junction and read a licence-named file outside the crate (21st
+        # assessment); each file is also resolved, as `inside` does.
+        dirs[:] = sorted(d for d in dirs if d.lower() not in SKIP_DIRS and not is_link(Path(path) / d))
         for f in sorted(files):
             low = f.lower()
-            # A link could point anywhere: only the package's own files count.
-            if low.startswith(PREFIXES) and not low.endswith(NOT_TEXT) and not (Path(path) / f).is_symlink():
-                found.append(Path(path) / f)
+            file = Path(path) / f
+            if not low.startswith(PREFIXES) or low.endswith(NOT_TEXT) or is_link(file):
+                continue
+            try:
+                resolved = file.resolve(strict=True)
+            except (OSError, RuntimeError):
+                continue
+            if resolved.is_file() and resolved.is_relative_to(real_root):
+                found.append(file)
     return found
 
 

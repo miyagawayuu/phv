@@ -1,0 +1,114 @@
+<?phv
+// `$s = $s . ...` in every shape: the output must be what 1.3.2 prints.
+class Box {
+    public string $s = "p";
+}
+function boom(string $why): string {
+    throw new RuntimeException($why);
+}
+function twice(string $s): string {
+    return $s . $s;
+}
+function steps(int $n): Generator<string> {
+    $s = "";
+    for ($i = 0; $i < $n; $i++) {
+        $s = $s . $i;
+        yield $s;
+        $s = "{$s}-";
+    }
+}
+function inner(string $u, int $n): string {
+    $s = $u;
+    for ($i = 0; $i < $n; $i++) {
+        $s = $s . $u . $i;
+        $s = "{$s}|";
+        $s = $s . $s;
+    }
+    return $s;
+}
+$s = "a";
+$s = $s . $s;
+echo $s, "\n";
+$s = $s . $s . $s;
+echo $s, "\n";
+$s = $s . twice($s) . $s . "!";
+echo $s, "\n";
+$s = "b";
+try {
+    $s = $s . "1" . boom("mid") . "2";
+} catch (RuntimeException $e) {
+    echo "caught ", $e->getMessage(), " ", $s, "\n";
+}
+try {
+    $s = $s . boom("only");
+} catch (RuntimeException $e) {
+    echo "caught ", $e->getMessage(), " ", $s, "\n";
+}
+$t = $s;
+$s = $s . "x";
+echo $t, " ", $s, "\n";
+$l = [$s, $s];
+$m = ["k" => $s];
+$s = $s . "y" . count($l);
+echo json_encode($l), json_encode($m), $s, "\n";
+$f = fn(): string => $s;
+$s = $s . "z";
+echo $f(), " ", $s, "\n";
+$n = 7;
+$x = 2.5;
+$s = $s . $n . $x . -3;
+echo $s, "\n";
+$s = "{$s}-{$n}";
+echo $s, "\n";
+$s = "{$s}";
+echo $s, "\n";
+$s = "<{$s}>" . $s;
+echo $s, "\n";
+$s = $s . "";
+echo $s, "\n";
+$em = "";
+$em = $em . $em;
+$em = $em . "";
+echo "[", $em, "]\n";
+$q = ["q"]->first();
+if ($q != null) {
+    $q = $q . "z";
+}
+echo $q ?? "null", "\n";
+any $a = "any";
+if ($a is string) {
+    $a = $a . "+";
+    echo $a, "\n";
+}
+$h = escape("<i>");
+$h = $h . raw("<b>");
+$h = $h . escape("&");
+echo strlen((string)$h), "\n";
+$b = new Box();
+$b->s = $b->s . "r";
+$b->s = $b->s . $b->s;
+echo $b->s, "\n";
+$parts = ["u" => "v"];
+$parts["u"] = $parts["u"] . "w";
+echo $parts["u"], "\n";
+foreach (steps(4) as $v) {
+    echo $v, ";";
+}
+echo "\n", inner("mk", 3), "\n";
+$w = "w";
+for ($i = 0; $i < 3; $i++) {
+    $w = $w . ($i % 2 == 0 ? $w : "-") . $i;
+}
+echo $w, "\n";
+$k = "k";
+$g = function () use ($k): string {
+    $k = $k . "local";
+    return $k;
+};
+echo $g(), $k, "\n";
+$u = "é";
+$u = $u . "ü" . $u;
+echo $u, " ", strlen($u), " ", $u->len(), "\n";
+$c = "c";
+$c = $c . match (true) { strlen($c) == 1 => $c . "1", default => "0" };
+echo $c, "\n";

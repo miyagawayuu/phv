@@ -1,0 +1,17 @@
+<?phv
+// Browsers close HTML elements on their own (a `<p>` at the next `<p>`, an
+// `<a>` at the next `<a>`), which the checker does not follow: after
+// `<mi><p><p></p>` a `<p>` is still open for it and none for browsers, for
+// whom `<mglyph>` right inside the `<mi>` is MathML (inside the `<p>` it would
+// be HTML), and the `<svg>` in it no SVG. A `<p>` in its `<foreignObject>`
+// then returned them to the `<mi>`, where the `<script/>`, read here as SVG
+// (with the nonce), was an HTML script running the value (found by the 21st
+// assessment, in Chrome and parse5). `<mglyph>` and `<malignmark>` in HTML
+// inside SVG or MathML are refused: every line but the last is an error.
+$v = "x";
+?>
+<math><mi><p><p></p><mglyph><svg><foreignObject><p></p></foreignObject><script/><?= $v ?></script></svg></mglyph></p></mi></math>
+<math><mi><a href="/"><a href="/x">x</a><mglyph><svg><foreignObject><p></p></foreignObject><script/><?= $v ?></script></svg></mglyph></a></mi></math>
+<math><mtext><li><li></li><malignmark><svg><foreignObject><p></p></foreignObject><script/><?= $v ?></script></svg></malignmark></li></mtext></math>
+<svg><foreignObject><mglyph></mglyph></foreignObject></svg>
+<math><mi><mglyph src="/a.png" alt="a"/><?= $v ?></mi><mtext><malignmark></malignmark></mtext></math>

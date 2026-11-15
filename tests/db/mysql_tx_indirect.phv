@@ -1,0 +1,116 @@
+<?phv
+// Run by crates/phv_driver/tests/databases.rs against a MySQL server: a
+// transaction ended by a statement whose own words do not say so (ROLLBACK
+// through PREPARE and EXECUTE, a procedure that rolls back, a statement that
+// commits implicitly in the outermost transaction()) is not reported as
+// committed, the statements after it are refused, and std.orm forgets what it
+// kept; statements that leave the transaction open are not taken for its end
+// (21st assessment).
+import std.db.Database;
+import std.orm.Repo;
+
+#[Table("phv_txi_users")]
+class User {
+    public ?int $id = null;
+    public string $name = "";
+    public string $email = "";
+}
+
+$db = Database::connect("main");
+$db->execute(sql"DROP TABLE IF EXISTS phv_txi_users");
+$db->execute(sql"DROP TABLE IF EXISTS phv_txi_extra");
+$db->execute(sql"CREATE TABLE phv_txi_users (id int PRIMARY KEY, name varchar(20), email varchar(20))");
+$db->execute(sql"DROP PROCEDURE IF EXISTS phv_txi_rb");
+$db->execute(sql"CREATE PROCEDURE phv_txi_rb() ROLLBACK");
+$db->execute(sql"DROP PROCEDURE IF EXISTS phv_txi_wr");
+$db->execute(sql"CREATE PROCEDURE phv_txi_wr() UPDATE phv_txi_users SET email = 'proc@x' WHERE id = 1");
+$show = function (string $what, User $u) use ($db): void {
+    $r = $db->first(sql"SELECT name, email FROM phv_txi_users WHERE id = 1");
+    echo $what, ": row ", $r?->string("name") ?? "?", " / ", $r?->string("email") ?? "?", ", entity ", $u->name, " / ",
+        $u->email, "\n";
+};
+
+foreach (["written", "prepared", "called", "implicit"] as $how) {
+    $db->execute(sql"DELETE FROM phv_txi_users");
+    $db->execute(sql"INSERT INTO phv_txi_users VALUES (1, 'old', 'old@x')");
+    $users = new Repo<User>($db);
+    $u = $users->find(1) ?? new User();
+    try {
+        $db->transaction(function () use ($db, $users, $u, $how): void {
+            $u->name = "new";
+            $users->update($u);
+            if ($how == "written") {
+                $db->execute(sql"ROLLBACK");
+            } else if ($how == "prepared") {
+                $db->execute(sql"PREPARE phv_txi_s FROM 'ROLLBACK'");
+                $db->execute(sql"EXECUTE phv_txi_s");
+            } else if ($how == "called") {
+                $db->execute(sql"CALL phv_txi_rb()");
+            } else {
+                $db->execute(sql"CREATE TABLE IF NOT EXISTS phv_txi_extra (id int)");
+            }
+            try {
+                $db->execute(sql"UPDATE phv_txi_users SET email = 'outside@x' WHERE id = 1");
+                echo $how, ": a statement ran after the transaction ended\n";
+            } catch (DatabaseError $e) {
+                echo $how, ": refused: ", $e->getMessage(), "\n";
+            }
+        });
+        echo $how, ": transaction() returned\n";
+    } catch (DatabaseError $e) {
+        echo $how, ": transaction() threw: ", $e->getMessage(), "\n";
+    }
+    // The Repo forgot what it wrote: every column is written again.
+    $u->email = "new@x";
+    $users->update($u);
+    $show($how, $u);
+}
+
+// What leaves the transaction open is not taken for its end.
+$db->execute(sql"DELETE FROM phv_txi_users");
+$db->execute(sql"INSERT INTO phv_txi_users VALUES (1, 'old', 'old@x')");
+$users = new Repo<User>($db);
+$u = $users->find(1) ?? new User();
+$db->transaction(function () use ($db, $users, $u): void {
+    $u->name = "kept";
+    $users->update($u);
+    $db->execute(sql"SAVEPOINT mine");
+    $db->execute(sql"UPDATE phv_txi_users SET email = 'undone@x' WHERE id = 1");
+    $db->execute(sql"ROLLBACK TO SAVEPOINT mine");
+    $db->execute(sql"RELEASE SAVEPOINT mine");
+    $db->execute(sql"CALL phv_txi_wr()");
+    $db->execute(sql"PREPARE phv_txi_q FROM 'SELECT 1'");
+    $db->execute(sql"SET @phv_txi = 1");
+    echo "rows seen inside: ", count($db->query(sql"SELECT id FROM phv_txi_users FOR UPDATE")), "\n";
+    $db->transaction(function () use ($db): void {
+        $db->execute(sql"UPDATE phv_txi_users SET email = 'inner@x' WHERE id = 1");
+    });
+});
+echo "a transaction that went on: returned\n";
+$show("went on", $u);
+
+// Outside transaction(), in a transaction the script began itself: the Repo forgets too.
+$db->execute(sql"BEGIN");
+$u->name = "mine";
+$users->update($u);
+$db->execute(sql"CALL phv_txi_rb()");
+$u->email = "mine@x";
+$users->update($u);
+$show("own BEGIN", $u);
+
+// A statement kept to run later may not hold an XA statement.
+$try = function (Sql $s) use ($db): void {
+    try { $db->execute($s); echo "ok\n"; } catch (DatabaseError $e) { echo "error: ", $e->getMessage(), "\n"; }
+};
+$try(sql"CREATE PROCEDURE phv_txi_xa() XA PREPARE 'phv_txi'");
+$try(sql"create procedure phv_txi_xa() xa/**/prepare 'phv_txi'");
+$try(sql"CREATE EVENT phv_txi_ev ON SCHEDULE EVERY 1 HOUR DO XA PREPARE 'phv_txi'");
+$try(sql"PREPARE phv_txi_p FROM 'XA PREPARE ''phv_txi'''");
+$try(sql"LOAD XML LOCAL INFILE 'phv.toml' INTO TABLE phv_txi_users");
+
+// An XA transaction the script leaves open is rolled back when the script is
+// done with the connection (mysql_tx_indirect_after.phv looks).
+$db->execute(sql"XA START 'phv_txi'");
+$db->execute(sql"UPDATE phv_txi_users SET name = 'xa' WHERE id = 1");
+$db->execute(sql"XA END 'phv_txi'");
+echo "done\n";

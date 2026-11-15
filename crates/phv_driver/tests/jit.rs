@@ -1503,6 +1503,87 @@ echo push(new A(), $n), " ", pick(range(0, $n), [1], $n);
     assert!(took[1] < took[0] * 10 + Duration::from_millis(500), "interpreted {:?}, native {:?}", took[0], took[1]);
 }
 
+/// The same for a register that becomes a nullable number (`$m[$k] ?? 1`, a
+/// `?int`, `?float` or `?bool` property): native code keeps those in a
+/// machine register too, but their slot was not emptied, so the list a
+/// conditional had left there stayed shared and every element write copied
+/// it (21st assessment: 30 s natively against 0.02 s interpreted at 40,000
+/// passes, also in 1.3.2).
+#[test]
+fn nullable_numbers_written_over_lists_let_them_go() {
+    let src = r#"<?phv
+class A {
+    public ?int $limit = 5;
+    public ?float $rate = 0.5;
+    public ?bool $on = true;
+}
+function coalesced(list<int> $xs, list<int> $ys, map<string, int> $m, int $n): int {
+    $t = 0;
+    for ($i = 0; $i < $n; $i++) {
+        $zs = $i >= 0 ? $xs : $ys;
+        $u = $m["k"] ?? 1;
+        $zs = $ys;
+        $t += $u;
+        $xs[$i] = $t;
+    }
+    return $t;
+}
+function nullable(list<int> $xs, list<int> $ys, list<int> $ws, A $a, int $n): int {
+    $t = 0;
+    $s = 0.0;
+    for ($i = 0; $i < $n; $i++) {
+        $zs = $i >= 0 ? $xs : $ys;
+        $u = $a->limit ?? 1;
+        $zs = $ys;
+        $t += $u;
+        $xs[$i] = $t;
+        $zs = $i >= 0 ? $ws : $ys;
+        $f = $a->rate ?? 1.0;
+        $zs = $ys;
+        $s += $f;
+        $ws[$i] = $i;
+    }
+    return $t + (int)$s + count($ws);
+}
+function flagged(list<int> $xs, list<int> $ys, A $a, int $n): int {
+    $t = 0;
+    for ($i = 0; $i < $n; $i++) {
+        $zs = $i >= 0 ? $xs : $ys;
+        $b = $a->on ?? false;
+        $zs = $ys;
+        if ($b) {
+            $t++;
+        }
+        $xs[$i] = $t;
+    }
+    return $t;
+}
+$n = 40000;
+echo coalesced(range(0, $n), [1], ["k" => 2], $n), " ", nullable(range(0, $n), [1], range(0, $n), new A(), $n), " ";
+echo flagged(range(0, $n), [1], new A(), $n);
+"#;
+    let dir = std::env::temp_dir().join(format!("phv-jit-test-{}-stale-nullable", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("main.phv");
+    std::fs::write(&entry, src).unwrap();
+    let mut took = Vec::new();
+    for jit in [false, true] {
+        let mut c = compile(&dir, &entry).unwrap_or_else(|e| panic!("{}", e.render(false)));
+        if jit {
+            c.enable_jit_all();
+            assert_compiled(&c, &["coalesced", "nullable", "flagged"]);
+        }
+        let start = std::time::Instant::now();
+        let outcome = run(&c, RunOptions { html: false, limits: Limits::default(), http: None, host: None });
+        took.push(start.elapsed());
+        assert!(outcome.error.is_none(), "{:?}", outcome.error.map(|e| e.render()));
+        assert_eq!(outcome.output, "80000 260001 40000", "jit: {jit}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    // Copying the list at every pass copies 800 million elements in each loop.
+    assert!(took[1] < took[0] * 10 + Duration::from_millis(500), "interpreted {:?}, native {:?}", took[0], took[1]);
+}
+
 /// Native code keeps a returned function's register window, emptied, for the
 /// next call at that depth. Functions with more and fewer registers called
 /// in turn (and after a call that threw) must each find their slots empty,

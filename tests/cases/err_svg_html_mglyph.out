@@ -1,0 +1,29 @@
+error: `<mglyph>` in HTML inside `<svg>` or `<math>`, which browsers read as MathML where they have closed the HTML elements before it on their own (a `<p>` at the next `<p>`...)
+  --> err_svg_html_mglyph.phv:13:28
+   |
+13 | <math><mi><p><p></p><mglyph><svg><foreignObject><p></p></foreignObject><script/><?= $v ?></script></svg></mglyph></p></mi></math>
+   |                            ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `<mglyph>` in HTML inside `<svg>` or `<math>`, which browsers read as MathML where they have closed the HTML elements before it on their own (a `<p>` at the next `<p>`...)
+  --> err_svg_html_mglyph.phv:14:48
+   |
+14 | <math><mi><a href="/"><a href="/x">x</a><mglyph><svg><foreignObject><p></p></foreignObject><script/><?= $v ?></script></svg></mglyph></a></mi></math>
+   |                                                ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `<malignmark>` in HTML inside `<svg>` or `<math>`, which browsers read as MathML where they have closed the HTML elements before it on their own (a `<p>` at the next `<p>`...)
+  --> err_svg_html_mglyph.phv:15:38
+   |
+15 | <math><mtext><li><li></li><malignmark><svg><foreignObject><p></p></foreignObject><script/><?= $v ?></script></svg></malignmark></li></mtext></math>
+   |                                      ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+error: `<mglyph>` in HTML inside `<svg>` or `<math>`, which browsers read as MathML where they have closed the HTML elements before it on their own (a `<p>` at the next `<p>`...)
+  --> err_svg_html_mglyph.phv:16:28
+   |
+16 | <svg><foreignObject><mglyph></mglyph></foreignObject></svg>
+   |                            ^
+   = note: what follows would be read as SVG or MathML where this template is checked as HTML, or the other way round; close every element opened inside `<foreignObject>`, `<desc>`, `<title>` or a MathML text element (`<mi>`, `<mtext>`...) before its end tag, and write HTML elements only inside these
+
+4 errors found

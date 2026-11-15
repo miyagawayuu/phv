@@ -213,10 +213,131 @@ pub(crate) fn check_discovered_url(issuer: &str, url: &str, tls: Option<bool>) -
     if issuer.tls && !endpoint.tls {
         return Err("the issuer uses https://, so its endpoints must too".into());
     }
-    if crate::netdb::is_local_host(&endpoint.host) && !crate::netdb::is_local_host(&issuer.host) {
-        return Err("the endpoint is on this machine but the issuer is not".into());
+    // Both read the same way: an issuer on this machine may name its own
+    // endpoints. A name is on this machine when every address it has now is
+    // (the ones its discovery document was just fetched from): a name of the
+    // hosts file for a provider run here, say.
+    if is_this_machine(&issuer.host) || resolves_here(&issuer) {
+        return Ok(());
+    }
+    if is_this_machine(&endpoint.host) {
+        return Err(LOCAL_ENDPOINT.into());
+    }
+    // A name says nothing of where it leads: it is looked at again, by the
+    // addresses it has, when a request is sent to it (`send_url`).
+    let mut remote = remote_endpoints();
+    if remote.len() < MAX_REMOTE_ENDPOINTS {
+        remote.insert((endpoint.host.to_ascii_lowercase(), endpoint.port));
     }
     Ok(())
+}
+
+const LOCAL_ENDPOINT: &str = "the endpoint is on this machine but the issuer is not";
+
+/// The hosts and ports of the endpoints that providers on other machines
+/// named (`check_discovered_url`): a request to one of them is refused when
+/// its name has an address of this machine at that time (found by the
+/// re-attack of the 21st assessment: a name that resolves to 127.0.0.1 got
+/// the code and the client secret posted to a port of this machine).
+static REMOTE_ENDPOINTS: LazyLock<Mutex<std::collections::HashSet<(String, u16)>>> = LazyLock::new(Default::default);
+/// Far more than the endpoints of the providers of one configuration.
+const MAX_REMOTE_ENDPOINTS: usize = 4096;
+
+fn remote_endpoints() -> std::sync::MutexGuard<'static, std::collections::HashSet<(String, u16)>> {
+    REMOTE_ENDPOINTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Refuses a request to an endpoint that a provider on another machine named
+/// when the endpoint's name leads to this machine now: the addresses are the
+/// ones the connection made right after is given (they are kept for 30
+/// seconds, `netio::resolve`).
+fn check_remote_endpoint(base: &Base, until: Instant) -> Result<(), String> {
+    if !remote_endpoints().contains(&(base.host.to_ascii_lowercase(), base.port)) {
+        return Ok(());
+    }
+    let addrs = crate::netio::resolve(&base.host, base.port, until)?;
+    if addrs.iter().any(|a| local_address(a.ip())) {
+        return Err(LOCAL_ENDPOINT.into());
+    }
+    Ok(())
+}
+
+/// Whether the name of `base` has addresses now, all of this machine
+/// (`local_address`). Looked up within two seconds (the addresses of a name
+/// just connected to are kept, `netio::resolve`); a name that cannot be
+/// looked up is not this machine.
+fn resolves_here(base: &Base) -> bool {
+    let until = Instant::now() + Duration::from_secs(2);
+    crate::netio::resolve(&base.host, base.port, until)
+        .is_ok_and(|addrs| !addrs.is_empty() && addrs.iter().all(|a| local_address(a.ip())))
+}
+
+/// Whether a connection to `ip` reaches this machine whatever its network:
+/// a loopback address (also as an IPv4-mapped IPv6 address) or an
+/// unspecified one (`0.0.0.0`, `::`), which a connection takes as this machine.
+fn local_address(ip: std::net::IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_loopback() || ip.is_unspecified()
+}
+
+/// An IPv4 address in the older forms name lookups still take (`inet_aton`):
+/// one to four parts, each decimal, octal (`0177`) or hexadecimal (`0x7f`),
+/// the last filling the bytes that are left: `127.1`, `2130706433`,
+/// `0x7f.0.0.1`.
+fn old_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() > 4 {
+        return None;
+    }
+    let mut numbers = Vec::with_capacity(4);
+    for part in &parts {
+        let lower = part.to_ascii_lowercase();
+        let n = if let Some(hex) = lower.strip_prefix("0x") {
+            u32::from_str_radix(hex, 16).ok()?
+        } else if lower.len() > 1 && lower.starts_with('0') {
+            u32::from_str_radix(&lower[1..], 8).ok()?
+        } else if !lower.is_empty() && lower.bytes().all(|b| b.is_ascii_digit()) {
+            lower.parse::<u32>().ok()?
+        } else {
+            return None;
+        };
+        numbers.push(n);
+    }
+    let (last, first) = numbers.split_last()?;
+    let mut value: u32 = 0;
+    for n in first {
+        if *n > 255 {
+            return None;
+        }
+        value = (value << 8) | n;
+    }
+    let room = 8 * (4 - first.len()) as u32;
+    if room < 32 && *last >= 1 << room {
+        return None;
+    }
+    let value = if first.is_empty() { *last } else { (value << room) | last };
+    Some(std::net::Ipv4Addr::from(value))
+}
+
+/// Whether `host` may be this machine, read more widely than
+/// `is_local_host`: `localhost` also with a trailing dot, a loopback address
+/// also written as an IPv4-mapped IPv6 address (`[::ffff:127.0.0.1]`), and
+/// the unspecified addresses (`0.0.0.0`, `::`), which a connection takes as
+/// this machine; an IPv6 address also with a zone (`[::1%1]`, `[::1%25lo]`),
+/// and an IPv4 address also in its older forms (`127.1`, `2130706433`,
+/// `0x7f.0.0.1`; `old_ipv4`). Only for telling whether an issuer and the
+/// endpoints it names are on this machine (`check_discovered_url`; found by
+/// the 21st assessment: a remote provider could name such an endpoint):
+/// where being on this machine allows something (a connection without TLS),
+/// `is_local_host` keeps deciding, so nothing more is allowed.
+fn is_this_machine(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    let h = h.strip_suffix('.').unwrap_or(h);
+    // The zone of an IPv6 address (`%25` in a URL, or as it is).
+    let address = h.split_once('%').map_or(h, |(address, _)| address);
+    h.eq_ignore_ascii_case("localhost")
+        || address.parse::<std::net::IpAddr>().is_ok_and(local_address)
+        || old_ipv4(h).is_some_and(|ip| local_address(ip.into()))
 }
 
 fn is_token(name: &str) -> bool {
@@ -226,10 +347,12 @@ fn is_token(name: &str) -> bool {
 /// Checks a header name that phv.toml or a script wants to send.
 pub fn check_header_name(name: &str) -> Result<(), String> {
     if !is_token(name) {
-        return Err(format!("invalid header name \"{}\"", name.escape_debug()));
+        return Err(format!("invalid header name \"{}\"", brief(name)));
     }
-    if RESERVED.contains(&name.to_ascii_lowercase().as_str()) {
-        return Err(format!("the {name} header is set by PHV"));
+    // `_` counts as `-` here too: servers that pass headers on as variables
+    // read `Content_Length` as `Content-Length` (21st assessment).
+    if RESERVED.iter().any(|r| same_header(r, name)) {
+        return Err(format!("the {} header is set by PHV", brief(name)));
     }
     Ok(())
 }
@@ -237,16 +360,39 @@ pub fn check_header_name(name: &str) -> Result<(), String> {
 /// Checks a header value: no line breaks or other control characters (tab is allowed).
 pub fn check_header_value(name: &str, value: &str) -> Result<(), String> {
     if value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f) {
-        return Err(format!("the value of the {name} header contains a line break or a control character"));
+        return Err(format!("the value of the {} header contains a line break or a control character", brief(name)));
     }
     Ok(())
 }
 
 /// Whether two header names are the same header. `_` counts as `-`: servers
-/// that pass headers on as variables (CGI: `HTTP_X_API_KEY`) cannot tell them apart.
+/// that pass headers on as variables (CGI: `HTTP_X_API_KEY`) cannot tell them
+/// apart. So do `.` and a run of them (`Content.Length`, `Content__Length`):
+/// gateways that make variable names of headers turn every character a name
+/// cannot hold into `_`, and some read several as one.
 fn same_header(a: &str, b: &str) -> bool {
-    let norm = |c: u8| if c == b'_' { b'-' } else { c.to_ascii_lowercase() };
-    a.len() == b.len() && a.bytes().zip(b.bytes()).all(|(x, y)| norm(x) == norm(y))
+    header_key(a) == header_key(b)
+}
+
+/// A header name as `same_header` compares it.
+fn header_key(name: &str) -> String {
+    let mut key = String::with_capacity(name.len());
+    for c in name.chars() {
+        let c = if matches!(c, '_' | '.') { '-' } else { c.to_ascii_lowercase() };
+        if !(c == '-' && key.ends_with('-')) {
+            key.push(c);
+        }
+    }
+    key
+}
+
+/// A value a script gave, for a message: its first 64 characters, escaped.
+/// A message never holds a whole value (found by the re-attack of the 21st
+/// assessment: a 40 MB address made a 41 MB exception message).
+pub(crate) fn brief(value: &str) -> String {
+    let short: String = value.chars().take(64).collect();
+    let more = if short.len() < value.len() { "…" } else { "" };
+    format!("{}{more}", short.escape_debug())
 }
 
 /// The keys of a query string (`a=1&b=2`), decoded.
@@ -479,6 +625,8 @@ fn read_response(stream: &mut impl Read, head_only: bool, limit: usize) -> Resul
             if len > limit {
                 return Err(too_large(limit));
             }
+            // Exactly the body: growing by doubling could hold twice as much.
+            buf.reserve_exact(len.saturating_sub(buf.len()));
             while buf.len() < len {
                 let n = read_some(stream, &mut chunk)?;
                 if n == 0 {
@@ -496,12 +644,41 @@ fn read_response(stream: &mut impl Read, head_only: bool, limit: usize) -> Resul
                 }
                 let n = read_some(stream, &mut chunk)?;
                 if n == 0 {
+                    settle(&mut buf);
                     break buf;
                 }
+                make_room(&mut buf, n, limit + chunk.len());
                 buf.extend_from_slice(&chunk[..n]);
             }
         };
         return Ok((Response { status, headers, body }, keep && clean));
+    }
+}
+
+/// A body of unknown size grows by doubling up to this, and then gets all
+/// the room it may ever take at once (`make_room`).
+const GROW_AT_ONCE: usize = 256 << 10;
+
+/// Makes room for `more` bytes in a body that may hold `most` in all. A
+/// vector left to grow by itself doubles, and holds the old and the new
+/// buffer while it does: up to three times the body, whatever the limit
+/// (found by the re-attack of the 21st assessment: a response without a
+/// length took 40 MB under a 16 MB limit). Here it doubles only while it
+/// is small, and then takes `most` once, so no more than `GROW_AT_ONCE`
+/// past `most` is ever held.
+fn make_room(body: &mut Vec<u8>, more: usize, most: usize) {
+    let need = body.len() + more;
+    if need <= body.capacity() {
+        return;
+    }
+    let room = if need <= GROW_AT_ONCE { need.next_power_of_two().max(8192) } else { need.max(most) };
+    body.reserve_exact(room - body.len());
+}
+
+/// Gives back the room a finished body did not take, when that is much.
+fn settle(body: &mut Vec<u8>) {
+    if body.capacity() - body.len() > GROW_AT_ONCE {
+        body.shrink_to_fit();
     }
 }
 
@@ -562,20 +739,33 @@ fn read_chunked(
         let size = usize::from_str_radix(size_text, 16).map_err(|_| invalid)?;
         buf.drain(..line_end + 2);
         if size == 0 {
+            settle(&mut body);
             // Trailers are ignored (the connection is then not kept).
             return Ok((body, buf.as_slice() == b"\r\n"));
         }
         if size > limit - body.len() {
             return Err(too_large(limit));
         }
-        while buf.len() < size + 2 {
+        // The chunk's bytes go to the body as they come (found by the 21st
+        // assessment: a whole chunk was held in the buffer and then copied).
+        make_room(&mut body, size, limit);
+        let mut left = size;
+        while left > 0 {
+            if buf.is_empty() {
+                fill(&mut buf)?;
+            }
+            let n = left.min(buf.len());
+            body.extend_from_slice(&buf[..n]);
+            buf.drain(..n);
+            left -= n;
+        }
+        while buf.len() < 2 {
             fill(&mut buf)?;
         }
-        if &buf[size..size + 2] != b"\r\n" {
+        if &buf[..2] != b"\r\n" {
             return Err(invalid.into());
         }
-        body.extend_from_slice(&buf[..size]);
-        buf.drain(..size + 2);
+        buf.drain(..2);
     }
 }
 
@@ -657,7 +847,8 @@ fn send(
 pub fn request(vm: &mut Vm, a: &[Value]) -> R {
     let (base, mut req, fail) = prepare(vm, a)?;
     let span = ClientSpan::open(vm, &base, &mut req, Some(s(&a[0])));
-    let result = exchange(&base, &req, until(vm, REQUEST_TIMEOUT), MAX_BODY);
+    let limit = body_limit(vm);
+    let result = exchange(&base, &req, until(vm, REQUEST_TIMEOUT), limit).and_then(|r| r.into_text(limit));
     ClientSpan::close(span, &result);
     vm.check_limits()?;
     match result {
@@ -666,16 +857,59 @@ pub fn request(vm: &mut Vm, a: &[Value]) -> R {
     }
 }
 
+/// The largest response a script's request reads, as bytes and as the text
+/// they become (`Response::into_text`): `MAX_BODY`, and at most a third of
+/// the memory left to the script, since the bytes and the text are held
+/// together while one is made from the other (found by the 21st assessment:
+/// 16 MB were read whatever was left, 84 MB in all under a 16 MB limit).
+fn body_limit(vm: &Vm) -> usize {
+    (vm.memory_left() / 3).clamp(64 << 10, MAX_BODY)
+}
+
+/// The same for a request sent in the background: a script may have 16 of
+/// them running at once, each holding its bytes and its text for a moment
+/// on a thread whose memory is not the script's, so each gets a fortieth of
+/// what is left (found by the re-attack of the 21st assessment: with a
+/// sixteenth each, and the text made unreserved when awaited, 16 responses
+/// took 523 MB under a 128 MB limit).
+fn background_limit(vm: &Vm) -> usize {
+    (vm.memory_left() / 40).clamp(64 << 10, MAX_BODY)
+}
+
+impl Response {
+    /// The response with its body as the UTF-8 text a script gets (each
+    /// sequence that is not UTF-8 becomes U+FFFD), refused when the text is
+    /// longer than `limit`: text of bytes that are not UTF-8 is up to three
+    /// times as long as they are. Afterwards `response_value` takes the body
+    /// as it is, so nothing grows where the response is awaited.
+    fn into_text(mut self, limit: usize) -> Result<Response, String> {
+        if std::str::from_utf8(&self.body).is_ok() {
+            return Ok(self);
+        }
+        if text_len(&self.body) > limit {
+            return Err(too_large(limit));
+        }
+        self.body = body_text(std::mem::take(&mut self.body)).into_bytes();
+        Ok(self)
+    }
+}
+
+/// The length of `bytes` as text (see `body_text`).
+fn text_len(bytes: &[u8]) -> usize {
+    let replaced = |c: &std::str::Utf8Chunk<'_>| if c.invalid().is_empty() { 0 } else { '\u{FFFD}'.len_utf8() };
+    bytes.utf8_chunks().map(|c| c.valid().len() + replaced(&c)).sum()
+}
+
 /// `__http_start(...)`: `__http_request` in the background; `await()` gives
-/// the same map. The response may take a sixteenth of the memory left to the
-/// script (other work may run at the same time), and at most 16 MB.
+/// the same map. The response may take a fortieth of the memory left to the
+/// script (see `background_limit`), and at most 16 MB.
 pub fn start(vm: &mut Vm, a: &[Value]) -> R {
     let (base, mut req, fail) = prepare(vm, a)?;
     let span = ClientSpan::open(vm, &base, &mut req, Some(s(&a[0])));
-    let limit = (vm.memory_left() / 16).clamp(64 << 10, MAX_BODY);
+    let limit = background_limit(vm);
     let until = until(vm, REQUEST_TIMEOUT);
     crate::asyncio::start(vm, until, None, move || {
-        let result = exchange(&base, &req, until, limit);
+        let result = exchange(&base, &req, until, limit).and_then(|r| r.into_text(limit));
         ClientSpan::close(span, &result);
         crate::asyncio::Outcome::Http(result.map_err(|e| format!("{fail}{e}")))
     })
@@ -695,8 +929,26 @@ pub(crate) fn response_value(resp: Response) -> Value {
     let mut out: IndexMap<Key, Value> = IndexMap::new();
     out.insert(Key::Str(Rc::new("status".into())), Value::Int(resp.status as i64));
     out.insert(Key::Str(Rc::new("headers".into())), Value::map(hs));
-    out.insert(Key::Str(Rc::new("body".into())), Value::str(String::from_utf8_lossy(&resp.body).into_owned()));
+    out.insert(Key::Str(Rc::new("body".into())), Value::str(body_text(resp.body)));
     Value::map(out)
+}
+
+/// A body as text: as it is when it is UTF-8 (no copy); otherwise each
+/// sequence that is not becomes U+FFFD, in a string of exactly the size that
+/// takes (one grown by doubling could hold twice as much).
+fn body_text(body: Vec<u8>) -> String {
+    let bytes = match String::from_utf8(body) {
+        Ok(text) => return text,
+        Err(e) => e.into_bytes(),
+    };
+    let mut text = String::with_capacity(text_len(&bytes));
+    for c in bytes.utf8_chunks() {
+        text.push_str(c.valid());
+        if !c.invalid().is_empty() {
+            text.push('\u{FFFD}');
+        }
+    }
+    text
 }
 
 /// Checks the arguments of `__http_request` / `__http_start` and builds the
@@ -705,6 +957,7 @@ fn prepare(vm: &mut Vm, a: &[Value]) -> Result<(Base, Request, String), VmError>
     let name = s(&a[0]).to_string();
     let fail = |vm: &Vm, msg: String| vm.throw("NetworkError", format!("HTTP service \"{name}\": {msg}"));
     let Some(spec) = vm.host.http.get(&name).cloned() else {
+        let name = brief(&name);
         return Err(vm.throw("NetworkError", format!("no HTTP service named \"{name}\" in [http] of phv.toml")));
     };
     let Some(url) = spec.url.clone() else {
@@ -713,7 +966,7 @@ fn prepare(vm: &mut Vm, a: &[Value]) -> Result<(Base, Request, String), VmError>
     };
     let method = s(&a[1]).to_ascii_uppercase();
     if !METHODS.contains(&method.as_str()) {
-        return Err(vm.throw("ValueError", format!("unsupported HTTP method \"{}\"", method.escape_debug())));
+        return Err(vm.throw("ValueError", format!("unsupported HTTP method \"{}\"", brief(&method))));
     }
     let path = match check_path(s(&a[2])) {
         Ok(p) => p,
@@ -771,12 +1024,12 @@ fn prepare(vm: &mut Vm, a: &[Value]) -> Result<(Base, Request, String), VmError>
     let fixed = query_keys(&base.query);
     if let Some((k, f)) = pairs.iter().find_map(|(k, _)| replaces_fixed(k, &fixed).map(|f| (k, f))) {
         let msg = if k == f {
-            format!("the query parameter \"{}\" comes from phv.toml and cannot be replaced", k.escape_debug())
+            format!("the query parameter \"{}\" comes from phv.toml and cannot be replaced", brief(k))
         } else {
             format!(
                 "the query parameter \"{}\" would be read as \"{}\", which comes from phv.toml and cannot be replaced",
-                k.escape_debug(),
-                f.escape_debug()
+                brief(k),
+                brief(f)
             )
         };
         return Err(vm.throw("ValueError", msg));
@@ -789,7 +1042,7 @@ fn prepare(vm: &mut Vm, a: &[Value]) -> Result<(Base, Request, String), VmError>
         (true, false) => target.push_str(&format!("?{query}")),
         (false, false) => target.push_str(&format!("?{}&{query}", base.query)),
     }
-    let fail = format!("HTTP service \"{name}\": {method} {path}: ");
+    let fail = format!("HTTP service \"{name}\": {method} {}: ", brief(&path));
     let req = Request { method, target, headers, body };
     Ok((base, req, fail))
 }
@@ -842,6 +1095,7 @@ pub(crate) fn send_url(
     let mut base = parse_base(url)?;
     base.own = vm.host.listen;
     check_plain(&base.host, base.tls, tls, "https://")?;
+    check_remote_endpoint(&base, until(vm, REQUEST_TIMEOUT))?;
     let scheme_len = if base.tls { 8 } else { 7 };
     let tail = &url[scheme_len + base.authority.len()..];
     let target = if tail.is_empty() || tail.starts_with('?') { format!("/{tail}") } else { tail.to_string() };
@@ -1014,6 +1268,25 @@ mod tests {
     #[test]
     fn headers_are_checked() {
         assert!(check_header_name("X-Api-Key").is_ok());
+        // `_` counts as `-` in the names PHV sets itself (21st assessment).
+        for bad in ["Content_Length", "transfer_encoding", "Proxy_Authorization", "Keep_Alive", "PROXY_CONNECTION"] {
+            assert!(check_header_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(check_header_name("X_Content_Length").is_ok());
+        // `.` and runs of `_`, `.` and `-` read as one `-` (re-attack of the 21st assessment).
+        for bad in
+            ["Content.Length", "Content__Length", "content-.length", "Transfer._Encoding", "Proxy..Authorization"]
+        {
+            assert!(check_header_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(same_header("X-Api-Key", "x.api__key") && !same_header("X-Api-Key", "XApiKey"));
+        assert_eq!(header_key("X__Api.-Key"), "x-api-key");
+        // A message holds the start of a long value, never all of it.
+        let long = "A".repeat(1 << 20);
+        assert!(check_header_name(&format!("{long} ")).unwrap_err().len() < 200);
+        assert!(check_header_value(&long, "a\nb").unwrap_err().len() < 200);
+        assert_eq!(brief("short \"x\""), "short \\\"x\\\"");
+        assert_eq!(brief(&long).chars().count(), 65);
         for bad in ["Host", "content-length", "Transfer-Encoding", "Bad Name", "X:Y", ""] {
             assert!(check_header_name(bad).is_err(), "{bad:?}");
         }
@@ -1058,6 +1331,140 @@ mod tests {
         let fixed = query_keys("account_id=site1");
         for other in ["account_ids", "accountid", "account-id", "id", "x[account_id]", "account", "account_id2[x]"] {
             assert_eq!(replaces_fixed(other, &fixed), None, "{other:?}");
+        }
+    }
+
+    /// An endpoint a provider names is taken as this machine in every
+    /// spelling a connection would reach it by (21st assessment).
+    #[test]
+    fn endpoints_on_this_machine_are_seen_in_every_spelling() {
+        let local = [
+            "localhost",
+            "LOCALHOST.",
+            "127.0.0.1",
+            "[::1]",
+            "[::ffff:127.0.0.1]",
+            "[::ffff:7f00:1]",
+            "0.0.0.0",
+            "[::]",
+        ];
+        for h in local {
+            assert!(is_this_machine(h), "{h}");
+            let url = format!("https://{h}:9000/token");
+            assert!(check_discovered_url("https://id.example.com", &url, None).is_err(), "{url}");
+        }
+        // With a zone, and in the older forms of IPv4 addresses (re-attack of the 21st assessment).
+        let more = [
+            "[::1%1]",
+            "[::1%25]",
+            "[::1%25lo]",
+            "[::%eth0]",
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+            "0177.0.0.1",
+            "0",
+            "127.0.1",
+        ];
+        for h in more {
+            assert!(is_this_machine(h), "{h}");
+            let url = format!("https://{h}:9000/token");
+            assert!(check_discovered_url("https://id.example.com", &url, None).is_err(), "{url}");
+        }
+        let other = ["id.example.com", "localhost.example.com", "10.0.0.5", "localhost..", "[::ffff:10.0.0.5]"];
+        for h in other.into_iter().chain([
+            "[fe80::1%1]",
+            "10.1",
+            "167772161",
+            "0x0a.0.0.1",
+            "1.2.3.4.5",
+            "256.0.0.1",
+            "127.0.0.0x",
+        ]) {
+            assert!(!is_this_machine(h), "{h}");
+        }
+        assert_eq!(old_ipv4("127.1"), Some([127, 0, 0, 1].into()));
+        assert_eq!(old_ipv4("0x7f.1"), Some([127, 0, 0, 1].into()));
+        assert_eq!(old_ipv4("10.2.515"), Some([10, 2, 2, 3].into()));
+        assert_eq!(old_ipv4("example.com"), None);
+        assert!(check_discovered_url("https://id.example.com", "https://id.example.com/token", None).is_ok());
+        assert!(check_discovered_url("http://localhost:9000", "http://localhost:9000/token", None).is_ok());
+        // An issuer on this machine, however it is written, may name its own endpoints.
+        assert!(check_discovered_url("http://localhost.:9000", "http://localhost.:9000/token", Some(false)).is_ok());
+        assert!(check_discovered_url("http://127.0.0.1:9000", "http://localhost.:9000/token", Some(false)).is_ok());
+        // An endpoint a remote issuer named is looked at again when a request goes to it.
+        let named = |host: &str, port: u16| remote_endpoints().contains(&(host.to_string(), port));
+        assert!(check_discovered_url("https://id.example.com", "https://Token.Example.com:8443/t", None).is_ok());
+        assert!(named("token.example.com", 8443) && !named("localhost", 9000) && !named("localhost.", 9000));
+        assert!(local_address("127.0.0.9".parse().unwrap()) && local_address("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(local_address("::".parse().unwrap()) && !local_address("192.168.1.5".parse().unwrap()));
+    }
+
+    /// A chunk's bytes are moved to the body as they come, also when they
+    /// arrive in pieces: the buffer never holds a whole chunk (21st
+    /// assessment: a 16 MB chunk was held twice).
+    #[test]
+    fn a_chunk_goes_to_the_body_as_it_comes() {
+        /// Gives the response in pieces of at most 1,000 bytes.
+        struct Pieces<'a>(&'a [u8]);
+        impl Read for Pieces<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.len().min(buf.len()).min(1000);
+                buf[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Ok(n)
+            }
+        }
+        let size = 300_000;
+        let mut raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{size:x}\r\n").into_bytes();
+        raw.extend(std::iter::repeat_n(0xffu8, size));
+        raw.extend_from_slice(b"\r\n3\r\nabc\r\n0\r\n\r\n");
+        let (r, keep) = read_response(&mut Pieces(&raw), false, MAX_BODY).unwrap();
+        assert!(keep && r.body.len() == size + 3 && r.body.ends_with(b"\xffabc"));
+        // Past the limit: refused at the chunk's size, before its bytes are read.
+        assert!(read_response(&mut Pieces(&raw), false, size - 1).unwrap_err().contains("larger than"));
+        // A chunk cut in the middle, and one that does not end with a line break.
+        let cut = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel";
+        assert!(read_response(&mut &cut[..], false, MAX_BODY).is_err());
+        let bad = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n";
+        assert!(read_response(&mut &bad[..], false, MAX_BODY).is_err());
+        // A body that is not UTF-8 becomes text without failing; one that is, as it is.
+        let text =
+            |body: &[u8]| match response_value(Response { status: 200, headers: Vec::new(), body: body.to_vec() }) {
+                Value::Map(ref m) => m.get(&Key::Str(Rc::new("body".into()))).map(|v| s(v).to_string()),
+                _ => None,
+            };
+        assert_eq!(text(b"caf\xc3\xa9").as_deref(), Some("caf\u{e9}"));
+        assert_eq!(text(b"a\xffb").as_deref(), Some("a\u{fffd}b"));
+        // The text is made where the body is, within the limit, and taken as it is afterwards.
+        let resp = |body: &[u8]| Response { status: 200, headers: Vec::new(), body: body.to_vec() };
+        assert_eq!(resp(b"a\xffb").into_text(5).unwrap().body, "a\u{fffd}b".as_bytes());
+        assert!(resp(b"a\xffb").into_text(4).unwrap_err().contains("larger than"));
+        assert_eq!(
+            resp(b"plain").into_text(1).unwrap().body,
+            b"plain",
+            "UTF-8 is what was read, within the read's limit"
+        );
+        // A body of unknown size never holds much more than it may take in all.
+        let mut body = Vec::new();
+        let mut most = 0;
+        for _ in 0..3000 {
+            make_room(&mut body, 1000, 3_000_000);
+            body.extend_from_slice(&[0u8; 1000]);
+            most = most.max(body.capacity());
+        }
+        assert!(body.len() == 3_000_000 && most == 3_000_000, "{most}");
+        let mut small = Vec::new();
+        make_room(&mut small, 300_000, 16 << 20);
+        small.extend_from_slice(&[0u8; 300_000]);
+        assert_eq!(small.capacity(), 16 << 20);
+        settle(&mut small);
+        assert!(small.capacity() < 400_000);
+        // As `String::from_utf8_lossy` reads it, in a string of exactly that size.
+        for body in [&b"\xff\xfe"[..], b"a\xe3\x81", b"\xf0\x9f\x98x\xc3", b"ok", b"", b"\xed\xa0\x80z"] {
+            let text = body_text(body.to_vec());
+            assert_eq!(text, String::from_utf8_lossy(body));
+            assert_eq!(text.capacity(), text.len(), "{body:?}");
         }
     }
 

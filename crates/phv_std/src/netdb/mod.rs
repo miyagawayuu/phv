@@ -179,6 +179,26 @@ mod tests {
             ("XA\x0cPREPARE 'x'", Kind::MySql),
             ("PREPARE\x0bTRANSACTION 'x'", Kind::Postgres),
             ("LOAD\x0bDATA\x0bLOCAL\x0bINFILE 'f' INTO TABLE t", Kind::MySql),
+            // `LOAD XML` reads a file of the client too (21st assessment).
+            ("LOAD XML LOCAL INFILE 'f' INTO TABLE t", Kind::MySql),
+            ("load xml low_priority local infile 'f' into table t", Kind::MySql),
+            ("LOAD/**/XML\x0bLOCAL INFILE 'f' INTO TABLE t", Kind::MySql),
+            // A statement kept to run later that holds `XA` (21st assessment:
+            // a procedure whose body is `XA PREPARE` prepared the transaction
+            // when it was called).
+            ("CREATE PROCEDURE p() XA PREPARE 'x'", Kind::MySql),
+            ("create procedure p() xa\x0bprepare 'x'", Kind::MySql),
+            ("CREATE DEFINER = CURRENT_USER PROCEDURE p() XA/**/PREPARE 'x'", Kind::MySql),
+            ("CREATE PROCEDURE p() /*!50000 XA */ PREPARE 'x'", Kind::MySql),
+            ("/*!50000 CREATE */ PROCEDURE p() BEGIN XA END 'x'; XA PREPARE 'x'; END", Kind::MySql),
+            ("CREATE FUNCTION f() RETURNS INT BEGIN XA PREPARE 'x'; RETURN 1; END", Kind::MySql),
+            ("CREATE TRIGGER t BEFORE INSERT ON u FOR EACH ROW XA PREPARE 'x'", Kind::MySql),
+            ("CREATE EVENT e ON SCHEDULE EVERY 1 HOUR DO XA PREPARE 'x'", Kind::MySql),
+            ("ALTER EVENT e DO XA PREPARE 'x'", Kind::MySql),
+            ("CREATE PROCEDURE p() XA START 'x'", Kind::MySql),
+            ("PREPARE s FROM 'XA PREPARE ''x'''", Kind::MySql),
+            ("PREPARE s FROM \"xa prepare 'x'\"", Kind::MySql),
+            ("EXECUTE IMMEDIATE 'XA PREPARE ''x'''", Kind::MySql),
         ] {
             assert!(refused_statement(text, kind).is_some_and(|why| why.contains("is not allowed")), "{text}");
         }
@@ -189,6 +209,15 @@ mod tests {
             ("XA RECOVER", Kind::MySql),
             ("PREPARE s FROM 'SELECT 1'", Kind::MySql),
             ("LOAD DATA INFILE '/tmp/f' INTO TABLE t", Kind::MySql),
+            ("LOAD XML INFILE '/tmp/f' INTO TABLE t", Kind::MySql),
+            ("CREATE PROCEDURE p() ROLLBACK", Kind::MySql),
+            ("CREATE PROCEDURE p() UPDATE taxa SET xa_id = 1, exact = 2", Kind::MySql),
+            ("CREATE TABLE xa (procedure_id INT)", Kind::MySql),
+            ("INSERT INTO t VALUES ('xa')", Kind::MySql),
+            ("PREPARE s FROM 'ROLLBACK'", Kind::MySql),
+            ("EXECUTE s", Kind::MySql),
+            ("CALL p()", Kind::MySql),
+            ("CREATE PROCEDURE p() XA PREPARE 'x'", Kind::Postgres),
             ("SELECT 'XA PREPARE'", Kind::MySql),
             ("INSERT INTO t VALUES ('PREPARE TRANSACTION')", Kind::Postgres),
             ("PREPARE s AS SELECT 1", Kind::Postgres),
@@ -208,6 +237,54 @@ mod tests {
         assert!(refused_statement(&many, Kind::MySql).is_some_and(|why| why.contains("is not allowed")));
         let few: String = (0..16).map(|v| format!("/*!{} x */ ", 10000 + v)).collect::<String>() + "SELECT 1";
         assert!(refused_statement(&few, Kind::MySql).is_none());
+    }
+
+    /// The id of the XA transaction a script starts is kept, to roll it
+    /// back when the script is done with the connection, only when it is an
+    /// id and nothing else (21st assessment).
+    #[test]
+    fn the_id_of_an_xa_transaction_is_read_from_its_start() {
+        use super::my::xa_id_only;
+        use super::pg::{xa_ends, xa_start_id};
+        for (text, ends) in [
+            ("XA COMMIT 'a'", true),
+            ("xa rollback 'a';", true),
+            ("XA COMMIT 'a' ONE PHASE", true),
+            ("XA END 'a'", false),
+            ("XA PREPARE 'a'", false),
+            ("COMMIT", false),
+        ] {
+            assert_eq!(xa_ends(text), ends, "{text}");
+        }
+        for (text, id) in [
+            ("XA START 'mk1'", Some("'mk1'")),
+            ("xa  begin\x0b'a', 'b', 7 ;", Some("'a', 'b', 7")),
+            ("  XA START X'6162',0x63", Some("X'6162',0x63")),
+            ("XA START 'a' JOIN", Some("'a' JOIN")),
+            ("XA END 'mk1'", None),
+            ("XA START", None),
+            ("SELECT 'XA START'", None),
+            ("/* c */ XA START 'a'", None),
+        ] {
+            assert_eq!(xa_start_id(text).as_deref(), id, "{text}");
+        }
+        for id in ["'mk1'", "'a', 'b', 7", "X'6162',0x63", "\"a\"", "'it''s'", "b'01' , 'q'", "''"] {
+            assert!(xa_id_only(id), "{id}");
+        }
+        for id in [
+            "'a' JOIN",
+            "'a' RESUME",
+            "'a'; DROP TABLE t",
+            "'a', 'b', 1, 2",
+            "a",
+            "'a",
+            "'a\\'",
+            "",
+            "'a' -- x",
+            "'a',",
+        ] {
+            assert!(!xa_id_only(id), "{id}");
+        }
     }
 
     #[test]
@@ -609,6 +686,114 @@ mod tests {
         assert!(d.reset());
         d.conn.query_drop(format!("USE {db}")).unwrap();
         assert!(!d.reset());
+    }
+
+    /// The server reports the state of a MySQL session's transaction with
+    /// each reply: a statement that ended the transaction it found open is
+    /// seen whatever its text (21st assessment: `ROLLBACK` through `EXECUTE`
+    /// or `CALL` was not), and the statements of a transaction that goes on
+    /// (savepoints, reads, writes, a procedure that only writes) are not
+    /// taken for its end.
+    #[test]
+    fn the_mysql_transaction_state_tells_when_a_transaction_ended() {
+        use mysql::prelude::Queryable;
+        let Some(url) = std::env::var("PHV_TEST_MYSQL_URL").ok().filter(|u| !u.is_empty()) else { return };
+        let spec = DatabaseSpec { url: Some(url.clone()), url_env: None, tls: None, pool_size: 2 };
+        let mut c = my_connect(&url, &spec, Duration::from_secs(10), None, None).unwrap();
+        let id = crate::testing::run_id();
+        let (t, rb, wr) = (format!("phv_{id}_txs"), format!("phv_{id}_txs_rb"), format!("phv_{id}_txs_wr"));
+        let (again, inner) = (format!("phv_{id}_txs_again"), format!("phv_{id}_txs_inner"));
+        // Runs `sql` and says whether it ended the transaction it found open.
+        let run = |c: &mut super::my::MyConn, sql: &str| -> bool {
+            c.conn.query_drop(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            c.note_tx();
+            let ended = c.take_tx_ended();
+            eprintln!("{:8} {} {sql}", c.tx_state(), if ended { "ENDED" } else { "     " });
+            ended
+        };
+        for sql in [
+            format!("CREATE TABLE {t} (id INT PRIMARY KEY, v VARCHAR(20))"),
+            format!("INSERT INTO {t} VALUES (1, 'a')"),
+            format!("CREATE PROCEDURE {rb}() ROLLBACK"),
+            format!("CREATE PROCEDURE {wr}() UPDATE {t} SET v = 'p' WHERE id = 1"),
+            // Ends the transaction and begins another that does the same kind of thing.
+            format!("CREATE PROCEDURE {again}() BEGIN ROLLBACK; START TRANSACTION; UPDATE {t} SET v = 'q' WHERE id = 1; END"),
+            format!("CREATE PROCEDURE {inner}() BEGIN SAVEPOINT p1; UPDATE {t} SET v = 'r' WHERE id = 1; SELECT COUNT(*) FROM {t}; ROLLBACK TO SAVEPOINT p1; END"),
+        ] {
+            assert!(!run(&mut c, &sql), "{sql}: no transaction was open");
+        }
+        // What a transaction does without ending.
+        for sql in [
+            "BEGIN".to_string(),
+            format!("SELECT v FROM {t}"),
+            format!("UPDATE {t} SET v = 'b' WHERE id = 1"),
+            "SAVEPOINT s1".to_string(),
+            format!("UPDATE {t} SET v = 'c' WHERE id = 1"),
+            "ROLLBACK TO SAVEPOINT s1".to_string(),
+            "RELEASE SAVEPOINT s1".to_string(),
+            format!("CALL {wr}()"),
+            "SET @phv_x = 1".to_string(),
+            "SELECT 1".to_string(),
+            "DO 1".to_string(),
+            format!("SELECT COUNT(*) FROM {t} FOR UPDATE"),
+            "PREPARE phv_s FROM 'SELECT 1'".to_string(),
+            "EXECUTE phv_s".to_string(),
+            format!("CALL {inner}()"),
+            "SET SESSION TRANSACTION READ WRITE".to_string(),
+            format!("INSERT INTO {t} VALUES (2, 'x') ON DUPLICATE KEY UPDATE v = 'x'"),
+            format!("DELETE FROM {t} WHERE id = 2"),
+        ] {
+            assert!(!run(&mut c, &sql), "{sql}: the transaction goes on");
+        }
+        // What ends it, by any text.
+        assert!(run(&mut c, &format!("CALL {rb}()")), "a procedure that rolls back");
+        assert!(!run(&mut c, "SELECT 1"), "no transaction is open any more");
+        for end in ["PREPARE phv_r FROM 'ROLLBACK'|EXECUTE phv_r", "PREPARE phv_r FROM 'COMMIT'|EXECUTE phv_r"] {
+            assert!(!run(&mut c, "START TRANSACTION"));
+            assert!(!run(&mut c, &format!("UPDATE {t} SET v = 'd' WHERE id = 1")));
+            let (prepare, execute) = end.split_once('|').unwrap();
+            assert!(!run(&mut c, prepare));
+            assert!(run(&mut c, execute), "{end}");
+        }
+        // A statement that commits implicitly.
+        assert!(!run(&mut c, "BEGIN"));
+        assert!(!run(&mut c, &format!("UPDATE {t} SET v = 'e' WHERE id = 1")));
+        assert!(run(&mut c, &format!("CREATE TABLE {t}_2 (id INT)")), "DDL commits");
+        // A transaction ended and begun again in one statement: it lost what the first had done.
+        assert!(!run(&mut c, "BEGIN"));
+        assert!(!run(&mut c, &format!("UPDATE {t} SET v = 'f' WHERE id = 1")));
+        assert!(run(&mut c, "BEGIN"), "BEGIN commits the open transaction and begins another");
+        assert!(run(&mut c, "COMMIT"));
+        // A transaction ended and begun again inside a procedure, which then
+        // does what the first had done: the state is the same, but the
+        // server reported a transaction's begin (re-attack of the 21st assessment).
+        assert!(!run(&mut c, "BEGIN"));
+        assert!(!run(&mut c, &format!("UPDATE {t} SET v = 'g' WHERE id = 1")));
+        assert!(run(&mut c, &format!("CALL {again}()")), "ROLLBACK; START TRANSACTION; UPDATE in a procedure");
+        assert!(run(&mut c, "ROLLBACK"));
+        // After the reset of a pooled connection the state is reported again.
+        assert!(c.reset());
+        assert!(!run(&mut c, "BEGIN"));
+        assert!(run(&mut c, &format!("CALL {rb}()")));
+        let drops = [rb, wr, again, inner].map(|p| format!("DROP PROCEDURE {p}"));
+        for sql in drops.into_iter().chain([format!("DROP TABLE {t}, {t}_2")]) {
+            run(&mut c, &sql);
+        }
+        // The states themselves.
+        for (old, new, over) in [
+            ("________", "T_______", false),
+            ("T_______", "T___W___", false),
+            ("T___W___", "T_R_W_S_", false),
+            ("T___W___", "________", true),
+            ("T___W___", "T_______", true),
+            ("T_R_W___", "T___W___", true),
+            ("T___W___", "I___W___", true),
+            ("I___W___", "________", true),
+            ("________", "________", false),
+        ] {
+            let b = |s: &str| <[u8; 8]>::try_from(s.as_bytes()).unwrap();
+            assert_eq!(super::my::tx_over(&b(old), &b(new)), over, "{old} -> {new}");
+        }
     }
 
     #[test]

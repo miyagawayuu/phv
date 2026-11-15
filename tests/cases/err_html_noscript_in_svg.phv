@@ -1,0 +1,19 @@
+<?phv
+// Browsers with scripting on read a `<noscript>` as raw text up to the first
+// `</noscript>`, wherever that is written. Inside SVG or MathML the checker
+// reads it as the end of an SVG `<noscript>` (or of one in a
+// `<foreignObject>`) and the SVG stays open, while for browsers it ends a
+// `<noscript>` around the SVG, and the SVG with it: the `<script/>` after it,
+// read here as SVG (with the nonce), was an HTML script running the value
+// (found by the re-attack of the 21st assessment's fixes, with parse5). Any
+// template may be written inside a `<noscript>`, so `<noscript>` and
+// `</noscript>` inside SVG or MathML are errors everywhere: every line but the
+// last two is one.
+$v = "x";
+?>
+<noscript><svg><noscript></noscript><script/><?= $v ?></script></svg></noscript>
+<noscript><math><mi><noscript></noscript></mi><script/><?= $v ?></script></math></noscript>
+<svg><foreignObject><noscript><p>no script</p></noscript></foreignObject><text><?= $v ?></text></svg>
+<svg><desc><b><noscript></noscript></b></desc></svg>
+<noscript><svg viewBox="0 0 1 1"><title><?= $v ?></title><path d="M0 0h1v1z"/></svg> <?= $v ?></noscript>
+<noscript><p title="<?= $v ?>"><?= $v ?></p><img src="/pixel.gif" alt="<?= $v ?>"></noscript>

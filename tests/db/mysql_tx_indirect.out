@@ -1,0 +1,22 @@
+written: refused: the transaction of transaction() has ended, and nothing more runs in it: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+written: transaction() threw: transaction() did not commit: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+written: row new / new@x, entity new / new@x
+prepared: refused: the transaction of transaction() has ended, and nothing more runs in it: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+prepared: transaction() threw: transaction() did not commit: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+prepared: row new / new@x, entity new / new@x
+called: refused: the transaction of transaction() has ended, and nothing more runs in it: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+called: transaction() threw: transaction() did not commit: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+called: row new / new@x, entity new / new@x
+implicit: refused: the transaction of transaction() has ended, and nothing more runs in it: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+implicit: transaction() threw: transaction() did not commit: a statement in it ended it (COMMIT, ROLLBACK or BEGIN written as SQL, a statement that commits implicitly, or an error that rolls the whole transaction back)
+implicit: row new / new@x, entity new / new@x
+rows seen inside: 1
+a transaction that went on: returned
+went on: row kept / inner@x, entity kept / old@x
+own BEGIN: row mine / mine@x, entity mine / mine@x
+error: an XA statement is not allowed in a procedure, function, trigger or event, nor in a statement prepared with PREPARE or EXECUTE IMMEDIATE: a transaction prepared there would keep its locks after the script until XA ROLLBACK or XA COMMIT ends it
+error: an XA statement is not allowed in a procedure, function, trigger or event, nor in a statement prepared with PREPARE or EXECUTE IMMEDIATE: a transaction prepared there would keep its locks after the script until XA ROLLBACK or XA COMMIT ends it
+error: an XA statement is not allowed in a procedure, function, trigger or event, nor in a statement prepared with PREPARE or EXECUTE IMMEDIATE: a transaction prepared there would keep its locks after the script until XA ROLLBACK or XA COMMIT ends it
+error: an XA statement is not allowed in a procedure, function, trigger or event, nor in a statement prepared with PREPARE or EXECUTE IMMEDIATE: a transaction prepared there would keep its locks after the script until XA ROLLBACK or XA COMMIT ends it
+error: LOAD XML LOCAL INFILE is not allowed: it would send the server a file of this host
+done

@@ -358,7 +358,14 @@ return 1
 "#,
 );
 
-/// ARGV: now, lease_until, token. The job taken: {id, name, payload, attempts}, or nil.
+/// ARGV: now, lease_until, token, the largest payload sent. The job taken:
+/// {id, name, payload, attempts, bytes of the payload, bytes of the name}, or
+/// nil. Nothing longer than PHV writes is sent, so no job can make the reply
+/// too large to read: a payload over ARGV[4] and a name over 64 bytes are
+/// left out (their places hold an empty string), and an entry whose id is
+/// over 64 bytes is removed, with {nil, nil, '', 0, 0, 0, bytes of the id}
+/// (found by the re-attack of the 21st assessment's fixes: a name of 33 MB
+/// stalled the jobs as a payload had).
 pub(super) static REDIS_JOB_TAKE: LuaScript = LuaScript::new(
     r#"
 local p = KEYS[1]
@@ -371,12 +378,19 @@ else
   redis.call('ZREM', p .. 'due', id)
 end
 local k = p .. 'job:' .. id
+if #id > 64 then
+  redis.call('DEL', k)
+  return {false, false, '', 0, 0, 0, #id}
+end
 if redis.call('EXISTS', k) == 0 then return false end
 redis.call('ZADD', p .. 'running', ARGV[2], id)
 local n = redis.call('HINCRBY', k, 'attempts', 1)
 redis.call('HSET', k, 'lease', ARGV[3])
-local f = redis.call('HMGET', k, 'name', 'payload')
-return {id, f[1], f[2], n}
+local size, named = redis.call('HSTRLEN', k, 'payload'), redis.call('HSTRLEN', k, 'name')
+local name = ''
+if named <= 64 then name = redis.call('HGET', k, 'name') end
+if size > tonumber(ARGV[4]) then return {id, name, '', n, size, named} end
+return {id, name, redis.call('HGET', k, 'payload'), n, size, named}
 "#,
 );
 
@@ -450,6 +464,8 @@ return #old
 );
 
 /// ARGV: "all" | "failed". Flat list: id, name, state, attempts, at, error, ...
+/// (of an id or a name the first 64 bytes, of an error the first 4,000: what
+/// PHV writes is shorter).
 pub(super) static REDIS_JOB_LIST: LuaScript = LuaScript::new(
     r#"
 local p = KEYS[1]
@@ -460,8 +476,9 @@ for _, s in ipairs(sets) do
   local ids = redis.call('ZRANGE', p .. s, 0, 999, 'WITHSCORES')
   for i = 1, #ids, 2 do
     local f = redis.call('HMGET', p .. 'job:' .. ids[i], 'name', 'attempts', 'error')
-    table.insert(out, ids[i]); table.insert(out, f[1] or ''); table.insert(out, states[s])
-    table.insert(out, f[2] or '0'); table.insert(out, ids[i + 1]); table.insert(out, f[3] or '')
+    table.insert(out, string.sub(ids[i], 1, 64)); table.insert(out, string.sub(f[1] or '', 1, 64))
+    table.insert(out, states[s]); table.insert(out, string.sub(f[2] or '0', 1, 20))
+    table.insert(out, ids[i + 1]); table.insert(out, string.sub(f[3] or '', 1, 4000))
   end
 end
 return out

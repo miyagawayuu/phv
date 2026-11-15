@@ -72,5 +72,29 @@ class FindingPrograms(unittest.TestCase):
             self.assertIsNone(compare_php.program(os.path.join(".", "missing")))
 
 
+class FindingGit(FindingPrograms):
+    """bench/lsp.py names its result file with `git rev-parse`: `git` is found as `php` is (21st assessment)."""
+
+    def setUp(self):
+        super().setUp()
+        spec = importlib.util.spec_from_file_location("bench_lsp", HERE / "lsp.py")
+        self.lsp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.lsp)
+        self.git = "git.bat" if os.name == "nt" else "git"
+        executable(self.cwd / self.git)
+
+    def test_git_is_not_taken_from_the_current_folder(self):
+        with self.env(os.pathsep.join([".", "", str(self.empty)])):
+            self.assertIsNone(self.lsp.program("git"))
+            with self.assertRaises(SystemExit):
+                self.lsp.short_sha()
+
+    def test_git_is_found_in_path(self):
+        executable(self.bin / self.git)
+        with self.env(os.pathsep.join([str(self.empty), str(self.bin)])):
+            found = self.lsp.program("git")
+        self.assertEqual(Path(found), (self.bin / self.git).resolve())
+
+
 if __name__ == "__main__":
     unittest.main()

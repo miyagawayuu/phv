@@ -39,7 +39,7 @@ class UploadedFile
 - `public readonly int $size`
 - `public function __construct(public readonly int $index, public readonly string $field, public readonly string $name, public readonly string $type, public readonly int $size)`
 - `public function text(): string` — The contents as text (invalid UTF-8 is replaced).
-- `public function saveTo(string $path): void` — Saves the file; the path must be inside a [permissions].write directory.
+- `public function saveTo(string $path): void` — Saves the file; the path must be inside a \[permissions\].write directory.
 
 ### class Request
 
@@ -82,7 +82,7 @@ class Response
 - `public function deleteCookie(string $name, string $path = "/"): Response`
 - `public function redirect(string $path, int $code = 302): void` — Redirects to a path on this site ("/login", "/posts?id=2"). Other URLs are rejected (open-redirect protection); use redirectExternal() for those.
 - `public function redirectExternal(string $url, int $code = 302): void` — Redirects to an absolute http(s) URL on another site.
-- `public function file(string $path, string $type = ""): void` — Sends a file instead of the page output, for example an uploaded image kept in `data/`. The path needs [permissions].read or write. Without `$type` the Content-Type comes from the extension; HTML, SVG and unknown files are sent as `application/octet-stream`.
+- `public function file(string $path, string $type = ""): void` — Sends a file instead of the page output, for example an uploaded image kept in `data/`. The path needs \[permissions\].read or write. Without `$type` the Content-Type comes from the extension; HTML, SVG and unknown files are sent as `application/octet-stream`.
 - `public function json(any $value): void` — Sends `$value` as JSON.
 - `public function flush(): bool` — Sends the status, the headers and what the page has written so far, and keeps the response open: what it writes later is sent at the next flush() or when the page ends. Afterwards the status, headers, cookies and session can no longer change. Returns false once the visitor has gone away (or has taken nothing for 10 seconds), or when the visitor's address has `[server] streams_per_address` pages streaming already (the request is answered with 429): stop the work then. Outside `phv serve` (scripts, `phv test`) it keeps the output and returns true.
 
@@ -245,7 +245,7 @@ one round trip instead of one per command.
 
   $p = $redis->pipeline();
   $p->set("greeting", "hello", 60)->incr("visits")->get("name");
-  [$set, $visits, $name] = $p->exec();   // [true, 3, "Ann"]
+  \[$set, $visits, $name\] = $p->exec();   // \[true, 3, "Ann"\]
 
 The methods take what the methods of `Redis` of the same name take and
 queue the command; `exec()` sends them and returns the replies in order, as
@@ -520,7 +520,7 @@ class TestResponse
 
 - `public readonly int $status`
 - `public readonly string $body`
-- `public readonly list<list<string>> $headerList` — Every header as [name, value], in order (names in lowercase).
+- `public readonly list<list<string>> $headerList` — Every header as \[name, value\], in order (names in lowercase).
 - `public function __construct(public readonly int $status, public readonly string $body, public readonly list<list<string>> $headerList)`
 - `public function header(string $name): ?string` — The first value of a header (case-insensitive), or null.
 - `public function headers(string $name): list<string>` — Every value of a header, such as each `set-cookie`.
@@ -1039,9 +1039,9 @@ The translator of the request's locale (see `locale()`).
 function locale(): string
 ```
 
-The request's locale: the one `set_locale()` chose, or the best of `[i18n]
-locales` for the request's `Accept-Language` (the default locale outside a
-request).
+The request's locale: the one `set_locale()` chose, or the best of the
+`[i18n] locales` for the request's `Accept-Language` (the default locale
+outside a request).
 
 ### function locales
 

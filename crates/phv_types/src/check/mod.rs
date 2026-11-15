@@ -264,7 +264,11 @@ pub(crate) struct Checker<'a> {
     const_bytes: usize,
     /// Nodes of the large types of expressions so far (see `MAX_TYPE_TOTAL`).
     type_nodes: usize,
+    /// Set once a total (large types, defaults of left-out arguments) is
+    /// passed: the rest of the program is then not checked.
     reported_type_nodes: bool,
+    /// Default values that calls hold for arguments left out (see `MAX_DEFAULT_ARGS`).
+    default_args: usize,
     /// While a member of a generic trait is resolved or checked for a class
     /// that uses it: what the trait's type parameters stand for.
     trait_subst: Vec<(Name, Type)>,
@@ -279,6 +283,10 @@ pub(crate) struct Checker<'a> {
     /// (see `drop_repeated`), however many there are.
     seen_diags: HashSet<(bool, String, Span)>,
     seen_len: usize,
+    /// Errors and warnings reported so far (see `diagnostic`).
+    diag_counts: [usize; 2],
+    /// The last diagnostic past `MAX_DIAGNOSTICS`, as it was reported.
+    brief_diag: Option<Diagnostic>,
     /// What each trait gives (with what its type parameters stand for) while
     /// the traits of one class or trait are flattened: a trait reached along
     /// many paths is flattened at most twice (see `traits::flatten_trait`).
@@ -344,7 +352,7 @@ const MAX_CONST_STR: usize = 1 << 20;
 const MAX_CONST_TOTAL: usize = 16 << 20;
 
 /// Members of a union type written in the source (each use of one checks them all).
-const MAX_UNION: usize = 256;
+pub(crate) const MAX_UNION: usize = 256;
 
 /// Type aliases resolved inside each other (`type A = B; type B = C; ...`).
 const MAX_ALIAS_DEPTH: usize = 64;
@@ -370,6 +378,53 @@ const LARGE_TYPE: usize = 100;
 /// Properties of one class, its inherited ones included: a property's slot is a
 /// 16-bit operand of the bytecode.
 const MAX_FIELDS: usize = u16::MAX as usize;
+
+/// Arguments left out by all the calls of a program together, each filled
+/// with its parameter's default value.
+pub(crate) const MAX_DEFAULT_ARGS: usize = 1_000_000;
+
+/// Errors, and warnings, kept with their whole message and their notes (the
+/// tools show 50, the language server 1,000). A message can name types and
+/// members, so generated source could make long ones without end: the ones
+/// after these are kept `MAX_BRIEF_MESSAGE` bytes long.
+const MAX_DIAGNOSTICS: usize = 1000;
+
+/// Bytes of a diagnostic's message kept: the name of a type can be as long
+/// as `MAX_TYPE_SIZE` names.
+const MAX_MESSAGE: usize = 2000;
+const MAX_BRIEF_MESSAGE: usize = 120;
+
+/// Members named at most in a message that lists them.
+const MAX_LISTED: usize = 5;
+
+/// `msg`, cut after `max` bytes (at a character) with `...` in place of the rest.
+fn clip(mut msg: String, max: usize) -> String {
+    if msg.len() > max {
+        let mut end = max;
+        while !msg.is_char_boundary(end) {
+            end -= 1;
+        }
+        msg.truncate(end);
+        msg.push_str("...");
+        // The rest of a long message is given back, not kept with the start.
+        msg.shrink_to_fit();
+    }
+    msg
+}
+
+/// `names` as a list for a message: the first `MAX_LISTED`, then how many more.
+fn list_some(names: &[String], what: &str) -> String {
+    list_counted(names, names.len(), what)
+}
+
+/// `list_some` of `total` names, of which `names` are the first.
+fn list_counted(names: &[String], total: usize, what: &str) -> String {
+    let mut out = names.iter().take(MAX_LISTED).cloned().collect::<Vec<_>>().join(", ");
+    if total > MAX_LISTED {
+        out.push_str(&format!(" and {} more {what}", total - MAX_LISTED));
+    }
+    out
+}
 
 /// The signatures of the builtins, read once per process (see `sig`).
 fn parsed_builtins() -> &'static HashMap<&'static str, Vec<ParsedBuiltin>> {
@@ -427,12 +482,15 @@ impl<'a> Checker<'a> {
             const_bytes: 0,
             type_nodes: 0,
             reported_type_nodes: false,
+            default_args: 0,
             trait_subst: Vec::new(),
             func_trait: HashMap::new(),
             trait_code: 0,
             reported_trait_code: false,
             seen_diags: HashSet::new(),
             seen_len: 0,
+            diag_counts: [0; 2],
+            brief_diag: None,
             trait_memo: HashMap::new(),
         }
     }
@@ -544,6 +602,7 @@ impl<'a> Checker<'a> {
 
     fn run(&mut self) {
         take_too_large();
+        take_too_wide();
         self.collect();
         self.resolve_imports();
         let order = self.order_classes();
@@ -911,13 +970,34 @@ impl<'a> Checker<'a> {
     // ----- helpers -------------------------------------------------------
 
     fn error(&mut self, msg: impl Into<String>, span: Span) -> &mut Diagnostic {
-        self.diags.push(Diagnostic::error(msg, span));
-        self.diags.last_mut().unwrap()
+        self.diagnostic(Diagnostic::error(clip(msg.into(), MAX_MESSAGE), span))
     }
 
     fn warn(&mut self, msg: impl Into<String>, span: Span) -> &mut Diagnostic {
-        self.diags.push(Diagnostic::warning(msg, span));
-        self.diags.last_mut().unwrap()
+        self.diagnostic(Diagnostic::warning(clip(msg.into(), MAX_MESSAGE), span))
+    }
+
+    /// Keeps `d`: whole for the first `MAX_DIAGNOSTICS` errors and as many
+    /// warnings, and after that only the start of its message, without notes
+    /// (the count of errors stays right, and positions in the list still tell
+    /// what was reported since a mark): 20,000 errors that each named a class
+    /// with a 1 MB name took 70 GB (21st assessment).
+    fn diagnostic(&mut self, d: Diagnostic) -> &mut Diagnostic {
+        let kind = usize::from(!d.is_error());
+        self.diag_counts[kind] += 1;
+        if self.diag_counts[kind] <= MAX_DIAGNOSTICS {
+            self.diags.push(d);
+            return self.diags.last_mut().unwrap();
+        }
+        let brief = clip(d.message.clone(), MAX_BRIEF_MESSAGE);
+        self.diags.push(if d.is_error() {
+            Diagnostic::error(brief, d.span)
+        } else {
+            Diagnostic::warning(brief, d.span)
+        });
+        // Notes added by the caller go to `d`, which the next one replaces.
+        self.brief_diag = Some(d);
+        self.brief_diag.as_mut().unwrap()
     }
 
     fn tn(&self, t: &Type) -> String {
@@ -2780,44 +2860,54 @@ impl<'a> Checker<'a> {
         let ci = cid as usize;
         let span = self.classes[ci].span;
         let name = self.classes[ci].name.clone();
-        let mut missing = Vec::new();
-        let mut methods: Vec<(String, MethodInfo)> =
-            self.classes[ci].methods.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        methods.sort_by(|a, b| a.0.cmp(&b.0));
-        for (mname, m) in &methods {
-            if !m.is_static && self.funcs[m.func as usize].is_abstract {
-                missing.push(self.funcs[m.func as usize].name.clone());
-            }
-            let _ = mname;
-        }
+        // The methods are gone through as they are kept (not copied and
+        // sorted for each class: 5,000 classes of a 40,000-method interface
+        // took 80 s; 21st assessment); what is reported is put in order.
+        let mut missing: Vec<FuncId> = self.classes[ci]
+            .methods
+            .values()
+            .filter(|m| !m.is_static && self.funcs[m.func as usize].is_abstract)
+            .map(|m| m.func)
+            .collect();
         let mut supers: Vec<ClassId> = self.classes[ci].supers.iter().copied().collect();
         supers.sort();
         for s in supers {
             if self.classes[s as usize].kind != ClassKind::Interface {
                 continue;
             }
-            let mut imethods: Vec<(String, MethodInfo)> =
-                self.classes[s as usize].methods.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            imethods.sort_by(|a, b| a.0.cmp(&b.0));
-            for (mname, im) in imethods {
-                match self.classes[ci].methods.get(&mname).cloned() {
-                    Some(cm) if cm.func == im.func => missing.push(self.funcs[im.func as usize].name.clone()),
-                    Some(cm) => {
-                        if cm.vis != Visibility::Public {
-                            self.error(format!("`{name}::{mname}` must be public to implement an interface"), span);
-                        } else if !self.compatible_override(cm.func, im.func, cid) {
-                            let iname = self.funcs[im.func as usize].name.clone();
-                            self.error(format!("`{name}::{mname}` does not match the signature of `{iname}`"), span);
-                        }
-                    }
-                    None => missing.push(self.funcs[im.func as usize].name.clone()),
+            // The interface's methods that the class declares itself.
+            let mut own: Vec<(String, MethodInfo, FuncId)> = Vec::new();
+            for (mname, im) in &self.classes[s as usize].methods {
+                match self.classes[ci].methods.get(mname) {
+                    Some(cm) if cm.func != im.func => own.push((mname.clone(), cm.clone(), im.func)),
+                    _ => missing.push(im.func),
+                }
+            }
+            own.sort_by(|a, b| a.0.cmp(&b.0));
+            for (mname, cm, ifunc) in own {
+                if cm.vis != Visibility::Public {
+                    self.error(format!("`{name}::{mname}` must be public to implement an interface"), span);
+                } else if !self.compatible_override(cm.func, ifunc, cid) {
+                    let iname = self.funcs[ifunc as usize].name.clone();
+                    self.error(format!("`{name}::{mname}` does not match the signature of `{iname}`"), span);
                 }
             }
         }
-        missing.sort();
-        missing.dedup();
         if !missing.is_empty() {
-            self.error(format!("class `{name}` does not implement {}", missing.join(", ")), span)
+            // Each method once (it can be asked for by several interfaces),
+            // and the first `MAX_LISTED` names in order: the rest are counted.
+            missing.sort_unstable();
+            missing.dedup();
+            let total = missing.len();
+            let mut names: Vec<&str> = missing.iter().map(|f| self.funcs[*f as usize].name.as_str()).collect();
+            if total > MAX_LISTED {
+                names.select_nth_unstable(MAX_LISTED);
+                names.truncate(MAX_LISTED);
+            }
+            names.sort_unstable();
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            let list = list_counted(&names, total, "methods");
+            self.error(format!("class `{name}` does not implement {list}"), span)
                 .add_note("implement the methods, or declare the class `abstract`");
         }
     }
@@ -3131,7 +3221,8 @@ impl<'a> Checker<'a> {
 
     /// Checks that a constructor initializes the fields that need it.
     fn check_ctor_init(&mut self, cid: ClassId, d: &FunctionDecl) {
-        let assigned: Vec<&str> = d
+        // Sets: a scan per property made 65,000 promoted parameters take 10 s.
+        let assigned: HashSet<&str> = d
             .body
             .iter()
             .filter_map(|s| match &s.kind {
@@ -3148,7 +3239,8 @@ impl<'a> Checker<'a> {
             matches!(&s.kind, StmtKind::Expr(e) if matches!(&e.kind,
                 ExprKind::StaticCall(c) if c.class == "parent" && c.name == "__construct"))
         });
-        let promoted: Vec<&str> = d.params.iter().filter(|p| p.promote.is_some()).map(|p| p.name.as_str()).collect();
+        let promoted: HashSet<&str> =
+            d.params.iter().filter(|p| p.promote.is_some()).map(|p| p.name.as_str()).collect();
         let class = &self.classes[cid as usize];
         let missing: Vec<String> = class
             .fields
@@ -3156,15 +3248,16 @@ impl<'a> Checker<'a> {
             .filter(|f| {
                 f.required
                     && f.owner == cid
-                    && !assigned.contains(&f.name.as_str())
-                    && !promoted.contains(&f.name.as_str())
+                    && !assigned.contains(f.name.as_str())
+                    && !promoted.contains(f.name.as_str())
             })
             .map(|f| format!("${}", f.name))
             .collect();
         let parent_needs_init = class.fields.iter().any(|f| f.owner != cid && f.required);
         let name = class.name.clone();
         if !missing.is_empty() {
-            self.error(format!("the constructor of `{name}` does not initialize {}", missing.join(", ")), d.name_span)
+            let list = list_some(&missing, "properties");
+            self.error(format!("the constructor of `{name}` does not initialize {list}"), d.name_span)
                 .add_note("assign every non-nullable property without a default at the top of `__construct`");
         }
         if parent_needs_init && !calls_parent {
@@ -3366,6 +3459,8 @@ thread_local! {
     /// was made instead (by `subst_params`, inference or a join); the
     /// expression or statement being checked then reports it.
     static TOO_LARGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set with `TOO_LARGE` when the reason is a union of too many types.
+    static TOO_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn note_too_large() {
@@ -3374,6 +3469,18 @@ pub(crate) fn note_too_large() {
 
 pub(crate) fn take_too_large() -> bool {
     TOO_LARGE.with(|c| c.replace(false))
+}
+
+/// A join would have made a union of more than `MAX_UNION` types (and made
+/// `Type::Error` instead): also sets `TOO_LARGE`, for the places that only
+/// report that.
+pub(crate) fn note_too_wide() {
+    TOO_WIDE.with(|c| c.set(true));
+    note_too_large();
+}
+
+pub(crate) fn take_too_wide() -> bool {
+    TOO_WIDE.with(|c| c.replace(false))
 }
 
 /// The number of nodes in `t`, counting stopped past `limit`.

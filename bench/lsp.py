@@ -41,8 +41,31 @@ ROOT = Path(__file__).resolve().parent.parent
 SITE = ROOT / "examples" / "site"
 
 
+def program(name: str) -> "str | None":
+    """The executable a bare `name` names: looked for only in the folders of
+    PATH that are absolute. Never the current folder, which Windows searches
+    first for a bare name: a `git.exe` there ran (21st assessment; as
+    compare_php.py does for `php` since R23-24)."""
+    suffixes = [""]
+    if os.name == "nt":
+        exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+        if not any(name.lower().endswith(e.lower()) for e in exts):
+            suffixes = exts
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if not folder or not os.path.isabs(folder):
+            continue
+        for suffix in suffixes:
+            candidate = os.path.join(folder, name + suffix)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return str(Path(candidate).resolve())
+    return None
+
+
 def short_sha() -> str:
-    return subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], text=True).strip()
+    git = program("git")
+    if git is None:
+        raise SystemExit("error: git was not found in PATH (it names the result file); pass --out")
+    return subprocess.check_output([git, "-C", str(ROOT), "rev-parse", "--short", "HEAD"], text=True).strip()
 
 
 def default_phv() -> Path:

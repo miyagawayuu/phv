@@ -33,17 +33,99 @@ pub fn job_store_ready(spec: &DatabaseSpec, ns: Option<&str>, deadline: Option<I
     job_conn_before(spec, ns, deadline).map(|_| ())
 }
 
+/// The largest payload a job is taken with: far above what `enqueue()` adds
+/// (64 KB) and below what one reply of any store may hold (8 MB on
+/// PostgreSQL and MySQL, 32 MB on Redis).
+const JOB_MAX_TAKEN: usize = 1 << 20;
+
+/// How many jobs whose payload is over `JOB_MAX_TAKEN` one `job_take` gives
+/// up before it leaves the rest to the next.
+const JOB_TAKE_TRIES: usize = 16;
+
+/// The longest name of a job (`jobs::job_name`), and the longest id a Redis
+/// store is asked to send (PHV's are 32 hex digits).
+const JOB_MAX_NAME: i64 = 64;
+
+/// What `job_take_once` took: a job to run, one whose payload or name (of so
+/// many bytes) was not read, or an entry of a Redis store that was removed
+/// because its id (of so many bytes) is none PHV writes.
+enum Taken {
+    Job(JobRow),
+    TooLarge(JobRow, i64),
+    LongName(JobRow, i64),
+    Removed(i64),
+}
+
+impl Taken {
+    /// The job leased with `row`, whose payload of `size` bytes is `payload`
+    /// unless it was over `JOB_MAX_TAKEN` (then the store did not send it).
+    fn of(mut row: JobRow, payload: Option<String>, size: i64) -> Taken {
+        match payload {
+            Some(p) => {
+                row.payload = p;
+                Taken::Job(row)
+            }
+            None => Taken::TooLarge(row, size),
+        }
+    }
+}
+
 /// Takes the next job due (or one whose lease ran out) for `lease_ms`.
+///
+/// A job is leased first and its payload read after, and only when it is at
+/// most `JOB_MAX_TAKEN` bytes: a larger one (no `enqueue()` adds it; another
+/// writer of the database, or a damaged row) is given up as failed, with an
+/// error that says so, and the next job is taken. (Found by the 21st
+/// assessment: MySQL read the payload in the transaction that chose the job;
+/// a row over the 8 MB a reply may hold failed the read, the transaction
+/// ended, the row stayed first in line, and every runner of every process
+/// took it again: no job of the site ran any more. PostgreSQL and Redis
+/// leased it first, and failed on it once per lease, for ever.) The same
+/// holds for the other texts a store sends with a job: the name and the id
+/// are 64 and 32 bytes at most in the tables of PostgreSQL and MySQL; a
+/// Redis store sends neither when longer than 64 bytes (a job with such a
+/// name is given up, an entry with such an id removed).
 pub fn job_take(spec: &DatabaseSpec, ns: Option<&str>, lease_ms: i64) -> Result<Option<JobRow>, String> {
+    for _ in 0..JOB_TAKE_TRIES {
+        match job_take_once(spec, ns, lease_ms)? {
+            None => return Ok(None),
+            Some(Taken::Job(job)) => return Ok(Some(job)),
+            Some(Taken::TooLarge(job, size)) => {
+                let error = format!(
+                    "the payload ({size} bytes) is over the {} MB a job is run with: enqueue() did not add it",
+                    JOB_MAX_TAKEN >> 20
+                );
+                eprintln!("warning: job {} ({}) was given up: {error}", job.name.escape_debug(), job.id.escape_debug());
+                job_end(spec, ns, &job, JobEnd::Dead { error: &error })?;
+            }
+            Some(Taken::LongName(job, size)) => {
+                let error =
+                    format!("the name ({size} bytes) is over the {JOB_MAX_NAME} bytes of a job's name: enqueue() did not add it");
+                eprintln!("warning: job {} was given up: {error}", job.id.escape_debug());
+                job_end(spec, ns, &job, JobEnd::Dead { error: &error })?;
+            }
+            Some(Taken::Removed(size)) => {
+                eprintln!(
+                    "warning: an entry of the job store was removed: its id ({size} bytes) is over the {JOB_MAX_NAME} \
+                     bytes a job is taken with: enqueue() did not add it"
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn job_take_once(spec: &DatabaseSpec, ns: Option<&str>, lease_ms: i64) -> Result<Option<Taken>, String> {
     let t = jobs_table(ns);
     let (mut conn, until) = job_conn(spec, ns)?;
     let now = now_ms();
     let token = crate::random_hex(16);
     let lease_until = now + lease_ms;
+    let cap = JOB_MAX_TAKEN as i64;
     match &mut conn {
         SessionConn::Redis(c) => {
-            let (now_s, until_s) = (now.to_string(), lease_until.to_string());
-            let args: [&[u8]; 4] = [b"0", now_s.as_bytes(), until_s.as_bytes(), token.as_bytes()];
+            let (now_s, until_s, cap_s) = (now.to_string(), lease_until.to_string(), cap.to_string());
+            let args: [&[u8]; 5] = [b"0", now_s.as_bytes(), until_s.as_bytes(), token.as_bytes(), cap_s.as_bytes()];
             match job_redis(c, &REDIS_JOB_TAKE, &jobs_prefix(ns), &args, until)? {
                 Reply::Nil => Ok(None),
                 Reply::Array(items) => {
@@ -58,7 +140,28 @@ pub fn job_take(spec: &DatabaseSpec, ns: Option<&str>, lease_ms: i64) -> Result<
                     let (Some(id), Some(name), Some(payload)) = (items.first(), items.get(1), items.get(2)) else {
                         return Err("the server sent an invalid reply".into());
                     };
-                    Ok(Some(JobRow { id: text(id), name: text(name), payload: text(payload), attempts, lease: token }))
+                    let number = |i: usize| match items.get(i) {
+                        Some(Reply::Int(n)) => *n,
+                        _ => 0,
+                    };
+                    if matches!(id, Reply::Nil) {
+                        return Ok(Some(Taken::Removed(number(6))));
+                    }
+                    let (size, named) = (number(4), number(5));
+                    if named > JOB_MAX_NAME {
+                        let row = JobRow {
+                            id: text(id),
+                            name: String::new(),
+                            payload: String::new(),
+                            attempts,
+                            lease: token,
+                        };
+                        return Ok(Some(Taken::LongName(row, named)));
+                    }
+                    // A job without a payload field has an empty one, as before.
+                    let payload = (size <= cap).then(|| text(payload));
+                    let row = JobRow { id: text(id), name: text(name), payload: String::new(), attempts, lease: token };
+                    Ok(Some(Taken::of(row, payload, size)))
                 }
                 _ => Err("the server sent an invalid reply".into()),
             }
@@ -71,37 +174,41 @@ pub fn job_take(spec: &DatabaseSpec, ns: Option<&str>, lease_ms: i64) -> Result<
                         "UPDATE {t} SET state = 1, attempts = LEAST(attempts, 1000) + 1, lease = $1, lease_until = $2 \
                      WHERE id = (SELECT id FROM {t} WHERE (state = 0 AND run_at <= $3) \
                      OR (state = 1 AND lease_until < $3) ORDER BY run_at LIMIT 1 FOR UPDATE SKIP LOCKED) \
-                     RETURNING id, name, payload, attempts"
+                     RETURNING id, name, CASE WHEN octet_length(payload) <= $4::bigint THEN payload END, attempts, \
+                     octet_length(payload)::bigint"
                     ),
-                    &[&token, &lease_until, &now],
+                    &[&token, &lease_until, &now, &cap],
                 )
                 .map_err(|e| pg_message(&e))?;
             let Some(r) = rows.first() else { return Ok(None) };
             let get = |e: postgres::Error| pg_message(&e);
-            Ok(Some(JobRow {
+            let row = JobRow {
                 id: r.try_get(0).map_err(get)?,
                 name: r.try_get(1).map_err(get)?,
-                payload: r.try_get(2).map_err(get)?,
+                payload: String::new(),
                 attempts: r.try_get::<_, i32>(3).map_err(get)?.max(0) as u32,
                 lease: token,
-            }))
+            };
+            Ok(Some(Taken::of(row, r.try_get(2).map_err(get)?, r.try_get(4).map_err(get)?)))
         }
         SessionConn::My(c) => {
             use mysql::prelude::Queryable;
             let w = c.get().watch();
             let my = |e: mysql::Error| w.msg(e);
             let conn = &mut c.get().conn;
+            // The job is chosen and leased without its payload, which is
+            // read once the lease is committed (see `job_take`).
             conn.query_drop("START TRANSACTION").map_err(my)?;
-            let found: Option<(String, String, String, i64)> = conn
+            let found: Option<(String, i64)> = conn
                 .exec_first(
                     format!(
-                        "SELECT id, name, payload, attempts FROM {t} WHERE (state = 0 AND run_at <= ?) \
+                        "SELECT id, attempts FROM {t} WHERE (state = 0 AND run_at <= ?) \
                      OR (state = 1 AND lease_until < ?) ORDER BY run_at LIMIT 1 FOR UPDATE SKIP LOCKED"
                     ),
                     (now, now),
                 )
                 .map_err(my)?;
-            let Some((id, name, payload, attempts)) = found else {
+            let Some((id, attempts)) = found else {
                 conn.query_drop("COMMIT").map_err(my)?;
                 return Ok(None);
             };
@@ -111,7 +218,20 @@ pub fn job_take(spec: &DatabaseSpec, ns: Option<&str>, lease_ms: i64) -> Result<
             )
             .map_err(my)?;
             conn.query_drop("COMMIT").map_err(my)?;
-            Ok(Some(JobRow { id, name, payload, attempts: (attempts.min(1000) + 1).max(0) as u32, lease: token }))
+            let read: Option<(String, Option<String>, i64)> = conn
+                .exec_first(
+                    format!(
+                        "SELECT name, IF(LENGTH(payload) <= ?, payload, NULL), LENGTH(payload) FROM {t} \
+                         WHERE id = ? AND lease = ?"
+                    ),
+                    (cap, &id, &token),
+                )
+                .map_err(my)?;
+            // Gone meanwhile (removed by hand): nothing was taken.
+            let Some((name, payload, size)) = read else { return Ok(None) };
+            let attempts = (attempts.min(1000) + 1).max(0) as u32;
+            let row = JobRow { id, name, payload: String::new(), attempts, lease: token };
+            Ok(Some(Taken::of(row, payload, size)))
         }
     }
 }
@@ -1199,6 +1319,208 @@ pub fn job_requeue(spec: &DatabaseSpec, ns: Option<&str>, id: &str) -> Result<bo
             )
             .map_err(|e| w.msg(e))?;
             Ok(conn.affected_rows() > 0)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::jobs_add::job_add;
+    use super::*;
+
+    /// The servers of the database tests (see crates/phv_driver/tests/databases.rs), when set.
+    fn test_servers() -> Vec<(&'static str, DatabaseSpec)> {
+        ["PHV_TEST_POSTGRES_URL", "PHV_TEST_MYSQL_URL", "PHV_TEST_REDIS_URL"]
+            .into_iter()
+            .filter_map(|var| {
+                let url = std::env::var(var).ok().filter(|u| !u.is_empty());
+                if url.is_none() {
+                    eprintln!("skipped: {var} is not set");
+                }
+                Some((var, DatabaseSpec { url: Some(url?), url_env: None, tls: None, pool_size: 4 }))
+            })
+            .collect()
+    }
+
+    /// Puts a waiting job whose payload is `len` times `ch` in the store as
+    /// another writer of the database would (no cap on the payload), due at
+    /// `run_at`.
+    fn plant(spec: &DatabaseSpec, ns: Option<&str>, id: &str, ch: &str, len: usize, run_at: i64) {
+        let t = jobs_table(ns);
+        let (mut conn, until) = job_conn(spec, ns).unwrap();
+        match &mut conn {
+            SessionConn::Redis(c) => {
+                let p = jobs_prefix(ns);
+                let (key, due, at) = (format!("{p}job:{id}"), format!("{p}due"), run_at.to_string());
+                let payload = ch.repeat(len);
+                let hset: [&[u8]; 8] =
+                    [b"HSET", key.as_bytes(), b"name", b"echo", b"payload", payload.as_bytes(), b"attempts", b"0"];
+                c.get().command(&hset, until, 1024).ok().expect("the Redis command");
+                c.get()
+                    .command(&[b"ZADD", due.as_bytes(), at.as_bytes(), id.as_bytes()], until, 1024)
+                    .ok()
+                    .expect("the Redis command");
+            }
+            SessionConn::Pg(c) => {
+                let sql = format!(
+                    "INSERT INTO {t} (id, name, payload, run_at, attempts, state, created) \
+                     VALUES ($1, 'echo', repeat($2::text, $3::int), $4, 0, 0, 1)"
+                );
+                c.get().execute_kept(&sql, &[&id, &ch, &(len as i32), &run_at]).unwrap();
+            }
+            SessionConn::My(c) => {
+                use mysql::prelude::Queryable;
+                let sql = format!(
+                    "INSERT INTO {t} (id, name, payload, run_at, attempts, state, created) \
+                     VALUES (?, 'echo', REPEAT(?, ?), ?, 0, 0, 1)"
+                );
+                c.get().conn.exec_drop(sql, (id, ch, len, run_at)).unwrap();
+            }
+        }
+    }
+
+    /// Removes a job that was given up.
+    fn remove(spec: &DatabaseSpec, ns: Option<&str>, id: &str) {
+        let t = jobs_table(ns);
+        let (mut conn, until) = job_conn(spec, ns).unwrap();
+        match &mut conn {
+            SessionConn::Redis(c) => {
+                let p = jobs_prefix(ns);
+                let (key, dead) = (format!("{p}job:{id}"), format!("{p}dead"));
+                c.get().command(&[b"DEL", key.as_bytes()], until, 1024).ok().expect("the Redis command");
+                c.get()
+                    .command(&[b"ZREM", dead.as_bytes(), id.as_bytes()], until, 1024)
+                    .ok()
+                    .expect("the Redis command");
+            }
+            SessionConn::Pg(c) => {
+                c.get().execute_kept(&format!("DELETE FROM {t} WHERE id = $1"), &[&id]).unwrap();
+            }
+            SessionConn::My(c) => {
+                use mysql::prelude::Queryable;
+                c.get().conn.exec_drop(format!("DELETE FROM {t} WHERE id = ?"), (id,)).unwrap();
+            }
+        }
+    }
+
+    /// A job whose payload no reply of the store can hold (planted by another
+    /// writer of the database: `enqueue()` adds 64 KB at most) is given up as
+    /// failed when its turn comes, and the jobs after it run (found by the
+    /// 21st assessment: on MySQL a row of 9 MB failed the read that chose the
+    /// job and stayed first in line, so no job of the site ran any more; on
+    /// PostgreSQL and Redis it was taken again at every lease, for ever).
+    #[test]
+    fn a_job_too_large_to_read_is_given_up_and_the_queue_goes_on() {
+        let ns = crate::testing::namespace(0x36);
+        let ns = Some(ns.as_str());
+        for (var, spec) in test_servers() {
+            let clear = || {
+                while let Some(j) = job_take(&spec, ns, 60_000).unwrap() {
+                    job_end(&spec, ns, &j, JobEnd::Done { keyed: false }).unwrap();
+                }
+            };
+            job_store_ready(&spec, ns, None).unwrap();
+            clear();
+            let now = now_ms();
+            let big = format!("big{}", crate::random_hex(6));
+            plant(&spec, ns, &big, "B", 9 << 20, now - 5000);
+            // One at the bound is run; one byte more is not.
+            let (most, over) = (format!("most{}", crate::random_hex(6)), format!("over{}", crate::random_hex(6)));
+            plant(&spec, ns, &most, "m", JOB_MAX_TAKEN, now - 4000);
+            plant(&spec, ns, &over, "o", JOB_MAX_TAKEN + 1, now - 3000);
+            let after = crate::random_hex(16);
+            let cap = JobCap { jobs: 1000, bytes: 1 << 30 };
+            assert_eq!(
+                job_add(&spec, ns, (&after, "echo", "after"), now - 1000, None, cap, None),
+                Ok(Some(())),
+                "{var}"
+            );
+
+            let first = job_take(&spec, ns, 60_000).unwrap().unwrap_or_else(|| panic!("{var}: no job was taken"));
+            assert_eq!(
+                (first.id.as_str(), first.payload.len(), first.attempts),
+                (most.as_str(), JOB_MAX_TAKEN, 1),
+                "{var}"
+            );
+            let second = job_take(&spec, ns, 60_000).unwrap().unwrap_or_else(|| panic!("{var}: the queue stopped"));
+            assert_eq!((second.id.as_str(), second.payload.as_str()), (after.as_str(), "after"), "{var}");
+            assert!(job_take(&spec, ns, 60_000).unwrap().is_none(), "{var}: nothing else waits");
+            for job in [&first, &second] {
+                assert!(job_end(&spec, ns, job, JobEnd::Done { keyed: false }).unwrap(), "{var}");
+            }
+            // Both are among the failed jobs, with the reason; neither waits or runs.
+            let jobs = job_list(&spec, ns, false).unwrap();
+            for (id, size) in [(&big, 9 << 20), (&over, JOB_MAX_TAKEN + 1)] {
+                let j = jobs.iter().find(|j| &j.id == id).unwrap_or_else(|| panic!("{var}: {id} is gone"));
+                assert_eq!(j.state, "failed", "{var}: {id}");
+                assert!(
+                    j.error.contains(&format!("the payload ({size} bytes) is over the 1 MB")),
+                    "{var}: {}",
+                    j.error
+                );
+            }
+            assert!(jobs.iter().all(|j| j.state == "failed" || (j.id != most && j.id != after)), "{var}");
+            // Put back by hand (`phv jobs retry`), such a job is given up again.
+            assert!(job_requeue(&spec, ns, &big).unwrap(), "{var}");
+            assert!(job_take(&spec, ns, 60_000).unwrap().is_none(), "{var}");
+            assert!(job_list(&spec, ns, true).unwrap().iter().any(|j| j.id == big), "{var}");
+            for id in [&big, &over] {
+                remove(&spec, ns, id);
+            }
+        }
+    }
+
+    /// Nothing a Redis store sends with a job is longer than PHV writes: a
+    /// job whose name is over 64 bytes is given up as failed, an entry whose
+    /// id is over 64 bytes is removed, and the jobs after them run (found by
+    /// the re-attack of the 21st assessment's fixes: a name of 33 MB made the
+    /// reply too large to read, the job stayed leased and was taken again at
+    /// every lease). `phv jobs list` shows such a job, its name cut. (The
+    /// tables of PostgreSQL and MySQL hold no such name or id.)
+    #[test]
+    fn a_redis_job_with_a_name_or_id_too_long_to_read_does_not_stop_the_queue() {
+        let ns = crate::testing::namespace(0x37);
+        let ns = Some(ns.as_str());
+        for (var, spec) in test_servers() {
+            if var != "PHV_TEST_REDIS_URL" {
+                continue;
+            }
+            while let Some(j) = job_take(&spec, ns, 60_000).unwrap() {
+                job_end(&spec, ns, &j, JobEnd::Done { keyed: false }).unwrap();
+            }
+            let now = now_ms();
+            let p = jobs_prefix(ns);
+            let command = |args: &[&[u8]]| {
+                let (mut conn, until) = job_conn(&spec, ns).unwrap();
+                let SessionConn::Redis(c) = &mut conn else { unreachable!() };
+                c.get().command(args, until, 1 << 20).ok().expect("the Redis command");
+            };
+            let due = format!("{p}due");
+            // A name of 33 MB, an id of 33 MB (with and without a hash), then a job.
+            let (named, long_id) = (format!("named{}", crate::random_hex(6)), "i".repeat(33 << 20));
+            let long_name = "n".repeat(33 << 20);
+            let key = format!("{p}job:{named}");
+            command(&[b"HSET", key.as_bytes(), b"name", long_name.as_bytes(), b"payload", b"x", b"attempts", b"0"]);
+            command(&[b"ZADD", due.as_bytes(), (now - 5000).to_string().as_bytes(), named.as_bytes()]);
+            let key = format!("{p}job:{long_id}");
+            command(&[b"HSET", key.as_bytes(), b"name", b"echo", b"payload", b"x", b"attempts", b"0"]);
+            command(&[b"ZADD", due.as_bytes(), (now - 4000).to_string().as_bytes(), long_id.as_bytes()]);
+            let bare = "b".repeat(100);
+            command(&[b"ZADD", due.as_bytes(), (now - 3000).to_string().as_bytes(), bare.as_bytes()]);
+            let after = crate::random_hex(16);
+            let cap = JobCap { jobs: 1000, bytes: 1 << 30 };
+            assert_eq!(job_add(&spec, ns, (&after, "echo", "after"), now - 1000, None, cap, None), Ok(Some(())));
+
+            let job = job_take(&spec, ns, 60_000).unwrap().expect("the queue stopped");
+            assert_eq!((job.id.as_str(), job.name.as_str(), job.payload.as_str()), (after.as_str(), "echo", "after"));
+            assert!(job_end(&spec, ns, &job, JobEnd::Done { keyed: false }).unwrap());
+            assert!(job_take(&spec, ns, 60_000).unwrap().is_none());
+            let jobs = job_list(&spec, ns, false).unwrap();
+            assert_eq!(jobs.len(), 1, "the entries with long ids are gone, the job that ran too");
+            let j = &jobs[0];
+            assert_eq!((j.id.as_str(), j.state, j.name.len()), (named.as_str(), "failed", 64));
+            assert!(j.error.contains(&format!("the name ({} bytes) is over the 64 bytes", 33 << 20)), "{}", j.error);
+            remove(&spec, ns, &named);
         }
     }
 }
