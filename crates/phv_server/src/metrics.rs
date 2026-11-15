@@ -302,8 +302,8 @@ impl Metrics {
         }
         head(&mut out, "phv_requests_total", "counter", "Requests answered, by what answered them and status class.");
         for (k, (_, kind)) in KINDS.iter().enumerate() {
-            for class in 0..5 {
-                let n = self.requests[k][class].load(Ordering::Relaxed);
+            for (class, count) in self.requests[k].iter().enumerate() {
+                let n = count.load(Ordering::Relaxed);
                 let _ = writeln!(out, "phv_requests_total{{kind=\"{kind}\",code=\"{}xx\"}} {n}", class + 1);
             }
         }
